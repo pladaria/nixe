@@ -240,6 +240,26 @@ impl NcaSection {
         self.storage.clone()
     }
 
+    /// Returns the bounded data payload, excluding advertised integrity/hash
+    /// layers. For PFS0 sections this begins at the PFS0 magic rather than at
+    /// physical section offset zero.
+    pub fn payload_storage(&self) -> Result<StorageRef, LoadError> {
+        let (offset, size) = match &self.integrity {
+            IntegrityLayout::HierarchicalSha256(layout) => (layout.data_offset, layout.data_size),
+            IntegrityLayout::Ivfc(layout) => layout
+                .levels
+                .last()
+                .map(|level| (level.offset, level.size))
+                .ok_or_else(|| LoadError::invalid("NCA", "IVFC section has no data level"))?,
+            IntegrityLayout::None | IntegrityLayout::Bktr => (0, self.size),
+        };
+        Ok(Arc::new(SubStorage::new(
+            self.storage.clone(),
+            offset,
+            size,
+        )?))
+    }
+
     pub fn validate_integrity(&self) -> Result<IntegrityReport, LoadError> {
         integrity::validate(
             self.index,
@@ -883,6 +903,12 @@ mod tests {
         let report = section.validate_integrity().unwrap();
         assert!(report.is_valid());
         assert_eq!(report.checks().len(), 3);
+
+        let payload = section.payload_storage().unwrap();
+        assert_eq!(payload.len().unwrap(), 0x100);
+        let mut first = [0_u8; 2];
+        payload.read_at(0, &mut first).unwrap();
+        assert_eq!(first, [0, 1]);
     }
 
     #[test]

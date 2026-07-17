@@ -17,3 +17,7 @@ pub use inspection::{
 pub use package::{ApplicationId, ContentType, PackageMetadata, TitleId};
 pub use resolved_title::ResolvedTitle;
 pub use resolver::TitleResolver;
+pub use swiitx_loader_content::{
+    CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType, CnmtExtendedHeader,
+    CnmtInstallType, CnmtMetaType, CnmtPlatform,
+};

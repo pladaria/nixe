@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use swiitx_loader_storage::FormatLoader;
 use swiitx_loader_storage::{LoadError, StorageRef, SubStorage};
 
 const HEADER_SIZE: u64 = 0x10;
@@ -34,7 +35,7 @@ impl Pfs0Entry {
 }
 
 /// Parsed Partition File System 0 archive.
-pub(crate) struct Pfs0Archive {
+pub struct Pfs0Archive {
     storage: StorageRef,
     entries: Vec<Pfs0Entry>,
     data_offset: u64,
@@ -150,15 +151,15 @@ impl Pfs0Archive {
         })
     }
 
-    pub(crate) fn entries(&self) -> &[Pfs0Entry] {
+    pub fn entries(&self) -> &[Pfs0Entry] {
         &self.entries
     }
 
-    pub(crate) fn entry(&self, name: &str) -> Option<&Pfs0Entry> {
+    pub fn entry(&self, name: &str) -> Option<&Pfs0Entry> {
         self.entries.iter().find(|entry| entry.name == name)
     }
 
-    pub(crate) fn open_entry(&self, entry: &Pfs0Entry) -> Result<StorageRef, LoadError> {
+    pub fn open_entry(&self, entry: &Pfs0Entry) -> Result<StorageRef, LoadError> {
         Ok(Arc::new(SubStorage::new(
             self.storage.clone(),
             entry.offset,
@@ -166,14 +167,28 @@ impl Pfs0Archive {
         )?))
     }
 
-    pub(crate) fn open(&self, name: &str) -> Result<Option<StorageRef>, LoadError> {
+    pub fn open(&self, name: &str) -> Result<Option<StorageRef>, LoadError> {
         self.entry(name)
             .map(|entry| self.open_entry(entry))
             .transpose()
     }
 
-    pub(crate) const fn data_offset(&self) -> u64 {
+    pub const fn data_offset(&self) -> u64 {
         self.data_offset
+    }
+}
+
+/// Loads a generic Partition File System 0 archive.
+#[derive(Debug)]
+pub struct Pfs0Loader;
+
+impl FormatLoader for Pfs0Loader {
+    type Output = Pfs0Archive;
+
+    const FORMAT_NAME: &'static str = "PFS0";
+
+    fn load(storage: StorageRef) -> Result<Self::Output, LoadError> {
+        Pfs0Archive::parse(storage, Self::FORMAT_NAME)
     }
 }
 

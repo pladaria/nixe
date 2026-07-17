@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use swiitx_loader_content::{NcaFormatVersion, NcaKeySet};
-use swiitx_loader_title::{EntryKind, NcaInspection, TitleInspection, TitleInspector};
+use swiitx_loader_title::{
+    CnmtExtendedHeader, EntryKind, NcaInspection, TitleInspection, TitleInspector,
+};
 
 const DEFAULT_KEYS_DIR: &str = "keys";
 
@@ -159,6 +161,62 @@ fn print_inspection(inspection: &TitleInspection) {
             println!("  Ticket warning: {warning}");
         }
 
+        if let Some(metadata) = &package.canonical_content_meta {
+            println!("  Canonical content metadata:");
+            println!("    Type: {}", metadata.content_meta_type);
+            println!("    Title ID: {:016X}", metadata.title_id);
+            println!("    Version: {}", metadata.version);
+            println!("    Platform: {}", metadata.platform);
+            println!("    Attributes: {:#04X}", metadata.attributes);
+            println!("    Storage ID: {:#04X}", metadata.storage_id);
+            println!("    Install type: {}", metadata.install_type);
+            println!("    Committed: {}", metadata.committed);
+            println!(
+                "    Required download system version (raw): {}",
+                metadata.required_download_system_version
+            );
+            println!(
+                "    Extended header size: {:#X}",
+                metadata.extended_header_size
+            );
+            print_extended_cnmt_header(&metadata.extended_header);
+            println!("    Declared contents: {}", metadata.contents.len());
+            for content in &metadata.contents {
+                println!(
+                    "      {:<18} {:>18}  {}",
+                    content.content_type,
+                    format_size(content.size),
+                    format_hex(&content.content_id)
+                );
+                println!("        SHA-256: {}", format_hex(&content.hash));
+                println!("        Attributes: {:#04X}", content.attributes);
+                println!("        ID offset: {}", content.id_offset);
+            }
+            println!(
+                "    Content-meta references: {}",
+                metadata.content_meta.len()
+            );
+            for reference in &metadata.content_meta {
+                println!(
+                    "      {} {:016X} version {} attributes {:#04X}",
+                    reference.content_meta_type,
+                    reference.title_id,
+                    reference.version,
+                    reference.attributes
+                );
+            }
+            if metadata.extended_data_size != 0 {
+                println!(
+                    "    Extended data size: {}",
+                    format_size(metadata.extended_data_size)
+                );
+            }
+            println!("    Digest: {}", format_hex(&metadata.digest));
+        }
+        if let Some(warning) = &package.canonical_metadata_warning {
+            println!("  Canonical metadata warning: {warning}");
+        }
+
         if let Some(metadata) = &package.content_meta {
             println!("  Auxiliary content metadata:");
             println!("    Type: {}", metadata.content_type);
@@ -212,7 +270,60 @@ fn print_inspection(inspection: &TitleInspection) {
     }
 
     println!();
-    println!("Note: auxiliary XML is informational; canonical CNMT validation is not implemented.");
+    println!(
+        "Note: binary CNMT is canonical package metadata; auxiliary XML remains informational."
+    );
+    println!("Canonical metadata does not by itself establish full package authenticity.");
+}
+
+fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {
+    match header {
+        CnmtExtendedHeader::None => {}
+        CnmtExtendedHeader::Application {
+            patch_id,
+            required_system_version,
+            required_application_version,
+        } => {
+            println!("    Patch ID: {patch_id:016X}");
+            println!("    Required system version (raw): {required_system_version}");
+            println!("    Required application version: {required_application_version}");
+        }
+        CnmtExtendedHeader::Patch {
+            application_id,
+            required_system_version,
+            ..
+        } => {
+            println!("    Original/base application ID: {application_id:016X}");
+            println!("    Required system version (raw): {required_system_version}");
+        }
+        CnmtExtendedHeader::AddOnContent {
+            application_id,
+            required_application_version,
+            content_accessibilities,
+            data_patch_id,
+            ..
+        } => {
+            println!("    Application ID: {application_id:016X}");
+            println!("    Required application version: {required_application_version}");
+            println!("    Content accessibilities: {content_accessibilities:#04X}");
+            println!("    Data patch ID: {data_patch_id:016X}");
+        }
+        CnmtExtendedHeader::LegacyAddOnContent {
+            application_id,
+            required_application_version,
+            ..
+        } => {
+            println!("    Application ID: {application_id:016X}");
+            println!("    Required application version: {required_application_version}");
+        }
+        CnmtExtendedHeader::Delta { application_id, .. } => {
+            println!("    Application ID: {application_id:016X}");
+        }
+        CnmtExtendedHeader::SystemUpdate { .. } => {}
+        CnmtExtendedHeader::Unknown(bytes) => {
+            println!("    Unknown extended-header bytes: {}", bytes.len());
+        }
+    }
 }
 
 fn print_nca(nca: &NcaInspection) {

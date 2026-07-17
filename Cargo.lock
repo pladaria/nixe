@@ -135,6 +135,7 @@ version = "0.1.0"
 name = "swiitx-loader-title"
 version = "0.1.0"
 dependencies = [
+ "sha2",
  "swiitx-loader-content",
  "swiitx-loader-storage",
 ]

@@ -2,7 +2,9 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use swiitx_loader_content::{NcaKeySet, NcaLoader, NcaSectionType, NspLoader};
+use swiitx_loader_content::{
+    CnmtLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, Pfs0Loader,
+};
 use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
 
 #[test]
@@ -31,6 +33,7 @@ fn opens_and_validates_caller_owned_nsp() {
     }
 
     let mut nca_count = 0;
+    let mut cnmt_count = 0;
 
     for entry in nsp
         .entries()
@@ -60,10 +63,29 @@ fn opens_and_validates_caller_owned_nsp() {
                 );
             }
         }
+        if nca.header().content_type() == NcaContentType::Meta {
+            let section = nca
+                .sections()
+                .iter()
+                .find(|section| section.section_type() == NcaSectionType::Pfs0)
+                .expect("meta NCA has no PFS0 section");
+            assert!(section.validate_integrity().unwrap().is_valid());
+            let pfs0 = Pfs0Loader::load(section.payload_storage().unwrap()).unwrap();
+            let cnmt_entry = pfs0
+                .entries()
+                .iter()
+                .find(|entry| entry.name().ends_with(".cnmt"))
+                .expect("meta NCA PFS0 has no binary CNMT");
+            let cnmt = CnmtLoader::load(pfs0.open_entry(cnmt_entry).unwrap()).unwrap();
+            assert_eq!(cnmt.title_id, nca.header().title_id());
+            assert!(!cnmt.contents.is_empty());
+            cnmt_count += 1;
+        }
         nca_count += 1;
     }
 
     assert!(nca_count > 0, "the NSP contains no NCA entries");
+    assert!(cnmt_count > 0, "the NSP contains no canonical CNMT");
 }
 
 fn required_path(name: &str) -> PathBuf {
