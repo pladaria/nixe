@@ -1,8 +1,14 @@
 //! Shared, random-access storage and format-loading interfaces.
 
+mod file;
+mod sub;
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+
+pub use file::FileStorage;
+pub use sub::SubStorage;
 
 /// A shared reference to a random-access data source.
 pub type StorageRef = Arc<dyn Storage>;
@@ -67,10 +73,27 @@ impl From<std::io::Error> for StorageError {
 }
 
 /// Errors shared by all format loaders.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum LoadError {
     /// The loader exists, but parsing has not been implemented yet.
     NotImplemented { format: &'static str },
+    /// Reading from the underlying data source failed.
+    Storage(StorageError),
+    /// The source does not contain a valid instance of the requested format.
+    InvalidFormat {
+        format: &'static str,
+        reason: String,
+    },
+}
+
+impl LoadError {
+    /// Creates a format-validation error.
+    pub fn invalid(format: &'static str, reason: impl Into<String>) -> Self {
+        Self::InvalidFormat {
+            format,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl Display for LoadError {
@@ -79,8 +102,25 @@ impl Display for LoadError {
             Self::NotImplemented { format } => {
                 write!(formatter, "loading {format} files is not implemented")
             }
+            Self::Storage(error) => Display::fmt(error, formatter),
+            Self::InvalidFormat { format, reason } => {
+                write!(formatter, "invalid {format}: {reason}")
+            }
         }
     }
 }
 
-impl Error for LoadError {}
+impl Error for LoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::NotImplemented { .. } | Self::InvalidFormat { .. } => None,
+        }
+    }
+}
+
+impl From<StorageError> for LoadError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}

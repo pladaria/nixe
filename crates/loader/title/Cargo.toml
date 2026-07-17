@@ -1,0 +1,8 @@
+[package]
+name = "swiitx-loader-title"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swiitx-loader-content.workspace = true
+swiitx-loader-storage.workspace = true
