@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swiitx_loader_content::{
-    NcaContentType, NcaDistributionType, NcaEncryptionType, NcaFormatVersion, NcaKeySet, NcaLoader,
-    NcaSectionType, NspLoader,
+    CnmtContentMeta, CnmtLoader, NcaContentType, NcaDistributionType, NcaEncryptionType,
+    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, Pfs0Loader,
 };
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
@@ -157,6 +157,11 @@ pub struct PackageInspection {
     pub data_offset: u64,
     /// Files stored in the package.
     pub entries: Vec<EntryInspection>,
+    /// Canonical binary content metadata read from the package's meta NCA.
+    pub canonical_content_meta: Option<CnmtContentMeta>,
+    /// Explanation when the meta NCA or its binary CNMT could not be read and
+    /// validated.
+    pub canonical_metadata_warning: Option<String>,
     /// Optional auxiliary content metadata found alongside the NCAs.
     pub content_meta: Option<ContentMetaInspection>,
     /// Explanation when auxiliary metadata existed but could not be read.
@@ -375,6 +380,8 @@ fn inspect_nsp(
             nca_warning,
         });
     }
+    let (canonical_content_meta, canonical_metadata_warning) =
+        inspect_canonical_metadata(&archive, keys.as_deref());
     let (content_meta, metadata_warning) = inspect_auxiliary_metadata(&archive);
 
     Ok(PackageInspection {
@@ -383,10 +390,101 @@ fn inspect_nsp(
         size,
         data_offset: archive.data_offset(),
         entries,
+        canonical_content_meta,
+        canonical_metadata_warning,
         content_meta,
         metadata_warning,
         ticket_warnings,
     })
+}
+
+fn inspect_canonical_metadata(
+    archive: &swiitx_loader_content::NspArchive,
+    keys: Option<&NcaKeySet>,
+) -> (Option<CnmtContentMeta>, Option<String>) {
+    let meta_entries: Vec<_> = archive
+        .entries()
+        .iter()
+        .filter(|entry| entry_kind(entry.name()) == EntryKind::MetaContentArchive)
+        .collect();
+    if meta_entries.is_empty() {
+        return (
+            None,
+            Some("package does not contain a .cnmt.nca entry".to_owned()),
+        );
+    }
+    if meta_entries.len() != 1 {
+        return (
+            None,
+            Some(format!(
+                "package contains {} .cnmt.nca entries; expected exactly one",
+                meta_entries.len()
+            )),
+        );
+    }
+
+    let result = (|| {
+        let storage = archive.open_entry(meta_entries[0])?;
+        let nca = match keys {
+            Some(keys) => NcaLoader::load_with_key_provider(storage, keys)?,
+            None => NcaLoader::load(storage)?,
+        };
+        if nca.header().content_type() != NcaContentType::Meta {
+            return Err(LoadError::invalid(
+                "CNMT",
+                "the .cnmt.nca entry is not a meta-content NCA",
+            ));
+        }
+
+        let pfs0_sections: Vec<_> = nca
+            .sections()
+            .iter()
+            .filter(|section| section.section_type() == NcaSectionType::Pfs0)
+            .collect();
+        if pfs0_sections.len() != 1 {
+            return Err(LoadError::invalid(
+                "CNMT",
+                format!(
+                    "meta NCA contains {} PFS0 sections; expected exactly one",
+                    pfs0_sections.len()
+                ),
+            ));
+        }
+        let section = pfs0_sections[0];
+        let integrity = section.validate_integrity()?;
+        if !integrity.is_valid() {
+            return Err(LoadError::invalid(
+                "CNMT",
+                format!(
+                    "meta NCA PFS0 section {} failed integrity validation: {:?}",
+                    section.index(),
+                    integrity.checks()
+                ),
+            ));
+        }
+
+        let pfs0 = Pfs0Loader::load(section.payload_storage()?)?;
+        let cnmt_entries: Vec<_> = pfs0
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().to_ascii_lowercase().ends_with(".cnmt"))
+            .collect();
+        if cnmt_entries.len() != 1 {
+            return Err(LoadError::invalid(
+                "CNMT",
+                format!(
+                    "meta NCA PFS0 contains {} .cnmt entries; expected exactly one",
+                    cnmt_entries.len()
+                ),
+            ));
+        }
+        CnmtLoader::load(pfs0.open_entry(cnmt_entries[0])?)
+    })();
+
+    match result {
+        Ok(metadata) => (Some(metadata), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
 }
 
 fn import_ticket_keys(
@@ -573,6 +671,7 @@ fn entry_kind(name: &str) -> EntryKind {
 mod tests {
     use std::sync::Arc;
 
+    use sha2::{Digest, Sha256};
     use swiitx_loader_storage::{StorageError, StorageRef};
 
     use super::*;
@@ -660,5 +759,167 @@ mod tests {
         assert_eq!(inspection.key_area_key_index, 1);
         assert!(inspection.source_is_decrypted);
         assert!(inspection.sections.is_empty());
+    }
+
+    #[test]
+    fn parses_canonical_cnmt_without_auxiliary_xml() {
+        let inner_pfs0 = build_pfs0(&[("Application_0100123456789000.cnmt", &application_cnmt())]);
+        let nsp = load_synthetic_nsp(build_meta_nca(&inner_pfs0));
+
+        let (metadata, warning) = inspect_canonical_metadata(&nsp, None);
+
+        assert!(warning.is_none());
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.title_id, 0x0100_1234_5678_9000);
+        assert_eq!(
+            metadata.content_meta_type,
+            swiitx_loader_content::CnmtMetaType::Application
+        );
+        assert_eq!(metadata.contents.len(), 1);
+    }
+
+    #[test]
+    fn warns_when_meta_pfs0_has_no_cnmt_entry() {
+        let inner_pfs0 = build_pfs0(&[("readme.txt", b"not metadata")]);
+        let nsp = load_synthetic_nsp(build_meta_nca(&inner_pfs0));
+
+        let (metadata, warning) = inspect_canonical_metadata(&nsp, None);
+
+        assert!(metadata.is_none());
+        assert!(warning.unwrap().contains("contains 0 .cnmt entries"));
+    }
+
+    #[test]
+    fn warns_when_meta_section_payload_is_not_pfs0() {
+        let nsp = load_synthetic_nsp(build_meta_nca(b"not a PFS0 file!"));
+
+        let (metadata, warning) = inspect_canonical_metadata(&nsp, None);
+
+        assert!(metadata.is_none());
+        assert!(warning.unwrap().contains("expected PFS0 magic"));
+    }
+
+    #[test]
+    fn rejects_cnmt_from_meta_section_with_invalid_integrity() {
+        let inner_pfs0 = build_pfs0(&[("Application.cnmt", &application_cnmt())]);
+        let mut nca = build_meta_nca(&inner_pfs0);
+        nca[0xE00] ^= 0x80;
+        let nsp = load_synthetic_nsp(nca);
+
+        let (metadata, warning) = inspect_canonical_metadata(&nsp, None);
+
+        assert!(metadata.is_none());
+        assert!(warning.unwrap().contains("failed integrity validation"));
+    }
+
+    fn application_cnmt() -> Vec<u8> {
+        let mut cnmt = vec![0_u8; 0x20];
+        put_u64(&mut cnmt, 0, 0x0100_1234_5678_9000);
+        put_u32(&mut cnmt, 8, 7);
+        cnmt[0x0C] = 0x80;
+        put_u16(&mut cnmt, 0x0E, 0x10);
+        put_u16(&mut cnmt, 0x10, 1);
+        cnmt[0x17] = 1;
+        let mut extended = [0_u8; 0x10];
+        put_u64(&mut extended, 0, 0x0100_1234_5678_9800);
+        cnmt.extend_from_slice(&extended);
+        let mut content = [0_u8; 0x38];
+        content[..0x20].fill(0x11);
+        content[0x20..0x30].fill(0x22);
+        content[0x30] = 0x34;
+        content[0x31] = 0x12;
+        content[0x36] = 1;
+        cnmt.extend_from_slice(&content);
+        cnmt.extend_from_slice(&[0x33; 0x20]);
+        cnmt
+    }
+
+    fn build_pfs0(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut name_offsets = Vec::new();
+        for (name, _) in files {
+            name_offsets.push(u32::try_from(strings.len()).unwrap());
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+
+        let mut pfs0 = Vec::new();
+        pfs0.extend_from_slice(b"PFS0");
+        pfs0.extend_from_slice(&u32::try_from(files.len()).unwrap().to_le_bytes());
+        pfs0.extend_from_slice(&u32::try_from(strings.len()).unwrap().to_le_bytes());
+        pfs0.extend_from_slice(&0_u32.to_le_bytes());
+        let mut relative_offset = 0_u64;
+        for ((_, data), name_offset) in files.iter().zip(name_offsets) {
+            pfs0.extend_from_slice(&relative_offset.to_le_bytes());
+            pfs0.extend_from_slice(&u64::try_from(data.len()).unwrap().to_le_bytes());
+            pfs0.extend_from_slice(&name_offset.to_le_bytes());
+            pfs0.extend_from_slice(&0_u32.to_le_bytes());
+            relative_offset += u64::try_from(data.len()).unwrap();
+        }
+        pfs0.extend_from_slice(&strings);
+        for (_, data) in files {
+            pfs0.extend_from_slice(data);
+        }
+        pfs0
+    }
+
+    fn build_meta_nca(payload: &[u8]) -> Vec<u8> {
+        const SECTION_OFFSET: usize = 0xC00;
+        const SECTION_SIZE: usize = 0x400;
+        const DATA_OFFSET: usize = 0x200;
+        const BLOCK_SIZE: usize = 0x200;
+        assert!(payload.len() <= BLOCK_SIZE);
+
+        let mut nca = vec![0_u8; SECTION_OFFSET + SECTION_SIZE];
+        nca[0x200..0x204].copy_from_slice(b"NCA3");
+        nca[0x205] = 1;
+        nca[0x206] = 1;
+        put_u64(&mut nca, 0x208, (SECTION_OFFSET + SECTION_SIZE) as u64);
+        put_u64(&mut nca, 0x210, 0x0100_1234_5678_9000);
+        put_u32(&mut nca, 0x240, (SECTION_OFFSET / 0x200) as u32);
+        put_u32(
+            &mut nca,
+            0x244,
+            ((SECTION_OFFSET + SECTION_SIZE) / 0x200) as u32,
+        );
+
+        let data_start = SECTION_OFFSET + DATA_OFFSET;
+        nca[data_start..data_start + payload.len()].copy_from_slice(payload);
+        let data_hash: [u8; 32] = Sha256::digest(payload).into();
+        nca[SECTION_OFFSET..SECTION_OFFSET + 0x20].copy_from_slice(&data_hash);
+        let master_hash: [u8; 32] =
+            Sha256::digest(&nca[SECTION_OFFSET..SECTION_OFFSET + 0x20]).into();
+
+        let fs = &mut nca[0x400..0x600];
+        fs[2] = 1;
+        fs[3] = 2;
+        fs[4] = 1;
+        fs[0x08..0x28].copy_from_slice(&master_hash);
+        put_u32(fs, 0x28, BLOCK_SIZE as u32);
+        put_u64(fs, 0x30, 0);
+        put_u64(fs, 0x38, 0x20);
+        put_u64(fs, 0x40, DATA_OFFSET as u64);
+        put_u64(fs, 0x48, payload.len() as u64);
+        let fs_hash: [u8; 32] = Sha256::digest(&nca[0x400..0x600]).into();
+        nca[0x280..0x2A0].copy_from_slice(&fs_hash);
+        nca
+    }
+
+    fn load_synthetic_nsp(meta_nca: Vec<u8>) -> swiitx_loader_content::NspArchive {
+        let nsp_bytes = build_pfs0(&[("meta.cnmt.nca", &meta_nca)]);
+        let storage: StorageRef = Arc::new(VecStorage(nsp_bytes));
+        NspLoader::load(storage).unwrap()
+    }
+
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 }
