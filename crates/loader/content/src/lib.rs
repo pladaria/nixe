@@ -1,6 +1,9 @@
 //! Loaders for Nintendo Switch content containers and file-system images.
 
+mod crypto;
 mod exefs;
+mod integrity;
+mod keys;
 mod nca;
 mod nsp;
 mod pfs0;
@@ -8,7 +11,12 @@ mod romfs;
 mod xci;
 
 pub use exefs::ExeFsLoader;
-pub use nca::NcaLoader;
+pub use integrity::{IntegrityCheck, IntegrityCheckKind, IntegrityReport, IntegrityStatus};
+pub use keys::{KeyAreaKeyIndex, KeySetError, NcaKeyProvider, NcaKeySet};
+pub use nca::{
+    NcaArchive, NcaContentType, NcaDistributionType, NcaEncryptionType, NcaFormatVersion,
+    NcaHeader, NcaLoader, NcaSection, NcaSectionType,
+};
 pub use nsp::{NspArchive, NspLoader};
 pub use pfs0::Pfs0Entry;
 pub use romfs::RomFsLoader;

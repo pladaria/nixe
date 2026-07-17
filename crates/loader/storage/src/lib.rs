@@ -84,6 +84,8 @@ pub enum LoadError {
         format: &'static str,
         reason: String,
     },
+    /// A caller-supplied cryptographic key is required to continue loading.
+    MissingKey { key: String },
 }
 
 impl LoadError {
@@ -106,6 +108,7 @@ impl Display for LoadError {
             Self::InvalidFormat { format, reason } => {
                 write!(formatter, "invalid {format}: {reason}")
             }
+            Self::MissingKey { key } => write!(formatter, "missing required key: {key}"),
         }
     }
 }
@@ -114,7 +117,9 @@ impl Error for LoadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::NotImplemented { .. } | Self::InvalidFormat { .. } => None,
+            Self::NotImplemented { .. } | Self::InvalidFormat { .. } | Self::MissingKey { .. } => {
+                None
+            }
         }
     }
 }

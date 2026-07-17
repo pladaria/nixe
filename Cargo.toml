@@ -14,6 +14,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+aes = "0.8.4"
+sha2 = "0.10.9"
 swiitx-loader-content = { path = "crates/loader/content" }
 swiitx-loader-storage = { path = "crates/loader/storage" }
 swiitx-loader-title = { path = "crates/loader/title" }

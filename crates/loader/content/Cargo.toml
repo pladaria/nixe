@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aes.workspace = true
+sha2.workspace = true
 swiitx-loader-storage.workspace = true
