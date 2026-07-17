@@ -11,7 +11,8 @@ pub use catalog::TitleCatalog;
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
-    PackageFormat, PackageInspection, TitleInspection, TitleInspector,
+    NcaInspection, NcaSectionInspection, PackageFormat, PackageInspection, TitleInspection,
+    TitleInspector,
 };
 pub use package::{ApplicationId, ContentType, PackageMetadata, TitleId};
 pub use resolved_title::ResolvedTitle;

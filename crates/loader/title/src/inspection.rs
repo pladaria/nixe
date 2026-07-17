@@ -4,7 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use swiitx_loader_content::NspLoader;
+use swiitx_loader_content::{
+    NcaContentType, NcaDistributionType, NcaEncryptionType, NcaFormatVersion, NcaKeySet, NcaLoader,
+    NcaSectionType, NspLoader,
+};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
@@ -43,14 +46,14 @@ pub enum EntryKind {
 
 impl Display for EntryKind {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MetaContentArchive => formatter.write_str("meta NCA"),
-            Self::ContentArchive => formatter.write_str("NCA"),
-            Self::Ticket => formatter.write_str("ticket"),
-            Self::Certificate => formatter.write_str("certificate"),
-            Self::XmlMetadata => formatter.write_str("XML metadata"),
-            Self::Other => formatter.write_str("other"),
-        }
+        formatter.pad(match self {
+            Self::MetaContentArchive => "meta NCA",
+            Self::ContentArchive => "NCA",
+            Self::Ticket => "ticket",
+            Self::Certificate => "certificate",
+            Self::XmlMetadata => "XML metadata",
+            Self::Other => "other",
+        })
     }
 }
 
@@ -65,6 +68,37 @@ pub struct EntryInspection {
     pub offset: u64,
     /// Entry size in bytes.
     pub size: u64,
+    /// Parsed NCA header and section layout for content-archive entries.
+    pub nca: Option<NcaInspection>,
+    /// Explanation when an NCA entry could not be inspected.
+    pub nca_warning: Option<String>,
+}
+
+/// Header and section information parsed from one NCA entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NcaInspection {
+    pub format_version: NcaFormatVersion,
+    pub distribution_type: NcaDistributionType,
+    pub content_type: NcaContentType,
+    pub size: u64,
+    pub title_id: u64,
+    pub sdk_version: u32,
+    pub key_generation: u8,
+    pub key_area_key_index: u8,
+    pub rights_id: Option<[u8; 16]>,
+    pub source_is_decrypted: bool,
+    pub sections: Vec<NcaSectionInspection>,
+}
+
+/// Physical section discovered in an NCA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NcaSectionInspection {
+    pub index: u8,
+    pub offset: u64,
+    pub size: u64,
+    pub section_type: NcaSectionType,
+    pub encryption_type: NcaEncryptionType,
+    pub fs_header_hash_valid: bool,
 }
 
 /// One content record described by auxiliary CNMT XML metadata.
@@ -127,6 +161,8 @@ pub struct PackageInspection {
     pub content_meta: Option<ContentMetaInspection>,
     /// Explanation when auxiliary metadata existed but could not be read.
     pub metadata_warning: Option<String>,
+    /// Problems encountered while importing title keys from package tickets.
+    pub ticket_warnings: Vec<String>,
 }
 
 impl PackageInspection {
@@ -161,7 +197,22 @@ pub struct TitleInspector;
 impl TitleInspector {
     /// Inspects one NSP file or every direct child file of a directory.
     pub fn inspect(path: impl AsRef<Path>) -> Result<TitleInspection, InspectError> {
-        let path = path.as_ref();
+        Self::inspect_impl(path.as_ref(), None)
+    }
+
+    /// Inspects title packages and decrypts their NCAs with caller-owned keys.
+    /// Encrypted title keys present in NSP tickets are imported into the key set.
+    pub fn inspect_with_key_set(
+        path: impl AsRef<Path>,
+        keys: &mut NcaKeySet,
+    ) -> Result<TitleInspection, InspectError> {
+        Self::inspect_impl(path.as_ref(), Some(keys))
+    }
+
+    fn inspect_impl(
+        path: &Path,
+        mut keys: Option<&mut NcaKeySet>,
+    ) -> Result<TitleInspection, InspectError> {
         let metadata = fs::metadata(path).map_err(|source| InspectError::Io {
             path: path.to_owned(),
             source,
@@ -179,7 +230,9 @@ impl TitleInspector {
         let mut ignored_files = Vec::new();
         for candidate in candidates {
             match package_format(&candidate) {
-                Some(PackageFormat::Nsp) => packages.push(inspect_nsp(&candidate)?),
+                Some(PackageFormat::Nsp) => {
+                    packages.push(inspect_nsp(&candidate, keys.as_deref_mut())?)
+                }
                 None => ignored_files.push(candidate),
             }
         }
@@ -273,7 +326,10 @@ fn package_format(path: &Path) -> Option<PackageFormat> {
         .map(|_| PackageFormat::Nsp)
 }
 
-fn inspect_nsp(path: &Path) -> Result<PackageInspection, InspectError> {
+fn inspect_nsp(
+    path: &Path,
+    mut keys: Option<&mut NcaKeySet>,
+) -> Result<PackageInspection, InspectError> {
     let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
         path: path.to_owned(),
         source: LoadError::Storage(source),
@@ -287,16 +343,38 @@ fn inspect_nsp(path: &Path) -> Result<PackageInspection, InspectError> {
         path: path.to_owned(),
         source,
     })?;
-    let entries = archive
-        .entries()
-        .iter()
-        .map(|entry| EntryInspection {
+    let ticket_warnings = keys
+        .as_deref_mut()
+        .map_or_else(Vec::new, |keys| import_ticket_keys(&archive, keys));
+    let mut entries = Vec::with_capacity(archive.entries().len());
+    for entry in archive.entries() {
+        let kind = entry_kind(entry.name());
+        let (nca, nca_warning) = if matches!(
+            kind,
+            EntryKind::MetaContentArchive | EntryKind::ContentArchive
+        ) {
+            let result = archive
+                .open_entry(entry)
+                .and_then(|storage| match keys.as_deref() {
+                    Some(keys) => NcaLoader::load_with_key_provider(storage, keys),
+                    None => NcaLoader::load(storage),
+                });
+            match result {
+                Ok(archive) => (Some(inspect_nca(&archive)), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        entries.push(EntryInspection {
             name: entry.name().to_owned(),
-            kind: entry_kind(entry.name()),
+            kind,
             offset: entry.offset(),
             size: entry.size(),
-        })
-        .collect();
+            nca,
+            nca_warning,
+        });
+    }
     let (content_meta, metadata_warning) = inspect_auxiliary_metadata(&archive);
 
     Ok(PackageInspection {
@@ -307,7 +385,69 @@ fn inspect_nsp(path: &Path) -> Result<PackageInspection, InspectError> {
         entries,
         content_meta,
         metadata_warning,
+        ticket_warnings,
     })
+}
+
+fn import_ticket_keys(
+    archive: &swiitx_loader_content::NspArchive,
+    keys: &mut NcaKeySet,
+) -> Vec<String> {
+    const ENCRYPTED_TITLE_KEY_OFFSET: u64 = 0x180;
+    const RIGHTS_ID_OFFSET: u64 = 0x2A0;
+    const REQUIRED_TICKET_SIZE: u64 = RIGHTS_ID_OFFSET + 16;
+
+    let mut warnings = Vec::new();
+    for entry in archive
+        .entries()
+        .iter()
+        .filter(|entry| entry_kind(entry.name()) == EntryKind::Ticket)
+    {
+        let result = (|| {
+            if entry.size() < REQUIRED_TICKET_SIZE {
+                return Err(LoadError::invalid("ticket", "ticket is truncated"));
+            }
+            let storage = archive.open_entry(entry)?;
+            let mut encrypted_title_key = [0_u8; 16];
+            let mut rights_id = [0_u8; 16];
+            storage.read_at(ENCRYPTED_TITLE_KEY_OFFSET, &mut encrypted_title_key)?;
+            storage.read_at(RIGHTS_ID_OFFSET, &mut rights_id)?;
+            keys.insert_encrypted_title_key(rights_id, encrypted_title_key);
+            Ok::<_, LoadError>(())
+        })();
+        if let Err(error) = result {
+            warnings.push(format!("{}: {error}", entry.name()));
+        }
+    }
+    warnings
+}
+
+fn inspect_nca(archive: &swiitx_loader_content::NcaArchive) -> NcaInspection {
+    let header = archive.header();
+    NcaInspection {
+        format_version: header.version(),
+        distribution_type: header.distribution_type(),
+        content_type: header.content_type(),
+        size: header.size(),
+        title_id: header.title_id(),
+        sdk_version: header.sdk_version(),
+        key_generation: header.key_generation(),
+        key_area_key_index: header.key_area_key_index(),
+        rights_id: header.rights_id().copied(),
+        source_is_decrypted: header.source_is_decrypted(),
+        sections: archive
+            .sections()
+            .iter()
+            .map(|section| NcaSectionInspection {
+                index: section.index(),
+                offset: section.offset(),
+                size: section.size(),
+                section_type: section.section_type(),
+                encryption_type: section.encryption_type(),
+                fs_header_hash_valid: section.fs_header_hash_valid(),
+            })
+            .collect(),
+    }
 }
 
 fn inspect_auxiliary_metadata(
@@ -431,7 +571,29 @@ fn entry_kind(name: &str) -> EntryKind {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use swiitx_loader_storage::{StorageError, StorageRef};
+
     use super::*;
+
+    #[derive(Debug)]
+    struct VecStorage(Vec<u8>);
+
+    impl Storage for VecStorage {
+        fn len(&self) -> Result<u64, StorageError> {
+            u64::try_from(self.0.len()).map_err(|_| StorageError::OutOfBounds)
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), StorageError> {
+            let start = usize::try_from(offset).map_err(|_| StorageError::OutOfBounds)?;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or(StorageError::OutOfBounds)?;
+            buffer.copy_from_slice(self.0.get(start..end).ok_or(StorageError::OutOfBounds)?);
+            Ok(())
+        }
+    }
 
     #[test]
     fn classifies_common_nsp_entries() {
@@ -471,5 +633,32 @@ mod tests {
         assert_eq!(metadata.original_id, Some(0x0100_2cd0_0a51_c000));
         assert_eq!(metadata.contents.len(), 1);
         assert_eq!(metadata.contents[0].size, 42);
+    }
+
+    #[test]
+    fn captures_parsed_nca_header_information() {
+        let mut bytes = vec![0_u8; 0xC00];
+        bytes[0x200..0x204].copy_from_slice(b"NCA3");
+        bytes[0x204] = 1;
+        bytes[0x205] = 2;
+        bytes[0x206] = 8;
+        bytes[0x207] = 1;
+        let archive_size = bytes.len() as u64;
+        bytes[0x208..0x210].copy_from_slice(&archive_size.to_le_bytes());
+        bytes[0x210..0x218].copy_from_slice(&0x0100_1234_5678_9000_u64.to_le_bytes());
+        bytes[0x21C..0x220].copy_from_slice(&0x0012_0304_u32.to_le_bytes());
+        let storage: StorageRef = Arc::new(VecStorage(bytes));
+
+        let archive = NcaLoader::load(storage).unwrap();
+        let inspection = inspect_nca(&archive);
+
+        assert_eq!(inspection.format_version, NcaFormatVersion::Nca3);
+        assert_eq!(inspection.distribution_type, NcaDistributionType::GameCard);
+        assert_eq!(inspection.content_type, NcaContentType::Control);
+        assert_eq!(inspection.title_id, 0x0100_1234_5678_9000);
+        assert_eq!(inspection.key_generation, 7);
+        assert_eq!(inspection.key_area_key_index, 1);
+        assert!(inspection.source_is_decrypted);
+        assert!(inspection.sections.is_empty());
     }
 }

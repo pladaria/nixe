@@ -1,30 +1,38 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use swiitx_loader_title::{EntryKind, TitleInspection, TitleInspector};
+use swiitx_loader_content::{NcaFormatVersion, NcaKeySet};
+use swiitx_loader_title::{EntryKind, NcaInspection, TitleInspection, TitleInspector};
+
+const DEFAULT_KEYS_DIR: &str = "keys";
+
+struct CliArguments {
+    title_path: PathBuf,
+    keys_dir: Option<PathBuf>,
+}
 
 fn main() -> ExitCode {
-    let mut arguments = env::args_os();
-    let program = arguments
+    let mut raw_arguments = env::args_os();
+    let program = raw_arguments
         .next()
         .unwrap_or_else(|| OsString::from("swiitx-cli"));
-    let Some(path) = arguments.next() else {
-        print_usage(&program);
-        return ExitCode::from(2);
+    let arguments = match parse_arguments(raw_arguments) {
+        Ok(Some(arguments)) => arguments,
+        Ok(None) => {
+            print_usage(&program);
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            print_usage(&program);
+            return ExitCode::from(2);
+        }
     };
-    if path == "-h" || path == "--help" {
-        print_usage(&program);
-        return ExitCode::SUCCESS;
-    }
-    if arguments.next().is_some() {
-        eprintln!("error: expected exactly one title path");
-        print_usage(&program);
-        return ExitCode::from(2);
-    }
 
-    match TitleInspector::inspect(path) {
+    match inspect_title(arguments) {
         Ok(inspection) => {
             print_inspection(&inspection);
             ExitCode::SUCCESS
@@ -38,9 +46,74 @@ fn main() -> ExitCode {
 
 fn print_usage(program: &OsString) {
     eprintln!(
-        "Usage: {} <title-path>\n\nInspect an NSP file or a directory containing title packages.",
+        "Usage: {} [--keys-dir <directory>] <title-path>\n\n\
+         Inspect an NSP file or a directory containing title packages.\n\
+         Pass --keys-dir to inspect encrypted NCA headers and sections with\n\
+         caller-owned prod.keys and optional title.keys files. If omitted,\n\
+         the CLI uses keys/ when keys/prod.keys exists.",
         program.to_string_lossy()
     );
+}
+
+fn parse_arguments(
+    arguments: impl Iterator<Item = OsString>,
+) -> Result<Option<CliArguments>, String> {
+    let mut title_path = None;
+    let mut keys_dir = None;
+    let mut positional_only = false;
+    let mut arguments = arguments.peekable();
+
+    while let Some(argument) = arguments.next() {
+        if !positional_only && (argument == "-h" || argument == "--help") {
+            return Ok(None);
+        }
+        if !positional_only && argument == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && argument == "--keys-dir" {
+            if keys_dir.is_some() {
+                return Err("--keys-dir may only be specified once".to_owned());
+            }
+            let directory = arguments
+                .next()
+                .ok_or_else(|| "--keys-dir requires a directory path".to_owned())?;
+            keys_dir = Some(PathBuf::from(directory));
+            continue;
+        }
+        if !positional_only && argument.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option: {}", argument.to_string_lossy()));
+        }
+        if title_path.replace(PathBuf::from(argument)).is_some() {
+            return Err("expected exactly one title path".to_owned());
+        }
+    }
+
+    let title_path = title_path.ok_or_else(|| "a title path is required".to_owned())?;
+    Ok(Some(CliArguments {
+        title_path,
+        keys_dir,
+    }))
+}
+
+fn inspect_title(arguments: CliArguments) -> Result<TitleInspection, String> {
+    let keys_dir = arguments.keys_dir.or_else(default_keys_dir);
+    let Some(keys_dir) = keys_dir else {
+        return TitleInspector::inspect(arguments.title_path).map_err(|error| error.to_string());
+    };
+
+    let prod_keys = keys_dir.join("prod.keys");
+    let title_keys_path = keys_dir.join("title.keys");
+    let title_keys = title_keys_path.is_file().then_some(title_keys_path);
+    let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
+        .map_err(|error| error.to_string())?;
+    TitleInspector::inspect_with_key_set(arguments.title_path, &mut keys)
+        .map_err(|error| error.to_string())
+}
+
+fn default_keys_dir() -> Option<PathBuf> {
+    let directory = PathBuf::from(DEFAULT_KEYS_DIR);
+    directory.join("prod.keys").is_file().then_some(directory)
 }
 
 fn print_inspection(inspection: &TitleInspection) {
@@ -63,17 +136,27 @@ fn print_inspection(inspection: &TitleInspection) {
         for entry in &package.entries {
             *counts.entry(entry.kind).or_default() += 1;
             println!(
-                "    {:<12} {:>18}  offset {:#X}  {}",
+                "    {:<12} {:>12} bytes {:<14} offset {:#X}  {}",
                 entry.kind,
-                format_size(entry.size),
+                entry.size,
+                format_binary_size(entry.size),
                 entry.offset,
                 entry.name
             );
+            if let Some(nca) = &entry.nca {
+                print_nca(nca);
+            }
+            if let Some(warning) = &entry.nca_warning {
+                println!("      NCA inspection warning: {warning}");
+            }
         }
 
         println!("  Entry summary:");
         for (kind, count) in counts {
             println!("    {kind}: {count}");
+        }
+        for warning in &package.ticket_warnings {
+            println!("  Ticket warning: {warning}");
         }
 
         if let Some(metadata) = &package.content_meta {
@@ -132,18 +215,125 @@ fn print_inspection(inspection: &TitleInspection) {
     println!("Note: auxiliary XML is informational; canonical CNMT validation is not implemented.");
 }
 
+fn print_nca(nca: &NcaInspection) {
+    let version = match nca.format_version {
+        NcaFormatVersion::Nca2 => "NCA2",
+        NcaFormatVersion::Nca3 => "NCA3",
+    };
+    println!("      NCA header:");
+    println!("        Format: {version}");
+    println!("        Distribution: {:?}", nca.distribution_type);
+    println!("        Content type: {:?}", nca.content_type);
+    println!("        Title ID: {:016X}", nca.title_id);
+    println!("        Declared size: {}", format_size(nca.size));
+    println!("        SDK version (raw): {:#010X}", nca.sdk_version);
+    println!("        Key generation: {}", nca.key_generation);
+    println!("        Key-area index: {}", nca.key_area_key_index);
+    match nca.rights_id {
+        Some(rights_id) => println!("        Rights ID: {}", format_hex(&rights_id)),
+        None => println!("        Rights ID: none"),
+    }
+    println!(
+        "        Source: {}",
+        if nca.source_is_decrypted {
+            "decrypted"
+        } else {
+            "encrypted"
+        }
+    );
+    println!("        Sections: {}", nca.sections.len());
+    for section in &nca.sections {
+        println!(
+            "          {}: {:?}, {:?}, offset {:#X}, {}, FS header hash {}",
+            section.index,
+            section.section_type,
+            section.encryption_type,
+            section.offset,
+            format_size(section.size),
+            if section.fs_header_hash_valid {
+                "valid"
+            } else {
+                "INVALID"
+            }
+        );
+    }
+}
+
+fn format_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        result.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    result
+}
+
 fn format_size(bytes: u64) -> String {
+    let binary_size = format_binary_size(bytes);
+    if binary_size.is_empty() {
+        format!("{bytes} bytes")
+    } else {
+        format!("{bytes} bytes {binary_size}")
+    }
+}
+
+fn format_binary_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
 
     if bytes >= GIB {
-        format!("{bytes} bytes ({:.2} GiB)", bytes as f64 / GIB as f64)
+        format!("({:.2} GiB)", bytes as f64 / GIB as f64)
     } else if bytes >= MIB {
-        format!("{bytes} bytes ({:.2} MiB)", bytes as f64 / MIB as f64)
+        format!("({:.2} MiB)", bytes as f64 / MIB as f64)
     } else if bytes >= KIB {
-        format!("{bytes} bytes ({:.2} KiB)", bytes as f64 / KIB as f64)
+        format!("({:.2} KiB)", bytes as f64 / KIB as f64)
     } else {
-        format!("{bytes} bytes")
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_arguments(values: &[&str]) -> impl Iterator<Item = OsString> {
+        values
+            .iter()
+            .map(|value| OsString::from(*value))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn parses_keys_directory_and_title_path() {
+        let arguments = parse_arguments(os_arguments(&[
+            "--keys-dir",
+            "keys",
+            "roms/Baba is You [NSP]",
+        ]))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(arguments.keys_dir, Some(PathBuf::from("keys")));
+        assert_eq!(
+            arguments.title_path,
+            PathBuf::from("roms/Baba is You [NSP]")
+        );
+    }
+
+    #[test]
+    fn accepts_help_without_a_title_path() {
+        assert!(
+            parse_arguments(os_arguments(&["--help"]))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_title_paths() {
+        assert!(parse_arguments(os_arguments(&["first", "second"])).is_err());
     }
 }
