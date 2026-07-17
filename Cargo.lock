@@ -34,3 +34,7 @@ dependencies = [
  "swiitx-loader-content",
  "swiitx-loader-storage",
 ]
+
+[[package]]
+name = "swiitx-runtime"
+version = "0.1.0"
