@@ -5,6 +5,7 @@ members = [
     "crates/loader/executable",
     "crates/loader/storage",
     "crates/loader/title",
+    "crates/runtime",
 ]
 resolver = "3"
 
