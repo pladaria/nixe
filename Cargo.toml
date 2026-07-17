@@ -4,6 +4,7 @@ members = [
     "crates/loader/content",
     "crates/loader/executable",
     "crates/loader/storage",
+    "crates/loader/title",
 ]
 resolver = "3"
 
@@ -12,4 +13,6 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+swiitx-loader-content = { path = "crates/loader/content" }
 swiitx-loader-storage = { path = "crates/loader/storage" }
+swiitx-loader-title = { path = "crates/loader/title" }

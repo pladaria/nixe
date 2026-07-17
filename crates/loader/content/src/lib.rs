@@ -3,12 +3,14 @@
 mod exefs;
 mod nca;
 mod nsp;
+mod pfs0;
 mod romfs;
 mod xci;
 
 pub use exefs::ExeFsLoader;
 pub use nca::NcaLoader;
-pub use nsp::NspLoader;
+pub use nsp::{NspArchive, NspLoader};
+pub use pfs0::Pfs0Entry;
 pub use romfs::RomFsLoader;
 pub use xci::XciLoader;
 

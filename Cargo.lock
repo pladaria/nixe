@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "swiitx-cli"
 version = "0.1.0"
+dependencies = [
+ "swiitx-loader-title",
+]
 
 [[package]]
 name = "swiitx-loader-content"
@@ -23,3 +26,11 @@ dependencies = [
 [[package]]
 name = "swiitx-loader-storage"
 version = "0.1.0"
+
+[[package]]
+name = "swiitx-loader-title"
+version = "0.1.0"
+dependencies = [
+ "swiitx-loader-content",
+ "swiitx-loader-storage",
+]
