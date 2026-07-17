@@ -1,0 +1,24 @@
+# Rust build artifacts
+target/
+
+# Rust tooling backups and profiling data
+**/*.rs.bk
+*.profraw
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+
+# Local stuff
+./roms
