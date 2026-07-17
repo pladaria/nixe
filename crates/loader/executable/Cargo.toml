@@ -1,0 +1,7 @@
+[package]
+name = "swiitx-loader-executable"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swiitx-loader-storage.workspace = true

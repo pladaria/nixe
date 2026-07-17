@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "apps/cli",
+    "crates/loader/content",
+    "crates/loader/executable",
+    "crates/loader/storage",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+swiitx-loader-storage = { path = "crates/loader/storage" }
