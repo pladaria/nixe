@@ -67,7 +67,7 @@ pub(crate) enum IntegrityLayout {
     None,
     HierarchicalSha256(Sha256Layout),
     Ivfc(IvfcLayout),
-    Bktr,
+    Bktr(IvfcLayout),
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +106,7 @@ pub(crate) fn validate(
 
     match layout {
         IntegrityLayout::None => {}
-        IntegrityLayout::Bktr => checks.push(IntegrityCheck {
+        IntegrityLayout::Bktr(_) => checks.push(IntegrityCheck {
             kind: IntegrityCheckKind::BktrVirtualImage,
             status: IntegrityStatus::Unchecked,
         }),

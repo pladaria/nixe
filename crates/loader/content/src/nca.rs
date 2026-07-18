@@ -3,6 +3,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
+use crate::BucketTreeHeader;
 use crate::crypto::{ctr_storage, decrypt_ecb_blocks, decrypt_xts, xts_storage};
 use crate::integrity::{
     self, IntegrityLayout, IntegrityReport, IvfcLayout, IvfcLevel, Sha256Layout,
@@ -98,6 +99,54 @@ pub enum NcaEncryptionType {
     AesXts,
     AesCtr,
     AesCtrEx,
+}
+
+/// Validated locations of the two BKTR metadata trees in a patch section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BktrPatchInfo {
+    indirect_offset: u64,
+    indirect_size: u64,
+    indirect_header: BucketTreeHeader,
+    aes_ctr_ex_offset: u64,
+    aes_ctr_ex_size: u64,
+    aes_ctr_ex_header: BucketTreeHeader,
+}
+
+impl BktrPatchInfo {
+    /// Physical update-section offset of the relocation tree.
+    pub const fn indirect_offset(&self) -> u64 {
+        self.indirect_offset
+    }
+
+    pub const fn indirect_size(&self) -> u64 {
+        self.indirect_size
+    }
+
+    pub const fn indirect_header(&self) -> BucketTreeHeader {
+        self.indirect_header
+    }
+
+    /// Physical update-section offset of the AES-CTR-Ex subsection tree.
+    pub const fn aes_ctr_ex_offset(&self) -> u64 {
+        self.aes_ctr_ex_offset
+    }
+
+    pub const fn aes_ctr_ex_size(&self) -> u64 {
+        self.aes_ctr_ex_size
+    }
+
+    pub const fn aes_ctr_ex_header(&self) -> BucketTreeHeader {
+        self.aes_ctr_ex_header
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BktrCryptoContext {
+    pub raw_storage: StorageRef,
+    pub key: Option<[u8; 16]>,
+    pub secure_value: u32,
+    pub counter_offset: u64,
+    pub source_is_decrypted: bool,
 }
 
 /// Parsed fields from the NCA main header.
@@ -206,6 +255,8 @@ pub struct NcaSection {
     fs_header_hash_valid: bool,
     storage: StorageRef,
     integrity: IntegrityLayout,
+    patch_info: Option<BktrPatchInfo>,
+    patch_crypto: Option<BktrCryptoContext>,
 }
 
 impl NcaSection {
@@ -233,6 +284,29 @@ impl NcaSection {
         self.fs_header_hash_valid
     }
 
+    /// Returns BKTR metadata for an update section.
+    pub const fn bktr_patch_info(&self) -> Option<&BktrPatchInfo> {
+        self.patch_info.as_ref()
+    }
+
+    pub(crate) const fn bktr_crypto(&self) -> Option<&BktrCryptoContext> {
+        self.patch_crypto.as_ref()
+    }
+
+    pub(crate) const fn bktr_ivfc(&self) -> Option<&IvfcLayout> {
+        match &self.integrity {
+            IntegrityLayout::Bktr(layout) => Some(layout),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn romfs_ivfc(&self) -> Option<&IvfcLayout> {
+        match &self.integrity {
+            IntegrityLayout::Ivfc(layout) => Some(layout),
+            _ => None,
+        }
+    }
+
     /// Returns a bounded plaintext view. For CTR-Ex/BKTR this is the physical
     /// initial-counter view; composing its virtual RomFS remains a separate
     /// operation requiring the base NCA.
@@ -251,7 +325,7 @@ impl NcaSection {
                 .last()
                 .map(|level| (level.offset, level.size))
                 .ok_or_else(|| LoadError::invalid("NCA", "IVFC section has no data level"))?,
-            IntegrityLayout::None | IntegrityLayout::Bktr => (0, self.size),
+            IntegrityLayout::None | IntegrityLayout::Bktr(_) => (0, self.size),
         };
         Ok(Arc::new(SubStorage::new(
             self.storage.clone(),
@@ -398,7 +472,7 @@ fn parse_nca(storage: StorageRef, keys: &dyn NcaKeyProvider) -> Result<NcaArchiv
             .try_into()
             .expect("fixed section counter range");
         let plaintext_storage = open_plaintext_section(
-            raw_storage,
+            raw_storage.clone(),
             entry.offset,
             encryption_type,
             section_counter,
@@ -406,6 +480,31 @@ fn parse_nca(storage: StorageRef, keys: &dyn NcaKeyProvider) -> Result<NcaArchiv
             content_keys.as_ref(),
         )?;
         let integrity = parse_integrity_layout(section_type, fs_header, entry.size)?;
+        let patch_info = (section_type == NcaSectionType::Bktr)
+            .then(|| parse_patch_info(fs_header, entry.size))
+            .transpose()?;
+        let patch_crypto = if section_type == NcaSectionType::Bktr {
+            let key = if source_is_decrypted {
+                None
+            } else {
+                let keys = content_keys
+                    .as_ref()
+                    .expect("encrypted BKTR section resolved content keys");
+                Some(match keys {
+                    ContentKeys::Rights(key) => *key,
+                    ContentKeys::KeyArea(slots) => slots[2],
+                })
+            };
+            Some(BktrCryptoContext {
+                raw_storage,
+                key,
+                secure_value: read_u32(fs_header, 0x144),
+                counter_offset: entry.offset,
+                source_is_decrypted,
+            })
+        } else {
+            None
+        };
 
         sections.push(NcaSection {
             index: u8::try_from(entry.index).expect("NCA has four section slots"),
@@ -416,6 +515,8 @@ fn parse_nca(storage: StorageRef, keys: &dyn NcaKeyProvider) -> Result<NcaArchiv
             fs_header_hash_valid,
             storage: plaintext_storage,
             integrity,
+            patch_info,
+            patch_crypto,
         });
     }
 
@@ -620,9 +721,77 @@ fn parse_integrity_layout(
         NcaSectionType::RomFs => {
             parse_ivfc_layout(fs_header, section_size).map(IntegrityLayout::Ivfc)
         }
-        NcaSectionType::Bktr => Ok(IntegrityLayout::Bktr),
+        NcaSectionType::Bktr => parse_ivfc_layout_unbounded(fs_header).map(IntegrityLayout::Bktr),
         NcaSectionType::Unknown { .. } => Ok(IntegrityLayout::None),
     }
+}
+
+fn parse_patch_info(
+    fs_header: &[u8; FS_HEADER_SIZE],
+    section_size: u64,
+) -> Result<BktrPatchInfo, LoadError> {
+    let indirect_offset = read_u64(fs_header, 0x100);
+    let indirect_size = read_u64(fs_header, 0x108);
+    let indirect_header = BucketTreeHeader::parse(&fs_header[0x110..0x120])?;
+    let aes_ctr_ex_offset = read_u64(fs_header, 0x120);
+    let aes_ctr_ex_size = read_u64(fs_header, 0x128);
+    let aes_ctr_ex_header = BucketTreeHeader::parse(&fs_header[0x130..0x140])?;
+
+    if indirect_size == 0 || aes_ctr_ex_size == 0 {
+        return Err(LoadError::invalid("BKTR", "patch table size is zero"));
+    }
+    validate_patch_range(
+        indirect_offset,
+        indirect_size,
+        section_size,
+        "relocation table",
+    )?;
+    validate_patch_range(
+        aes_ctr_ex_offset,
+        aes_ctr_ex_size,
+        section_size,
+        "subsection table",
+    )?;
+    let indirect_end = indirect_offset
+        .checked_add(indirect_size)
+        .ok_or_else(|| LoadError::invalid("BKTR", "relocation table range overflows"))?;
+    if indirect_end > aes_ctr_ex_offset {
+        return Err(LoadError::invalid(
+            "BKTR",
+            "relocation table overlaps the subsection table or patch data",
+        ));
+    }
+
+    Ok(BktrPatchInfo {
+        indirect_offset,
+        indirect_size,
+        indirect_header,
+        aes_ctr_ex_offset,
+        aes_ctr_ex_size,
+        aes_ctr_ex_header,
+    })
+}
+
+fn validate_patch_range(
+    offset: u64,
+    size: u64,
+    section_size: u64,
+    name: &str,
+) -> Result<(), LoadError> {
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| LoadError::invalid("BKTR", format!("{name} range overflows")))?;
+    if end > section_size {
+        return Err(LoadError::invalid(
+            "BKTR",
+            format!("{name} is outside the physical update section"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_ivfc_layout_unbounded(fs_header: &[u8; FS_HEADER_SIZE]) -> Result<IvfcLayout, LoadError> {
+    parse_ivfc_layout(fs_header, u64::MAX)
 }
 
 fn parse_sha256_layout(
