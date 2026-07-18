@@ -7,8 +7,8 @@ pub struct ResolvedTitle {
     pub application_id: ApplicationId,
     /// Base application package.
     pub base: PackageMetadata,
-    /// Highest-version patch found for the application, if any.
+    /// Highest compatible patch version found for the application, if any.
     pub patch: Option<PackageMetadata>,
-    /// Add-on packages associated with the application.
+    /// Newest compatible revision of each add-on title, in title-ID order.
     pub add_ons: Vec<PackageMetadata>,
 }
