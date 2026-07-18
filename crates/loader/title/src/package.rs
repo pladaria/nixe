@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 
-use swiitx_loader_content::{CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType};
+use swiitx_loader_content::{
+    ApplicationVersion, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
+};
 use swiitx_loader_storage::StorageRef;
 
 /// Identifies an application to which base, patch, and add-on content belongs.
@@ -95,7 +97,7 @@ pub struct PackageMetadata {
     /// Identifier of the application to which this package belongs.
     pub application_id: ApplicationId,
     /// Package version obtained from its content metadata.
-    pub version: u32,
+    pub version: ApplicationVersion,
     /// Role of this package in the resolved title.
     pub content_type: ContentType,
     /// Random-access source containing the package.
@@ -151,7 +153,7 @@ impl PackageMetadata {
         Ok(Self {
             title_id: TitleId::new(content_meta.title_id),
             application_id,
-            version: content_meta.version,
+            version: ApplicationVersion::from_raw(content_meta.version.raw()),
             content_type,
             source,
             canonical_content_meta: content_meta.clone(),
@@ -172,7 +174,7 @@ impl PackageMetadata {
     }
 
     /// Returns the minimum effective application version required by this package.
-    pub fn required_application_version(&self) -> Option<u32> {
+    pub fn required_application_version(&self) -> Option<ApplicationVersion> {
         match &self.canonical_content_meta.extended_header {
             CnmtExtendedHeader::Application {
                 required_application_version,
@@ -244,7 +246,7 @@ mod tests {
     ) -> CnmtContentMeta {
         CnmtContentMeta {
             title_id: TITLE_ID,
-            version: 42,
+            version: 42.into(),
             content_meta_type,
             platform: CnmtPlatform::Nx,
             extended_header_size: 0,
@@ -252,7 +254,7 @@ mod tests {
             storage_id: 0,
             install_type: CnmtInstallType::Full,
             committed: true,
-            required_download_system_version: 0,
+            required_download_system_version: 0.into(),
             reserved: [0; 4],
             extended_header,
             contents: Vec::new(),
@@ -269,8 +271,8 @@ mod tests {
                 CnmtMetaType::Application,
                 CnmtExtendedHeader::Application {
                     patch_id: TITLE_ID + 0x800,
-                    required_system_version: 0,
-                    required_application_version: 0,
+                    required_system_version: 0.into(),
+                    required_application_version: 0.into(),
                 },
                 ContentType::Application,
                 TITLE_ID,
@@ -279,7 +281,7 @@ mod tests {
                 CnmtMetaType::Patch,
                 CnmtExtendedHeader::Patch {
                     application_id: APPLICATION_ID,
-                    required_system_version: 0,
+                    required_system_version: 0.into(),
                     extended_data_size: 0,
                     reserved: [0; 8],
                 },
@@ -290,7 +292,7 @@ mod tests {
                 CnmtMetaType::AddOnContent,
                 CnmtExtendedHeader::AddOnContent {
                     application_id: APPLICATION_ID,
-                    required_application_version: 0,
+                    required_application_version: 0.into(),
                     content_accessibilities: 0,
                     padding: [0; 3],
                     data_patch_id: 0,
@@ -302,7 +304,7 @@ mod tests {
                 CnmtMetaType::AddOnContent,
                 CnmtExtendedHeader::LegacyAddOnContent {
                     application_id: APPLICATION_ID,
-                    required_application_version: 0,
+                    required_application_version: 0.into(),
                     padding: 0,
                 },
                 ContentType::AddOnContent,
@@ -330,7 +332,7 @@ mod tests {
                 package.application_id,
                 ApplicationId::new(expected_application_id)
             );
-            assert_eq!(package.version, 42);
+            assert_eq!(package.version.raw(), 42);
             assert_eq!(package.content_type, expected_type);
             assert_eq!(package.canonical_content_meta(), &metadata);
             assert!(Arc::ptr_eq(&package.source, &source));
@@ -345,8 +347,8 @@ mod tests {
                 CnmtMetaType::Application,
                 CnmtExtendedHeader::Application {
                     patch_id: TITLE_ID + 0x800,
-                    required_system_version: 0,
-                    required_application_version: 12,
+                    required_system_version: 0.into(),
+                    required_application_version: 12.into(),
                 },
             ),
             source.clone(),
@@ -357,7 +359,7 @@ mod tests {
                 CnmtMetaType::AddOnContent,
                 CnmtExtendedHeader::LegacyAddOnContent {
                     application_id: APPLICATION_ID,
-                    required_application_version: 7,
+                    required_application_version: 7.into(),
                     padding: 0,
                 },
             ),
@@ -366,9 +368,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(application.patch_id(), Some(TitleId::new(TITLE_ID + 0x800)));
-        assert_eq!(application.required_application_version(), Some(12));
+        assert_eq!(
+            application
+                .required_application_version()
+                .map(|version| version.raw()),
+            Some(12)
+        );
         assert_eq!(add_on.patch_id(), None);
-        assert_eq!(add_on.required_application_version(), Some(7));
+        assert_eq!(
+            add_on
+                .required_application_version()
+                .map(|version| version.raw()),
+            Some(7)
+        );
     }
 
     #[test]
@@ -391,8 +403,8 @@ mod tests {
             CnmtMetaType::Patch,
             CnmtExtendedHeader::Application {
                 patch_id: 0,
-                required_system_version: 0,
-                required_application_version: 0,
+                required_system_version: 0.into(),
+                required_application_version: 0.into(),
             },
         );
 

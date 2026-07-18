@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swiitx_loader_content::{
-    CnmtContentMeta, NcaContentType, NcaDistributionType, NcaEncryptionType, NcaFormatVersion,
-    NcaKeySet, NcaLoader, NcaSectionType, NspLoader,
+    ApplicationVersion, CnmtContentMeta, CnmtMetaType, ContentMetaVersion,
+    DecodedContentMetaVersion, NcaContentType, NcaDistributionType, NcaEncryptionType,
+    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, SystemVersion,
 };
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
@@ -129,7 +130,7 @@ pub struct ContentMetaInspection {
     /// Title identifier declared by the metadata.
     pub title_id: u64,
     /// Raw title version.
-    pub version: u32,
+    pub version: ContentMetaVersion,
     /// Base title associated with a patch, when declared.
     pub original_id: Option<u64>,
     /// Application associated with add-on content, when declared.
@@ -137,13 +138,23 @@ pub struct ContentMetaInspection {
     /// Minimum key generation among the package contents, when declared.
     pub minimum_key_generation: Option<u32>,
     /// Required system version, when declared.
-    pub required_system_version: Option<u32>,
+    pub required_system_version: Option<SystemVersion>,
     /// Required application version, when declared.
-    pub required_application_version: Option<u32>,
+    pub required_application_version: Option<ApplicationVersion>,
     /// Content records listed by the metadata.
     pub contents: Vec<ContentRecordInspection>,
     /// Overall metadata digest, when present.
     pub digest: Option<String>,
+}
+
+impl ContentMetaInspection {
+    /// Decodes the auxiliary version only when its textual type is recognized.
+    pub fn decoded_version(&self) -> DecodedContentMetaVersion {
+        match auxiliary_content_meta_type(&self.content_type) {
+            Some(content_meta_type) => self.version.decode(content_meta_type),
+            None => DecodedContentMetaVersion::Unknown(self.version),
+        }
+    }
 }
 
 /// Information obtained from one package without parsing its encrypted NCAs.
@@ -477,15 +488,17 @@ fn inspect_auxiliary_metadata(
 fn parse_content_meta_xml(xml: &str) -> Option<ContentMetaInspection> {
     let content_type = tag_value(xml, "Type")?.to_owned();
     let title_id = parse_hex_u64(tag_value(xml, "Id")?)?;
-    let version = tag_value(xml, "Version")?.parse().ok()?;
+    let version = ContentMetaVersion::from_raw(tag_value(xml, "Version")?.parse().ok()?);
     let original_id = tag_value(xml, "OriginalId").and_then(parse_hex_u64);
     let application_id = tag_value(xml, "ApplicationId").and_then(parse_hex_u64);
     let minimum_key_generation =
         tag_value(xml, "KeyGenerationMin").and_then(|value| value.parse().ok());
-    let required_system_version =
-        tag_value(xml, "RequiredSystemVersion").and_then(|value| value.parse().ok());
-    let required_application_version =
-        tag_value(xml, "RequiredApplicationVersion").and_then(|value| value.parse().ok());
+    let required_system_version = tag_value(xml, "RequiredSystemVersion")
+        .and_then(|value| value.parse().ok())
+        .map(SystemVersion::from_raw);
+    let required_application_version = tag_value(xml, "RequiredApplicationVersion")
+        .and_then(|value| value.parse().ok())
+        .map(ApplicationVersion::from_raw);
     let digest = tag_value(xml, "Digest").map(str::to_owned);
     let contents = element_values(xml, "Content")
         .filter_map(|content| {
@@ -512,6 +525,22 @@ fn parse_content_meta_xml(xml: &str) -> Option<ContentMetaInspection> {
         contents,
         digest,
     })
+}
+
+fn auxiliary_content_meta_type(content_type: &str) -> Option<CnmtMetaType> {
+    match content_type {
+        "SystemProgram" => Some(CnmtMetaType::SystemProgram),
+        "SystemData" => Some(CnmtMetaType::SystemData),
+        "SystemUpdate" => Some(CnmtMetaType::SystemUpdate),
+        "BootImagePackage" => Some(CnmtMetaType::BootImagePackage),
+        "BootImagePackageSafe" => Some(CnmtMetaType::BootImagePackageSafe),
+        "Application" => Some(CnmtMetaType::Application),
+        "Patch" => Some(CnmtMetaType::Patch),
+        "AddOnContent" => Some(CnmtMetaType::AddOnContent),
+        "Delta" => Some(CnmtMetaType::Delta),
+        "DataPatch" => Some(CnmtMetaType::DataPatch),
+        _ => None,
+    }
 }
 
 fn tag_value<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
@@ -618,10 +647,30 @@ mod tests {
 
         assert_eq!(metadata.content_type, "Patch");
         assert_eq!(metadata.title_id, 0x0100_2cd0_0a51_c800);
-        assert_eq!(metadata.version, 786_432);
+        assert_eq!(metadata.version.raw(), 786_432);
+        assert_eq!(metadata.decoded_version().to_string(), "12.0");
+        assert_eq!(metadata.required_system_version.unwrap().raw(), 123);
         assert_eq!(metadata.original_id, Some(0x0100_2cd0_0a51_c000));
         assert_eq!(metadata.contents.len(), 1);
         assert_eq!(metadata.contents[0].size, 42);
+    }
+
+    #[test]
+    fn leaves_unrecognized_auxiliary_content_meta_version_raw() {
+        let xml = r#"
+            <ContentMeta>
+              <Type>FutureContent</Type>
+              <Id>0x01002cd00a51c800</Id>
+              <Version>786432</Version>
+            </ContentMeta>
+        "#;
+
+        let metadata = parse_content_meta_xml(xml).unwrap();
+
+        assert_eq!(
+            metadata.decoded_version(),
+            DecodedContentMetaVersion::Unknown(ContentMetaVersion::from_raw(786_432))
+        );
     }
 
     #[test]

@@ -2,6 +2,10 @@ use std::fmt::{Display, Formatter};
 
 use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
 
+use crate::version::{
+    ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
+};
+
 const HEADER_SIZE: u64 = 0x20;
 const CONTENT_INFO_SIZE: u64 = 0x38;
 const CONTENT_META_INFO_SIZE: u64 = 0x10;
@@ -165,25 +169,25 @@ pub enum CnmtExtendedHeader {
     None,
     Application {
         patch_id: u64,
-        required_system_version: u32,
-        required_application_version: u32,
+        required_system_version: SystemVersion,
+        required_application_version: ApplicationVersion,
     },
     Patch {
         application_id: u64,
-        required_system_version: u32,
+        required_system_version: SystemVersion,
         extended_data_size: u32,
         reserved: [u8; 8],
     },
     AddOnContent {
         application_id: u64,
-        required_application_version: u32,
+        required_application_version: ApplicationVersion,
         content_accessibilities: u8,
         padding: [u8; 3],
         data_patch_id: u64,
     },
     LegacyAddOnContent {
         application_id: u64,
-        required_application_version: u32,
+        required_application_version: ApplicationVersion,
         padding: u32,
     },
     Delta {
@@ -231,17 +235,24 @@ pub struct CnmtContentInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CnmtContentMetaInfo {
     pub title_id: u64,
-    pub version: u32,
+    pub version: ContentMetaVersion,
     pub content_meta_type: CnmtMetaType,
     pub attributes: u8,
     pub padding: [u8; 2],
+}
+
+impl CnmtContentMetaInfo {
+    /// Decodes this referenced version using this record's own meta type.
+    pub const fn decoded_version(&self) -> DecodedContentMetaVersion {
+        self.version.decode(self.content_meta_type)
+    }
 }
 
 /// Canonical packaged content metadata stored inside a meta NCA.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CnmtContentMeta {
     pub title_id: u64,
-    pub version: u32,
+    pub version: ContentMetaVersion,
     pub content_meta_type: CnmtMetaType,
     pub platform: CnmtPlatform,
     pub extended_header_size: u16,
@@ -249,7 +260,7 @@ pub struct CnmtContentMeta {
     pub storage_id: u8,
     pub install_type: CnmtInstallType,
     pub committed: bool,
-    pub required_download_system_version: u32,
+    pub required_download_system_version: SystemVersion,
     pub reserved: [u8; 4],
     pub extended_header: CnmtExtendedHeader,
     pub contents: Vec<CnmtContentInfo>,
@@ -258,6 +269,13 @@ pub struct CnmtContentMeta {
     /// not copy this potentially large region into memory.
     pub extended_data_size: u64,
     pub digest: [u8; 32],
+}
+
+impl CnmtContentMeta {
+    /// Decodes this package version using this CNMT's own meta type.
+    pub const fn decoded_version(&self) -> DecodedContentMetaVersion {
+        self.version.decode(self.content_meta_type)
+    }
 }
 
 /// Loads canonical binary packaged content metadata (`*.cnmt`).
@@ -380,7 +398,7 @@ fn parse_cnmt(storage: StorageRef) -> Result<CnmtContentMeta, LoadError> {
         storage.read_at(offset, &mut bytes)?;
         content_meta.push(CnmtContentMetaInfo {
             title_id: read_u64(&bytes, 0),
-            version: read_u32(&bytes, 8),
+            version: ContentMetaVersion::from_raw(read_u32(&bytes, 8)),
             content_meta_type: CnmtMetaType::from(bytes[0x0C]),
             attributes: bytes[0x0D],
             padding: bytes[0x0E..0x10]
@@ -404,7 +422,7 @@ fn parse_cnmt(storage: StorageRef) -> Result<CnmtContentMeta, LoadError> {
 
     Ok(CnmtContentMeta {
         title_id: read_u64(&header, 0),
-        version: read_u32(&header, 8),
+        version: ContentMetaVersion::from_raw(read_u32(&header, 8)),
         content_meta_type,
         platform: CnmtPlatform::from(header[0x0D]),
         extended_header_size,
@@ -412,7 +430,7 @@ fn parse_cnmt(storage: StorageRef) -> Result<CnmtContentMeta, LoadError> {
         storage_id: header[0x15],
         install_type: CnmtInstallType::from(header[0x16]),
         committed,
-        required_download_system_version: read_u32(&header, 0x18),
+        required_download_system_version: SystemVersion::from_raw(read_u32(&header, 0x18)),
         reserved: header[0x1C..0x20]
             .try_into()
             .expect("fixed CNMT reserved range"),
@@ -445,8 +463,8 @@ fn parse_extended_header(
             }
             Ok(CnmtExtendedHeader::Application {
                 patch_id: read_u64(bytes, 0),
-                required_system_version: read_u32(bytes, 8),
-                required_application_version: read_u32(bytes, 0x0C),
+                required_system_version: SystemVersion::from_raw(read_u32(bytes, 8)),
+                required_application_version: ApplicationVersion::from_raw(read_u32(bytes, 0x0C)),
             })
         }
         CnmtMetaType::Patch => {
@@ -455,7 +473,7 @@ fn parse_extended_header(
             }
             Ok(CnmtExtendedHeader::Patch {
                 application_id: read_u64(bytes, 0),
-                required_system_version: read_u32(bytes, 8),
+                required_system_version: SystemVersion::from_raw(read_u32(bytes, 8)),
                 extended_data_size: read_u32(bytes, 0x0C),
                 reserved: bytes[0x10..0x18]
                     .try_into()
@@ -469,7 +487,7 @@ fn parse_extended_header(
             if bytes.len() == 0x18 {
                 Ok(CnmtExtendedHeader::AddOnContent {
                     application_id: read_u64(bytes, 0),
-                    required_application_version: read_u32(bytes, 8),
+                    required_application_version: ApplicationVersion::from_raw(read_u32(bytes, 8)),
                     content_accessibilities: bytes[0x0C],
                     padding: bytes[0x0D..0x10]
                         .try_into()
@@ -479,7 +497,7 @@ fn parse_extended_header(
             } else {
                 Ok(CnmtExtendedHeader::LegacyAddOnContent {
                     application_id: read_u64(bytes, 0),
-                    required_application_version: read_u32(bytes, 8),
+                    required_application_version: ApplicationVersion::from_raw(read_u32(bytes, 8)),
                     padding: read_u32(bytes, 0x0C),
                 })
             }
@@ -665,17 +683,58 @@ mod tests {
             metadata.extended_header,
             CnmtExtendedHeader::Patch {
                 application_id: 0x0100_1234_5678_9000,
-                required_system_version: 300,
+                required_system_version,
                 extended_data_size: 3,
                 ..
-            }
+            } if required_system_version.raw() == 300
         ));
+    }
+
+    #[test]
+    fn parses_typed_versions_and_decodes_each_record_from_its_own_type() {
+        let mut extended = [0_u8; 0x10];
+        put_u32(&mut extended, 8, 0x2803_0014);
+        put_u32(&mut extended, 0x0C, 0x000C_0000);
+        let mut bytes = build_cnmt(0x80, &extended, 0, 1);
+        put_u32(&mut bytes, 8, 0x000C_0000);
+        put_u32(&mut bytes, 0x18, 0x2803_0014);
+        let reference_offset = HEADER_SIZE as usize + 0x10;
+        put_u32(&mut bytes, reference_offset + 8, 0x2803_0014);
+        bytes[reference_offset + 0x0C] = 0x02;
+
+        let metadata = load(bytes).unwrap();
+
+        assert_eq!(
+            metadata.decoded_version(),
+            DecodedContentMetaVersion::Application(ApplicationVersion::from_raw(0x000C_0000))
+        );
+        assert_eq!(
+            metadata.required_download_system_version,
+            SystemVersion::from_raw(0x2803_0014)
+        );
+        assert!(matches!(
+            metadata.extended_header,
+            CnmtExtendedHeader::Application {
+                required_system_version,
+                required_application_version,
+                ..
+            } if required_system_version == SystemVersion::from_raw(0x2803_0014)
+                && required_application_version == ApplicationVersion::from_raw(0x000C_0000)
+        ));
+        assert_eq!(
+            metadata.content_meta[0].decoded_version(),
+            DecodedContentMetaVersion::System(SystemVersion::from_raw(0x2803_0014))
+        );
     }
 
     #[test]
     fn preserves_unknown_meta_type_and_extended_header() {
         let metadata = load(build_cnmt(0xF2, &[1, 2, 3], 0, 0)).unwrap();
         assert_eq!(metadata.content_meta_type, CnmtMetaType::Unrecognized(0xF2));
+        assert_eq!(
+            metadata.decoded_version(),
+            DecodedContentMetaVersion::Unknown(ContentMetaVersion::from_raw(42))
+        );
         assert_eq!(
             metadata.extended_header,
             CnmtExtendedHeader::Unknown(vec![1, 2, 3])
