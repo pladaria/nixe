@@ -239,7 +239,7 @@ mod tests {
     fn application_content_meta(title_id: u64, version: u32) -> CnmtContentMeta {
         CnmtContentMeta {
             title_id,
-            version,
+            version: version.into(),
             content_meta_type: CnmtMetaType::Application,
             platform: CnmtPlatform::Nx,
             extended_header_size: 0x10,
@@ -247,12 +247,12 @@ mod tests {
             storage_id: 0,
             install_type: CnmtInstallType::Full,
             committed: true,
-            required_download_system_version: 0,
+            required_download_system_version: 0.into(),
             reserved: [0; 4],
             extended_header: CnmtExtendedHeader::Application {
                 patch_id: title_id + 0x800,
-                required_system_version: 0,
-                required_application_version: 0,
+                required_system_version: 0.into(),
+                required_application_version: 0.into(),
             },
             contents: Vec::new(),
             content_meta: Vec::new(),
@@ -328,7 +328,7 @@ mod tests {
                     CnmtMetaType::Patch,
                     CnmtExtendedHeader::Patch {
                         application_id: FIRST_APPLICATION_ID,
-                        required_system_version: 0,
+                        required_system_version: 0.into(),
                         extended_data_size: 0,
                         reserved: [0; 8],
                     },
@@ -348,7 +348,7 @@ mod tests {
                     CnmtMetaType::AddOnContent,
                     CnmtExtendedHeader::AddOnContent {
                         application_id: FIRST_APPLICATION_ID,
-                        required_application_version: 0,
+                        required_application_version: 0.into(),
                         content_accessibilities: 0,
                         padding: [0; 3],
                         data_patch_id: 0,
@@ -429,7 +429,7 @@ mod tests {
             titles[0].application_id,
             ApplicationId::new(FIRST_APPLICATION_ID)
         );
-        assert_eq!(titles[0].patch.as_ref().unwrap().version, 5);
+        assert_eq!(titles[0].patch.as_ref().unwrap().version.raw(), 5);
         assert_eq!(titles[0].add_ons.len(), 1);
     }
 

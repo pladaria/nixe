@@ -19,6 +19,7 @@ pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataEr
 pub use resolved_title::ResolvedTitle;
 pub use resolver::TitleResolver;
 pub use swiitx_loader_content::{
-    CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType, CnmtExtendedHeader,
-    CnmtInstallType, CnmtMetaType, CnmtPlatform,
+    ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType,
+    CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform, ContentMetaVersion,
+    DecodedContentMetaVersion, SystemVersion,
 };

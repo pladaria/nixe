@@ -165,15 +165,20 @@ fn print_inspection(inspection: &TitleInspection) {
             println!("  Canonical content metadata:");
             println!("    Type: {}", metadata.content_meta_type);
             println!("    Title ID: {:016X}", metadata.title_id);
-            println!("    Version: {}", metadata.version);
+            println!(
+                "    Version: {} (raw {})",
+                metadata.decoded_version(),
+                metadata.version.raw()
+            );
             println!("    Platform: {}", metadata.platform);
             println!("    Attributes: {:#04X}", metadata.attributes);
             println!("    Storage ID: {:#04X}", metadata.storage_id);
             println!("    Install type: {}", metadata.install_type);
             println!("    Committed: {}", metadata.committed);
             println!(
-                "    Required download system version (raw): {}",
-                metadata.required_download_system_version
+                "    Required download system version: {} (raw {})",
+                metadata.required_download_system_version,
+                metadata.required_download_system_version.raw()
             );
             println!(
                 "    Extended header size: {:#X}",
@@ -198,10 +203,11 @@ fn print_inspection(inspection: &TitleInspection) {
             );
             for reference in &metadata.content_meta {
                 println!(
-                    "      {} {:016X} version {} attributes {:#04X}",
+                    "      {} {:016X} version {} (raw {}) attributes {:#04X}",
                     reference.content_meta_type,
                     reference.title_id,
-                    reference.version,
+                    reference.decoded_version(),
+                    reference.version.raw(),
                     reference.attributes
                 );
             }
@@ -221,7 +227,11 @@ fn print_inspection(inspection: &TitleInspection) {
             println!("  Auxiliary content metadata:");
             println!("    Type: {}", metadata.content_type);
             println!("    Title ID: {:016X}", metadata.title_id);
-            println!("    Version: {}", metadata.version);
+            println!(
+                "    Version: {} (raw {})",
+                metadata.decoded_version(),
+                metadata.version.raw()
+            );
             if let Some(original_id) = metadata.original_id {
                 println!("    Original/base ID: {original_id:016X}");
             }
@@ -232,10 +242,16 @@ fn print_inspection(inspection: &TitleInspection) {
                 println!("    Minimum key generation: {key_generation}");
             }
             if let Some(version) = metadata.required_system_version {
-                println!("    Required system version (raw): {version}");
+                println!(
+                    "    Required system version: {version} (raw {})",
+                    version.raw()
+                );
             }
             if let Some(version) = metadata.required_application_version {
-                println!("    Required application version: {version}");
+                println!(
+                    "    Required application version: {version} (raw {})",
+                    version.raw()
+                );
             }
             if let Some(digest) = &metadata.digest {
                 println!("    Digest: {digest}");
@@ -285,8 +301,14 @@ fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {
             required_application_version,
         } => {
             println!("    Patch ID: {patch_id:016X}");
-            println!("    Required system version (raw): {required_system_version}");
-            println!("    Required application version: {required_application_version}");
+            println!(
+                "    Required system version: {required_system_version} (raw {})",
+                required_system_version.raw()
+            );
+            println!(
+                "    Required application version: {required_application_version} (raw {})",
+                required_application_version.raw()
+            );
         }
         CnmtExtendedHeader::Patch {
             application_id,
@@ -294,7 +316,10 @@ fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {
             ..
         } => {
             println!("    Original/base application ID: {application_id:016X}");
-            println!("    Required system version (raw): {required_system_version}");
+            println!(
+                "    Required system version: {required_system_version} (raw {})",
+                required_system_version.raw()
+            );
         }
         CnmtExtendedHeader::AddOnContent {
             application_id,
@@ -304,7 +329,10 @@ fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {
             ..
         } => {
             println!("    Application ID: {application_id:016X}");
-            println!("    Required application version: {required_application_version}");
+            println!(
+                "    Required application version: {required_application_version} (raw {})",
+                required_application_version.raw()
+            );
             println!("    Content accessibilities: {content_accessibilities:#04X}");
             println!("    Data patch ID: {data_patch_id:016X}");
         }
@@ -314,7 +342,10 @@ fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {
             ..
         } => {
             println!("    Application ID: {application_id:016X}");
-            println!("    Required application version: {required_application_version}");
+            println!(
+                "    Required application version: {required_application_version} (raw {})",
+                required_application_version.raw()
+            );
         }
         CnmtExtendedHeader::Delta { application_id, .. } => {
             println!("    Application ID: {application_id:016X}");

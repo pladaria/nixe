@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use swiitx_loader_storage::LoadError;
 
-use crate::{ApplicationId, ContentType, PackageMetadataError, TitleId};
+use crate::{ApplicationId, ApplicationVersion, ContentType, PackageMetadataError, TitleId};
 
 /// Errors produced while discovering or resolving titles.
 #[derive(Debug)]
@@ -37,7 +37,7 @@ pub enum TitleError {
         application_id: ApplicationId,
         content_type: ContentType,
         title_id: TitleId,
-        version: u32,
+        version: ApplicationVersion,
         count: usize,
     },
     /// A patch relationship does not match the patch declared by its base.
@@ -49,15 +49,15 @@ pub enum TitleError {
     /// The base requires a patch version that is not available.
     MissingCompatiblePatch {
         application_id: ApplicationId,
-        required_application_version: u32,
-        newest_available_version: Option<u32>,
+        required_application_version: ApplicationVersion,
+        newest_available_version: Option<ApplicationVersion>,
     },
     /// No revision of one add-on supports the resolved application version.
     IncompatibleAddOnContent {
         application_id: ApplicationId,
         title_id: TitleId,
-        required_application_version: u32,
-        actual_application_version: u32,
+        required_application_version: ApplicationVersion,
+        actual_application_version: ApplicationVersion,
     },
 }
 

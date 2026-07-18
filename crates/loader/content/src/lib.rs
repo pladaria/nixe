@@ -9,6 +9,7 @@ mod nca;
 mod nsp;
 mod pfs0;
 mod romfs;
+mod version;
 mod xci;
 
 pub use cnmt::{
@@ -25,6 +26,9 @@ pub use nca::{
 pub use nsp::{NspArchive, NspLoader};
 pub use pfs0::{Pfs0Archive, Pfs0Entry, Pfs0Loader};
 pub use romfs::RomFsLoader;
+pub use version::{
+    ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
+};
 pub use xci::XciLoader;
 
 /// Placeholder representation of content exposed by a parsed container.

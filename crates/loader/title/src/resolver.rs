@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ApplicationId, ContentType, PackageMetadata, ResolvedTitle, TitleCatalog, TitleError, TitleId,
+    ApplicationId, ApplicationVersion, ContentType, PackageMetadata, ResolvedTitle, TitleCatalog,
+    TitleError, TitleId,
 };
 
 /// Resolves catalogued packages into a complete launchable title description.
@@ -59,7 +60,7 @@ impl TitleResolver {
             });
         }
 
-        let required_patch_version = base.required_application_version().unwrap_or(0);
+        let required_patch_version = base.required_application_version().unwrap_or_default();
         let patch = patches
             .iter()
             .copied()
@@ -95,7 +96,7 @@ impl TitleResolver {
                 .iter()
                 .copied()
                 .filter(|package| {
-                    package.required_application_version().unwrap_or(0)
+                    package.required_application_version().unwrap_or_default()
                         <= effective_application_version
                 })
                 .max_by_key(|package| package.version);
@@ -104,7 +105,7 @@ impl TitleResolver {
                     .iter()
                     .filter_map(|package| package.required_application_version())
                     .min()
-                    .unwrap_or(0);
+                    .unwrap_or_default();
                 return Err(TitleError::IncompatibleAddOnContent {
                     application_id,
                     title_id,
@@ -124,7 +125,7 @@ impl TitleResolver {
     }
 }
 
-type LogicalCoordinate = (ContentType, TitleId, u32);
+type LogicalCoordinate = (ContentType, TitleId, ApplicationVersion);
 
 fn deduplicate<'a>(
     packages: impl Iterator<Item = &'a PackageMetadata>,
@@ -223,7 +224,7 @@ mod tests {
     ) -> PackageMetadata {
         let metadata = CnmtContentMeta {
             title_id,
-            version,
+            version: version.into(),
             content_meta_type,
             platform: CnmtPlatform::Nx,
             extended_header_size: 0,
@@ -231,7 +232,7 @@ mod tests {
             storage_id: 0,
             install_type: CnmtInstallType::Full,
             committed: true,
-            required_download_system_version: 0,
+            required_download_system_version: 0.into(),
             reserved: [0; 4],
             extended_header,
             contents: Vec::new(),
@@ -258,8 +259,8 @@ mod tests {
             CnmtMetaType::Application,
             CnmtExtendedHeader::Application {
                 patch_id: application_id.get() + 0x800,
-                required_system_version: 0,
-                required_application_version: required_patch_version,
+                required_system_version: 0.into(),
+                required_application_version: required_patch_version.into(),
             },
             fingerprint,
         )
@@ -276,7 +277,7 @@ mod tests {
             CnmtMetaType::Patch,
             CnmtExtendedHeader::Patch {
                 application_id: APPLICATION_ID.get(),
-                required_system_version: 0,
+                required_system_version: 0.into(),
                 extended_data_size: 0,
                 reserved: [0; 8],
             },
@@ -296,7 +297,7 @@ mod tests {
             CnmtMetaType::AddOnContent,
             CnmtExtendedHeader::AddOnContent {
                 application_id: APPLICATION_ID.get(),
-                required_application_version,
+                required_application_version: required_application_version.into(),
                 content_accessibilities: 0,
                 padding: [0; 3],
                 data_patch_id: 0,
@@ -333,10 +334,10 @@ mod tests {
         let title = TitleResolver::resolve(&catalog, APPLICATION_ID).unwrap();
 
         assert_eq!(title.base.content_type, ContentType::Application);
-        assert_eq!(title.patch.unwrap().version, 3);
+        assert_eq!(title.patch.unwrap().version.raw(), 3);
         assert_eq!(title.add_ons.len(), 2);
         assert_eq!(title.add_ons[0].title_id, TitleId::new(FIRST_ADD_ON_ID));
-        assert_eq!(title.add_ons[0].version, 2);
+        assert_eq!(title.add_ons[0].version.raw(), 2);
         assert_eq!(title.add_ons[1].title_id, TitleId::new(SECOND_ADD_ON_ID));
     }
 
@@ -362,8 +363,8 @@ mod tests {
             CnmtMetaType::Application,
             CnmtExtendedHeader::Application {
                 patch_id: PATCH_ID,
-                required_system_version: 0,
-                required_application_version: 0,
+                required_system_version: 0.into(),
+                required_application_version: 0.into(),
             },
             7,
             first_source.clone(),
@@ -374,8 +375,8 @@ mod tests {
             CnmtMetaType::Application,
             CnmtExtendedHeader::Application {
                 patch_id: PATCH_ID,
-                required_system_version: 0,
-                required_application_version: 0,
+                required_system_version: 0.into(),
+                required_application_version: 0.into(),
             },
             7,
             second_source,
@@ -399,7 +400,7 @@ mod tests {
 
         let title = TitleResolver::resolve(&catalog, APPLICATION_ID).unwrap();
 
-        assert_eq!(title.patch.unwrap().version, 2);
+        assert_eq!(title.patch.unwrap().version.raw(), 2);
         assert_eq!(title.add_ons.len(), 1);
     }
 
@@ -413,9 +414,9 @@ mod tests {
                 application_id: APPLICATION_ID,
                 content_type: ContentType::Application,
                 title_id,
-                version: 0,
+                version,
                 count: 2,
-            }) if title_id == TitleId::new(APPLICATION_ID.get())
+            }) if title_id == TitleId::new(APPLICATION_ID.get()) && version.raw() == 0
         ));
     }
 
@@ -440,9 +441,9 @@ mod tests {
             TitleResolver::resolve(&patch_catalog, APPLICATION_ID),
             Err(TitleError::ConflictingPackages {
                 content_type: ContentType::Patch,
-                version: 2,
+                version,
                 ..
-            })
+            }) if version.raw() == 2
         ));
 
         let add_on_catalog = TitleCatalog::from_packages(vec![
@@ -454,9 +455,9 @@ mod tests {
             TitleResolver::resolve(&add_on_catalog, APPLICATION_ID),
             Err(TitleError::ConflictingPackages {
                 content_type: ContentType::AddOnContent,
-                version: 1,
+                version,
                 ..
-            })
+            }) if version.raw() == 1
         ));
     }
 
@@ -468,9 +469,10 @@ mod tests {
             TitleResolver::resolve(&catalog, APPLICATION_ID),
             Err(TitleError::MissingCompatiblePatch {
                 application_id: APPLICATION_ID,
-                required_application_version: 4,
-                newest_available_version: Some(3),
-            })
+                required_application_version,
+                newest_available_version: Some(newest_available_version),
+            }) if required_application_version.raw() == 4
+                && newest_available_version.raw() == 3
         ));
     }
 
@@ -507,9 +509,11 @@ mod tests {
             Err(TitleError::IncompatibleAddOnContent {
                 application_id: APPLICATION_ID,
                 title_id,
-                required_application_version: 3,
-                actual_application_version: 2,
+                required_application_version,
+                actual_application_version,
             }) if title_id == TitleId::new(FIRST_ADD_ON_ID)
+                && required_application_version.raw() == 3
+                && actual_application_version.raw() == 2
         ));
     }
 
