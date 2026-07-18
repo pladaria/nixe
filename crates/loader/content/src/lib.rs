@@ -3,6 +3,7 @@
 mod cnmt;
 mod crypto;
 mod exefs;
+mod hfs0;
 mod integrity;
 mod keys;
 mod nacp;
@@ -18,6 +19,7 @@ pub use cnmt::{
     CnmtInstallType, CnmtLoader, CnmtMetaType, CnmtPlatform,
 };
 pub use exefs::ExeFsLoader;
+pub use hfs0::{Hfs0Archive, Hfs0Entry, Hfs0HashResult, Hfs0Loader};
 pub use integrity::{IntegrityCheck, IntegrityCheckKind, IntegrityReport, IntegrityStatus};
 pub use keys::{KeyAreaKeyIndex, KeySetError, NcaKeyProvider, NcaKeySet};
 pub use nacp::{
@@ -37,7 +39,9 @@ pub use romfs::{RomFsArchive, RomFsFile, RomFsLoader};
 pub use version::{
     ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
 };
-pub use xci::XciLoader;
+pub use xci::{
+    XciArchive, XciHeader, XciLoader, XciPartition, XciPartitionKind, XciRootHeaderIntegrity,
+};
 
 /// Placeholder representation of content exposed by a parsed container.
 ///

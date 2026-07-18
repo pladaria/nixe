@@ -21,7 +21,7 @@ target/
 Thumbs.db
 
 # Local stuff
-/roms
-/notes
-/keys
-/cache
+/roms/
+/notes/
+/keys/
+/cache/

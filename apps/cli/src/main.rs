@@ -288,7 +288,46 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
         println!("Package {}: {}", index + 1, package.path.display());
         println!("  Format: {}", package.format);
         println!("  Size: {}", format_size(package.size));
-        println!("  PFS0 data offset: {:#X}", package.data_offset);
+        println!("  Content data offset: {:#X}", package.data_offset);
+        if let Some(xci) = &package.xci {
+            println!("  XCI header:");
+            println!("    Package ID: {:016X}", xci.header.package_id);
+            println!(
+                "    Root HFS0: offset {:#X}, header size {:#X}, hash {}",
+                xci.header.root_hfs0_offset,
+                xci.header.root_hfs0_header_size,
+                if xci.root_header_hash_valid {
+                    "valid"
+                } else {
+                    "invalid"
+                }
+            );
+            println!(
+                "    Card size code: {:#04X}; header version: {:#04X}; flags: {:#04X}",
+                xci.header.card_size_code, xci.header.header_version, xci.header.flags
+            );
+            println!("  HFS0 partitions: {}", xci.partitions.len());
+            for partition in &xci.partitions {
+                println!(
+                    "    {} ({:?}): offset {:#X}, size {}, hashed {}, hash {}",
+                    partition.name,
+                    partition.kind,
+                    partition.offset,
+                    format_size(partition.size),
+                    format_size(partition.hashed_region_size),
+                    if partition.hash_valid {
+                        "valid"
+                    } else {
+                        "invalid"
+                    }
+                );
+                println!(
+                    "      data offset {:#X}; entries {}",
+                    partition.data_offset,
+                    partition.entries.len()
+                );
+            }
+        }
         println!(
             "  Container overhead: {}",
             format_size(package.container_overhead())
@@ -306,6 +345,13 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
                 entry.offset,
                 entry.name
             );
+            if let (Some(hashed_size), Some(valid)) = (entry.hashed_region_size, entry.hash_valid) {
+                println!(
+                    "      HFS0 hashed prefix: {} ({})",
+                    format_size(hashed_size),
+                    if valid { "valid" } else { "invalid" }
+                );
+            }
             if let Some(nca) = &entry.nca {
                 print_nca(nca);
             }
@@ -322,8 +368,12 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
             println!("  Ticket warning: {warning}");
         }
 
-        if let Some(metadata) = &package.canonical_content_meta {
-            println!("  Canonical content metadata:");
+        for (metadata_index, metadata) in package.canonical_content_metas.iter().enumerate() {
+            println!(
+                "  Canonical content metadata {} of {}:",
+                metadata_index + 1,
+                package.canonical_content_metas.len()
+            );
             println!("    Type: {}", metadata.content_meta_type);
             println!("    Title ID: {:016X}", metadata.title_id);
             println!(
@@ -384,8 +434,12 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
             println!("  Canonical metadata warning: {warning}");
         }
 
-        if let Some(control) = &package.control_metadata {
-            println!("  Control metadata:");
+        for (control_index, control) in package.control_metadatas.iter().enumerate() {
+            println!(
+                "  Control metadata {} of {}:",
+                control_index + 1,
+                package.control_metadatas.len()
+            );
             if let Some((language, title)) = control.nacp.preferred_title(preferred_languages) {
                 println!("    Preferred title ({language}): {}", title.name);
                 println!("    Preferred publisher: {}", title.publisher);
