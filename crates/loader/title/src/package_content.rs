@@ -1,32 +1,143 @@
+//! Container-independent access to canonical package metadata and Control content.
+
 use swiitx_loader_content::{
-    CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtLoader, NacpLanguage, NacpLoader,
-    NcaContentType, NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive, Pfs0Loader,
-    RomFsLoader,
+    CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtLoader, Hfs0Archive, NacpLanguage,
+    NacpLoader, NcaContentType, NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive,
+    Pfs0Loader, RomFsLoader,
 };
-use swiitx_loader_storage::{FormatLoader, LoadError};
+use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::{ControlIcon, ControlMetadata};
 
-pub(crate) fn load_canonical_content_meta(
-    archive: &NspArchive,
+pub(crate) trait PackageContent {
+    fn entry_count(&self) -> usize;
+    fn entry_name(&self, index: usize) -> &str;
+    fn entry_size(&self, index: usize) -> u64;
+    fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError>;
+}
+
+impl PackageContent for NspArchive {
+    fn entry_count(&self) -> usize {
+        self.entries().len()
+    }
+
+    fn entry_name(&self, index: usize) -> &str {
+        self.entries()[index].name()
+    }
+
+    fn entry_size(&self, index: usize) -> u64 {
+        self.entries()[index].size()
+    }
+
+    fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {
+        self.open_entry(&self.entries()[index])
+    }
+}
+
+impl PackageContent for Hfs0Archive {
+    fn entry_count(&self) -> usize {
+        self.entries().len()
+    }
+
+    fn entry_name(&self, index: usize) -> &str {
+        self.entries()[index].name()
+    }
+
+    fn entry_size(&self, index: usize) -> u64 {
+        self.entries()[index].size()
+    }
+
+    fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {
+        let entry = &self.entries()[index];
+        let integrity = self.validate_entry(entry)?;
+        if !integrity.is_valid() {
+            return Err(LoadError::invalid(
+                "HFS0 package content",
+                format!(
+                    "entry {:?} failed its advertised hash validation",
+                    entry.name()
+                ),
+            ));
+        }
+        self.open_entry(entry)
+    }
+}
+
+pub(crate) fn load_canonical_content_meta<C: PackageContent + ?Sized>(
+    archive: &C,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<CnmtContentMeta, LoadError> {
-    let meta_entries: Vec<_> = archive
-        .entries()
-        .iter()
-        .filter(|entry| entry.name().to_ascii_lowercase().ends_with(".cnmt.nca"))
-        .collect();
-    if meta_entries.len() != 1 {
+    let metadata = load_canonical_content_metas(archive, keys)?;
+    if metadata.len() != 1 {
         return Err(LoadError::invalid(
             "CNMT",
             format!(
                 "package contains {} .cnmt.nca entries; expected exactly one",
-                meta_entries.len()
+                metadata.len()
             ),
         ));
     }
+    Ok(metadata
+        .into_iter()
+        .next()
+        .expect("validated metadata count"))
+}
 
-    let storage = archive.open_entry(meta_entries[0])?;
+pub(crate) fn load_canonical_content_metas<C: PackageContent + ?Sized>(
+    archive: &C,
+    keys: Option<&dyn NcaKeyProvider>,
+) -> Result<Vec<CnmtContentMeta>, LoadError> {
+    let meta_entries: Vec<_> = (0..archive.entry_count())
+        .filter(|index| {
+            archive
+                .entry_name(*index)
+                .to_ascii_lowercase()
+                .ends_with(".cnmt.nca")
+        })
+        .collect();
+    if meta_entries.is_empty() {
+        return Err(LoadError::invalid(
+            "CNMT",
+            "package contains no .cnmt.nca entries",
+        ));
+    }
+    let mut metadata = Vec::with_capacity(meta_entries.len());
+    for index in meta_entries {
+        let content_meta = load_content_meta_entry(archive, index, keys).map_err(|error| {
+            LoadError::invalid(
+                "CNMT",
+                format!("entry {:?}: {error}", archive.entry_name(index)),
+            )
+        })?;
+        if metadata.iter().any(|existing| existing == &content_meta) {
+            continue;
+        }
+        if metadata.iter().any(|existing: &CnmtContentMeta| {
+            existing.title_id == content_meta.title_id
+                && existing.version == content_meta.version
+                && existing.content_meta_type == content_meta.content_meta_type
+        }) {
+            return Err(LoadError::invalid(
+                "CNMT",
+                format!(
+                    "conflicting metadata records claim title {:016X}, type {}, version {}",
+                    content_meta.title_id,
+                    content_meta.content_meta_type,
+                    content_meta.version.raw()
+                ),
+            ));
+        }
+        metadata.push(content_meta);
+    }
+    Ok(metadata)
+}
+
+fn load_content_meta_entry<C: PackageContent + ?Sized>(
+    archive: &C,
+    entry_index: usize,
+    keys: Option<&dyn NcaKeyProvider>,
+) -> Result<CnmtContentMeta, LoadError> {
+    let storage = archive.open_entry_at(entry_index)?;
     let nca = match keys {
         Some(keys) => NcaLoader::load_with_key_provider(storage, keys)?,
         None => NcaLoader::load(storage)?,
@@ -85,8 +196,8 @@ pub(crate) fn load_canonical_content_meta(
     CnmtLoader::load(pfs0.open_entry(cnmt_entries[0])?)
 }
 
-pub(crate) fn load_control_metadata(
-    archive: &NspArchive,
+pub(crate) fn load_control_metadata<C: PackageContent + ?Sized>(
+    archive: &C,
     content_meta: &CnmtContentMeta,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Option<ControlMetadata>, LoadError> {
@@ -110,13 +221,15 @@ pub(crate) fn load_control_metadata(
     };
 
     let expected_name = format!("{}.nca", hex(&content.content_id));
-    let entries: Vec<_> = archive
-        .entries()
-        .iter()
-        .filter(|entry| entry.name().eq_ignore_ascii_case(&expected_name))
+    let entries: Vec<_> = (0..archive.entry_count())
+        .filter(|index| {
+            archive
+                .entry_name(*index)
+                .eq_ignore_ascii_case(&expected_name)
+        })
         .collect();
-    let entry = match entries.as_slice() {
-        [entry] => *entry,
+    let entry_index = match entries.as_slice() {
+        [index] => *index,
         [] => {
             return Err(LoadError::invalid(
                 "Control NCA",
@@ -130,18 +243,18 @@ pub(crate) fn load_control_metadata(
             ));
         }
     };
-    if entry.size() != content.size {
+    if archive.entry_size(entry_index) != content.size {
         return Err(LoadError::invalid(
             "Control NCA",
             format!(
                 "CNMT declares {} bytes for {expected_name}, but the entry has {}",
                 content.size,
-                entry.size()
+                archive.entry_size(entry_index)
             ),
         ));
     }
 
-    let storage = archive.open_entry(entry)?;
+    let storage = archive.open_entry_at(entry_index)?;
     let nca = match keys {
         Some(keys) => NcaLoader::load_with_key_provider(storage, keys)?,
         None => NcaLoader::load(storage)?,
@@ -223,22 +336,26 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-pub(crate) fn import_ticket_keys(archive: &NspArchive, keys: &mut NcaKeySet) -> Vec<String> {
+pub(crate) fn import_ticket_keys<C: PackageContent + ?Sized>(
+    archive: &C,
+    keys: &mut NcaKeySet,
+) -> Vec<String> {
     const ENCRYPTED_TITLE_KEY_OFFSET: u64 = 0x180;
     const RIGHTS_ID_OFFSET: u64 = 0x2A0;
     const REQUIRED_TICKET_SIZE: u64 = RIGHTS_ID_OFFSET + 16;
 
     let mut warnings = Vec::new();
-    for entry in archive
-        .entries()
-        .iter()
-        .filter(|entry| entry.name().to_ascii_lowercase().ends_with(".tik"))
-    {
+    for index in (0..archive.entry_count()).filter(|index| {
+        archive
+            .entry_name(*index)
+            .to_ascii_lowercase()
+            .ends_with(".tik")
+    }) {
         let result = (|| {
-            if entry.size() < REQUIRED_TICKET_SIZE {
+            if archive.entry_size(index) < REQUIRED_TICKET_SIZE {
                 return Err(LoadError::invalid("ticket", "ticket is truncated"));
             }
-            let storage = archive.open_entry(entry)?;
+            let storage = archive.open_entry_at(index)?;
             let mut encrypted_title_key = [0_u8; 16];
             let mut rights_id = [0_u8; 16];
             storage.read_at(ENCRYPTED_TITLE_KEY_OFFSET, &mut encrypted_title_key)?;
@@ -247,7 +364,7 @@ pub(crate) fn import_ticket_keys(archive: &NspArchive, keys: &mut NcaKeySet) -> 
             Ok::<_, LoadError>(())
         })();
         if let Err(error) = result {
-            warnings.push(format!("{}: {error}", entry.name()));
+            warnings.push(format!("{}: {error}", archive.entry_name(index)));
         }
     }
     warnings

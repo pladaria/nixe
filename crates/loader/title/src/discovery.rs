@@ -32,6 +32,8 @@ impl Default for DirectoryScanOptions {
 pub enum PackageFormat {
     /// Nintendo Submission Package backed by PFS0.
     Nsp,
+    /// NX Card Image backed by nested HFS0 partitions.
+    Xci,
 }
 
 pub(crate) struct DirectoryDiscoveryError {
@@ -85,8 +87,12 @@ pub(crate) fn directory_files(
 }
 
 pub(crate) fn package_format(path: &Path) -> Option<PackageFormat> {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| extension.eq_ignore_ascii_case("nsp"))
-        .map(|_| PackageFormat::Nsp)
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("nsp") {
+        Some(PackageFormat::Nsp)
+    } else if extension.eq_ignore_ascii_case("xci") {
+        Some(PackageFormat::Xci)
+    } else {
+        None
+    }
 }

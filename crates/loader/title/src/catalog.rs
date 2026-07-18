@@ -3,12 +3,17 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use swiitx_loader_content::{CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader};
+use swiitx_loader_content::{CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader, XciLoader};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
 
 use crate::discovery::{directory_files, package_format};
-use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
-use crate::{ApplicationId, DirectoryScanOptions, PackageFormat, PackageMetadata, TitleError};
+use crate::package_content::{
+    PackageContent, import_ticket_keys, load_canonical_content_metas, load_control_metadata,
+};
+use crate::{
+    ApplicationId, DirectoryScanOptions, PackageFormat, PackageMetadata, PackageMetadataError,
+    TitleError,
+};
 
 /// Collection of package metadata discovered in one or more locations.
 #[derive(Debug, Default)]
@@ -93,44 +98,52 @@ impl TitleCatalog {
 
         let mut catalog = Self::new();
         for candidate in candidates {
-            let PackageFormat::Nsp = package_format(&candidate)
+            let format = package_format(&candidate)
                 .expect("catalog candidates must have a supported package format");
             let storage = FileStorage::open(&candidate).map_err(|source| TitleError::Package {
                 path: candidate.clone(),
                 source: LoadError::Storage(source),
             })?;
             let storage: StorageRef = Arc::new(storage);
-            let archive =
-                NspLoader::load(storage.clone()).map_err(|source| TitleError::Package {
-                    path: candidate.clone(),
-                    source,
-                })?;
-
-            if let Some(keys) = keys.as_deref_mut() {
-                let _warnings = import_ticket_keys(&archive, keys);
+            match format {
+                PackageFormat::Nsp => {
+                    let archive =
+                        NspLoader::load(storage.clone()).map_err(|source| TitleError::Package {
+                            path: candidate.clone(),
+                            source,
+                        })?;
+                    add_package_contents(
+                        &mut catalog,
+                        &candidate,
+                        storage,
+                        &archive,
+                        keys.as_deref_mut(),
+                        false,
+                    )?;
+                }
+                PackageFormat::Xci => {
+                    let archive =
+                        XciLoader::load(storage.clone()).map_err(|source| TitleError::Package {
+                            path: candidate.clone(),
+                            source,
+                        })?;
+                    let secure =
+                        archive
+                            .secure_partition()
+                            .map_err(|source| TitleError::Package {
+                                path: candidate.clone(),
+                                source,
+                            })?;
+                    add_package_contents(
+                        &mut catalog,
+                        &candidate,
+                        storage,
+                        secure.archive(),
+                        keys.as_deref_mut(),
+                        true,
+                    )?;
+                }
             }
-            let key_provider = keys.as_deref().map(|keys| keys as &dyn NcaKeyProvider);
-            let content_meta =
-                load_canonical_content_meta(&archive, key_provider).map_err(|source| {
-                    TitleError::Package {
-                        path: candidate.clone(),
-                        source,
-                    }
-                })?;
-            let control_metadata = load_control_metadata(&archive, &content_meta, key_provider)
-                .map_err(|source| TitleError::Package {
-                    path: candidate.clone(),
-                    source,
-                })?;
-            let mut package =
-                PackageMetadata::from_content_meta(&content_meta, storage).map_err(|source| {
-                    TitleError::PackageMetadata {
-                        path: candidate.clone(),
-                        source,
-                    }
-                })?;
-            package.set_control_metadata(control_metadata);
-            catalog.add(package);
         }
 
         Ok(catalog)
@@ -174,6 +187,51 @@ impl TitleCatalog {
                 .then_some(package.application_id)
         })
     }
+}
+
+fn add_package_contents<C: PackageContent + ?Sized>(
+    catalog: &mut TitleCatalog,
+    path: &Path,
+    source_storage: StorageRef,
+    contents: &C,
+    mut keys: Option<&mut NcaKeySet>,
+    ignore_unsupported_metadata: bool,
+) -> Result<(), TitleError> {
+    if let Some(keys) = keys.as_deref_mut() {
+        let _warnings = import_ticket_keys(contents, keys);
+    }
+    let key_provider = keys.as_deref().map(|keys| keys as &dyn NcaKeyProvider);
+    let content_metas = load_canonical_content_metas(contents, key_provider).map_err(|source| {
+        TitleError::Package {
+            path: path.to_owned(),
+            source,
+        }
+    })?;
+    for content_meta in content_metas {
+        let package = PackageMetadata::from_content_meta(&content_meta, source_storage.clone());
+        let mut package = match package {
+            Ok(package) => package,
+            Err(PackageMetadataError::UnsupportedContentMetaType { .. })
+                if ignore_unsupported_metadata =>
+            {
+                continue;
+            }
+            Err(source) => {
+                return Err(TitleError::PackageMetadata {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        let control_metadata = load_control_metadata(contents, &content_meta, key_provider)
+            .map_err(|source| TitleError::Package {
+                path: path.to_owned(),
+                source,
+            })?;
+        package.set_control_metadata(control_metadata);
+        catalog.add(package);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -402,7 +460,7 @@ mod tests {
         directory.write("c-dlc.NSP", &add_on);
         directory.write("b-update.nsp", &patch);
         directory.write("a-base.nsp", &base);
-        directory.write("ignored.xci", b"not implemented");
+        directory.write("ignored.bin", b"unsupported format");
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
         fs::write(
@@ -526,6 +584,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn scans_mixed_nsp_and_xci_in_order_and_reads_multiple_xci_titles() {
+        let directory = TemporaryDirectory::new();
+        directory.write(
+            "a-digital.nsp",
+            &synthetic_nsp(
+                SECOND_APPLICATION_ID,
+                0,
+                SyntheticMetaType::Application,
+                false,
+            ),
+        );
+        let image = synthetic_xci(&[
+            (FIRST_APPLICATION_ID, 0, SyntheticMetaType::Application),
+            (
+                FIRST_APPLICATION_ID + 0x800,
+                3,
+                SyntheticMetaType::Patch {
+                    application_id: FIRST_APPLICATION_ID,
+                },
+            ),
+        ]);
+        directory.write("b-game.XcI", &image);
+
+        let catalog = TitleCatalog::scan_directory(directory.path()).unwrap();
+        let titles = TitleResolver::resolve_all(&catalog).unwrap();
+
+        assert_eq!(catalog.packages().len(), 3);
+        assert_eq!(
+            catalog.packages()[0].application_id,
+            ApplicationId::new(SECOND_APPLICATION_ID)
+        );
+        assert_eq!(
+            catalog.packages()[1].application_id,
+            ApplicationId::new(FIRST_APPLICATION_ID)
+        );
+        assert_eq!(titles.len(), 2);
+        assert_eq!(titles[1].patch.as_ref().unwrap().version.raw(), 3);
+        assert!(
+            catalog
+                .packages()
+                .iter()
+                .skip(1)
+                .all(|package| package.source.len().unwrap() == image.len() as u64)
+        );
+    }
+
     enum SyntheticMetaType {
         Application,
         Patch { application_id: u64 },
@@ -550,6 +655,80 @@ mod tests {
         } else {
             build_pfs0(&[("meta.cnmt.nca", meta_nca.as_slice())])
         }
+    }
+
+    fn synthetic_xci(records: &[(u64, u32, SyntheticMetaType)]) -> Vec<u8> {
+        let meta_ncas = records
+            .iter()
+            .enumerate()
+            .map(|(index, (title_id, version, meta_type))| {
+                let meta_type = match meta_type {
+                    SyntheticMetaType::Application => SyntheticMetaType::Application,
+                    SyntheticMetaType::Patch { application_id } => SyntheticMetaType::Patch {
+                        application_id: *application_id,
+                    },
+                    SyntheticMetaType::AddOnContent { application_id } => {
+                        SyntheticMetaType::AddOnContent {
+                            application_id: *application_id,
+                        }
+                    }
+                };
+                let cnmt = synthetic_cnmt(*title_id, *version, meta_type);
+                let pfs0 = build_pfs0(&[("ContentMeta.cnmt", cnmt.as_slice())]);
+                (
+                    format!("meta-{index}.cnmt.nca"),
+                    build_meta_nca(*title_id, &pfs0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let secure_files = meta_ncas
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let secure = build_hfs0(&secure_files);
+        let root = build_hfs0(&[("secure", secure.as_slice())]);
+        let root_header_size = 0x10 + 0x40 + "secure".len() + 1;
+        let root_offset = 0x200_usize;
+        let image_size = root_offset + root.len();
+        let page_count = image_size.div_ceil(0x200);
+        let mut image = vec![0_u8; page_count * 0x200];
+        image[0x100..0x104].copy_from_slice(b"HEAD");
+        image[0x118..0x11c].copy_from_slice(&((page_count - 1) as u32).to_le_bytes());
+        image[0x130..0x138].copy_from_slice(&(root_offset as u64).to_le_bytes());
+        image[0x138..0x140].copy_from_slice(&(root_header_size as u64).to_le_bytes());
+        image[0x140..0x160].copy_from_slice(&Sha256::digest(&root[..root_header_size]));
+        image[root_offset..root_offset + root.len()].copy_from_slice(&root);
+        image
+    }
+
+    fn build_hfs0(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut name_offsets = Vec::new();
+        for (name, _) in files {
+            name_offsets.push(strings.len() as u32);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let mut hfs0 = Vec::new();
+        hfs0.extend_from_slice(b"HFS0");
+        hfs0.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        hfs0.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        hfs0.extend_from_slice(&0_u32.to_le_bytes());
+        let mut offset = 0_u64;
+        for ((_, data), name_offset) in files.iter().zip(name_offsets) {
+            hfs0.extend_from_slice(&offset.to_le_bytes());
+            hfs0.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            hfs0.extend_from_slice(&name_offset.to_le_bytes());
+            hfs0.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            hfs0.extend_from_slice(&[0; 8]);
+            hfs0.extend_from_slice(&Sha256::digest(data));
+            offset += data.len() as u64;
+        }
+        hfs0.extend_from_slice(&strings);
+        for (_, data) in files {
+            hfs0.extend_from_slice(data);
+        }
+        hfs0
     }
 
     fn synthetic_cnmt(title_id: u64, version: u32, meta_type: SyntheticMetaType) -> Vec<u8> {

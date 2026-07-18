@@ -7,20 +7,25 @@ use std::sync::Arc;
 use swiitx_loader_content::{
     ApplicationVersion, CnmtContentMeta, CnmtMetaType, ContentMetaVersion,
     DecodedContentMetaVersion, NcaContentType, NcaDistributionType, NcaEncryptionType,
-    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, SystemVersion,
+    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, SystemVersion, XciHeader,
+    XciLoader, XciPartitionKind,
 };
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
 
 use crate::discovery::{directory_files, package_format};
-use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
+use crate::package_content::{
+    import_ticket_keys, load_canonical_content_meta, load_canonical_content_metas,
+    load_control_metadata,
+};
 use crate::{ControlMetadata, DirectoryScanOptions, PackageFormat};
 
 impl Display for PackageFormat {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Nsp => formatter.write_str("NSP (PFS0)"),
+            Self::Xci => formatter.write_str("XCI (HFS0)"),
         }
     }
 }
@@ -66,10 +71,36 @@ pub struct EntryInspection {
     pub offset: u64,
     /// Entry size in bytes.
     pub size: u64,
+    /// Advertised HFS0 hashed prefix, when the entry comes from XCI.
+    pub hashed_region_size: Option<u64>,
+    /// Result of validating the advertised HFS0 prefix, when applicable.
+    pub hash_valid: Option<bool>,
     /// Parsed NCA header and section layout for content-archive entries.
     pub nca: Option<NcaInspection>,
     /// Explanation when an NCA entry could not be inspected.
     pub nca_warning: Option<String>,
+}
+
+/// One nested partition reported while inspecting an XCI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XciPartitionInspection {
+    pub name: String,
+    pub kind: XciPartitionKind,
+    pub offset: u64,
+    pub size: u64,
+    pub hashed_region_size: u64,
+    pub hash_valid: bool,
+    pub data_offset: u64,
+    pub entries: Vec<EntryInspection>,
+}
+
+/// Header and partition information specific to an XCI container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XciInspection {
+    pub header: XciHeader,
+    pub root_header_hash_valid: bool,
+    pub root_data_offset: u64,
+    pub partitions: Vec<XciPartitionInspection>,
 }
 
 /// Header and section information parsed from one NCA entry.
@@ -163,15 +194,21 @@ pub struct PackageInspection {
     pub size: u64,
     /// Offset at which the PFS0 file-data area starts.
     pub data_offset: u64,
+    /// XCI-specific header and nested partition information.
+    pub xci: Option<XciInspection>,
     /// Files stored in the package.
     pub entries: Vec<EntryInspection>,
     /// Canonical binary content metadata read from the package's meta NCA.
     pub canonical_content_meta: Option<CnmtContentMeta>,
+    /// Every canonical CNMT found in deterministic container order.
+    pub canonical_content_metas: Vec<CnmtContentMeta>,
     /// Explanation when the meta NCA or its binary CNMT could not be read and
     /// validated.
     pub canonical_metadata_warning: Option<String>,
     /// Localized titles, icons, and application properties from the Control NCA.
     pub control_metadata: Option<ControlMetadata>,
+    /// Control metadata corresponding to every readable canonical CNMT.
+    pub control_metadatas: Vec<ControlMetadata>,
     /// Explanation when canonical CNMT declares Control data that could not be read.
     pub control_metadata_warning: Option<String>,
     /// Optional auxiliary content metadata found alongside the NCAs.
@@ -185,6 +222,11 @@ pub struct PackageInspection {
 impl PackageInspection {
     /// Returns the sum of the sizes declared by all entries.
     pub fn payload_size(&self) -> u64 {
+        if let Some(xci) = &self.xci {
+            return xci.partitions.iter().fold(0_u64, |total, partition| {
+                total.saturating_add(partition.size)
+            });
+        }
         self.entries
             .iter()
             .fold(0_u64, |total, entry| total.saturating_add(entry.size))
@@ -270,6 +312,9 @@ impl TitleInspector {
             match package_format(&candidate) {
                 Some(PackageFormat::Nsp) => {
                     packages.push(inspect_nsp(&candidate, keys.as_deref_mut())?)
+                }
+                Some(PackageFormat::Xci) => {
+                    packages.push(inspect_xci(&candidate, keys.as_deref_mut())?)
                 }
                 None => ignored_files.push(candidate),
             }
@@ -379,6 +424,8 @@ fn inspect_nsp(
             kind,
             offset: entry.offset(),
             size: entry.size(),
+            hashed_region_size: None,
+            hash_valid: None,
             nca,
             nca_warning,
         });
@@ -399,19 +446,158 @@ fn inspect_nsp(
                 }
             });
     let (content_meta, metadata_warning) = inspect_auxiliary_metadata(&archive);
+    let control_metadatas = control_metadata.clone().into_iter().collect();
 
     Ok(PackageInspection {
         path: path.to_owned(),
         format: PackageFormat::Nsp,
         size,
         data_offset: archive.data_offset(),
+        xci: None,
         entries,
+        canonical_content_metas: canonical_content_meta.clone().into_iter().collect(),
         canonical_content_meta,
         canonical_metadata_warning,
         control_metadata,
+        control_metadatas,
         control_metadata_warning,
         content_meta,
         metadata_warning,
+        ticket_warnings,
+    })
+}
+
+fn inspect_xci(
+    path: &Path,
+    mut keys: Option<&mut NcaKeySet>,
+) -> Result<PackageInspection, InspectError> {
+    let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let size = storage.len().map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let storage: StorageRef = Arc::new(storage);
+    let archive = XciLoader::load(storage).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source,
+    })?;
+
+    let mut partition_inspections = Vec::with_capacity(archive.partitions().len());
+    for partition in archive.partitions() {
+        let mut entries = Vec::with_capacity(partition.archive().entries().len());
+        for entry in partition.archive().entries() {
+            let integrity = partition
+                .archive()
+                .validate_entry(entry)
+                .map_err(|source| InspectError::Package {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let kind = entry_kind(entry.name());
+            let (nca, nca_warning) = if matches!(
+                kind,
+                EntryKind::MetaContentArchive | EntryKind::ContentArchive
+            ) {
+                let result = partition.archive().open_entry(entry).and_then(|storage| {
+                    match keys.as_deref() {
+                        Some(keys) => NcaLoader::load_with_key_provider(storage, keys),
+                        None => NcaLoader::load(storage),
+                    }
+                });
+                match result {
+                    Ok(archive) => (Some(inspect_nca(&archive)), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else {
+                (None, None)
+            };
+            entries.push(EntryInspection {
+                name: entry.name().to_owned(),
+                kind,
+                offset: entry.offset(),
+                size: entry.size(),
+                hashed_region_size: Some(entry.hashed_region_size()),
+                hash_valid: Some(integrity.is_valid()),
+                nca,
+                nca_warning,
+            });
+        }
+        partition_inspections.push(XciPartitionInspection {
+            name: partition.name().to_owned(),
+            kind: partition.kind().clone(),
+            offset: partition.root_entry().offset(),
+            size: partition.root_entry().size(),
+            hashed_region_size: partition.root_entry().hashed_region_size(),
+            hash_valid: partition.root_entry_integrity().is_valid(),
+            data_offset: partition.archive().data_offset(),
+            entries,
+        });
+    }
+
+    let secure = archive
+        .partition(&XciPartitionKind::Secure)
+        .map(|partition| partition.archive());
+    let ticket_warnings = match (secure, keys.as_deref_mut()) {
+        (Some(secure), Some(keys)) => import_ticket_keys(secure, keys),
+        _ => Vec::new(),
+    };
+    let key_provider = keys.as_deref().map(|keys| keys as _);
+    let (canonical_content_metas, canonical_metadata_warning) = match secure {
+        Some(secure) => match load_canonical_content_metas(secure, key_provider) {
+            Ok(metadata) => (metadata, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        },
+        None => (
+            Vec::new(),
+            Some("XCI has no secure partition; no title metadata was loaded".to_owned()),
+        ),
+    };
+    let canonical_content_meta = canonical_content_metas.first().cloned();
+    let mut control_metadatas = Vec::new();
+    let mut control_warnings = Vec::new();
+    if let Some(secure) = secure {
+        for content_meta in &canonical_content_metas {
+            match load_control_metadata(secure, content_meta, key_provider) {
+                Ok(Some(metadata)) => control_metadatas.push(metadata),
+                Ok(None) => {}
+                Err(error) => {
+                    control_warnings.push(format!("{:016X}: {error}", content_meta.title_id));
+                }
+            }
+        }
+    }
+    let control_metadata = control_metadatas.first().cloned();
+    let control_metadata_warning =
+        (!control_warnings.is_empty()).then(|| control_warnings.join("; "));
+    let entries = partition_inspections
+        .iter()
+        .find(|partition| partition.kind == XciPartitionKind::Secure)
+        .map_or_else(Vec::new, |partition| partition.entries.clone());
+    let xci = XciInspection {
+        header: archive.header().clone(),
+        root_header_hash_valid: archive.root_header_integrity().is_valid(),
+        root_data_offset: archive.root().data_offset(),
+        partitions: partition_inspections,
+    };
+
+    Ok(PackageInspection {
+        path: path.to_owned(),
+        format: PackageFormat::Xci,
+        size,
+        data_offset: secure.map_or(archive.root().data_offset(), |secure| secure.data_offset()),
+        xci: Some(xci),
+        entries,
+        canonical_content_meta,
+        canonical_content_metas,
+        canonical_metadata_warning,
+        control_metadata,
+        control_metadatas,
+        control_metadata_warning,
+        content_meta: None,
+        metadata_warning: None,
         ticket_warnings,
     })
 }

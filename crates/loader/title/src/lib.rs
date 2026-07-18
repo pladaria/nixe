@@ -5,8 +5,8 @@ mod control;
 mod discovery;
 mod error;
 mod inspection;
-mod nsp_metadata;
 mod package;
+mod package_content;
 mod resolved_title;
 mod resolver;
 
@@ -17,6 +17,7 @@ pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
     NcaInspection, NcaSectionInspection, PackageInspection, TitleInspection, TitleInspector,
+    XciInspection, XciPartitionInspection,
 };
 pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
 pub use resolved_title::ResolvedTitle;
