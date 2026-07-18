@@ -101,7 +101,7 @@ impl SwiitxConfig {
 /// Title-library locations and discovery behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryConfig {
-    /// Package files or directories containing packages.
+    /// Directories containing title packages.
     pub paths: Vec<PathBuf>,
     /// Whether directory scans descend into subdirectories.
     pub recursive_scan: bool,

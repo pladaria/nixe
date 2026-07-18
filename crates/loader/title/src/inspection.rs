@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn reads_control_nca_metadata_by_canonical_content_id() {
         let content_id = [0x22_u8; 16];
-        let control_nca = build_control_nca();
+        let control_nca = build_control_nca(0x0100_1234_5678_9000);
         let cnmt = application_cnmt_with_control(content_id, control_nca.len() as u64);
         let inner_pfs0 = build_pfs0(&[("Application.cnmt", &cnmt)]);
         let meta_nca = build_meta_nca(&inner_pfs0);
@@ -783,6 +783,37 @@ mod tests {
         assert_eq!(
             control.icons()[0].language,
             swiitx_loader_content::NacpLanguage::AmericanEnglish
+        );
+    }
+
+    #[test]
+    fn accepts_patch_control_nca_with_application_title_id() {
+        let application_id = 0x0100_1234_5678_9000;
+        let content_id = [0x44_u8; 16];
+        let control_nca = build_control_nca(application_id);
+        let cnmt = patch_cnmt_with_control(
+            application_id,
+            content_id,
+            u64::try_from(control_nca.len()).unwrap(),
+        );
+        let inner_pfs0 = build_pfs0(&[("Patch.cnmt", &cnmt)]);
+        let meta_nca = build_meta_nca(&inner_pfs0);
+        let control_name = format!("{}.nca", "44".repeat(16));
+        let nsp_bytes = build_pfs0(&[("meta.cnmt.nca", &meta_nca), (&control_name, &control_nca)]);
+        let storage: StorageRef = Arc::new(VecStorage(nsp_bytes));
+        let nsp = NspLoader::load(storage).unwrap();
+        let content_meta = load_canonical_content_meta(&nsp, None).unwrap();
+
+        let control = load_control_metadata(&nsp, &content_meta, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            control
+                .nacp
+                .title(swiitx_loader_content::NacpLanguage::AmericanEnglish)
+                .name,
+            "Synthetic title"
         );
     }
 
@@ -816,6 +847,31 @@ mod tests {
         cnmt
     }
 
+    fn patch_cnmt_with_control(
+        application_id: u64,
+        content_id: [u8; 16],
+        content_size: u64,
+    ) -> Vec<u8> {
+        let mut cnmt = vec![0_u8; 0x20];
+        put_u64(&mut cnmt, 0, application_id + 0x800);
+        put_u32(&mut cnmt, 8, 1);
+        cnmt[0x0C] = 0x81;
+        put_u16(&mut cnmt, 0x0E, 0x18);
+        put_u16(&mut cnmt, 0x10, 1);
+        cnmt[0x17] = 1;
+        let mut extended = [0_u8; 0x18];
+        put_u64(&mut extended, 0, application_id);
+        cnmt.extend_from_slice(&extended);
+        let mut content = [0_u8; 0x38];
+        content[..0x20].fill(0x55);
+        content[0x20..0x30].copy_from_slice(&content_id);
+        content[0x30..0x36].copy_from_slice(&content_size.to_le_bytes()[..6]);
+        content[0x36] = 3;
+        cnmt.extend_from_slice(&content);
+        cnmt.extend_from_slice(&[0x66; 0x20]);
+        cnmt
+    }
+
     fn build_pfs0(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut strings = Vec::new();
         let mut name_offsets = Vec::new();
@@ -845,7 +901,7 @@ mod tests {
         pfs0
     }
 
-    fn build_control_nca() -> Vec<u8> {
+    fn build_control_nca(title_id: u64) -> Vec<u8> {
         const SECTION_OFFSET: usize = 0xC00;
         const BLOCK_SIZE: usize = 0x10000;
         let mut nacp = vec![0_u8; swiitx_loader_content::NACP_SIZE];
@@ -865,7 +921,7 @@ mod tests {
         nca[0x206] = 1;
         let nca_size = nca.len() as u64;
         put_u64(&mut nca, 0x208, nca_size);
-        put_u64(&mut nca, 0x210, 0x0100_1234_5678_9000);
+        put_u64(&mut nca, 0x210, title_id);
         put_u32(&mut nca, 0x240, (SECTION_OFFSET / 0x200) as u32);
         put_u32(
             &mut nca,
