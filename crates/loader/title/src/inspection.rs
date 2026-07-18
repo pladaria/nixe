@@ -13,15 +13,9 @@ use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, Stora
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
 
-use crate::ControlMetadata;
+use crate::discovery::{directory_files, package_format};
 use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
-
-/// Container format recognized while inspecting a title path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PackageFormat {
-    /// Nintendo Submission Package backed by PFS0.
-    Nsp,
-}
+use crate::{ControlMetadata, DirectoryScanOptions, PackageFormat};
 
 impl Display for PackageFormat {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -218,9 +212,17 @@ pub struct TitleInspection {
 pub struct TitleInspector;
 
 impl TitleInspector {
-    /// Inspects one NSP file or every direct child file of a directory.
+    /// Inspects one package file or recursively scans a directory.
     pub fn inspect(path: impl AsRef<Path>) -> Result<TitleInspection, InspectError> {
-        Self::inspect_impl(path.as_ref(), None)
+        Self::inspect_with_options(path, DirectoryScanOptions::default())
+    }
+
+    /// Inspects a package path using the supplied directory options.
+    pub fn inspect_with_options(
+        path: impl AsRef<Path>,
+        options: DirectoryScanOptions,
+    ) -> Result<TitleInspection, InspectError> {
+        Self::inspect_impl(path.as_ref(), None, options)
     }
 
     /// Inspects title packages and decrypts their NCAs with caller-owned keys.
@@ -229,12 +231,22 @@ impl TitleInspector {
         path: impl AsRef<Path>,
         keys: &mut NcaKeySet,
     ) -> Result<TitleInspection, InspectError> {
-        Self::inspect_impl(path.as_ref(), Some(keys))
+        Self::inspect_with_key_set_and_options(path, keys, DirectoryScanOptions::default())
+    }
+
+    /// Inspects a package path with keys and the supplied directory options.
+    pub fn inspect_with_key_set_and_options(
+        path: impl AsRef<Path>,
+        keys: &mut NcaKeySet,
+        options: DirectoryScanOptions,
+    ) -> Result<TitleInspection, InspectError> {
+        Self::inspect_impl(path.as_ref(), Some(keys), options)
     }
 
     fn inspect_impl(
         path: &Path,
         mut keys: Option<&mut NcaKeySet>,
+        options: DirectoryScanOptions,
     ) -> Result<TitleInspection, InspectError> {
         let metadata = fs::metadata(path).map_err(|source| InspectError::Io {
             path: path.to_owned(),
@@ -244,7 +256,10 @@ impl TitleInspector {
         let candidates = if metadata.is_file() {
             vec![path.to_owned()]
         } else if metadata.is_dir() {
-            directory_files(path)?
+            directory_files(path, options).map_err(|error| InspectError::Io {
+                path: error.path,
+                source: error.source,
+            })?
         } else {
             return Err(InspectError::UnsupportedPath(path.to_owned()));
         };
@@ -317,36 +332,6 @@ impl Error for InspectError {
             Self::UnsupportedPath(_) | Self::NoSupportedPackages(_) => None,
         }
     }
-}
-
-fn directory_files(path: &Path) -> Result<Vec<PathBuf>, InspectError> {
-    let entries = fs::read_dir(path).map_err(|source| InspectError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| InspectError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        let file_type = entry.file_type().map_err(|source| InspectError::Io {
-            path: entry.path(),
-            source,
-        })?;
-        if file_type.is_file() {
-            files.push(entry.path());
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn package_format(path: &Path) -> Option<PackageFormat> {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| extension.eq_ignore_ascii_case("nsp"))
-        .map(|_| PackageFormat::Nsp)
 }
 
 fn inspect_nsp(

@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use swiitx_loader_content::{CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
 
+use crate::discovery::{directory_files, package_format};
 use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
-use crate::{ApplicationId, PackageMetadata, TitleError};
+use crate::{ApplicationId, DirectoryScanOptions, PackageFormat, PackageMetadata, TitleError};
 
 /// Collection of package metadata discovered in one or more locations.
 #[derive(Debug, Default)]
@@ -28,12 +29,20 @@ impl TitleCatalog {
         Self { packages }
     }
 
-    /// Scans the direct child NSP files of a directory without decryption keys.
+    /// Recursively scans supported packages without decryption keys.
     pub fn scan_directory(path: impl AsRef<Path>) -> Result<Self, TitleError> {
-        Self::scan_directory_impl(path.as_ref(), None)
+        Self::scan_directory_with_options(path, DirectoryScanOptions::default())
     }
 
-    /// Scans direct child NSP files using caller-owned NCA keys.
+    /// Scans supported packages using the supplied directory options.
+    pub fn scan_directory_with_options(
+        path: impl AsRef<Path>,
+        options: DirectoryScanOptions,
+    ) -> Result<Self, TitleError> {
+        Self::scan_directory_impl(path.as_ref(), None, options)
+    }
+
+    /// Recursively scans supported packages using caller-owned NCA keys.
     ///
     /// Encrypted title keys present in package tickets are imported into the
     /// supplied key set before canonical content metadata is loaded.
@@ -41,12 +50,22 @@ impl TitleCatalog {
         path: impl AsRef<Path>,
         keys: &mut NcaKeySet,
     ) -> Result<Self, TitleError> {
-        Self::scan_directory_impl(path.as_ref(), Some(keys))
+        Self::scan_directory_with_key_set_and_options(path, keys, DirectoryScanOptions::default())
+    }
+
+    /// Scans supported packages with caller-owned keys and directory options.
+    pub fn scan_directory_with_key_set_and_options(
+        path: impl AsRef<Path>,
+        keys: &mut NcaKeySet,
+        options: DirectoryScanOptions,
+    ) -> Result<Self, TitleError> {
+        Self::scan_directory_impl(path.as_ref(), Some(keys), options)
     }
 
     fn scan_directory_impl(
         path: &Path,
         mut keys: Option<&mut NcaKeySet>,
+        options: DirectoryScanOptions,
     ) -> Result<Self, TitleError> {
         let metadata = fs::metadata(path).map_err(|source| TitleError::Io {
             path: path.to_owned(),
@@ -58,7 +77,14 @@ impl TitleCatalog {
             });
         }
 
-        let candidates = nsp_files(path)?;
+        let candidates = directory_files(path, options)
+            .map_err(|error| TitleError::Io {
+                path: error.path,
+                source: error.source,
+            })?
+            .into_iter()
+            .filter(|candidate| package_format(candidate).is_some())
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
             return Err(TitleError::NoSupportedPackages {
                 path: path.to_owned(),
@@ -67,6 +93,8 @@ impl TitleCatalog {
 
         let mut catalog = Self::new();
         for candidate in candidates {
+            let PackageFormat::Nsp = package_format(&candidate)
+                .expect("catalog candidates must have a supported package format");
             let storage = FileStorage::open(&candidate).map_err(|source| TitleError::Package {
                 path: candidate.clone(),
                 source: LoadError::Storage(source),
@@ -146,36 +174,6 @@ impl TitleCatalog {
                 .then_some(package.application_id)
         })
     }
-}
-
-fn nsp_files(path: &Path) -> Result<Vec<PathBuf>, TitleError> {
-    let entries = fs::read_dir(path).map_err(|source| TitleError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| TitleError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|source| TitleError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
-        if file_type.is_file() && is_nsp(&entry_path) {
-            files.push(entry_path);
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn is_nsp(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("nsp"))
 }
 
 #[cfg(test)]
@@ -377,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_direct_child_nsps_in_sorted_order_and_resolves_titles() {
+    fn recursively_scans_nsps_in_sorted_order_and_resolves_titles() {
         let directory = TemporaryDirectory::new();
         let base = synthetic_nsp(
             FIRST_APPLICATION_ID,
@@ -421,24 +419,64 @@ mod tests {
         let catalog = TitleCatalog::scan_directory(directory.path()).unwrap();
         let titles = TitleResolver::resolve_all(&catalog).unwrap();
 
-        assert_eq!(catalog.packages().len(), 3);
+        assert_eq!(catalog.packages().len(), 4);
         assert_eq!(catalog.packages()[0].content_type, ContentType::Application);
         assert_eq!(catalog.packages()[1].content_type, ContentType::Patch);
         assert_eq!(
             catalog.packages()[2].content_type,
             ContentType::AddOnContent
         );
+        assert_eq!(catalog.packages()[3].content_type, ContentType::Application);
         assert_eq!(
             catalog.packages()[0].source.len().unwrap(),
             base.len() as u64
         );
-        assert_eq!(titles.len(), 1);
+        assert_eq!(titles.len(), 2);
         assert_eq!(
             titles[0].application_id,
             ApplicationId::new(FIRST_APPLICATION_ID)
         );
         assert_eq!(titles[0].patch.as_ref().unwrap().version.raw(), 5);
         assert_eq!(titles[0].add_ons.len(), 1);
+        assert_eq!(
+            titles[1].application_id,
+            ApplicationId::new(SECOND_APPLICATION_ID)
+        );
+    }
+
+    #[test]
+    fn can_disable_recursive_directory_scanning() {
+        let directory = TemporaryDirectory::new();
+        directory.write(
+            "root.nsp",
+            &synthetic_nsp(
+                FIRST_APPLICATION_ID,
+                0,
+                SyntheticMetaType::Application,
+                false,
+            ),
+        );
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(
+            nested.join("nested.nsp"),
+            synthetic_nsp(
+                SECOND_APPLICATION_ID,
+                0,
+                SyntheticMetaType::Application,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let options = DirectoryScanOptions::default().with_recursive(false);
+        let catalog = TitleCatalog::scan_directory_with_options(directory.path(), options).unwrap();
+
+        assert_eq!(catalog.packages().len(), 1);
+        assert_eq!(
+            catalog.packages()[0].application_id,
+            ApplicationId::new(FIRST_APPLICATION_ID)
+        );
     }
 
     #[test]
