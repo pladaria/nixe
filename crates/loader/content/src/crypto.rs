@@ -127,7 +127,7 @@ impl Storage for AesCtrStorage {
     }
 }
 
-fn apply_ctr(key: &[u8; 16], prefix: [u8; 8], first_block: u64, data: &mut [u8]) {
+pub(crate) fn apply_ctr(key: &[u8; 16], prefix: [u8; 8], first_block: u64, data: &mut [u8]) {
     let cipher = Aes128::new(key.into());
     for (index, block) in data.chunks_mut(AES_BLOCK_SIZE as usize).enumerate() {
         let mut counter = [0_u8; 16];
