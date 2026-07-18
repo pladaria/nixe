@@ -5,6 +5,7 @@ mod crypto;
 mod exefs;
 mod integrity;
 mod keys;
+mod nacp;
 mod nca;
 mod nsp;
 mod pfs0;
@@ -19,13 +20,20 @@ pub use cnmt::{
 pub use exefs::ExeFsLoader;
 pub use integrity::{IntegrityCheck, IntegrityCheckKind, IntegrityReport, IntegrityStatus};
 pub use keys::{KeyAreaKeyIndex, KeySetError, NcaKeyProvider, NcaKeySet};
+pub use nacp::{
+    AddOnContentRegistrationType, ApplicationControlProperty, ApplicationTitle,
+    AppropriateAgeForChina, CrashReportPolicy, DataLossConfirmation, HdcpPolicy, LogoHandling,
+    LogoType, NACP_SIZE, NacpLanguage, NacpLoader, PlayLogPolicy, PlayLogQueryCapability,
+    RuntimeAddOnContentInstall, RuntimeParameterDelivery, ScreenshotPolicy, StartupUserAccount,
+    SupportedLanguages, UserAccountSwitchLock, VideoCapturePolicy,
+};
 pub use nca::{
     NcaArchive, NcaContentType, NcaDistributionType, NcaEncryptionType, NcaFormatVersion,
     NcaHeader, NcaLoader, NcaSection, NcaSectionType,
 };
 pub use nsp::{NspArchive, NspLoader};
 pub use pfs0::{Pfs0Archive, Pfs0Entry, Pfs0Loader};
-pub use romfs::RomFsLoader;
+pub use romfs::{RomFsArchive, RomFsFile, RomFsLoader};
 pub use version::{
     ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
 };

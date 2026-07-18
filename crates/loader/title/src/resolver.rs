@@ -169,9 +169,10 @@ mod tests {
     use std::sync::Arc;
 
     use swiitx_loader_content::{
-        CnmtContentMeta, CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform,
+        CnmtContentInfo, CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtInstallType,
+        CnmtMetaType, CnmtPlatform, NACP_SIZE, NacpLoader,
     };
-    use swiitx_loader_storage::{Storage, StorageError, StorageRef};
+    use swiitx_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
 
     use super::*;
 
@@ -194,6 +195,24 @@ mod tests {
             } else {
                 Err(StorageError::OutOfBounds)
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct BytesStorage(Vec<u8>);
+
+    impl Storage for BytesStorage {
+        fn len(&self) -> Result<u64, StorageError> {
+            Ok(self.0.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), StorageError> {
+            let start = usize::try_from(offset).map_err(|_| StorageError::OutOfBounds)?;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or(StorageError::OutOfBounds)?;
+            buffer.copy_from_slice(self.0.get(start..end).ok_or(StorageError::OutOfBounds)?);
+            Ok(())
         }
     }
 
@@ -320,6 +339,26 @@ mod tests {
         )
     }
 
+    fn with_control(mut package: PackageMetadata, name: &str) -> PackageMetadata {
+        let mut bytes = vec![0_u8; NACP_SIZE];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        let nacp = NacpLoader::load(Arc::new(BytesStorage(bytes))).unwrap();
+        let content = CnmtContentInfo {
+            hash: [0; 32],
+            content_id: [0; 16],
+            size: 0,
+            attributes: 0,
+            content_type: CnmtContentType::Control,
+            id_offset: 0,
+        };
+        package.set_control_metadata(Some(crate::ControlMetadata::new(
+            nacp,
+            &content,
+            Vec::new(),
+        )));
+        package
+    }
+
     #[test]
     fn resolves_latest_compatible_patch_and_add_on_revisions_in_canonical_order() {
         let catalog = TitleCatalog::from_packages(vec![
@@ -339,6 +378,43 @@ mod tests {
         assert_eq!(title.add_ons[0].title_id, TitleId::new(FIRST_ADD_ON_ID));
         assert_eq!(title.add_ons[0].version.raw(), 2);
         assert_eq!(title.add_ons[1].title_id, TitleId::new(SECOND_ADD_ON_ID));
+    }
+
+    #[test]
+    fn resolved_control_metadata_prefers_patch_and_falls_back_to_base() {
+        let base_package = with_control(base(0, 0, 0), "Base name");
+        let patched = TitleCatalog::from_packages(vec![
+            base_package.clone(),
+            with_control(patch(1, 1), "Patch name"),
+        ]);
+        let title = TitleResolver::resolve(&patched, APPLICATION_ID).unwrap();
+        assert_eq!(
+            title
+                .control_metadata()
+                .unwrap()
+                .nacp
+                .localized_titles()
+                .next()
+                .unwrap()
+                .1
+                .name,
+            "Patch name"
+        );
+
+        let fallback = TitleCatalog::from_packages(vec![base_package, patch(1, 1)]);
+        let title = TitleResolver::resolve(&fallback, APPLICATION_ID).unwrap();
+        assert_eq!(
+            title
+                .control_metadata()
+                .unwrap()
+                .nacp
+                .localized_titles()
+                .next()
+                .unwrap()
+                .1
+                .name,
+            "Base name"
+        );
     }
 
     #[test]

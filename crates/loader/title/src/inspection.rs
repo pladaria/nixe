@@ -13,7 +13,8 @@ use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, Stora
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
 
-use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta};
+use crate::ControlMetadata;
+use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
 
 /// Container format recognized while inspecting a title path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +176,10 @@ pub struct PackageInspection {
     /// Explanation when the meta NCA or its binary CNMT could not be read and
     /// validated.
     pub canonical_metadata_warning: Option<String>,
+    /// Localized titles, icons, and application properties from the Control NCA.
+    pub control_metadata: Option<ControlMetadata>,
+    /// Explanation when canonical CNMT declares Control data that could not be read.
+    pub control_metadata_warning: Option<String>,
     /// Optional auxiliary content metadata found alongside the NCAs.
     pub content_meta: Option<ContentMetaInspection>,
     /// Explanation when auxiliary metadata existed but could not be read.
@@ -395,6 +400,19 @@ fn inspect_nsp(
     }
     let (canonical_content_meta, canonical_metadata_warning) =
         inspect_canonical_metadata(&archive, keys.as_deref());
+    let (control_metadata, control_metadata_warning) =
+        canonical_content_meta
+            .as_ref()
+            .map_or((None, None), |content_meta| {
+                match load_control_metadata(
+                    &archive,
+                    content_meta,
+                    keys.as_deref().map(|keys| keys as _),
+                ) {
+                    Ok(metadata) => (metadata, None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            });
     let (content_meta, metadata_warning) = inspect_auxiliary_metadata(&archive);
 
     Ok(PackageInspection {
@@ -405,6 +423,8 @@ fn inspect_nsp(
         entries,
         canonical_content_meta,
         canonical_metadata_warning,
+        control_metadata,
+        control_metadata_warning,
         content_meta,
         metadata_warning,
         ticket_warnings,
@@ -751,6 +771,36 @@ mod tests {
         assert!(warning.unwrap().contains("failed integrity validation"));
     }
 
+    #[test]
+    fn reads_control_nca_metadata_by_canonical_content_id() {
+        let content_id = [0x22_u8; 16];
+        let control_nca = build_control_nca();
+        let cnmt = application_cnmt_with_control(content_id, control_nca.len() as u64);
+        let inner_pfs0 = build_pfs0(&[("Application.cnmt", &cnmt)]);
+        let meta_nca = build_meta_nca(&inner_pfs0);
+        let control_name = format!("{}.nca", "22".repeat(16));
+        let nsp_bytes = build_pfs0(&[("meta.cnmt.nca", &meta_nca), (&control_name, &control_nca)]);
+        let storage: StorageRef = Arc::new(VecStorage(nsp_bytes));
+        let nsp = NspLoader::load(storage).unwrap();
+        let content_meta = load_canonical_content_meta(&nsp, None).unwrap();
+
+        let control = load_control_metadata(&nsp, &content_meta, None)
+            .unwrap()
+            .unwrap();
+
+        let title = control
+            .nacp
+            .title(swiitx_loader_content::NacpLanguage::AmericanEnglish);
+        assert_eq!(title.name, "Synthetic title");
+        assert_eq!(title.publisher, "Synthetic publisher");
+        assert_eq!(control.nacp.display_version, "1.2.3");
+        assert_eq!(control.icons().len(), 1);
+        assert_eq!(
+            control.icons()[0].language,
+            swiitx_loader_content::NacpLanguage::AmericanEnglish
+        );
+    }
+
     fn application_cnmt() -> Vec<u8> {
         let mut cnmt = vec![0_u8; 0x20];
         put_u64(&mut cnmt, 0, 0x0100_1234_5678_9000);
@@ -770,6 +820,14 @@ mod tests {
         content[0x36] = 1;
         cnmt.extend_from_slice(&content);
         cnmt.extend_from_slice(&[0x33; 0x20]);
+        cnmt
+    }
+
+    fn application_cnmt_with_control(content_id: [u8; 16], content_size: u64) -> Vec<u8> {
+        let mut cnmt = application_cnmt();
+        cnmt[0x50..0x60].copy_from_slice(&content_id);
+        cnmt[0x60..0x66].copy_from_slice(&content_size.to_le_bytes()[..6]);
+        cnmt[0x66] = 3;
         cnmt
     }
 
@@ -800,6 +858,100 @@ mod tests {
             pfs0.extend_from_slice(data);
         }
         pfs0
+    }
+
+    fn build_control_nca() -> Vec<u8> {
+        const SECTION_OFFSET: usize = 0xC00;
+        const BLOCK_SIZE: usize = 0x10000;
+        let mut nacp = vec![0_u8; swiitx_loader_content::NACP_SIZE];
+        nacp[.."Synthetic title".len()].copy_from_slice(b"Synthetic title");
+        nacp[0x200..0x200 + "Synthetic publisher".len()].copy_from_slice(b"Synthetic publisher");
+        nacp[0x302C..0x3030].copy_from_slice(&1_u32.to_le_bytes());
+        nacp[0x3060..0x3065].copy_from_slice(b"1.2.3");
+        let romfs = build_romfs(&[
+            ("control.nacp", &nacp),
+            ("icon_AmericanEnglish.dat", &[0xFF, 0xD8, 0xFF, 0xD9]),
+        ]);
+        assert!(romfs.len() <= BLOCK_SIZE);
+        let section_size = romfs.len().next_multiple_of(0x200);
+        let mut nca = vec![0_u8; SECTION_OFFSET + section_size];
+        nca[0x200..0x204].copy_from_slice(b"NCA3");
+        nca[0x205] = 2;
+        nca[0x206] = 1;
+        let nca_size = nca.len() as u64;
+        put_u64(&mut nca, 0x208, nca_size);
+        put_u64(&mut nca, 0x210, 0x0100_1234_5678_9000);
+        put_u32(&mut nca, 0x240, (SECTION_OFFSET / 0x200) as u32);
+        put_u32(
+            &mut nca,
+            0x244,
+            ((SECTION_OFFSET + section_size) / 0x200) as u32,
+        );
+        nca[SECTION_OFFSET..SECTION_OFFSET + romfs.len()].copy_from_slice(&romfs);
+
+        let mut padded = vec![0_u8; BLOCK_SIZE];
+        padded[..romfs.len()].copy_from_slice(&romfs);
+        let master_hash: [u8; 32] = Sha256::digest(&padded).into();
+        let fs = &mut nca[0x400..0x600];
+        fs[2] = 0;
+        fs[3] = 3;
+        fs[4] = 1;
+        fs[0x08..0x0C].copy_from_slice(b"IVFC");
+        put_u32(fs, 0x10, 0x20);
+        put_u32(fs, 0x14, 2);
+        put_u64(fs, 0x18, 0);
+        put_u64(fs, 0x20, romfs.len() as u64);
+        put_u32(fs, 0x28, 16);
+        fs[0xC8..0xE8].copy_from_slice(&master_hash);
+        let fs_hash: [u8; 32] = Sha256::digest(&nca[0x400..0x600]).into();
+        nca[0x280..0x2A0].copy_from_slice(&fs_hash);
+        nca
+    }
+
+    fn build_romfs(files: &[(&str, &[u8])]) -> Vec<u8> {
+        const DIRECTORY_META_OFFSET: usize = 0x54;
+        const FILE_META_OFFSET: usize = 0x70;
+        let mut file_meta = Vec::new();
+        let mut data_offset = 0_u64;
+        for (index, (name, data)) in files.iter().enumerate() {
+            let next = if index + 1 == files.len() {
+                u32::MAX
+            } else {
+                (file_meta.len() + 0x20 + name.len().next_multiple_of(4)) as u32
+            };
+            file_meta.extend_from_slice(&0_u32.to_le_bytes());
+            file_meta.extend_from_slice(&next.to_le_bytes());
+            file_meta.extend_from_slice(&data_offset.to_le_bytes());
+            file_meta.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            file_meta.extend_from_slice(&u32::MAX.to_le_bytes());
+            file_meta.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            file_meta.extend_from_slice(name.as_bytes());
+            file_meta.resize(file_meta.len().next_multiple_of(4), 0);
+            data_offset += data.len() as u64;
+        }
+
+        let file_data_offset = (FILE_META_OFFSET + file_meta.len()).next_multiple_of(0x10);
+        let mut bytes = vec![0_u8; file_data_offset];
+        put_u64(&mut bytes, 0, 0x50);
+        put_u64(&mut bytes, 0x08, 0x50);
+        put_u64(&mut bytes, 0x10, 4);
+        put_u64(&mut bytes, 0x18, DIRECTORY_META_OFFSET as u64);
+        put_u64(&mut bytes, 0x20, 0x18);
+        put_u64(&mut bytes, 0x28, 0x6C);
+        put_u64(&mut bytes, 0x30, 4);
+        put_u64(&mut bytes, 0x38, FILE_META_OFFSET as u64);
+        put_u64(&mut bytes, 0x40, file_meta.len() as u64);
+        put_u64(&mut bytes, 0x48, file_data_offset as u64);
+        put_u32(&mut bytes, DIRECTORY_META_OFFSET, 0);
+        put_u32(&mut bytes, DIRECTORY_META_OFFSET + 4, u32::MAX);
+        put_u32(&mut bytes, DIRECTORY_META_OFFSET + 8, u32::MAX);
+        put_u32(&mut bytes, DIRECTORY_META_OFFSET + 0x0C, 0);
+        put_u32(&mut bytes, DIRECTORY_META_OFFSET + 0x10, u32::MAX);
+        bytes[FILE_META_OFFSET..FILE_META_OFFSET + file_meta.len()].copy_from_slice(&file_meta);
+        for (_, data) in files {
+            bytes.extend_from_slice(data);
+        }
+        bytes
     }
 
     fn build_meta_nca(payload: &[u8]) -> Vec<u8> {

@@ -6,6 +6,8 @@ use swiitx_loader_content::{
 };
 use swiitx_loader_storage::StorageRef;
 
+use crate::ControlMetadata;
+
 /// Identifies an application to which base, patch, and add-on content belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ApplicationId(u64);
@@ -102,6 +104,8 @@ pub struct PackageMetadata {
     pub content_type: ContentType,
     /// Random-access source containing the package.
     pub source: StorageRef,
+    /// Parsed Control NCA metadata, when this package declares it and keys were available.
+    control_metadata: Option<ControlMetadata>,
     /// Canonical binary metadata used to compare and resolve package revisions.
     canonical_content_meta: CnmtContentMeta,
 }
@@ -156,6 +160,7 @@ impl PackageMetadata {
             version: ApplicationVersion::from_raw(content_meta.version.raw()),
             content_type,
             source,
+            control_metadata: None,
             canonical_content_meta: content_meta.clone(),
         })
     }
@@ -163,6 +168,15 @@ impl PackageMetadata {
     /// Returns the canonical binary content metadata retained for resolution.
     pub fn canonical_content_meta(&self) -> &CnmtContentMeta {
         &self.canonical_content_meta
+    }
+
+    /// Returns parsed Control NCA metadata attached while loading the package.
+    pub fn control_metadata(&self) -> Option<&ControlMetadata> {
+        self.control_metadata.as_ref()
+    }
+
+    pub(crate) fn set_control_metadata(&mut self, metadata: Option<ControlMetadata>) {
+        self.control_metadata = metadata;
     }
 
     /// Returns the patch title declared by an application package.
@@ -205,6 +219,7 @@ impl Debug for PackageMetadata {
             .field("application_id", &self.application_id)
             .field("version", &self.version)
             .field("content_type", &self.content_type)
+            .field("control_metadata", &self.control_metadata)
             .field("canonical_content_meta", &self.canonical_content_meta)
             .field("source", &"<storage>")
             .finish()
