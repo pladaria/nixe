@@ -1,17 +1,32 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sanitize_filename::{Options, sanitize_with_options};
 use swiitx_config::SwiitxConfig;
 use swiitx_loader_content::{NcaFormatVersion, NcaKeySet};
 use swiitx_loader_title::{
-    CnmtExtendedHeader, EntryKind, NacpLanguage, NcaInspection, TitleInspection, TitleInspector,
+    CnmtExtendedHeader, EntryKind, NacpLanguage, NcaInspection, ResolvedTitle, TitleCatalog,
+    TitleInspection, TitleInspector, TitleResolver,
 };
 
 struct CliArguments {
     config_path: Option<PathBuf>,
+    title_path: Option<PathBuf>,
+}
+
+enum CliOutput {
+    Inspection {
+        inspection: TitleInspection,
+        preferred_languages: Vec<NacpLanguage>,
+    },
+    LibrarySummary {
+        titles: Vec<ResolvedTitle>,
+        preferred_languages: Vec<NacpLanguage>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -32,14 +47,19 @@ fn main() -> ExitCode {
         }
     };
 
-    match inspect_titles(arguments) {
-        Ok((inspections, preferred_languages)) => {
-            for (index, inspection) in inspections.iter().enumerate() {
-                if index != 0 {
-                    println!();
-                }
-                print_inspection(inspection, &preferred_languages);
-            }
+    match run(arguments) {
+        Ok(CliOutput::Inspection {
+            inspection,
+            preferred_languages,
+        }) => {
+            print_inspection(&inspection, &preferred_languages);
+            ExitCode::SUCCESS
+        }
+        Ok(CliOutput::LibrarySummary {
+            titles,
+            preferred_languages,
+        }) => {
+            print_library_summary(&titles, &preferred_languages);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -51,8 +71,9 @@ fn main() -> ExitCode {
 
 fn print_usage(program: &OsString) {
     eprintln!(
-        "Usage: {} [--config <file>]\n\n\
-         Inspect the title-library paths from the shared configuration.\n\
+        "Usage: {} [--config <file>] [<title-path>]\n\n\
+         Without title-path, scan the configured library and summarize resolved titles.\n\
+         With title-path, show a detailed inspection of that file or directory.\n\
          Pass --config to select a TOML file explicitly. Otherwise the CLI uses\n\
          SWIITX_CONFIG, ./swiitx.toml, or the platform user configuration.",
         program.to_string_lossy()
@@ -63,6 +84,7 @@ fn parse_arguments(
     arguments: impl Iterator<Item = OsString>,
 ) -> Result<Option<CliArguments>, String> {
     let mut config_path = None;
+    let mut title_path = None;
     let mut arguments = arguments;
 
     while let Some(argument) = arguments.next() {
@@ -79,15 +101,21 @@ fn parse_arguments(
             config_path = Some(PathBuf::from(path));
             continue;
         }
-        return Err(format!("unknown argument: {}", argument.to_string_lossy()));
+        if argument.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option: {}", argument.to_string_lossy()));
+        }
+        if title_path.replace(PathBuf::from(argument)).is_some() {
+            return Err("expected at most one title path".to_owned());
+        }
     }
 
-    Ok(Some(CliArguments { config_path }))
+    Ok(Some(CliArguments {
+        config_path,
+        title_path,
+    }))
 }
 
-fn inspect_titles(
-    arguments: CliArguments,
-) -> Result<(Vec<TitleInspection>, Vec<NacpLanguage>), String> {
+fn run(arguments: CliArguments) -> Result<CliOutput, String> {
     let config = match arguments.config_path {
         Some(path) => SwiitxConfig::load(path).map_err(|error| error.to_string())?,
         None => SwiitxConfig::load_discovered()
@@ -97,28 +125,158 @@ fn inspect_titles(
             })?,
     };
 
-    let paths = config.library.paths.clone();
-    if paths.is_empty() {
-        return Err("the configuration has no library paths".to_owned());
-    }
-
     let options = config.library.scan_options();
     let preferred_languages = config.system.preferred_languages.clone();
-    let keys_dir = config.system.keys;
-
-    let prod_keys = keys_dir.join("prod.keys");
-    let title_keys_path = keys_dir.join("title.keys");
+    let prod_keys = config.system.keys.join("prod.keys");
+    let title_keys_path = config.system.keys.join("title.keys");
     let title_keys = title_keys_path.is_file().then_some(title_keys_path);
     let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
         .map_err(|error| error.to_string())?;
-    let inspections = paths
-        .into_iter()
-        .map(|path| {
-            TitleInspector::inspect_with_key_set_and_options(path, &mut keys, options)
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((inspections, preferred_languages))
+
+    if let Some(path) = arguments.title_path {
+        let inspection = TitleInspector::inspect_with_key_set_and_options(path, &mut keys, options)
+            .map_err(|error| error.to_string())?;
+        return Ok(CliOutput::Inspection {
+            inspection,
+            preferred_languages,
+        });
+    }
+
+    if config.library.paths.is_empty() {
+        return Err("the configuration has no library paths".to_owned());
+    }
+
+    let mut catalog = TitleCatalog::new();
+    for path in config.library.paths {
+        let discovered =
+            TitleCatalog::scan_directory_with_key_set_and_options(path, &mut keys, options)
+                .map_err(|error| error.to_string())?;
+        for package in discovered.packages() {
+            catalog.add(package.clone());
+        }
+    }
+    let titles = TitleResolver::resolve_all(&catalog).map_err(|error| error.to_string())?;
+    cache_preferred_icons(&titles, &preferred_languages)?;
+    Ok(CliOutput::LibrarySummary {
+        titles,
+        preferred_languages,
+    })
+}
+
+fn cache_preferred_icons(
+    titles: &[ResolvedTitle],
+    preferred_languages: &[NacpLanguage],
+) -> Result<(), String> {
+    let cache_root = PathBuf::from("cache");
+    for title in titles {
+        let Some(control) = title.control_metadata() else {
+            continue;
+        };
+        let Some(icon) = control.preferred_icon(preferred_languages) else {
+            continue;
+        };
+        let directory_name = control
+            .nacp
+            .preferred_title(preferred_languages)
+            .map(|(_, metadata)| sanitize_directory_name(&metadata.name))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| title.application_id.to_string());
+        let directory = cache_root.join(directory_name);
+        fs::create_dir_all(&directory).map_err(|source| {
+            format!(
+                "cannot create icon cache directory {}: {source}",
+                directory.display()
+            )
+        })?;
+        let output_path = directory.join(format!("{}.jpg", icon.filename));
+        let bytes = icon.bytes().map_err(|error| {
+            format!(
+                "cannot read icon {} for {}: {error}",
+                icon.filename, title.application_id
+            )
+        })?;
+        fs::write(&output_path, bytes).map_err(|source| {
+            format!(
+                "cannot write cached icon {}: {source}",
+                output_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn sanitize_directory_name(name: &str) -> String {
+    sanitize_with_options(
+        name,
+        Options {
+            windows: true,
+            truncate: false,
+            replacement: "_",
+        },
+    )
+}
+
+fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLanguage]) {
+    println!("Titles: {}", titles.len());
+
+    for (index, title) in titles.iter().enumerate() {
+        println!();
+        let preferred_title = title
+            .control_metadata()
+            .and_then(|control| control.nacp.preferred_title(preferred_languages));
+        match preferred_title {
+            Some((language, metadata)) => {
+                println!("Title {}: {}", index + 1, metadata.name);
+                println!("  Publisher: {}", metadata.publisher);
+                println!("  Language: {language}");
+            }
+            None => println!("Title {}: {}", index + 1, title.application_id),
+        }
+        println!("  Application ID: {}", title.application_id);
+        println!(
+            "  Base: {} version {}",
+            title.base.title_id, title.base.version
+        );
+        match &title.patch {
+            Some(patch) => println!("  Patch: {} version {}", patch.title_id, patch.version),
+            None => println!("  Patch: none"),
+        }
+        let effective_version = title
+            .patch
+            .as_ref()
+            .map_or(title.base.version, |patch| patch.version);
+        println!("  Effective version: {effective_version}");
+        println!("  DLC: {}", title.add_ons.len());
+        for add_on in &title.add_ons {
+            match add_on.required_application_version() {
+                Some(required_version) => println!(
+                    "    {} version {} (requires application version {})",
+                    add_on.title_id, add_on.version, required_version
+                ),
+                None => println!("    {} version {}", add_on.title_id, add_on.version),
+            }
+        }
+
+        if let Some(control) = title.control_metadata() {
+            println!("  Display version: {}", control.nacp.display_version);
+            let languages = control
+                .supported_languages()
+                .iter()
+                .map(|language| language.to_string())
+                .collect::<Vec<_>>();
+            println!(
+                "  Supported languages: {}",
+                if languages.is_empty() {
+                    "none".to_owned()
+                } else {
+                    languages.join(", ")
+                }
+            );
+            if let Some(icon) = control.preferred_icon(preferred_languages) {
+                println!("  Preferred icon: {} ({})", icon.filename, icon.language);
+            }
+        }
+    }
 }
 
 fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLanguage]) {
@@ -516,6 +674,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(arguments.config_path, Some(PathBuf::from("custom.toml")));
+        assert_eq!(arguments.title_path, None);
+    }
+
+    #[test]
+    fn parses_one_title_path_with_config_in_either_order() {
+        for values in [
+            &["--config", "custom.toml", "title.nsp"][..],
+            &["title.nsp", "--config", "custom.toml"][..],
+        ] {
+            let arguments = parse_arguments(os_arguments(values)).unwrap().unwrap();
+
+            assert_eq!(arguments.config_path, Some(PathBuf::from("custom.toml")));
+            assert_eq!(arguments.title_path, Some(PathBuf::from("title.nsp")));
+        }
     }
 
     #[test]
@@ -532,15 +704,16 @@ mod tests {
         let arguments = parse_arguments(os_arguments(&[])).unwrap().unwrap();
 
         assert_eq!(arguments.config_path, None);
+        assert_eq!(arguments.title_path, None);
     }
 
     #[test]
-    fn rejects_every_other_argument() {
+    fn rejects_unsupported_options_and_multiple_title_paths() {
         for arguments in [
-            &["title.nsp"][..],
             &["--keys-dir", "keys"][..],
             &["--"][..],
             &["--unknown"][..],
+            &["first.nsp", "second.nsp"][..],
         ] {
             assert!(parse_arguments(os_arguments(arguments)).is_err());
         }
@@ -555,5 +728,21 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn sanitizes_title_names_for_cache_directories() {
+        assert_eq!(sanitize_directory_name("Mario: A/B?"), "Mario_ A_B_");
+        assert_eq!(
+            sanitize_directory_name("Mario vs. Donkey Kong"),
+            "Mario vs. Donkey Kong"
+        );
+        assert_eq!(sanitize_directory_name("CON.txt"), "_");
+        assert_eq!(sanitize_directory_name("LPT9"), "_");
+        assert_eq!(
+            sanitize_directory_name("Pokémon™ (Deluxe) #1!."),
+            "Pokémon™ (Deluxe) #1!_"
+        );
+        assert_eq!(sanitize_directory_name("line\nfeed"), "line_feed");
     }
 }

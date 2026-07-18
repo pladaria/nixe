@@ -27,6 +27,15 @@ file explicitly.
 Relative library and key paths are resolved from the directory containing the configuration file. The
 configuration stores only the location of caller-owned key files, never cryptographic key material itself.
 
+Run the CLI without a title path to recursively scan the configured library directories and print one summary
+per resolved application, including its selected patch and compatible add-on content. Pass one title package
+or directory path to request the detailed package inspection instead:
+
+```text
+swiitx-cli [--config <file>]
+swiitx-cli [--config <file>] <title-path>
+```
+
 ## Legal Notice
 
 This project is intended for lawful education, research, interoperability, and preservation work. It does not

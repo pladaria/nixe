@@ -16,6 +16,7 @@ edition = "2024"
 
 [workspace.dependencies]
 aes = "0.8.4"
+sanitize-filename = "0.6"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
 swiitx-config = { path = "crates/config" }

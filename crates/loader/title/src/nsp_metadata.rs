@@ -1,6 +1,7 @@
 use swiitx_loader_content::{
-    CnmtContentMeta, CnmtContentType, CnmtLoader, NacpLanguage, NacpLoader, NcaContentType,
-    NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive, Pfs0Loader, RomFsLoader,
+    CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtLoader, NacpLanguage, NacpLoader,
+    NcaContentType, NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive, Pfs0Loader,
+    RomFsLoader,
 };
 use swiitx_loader_storage::{FormatLoader, LoadError};
 
@@ -151,13 +152,17 @@ pub(crate) fn load_control_metadata(
             "canonical Control content is not a Control NCA",
         ));
     }
-    if nca.header().title_id() != content_meta.title_id {
+    let expected_title_id = match &content_meta.extended_header {
+        CnmtExtendedHeader::Patch { application_id, .. } => *application_id,
+        _ => content_meta.title_id,
+    };
+    if nca.header().title_id() != expected_title_id {
         return Err(LoadError::invalid(
             "Control NCA",
             format!(
-                "title ID {:016X} does not match CNMT title ID {:016X}",
+                "title ID {:016X} does not match expected title ID {:016X}",
                 nca.header().title_id(),
-                content_meta.title_id
+                expected_title_id
             ),
         ));
     }

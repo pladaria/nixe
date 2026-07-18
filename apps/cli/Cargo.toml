@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sanitize-filename.workspace = true
 swiitx-config.workspace = true
 swiitx-loader-content.workspace = true
 swiitx-loader-title.workspace = true
