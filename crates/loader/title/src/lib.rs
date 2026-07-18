@@ -3,6 +3,7 @@
 mod catalog;
 mod error;
 mod inspection;
+mod nsp_metadata;
 mod package;
 mod resolved_title;
 mod resolver;
@@ -14,7 +15,7 @@ pub use inspection::{
     NcaInspection, NcaSectionInspection, PackageFormat, PackageInspection, TitleInspection,
     TitleInspector,
 };
-pub use package::{ApplicationId, ContentType, PackageMetadata, TitleId};
+pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
 pub use resolved_title::ResolvedTitle;
 pub use resolver::TitleResolver;
 pub use swiitx_loader_content::{

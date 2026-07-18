@@ -1,9 +1,8 @@
+use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 
 use swiitx_loader_content::{CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType};
 use swiitx_loader_storage::StorageRef;
-
-use crate::TitleError;
 
 /// Identifies an application to which base, patch, and add-on content belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -50,7 +49,7 @@ impl Display for TitleId {
 }
 
 /// Describes the role of a package within a complete title.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ContentType {
     /// Base game or application.
     Application,
@@ -61,6 +60,32 @@ pub enum ContentType {
     /// Incremental data used while constructing a patch.
     Delta,
 }
+
+/// Errors produced while converting canonical CNMT into title-domain metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageMetadataError {
+    /// The parsed content-meta role cannot be represented in the title catalog.
+    UnsupportedContentMetaType { content_meta_type: CnmtMetaType },
+    /// The content-meta extended header does not match its declared role.
+    IncompatibleContentMetaHeader { content_meta_type: CnmtMetaType },
+}
+
+impl Display for PackageMetadataError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedContentMetaType { content_meta_type } => write!(
+                formatter,
+                "content-meta type {content_meta_type} is not supported by the title catalog"
+            ),
+            Self::IncompatibleContentMetaHeader { content_meta_type } => write!(
+                formatter,
+                "content-meta type {content_meta_type} has an incompatible extended header"
+            ),
+        }
+    }
+}
+
+impl Error for PackageMetadataError {}
 
 /// Metadata extracted from one NSP, NSZ, XCI, or equivalent package.
 #[derive(Clone)]
@@ -75,6 +100,8 @@ pub struct PackageMetadata {
     pub content_type: ContentType,
     /// Random-access source containing the package.
     pub source: StorageRef,
+    /// Canonical binary metadata used to compare and resolve package revisions.
+    canonical_content_meta: CnmtContentMeta,
 }
 
 impl PackageMetadata {
@@ -82,7 +109,7 @@ impl PackageMetadata {
     pub fn from_content_meta(
         content_meta: &CnmtContentMeta,
         source: StorageRef,
-    ) -> Result<Self, TitleError> {
+    ) -> Result<Self, PackageMetadataError> {
         let (content_type, application_id) = match (
             content_meta.content_meta_type,
             &content_meta.extended_header,
@@ -112,12 +139,12 @@ impl PackageMetadata {
                 | CnmtMetaType::Delta,
                 _,
             ) => {
-                return Err(TitleError::IncompatibleContentMetaHeader {
+                return Err(PackageMetadataError::IncompatibleContentMetaHeader {
                     content_meta_type: content_meta.content_meta_type,
                 });
             }
             (content_meta_type, _) => {
-                return Err(TitleError::UnsupportedContentMetaType { content_meta_type });
+                return Err(PackageMetadataError::UnsupportedContentMetaType { content_meta_type });
             }
         };
 
@@ -127,7 +154,44 @@ impl PackageMetadata {
             version: content_meta.version,
             content_type,
             source,
+            canonical_content_meta: content_meta.clone(),
         })
+    }
+
+    /// Returns the canonical binary content metadata retained for resolution.
+    pub fn canonical_content_meta(&self) -> &CnmtContentMeta {
+        &self.canonical_content_meta
+    }
+
+    /// Returns the patch title declared by an application package.
+    pub fn patch_id(&self) -> Option<TitleId> {
+        match &self.canonical_content_meta.extended_header {
+            CnmtExtendedHeader::Application { patch_id, .. } => Some(TitleId::new(*patch_id)),
+            _ => None,
+        }
+    }
+
+    /// Returns the minimum effective application version required by this package.
+    pub fn required_application_version(&self) -> Option<u32> {
+        match &self.canonical_content_meta.extended_header {
+            CnmtExtendedHeader::Application {
+                required_application_version,
+                ..
+            }
+            | CnmtExtendedHeader::AddOnContent {
+                required_application_version,
+                ..
+            }
+            | CnmtExtendedHeader::LegacyAddOnContent {
+                required_application_version,
+                ..
+            } => Some(*required_application_version),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_same_canonical_metadata(&self, other: &Self) -> bool {
+        self.canonical_content_meta == other.canonical_content_meta
     }
 }
 
@@ -139,6 +203,7 @@ impl Debug for PackageMetadata {
             .field("application_id", &self.application_id)
             .field("version", &self.version)
             .field("content_type", &self.content_type)
+            .field("canonical_content_meta", &self.canonical_content_meta)
             .field("source", &"<storage>")
             .finish()
     }
@@ -257,11 +322,8 @@ mod tests {
 
         for (content_meta_type, extended_header, expected_type, expected_application_id) in cases {
             let source: StorageRef = Arc::new(EmptyStorage);
-            let package = PackageMetadata::from_content_meta(
-                &content_meta(content_meta_type, extended_header),
-                source.clone(),
-            )
-            .unwrap();
+            let metadata = content_meta(content_meta_type, extended_header);
+            let package = PackageMetadata::from_content_meta(&metadata, source.clone()).unwrap();
 
             assert_eq!(package.title_id, TitleId::new(TITLE_ID));
             assert_eq!(
@@ -270,8 +332,43 @@ mod tests {
             );
             assert_eq!(package.version, 42);
             assert_eq!(package.content_type, expected_type);
+            assert_eq!(package.canonical_content_meta(), &metadata);
             assert!(Arc::ptr_eq(&package.source, &source));
         }
+    }
+
+    #[test]
+    fn exposes_canonical_application_version_requirements() {
+        let source: StorageRef = Arc::new(EmptyStorage);
+        let application = PackageMetadata::from_content_meta(
+            &content_meta(
+                CnmtMetaType::Application,
+                CnmtExtendedHeader::Application {
+                    patch_id: TITLE_ID + 0x800,
+                    required_system_version: 0,
+                    required_application_version: 12,
+                },
+            ),
+            source.clone(),
+        )
+        .unwrap();
+        let add_on = PackageMetadata::from_content_meta(
+            &content_meta(
+                CnmtMetaType::AddOnContent,
+                CnmtExtendedHeader::LegacyAddOnContent {
+                    application_id: APPLICATION_ID,
+                    required_application_version: 7,
+                    padding: 0,
+                },
+            ),
+            source,
+        )
+        .unwrap();
+
+        assert_eq!(application.patch_id(), Some(TitleId::new(TITLE_ID + 0x800)));
+        assert_eq!(application.required_application_version(), Some(12));
+        assert_eq!(add_on.patch_id(), None);
+        assert_eq!(add_on.required_application_version(), Some(7));
     }
 
     #[test]
@@ -281,7 +378,7 @@ mod tests {
 
         assert_eq!(
             PackageMetadata::from_content_meta(&metadata, source).unwrap_err(),
-            TitleError::UnsupportedContentMetaType {
+            PackageMetadataError::UnsupportedContentMetaType {
                 content_meta_type: CnmtMetaType::SystemProgram,
             }
         );
@@ -301,7 +398,7 @@ mod tests {
 
         assert_eq!(
             PackageMetadata::from_content_meta(&metadata, source).unwrap_err(),
-            TitleError::IncompatibleContentMetaHeader {
+            PackageMetadataError::IncompatibleContentMetaHeader {
                 content_meta_type: CnmtMetaType::Patch,
             }
         );
