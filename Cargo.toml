@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/cli",
+    "crates/config",
     "crates/loader/content",
     "crates/loader/executable",
     "crates/loader/storage",
@@ -15,7 +16,10 @@ edition = "2024"
 
 [workspace.dependencies]
 aes = "0.8.4"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
+swiitx-config = { path = "crates/config" }
 swiitx-loader-content = { path = "crates/loader/content" }
 swiitx-loader-storage = { path = "crates/loader/storage" }
 swiitx-loader-title = { path = "crates/loader/title" }
+toml = "0.8"

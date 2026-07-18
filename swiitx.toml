@@ -1,0 +1,14 @@
+version = 1
+
+[library]
+paths = [
+  "./roms/",
+]
+recursive_scan = true
+
+[system]
+preferred_languages = [
+  "Spanish",
+  "AmericanEnglish",
+]
+keys = "./keys/"

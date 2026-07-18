@@ -4,16 +4,14 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use swiitx_config::SwiitxConfig;
 use swiitx_loader_content::{NcaFormatVersion, NcaKeySet};
 use swiitx_loader_title::{
-    CnmtExtendedHeader, EntryKind, NcaInspection, TitleInspection, TitleInspector,
+    CnmtExtendedHeader, EntryKind, NacpLanguage, NcaInspection, TitleInspection, TitleInspector,
 };
 
-const DEFAULT_KEYS_DIR: &str = "keys";
-
 struct CliArguments {
-    title_path: PathBuf,
-    keys_dir: Option<PathBuf>,
+    config_path: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -34,9 +32,14 @@ fn main() -> ExitCode {
         }
     };
 
-    match inspect_title(arguments) {
-        Ok(inspection) => {
-            print_inspection(&inspection);
+    match inspect_titles(arguments) {
+        Ok((inspections, preferred_languages)) => {
+            for (index, inspection) in inspections.iter().enumerate() {
+                if index != 0 {
+                    println!();
+                }
+                print_inspection(inspection, &preferred_languages);
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -48,11 +51,10 @@ fn main() -> ExitCode {
 
 fn print_usage(program: &OsString) {
     eprintln!(
-        "Usage: {} [--keys-dir <directory>] <title-path>\n\n\
-         Inspect an NSP file or a directory containing title packages.\n\
-         Pass --keys-dir to inspect encrypted NCA headers and sections with\n\
-         caller-owned prod.keys and optional title.keys files. If omitted,\n\
-         the CLI uses keys/ when keys/prod.keys exists.",
+        "Usage: {} [--config <file>]\n\n\
+         Inspect the title-library paths from the shared configuration.\n\
+         Pass --config to select a TOML file explicitly. Otherwise the CLI uses\n\
+         SWIITX_CONFIG, ./swiitx.toml, or the platform user configuration.",
         program.to_string_lossy()
     );
 }
@@ -60,65 +62,66 @@ fn print_usage(program: &OsString) {
 fn parse_arguments(
     arguments: impl Iterator<Item = OsString>,
 ) -> Result<Option<CliArguments>, String> {
-    let mut title_path = None;
-    let mut keys_dir = None;
-    let mut positional_only = false;
-    let mut arguments = arguments.peekable();
+    let mut config_path = None;
+    let mut arguments = arguments;
 
     while let Some(argument) = arguments.next() {
-        if !positional_only && (argument == "-h" || argument == "--help") {
+        if argument == "-h" || argument == "--help" {
             return Ok(None);
         }
-        if !positional_only && argument == "--" {
-            positional_only = true;
-            continue;
-        }
-        if !positional_only && argument == "--keys-dir" {
-            if keys_dir.is_some() {
-                return Err("--keys-dir may only be specified once".to_owned());
+        if argument == "--config" {
+            if config_path.is_some() {
+                return Err("--config may only be specified once".to_owned());
             }
-            let directory = arguments
+            let path = arguments
                 .next()
-                .ok_or_else(|| "--keys-dir requires a directory path".to_owned())?;
-            keys_dir = Some(PathBuf::from(directory));
+                .ok_or_else(|| "--config requires a file path".to_owned())?;
+            config_path = Some(PathBuf::from(path));
             continue;
         }
-        if !positional_only && argument.to_string_lossy().starts_with('-') {
-            return Err(format!("unknown option: {}", argument.to_string_lossy()));
-        }
-        if title_path.replace(PathBuf::from(argument)).is_some() {
-            return Err("expected exactly one title path".to_owned());
-        }
+        return Err(format!("unknown argument: {}", argument.to_string_lossy()));
     }
 
-    let title_path = title_path.ok_or_else(|| "a title path is required".to_owned())?;
-    Ok(Some(CliArguments {
-        title_path,
-        keys_dir,
-    }))
+    Ok(Some(CliArguments { config_path }))
 }
 
-fn inspect_title(arguments: CliArguments) -> Result<TitleInspection, String> {
-    let keys_dir = arguments.keys_dir.or_else(default_keys_dir);
-    let Some(keys_dir) = keys_dir else {
-        return TitleInspector::inspect(arguments.title_path).map_err(|error| error.to_string());
+fn inspect_titles(
+    arguments: CliArguments,
+) -> Result<(Vec<TitleInspection>, Vec<NacpLanguage>), String> {
+    let config = match arguments.config_path {
+        Some(path) => SwiitxConfig::load(path).map_err(|error| error.to_string())?,
+        None => SwiitxConfig::load_discovered()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "no configuration found; pass --config or create swiitx.toml".to_owned()
+            })?,
     };
+
+    let paths = config.library.paths.clone();
+    if paths.is_empty() {
+        return Err("the configuration has no library paths".to_owned());
+    }
+
+    let options = config.library.scan_options();
+    let preferred_languages = config.system.preferred_languages.clone();
+    let keys_dir = config.system.keys;
 
     let prod_keys = keys_dir.join("prod.keys");
     let title_keys_path = keys_dir.join("title.keys");
     let title_keys = title_keys_path.is_file().then_some(title_keys_path);
     let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
         .map_err(|error| error.to_string())?;
-    TitleInspector::inspect_with_key_set(arguments.title_path, &mut keys)
-        .map_err(|error| error.to_string())
+    let inspections = paths
+        .into_iter()
+        .map(|path| {
+            TitleInspector::inspect_with_key_set_and_options(path, &mut keys, options)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((inspections, preferred_languages))
 }
 
-fn default_keys_dir() -> Option<PathBuf> {
-    let directory = PathBuf::from(DEFAULT_KEYS_DIR);
-    directory.join("prod.keys").is_file().then_some(directory)
-}
-
-fn print_inspection(inspection: &TitleInspection) {
+fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLanguage]) {
     println!("Title: {}", inspection.path.display());
     println!("Packages: {}", inspection.packages.len());
 
@@ -225,6 +228,13 @@ fn print_inspection(inspection: &TitleInspection) {
 
         if let Some(control) = &package.control_metadata {
             println!("  Control metadata:");
+            if let Some((language, title)) = control.nacp.preferred_title(preferred_languages) {
+                println!("    Preferred title ({language}): {}", title.name);
+                println!("    Preferred publisher: {}", title.publisher);
+            }
+            if let Some(icon) = control.preferred_icon(preferred_languages) {
+                println!("    Preferred icon: {} ({})", icon.filename, icon.language);
+            }
             for (language, title) in control.nacp.localized_titles() {
                 println!("    {language}:");
                 println!("      Name: {}", title.name);
@@ -500,24 +510,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_keys_directory_and_title_path() {
-        let arguments = parse_arguments(os_arguments(&[
-            "--keys-dir",
-            "keys",
-            "roms/Baba is You [NSP]",
-        ]))
-        .unwrap()
-        .unwrap();
+    fn parses_config() {
+        let arguments = parse_arguments(os_arguments(&["--config", "custom.toml"]))
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(arguments.keys_dir, Some(PathBuf::from("keys")));
-        assert_eq!(
-            arguments.title_path,
-            PathBuf::from("roms/Baba is You [NSP]")
-        );
+        assert_eq!(arguments.config_path, Some(PathBuf::from("custom.toml")));
     }
 
     #[test]
-    fn accepts_help_without_a_title_path() {
+    fn accepts_help() {
         assert!(
             parse_arguments(os_arguments(&["--help"]))
                 .unwrap()
@@ -526,7 +528,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_title_paths() {
-        assert!(parse_arguments(os_arguments(&["first", "second"])).is_err());
+    fn accepts_no_arguments_for_config_discovery() {
+        let arguments = parse_arguments(os_arguments(&[])).unwrap().unwrap();
+
+        assert_eq!(arguments.config_path, None);
+    }
+
+    #[test]
+    fn rejects_every_other_argument() {
+        for arguments in [
+            &["title.nsp"][..],
+            &["--keys-dir", "keys"][..],
+            &["--"][..],
+            &["--unknown"][..],
+        ] {
+            assert!(parse_arguments(os_arguments(arguments)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_duplicate_config_values() {
+        assert!(parse_arguments(os_arguments(&["--config"])).is_err());
+        assert!(
+            parse_arguments(os_arguments(&[
+                "--config", "one.toml", "--config", "two.toml"
+            ]))
+            .is_err()
+        );
     }
 }
