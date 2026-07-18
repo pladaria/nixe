@@ -2,6 +2,7 @@
 
 mod catalog;
 mod control;
+mod discovery;
 mod error;
 mod inspection;
 mod nsp_metadata;
@@ -11,11 +12,11 @@ mod resolver;
 
 pub use catalog::TitleCatalog;
 pub use control::{ControlIcon, ControlMetadata};
+pub use discovery::{DirectoryScanOptions, PackageFormat};
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
-    NcaInspection, NcaSectionInspection, PackageFormat, PackageInspection, TitleInspection,
-    TitleInspector,
+    NcaInspection, NcaSectionInspection, PackageInspection, TitleInspection, TitleInspector,
 };
 pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
 pub use resolved_title::ResolvedTitle;
