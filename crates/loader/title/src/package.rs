@@ -1,6 +1,9 @@
 use std::fmt::{Debug, Display, Formatter};
 
+use swiitx_loader_content::{CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType};
 use swiitx_loader_storage::StorageRef;
+
+use crate::TitleError;
 
 /// Identifies an application to which base, patch, and add-on content belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,6 +77,60 @@ pub struct PackageMetadata {
     pub source: StorageRef,
 }
 
+impl PackageMetadata {
+    /// Creates title-domain package metadata from canonical binary CNMT.
+    pub fn from_content_meta(
+        content_meta: &CnmtContentMeta,
+        source: StorageRef,
+    ) -> Result<Self, TitleError> {
+        let (content_type, application_id) = match (
+            content_meta.content_meta_type,
+            &content_meta.extended_header,
+        ) {
+            (CnmtMetaType::Application, CnmtExtendedHeader::Application { .. }) => (
+                ContentType::Application,
+                ApplicationId::new(content_meta.title_id),
+            ),
+            (CnmtMetaType::Patch, CnmtExtendedHeader::Patch { application_id, .. }) => {
+                (ContentType::Patch, ApplicationId::new(*application_id))
+            }
+            (
+                CnmtMetaType::AddOnContent,
+                CnmtExtendedHeader::AddOnContent { application_id, .. }
+                | CnmtExtendedHeader::LegacyAddOnContent { application_id, .. },
+            ) => (
+                ContentType::AddOnContent,
+                ApplicationId::new(*application_id),
+            ),
+            (CnmtMetaType::Delta, CnmtExtendedHeader::Delta { application_id, .. }) => {
+                (ContentType::Delta, ApplicationId::new(*application_id))
+            }
+            (
+                CnmtMetaType::Application
+                | CnmtMetaType::Patch
+                | CnmtMetaType::AddOnContent
+                | CnmtMetaType::Delta,
+                _,
+            ) => {
+                return Err(TitleError::IncompatibleContentMetaHeader {
+                    content_meta_type: content_meta.content_meta_type,
+                });
+            }
+            (content_meta_type, _) => {
+                return Err(TitleError::UnsupportedContentMetaType { content_meta_type });
+            }
+        };
+
+        Ok(Self {
+            title_id: TitleId::new(content_meta.title_id),
+            application_id,
+            version: content_meta.version,
+            content_type,
+            source,
+        })
+    }
+}
+
 impl Debug for PackageMetadata {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -84,5 +141,169 @@ impl Debug for PackageMetadata {
             .field("content_type", &self.content_type)
             .field("source", &"<storage>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use swiitx_loader_content::{CnmtInstallType, CnmtPlatform};
+    use swiitx_loader_storage::{Storage, StorageError};
+
+    use super::*;
+
+    const TITLE_ID: u64 = 0x0100_1234_5678_9800;
+    const APPLICATION_ID: u64 = 0x0100_1234_5678_9000;
+
+    #[derive(Debug)]
+    struct EmptyStorage;
+
+    impl Storage for EmptyStorage {
+        fn len(&self) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), StorageError> {
+            if offset == 0 && buffer.is_empty() {
+                Ok(())
+            } else {
+                Err(StorageError::OutOfBounds)
+            }
+        }
+    }
+
+    fn content_meta(
+        content_meta_type: CnmtMetaType,
+        extended_header: CnmtExtendedHeader,
+    ) -> CnmtContentMeta {
+        CnmtContentMeta {
+            title_id: TITLE_ID,
+            version: 42,
+            content_meta_type,
+            platform: CnmtPlatform::Nx,
+            extended_header_size: 0,
+            attributes: 0,
+            storage_id: 0,
+            install_type: CnmtInstallType::Full,
+            committed: true,
+            required_download_system_version: 0,
+            reserved: [0; 4],
+            extended_header,
+            contents: Vec::new(),
+            content_meta: Vec::new(),
+            extended_data_size: 0,
+            digest: [0; 32],
+        }
+    }
+
+    #[test]
+    fn converts_supported_content_meta_types() {
+        let cases = [
+            (
+                CnmtMetaType::Application,
+                CnmtExtendedHeader::Application {
+                    patch_id: TITLE_ID + 0x800,
+                    required_system_version: 0,
+                    required_application_version: 0,
+                },
+                ContentType::Application,
+                TITLE_ID,
+            ),
+            (
+                CnmtMetaType::Patch,
+                CnmtExtendedHeader::Patch {
+                    application_id: APPLICATION_ID,
+                    required_system_version: 0,
+                    extended_data_size: 0,
+                    reserved: [0; 8],
+                },
+                ContentType::Patch,
+                APPLICATION_ID,
+            ),
+            (
+                CnmtMetaType::AddOnContent,
+                CnmtExtendedHeader::AddOnContent {
+                    application_id: APPLICATION_ID,
+                    required_application_version: 0,
+                    content_accessibilities: 0,
+                    padding: [0; 3],
+                    data_patch_id: 0,
+                },
+                ContentType::AddOnContent,
+                APPLICATION_ID,
+            ),
+            (
+                CnmtMetaType::AddOnContent,
+                CnmtExtendedHeader::LegacyAddOnContent {
+                    application_id: APPLICATION_ID,
+                    required_application_version: 0,
+                    padding: 0,
+                },
+                ContentType::AddOnContent,
+                APPLICATION_ID,
+            ),
+            (
+                CnmtMetaType::Delta,
+                CnmtExtendedHeader::Delta {
+                    application_id: APPLICATION_ID,
+                    extended_data_size: 0,
+                    padding: 0,
+                },
+                ContentType::Delta,
+                APPLICATION_ID,
+            ),
+        ];
+
+        for (content_meta_type, extended_header, expected_type, expected_application_id) in cases {
+            let source: StorageRef = Arc::new(EmptyStorage);
+            let package = PackageMetadata::from_content_meta(
+                &content_meta(content_meta_type, extended_header),
+                source.clone(),
+            )
+            .unwrap();
+
+            assert_eq!(package.title_id, TitleId::new(TITLE_ID));
+            assert_eq!(
+                package.application_id,
+                ApplicationId::new(expected_application_id)
+            );
+            assert_eq!(package.version, 42);
+            assert_eq!(package.content_type, expected_type);
+            assert!(Arc::ptr_eq(&package.source, &source));
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_content_meta_type() {
+        let source: StorageRef = Arc::new(EmptyStorage);
+        let metadata = content_meta(CnmtMetaType::SystemProgram, CnmtExtendedHeader::None);
+
+        assert_eq!(
+            PackageMetadata::from_content_meta(&metadata, source).unwrap_err(),
+            TitleError::UnsupportedContentMetaType {
+                content_meta_type: CnmtMetaType::SystemProgram,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_extended_header() {
+        let source: StorageRef = Arc::new(EmptyStorage);
+        let metadata = content_meta(
+            CnmtMetaType::Patch,
+            CnmtExtendedHeader::Application {
+                patch_id: 0,
+                required_system_version: 0,
+                required_application_version: 0,
+            },
+        );
+
+        assert_eq!(
+            PackageMetadata::from_content_meta(&metadata, source).unwrap_err(),
+            TitleError::IncompatibleContentMetaHeader {
+                content_meta_type: CnmtMetaType::Patch,
+            }
+        );
     }
 }
