@@ -223,6 +223,57 @@ fn print_inspection(inspection: &TitleInspection) {
             println!("  Canonical metadata warning: {warning}");
         }
 
+        if let Some(control) = &package.control_metadata {
+            println!("  Control metadata:");
+            for (language, title) in control.nacp.localized_titles() {
+                println!("    {language}:");
+                println!("      Name: {}", title.name);
+                println!("      Publisher: {}", title.publisher);
+            }
+            let languages: Vec<_> = control
+                .supported_languages()
+                .iter()
+                .map(|language| language.to_string())
+                .collect();
+            println!(
+                "    Supported languages: {}",
+                if languages.is_empty() {
+                    "none".to_owned()
+                } else {
+                    languages.join(", ")
+                }
+            );
+            let unknown_language_bits = control.supported_languages().unknown_bits();
+            if unknown_language_bits != 0 {
+                println!("    Unknown supported-language bits: {unknown_language_bits:#010X}");
+            }
+            println!("    Display version: {}", control.nacp.display_version);
+            println!("    Program index: {}", control.nacp.program_index);
+            println!(
+                "    Startup user account: {:?}",
+                control.nacp.startup_user_account
+            );
+            println!("    Screenshot policy: {:?}", control.nacp.screenshot);
+            println!("    Video capture policy: {:?}", control.nacp.video_capture);
+            println!("    Play-log policy: {:?}", control.nacp.play_log_policy);
+            println!(
+                "    Save-data owner ID: {:016X}",
+                control.nacp.save_data_owner_id
+            );
+            println!("    Icons: {}", control.icons().len());
+            for icon in control.icons() {
+                println!(
+                    "      {}: {} ({}, JPEG)",
+                    icon.language,
+                    icon.filename,
+                    format_size(icon.size)
+                );
+            }
+        }
+        if let Some(warning) = &package.control_metadata_warning {
+            println!("  Control metadata warning: {warning}");
+        }
+
         if let Some(metadata) = &package.content_meta {
             println!("  Auxiliary content metadata:");
             println!("    Type: {}", metadata.content_type);

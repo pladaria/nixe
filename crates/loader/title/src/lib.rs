@@ -1,6 +1,7 @@
 //! Discovery and resolution of complete Nintendo Switch titles.
 
 mod catalog;
+mod control;
 mod error;
 mod inspection;
 mod nsp_metadata;
@@ -9,6 +10,7 @@ mod resolved_title;
 mod resolver;
 
 pub use catalog::TitleCatalog;
+pub use control::{ControlIcon, ControlMetadata};
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
@@ -19,7 +21,11 @@ pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataEr
 pub use resolved_title::ResolvedTitle;
 pub use resolver::TitleResolver;
 pub use swiitx_loader_content::{
-    ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType,
+    AddOnContentRegistrationType, ApplicationControlProperty, ApplicationTitle, ApplicationVersion,
+    AppropriateAgeForChina, CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType,
     CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform, ContentMetaVersion,
-    DecodedContentMetaVersion, SystemVersion,
+    CrashReportPolicy, DataLossConfirmation, DecodedContentMetaVersion, HdcpPolicy, LogoHandling,
+    LogoType, NacpLanguage, PlayLogPolicy, PlayLogQueryCapability, RuntimeAddOnContentInstall,
+    RuntimeParameterDelivery, ScreenshotPolicy, StartupUserAccount, SupportedLanguages,
+    SystemVersion, UserAccountSwitchLock, VideoCapturePolicy,
 };

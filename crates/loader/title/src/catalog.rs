@@ -6,7 +6,7 @@ use std::sync::Arc;
 use swiitx_loader_content::{CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
 
-use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta};
+use crate::nsp_metadata::{import_ticket_keys, load_canonical_content_meta, load_control_metadata};
 use crate::{ApplicationId, PackageMetadata, TitleError};
 
 /// Collection of package metadata discovered in one or more locations.
@@ -89,12 +89,20 @@ impl TitleCatalog {
                         source,
                     }
                 })?;
-            catalog
-                .add_content_meta(&content_meta, storage)
-                .map_err(|source| TitleError::PackageMetadata {
-                    path: candidate,
+            let control_metadata = load_control_metadata(&archive, &content_meta, key_provider)
+                .map_err(|source| TitleError::Package {
+                    path: candidate.clone(),
                     source,
                 })?;
+            let mut package =
+                PackageMetadata::from_content_meta(&content_meta, storage).map_err(|source| {
+                    TitleError::PackageMetadata {
+                        path: candidate.clone(),
+                        source,
+                    }
+                })?;
+            package.set_control_metadata(control_metadata);
+            catalog.add(package);
         }
 
         Ok(catalog)
