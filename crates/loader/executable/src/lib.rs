@@ -1,5 +1,6 @@
 //! Loaders for executable images that can be mapped into emulated memory.
 
+mod npdm;
 mod nro;
 mod nso;
 
@@ -7,6 +8,13 @@ use std::fmt::{Debug, Formatter};
 
 use swiitx_loader_storage::StorageRef;
 
+pub use npdm::{
+    AcidFlags, AcidMemoryRegion, AddressSpaceType, EffectiveNpdmPolicy, FileSystemAccess,
+    FileSystemPermissions, KernelCapabilities, KernelCapability, KernelMemoryMapping,
+    KernelMemoryPermission, KernelMemoryRegion, KernelVersion, Npdm, NpdmLoader, ProcessFlags,
+    ProgramType, SaveDataOwnerAccess, SaveDataOwnerId, ServiceAccess, ServiceAccessControl,
+    ServiceAccessMode,
+};
 pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
 pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange, NsoSegmentCompression};
 
