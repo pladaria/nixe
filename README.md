@@ -1,4 +1,4 @@
-# Swiix
+# Swiitx
 
 This is an educational and experimental project written in Rust. Its long-term goal is to research and build
 functional emulators for Nintendo Switch and Nintendo Switch 2 while sharing well-defined components between
