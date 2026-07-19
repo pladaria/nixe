@@ -5,6 +5,7 @@ use core::fmt;
 use crate::{
     address::{AddressSpaceId, GuestVirtualAddress},
     location::{InstructionEncoding, LocationDescriptor},
+    profile::{CapabilityStatus, InstructionFeature, InstructionFeatureRejection},
 };
 
 /// Reproduction context shared by instruction decode diagnostics.
@@ -170,24 +171,23 @@ impl std::error::Error for DecodeFailure {}
 pub struct ProfileDisabledInstruction {
     /// PC, state, profile, and raw bits required to reproduce the rejection.
     pub instruction: InstructionDiagnostic,
-    /// Stable name of the missing profile capability.
-    pub required_feature: Box<str>,
-    /// Optional detail about the profile restriction.
-    pub reason: Box<str>,
+    /// Named architectural capability required by the encoding.
+    pub required_feature: InstructionFeature,
+    /// Evidence status recorded by the selected profile.
+    pub status: CapabilityStatus,
 }
 
 impl ProfileDisabledInstruction {
     /// Creates a profile-disabled instruction diagnostic.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         instruction: InstructionDiagnostic,
-        required_feature: impl Into<Box<str>>,
-        reason: impl Into<Box<str>>,
+        rejection: InstructionFeatureRejection,
     ) -> Self {
         Self {
             instruction,
-            required_feature: required_feature.into(),
-            reason: reason.into(),
+            required_feature: rejection.feature,
+            status: rejection.status,
         }
     }
 }
@@ -196,8 +196,8 @@ impl fmt::Display for ProfileDisabledInstruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "profile-disabled instruction: {} feature={} reason={}",
-            self.instruction, self.required_feature, self.reason
+            "profile-disabled instruction: {} feature={} status={}",
+            self.instruction, self.required_feature, self.status
         )
     }
 }
@@ -405,8 +405,10 @@ mod tests {
     fn distinct_error_classes_remain_machine_matchable() {
         let disabled = FrontendError::from(ProfileDisabledInstruction::new(
             instruction(),
-            "FEAT_X",
-            "disabled by selected profile",
+            InstructionFeatureRejection {
+                feature: InstructionFeature::Crc32,
+                status: CapabilityStatus::Disabled,
+            },
         ));
         let unallocated = FrontendError::from(UnallocatedEncoding::new(
             instruction(),
