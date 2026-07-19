@@ -2,7 +2,7 @@
 
 mod block;
 mod builder;
-mod op;
+pub mod op;
 mod print;
 mod terminator;
 mod types;
