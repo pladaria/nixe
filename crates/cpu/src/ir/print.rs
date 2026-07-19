@@ -1,0 +1,1 @@
+//! Stable textual IR diagnostics.

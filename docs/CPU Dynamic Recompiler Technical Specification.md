@@ -2,7 +2,7 @@
 
 Status: proposed architecture  
 Audience: CPU, memory, kernel, scheduler, and GPU implementers  
-Primary target: AArch64 guest code on AMD64 hosts  
+Primary target: Arm A64, A32, and T32 guest code on AMD64 hosts
 Applies to: Nintendo Switch and Nintendo Switch 2 research profiles
 
 ## 1. Purpose
@@ -14,13 +14,15 @@ all hardware details of either console are already known.
 The recommended engine is a specialized dynamic binary translator (DBT):
 
 ```text
-AArch64 code
-    -> decode and lift
-    -> small typed intermediate representation
-    -> bounded local optimization
-    -> AMD64 register allocation and instruction selection
-    -> executable code cache
+A64 frontend ----+
+A32 frontend ----+-> shared typed IR -> AMD64 backend -> executable code cache
+T32 frontend ----+
 ```
+
+Each frontend fetches, decodes, and lifts its execution state's encodings into
+the same host-independent IR. The shared IR and backend do not erase
+architectural differences: frontend-specific state access, PC behavior, flags,
+conditions, and interworking semantics are made explicit before lowering.
 
 An interpreter using the same architectural definitions is required alongside
 the recompiler. It is the correctness oracle, debugging engine, and fallback for
@@ -39,7 +41,7 @@ The design prioritizes, in this order:
 
 The CPU engine is responsible for:
 
-- AArch64 instruction decode and architectural semantics.
+- A64, A32, and T32 instruction decode and architectural semantics.
 - Integer, floating-point, SIMD, atomic, and system-instruction execution.
 - Guest virtual memory accesses through a defined memory interface.
 - Precise synchronous exceptions and well-defined asynchronous exits.
@@ -85,9 +87,9 @@ optimization scope, and integration complexity are poorly matched to short
 translation blocks.
 
 This choice is not an endorsement of unnecessary custom machinery. The custom
-backend should implement only the operations needed by the AArch64 frontend and
-should use small, independently testable components for encoding, register
-allocation, patching, and executable-memory management.
+backend should implement only the operations required by the supported Arm
+frontends and should use small, independently testable components for encoding,
+register allocation, patching, and executable-memory management.
 
 ## 4. Verified facts, profiles, and assumptions
 
@@ -102,6 +104,7 @@ creation. A profile describes behavior rather than a product name:
 ```rust,ignore
 pub struct GuestCpuProfile {
     pub architecture: ArchitectureRevision,
+    pub allowed_execution_states: ExecutionStateSet,
     pub address_space: AddressSpaceProfile,
     pub instruction_features: InstructionFeatures,
     pub floating_point: FloatingPointProfile,
@@ -111,8 +114,26 @@ pub struct GuestCpuProfile {
 }
 ```
 
-Switch 1 and Switch 2 select separate profiles. They may reuse the same decoder,
-IR, and backend while enabling different feature bits and platform callbacks.
+Switch 1 process metadata may select A64 or AArch32 execution. An AArch32
+process can execute A32 and T32 encodings and can interwork between those states
+where the architecture permits it. Supporting such a process therefore
+requires real A32 and T32 decoders, architectural state, and semantics; setting
+a profile bit cannot make the A64 frontend decode those instruction sets.
+
+For implementation planning, Switch 2 native processes are treated as A64.
+This is a conservative software-profile policy, not a claim that every detail
+of the Switch 2 CPU or compatibility mechanism is publicly known. A32/T32
+availability, the exact architecture revision, optional instruction features,
+and compatibility-mode execution behavior remain unresolved Switch 2 profile
+questions. They must not be inferred from the AMD64 host, Switch 1 behavior, or
+unverified SoC descriptions.
+
+Switch 1 and Switch 2 select separate profiles. A profile determines which
+execution states, encodings, and features are legal for a process, after its
+initial state has been obtained from validated process metadata. It does not
+replace any execution state's decoder, state model, or semantics. Frontends may
+reuse their declarative decoding framework, semantic primitives, IR, and
+backend while enabling different feature bits and platform callbacks.
 Unsupported encodings produce the architecturally appropriate exception; they
 must never silently execute according to the host's capabilities.
 
@@ -130,10 +151,10 @@ questions.
         +-------------------------v-------------------------+
         |                  CPU execution engine             |
         |                                                   |
-        |  decoder -> A64 semantics -> IR -> AMD64 backend  |
-        |      |          |          |          |           |
-        |      +----------+----------+----------+           |
-        |                       code cache                  |
+        |  A64 frontend --+                                |
+        |  A32 frontend --+-> shared IR -> AMD64 backend   |
+        |  T32 frontend --+                    |            |
+        |                              code cache           |
         +--------------------+-------------+----------------+
                              |             |
                        memory access   execution events
@@ -166,13 +187,14 @@ The logical crate layout should initially be:
 
 ```text
 crates/cpu/
-    state             architectural registers and status
+    state             A64 and AArch32 thread state
+    vcpu              non-architectural execution resources
     profile           feature and platform profiles
-    decode            generated or table-driven A64 decoder
+    decode            generated or table-driven A64/A32/T32 decoders
     semantics         canonical instruction behavior
     interpreter       reference executor
     ir                IR values, operations, blocks, verifier
-    translate         A64-to-IR lifting
+    translate         A64/A32/T32-to-IR lifting
 
 crates/jit/
     amd64             lowering and machine-code emission
@@ -197,13 +219,39 @@ These are logical ownership boundaries, not a requirement that every directory
 immediately become a separate crate. Circular dependencies are forbidden. In
 particular, `cpu` must not depend on `runtime` or a host graphics API.
 
-## 7. Architectural CPU state
+## 7. Process, thread, and vCPU state
 
-The canonical state lives in a stable-layout `CpuState` owned by a guest thread:
+The implementation must keep three different lifetimes and ownership domains
+separate:
+
+- `ProcessCpuContext` owns immutable profile selection and address-space
+  identity. It constrains legal execution behavior but contains no live general
+  registers.
+- `ThreadCpuState` owns the canonical architectural register state of one guest
+  thread. It has distinct A64 and AArch32 representations; CPSR.T selects A32 or
+  T32 within the AArch32 representation.
+- `VcpuExecutionState` owns resources associated with a currently executing
+  virtual CPU, such as its software TLB, dispatch budget, pending-event state,
+  safepoint data, and local exclusive monitor. These resources are not part of
+  a guest thread's register file or a persistent process state. The scheduler
+  defines how local-monitor state is handled when a thread migrates.
+
+Conceptually:
 
 ```rust,ignore
 #[repr(C)]
-pub struct CpuState {
+pub struct ProcessCpuContext {
+    pub profile_id: CpuProfileId,
+    pub address_space_id: AddressSpaceId,
+}
+
+pub enum ThreadCpuState {
+    A64(A64State),
+    A32(A32State),
+}
+
+#[repr(C)]
+pub struct A64State {
     pub x: [u64; 31],
     pub sp: u64,
     pub pc: u64,
@@ -212,16 +260,31 @@ pub struct CpuState {
     pub fpcr: u32,
     pub fpsr: u32,
     pub thread_pointer: u64,
+}
+
+#[repr(C)]
+pub struct A32State {
+    pub r: [u32; 16],
+    pub cpsr: u32,
+    // VFP/NEON storage, FPSCR, and required user-visible system state.
+}
+
+pub struct VcpuExecutionState {
+    pub software_tlb: SoftwareTlb,
     pub exclusive: ExclusiveMonitorState,
     pub pending_events: AtomicU32,
-    // Profile-selected visible system state follows through accessors.
+    pub dispatch_budget: u64,
 }
 ```
 
-This example is illustrative; the final layout is decided by generated offset
+These examples are illustrative; final layouts are decided by generated offset
 tests and ABI requirements. Important rules are:
 
-- The layout is internal and versioned. It is not a save-state format.
+- A64 state must not be used as the storage model for A32/T32 state.
+- A32 PC reads, CPSR flags, T state, register banking assumptions, and VFP/NEON
+  aliases are represented according to AArch32 semantics.
+- A32/T32 interworking updates architectural state; it is not a profile change.
+- These layouts are internal and versioned. They are not a save-state format.
 - Generated code addresses fields through checked, generated constants.
 - State visible to helpers is committed before a helper that can observe it.
 - State not observable by an exit may remain in host registers within a block.
@@ -230,14 +293,18 @@ tests and ABI requirements. Important rules are:
 - Host floating-point state is treated as scratch owned by the executor and is
   restored at all host ABI boundaries.
 
-One AMD64 nonvolatile register should normally hold `CpuState*` while guest code
-is running. Other fixed registers may hold the fastmem or dispatch base only if
+One AMD64 nonvolatile register should normally hold the active
+`ThreadCpuState` representation while guest code is running. Another fixed
+pointer or a containing execution context may expose `VcpuExecutionState` if
 benchmarks show a net benefit across supported host ABIs.
 
-## 8. Decoder and canonical semantics
+## 8. Decoders and canonical semantics
 
-The A64 decoder should be generated from a declarative instruction table or use
-a table-driven decision tree. Each entry specifies:
+Separate A64, A32, and T32 decoders should be generated from declarative
+instruction tables or use table-driven decision trees behind a shared decoder
+interface. T32 must classify and assemble its 16-bit and 32-bit encodings
+correctly; A32 conditional execution and A32/T32 interworking remain explicit.
+Each entry specifies:
 
 - Encoding mask and value.
 - Required guest feature set.
@@ -246,8 +313,9 @@ a table-driven decision tree. Each entry specifies:
 - Semantic handler.
 - Interpreter and IR-lifter coverage identifiers.
 
-The decoder must distinguish unallocated encodings from implemented but
-profile-disabled instructions.
+Each decoder must distinguish unallocated encodings from implemented but
+profile-disabled instructions and from recognized instructions whose semantics
+or IR lifting are not implemented yet.
 
 Semantics should be centralized around reusable primitives: add-with-carry,
 shift-with-carry, bit masks, saturation, floating-point conversion, vector lane
@@ -356,7 +424,8 @@ pub struct BlockKey {
     pub code_page_id: u64,
     pub code_generation: u64,
     pub profile_id: u32,
-    pub execution_context: u32,
+    pub execution_state: ExecutionState,
+    pub translation_context: TranslationContext,
 }
 ```
 
@@ -366,6 +435,11 @@ PC to a physical code-page identity before the main lookup prevents unrelated
 mapping changes from invalidating the entire code cache. A unit spanning more
 than one page records every physical page and generation as dependencies in its
 metadata rather than expanding the hot lookup key without bound.
+
+`translation_context` contains only additional state that changes decoding or
+lifting at block entry, such as T32 IT state when applicable. It is not a bag of
+arbitrary vCPU state. Direct branch exits retain the destination guest address
+and destination execution state; the dispatcher resolves those to host blocks.
 
 Small extended blocks can include a conditional branch and its fall-through
 path. Trace formation and speculative guards are optional future work and must
@@ -403,12 +477,13 @@ Allocator requirements:
 - Caller/callee-saved knowledge for every supported host ABI.
 - Rematerialization of constants and cheap address expressions.
 - Spill slots in a dedicated JIT frame, not arbitrary modifications to
-  `CpuState`.
+  `ThreadCpuState`.
 - Parallel move resolution for block exits and helper calls.
 
-The initial implementation should not pin all AArch64 registers across blocks.
-Within-block state caching delivers most of the maintainable benefit. Linked
-block entry conventions can later carry a small, measured set of live values.
+The initial implementation should not pin an execution state's entire guest
+register file across blocks. Within-block state caching delivers most of the
+maintainable benefit. Linked block entry conventions can later carry a small,
+measured set of live values.
 
 ### 11.3 Instruction selection
 
@@ -821,7 +896,8 @@ does not contain graphics API logic.
 
 The following should be shared unless testing disproves the abstraction:
 
-- A64 decoder framework and canonical semantic primitives.
+- Shared decoder-table machinery, with distinct A64, A32, and T32 tables.
+- Canonical semantic primitives where the Arm execution states genuinely agree.
 - Typed IR and verifier.
 - Interpreter framework.
 - AMD64 backend, register allocator, and host feature tiers.
@@ -839,7 +915,8 @@ checks such as `if switch2` in instruction lowering.
 
 Separate profiles or platform implementations may define:
 
-- AArch64 architecture revision and optional instruction extensions.
+- Allowed process execution states and initial-state metadata interpretation.
+- Architecture revision and optional instruction extensions for each state.
 - Visible system registers and their values.
 - Virtual-address width, page sizes, and translation rules.
 - Cache-line and exclusive-reservation granules.
@@ -866,8 +943,8 @@ The execution modes are:
 
 The interpreter and baseline JIT are mandatory. A hot tier is not assumed. If
 added, it should compile only frequently executed units and use guards with
-explicit side exits. Deoptimization metadata must reconstruct canonical
-`CpuState` at every side exit.
+explicit side exits. Deoptimization metadata must reconstruct the active
+canonical `ThreadCpuState` at every side exit.
 
 Tier counters should be sampled or incremented cheaply; an atomic counter on
 every block execution is not acceptable. Optimization must be disabled in
@@ -896,7 +973,8 @@ Required developer features are:
 
 - Single-step interpreter mode.
 - Block-level JIT stepping.
-- A64 disassembly, pre/post-optimization IR, and AMD64 disassembly dumps.
+- A64, A32, and T32 disassembly plus pre/post-optimization IR and AMD64
+  disassembly dumps.
 - Translation reason and timing traces.
 - Register and memory watchpoints.
 - Per-op fallback counters.
@@ -922,7 +1000,7 @@ bytes and execute code where the test host permits it.
 For generated instruction sequences:
 
 ```text
-same initial CpuState and memory snapshot
+same initial ProcessCpuContext, ThreadCpuState, and memory snapshot
     -> interpreter
     -> baseline JIT
 compare state, memory, exceptions, and retired instruction count
@@ -956,7 +1034,8 @@ ordering can otherwise hide missing barriers.
 
 ### 25.5 End-to-end milestones
 
-Small redistributable AArch64 test programs should precede commercial software:
+Small redistributable A64, A32, T32, and mixed A32/T32 test programs should
+precede commercial software:
 
 - Integer and branch tests.
 - Virtual memory and permission faults.
@@ -1087,7 +1166,8 @@ essential for a maintainable JIT. The interpreter is not temporary scaffolding.
 
 ### Phase 0: contracts and test harness
 
-- Define `CpuState`, profiles, memory access results, and exit reasons.
+- Define `ProcessCpuContext`, `ThreadCpuState`, `VcpuExecutionState`, profiles,
+  execution-state selection, memory access results, and exit reasons.
 - Implement executable-memory abstraction and a minimal AMD64 call trampoline.
 - Establish interpreter/JIT differential harness.
 
@@ -1095,7 +1175,10 @@ Exit: a generated block can enter and leave Rust safely on supported host ABIs.
 
 ### Phase 1: scalar interpreter
 
-- Decode core A64 integer, branch, load/store, and exception instructions.
+- Establish separate A64, A32, and T32 decoder skeletons behind one interface.
+- Decode the core A64 integer, branch, load/store, and exception subset first,
+  then add A32/T32 subsets according to redistributable tests and observed
+  workloads.
 - Map executable segments into the new memory service.
 - Run small test programs through runtime syscall callbacks.
 
@@ -1104,7 +1187,8 @@ faults.
 
 ### Phase 2: scalar baseline JIT
 
-- Lift scalar instructions to verified IR.
+- Lift implemented scalar instructions from each enabled execution state to
+  verified shared IR.
 - Add linear-scan allocation and conservative AMD64 lowering.
 - Add block lookup, bounded cache, and interpreter fallback.
 
@@ -1121,7 +1205,8 @@ Exit: memory, alias, self-modifying code, and concurrent invalidation suites pas
 
 ### Phase 4: FP, NEON, and atomics
 
-- Complete architectural FP control/status behavior.
+- Expand A32/T32 scalar and interworking coverage required by Switch 1 titles.
+- Complete execution-state-specific architectural FP control/status behavior.
 - Add vector IR and tiered AMD64 SIMD lowering.
 - Implement exclusive monitors, atomics, barriers, and multicore tests.
 
@@ -1150,7 +1235,14 @@ lowering code.
 The following require prototypes or additional lawful research before becoming
 decisions:
 
-- Exact CPU feature profiles and visible system-register behavior per platform.
+- Exact Switch 1 CPU feature profiles and visible system-register behavior.
+- Whether verified Switch 2 native process metadata permits any execution state
+  other than A64; the provisional native profile remains A64-only meanwhile.
+- Exact Switch 2 architecture revision, instruction extensions, visible system
+  registers, and feature-disabled encoding behavior.
+- Whether Switch 2 compatibility uses native A32/T32 execution, CPU binary
+  translation, pretranslated code, or another mechanism; no CPU frontend
+  capability is derived from the public compatibility description alone.
 - Guest page-table and address-space details exposed to the emulator runtime.
 - Required fidelity of cache-maintenance operations for titles and system code.
 - Whether software-TLB fastmem meets performance targets on Windows, Linux, and
@@ -1196,3 +1288,9 @@ alternatives, benchmark/test method, and compatibility impact.
   — required handling of non-coherent host-visible memory.
 - [Nintendo Switch 2 official specifications](https://www.nintendo.com/en-gb/Hardware/Nintendo-Switch-2/Nintendo-Switch-2-Specifications-2785627.html)
   — limits of officially published processor detail.
+- [Switchbrew NPDM documentation](https://switchbrew.org/wiki/NPDM) — public
+  process metadata research describing the 32/64-bit instruction-mode flag and
+  address-space selection used by Switch 1 software.
+- [Nintendo Switch 2 developer interview, Chapter 4](https://www.nintendo.com/en-gb/News/2025/April/Ask-the-Developer-Vol-16-Nintendo-Switch-2-Chapter-4-2787954.html)
+  — Nintendo's high-level description of its compatibility translation; it
+  does not specify a CPU ISA implementation mechanism.
