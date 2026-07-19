@@ -15,7 +15,25 @@ both platforms whenever technically appropriate.
 
 ## Project Status
 
-The project is currently in the planning and research phase.
+The project is currently in an early development and research phase.
+
+Milestones:
+
+- Content
+  - [x] Random-access storage abstraction with bounded sub-storage views.
+  - [x] User-supplied key management; cryptographic keys are never bundled or downloaded.
+  - [x] NSP/PFS0 and XCI/HFS0 package loading.
+  - [x] NSZ, XCZ, and NCZ compressed package support.
+  - [x] Block-compressed random access and progressive caching for solid NCZ streams.
+  - [x] NCA header parsing, section discovery, decryption, and integrity validation.
+  - [x] ExeFS and RomFS filesystem loading.
+  - [x] BKTR patch RomFS composition using base and update content.
+  - [x] CNMT and NACP metadata parsing.
+  - [x] Title names, publishers, languages, versions, properties, and icons.
+  - [x] Recursive package discovery and title cataloguing.
+  - [x] Base application, update, DLC, duplicate, and conflict resolution.
+- Executable formats
+  - [x] NRO executable loading with segments, BSS, metadata, and optional ASET support.
 
 ## Legal Notice
 
