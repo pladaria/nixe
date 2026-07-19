@@ -1,0 +1,1 @@
+//! Structured CPU frontend diagnostics.
