@@ -117,7 +117,7 @@ impl XciPartitionKind {
 pub struct XciPartition {
     kind: XciPartitionKind,
     root_entry: Hfs0Entry,
-    root_entry_integrity: Hfs0HashResult,
+    root_entry_integrity: Option<Hfs0HashResult>,
     archive: Hfs0Archive,
 }
 
@@ -134,8 +134,8 @@ impl XciPartition {
         &self.root_entry
     }
 
-    pub fn root_entry_integrity(&self) -> &Hfs0HashResult {
-        &self.root_entry_integrity
+    pub fn root_entry_integrity(&self) -> Option<&Hfs0HashResult> {
+        self.root_entry_integrity.as_ref()
     }
 
     pub fn archive(&self) -> &Hfs0Archive {
@@ -155,7 +155,7 @@ impl XciPartition {
 #[derive(Debug)]
 pub struct XciArchive {
     header: XciHeader,
-    root_header_integrity: XciRootHeaderIntegrity,
+    root_header_integrity: Option<XciRootHeaderIntegrity>,
     root: Hfs0Archive,
     partitions: Vec<XciPartition>,
 }
@@ -165,8 +165,8 @@ impl XciArchive {
         &self.header
     }
 
-    pub fn root_header_integrity(&self) -> &XciRootHeaderIntegrity {
-        &self.root_header_integrity
+    pub fn root_header_integrity(&self) -> Option<&XciRootHeaderIntegrity> {
+        self.root_header_integrity.as_ref()
     }
 
     pub fn root(&self) -> &Hfs0Archive {
@@ -216,146 +216,188 @@ impl FormatLoader for XciLoader {
     const FORMAT_NAME: &'static str = "XCI";
 
     fn load(storage: StorageRef) -> Result<Self::Output, LoadError> {
-        let storage_len = storage.len()?;
-        if storage_len < PUBLIC_HEADER_SIZE {
-            return Err(LoadError::invalid(Self::FORMAT_NAME, "header is truncated"));
-        }
-        let mut bytes = [0_u8; PUBLIC_HEADER_SIZE as usize];
-        storage.read_at(0, &mut bytes)?;
-        if &bytes[0x100..0x104] != b"HEAD" {
-            return Err(LoadError::invalid(Self::FORMAT_NAME, "expected HEAD magic"));
-        }
+        load_xci(storage, XciValidation::Strict)
+    }
+}
 
-        let title_key_index_raw = bytes[0x10c];
-        let header = XciHeader {
-            rsa_signature: bytes[..0x100].try_into().expect("validated XCI header"),
-            secure_area_start_page: read_u32(&bytes, 0x104),
-            backup_area_start_page: read_u32(&bytes, 0x108),
-            title_key_index_raw,
-            title_key_decryption_index: title_key_index_raw >> 4,
-            key_index: title_key_index_raw & 0x0f,
-            card_size_code: bytes[0x10d],
-            header_version: bytes[0x10e],
-            flags: bytes[0x10f],
-            package_id: read_u64(&bytes, 0x110),
-            valid_data_end_page: read_u32(&bytes, 0x118),
-            secondary_header_fields: bytes[0x11c..0x120]
-                .try_into()
-                .expect("validated XCI header"),
-            iv: bytes[0x120..0x130]
-                .try_into()
-                .expect("validated XCI header"),
-            root_hfs0_offset: read_u64(&bytes, 0x130),
-            root_hfs0_header_size: read_u64(&bytes, 0x138),
-            root_hfs0_header_hash: bytes[0x140..0x160]
-                .try_into()
-                .expect("validated XCI header"),
-            initial_data_hash: bytes[0x160..0x180]
-                .try_into()
-                .expect("validated XCI header"),
-            secure_mode: read_u32(&bytes, 0x180),
-            title_key_flag: read_u32(&bytes, 0x184),
-            key_flag: read_u32(&bytes, 0x188),
-            area_limit_page: read_u32(&bytes, 0x18c),
-            encrypted_gamecard_info: bytes[0x190..0x200]
-                .try_into()
-                .expect("validated XCI header"),
-        };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XciValidation {
+    Strict,
+    Compressed,
+}
 
-        header.secure_area_start_offset().ok_or_else(|| {
-            LoadError::invalid(Self::FORMAT_NAME, "secure-area page address overflows")
-        })?;
-        header.backup_area_start_offset().ok_or_else(|| {
-            LoadError::invalid(Self::FORMAT_NAME, "backup-area page address overflows")
-        })?;
-        header.area_limit_offset().ok_or_else(|| {
-            LoadError::invalid(Self::FORMAT_NAME, "area-limit page address overflows")
-        })?;
-        let valid_data_end = header.valid_data_end_offset().ok_or_else(|| {
-            LoadError::invalid(Self::FORMAT_NAME, "valid-data-end address overflows")
-        })?;
-        if valid_data_end > storage_len {
-            return Err(LoadError::invalid(
-                Self::FORMAT_NAME,
-                "declared valid-data range is outside the image",
-            ));
-        }
-        let root_header_end = header
-            .root_hfs0_offset
-            .checked_add(header.root_hfs0_header_size)
-            .ok_or_else(|| LoadError::invalid(Self::FORMAT_NAME, "root HFS0 header overflows"))?;
-        if root_header_end > valid_data_end {
-            return Err(LoadError::invalid(
-                Self::FORMAT_NAME,
-                "root HFS0 header is outside the declared valid-data range",
-            ));
-        }
-        let root_extent = valid_data_end
-            .checked_sub(header.root_hfs0_offset)
-            .ok_or_else(|| LoadError::invalid(Self::FORMAT_NAME, "root HFS0 offset is invalid"))?;
-        let root_storage: StorageRef = Arc::new(SubStorage::new(
-            storage,
-            header.root_hfs0_offset,
-            root_extent,
-        )?);
+pub(crate) fn load_compressed_xci(storage: StorageRef) -> Result<XciArchive, LoadError> {
+    load_xci(storage, XciValidation::Compressed)
+}
+
+fn load_xci(storage: StorageRef, validation: XciValidation) -> Result<XciArchive, LoadError> {
+    let storage_len = storage.len()?;
+    if storage_len < PUBLIC_HEADER_SIZE {
+        return Err(LoadError::invalid(
+            XciLoader::FORMAT_NAME,
+            "header is truncated",
+        ));
+    }
+    let mut bytes = [0_u8; PUBLIC_HEADER_SIZE as usize];
+    storage.read_at(0, &mut bytes)?;
+    if &bytes[0x100..0x104] != b"HEAD" {
+        return Err(LoadError::invalid(
+            XciLoader::FORMAT_NAME,
+            "expected HEAD magic",
+        ));
+    }
+
+    let title_key_index_raw = bytes[0x10c];
+    let header = XciHeader {
+        rsa_signature: bytes[..0x100].try_into().expect("validated XCI header"),
+        secure_area_start_page: read_u32(&bytes, 0x104),
+        backup_area_start_page: read_u32(&bytes, 0x108),
+        title_key_index_raw,
+        title_key_decryption_index: title_key_index_raw >> 4,
+        key_index: title_key_index_raw & 0x0f,
+        card_size_code: bytes[0x10d],
+        header_version: bytes[0x10e],
+        flags: bytes[0x10f],
+        package_id: read_u64(&bytes, 0x110),
+        valid_data_end_page: read_u32(&bytes, 0x118),
+        secondary_header_fields: bytes[0x11c..0x120]
+            .try_into()
+            .expect("validated XCI header"),
+        iv: bytes[0x120..0x130]
+            .try_into()
+            .expect("validated XCI header"),
+        root_hfs0_offset: read_u64(&bytes, 0x130),
+        root_hfs0_header_size: read_u64(&bytes, 0x138),
+        root_hfs0_header_hash: bytes[0x140..0x160]
+            .try_into()
+            .expect("validated XCI header"),
+        initial_data_hash: bytes[0x160..0x180]
+            .try_into()
+            .expect("validated XCI header"),
+        secure_mode: read_u32(&bytes, 0x180),
+        title_key_flag: read_u32(&bytes, 0x184),
+        key_flag: read_u32(&bytes, 0x188),
+        area_limit_page: read_u32(&bytes, 0x18c),
+        encrypted_gamecard_info: bytes[0x190..0x200]
+            .try_into()
+            .expect("validated XCI header"),
+    };
+
+    header.secure_area_start_offset().ok_or_else(|| {
+        LoadError::invalid(XciLoader::FORMAT_NAME, "secure-area page address overflows")
+    })?;
+    header.backup_area_start_offset().ok_or_else(|| {
+        LoadError::invalid(XciLoader::FORMAT_NAME, "backup-area page address overflows")
+    })?;
+    header.area_limit_offset().ok_or_else(|| {
+        LoadError::invalid(XciLoader::FORMAT_NAME, "area-limit page address overflows")
+    })?;
+    let valid_data_end = header.valid_data_end_offset().ok_or_else(|| {
+        LoadError::invalid(XciLoader::FORMAT_NAME, "valid-data-end address overflows")
+    })?;
+    if validation == XciValidation::Strict && valid_data_end > storage_len {
+        return Err(LoadError::invalid(
+            XciLoader::FORMAT_NAME,
+            "declared valid-data range is outside the image",
+        ));
+    }
+    let root_header_end = header
+        .root_hfs0_offset
+        .checked_add(header.root_hfs0_header_size)
+        .ok_or_else(|| LoadError::invalid(XciLoader::FORMAT_NAME, "root HFS0 header overflows"))?;
+    let physical_data_end = match validation {
+        XciValidation::Strict => valid_data_end,
+        XciValidation::Compressed => storage_len,
+    };
+    if root_header_end > physical_data_end {
+        return Err(LoadError::invalid(
+            XciLoader::FORMAT_NAME,
+            "root HFS0 header is outside the image data range",
+        ));
+    }
+    let root_extent = physical_data_end
+        .checked_sub(header.root_hfs0_offset)
+        .ok_or_else(|| LoadError::invalid(XciLoader::FORMAT_NAME, "root HFS0 offset is invalid"))?;
+    let root_storage: StorageRef = Arc::new(SubStorage::new(
+        storage,
+        header.root_hfs0_offset,
+        root_extent,
+    )?);
+    let root_header_integrity = if validation == XciValidation::Strict {
         let actual_hash = hash_prefix(&root_storage, header.root_hfs0_header_size)?;
-        let root_header_integrity = XciRootHeaderIntegrity {
+        let integrity = XciRootHeaderIntegrity {
             expected: header.root_hfs0_header_hash,
             actual: actual_hash,
         };
-        if !root_header_integrity.is_valid() {
+        if !integrity.is_valid() {
             return Err(LoadError::invalid(
-                Self::FORMAT_NAME,
+                XciLoader::FORMAT_NAME,
                 "root HFS0 header hash does not match",
             ));
         }
+        Some(integrity)
+    } else {
+        None
+    };
 
-        let root = Hfs0Loader::load(root_storage)?;
-        if root.data_offset() != header.root_hfs0_header_size {
+    let root = match validation {
+        XciValidation::Strict => Hfs0Loader::load(root_storage)?,
+        XciValidation::Compressed => Hfs0Archive::parse_xcz(root_storage, "XCZ root HFS0")?,
+    };
+    if validation == XciValidation::Strict && root.data_offset() != header.root_hfs0_header_size {
+        return Err(LoadError::invalid(
+            XciLoader::FORMAT_NAME,
+            "root HFS0 metadata size does not match the header declaration",
+        ));
+    }
+    let mut partitions = Vec::with_capacity(root.entries().len());
+    let mut names = HashSet::with_capacity(root.entries().len());
+    for entry in root.entries() {
+        let folded = entry.name().to_ascii_lowercase();
+        if !names.insert(folded) {
             return Err(LoadError::invalid(
-                Self::FORMAT_NAME,
-                "root HFS0 metadata size does not match the header declaration",
+                XciLoader::FORMAT_NAME,
+                "root partition names are ambiguous when compared case-insensitively",
             ));
         }
-        let mut partitions = Vec::with_capacity(root.entries().len());
-        let mut names = HashSet::with_capacity(root.entries().len());
-        for entry in root.entries() {
-            let folded = entry.name().to_ascii_lowercase();
-            if !names.insert(folded) {
-                return Err(LoadError::invalid(
-                    Self::FORMAT_NAME,
-                    "root partition names are ambiguous when compared case-insensitively",
-                ));
-            }
-            let kind = XciPartitionKind::from_name(entry.name())?;
+        let kind = XciPartitionKind::from_name(entry.name())?;
+        let integrity = if validation == XciValidation::Strict || entry.has_advertised_hash() {
             let integrity = root.validate_entry(entry)?;
             if !integrity.is_valid() {
                 return Err(LoadError::invalid(
-                    Self::FORMAT_NAME,
+                    XciLoader::FORMAT_NAME,
                     format!(
                         "root partition {} failed HFS0 hash validation",
                         entry.name()
                     ),
                 ));
             }
-            let partition_storage = root.open_entry(entry)?;
-            let archive = Hfs0Archive::parse(partition_storage, "XCI partition HFS0")
-                .map_err(|error| contextual_partition_error(entry.name(), error))?;
-            partitions.push(XciPartition {
-                kind,
-                root_entry: entry.clone(),
-                root_entry_integrity: integrity,
-                archive,
-            });
+            Some(integrity)
+        } else {
+            None
+        };
+        let partition_storage = root.open_entry(entry)?;
+        let archive = match validation {
+            XciValidation::Strict => Hfs0Archive::parse(partition_storage, "XCI partition HFS0"),
+            XciValidation::Compressed => {
+                Hfs0Archive::parse_xcz(partition_storage, "XCZ partition HFS0")
+            }
         }
-
-        Ok(XciArchive {
-            header,
-            root_header_integrity,
-            root,
-            partitions,
-        })
+        .map_err(|error| contextual_partition_error(entry.name(), error))?;
+        partitions.push(XciPartition {
+            kind,
+            root_entry: entry.clone(),
+            root_entry_integrity: integrity,
+            archive,
+        });
     }
+
+    Ok(XciArchive {
+        header,
+        root_header_integrity,
+        root,
+        partitions,
+    })
 }
 
 fn contextual_partition_error(name: &str, error: LoadError) -> LoadError {
@@ -486,7 +528,7 @@ mod tests {
             ("future", &unknown),
         ]))
         .unwrap();
-        assert!(archive.root_header_integrity().is_valid());
+        assert!(archive.root_header_integrity().unwrap().is_valid());
         assert_eq!(archive.header().title_key_index_raw, 0xab);
         assert_eq!(archive.header().title_key_decryption_index, 0x0a);
         assert_eq!(archive.header().key_index, 0x0b);

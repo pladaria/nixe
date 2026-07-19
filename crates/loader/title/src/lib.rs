@@ -16,8 +16,9 @@ pub use discovery::{DirectoryScanOptions, PackageFormat};
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
-    NcaInspection, NcaSectionInspection, PackageInspection, TitleInspection, TitleInspector,
-    XciInspection, XciPartitionInspection,
+    NcaInspection, NcaSectionInspection, NczInspection, NczSectionInspection, PackageInspection,
+    StandaloneNczInspection, TitleInspection, TitleInspector, XciInspection,
+    XciPartitionInspection,
 };
 pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
 pub use resolved_title::ResolvedTitle;

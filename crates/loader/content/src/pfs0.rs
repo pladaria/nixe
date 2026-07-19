@@ -43,6 +43,18 @@ pub struct Pfs0Archive {
 
 impl Pfs0Archive {
     pub(crate) fn parse(storage: StorageRef, format: &'static str) -> Result<Self, LoadError> {
+        Self::parse_internal(storage, format, false)
+    }
+
+    pub(crate) fn parse_nsz(storage: StorageRef, format: &'static str) -> Result<Self, LoadError> {
+        Self::parse_internal(storage, format, true)
+    }
+
+    fn parse_internal(
+        storage: StorageRef,
+        format: &'static str,
+        allow_implicit_final_terminator: bool,
+    ) -> Result<Self, LoadError> {
         let storage_len = storage.len()?;
         if storage_len < HEADER_SIZE {
             return Err(LoadError::invalid(format, "header is truncated"));
@@ -114,10 +126,26 @@ impl Pfs0Archive {
             let name_bytes = string_table
                 .get(name_offset..)
                 .ok_or_else(|| LoadError::invalid(format, "file name is outside string table"))?;
-            let name_end = name_bytes
-                .iter()
-                .position(|byte| *byte == 0)
-                .ok_or_else(|| LoadError::invalid(format, "file name is not null-terminated"))?;
+            let name_end = match name_bytes.iter().position(|byte| *byte == 0) {
+                Some(end) => end,
+                None if allow_implicit_final_terminator => {
+                    let mut terminator = [0_u8; 1];
+                    storage.read_at(metadata_size, &mut terminator)?;
+                    if terminator[0] != 0 {
+                        return Err(LoadError::invalid(
+                            format,
+                            "file name is not null-terminated",
+                        ));
+                    }
+                    name_bytes.len()
+                }
+                None => {
+                    return Err(LoadError::invalid(
+                        format,
+                        "file name is not null-terminated",
+                    ));
+                }
+            };
             if name_end == 0 {
                 return Err(LoadError::invalid(format, "file name is empty"));
             }

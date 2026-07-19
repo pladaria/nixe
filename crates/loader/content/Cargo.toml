@@ -7,3 +7,5 @@ edition.workspace = true
 aes.workspace = true
 sha2.workspace = true
 swiitx-loader-storage.workspace = true
+tempfile.workspace = true
+zstd.workspace = true

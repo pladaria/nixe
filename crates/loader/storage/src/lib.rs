@@ -46,6 +46,8 @@ pub enum StorageError {
     OutOfBounds,
     /// The underlying source failed to perform the operation.
     Io(std::io::Error),
+    /// Stored data could not be decoded or reconstructed.
+    InvalidData(String),
 }
 
 impl Display for StorageError {
@@ -53,6 +55,7 @@ impl Display for StorageError {
         match self {
             Self::OutOfBounds => formatter.write_str("the requested range is out of bounds"),
             Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
+            Self::InvalidData(reason) => write!(formatter, "invalid stored data: {reason}"),
         }
     }
 }
@@ -62,6 +65,7 @@ impl Error for StorageError {
         match self {
             Self::OutOfBounds => None,
             Self::Io(error) => Some(error),
+            Self::InvalidData(_) => None,
         }
     }
 }

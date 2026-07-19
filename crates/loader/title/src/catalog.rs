@@ -3,7 +3,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use swiitx_loader_content::{CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader, XciLoader};
+use swiitx_loader_content::{
+    CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader, NszLoader, XciLoader, XczLoader,
+};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
 
 use crate::discovery::{directory_files, package_format};
@@ -121,6 +123,21 @@ impl TitleCatalog {
                         false,
                     )?;
                 }
+                PackageFormat::Nsz => {
+                    let archive =
+                        NszLoader::load(storage.clone()).map_err(|source| TitleError::Package {
+                            path: candidate.clone(),
+                            source,
+                        })?;
+                    add_package_contents(
+                        &mut catalog,
+                        &candidate,
+                        storage,
+                        &archive,
+                        keys.as_deref_mut(),
+                        false,
+                    )?;
+                }
                 PackageFormat::Xci => {
                     let archive =
                         XciLoader::load(storage.clone()).map_err(|source| TitleError::Package {
@@ -139,6 +156,28 @@ impl TitleCatalog {
                         &candidate,
                         storage,
                         secure.archive(),
+                        keys.as_deref_mut(),
+                        true,
+                    )?;
+                }
+                PackageFormat::Xcz => {
+                    let archive =
+                        XczLoader::load(storage.clone()).map_err(|source| TitleError::Package {
+                            path: candidate.clone(),
+                            source,
+                        })?;
+                    let secure =
+                        archive
+                            .secure_partition()
+                            .map_err(|source| TitleError::Package {
+                                path: candidate.clone(),
+                                source,
+                            })?;
+                    add_package_contents(
+                        &mut catalog,
+                        &candidate,
+                        storage,
+                        secure,
                         keys.as_deref_mut(),
                         true,
                     )?;
@@ -629,6 +668,32 @@ mod tests {
                 .skip(1)
                 .all(|package| package.source.len().unwrap() == image.len() as u64)
         );
+    }
+
+    #[test]
+    fn scans_nsz_and_xcz_through_the_same_title_pipeline() {
+        let directory = TemporaryDirectory::new();
+        directory.write(
+            "a-compressed-digital.nsz",
+            &synthetic_nsp(
+                SECOND_APPLICATION_ID,
+                0,
+                SyntheticMetaType::Application,
+                false,
+            ),
+        );
+        directory.write(
+            "b-compressed-card.xcz",
+            &synthetic_xci(&[(FIRST_APPLICATION_ID, 0, SyntheticMetaType::Application)]),
+        );
+
+        let catalog = TitleCatalog::scan_directory(directory.path()).unwrap();
+        let titles = TitleResolver::resolve_all(&catalog).unwrap();
+
+        assert_eq!(catalog.packages().len(), 2);
+        assert_eq!(titles.len(), 2);
+        assert_eq!(titles[0].application_id.get(), SECOND_APPLICATION_ID);
+        assert_eq!(titles[1].application_id.get(), FIRST_APPLICATION_ID);
     }
 
     enum SyntheticMetaType {

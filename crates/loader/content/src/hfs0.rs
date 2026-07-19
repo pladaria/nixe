@@ -42,6 +42,13 @@ impl Hfs0Entry {
         &self.expected_hash
     }
 
+    /// Whether this entry advertises a usable integrity digest.
+    ///
+    /// XCZ writers may leave this field all-zero when rebuilding HFS0 tables.
+    pub fn has_advertised_hash(&self) -> bool {
+        self.expected_hash != [0; 32]
+    }
+
     pub const fn reserved(&self) -> &[u8; 8] {
         &self.reserved
     }
@@ -71,6 +78,18 @@ pub struct Hfs0Archive {
 
 impl Hfs0Archive {
     pub(crate) fn parse(storage: StorageRef, format: &'static str) -> Result<Self, LoadError> {
+        Self::parse_internal(storage, format, false)
+    }
+
+    pub(crate) fn parse_xcz(storage: StorageRef, format: &'static str) -> Result<Self, LoadError> {
+        Self::parse_internal(storage, format, true)
+    }
+
+    fn parse_internal(
+        storage: StorageRef,
+        format: &'static str,
+        allow_implicit_final_terminator: bool,
+    ) -> Result<Self, LoadError> {
         let storage_len = storage.len()?;
         if storage_len < HEADER_SIZE {
             return Err(LoadError::invalid(format, "header is truncated"));
@@ -168,10 +187,26 @@ impl Hfs0Archive {
                     "file name offset does not point to the start of a name",
                 ));
             }
-            let name_end = name_bytes
-                .iter()
-                .position(|byte| *byte == 0)
-                .ok_or_else(|| LoadError::invalid(format, "file name is not null-terminated"))?;
+            let name_end = match name_bytes.iter().position(|byte| *byte == 0) {
+                Some(end) => end,
+                None if allow_implicit_final_terminator => {
+                    let mut terminator = [0_u8; 1];
+                    storage.read_at(metadata_size, &mut terminator)?;
+                    if terminator[0] != 0 {
+                        return Err(LoadError::invalid(
+                            format,
+                            "file name is not null-terminated",
+                        ));
+                    }
+                    name_bytes.len()
+                }
+                None => {
+                    return Err(LoadError::invalid(
+                        format,
+                        "file name is not null-terminated",
+                    ));
+                }
+            };
             if name_end == 0 {
                 return Err(LoadError::invalid(format, "file name is empty"));
             }
