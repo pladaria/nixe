@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 lz4_flex.workspace = true
+ruzstd-zbic.workspace = true
 swiitx-loader-storage.workspace = true
 
 [dev-dependencies]

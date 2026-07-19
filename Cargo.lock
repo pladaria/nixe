@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd-zbic"
+version = "0.8.3"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "sanitize-filename"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,6 +375,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "swiitx-cpu"
+version = "0.1.0"
+
+[[package]]
 name = "swiitx-loader-content"
 version = "0.1.0"
 dependencies = [
@@ -383,6 +394,7 @@ name = "swiitx-loader-executable"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
+ "ruzstd-zbic",
  "swiitx-loader-content",
  "swiitx-loader-storage",
 ]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use swiitx_loader_content::{
     ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader,
 };
-use swiitx_loader_executable::{ExecutableFormat, NsoLoader};
+use swiitx_loader_executable::{ExecutableFormat, NsoLoader, NsoSegmentCompression};
 use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
 
 #[test]
@@ -40,7 +40,10 @@ fn loads_main_nso_from_real_nsp() {
         keys.insert_encrypted_title_key(rights_id, encrypted_title_key);
     }
 
+    let require_zbic = env::var_os("SWIITX_REQUIRE_ZBIC").is_some();
     let mut failures = Vec::new();
+    let mut loaded = 0;
+    let mut found_zbic = false;
     for entry in nsp
         .entries()
         .iter()
@@ -73,8 +76,25 @@ fn loads_main_nso_from_real_nsp() {
             assert_eq!(image.executable().format(), ExecutableFormat::Nso);
             assert_eq!(image.executable().segments().len(), 3);
             assert!(!image.executable().module_id().iter().all(|byte| *byte == 0));
-            return;
+            eprintln!(
+                "{}: flags={:#x}, compression={:?}, text_permissions={:?}",
+                entry.name(),
+                image.metadata().flags(),
+                image.metadata().compression(),
+                image.executable().segments()[0].permissions()
+            );
+            loaded += 1;
+            found_zbic |= image
+                .metadata()
+                .compression()
+                .contains(&NsoSegmentCompression::Zbic);
         }
     }
-    panic!("no loadable Program ExeFS/main NSO found; failures: {failures:#?}");
+    assert!(
+        loaded != 0,
+        "no loadable Program ExeFS/main NSO found; failures: {failures:#?}"
+    );
+    if require_zbic {
+        assert!(found_zbic, "no ZBIC-compressed main NSO found in package");
+    }
 }
