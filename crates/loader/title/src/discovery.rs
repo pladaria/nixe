@@ -32,8 +32,12 @@ impl Default for DirectoryScanOptions {
 pub enum PackageFormat {
     /// Nintendo Submission Package backed by PFS0.
     Nsp,
+    /// Compressed NSP variant with logical NCZ entries.
+    Nsz,
     /// NX Card Image backed by nested HFS0 partitions.
     Xci,
+    /// Compressed XCI variant with logical NCZ entries.
+    Xcz,
 }
 
 pub(crate) struct DirectoryDiscoveryError {
@@ -90,9 +94,27 @@ pub(crate) fn package_format(path: &Path) -> Option<PackageFormat> {
     let extension = path.extension()?.to_str()?;
     if extension.eq_ignore_ascii_case("nsp") {
         Some(PackageFormat::Nsp)
+    } else if extension.eq_ignore_ascii_case("nsz") {
+        Some(PackageFormat::Nsz)
     } else if extension.eq_ignore_ascii_case("xci") {
         Some(PackageFormat::Xci)
+    } else if extension.eq_ignore_ascii_case("xcz") {
+        Some(PackageFormat::Xcz)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_package_extensions_case_insensitively() {
+        assert_eq!(package_format(Path::new("a.nsp")), Some(PackageFormat::Nsp));
+        assert_eq!(package_format(Path::new("b.NSZ")), Some(PackageFormat::Nsz));
+        assert_eq!(package_format(Path::new("c.Xci")), Some(PackageFormat::Xci));
+        assert_eq!(package_format(Path::new("d.xCZ")), Some(PackageFormat::Xcz));
+        assert_eq!(package_format(Path::new("standalone.ncz")), None);
     }
 }

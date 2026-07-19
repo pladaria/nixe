@@ -20,7 +20,7 @@ struct CliArguments {
 
 enum CliOutput {
     Inspection {
-        inspection: TitleInspection,
+        inspection: Box<TitleInspection>,
         preferred_languages: Vec<NacpLanguage>,
     },
     LibrarySummary {
@@ -137,7 +137,7 @@ fn run(arguments: CliArguments) -> Result<CliOutput, String> {
         let inspection = TitleInspector::inspect_with_key_set_and_options(path, &mut keys, options)
             .map_err(|error| error.to_string())?;
         return Ok(CliOutput::Inspection {
-            inspection,
+            inspection: Box::new(inspection),
             preferred_languages,
         });
     }
@@ -281,6 +281,18 @@ fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLa
 
 fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLanguage]) {
     println!("Title: {}", inspection.path.display());
+    if let Some(standalone) = &inspection.standalone_ncz {
+        println!("Format: standalone NCZ");
+        println!("Stored size: {}", format_size(standalone.stored_size));
+        print_ncz(&standalone.ncz, "  ");
+        if let Some(nca) = &standalone.nca {
+            print_nca(nca);
+        }
+        if let Some(warning) = &standalone.nca_warning {
+            println!("NCA inspection warning: {warning}");
+        }
+        return;
+    }
     println!("Packages: {}", inspection.packages.len());
 
     for (index, package) in inspection.packages.iter().enumerate() {
@@ -296,10 +308,10 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
                 "    Root HFS0: offset {:#X}, header size {:#X}, hash {}",
                 xci.header.root_hfs0_offset,
                 xci.header.root_hfs0_header_size,
-                if xci.root_header_hash_valid {
-                    "valid"
-                } else {
-                    "invalid"
+                match xci.root_header_hash_valid {
+                    Some(true) => "valid",
+                    Some(false) => "invalid",
+                    None => "not applicable",
                 }
             );
             println!(
@@ -315,10 +327,10 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
                     partition.offset,
                     format_size(partition.size),
                     format_size(partition.hashed_region_size),
-                    if partition.hash_valid {
-                        "valid"
-                    } else {
-                        "invalid"
+                    match partition.hash_valid {
+                        Some(true) => "valid",
+                        Some(false) => "invalid",
+                        None => "not advertised",
                     }
                 );
                 println!(
@@ -345,6 +357,16 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
                 entry.offset,
                 entry.name
             );
+            if let Some(stored_name) = &entry.stored_name {
+                println!(
+                    "      Stored as: {} ({} bytes)",
+                    stored_name,
+                    entry.stored_size.unwrap_or(entry.size)
+                );
+            }
+            if let Some(ncz) = &entry.ncz {
+                print_ncz(ncz, "      ");
+            }
             if let (Some(hashed_size), Some(valid)) = (entry.hashed_region_size, entry.hash_valid) {
                 println!(
                     "      HFS0 hashed prefix: {} ({})",
@@ -563,6 +585,21 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
         "Note: binary CNMT is canonical package metadata; auxiliary XML remains informational."
     );
     println!("Canonical metadata does not by itself establish full package authenticity.");
+}
+
+fn print_ncz(ncz: &swiitx_loader_title::NczInspection, indent: &str) {
+    println!("{indent}NCZ compression: {:?}", ncz.compression);
+    println!(
+        "{indent}Logical NCA size: {}",
+        format_size(ncz.logical_size)
+    );
+    if let (Some(block_size), Some(block_count)) = (ncz.block_size, ncz.block_count) {
+        println!(
+            "{indent}Blocks: {block_count}, block size {}",
+            format_size(block_size)
+        );
+    }
+    println!("{indent}Reconstruction sections: {}", ncz.sections.len());
 }
 
 fn print_extended_cnmt_header(header: &CnmtExtendedHeader) {

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use swiitx_loader_content::{
     ApplicationVersion, CnmtContentMeta, CnmtMetaType, ContentMetaVersion,
     DecodedContentMetaVersion, NcaContentType, NcaDistributionType, NcaEncryptionType,
-    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, SystemVersion, XciHeader,
-    XciLoader, XciPartitionKind,
+    NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NczCompressionKind, NczLoader,
+    NspLoader, NszLoader, SystemVersion, XciHeader, XciLoader, XciPartitionKind, XczLoader,
 };
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
@@ -16,7 +16,7 @@ const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
 
 use crate::discovery::{directory_files, package_format};
 use crate::package_content::{
-    import_ticket_keys, load_canonical_content_meta, load_canonical_content_metas,
+    PackageContent, import_ticket_keys, load_canonical_content_meta, load_canonical_content_metas,
     load_control_metadata,
 };
 use crate::{ControlMetadata, DirectoryScanOptions, PackageFormat};
@@ -25,7 +25,9 @@ impl Display for PackageFormat {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Nsp => formatter.write_str("NSP (PFS0)"),
+            Self::Nsz => formatter.write_str("NSZ (PFS0 + NCZ)"),
             Self::Xci => formatter.write_str("XCI (HFS0)"),
+            Self::Xcz => formatter.write_str("XCZ (HFS0 + NCZ)"),
         }
     }
 }
@@ -71,6 +73,12 @@ pub struct EntryInspection {
     pub offset: u64,
     /// Entry size in bytes.
     pub size: u64,
+    /// Stored name when it differs from the logical entry name.
+    pub stored_name: Option<String>,
+    /// Stored compressed size when it differs from the logical size.
+    pub stored_size: Option<u64>,
+    /// NCZ compression and reconstruction metadata, when applicable.
+    pub ncz: Option<NczInspection>,
     /// Advertised HFS0 hashed prefix, when the entry comes from XCI.
     pub hashed_region_size: Option<u64>,
     /// Result of validating the advertised HFS0 prefix, when applicable.
@@ -78,6 +86,34 @@ pub struct EntryInspection {
     /// Parsed NCA header and section layout for content-archive entries.
     pub nca: Option<NcaInspection>,
     /// Explanation when an NCA entry could not be inspected.
+    pub nca_warning: Option<String>,
+}
+
+/// Non-sensitive metadata parsed from an NCZ entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NczInspection {
+    pub compression: NczCompressionKind,
+    pub logical_size: u64,
+    pub block_size: Option<u64>,
+    pub block_count: Option<u32>,
+    pub sections: Vec<NczSectionInspection>,
+}
+
+/// Non-sensitive reconstruction range from an NCZ section table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NczSectionInspection {
+    pub offset: u64,
+    pub size: u64,
+    pub crypto_type: u64,
+}
+
+/// Inspection result for an explicitly supplied standalone NCZ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneNczInspection {
+    pub path: PathBuf,
+    pub stored_size: u64,
+    pub ncz: NczInspection,
+    pub nca: Option<NcaInspection>,
     pub nca_warning: Option<String>,
 }
 
@@ -89,7 +125,7 @@ pub struct XciPartitionInspection {
     pub offset: u64,
     pub size: u64,
     pub hashed_region_size: u64,
-    pub hash_valid: bool,
+    pub hash_valid: Option<bool>,
     pub data_offset: u64,
     pub entries: Vec<EntryInspection>,
 }
@@ -98,7 +134,7 @@ pub struct XciPartitionInspection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XciInspection {
     pub header: XciHeader,
-    pub root_header_hash_valid: bool,
+    pub root_header_hash_valid: Option<bool>,
     pub root_data_offset: u64,
     pub partitions: Vec<XciPartitionInspection>,
 }
@@ -227,9 +263,9 @@ impl PackageInspection {
                 total.saturating_add(partition.size)
             });
         }
-        self.entries
-            .iter()
-            .fold(0_u64, |total, entry| total.saturating_add(entry.size))
+        self.entries.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.stored_size.unwrap_or(entry.size))
+        })
     }
 
     /// Returns bytes occupied by the PFS0 header, tables, and any padding.
@@ -247,6 +283,8 @@ pub struct TitleInspection {
     pub packages: Vec<PackageInspection>,
     /// Regular files skipped because their format is not supported yet.
     pub ignored_files: Vec<PathBuf>,
+    /// Standalone NCZ information when the explicit input is an `.ncz` file.
+    pub standalone_ncz: Option<StandaloneNczInspection>,
 }
 
 /// Inspects title packages without loading their payloads into memory.
@@ -295,6 +333,20 @@ impl TitleInspector {
             source,
         })?;
 
+        if metadata.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ncz"))
+        {
+            return Ok(TitleInspection {
+                path: path.to_owned(),
+                packages: Vec::new(),
+                ignored_files: Vec::new(),
+                standalone_ncz: Some(inspect_standalone_ncz(path, keys.as_deref())?),
+            });
+        }
+
         let candidates = if metadata.is_file() {
             vec![path.to_owned()]
         } else if metadata.is_dir() {
@@ -313,8 +365,14 @@ impl TitleInspector {
                 Some(PackageFormat::Nsp) => {
                     packages.push(inspect_nsp(&candidate, keys.as_deref_mut())?)
                 }
+                Some(PackageFormat::Nsz) => {
+                    packages.push(inspect_nsz(&candidate, keys.as_deref_mut())?)
+                }
                 Some(PackageFormat::Xci) => {
                     packages.push(inspect_xci(&candidate, keys.as_deref_mut())?)
+                }
+                Some(PackageFormat::Xcz) => {
+                    packages.push(inspect_xcz(&candidate, keys.as_deref_mut())?)
                 }
                 None => ignored_files.push(candidate),
             }
@@ -328,6 +386,7 @@ impl TitleInspector {
             path: path.to_owned(),
             packages,
             ignored_files,
+            standalone_ncz: None,
         })
     }
 }
@@ -424,6 +483,9 @@ fn inspect_nsp(
             kind,
             offset: entry.offset(),
             size: entry.size(),
+            stored_name: None,
+            stored_size: None,
+            ncz: None,
             hashed_region_size: None,
             hash_valid: None,
             nca,
@@ -451,6 +513,84 @@ fn inspect_nsp(
     Ok(PackageInspection {
         path: path.to_owned(),
         format: PackageFormat::Nsp,
+        size,
+        data_offset: archive.data_offset(),
+        xci: None,
+        entries,
+        canonical_content_metas: canonical_content_meta.clone().into_iter().collect(),
+        canonical_content_meta,
+        canonical_metadata_warning,
+        control_metadata,
+        control_metadatas,
+        control_metadata_warning,
+        content_meta,
+        metadata_warning,
+        ticket_warnings,
+    })
+}
+
+fn inspect_nsz(
+    path: &Path,
+    mut keys: Option<&mut NcaKeySet>,
+) -> Result<PackageInspection, InspectError> {
+    let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let size = storage.len().map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let storage: StorageRef = Arc::new(storage);
+    let archive = NszLoader::load(storage).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source,
+    })?;
+    let ticket_warnings = keys
+        .as_deref_mut()
+        .map_or_else(Vec::new, |keys| import_ticket_keys(&archive, keys));
+    let mut entries = Vec::with_capacity(archive.entries().len());
+    for entry in archive.entries() {
+        let kind = entry_kind(entry.logical_name());
+        let (nca, nca_warning) =
+            inspect_entry_nca(entry.open(), kind, keys.as_deref().map(|keys| keys as _));
+        entries.push(EntryInspection {
+            name: entry.logical_name().to_owned(),
+            kind,
+            offset: entry.stored_offset(),
+            size: entry.logical_size(),
+            stored_name: (entry.stored_name() != entry.logical_name())
+                .then(|| entry.stored_name().to_owned()),
+            stored_size: (entry.stored_size() != entry.logical_size())
+                .then_some(entry.stored_size()),
+            ncz: entry.ncz().map(inspect_ncz_metadata),
+            hashed_region_size: None,
+            hash_valid: None,
+            nca,
+            nca_warning,
+        });
+    }
+    let (canonical_content_meta, canonical_metadata_warning) =
+        inspect_canonical_metadata(&archive, keys.as_deref());
+    let (control_metadata, control_metadata_warning) =
+        canonical_content_meta
+            .as_ref()
+            .map_or((None, None), |content_meta| {
+                match load_control_metadata(
+                    &archive,
+                    content_meta,
+                    keys.as_deref().map(|keys| keys as _),
+                ) {
+                    Ok(metadata) => (metadata, None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            });
+    let (content_meta, metadata_warning) = inspect_auxiliary_metadata(&archive);
+    let control_metadatas = control_metadata.clone().into_iter().collect();
+
+    Ok(PackageInspection {
+        path: path.to_owned(),
+        format: PackageFormat::Nsz,
         size,
         data_offset: archive.data_offset(),
         xci: None,
@@ -519,6 +659,9 @@ fn inspect_xci(
                 kind,
                 offset: entry.offset(),
                 size: entry.size(),
+                stored_name: None,
+                stored_size: None,
+                ncz: None,
                 hashed_region_size: Some(entry.hashed_region_size()),
                 hash_valid: Some(integrity.is_valid()),
                 nca,
@@ -531,7 +674,9 @@ fn inspect_xci(
             offset: partition.root_entry().offset(),
             size: partition.root_entry().size(),
             hashed_region_size: partition.root_entry().hashed_region_size(),
-            hash_valid: partition.root_entry_integrity().is_valid(),
+            hash_valid: partition
+                .root_entry_integrity()
+                .map(|integrity| integrity.is_valid()),
             data_offset: partition.archive().data_offset(),
             entries,
         });
@@ -578,7 +723,9 @@ fn inspect_xci(
         .map_or_else(Vec::new, |partition| partition.entries.clone());
     let xci = XciInspection {
         header: archive.header().clone(),
-        root_header_hash_valid: archive.root_header_integrity().is_valid(),
+        root_header_hash_valid: archive
+            .root_header_integrity()
+            .map(|integrity| integrity.is_valid()),
         root_data_offset: archive.root().data_offset(),
         partitions: partition_inspections,
     };
@@ -602,8 +749,224 @@ fn inspect_xci(
     })
 }
 
-fn inspect_canonical_metadata(
-    archive: &swiitx_loader_content::NspArchive,
+fn inspect_xcz(
+    path: &Path,
+    mut keys: Option<&mut NcaKeySet>,
+) -> Result<PackageInspection, InspectError> {
+    let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let size = storage.len().map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let storage: StorageRef = Arc::new(storage);
+    let archive = XczLoader::load(storage).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source,
+    })?;
+    let xci_archive = archive.xci();
+
+    let mut partition_inspections = Vec::with_capacity(archive.partitions().len());
+    for (partition, stored_partition) in archive.partitions().iter().zip(xci_archive.partitions()) {
+        let mut entries = Vec::with_capacity(partition.entries().len());
+        for (entry, stored) in partition
+            .entries()
+            .iter()
+            .zip(stored_partition.archive().entries())
+        {
+            let hash_valid = if stored.has_advertised_hash() {
+                let integrity =
+                    stored_partition
+                        .archive()
+                        .validate_entry(stored)
+                        .map_err(|source| InspectError::Package {
+                            path: path.to_owned(),
+                            source,
+                        })?;
+                Some(integrity.is_valid())
+            } else {
+                None
+            };
+            let kind = entry_kind(entry.logical_name());
+            let (nca, nca_warning) =
+                inspect_entry_nca(entry.open(), kind, keys.as_deref().map(|keys| keys as _));
+            entries.push(EntryInspection {
+                name: entry.logical_name().to_owned(),
+                kind,
+                offset: entry.stored_offset(),
+                size: entry.logical_size(),
+                stored_name: (entry.stored_name() != entry.logical_name())
+                    .then(|| entry.stored_name().to_owned()),
+                stored_size: (entry.stored_size() != entry.logical_size())
+                    .then_some(entry.stored_size()),
+                ncz: entry.ncz().map(inspect_ncz_metadata),
+                hashed_region_size: Some(stored.hashed_region_size()),
+                hash_valid,
+                nca,
+                nca_warning,
+            });
+        }
+        partition_inspections.push(XciPartitionInspection {
+            name: stored_partition.name().to_owned(),
+            kind: stored_partition.kind().clone(),
+            offset: stored_partition.root_entry().offset(),
+            size: stored_partition.root_entry().size(),
+            hashed_region_size: stored_partition.root_entry().hashed_region_size(),
+            hash_valid: stored_partition
+                .root_entry_integrity()
+                .map(|integrity| integrity.is_valid()),
+            data_offset: stored_partition.archive().data_offset(),
+            entries,
+        });
+    }
+
+    let secure = archive.partition(&XciPartitionKind::Secure);
+    let ticket_warnings = match (secure, keys.as_deref_mut()) {
+        (Some(secure), Some(keys)) => import_ticket_keys(secure, keys),
+        _ => Vec::new(),
+    };
+    let key_provider = keys.as_deref().map(|keys| keys as _);
+    let (canonical_content_metas, canonical_metadata_warning) = match secure {
+        Some(secure) => match load_canonical_content_metas(secure, key_provider) {
+            Ok(metadata) => (metadata, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        },
+        None => (
+            Vec::new(),
+            Some("XCZ has no secure partition; no title metadata was loaded".to_owned()),
+        ),
+    };
+    let canonical_content_meta = canonical_content_metas.first().cloned();
+    let mut control_metadatas = Vec::new();
+    let mut control_warnings = Vec::new();
+    if let Some(secure) = secure {
+        for content_meta in &canonical_content_metas {
+            match load_control_metadata(secure, content_meta, key_provider) {
+                Ok(Some(metadata)) => control_metadatas.push(metadata),
+                Ok(None) => {}
+                Err(error) => {
+                    control_warnings.push(format!("{:016X}: {error}", content_meta.title_id));
+                }
+            }
+        }
+    }
+    let control_metadata = control_metadatas.first().cloned();
+    let control_metadata_warning =
+        (!control_warnings.is_empty()).then(|| control_warnings.join("; "));
+    let entries = partition_inspections
+        .iter()
+        .find(|partition| partition.kind == XciPartitionKind::Secure)
+        .map_or_else(Vec::new, |partition| partition.entries.clone());
+    let xci = XciInspection {
+        header: xci_archive.header().clone(),
+        root_header_hash_valid: xci_archive
+            .root_header_integrity()
+            .map(|integrity| integrity.is_valid()),
+        root_data_offset: xci_archive.root().data_offset(),
+        partitions: partition_inspections,
+    };
+    let data_offset = xci_archive
+        .partition(&XciPartitionKind::Secure)
+        .map_or(xci_archive.root().data_offset(), |partition| {
+            partition.archive().data_offset()
+        });
+
+    Ok(PackageInspection {
+        path: path.to_owned(),
+        format: PackageFormat::Xcz,
+        size,
+        data_offset,
+        xci: Some(xci),
+        entries,
+        canonical_content_meta,
+        canonical_content_metas,
+        canonical_metadata_warning,
+        control_metadata,
+        control_metadatas,
+        control_metadata_warning,
+        content_meta: None,
+        metadata_warning: None,
+        ticket_warnings,
+    })
+}
+
+fn inspect_standalone_ncz(
+    path: &Path,
+    keys: Option<&NcaKeySet>,
+) -> Result<StandaloneNczInspection, InspectError> {
+    let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let stored_size = storage.len().map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let archive = NczLoader::load(Arc::new(storage)).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source,
+    })?;
+    let ncz = inspect_ncz_metadata(&archive);
+    let result = match keys {
+        Some(keys) => NcaLoader::load_with_key_provider(archive.nca_storage(), keys),
+        None => NcaLoader::load(archive.nca_storage()),
+    };
+    let (nca, nca_warning) = match result {
+        Ok(archive) => (Some(inspect_nca(&archive)), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(StandaloneNczInspection {
+        path: path.to_owned(),
+        stored_size,
+        ncz,
+        nca,
+        nca_warning,
+    })
+}
+
+fn inspect_entry_nca(
+    storage: Result<StorageRef, LoadError>,
+    kind: EntryKind,
+    keys: Option<&dyn swiitx_loader_content::NcaKeyProvider>,
+) -> (Option<NcaInspection>, Option<String>) {
+    if !matches!(
+        kind,
+        EntryKind::MetaContentArchive | EntryKind::ContentArchive
+    ) {
+        return (None, None);
+    }
+    let result = storage.and_then(|storage| match keys {
+        Some(keys) => NcaLoader::load_with_key_provider(storage, keys),
+        None => NcaLoader::load(storage),
+    });
+    match result {
+        Ok(archive) => (Some(inspect_nca(&archive)), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn inspect_ncz_metadata(archive: &swiitx_loader_content::NczArchive) -> NczInspection {
+    NczInspection {
+        compression: archive.compression_kind(),
+        logical_size: archive.logical_size(),
+        block_size: archive.block_info().map(|info| info.block_size()),
+        block_count: archive.block_info().map(|info| info.block_count()),
+        sections: archive
+            .sections()
+            .iter()
+            .map(|section| NczSectionInspection {
+                offset: section.offset(),
+                size: section.size(),
+                crypto_type: section.crypto_type(),
+            })
+            .collect(),
+    }
+}
+
+fn inspect_canonical_metadata<C: PackageContent + ?Sized>(
+    archive: &C,
     keys: Option<&NcaKeySet>,
 ) -> (Option<CnmtContentMeta>, Option<String>) {
     match load_canonical_content_meta(archive, keys.map(|keys| keys as _)) {
@@ -640,18 +1003,19 @@ fn inspect_nca(archive: &swiitx_loader_content::NcaArchive) -> NcaInspection {
     }
 }
 
-fn inspect_auxiliary_metadata(
-    archive: &swiitx_loader_content::NspArchive,
+fn inspect_auxiliary_metadata<C: PackageContent + ?Sized>(
+    archive: &C,
 ) -> (Option<ContentMetaInspection>, Option<String>) {
-    let Some(entry) = archive
-        .entries()
-        .iter()
-        .find(|entry| entry.name().to_ascii_lowercase().ends_with(".cnmt.xml"))
-    else {
+    let Some(index) = (0..archive.entry_count()).find(|index| {
+        archive
+            .entry_name(*index)
+            .to_ascii_lowercase()
+            .ends_with(".cnmt.xml")
+    }) else {
         return (None, None);
     };
 
-    if entry.size() > MAX_AUXILIARY_METADATA_SIZE {
+    if archive.entry_size(index) > MAX_AUXILIARY_METADATA_SIZE {
         return (
             None,
             Some("auxiliary CNMT XML exceeds the 1 MiB safety limit".to_owned()),
@@ -659,8 +1023,8 @@ fn inspect_auxiliary_metadata(
     }
 
     let result = (|| {
-        let storage = archive.open_entry(entry)?;
-        let length = usize::try_from(entry.size())
+        let storage = archive.open_entry_at(index)?;
+        let length = usize::try_from(archive.entry_size(index))
             .map_err(|_| LoadError::invalid("CNMT XML", "size does not fit in memory"))?;
         let mut bytes = vec![0_u8; length];
         storage.read_at(0, &mut bytes)?;
@@ -779,6 +1143,7 @@ fn entry_kind(name: &str) -> EntryKind {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::Arc;
 
     use sha2::{Digest, Sha256};
@@ -812,6 +1177,35 @@ mod tests {
         assert_eq!(entry_kind("title.cert"), EntryKind::Certificate);
         assert_eq!(entry_kind("info.xml"), EntryKind::XmlMetadata);
         assert_eq!(entry_kind("readme.txt"), EntryKind::Other);
+    }
+
+    #[test]
+    fn explicitly_inspects_a_standalone_ncz_without_cataloguing_it_as_a_package() {
+        let tail = vec![0x5a; 512];
+        let mut bytes = vec![0_u8; 0x4000];
+        bytes.extend_from_slice(b"NCZSECTN");
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&0x4000_u64.to_le_bytes());
+        bytes.extend_from_slice(&(tail.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&zstd_bytes(&tail));
+        let mut file = tempfile::Builder::new().suffix(".ncz").tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+
+        let inspection = TitleInspector::inspect(file.path()).unwrap();
+        assert!(inspection.packages.is_empty());
+        assert!(inspection.ignored_files.is_empty());
+        let standalone = inspection.standalone_ncz.unwrap();
+        assert_eq!(standalone.ncz.compression, NczCompressionKind::Solid);
+        assert_eq!(standalone.ncz.logical_size, 0x4000 + tail.len() as u64);
+        assert!(standalone.nca.is_none());
+        assert!(standalone.nca_warning.is_some());
+    }
+
+    fn zstd_bytes(bytes: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(bytes, 1).unwrap()
     }
 
     #[test]

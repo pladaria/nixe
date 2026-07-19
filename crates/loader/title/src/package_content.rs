@@ -3,7 +3,7 @@
 use swiitx_loader_content::{
     CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtLoader, Hfs0Archive, NacpLanguage,
     NacpLoader, NcaContentType, NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive,
-    Pfs0Loader, RomFsLoader,
+    NszArchive, Pfs0Loader, RomFsLoader, XczPartition,
 };
 use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
 
@@ -27,6 +27,42 @@ impl PackageContent for NspArchive {
 
     fn entry_size(&self, index: usize) -> u64 {
         self.entries()[index].size()
+    }
+
+    fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {
+        self.open_entry(&self.entries()[index])
+    }
+}
+
+impl PackageContent for NszArchive {
+    fn entry_count(&self) -> usize {
+        self.entries().len()
+    }
+
+    fn entry_name(&self, index: usize) -> &str {
+        self.entries()[index].logical_name()
+    }
+
+    fn entry_size(&self, index: usize) -> u64 {
+        self.entries()[index].logical_size()
+    }
+
+    fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {
+        self.open_entry(&self.entries()[index])
+    }
+}
+
+impl PackageContent for XczPartition {
+    fn entry_count(&self) -> usize {
+        self.entries().len()
+    }
+
+    fn entry_name(&self, index: usize) -> &str {
+        self.entries()[index].logical_name()
+    }
+
+    fn entry_size(&self, index: usize) -> u64 {
+        self.entries()[index].logical_size()
     }
 
     fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {

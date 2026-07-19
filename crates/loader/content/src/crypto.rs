@@ -142,6 +142,26 @@ pub(crate) fn apply_ctr(key: &[u8; 16], prefix: [u8; 8], first_block: u64, data:
     }
 }
 
+pub(crate) fn apply_ctr_at(key: &[u8; 16], prefix: [u8; 8], absolute_offset: u64, data: &mut [u8]) {
+    let cipher = Aes128::new(key.into());
+    let mut position = absolute_offset;
+    let mut output_offset = 0_usize;
+    while output_offset < data.len() {
+        let mut key_stream = [0_u8; AES_BLOCK_SIZE as usize];
+        key_stream[..8].copy_from_slice(&prefix);
+        key_stream[8..].copy_from_slice(&(position / AES_BLOCK_SIZE).to_be_bytes());
+        cipher.encrypt_block((&mut key_stream).into());
+
+        let within_block = usize::try_from(position % AES_BLOCK_SIZE).expect("AES offset fits");
+        let count = (AES_BLOCK_SIZE as usize - within_block).min(data.len() - output_offset);
+        for index in 0..count {
+            data[output_offset + index] ^= key_stream[within_block + index];
+        }
+        output_offset += count;
+        position += u64::try_from(count).expect("AES chunk length fits u64");
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AesXtsStorage {
     parent: StorageRef,
