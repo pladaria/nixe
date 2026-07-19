@@ -3,6 +3,7 @@
 mod npdm;
 mod nro;
 mod nso;
+mod preparation;
 
 use std::fmt::{Debug, Formatter};
 
@@ -17,6 +18,10 @@ pub use npdm::{
 };
 pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
 pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange, NsoSegmentCompression};
+pub use preparation::{
+    ExternalSymbol, MappingRegion, PreparationConfig, PrepareError, PreparedModule,
+    SymbolResolution, SymbolResolver,
+};
 
 /// Identifies the source executable format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
