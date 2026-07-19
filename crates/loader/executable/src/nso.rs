@@ -13,6 +13,19 @@ const HEADER_SIZE: u64 = 0x100;
 const PAGE_SIZE: u64 = 0x1000;
 const MOD0_SIZE: u64 = 0x1c;
 const KNOWN_FLAGS: u32 = 0xff;
+const FLAG_EXECUTE_ONLY: u32 = 1 << 6;
+const FLAG_ZBIC: u32 = 1 << 7;
+
+/// Describes how an NSO segment is stored in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsoSegmentCompression {
+    /// The segment is stored verbatim and remains a lazy view of the source.
+    None,
+    /// The segment is a classic raw LZ4 block.
+    Lz4,
+    /// The segment uses Nintendo's Zstandard binary-interpolative-coding variant.
+    Zbic,
+}
 
 /// Loads classic Nintendo Shared Object (NSO) files.
 #[derive(Debug)]
@@ -63,6 +76,7 @@ pub struct NsoMetadata {
     flags: u32,
     module_name: Vec<u8>,
     compressed: [bool; 3],
+    compression: [NsoSegmentCompression; 3],
     hash_present: [bool; 3],
     digests: [[u8; 32]; 3],
     embedded_api_info: NsoRange,
@@ -96,6 +110,10 @@ impl NsoMetadata {
     /// Returns compression flags in text, read-only, data order.
     pub const fn compressed(&self) -> &[bool; 3] {
         &self.compressed
+    }
+    /// Returns segment storage codecs in text, read-only, data order.
+    pub const fn compression(&self) -> &[NsoSegmentCompression; 3] {
+        &self.compression
     }
     /// Returns hash-presence flags in text, read-only, data order.
     pub const fn hash_present(&self) -> &[bool; 3] {
@@ -189,7 +207,7 @@ struct RawSegment {
     memory_offset: u64,
     decompressed_size: u64,
     stored_size: u64,
-    compressed: bool,
+    compression: NsoSegmentCompression,
     permissions: MemoryPermissions,
 }
 
@@ -223,15 +241,24 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
     }
 
     let flags = read_u32(&header, 0x0c);
-    if flags & (1 << 6) != 0 {
-        return Err(invalid("execute-only NSO variant is unsupported"));
-    }
-    if flags & (1 << 7) != 0 {
-        return Err(invalid("ZBIC-compressed NSO variant is unsupported"));
-    }
     if flags & !KNOWN_FLAGS != 0 {
         return Err(invalid("unsupported NSO flag bits are set"));
     }
+
+    let segment_compression = |index: u32| {
+        if flags & (1 << index) == 0 {
+            NsoSegmentCompression::None
+        } else if flags & FLAG_ZBIC != 0 {
+            NsoSegmentCompression::Zbic
+        } else {
+            NsoSegmentCompression::Lz4
+        }
+    };
+    let text_permissions = if flags & FLAG_EXECUTE_ONLY != 0 {
+        MemoryPermissions::EXECUTE
+    } else {
+        MemoryPermissions::from_bits(MemoryPermissions::READ.0 | MemoryPermissions::EXECUTE.0)
+    };
 
     let raw = [
         raw_segment(
@@ -240,8 +267,8 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
             ExecutableSegmentKind::Text,
             0x10,
             0x60,
-            flags & 1 != 0,
-            MemoryPermissions::from_bits(MemoryPermissions::READ.0 | MemoryPermissions::EXECUTE.0),
+            segment_compression(0),
+            text_permissions,
         ),
         raw_segment(
             &header,
@@ -249,7 +276,7 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
             ExecutableSegmentKind::ReadOnly,
             0x20,
             0x64,
-            flags & 2 != 0,
+            segment_compression(1),
             MemoryPermissions::READ,
         ),
         raw_segment(
@@ -258,7 +285,7 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
             ExecutableSegmentKind::Data,
             0x30,
             0x68,
-            flags & 4 != 0,
+            segment_compression(2),
             MemoryPermissions::from_bits(MemoryPermissions::READ.0 | MemoryPermissions::WRITE.0),
         ),
     ];
@@ -354,6 +381,11 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
             flags,
             module_name,
             compressed: [flags & 1 != 0, flags & 2 != 0, flags & 4 != 0],
+            compression: [
+                segment_compression(0),
+                segment_compression(1),
+                segment_compression(2),
+            ],
             hash_present: [flags & 8 != 0, flags & 16 != 0, flags & 32 != 0],
             digests,
             embedded_api_info: ranges[0],
@@ -370,7 +402,7 @@ fn raw_segment(
     kind: ExecutableSegmentKind,
     descriptor: usize,
     stored: usize,
-    compressed: bool,
+    compression: NsoSegmentCompression,
     permissions: MemoryPermissions,
 ) -> RawSegment {
     RawSegment {
@@ -380,7 +412,7 @@ fn raw_segment(
         memory_offset: u64::from(read_u32(header, descriptor + 4)),
         decompressed_size: u64::from(read_u32(header, descriptor + 8)),
         stored_size: u64::from(read_u32(header, stored)),
-        compressed,
+        compression,
         permissions,
     }
 }
@@ -408,7 +440,9 @@ fn validate_segments(segments: &[RawSegment; 3], source_len: u64) -> Result<(), 
                 segment.name
             )));
         }
-        if !segment.compressed && segment.stored_size != segment.decompressed_size {
+        if segment.compression == NsoSegmentCompression::None
+            && segment.stored_size != segment.decompressed_size
+        {
             return Err(invalid(format!(
                 "{} uncompressed stored size differs from decompressed size",
                 segment.name
@@ -459,7 +493,7 @@ fn validate_memory(segments: &[RawSegment; 3], data_memory_size: u64) -> Result<
 }
 
 fn load_segment(storage: &StorageRef, segment: RawSegment) -> Result<StorageRef, LoadError> {
-    if !segment.compressed {
+    if segment.compression == NsoSegmentCompression::None {
         return Ok(Arc::new(SubStorage::new(
             storage.clone(),
             segment.file_offset,
@@ -479,12 +513,28 @@ fn load_segment(storage: &StorageRef, segment: RawSegment) -> Result<StorageRef,
         .try_reserve_exact(expected)
         .map_err(|_| invalid(format!("{} decompressed allocation failed", segment.name)))?;
     decoded.resize(expected, 0);
-    let decoded_size = lz4_flex::block::decompress_into(&encoded, &mut decoded)
-        .map_err(|error| invalid(format!("{} LZ4 data is invalid: {error}", segment.name)))?;
+    let decoded_size = match segment.compression {
+        NsoSegmentCompression::None => unreachable!("uncompressed segments returned above"),
+        NsoSegmentCompression::Lz4 => lz4_flex::block::decompress_into(&encoded, &mut decoded)
+            .map_err(|error| invalid(format!("{} LZ4 data is invalid: {error}", segment.name)))?,
+        NsoSegmentCompression::Zbic => {
+            let mut decoder = ruzstd_zbic::decoding::FrameDecoder::new();
+            decoder
+                .decode_all(&encoded, &mut decoded)
+                .map_err(|error| {
+                    invalid(format!("{} ZBIC data is invalid: {error}", segment.name))
+                })?
+        }
+    };
     if decoded_size != expected {
         return Err(invalid(format!(
-            "{} LZ4 output has the wrong size",
-            segment.name
+            "{} {} output has the wrong size",
+            segment.name,
+            match segment.compression {
+                NsoSegmentCompression::Lz4 => "LZ4",
+                NsoSegmentCompression::Zbic => "ZBIC",
+                NsoSegmentCompression::None => unreachable!(),
+            }
         )));
     }
     Ok(Arc::new(ByteStorage(decoded)))
@@ -671,13 +721,27 @@ mod tests {
     }
 
     fn fixture(compressed: [bool; 3]) -> (Vec<u8>, [Vec<u8>; 3]) {
+        fixture_with_compression(compressed.map(|compressed| {
+            if compressed {
+                NsoSegmentCompression::Lz4
+            } else {
+                NsoSegmentCompression::None
+            }
+        }))
+    }
+
+    fn fixture_with_compression(
+        compression: [NsoSegmentCompression; 3],
+    ) -> (Vec<u8>, [Vec<u8>; 3]) {
         let mut payloads = [vec![0x11; 0x100], vec![0x22; 0x80], vec![0x33; 0x40]];
         payloads[0][4..8].fill(0);
-        let encoded = std::array::from_fn::<_, 3, _>(|index| {
-            if compressed[index] {
-                lz4_flex::block::compress(&payloads[index])
-            } else {
-                payloads[index].clone()
+        let encoded = std::array::from_fn::<_, 3, _>(|index| match compression[index] {
+            NsoSegmentCompression::None => payloads[index].clone(),
+            NsoSegmentCompression::Lz4 => lz4_flex::block::compress(&payloads[index]),
+            NsoSegmentCompression::Zbic => {
+                let (decoded, encoded) = zbic_fixture();
+                payloads[index] = decoded;
+                encoded
             }
         });
         let mut bytes = vec![0; 0x106];
@@ -686,10 +750,13 @@ mod tests {
         put_u32(
             &mut bytes,
             0x0c,
-            compressed
+            compression
                 .iter()
                 .enumerate()
-                .fold(0, |flags, (index, set)| flags | (u32::from(*set) << index))
+                .fold(0, |flags, (index, codec)| {
+                    flags | (u32::from(*codec != NsoSegmentCompression::None) << index)
+                })
+                | (u32::from(compression.contains(&NsoSegmentCompression::Zbic)) * FLAG_ZBIC)
                 | 0x38,
         );
         put_u32(&mut bytes, 0x1c, 0x100);
@@ -728,6 +795,23 @@ mod tests {
             bytes[0xa0 + index * 32..0xc0 + index * 32].fill((index + 1) as u8);
         }
         (bytes, payloads)
+    }
+
+    fn zbic_fixture() -> (Vec<u8>, Vec<u8>) {
+        // Produced from synthetic bytes by Atmosphere's ZBIC-enabled Zstandard compressor.
+        // This frame contains compressed entropy tables, so it exercises BIC rather than merely
+        // the alternate frame magic.
+        const ENCODED: &str = "5a424943600001450b0094120000899aabbccddef0061728394a5b6d7e8fa0b1c2d3e5f60c1d2e3f5062738495a6b7c8daeb01122334455768798a9bacbdcfe0f10718293a4c5d6e7f90a1b2c4d5e6f70d1e2f415263748596a7b9cadbec021324364758697a8b9caebfd0e1f208192b3c4d5e6f8091a3b4c5d6e7f80e2031425364758698a9bacbdced0315263748596a7b8d9eafc0d1e2f30a1b2c3d4e5f708293a4b5c6d7e8fa102132435465778899aabbccddef05162738495a6c7d8e9fb0c1d2e4f50b1c2d3e4f61728394a5b6c7d9ea0011223344566778cedf4b5cc3d44051b8c93546adbe2a3ba2b31f3097a814258c9d091a8192f90f7687ee046b7ce3f46071d8e95566cdde4a5bc2d33f50b7c83445acbd293aa1b21e2f96a713248b9c08198091f80e7586ed036a7b8c9daebfd0e22b200466ae2b6b820f372cf870c3820f372cf870c3820f372cf870c3821d6e58f0e186051f6e58f0e186051f6e58f0e186051f6e986070b809b5725858";
+        let encoded = ENCODED
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let mut decoded: Vec<u8> = (0..512)
+            .map(|index| ((index * 17 + index / 7) % 251) as u8)
+            .collect();
+        decoded[..8].fill(0);
+        (decoded, encoded)
     }
 
     fn load(bytes: Vec<u8>) -> Result<NsoImage, LoadError> {
@@ -779,6 +863,10 @@ mod tests {
             NsoRange::new(0x80, 0)
         );
         assert_eq!(image.metadata().digests()[2], [3; 32]);
+        assert_eq!(
+            image.metadata().compression(),
+            &[NsoSegmentCompression::None; 3]
+        );
         assert!(image.mod0().is_none());
     }
 
@@ -788,6 +876,47 @@ mod tests {
             let (bytes, expected) = fixture(flags);
             let image = load(bytes).unwrap();
             assert_eq!(image.metadata().compressed(), &flags);
+            for (segment, expected) in image.executable().segments().iter().zip(expected) {
+                assert_eq!(read_all(segment.storage()), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn supports_execute_only_with_uncompressed_and_lz4_text() {
+        for compressed in [false, true] {
+            let (mut bytes, _) = fixture([compressed, false, false]);
+            let flags = read_u32(&bytes, 0x0c) | FLAG_EXECUTE_ONLY;
+            put_u32(&mut bytes, 0x0c, flags);
+            let image = load(bytes).unwrap();
+            let permissions = image.executable().segments()[0].permissions();
+            assert!(permissions.is_executable());
+            assert!(!permissions.is_readable());
+            assert!(!permissions.is_writable());
+        }
+    }
+
+    #[test]
+    fn reconstructs_independent_and_mixed_zbic_segments() {
+        for compression in [
+            [NsoSegmentCompression::Zbic; 3],
+            [
+                NsoSegmentCompression::Zbic,
+                NsoSegmentCompression::None,
+                NsoSegmentCompression::Zbic,
+            ],
+            [
+                NsoSegmentCompression::None,
+                NsoSegmentCompression::Zbic,
+                NsoSegmentCompression::None,
+            ],
+        ] {
+            let (mut bytes, expected) = fixture_with_compression(compression);
+            let flags = read_u32(&bytes, 0x0c) | FLAG_EXECUTE_ONLY;
+            put_u32(&mut bytes, 0x0c, flags);
+            let image = load(bytes).unwrap();
+            assert_eq!(image.metadata().compression(), &compression);
+            assert!(!image.executable().segments()[0].permissions().is_readable());
             for (segment, expected) in image.executable().segments().iter().zip(expected) {
                 assert_eq!(read_all(segment.storage()), expected);
             }
@@ -822,8 +951,8 @@ mod tests {
         assert_invalid(bytes, "NSO0 magic");
 
         let (mut bytes, _) = fixture([false; 3]);
-        put_u32(&mut bytes, 0x0c, 1 << 6);
-        assert_invalid(bytes, "execute-only");
+        put_u32(&mut bytes, 0x0c, 1 << 8);
+        assert_invalid(bytes, "unsupported NSO flag bits");
 
         let (mut bytes, _) = fixture([false; 3]);
         put_u32(&mut bytes, 0x24, 1);
@@ -842,6 +971,42 @@ mod tests {
         let text_offset = read_u32(&bytes, 0x10) as usize;
         bytes[text_offset] = 0xff;
         assert_invalid(bytes, "LZ4");
+
+        let (mut bytes, _) = fixture_with_compression([
+            NsoSegmentCompression::Zbic,
+            NsoSegmentCompression::None,
+            NsoSegmentCompression::None,
+        ]);
+        let text_offset = read_u32(&bytes, 0x10) as usize;
+        bytes[text_offset] = 0xff;
+        assert_invalid(bytes, "ZBIC");
+
+        let (mut bytes, _) = fixture_with_compression([
+            NsoSegmentCompression::Zbic,
+            NsoSegmentCompression::None,
+            NsoSegmentCompression::None,
+        ]);
+        put_u32(&mut bytes, 0x18, 511);
+        assert_invalid(bytes, "ZBIC");
+
+        let (mut bytes, _) = fixture_with_compression([
+            NsoSegmentCompression::None,
+            NsoSegmentCompression::None,
+            NsoSegmentCompression::Zbic,
+        ]);
+        let stored = read_u32(&bytes, 0x68);
+        put_u32(&mut bytes, 0x68, stored + 1);
+        bytes.push(0xaa);
+        assert_invalid(bytes, "ZBIC");
+
+        let (mut bytes, _) = fixture_with_compression([
+            NsoSegmentCompression::Zbic,
+            NsoSegmentCompression::None,
+            NsoSegmentCompression::None,
+        ]);
+        let stored = read_u32(&bytes, 0x60);
+        put_u32(&mut bytes, 0x60, stored - 1);
+        assert_invalid(bytes, "ZBIC");
     }
 
     #[test]

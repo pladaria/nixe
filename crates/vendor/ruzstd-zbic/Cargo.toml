@@ -1,0 +1,37 @@
+[package]
+name = "ruzstd-zbic"
+version = "0.8.3"
+rust-version = "1.87"
+authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
+edition = "2018"
+license = "MIT"
+homepage = "https://github.com/KillingSpark/zstd-rs"
+repository = "https://github.com/KillingSpark/zstd-rs"
+description = "A local ruzstd fork for Nintendo's ZBIC compression variant"
+exclude = ["decodecorpus_files/*", "dict_tests/*", "fuzz_decodecorpus/*"]
+readme = "Readme.md"
+keywords = ["zstd", "zstandard", "decompression"]
+categories = ["compression"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# Locked behind the `hash` feature flag
+twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"], optional = true }
+
+# Internal feature, only used when building as part of libstd, not part of the
+# stable interface of this crate.
+compiler_builtins = { version = "0.1.2", optional = true }
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
+
+[features]
+default = ["hash", "std"]
+hash = ["dep:twox-hash"]
+fuzz_exports = []
+std = []
+
+# Internal feature, only used when building as part of libstd, not part of the
+# stable interface of this crate.
+rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
