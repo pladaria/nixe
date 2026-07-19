@@ -8,7 +8,7 @@ use std::fmt::{Debug, Formatter};
 use swiitx_loader_storage::StorageRef;
 
 pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
-pub use nso::NsoLoader;
+pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange};
 
 /// Identifies the source executable format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

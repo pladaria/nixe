@@ -4,4 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+lz4_flex.workspace = true
 swiitx-loader-storage.workspace = true
+
+[dev-dependencies]
+swiitx-loader-content.workspace = true
