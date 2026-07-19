@@ -19,7 +19,7 @@ The project is currently in an early development and research phase.
 
 Milestones:
 
-- Content
+- **Content**
   - [x] Random-access storage abstraction with bounded sub-storage views.
   - [x] User-supplied key management; cryptographic keys are never bundled or downloaded.
   - [x] NSP/PFS0 and XCI/HFS0 package loading.
@@ -32,10 +32,13 @@ Milestones:
   - [x] Title names, publishers, languages, versions, properties, and icons.
   - [x] Recursive package discovery and title cataloguing.
   - [x] Base application, update, DLC, duplicate, and conflict resolution.
-- Executable formats
+- **Executable formats**
   - [x] NRO executable loading with segments, BSS, metadata, and optional ASET support.
   - [x] Classic NSO executable loading with LZ4-compressed segments, BSS, module metadata, and `MOD0` parsing.
   - [x] Execute-only and ZBIC-compressed NSO variants.
+  - [x] NPDM process metadata, filesystem permissions, service access control, and kernel capabilities.
+- **CPU**
+  - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
 
 ## Legal Notice
 

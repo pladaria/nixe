@@ -16,3 +16,4 @@ pub mod profile;
 mod semantics;
 pub mod state;
 pub mod translate;
+pub mod vcpu;

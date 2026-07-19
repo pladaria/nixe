@@ -46,6 +46,8 @@ pub enum InstructionFetchFaultReason {
     },
     /// Fetch crossed into a page which could not supply the remaining bytes.
     IncompleteCrossPageFetch,
+    /// Address arithmetic needed to complete the fetch overflowed the guest domain.
+    AddressOverflow,
     /// The memory implementation reported a platform-specific failure.
     Memory(Box<str>),
 }
@@ -60,6 +62,7 @@ impl fmt::Display for InstructionFetchFaultReason {
                 "misaligned instruction address (requires {required_alignment}-byte alignment)"
             ),
             Self::IncompleteCrossPageFetch => f.write_str("incomplete cross-page fetch"),
+            Self::AddressOverflow => f.write_str("instruction address overflow"),
             Self::Memory(reason) => f.write_str(reason),
         }
     }
