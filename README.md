@@ -34,6 +34,8 @@ Milestones:
   - [x] Base application, update, DLC, duplicate, and conflict resolution.
 - Executable formats
   - [x] NRO executable loading with segments, BSS, metadata, and optional ASET support.
+  - [x] Classic NSO executable loading with LZ4-compressed segments, BSS, module metadata, and `MOD0` parsing.
+  - [ ] Execute-only and ZBIC-compressed NSO variants.
 
 ## Legal Notice
 
