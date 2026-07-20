@@ -641,7 +641,9 @@ mod tests {
         ));
 
         let mut recognized = memory_with_pages(0x2000, 1);
-        put(&mut recognized, 1, 0, &0x9100_0000_u32.to_le_bytes());
+        // A recognized architectural hint whose precise behavior is not yet
+        // among the frontend's supported scheduling hints.
+        put(&mut recognized, 1, 0, &0xd503_20df_u32.to_le_bytes());
         let block = translate_block(
             BlockTranslationConfig::default(),
             &profile,

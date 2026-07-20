@@ -40,9 +40,7 @@ Milestones:
   - [x] AArch64 executable relocations and immutable, page-safe NRO/NSO mapping plans.
 - **Runtime**
   - [x] Atomic installation of prepared executable mappings into permission-aware process memory.
-  - [x] Immutable launch plans for packaged titles and NRO homebrew, including NPDM policy, ordered modules,
-        lazy primary/DLC RomFS mounts, and deterministic process-wide symbol scope.
-  - [x] Launcher coordination for NSP, NSZ, XCI, XCZ, title directories, and standalone NRO paths.
+  - [x] Deterministic launch plans and loader coordination for packaged titles, DLC, and NRO homebrew.
 - **CPU**
   - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
   - [x] IR foundation: typed block construction, verification, deterministic printing, and shared canonical semantic primitives.
