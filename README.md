@@ -42,6 +42,8 @@ Milestones:
   - [x] Atomic installation of prepared executable mappings into permission-aware process memory.
 - **CPU**
   - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
+  - [x] IR foundation: typed block construction, verification, deterministic printing, and shared canonical semantic primitives.
+  - [x] Declarative decoder framework: indexed A64/A32/T32 classification, typed operands, profile gating, and stable coverage IDs.
 
 ## Legal Notice
 

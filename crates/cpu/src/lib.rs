@@ -6,7 +6,7 @@
 
 pub mod address;
 pub mod coverage;
-mod decode;
+pub mod decode;
 pub mod error;
 pub mod interpreter;
 pub mod ir;
