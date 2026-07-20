@@ -417,6 +417,11 @@ dependencies = [
 [[package]]
 name = "swiitx-runtime"
 version = "0.1.0"
+dependencies = [
+ "swiitx-cpu",
+ "swiitx-loader-executable",
+ "swiitx-loader-storage",
+]
 
 [[package]]
 name = "syn"

@@ -3,7 +3,11 @@
 //! Frontends fetch from the final process address space through these traits.
 //! They never consume loader images, file storage, or mutable host pointers.
 
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    fmt::{Display, Formatter},
+};
 
 use crate::{
     address::{AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
@@ -12,6 +16,62 @@ use crate::{
 
 /// Page size used by [`SyntheticMemory`].
 pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
+
+/// Stage of an atomic synthetic RAM installation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SyntheticInstallStage {
+    /// Request validation before resources are created.
+    Preflight,
+    /// Private physical-page allocation.
+    Allocation,
+    /// Private physical-page initialization.
+    Initialization,
+    /// Atomic virtual-mapping publication.
+    Publication,
+}
+
+/// One ephemeral page request for [`SyntheticMemory::install_ram_pages_atomic`].
+#[derive(Clone, Copy, Debug)]
+pub struct SyntheticRamPage<'a> {
+    /// Page-aligned guest virtual address.
+    pub virtual_address: GuestVirtualAddress,
+    /// Exact initialized contents of one synthetic page.
+    pub bytes: &'a [u8],
+    /// Final guest-visible permissions.
+    pub permissions: MemoryPermissions,
+}
+
+/// Failure of an atomic synthetic RAM installation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntheticInstallError {
+    /// Stage which rejected the request.
+    pub stage: SyntheticInstallStage,
+    /// Guest page associated with the failure, when available.
+    pub address: Option<GuestVirtualAddress>,
+    /// Backend-specific diagnostic.
+    pub reason: Box<str>,
+}
+
+impl Display for SyntheticInstallError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "synthetic RAM installation failed")?;
+        if let Some(address) = self.address {
+            write!(formatter, " at {address}")?;
+        }
+        write!(formatter, " during {:?}: {}", self.stage, self.reason)
+    }
+}
+
+impl std::error::Error for SyntheticInstallError {}
+
+/// Observable identity and permissions of one synthetic virtual mapping.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SyntheticMappingInfo {
+    /// Runtime-owned physical-page identity.
+    pub physical_page: GuestPhysicalPageId,
+    /// Exact guest-visible mapping permissions.
+    pub permissions: MemoryPermissions,
+}
 
 /// Identity and content version of one physical code page.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -458,12 +518,26 @@ enum PhysicalPage {
     Mmio(Box<dyn SyntheticMmio>),
 }
 
-#[derive(Default)]
 struct SyntheticMemoryInner {
     mappings: BTreeMap<(AddressSpaceId, u64), Mapping>,
     pages: BTreeMap<GuestPhysicalPageId, PhysicalPage>,
     instruction_faults: BTreeMap<(AddressSpaceId, GuestVirtualAddress), Box<str>>,
     data_faults: BTreeMap<(AddressSpaceId, GuestVirtualAddress, DataAccessKind), Box<str>>,
+    next_page_id: u64,
+    install_failure: Option<(SyntheticInstallStage, usize, Box<str>)>,
+}
+
+impl Default for SyntheticMemoryInner {
+    fn default() -> Self {
+        Self {
+            mappings: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            instruction_faults: BTreeMap::new(),
+            data_faults: BTreeMap::new(),
+            next_page_id: 1,
+            install_failure: None,
+        }
+    }
 }
 
 /// Small deterministic process-memory implementation for frontend tests.
@@ -480,6 +554,170 @@ impl SyntheticMemory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Atomically creates, initializes, and publishes ordinary RAM pages.
+    ///
+    /// Physical pages are owned by this memory object after success. A failed
+    /// request changes neither existing mappings nor physical pages.
+    pub fn install_ram_pages_atomic(
+        &mut self,
+        address_space: AddressSpaceId,
+        requests: &[SyntheticRamPage<'_>],
+    ) -> Result<(), SyntheticInstallError> {
+        let inner = self.inner.get_mut();
+        let mut virtual_pages = Vec::with_capacity(requests.len());
+        let mut unique_virtual_pages = BTreeSet::new();
+        for (index, request) in requests.iter().enumerate() {
+            fail_install_if_requested(
+                inner,
+                SyntheticInstallStage::Preflight,
+                index,
+                request.virtual_address,
+            )?;
+            if !request
+                .virtual_address
+                .is_aligned_to(SYNTHETIC_PAGE_SIZE as u64)
+            {
+                return Err(install_error(
+                    SyntheticInstallStage::Preflight,
+                    Some(request.virtual_address),
+                    "virtual address is not page aligned",
+                ));
+            }
+            if request.bytes.len() != SYNTHETIC_PAGE_SIZE {
+                return Err(install_error(
+                    SyntheticInstallStage::Preflight,
+                    Some(request.virtual_address),
+                    "page contents do not match the synthetic page size",
+                ));
+            }
+            if request
+                .virtual_address
+                .checked_add((SYNTHETIC_PAGE_SIZE - 1) as u64)
+                .is_none()
+            {
+                return Err(install_error(
+                    SyntheticInstallStage::Preflight,
+                    Some(request.virtual_address),
+                    "virtual page range overflows",
+                ));
+            }
+            let virtual_page = request.virtual_address.get() / SYNTHETIC_PAGE_SIZE as u64;
+            if !unique_virtual_pages.insert(virtual_page) {
+                return Err(install_error(
+                    SyntheticInstallStage::Preflight,
+                    Some(request.virtual_address),
+                    "request contains a duplicate virtual page",
+                ));
+            }
+            if inner.mappings.contains_key(&(address_space, virtual_page)) {
+                return Err(install_error(
+                    SyntheticInstallStage::Preflight,
+                    Some(request.virtual_address),
+                    "virtual page is already mapped",
+                ));
+            }
+            virtual_pages.push(virtual_page);
+        }
+
+        let mut next_page_id = inner.next_page_id;
+        let mut pending = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            fail_install_if_requested(
+                inner,
+                SyntheticInstallStage::Allocation,
+                index,
+                request.virtual_address,
+            )?;
+            while inner
+                .pages
+                .contains_key(&GuestPhysicalPageId::new(next_page_id))
+            {
+                next_page_id = next_page_id.checked_add(1).ok_or_else(|| {
+                    install_error(
+                        SyntheticInstallStage::Allocation,
+                        Some(request.virtual_address),
+                        "physical-page identities are exhausted",
+                    )
+                })?;
+            }
+            let physical_page = GuestPhysicalPageId::new(next_page_id);
+            next_page_id = next_page_id.checked_add(1).ok_or_else(|| {
+                install_error(
+                    SyntheticInstallStage::Allocation,
+                    Some(request.virtual_address),
+                    "physical-page identities are exhausted",
+                )
+            })?;
+            fail_install_if_requested(
+                inner,
+                SyntheticInstallStage::Initialization,
+                index,
+                request.virtual_address,
+            )?;
+            let mut contents = Box::new([0; SYNTHETIC_PAGE_SIZE]);
+            contents.copy_from_slice(request.bytes);
+            pending.push((
+                virtual_pages[index],
+                Mapping {
+                    physical_page,
+                    permissions: request.permissions,
+                },
+                PhysicalPage::Ram {
+                    bytes: contents,
+                    generation: 1,
+                },
+            ));
+        }
+        for (index, request) in requests.iter().enumerate() {
+            fail_install_if_requested(
+                inner,
+                SyntheticInstallStage::Publication,
+                index,
+                request.virtual_address,
+            )?;
+        }
+
+        for (virtual_page, mapping, page) in pending {
+            let previous_page = inner.pages.insert(mapping.physical_page, page);
+            let previous_mapping = inner
+                .mappings
+                .insert((address_space, virtual_page), mapping);
+            debug_assert!(previous_page.is_none());
+            debug_assert!(previous_mapping.is_none());
+        }
+        inner.next_page_id = next_page_id;
+        Ok(())
+    }
+
+    /// Injects a deterministic failure into a future atomic installation.
+    pub fn inject_install_failure(
+        &mut self,
+        stage: SyntheticInstallStage,
+        request_index: usize,
+        reason: impl Into<Box<str>>,
+    ) {
+        self.inner.get_mut().install_failure = Some((stage, request_index, reason.into()));
+    }
+
+    /// Returns mapping identity and permissions for a page containing `address`.
+    pub fn mapping_info(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Option<SyntheticMappingInfo> {
+        mapping_at(&self.inner.borrow(), address_space, address).map(|mapping| {
+            SyntheticMappingInfo {
+                physical_page: mapping.physical_page,
+                permissions: mapping.permissions,
+            }
+        })
+    }
+
+    /// Returns the number of physical pages currently owned by this backend.
+    pub fn physical_page_count(&self) -> usize {
+        self.inner.borrow().pages.len()
     }
 
     /// Creates a zero-filled ordinary physical page.
@@ -666,6 +904,33 @@ impl SyntheticMemory {
             dependencies.expect("non-empty fetch has a dependency"),
         ))
     }
+}
+
+fn install_error(
+    stage: SyntheticInstallStage,
+    address: Option<GuestVirtualAddress>,
+    reason: impl Into<Box<str>>,
+) -> SyntheticInstallError {
+    SyntheticInstallError {
+        stage,
+        address,
+        reason: reason.into(),
+    }
+}
+
+fn fail_install_if_requested(
+    inner: &SyntheticMemoryInner,
+    stage: SyntheticInstallStage,
+    index: usize,
+    address: GuestVirtualAddress,
+) -> Result<(), SyntheticInstallError> {
+    if let Some((requested_stage, requested_index, reason)) = &inner.install_failure
+        && *requested_stage == stage
+        && *requested_index == index
+    {
+        return Err(install_error(stage, Some(address), reason.clone()));
+    }
+    Ok(())
 }
 
 impl InstructionMemory for SyntheticMemory {
@@ -1206,5 +1471,61 @@ mod tests {
             fault.reason,
             InstructionFetchFaultReason::Memory("synthetic instruction abort".into())
         );
+    }
+
+    #[test]
+    fn atomic_page_install_rejects_identity_exhaustion_without_changes() {
+        let mut memory = SyntheticMemory::new();
+        memory.inner.get_mut().next_page_id = u64::MAX;
+        let bytes = [0x5a; SYNTHETIC_PAGE_SIZE];
+        let request = SyntheticRamPage {
+            virtual_address: CODE,
+            bytes: &bytes,
+            permissions: MemoryPermissions::READ_EXECUTE,
+        };
+
+        let error = memory
+            .install_ram_pages_atomic(SPACE, &[request])
+            .unwrap_err();
+
+        assert_eq!(error.stage, SyntheticInstallStage::Allocation);
+        assert_eq!(memory.physical_page_count(), 0);
+        assert!(memory.mapping_info(SPACE, CODE).is_none());
+    }
+
+    #[test]
+    fn atomic_page_install_rejects_malformed_and_duplicate_requests() {
+        let bytes = [0x5a; SYNTHETIC_PAGE_SIZE];
+        let valid = SyntheticRamPage {
+            virtual_address: CODE,
+            bytes: &bytes,
+            permissions: MemoryPermissions::READ,
+        };
+        let malformed = [
+            SyntheticRamPage {
+                virtual_address: CODE.checked_add(1).unwrap(),
+                ..valid
+            },
+            SyntheticRamPage {
+                bytes: &bytes[..SYNTHETIC_PAGE_SIZE - 1],
+                ..valid
+            },
+        ];
+        for request in malformed {
+            let mut memory = SyntheticMemory::new();
+            let error = memory
+                .install_ram_pages_atomic(SPACE, &[request])
+                .unwrap_err();
+            assert_eq!(error.stage, SyntheticInstallStage::Preflight);
+            assert_eq!(memory.physical_page_count(), 0);
+        }
+
+        let mut memory = SyntheticMemory::new();
+        let error = memory
+            .install_ram_pages_atomic(SPACE, &[valid, valid])
+            .unwrap_err();
+        assert_eq!(error.stage, SyntheticInstallStage::Preflight);
+        assert_eq!(memory.physical_page_count(), 0);
+        assert!(memory.mapping_info(SPACE, CODE).is_none());
     }
 }

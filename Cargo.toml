@@ -27,6 +27,7 @@ tempfile = "3.27"
 swiitx-config = { path = "crates/config" }
 swiitx-cpu = { path = "crates/cpu" }
 swiitx-loader-content = { path = "crates/loader/content" }
+swiitx-loader-executable = { path = "crates/loader/executable" }
 swiitx-loader-storage = { path = "crates/loader/storage" }
 swiitx-loader-title = { path = "crates/loader/title" }
 toml = "0.8"
