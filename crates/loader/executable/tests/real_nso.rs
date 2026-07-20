@@ -157,10 +157,17 @@ fn loads_main_nso_from_real_package() {
                         .map(|image| (candidate.name(), image))
                 });
             if let Some((name, dependency)) = dependency {
+                let dependency_base = prepared
+                    .mappings()
+                    .last()
+                    .expect("prepared main has mappings")
+                    .guest_end()
+                    .checked_add(0x1000)
+                    .expect("dependency placement overflows");
                 let dependency = dependency
                     .prepare(
                         PreparationConfig {
-                            image_base: 0x7200_0000,
+                            image_base: dependency_base,
                             address_limit: 0x8000_0000,
                         },
                         &deterministic_runtime_export,
