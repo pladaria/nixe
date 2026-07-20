@@ -9,12 +9,264 @@ use crate::{
 };
 
 use super::{
-    DecodeResult,
+    DecodeResult, DecodedOpcode,
     table::{
         DecodeSupport, DecoderTable, InstructionPattern, OperandField, OperandId, OperandKind,
         SemanticId,
     },
 };
+
+/// Normalized A64 instruction consumed by the lifter.
+///
+/// The declarative table establishes the instruction family. Normalization
+/// then extracts every encoded field once, before IR construction begins.
+/// Family lifters receive these fields rather than the fetched encoding, so
+/// they cannot silently grow a second, inconsistent decoder. Exact helpers
+/// receive only an opaque ABI token when they must retain the full encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A64Instruction {
+    pub operation: A64Operation,
+    pub fields: A64Fields,
+    pub coverage_id: CoverageId,
+}
+
+/// Opaque payload forwarded to exact helpers without being decoded by a
+/// lifter. It is not an operand source and deliberately exposes no bit-field
+/// access API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A64HelperToken(u32);
+
+impl A64HelperToken {
+    #[must_use]
+    pub const fn helper_abi_value(self) -> u32 {
+        self.0
+    }
+}
+
+/// Coarse semantic family used for type-safe lifter dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum A64Operation {
+    Control(ControlOperation),
+    System(SystemOperation),
+    Integer(IntegerOperation),
+    Memory(MemoryOperation),
+    FpSimd(FpSimdOperation),
+    RecognizedFallback,
+}
+
+macro_rules! operation_enum {
+    ($name:ident { $($variant:ident => $pattern:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum $name { $($variant),+ }
+
+        impl $name {
+            fn from_pattern(name: &str) -> Option<Self> {
+                match name {
+                    $($pattern => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+operation_enum!(ControlOperation {
+    Nop => "nop",
+    BranchImmediate => "b",
+    BranchLinkImmediate => "bl",
+    BranchRegister => "branch-register",
+    ConditionalBranch => "b.cond",
+    CompareBranch => "compare-branch",
+    TestBranch => "test-branch",
+    SupervisorCall => "svc",
+    Breakpoint => "brk",
+});
+
+operation_enum!(SystemOperation {
+    Hint => "hint",
+    ReadRegister => "mrs",
+    WriteRegister => "msr-register",
+    Barrier => "barrier",
+    System => "system",
+});
+
+operation_enum!(IntegerOperation {
+    MoveWide => "move-wide",
+    AddSubImmediate => "add-sub-immediate",
+    AddSubShifted => "add-sub-shifted",
+    AddSubExtended => "add-sub-extended",
+    AddSubCarry => "add-sub-carry",
+    LogicalImmediate => "logical-immediate",
+    LogicalShifted => "logical-shifted",
+    Bitfield => "bitfield",
+    Extract => "extract",
+    TwoSource => "data-processing-two-source",
+    ConditionalCompareRegister => "conditional-compare-register",
+    ConditionalCompareImmediate => "conditional-compare-immediate",
+    ConditionalSelect => "conditional-select",
+    ThreeSource => "data-processing-three-source",
+    OneSource => "data-processing-one-source",
+    Adr => "adr",
+    Adrp => "adrp",
+});
+
+operation_enum!(MemoryOperation {
+    Literal => "load-literal",
+    Unsigned => "load-store-unsigned",
+    Unscaled => "load-store-unscaled",
+    PostIndex => "load-store-post-index",
+    PreIndex => "load-store-pre-index",
+    Register => "load-store-register",
+    Pair => "load-store-pair",
+    LoadAcquire => "load-acquire",
+    StoreRelease => "store-release",
+    LoadExclusive => "load-exclusive",
+    StoreExclusive => "store-exclusive",
+});
+
+operation_enum!(FpSimdOperation {
+    Bitwise => "simd-bitwise",
+    Integer => "simd-integer",
+    ScalarTwoSource => "fp-scalar-two-source",
+    ScalarMove => "fp-scalar-move",
+    CompareRegister => "fp-compare-register",
+    CompareZero => "fp-compare-zero",
+    SignedIntToFloat => "fp-signed-int-to-float",
+    UnsignedIntToFloat => "fp-unsigned-int-to-float",
+    FloatToSignedInt => "fp-float-to-signed-int",
+    FloatToUnsignedInt => "fp-float-to-unsigned-int",
+    MoveToGeneral => "fp-move-to-general",
+    MoveFromGeneral => "fp-move-from-general",
+    MemoryUnsigned => "fp-simd-load-store-unsigned",
+    MemoryUnscaled => "fp-simd-load-store-unscaled",
+    MemoryPostIndex => "fp-simd-load-store-post-index",
+    MemoryPreIndex => "fp-simd-load-store-pre-index",
+    MemoryRegister => "fp-simd-load-store-register",
+    MemoryLiteral => "fp-simd-load-literal",
+});
+
+/// Pre-extracted A64 fields shared by normalized instruction families.
+///
+/// Aliased fields are intentionally named by their encoded position: their
+/// architectural meaning is supplied by the typed operation variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A64Fields {
+    pub rd: u8,
+    pub rn: u8,
+    pub ra: u8,
+    pub rm: u8,
+    pub low4: u8,
+    pub field_5_7: u8,
+    pub field_8_4: u8,
+    pub field_10_3: u8,
+    pub field_10_6: u8,
+    pub field_10_12: u16,
+    pub field_12_4: u8,
+    pub field_12_9: u16,
+    pub field_13_3: u8,
+    pub field_15_7: u8,
+    pub field_16_5: u8,
+    pub field_16_6: u8,
+    pub field_19_5: u8,
+    pub field_21_2: u8,
+    pub field_21_3: u8,
+    pub field_22_2: u8,
+    pub field_23_2: u8,
+    pub size: u8,
+    pub immediate_14: u16,
+    pub immediate_16: u16,
+    pub immediate_19: u32,
+    pub immediate_26: u32,
+    pub bit10: bool,
+    pub bit11: bool,
+    pub bit12: bool,
+    pub bit15: bool,
+    pub bit21: bool,
+    pub bit22: bool,
+    pub bit23: bool,
+    pub bit24: bool,
+    pub bit29: bool,
+    pub bit30: bool,
+    pub bit31: bool,
+    pub branch_register_key: u32,
+    pub system_key: u32,
+    pub adr_immediate: u32,
+    /// Opaque helper-ABI token for operations whose full semantics are
+    /// intentionally delegated to an exact instruction helper.
+    pub helper_token: A64HelperToken,
+}
+
+impl A64Fields {
+    const fn extract(bits: u32) -> Self {
+        Self {
+            rd: (bits & 0x1f) as u8,
+            rn: ((bits >> 5) & 0x1f) as u8,
+            ra: ((bits >> 10) & 0x1f) as u8,
+            rm: ((bits >> 16) & 0x1f) as u8,
+            low4: (bits & 0xf) as u8,
+            field_5_7: ((bits >> 5) & 0x7f) as u8,
+            field_8_4: ((bits >> 8) & 0xf) as u8,
+            field_10_3: ((bits >> 10) & 7) as u8,
+            field_10_6: ((bits >> 10) & 0x3f) as u8,
+            field_10_12: ((bits >> 10) & 0xfff) as u16,
+            field_12_4: ((bits >> 12) & 0xf) as u8,
+            field_12_9: ((bits >> 12) & 0x1ff) as u16,
+            field_13_3: ((bits >> 13) & 7) as u8,
+            field_15_7: ((bits >> 15) & 0x7f) as u8,
+            field_16_5: ((bits >> 16) & 0x1f) as u8,
+            field_16_6: ((bits >> 16) & 0x3f) as u8,
+            field_19_5: ((bits >> 19) & 0x1f) as u8,
+            field_21_2: ((bits >> 21) & 3) as u8,
+            field_21_3: ((bits >> 21) & 7) as u8,
+            field_22_2: ((bits >> 22) & 3) as u8,
+            field_23_2: ((bits >> 23) & 3) as u8,
+            size: (bits >> 30) as u8,
+            immediate_14: ((bits >> 5) & 0x3fff) as u16,
+            immediate_16: ((bits >> 5) & 0xffff) as u16,
+            immediate_19: (bits >> 5) & 0x7ffff,
+            immediate_26: bits & 0x03ff_ffff,
+            bit10: bits & (1 << 10) != 0,
+            bit11: bits & (1 << 11) != 0,
+            bit12: bits & (1 << 12) != 0,
+            bit15: bits & (1 << 15) != 0,
+            bit21: bits & (1 << 21) != 0,
+            bit22: bits & (1 << 22) != 0,
+            bit23: bits & (1 << 23) != 0,
+            bit24: bits & (1 << 24) != 0,
+            bit29: bits & (1 << 29) != 0,
+            bit30: bits & (1 << 30) != 0,
+            bit31: bits & (1 << 31) != 0,
+            branch_register_key: bits & 0xffff_fc1f,
+            system_key: bits & 0xffff_ffe0,
+            adr_immediate: ((bits >> 3) & 0x1f_fffc) | ((bits >> 29) & 3),
+            helper_token: A64HelperToken(bits),
+        }
+    }
+}
+
+/// Converts a table-classified A64 opcode into the typed lifter contract.
+#[must_use]
+pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64Instruction {
+    let name = opcode.pattern().name;
+    let operation = if let Some(operation) = ControlOperation::from_pattern(name) {
+        A64Operation::Control(operation)
+    } else if let Some(operation) = SystemOperation::from_pattern(name) {
+        A64Operation::System(operation)
+    } else if let Some(operation) = IntegerOperation::from_pattern(name) {
+        A64Operation::Integer(operation)
+    } else if let Some(operation) = MemoryOperation::from_pattern(name) {
+        A64Operation::Memory(operation)
+    } else if let Some(operation) = FpSimdOperation::from_pattern(name) {
+        A64Operation::FpSimd(operation)
+    } else {
+        A64Operation::RecognizedFallback
+    };
+    A64Instruction {
+        operation,
+        fields: A64Fields::extract(encoding.bits()),
+        coverage_id: opcode.coverage_id(),
+    }
+}
 
 const NO_FIELDS: &[OperandField] = &[];
 const NO_CONSTRAINTS: &[super::ReservedConstraint] = &[];
@@ -505,5 +757,31 @@ mod tests {
             decoded_name(profile, 0x1e21_c000),
             "floating-point-fallback"
         );
+    }
+
+    #[test]
+    fn normalization_produces_typed_operations_and_pre_extracted_fields() {
+        let profile = GuestCpuProfile::switch_1();
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            profile.id(),
+        );
+        let encoding = InstructionEncoding::from_u32(0x9100_4423); // ADD X3, X1, #17
+        let decoded = match decode(&profile, location, encoding) {
+            DecodeResult::Decoded(decoded) => decoded,
+            result => panic!("expected decoded ADD immediate, got {result:?}"),
+        };
+        let normalized = normalize(&decoded.instruction, encoding);
+
+        assert_eq!(
+            normalized.operation,
+            A64Operation::Integer(IntegerOperation::AddSubImmediate)
+        );
+        assert_eq!(normalized.fields.rd, 3);
+        assert_eq!(normalized.fields.rn, 1);
+        assert_eq!(normalized.fields.field_10_12, 17);
+        assert!(normalized.fields.bit31);
+        assert!(!normalized.fields.bit30);
     }
 }
