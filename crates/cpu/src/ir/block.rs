@@ -3,16 +3,44 @@
 use crate::{
     address::GuestVirtualAddress,
     location::{InstructionEncoding, LocationDescriptor},
-    memory::CodePageDependency,
+    memory::{CodeDependencies, CodePageDependency},
 };
 
 use super::{op::IrOperation, terminator::Terminator};
 
 /// Source instruction represented in a block.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InstructionSource {
     pub location: LocationDescriptor,
     pub encoding: InstructionEncoding,
+    /// Physical pages and generations returned by the instruction fetch.
+    pub dependencies: CodeDependencies,
+    /// Optional frontend disassembly used only for diagnostics.
+    pub disassembly: Option<Box<str>>,
+}
+
+impl InstructionSource {
+    /// Records one fetched instruction without requiring a disassembler.
+    #[must_use]
+    pub const fn new(
+        location: LocationDescriptor,
+        encoding: InstructionEncoding,
+        dependencies: CodeDependencies,
+    ) -> Self {
+        Self {
+            location,
+            encoding,
+            dependencies,
+            disassembly: None,
+        }
+    }
+
+    /// Attaches a diagnostic disassembly string.
+    #[must_use]
+    pub fn with_disassembly(mut self, disassembly: impl Into<Box<str>>) -> Self {
+        self.disassembly = Some(disassembly.into());
+        self
+    }
 }
 
 /// Semantic class of an exit recorded in block metadata.
@@ -52,7 +80,7 @@ pub struct BlockMetadata {
     pub exits: Box<[BlockExit]>,
     /// Physical code pages and generations observed during translation.
     pub code_dependencies: Box<[CodePageDependency]>,
-    /// Ordered source locations and raw encodings.
+    /// Ordered source locations, raw encodings, and fetch provenance.
     pub sources: Box<[InstructionSource]>,
 }
 
@@ -80,9 +108,9 @@ impl BlockMetadata {
 
 /// One typed SSA-like translation unit with exactly one stored terminator.
 ///
-/// Section 10 adds the enforcing builder and verifier. This representation is
-/// intentionally constructible without a decoder so operation families can be
-/// tested independently first.
+/// Frontends should construct this through [`super::builder::IrBuilder`]. The
+/// public representation remains intentionally constructible so verifier
+/// negative tests and external diagnostic tools can inspect malformed IR.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IrBlock {
     pub metadata: BlockMetadata,
@@ -91,7 +119,7 @@ pub struct IrBlock {
 }
 
 impl IrBlock {
-    /// Creates a manually assembled block.
+    /// Creates a manually assembled, not-yet-verified block.
     #[must_use]
     pub const fn new(
         metadata: BlockMetadata,
@@ -148,14 +176,22 @@ mod tests {
                 generation: CodeGeneration::new(9),
             }],
             vec![
-                InstructionSource {
-                    location: location(0x1000),
-                    encoding: InstructionEncoding::from_u32(0x8b02_0020),
-                },
-                InstructionSource {
-                    location: location(0x1004),
-                    encoding: InstructionEncoding::from_u32(0x5400_0020),
-                },
+                InstructionSource::new(
+                    location(0x1000),
+                    InstructionEncoding::from_u32(0x8b02_0020),
+                    CodeDependencies::one(CodePageDependency {
+                        page: GuestPhysicalPageId::new(5),
+                        generation: CodeGeneration::new(9),
+                    }),
+                ),
+                InstructionSource::new(
+                    location(0x1004),
+                    InstructionEncoding::from_u32(0x5400_0020),
+                    CodeDependencies::one(CodePageDependency {
+                        page: GuestPhysicalPageId::new(5),
+                        generation: CodeGeneration::new(9),
+                    }),
+                ),
             ],
         )
     }
