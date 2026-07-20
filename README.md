@@ -38,6 +38,8 @@ Milestones:
   - [x] Execute-only and ZBIC-compressed NSO variants.
   - [x] NPDM process metadata, filesystem permissions, service access control, and kernel capabilities.
   - [x] AArch64 executable relocations and immutable, page-safe NRO/NSO mapping plans.
+- **Runtime**
+  - [x] Atomic installation of prepared executable mappings into permission-aware process memory.
 - **CPU**
   - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
 
