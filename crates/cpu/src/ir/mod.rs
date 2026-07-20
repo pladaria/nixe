@@ -1,10 +1,10 @@
 //! Typed, host-independent CPU intermediate representation.
 
-mod block;
+pub mod block;
 mod builder;
 pub mod op;
 mod print;
-mod terminator;
-mod types;
-mod value;
+pub mod terminator;
+pub mod types;
+pub mod value;
 mod verify;

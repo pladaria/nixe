@@ -19,7 +19,7 @@ The project is currently in an early development and research phase.
 
 Milestones:
 
-- **Content**
+- **Content formats**
   - [x] Random-access storage abstraction with bounded sub-storage views.
   - [x] User-supplied key management; cryptographic keys are never bundled or downloaded.
   - [x] NSP/PFS0 and XCI/HFS0 package loading.
