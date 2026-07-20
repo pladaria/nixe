@@ -55,6 +55,11 @@ using only software and data they are legally entitled to use.
 Nintendo Switch and Nintendo Switch 2 are trademarks of Nintendo. This project is independent and is not
 affiliated with, sponsored by, or endorsed by Nintendo or NVIDIA.
 
+## Testing
+
+To run integration tests against caller-owned titles, copy `.env.integration.example` to
+`.env.integration`, configure the paths, and run `./scripts/test-integration.sh`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

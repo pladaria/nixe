@@ -144,6 +144,13 @@ fn prepare_modules(
                     &deterministic_runtime_export,
                 )
                 .expect("prepare main NSO");
+            let dependency_base = main
+                .mappings()
+                .last()
+                .expect("prepared main has mappings")
+                .guest_end()
+                .checked_add(SYNTHETIC_PAGE_SIZE as u64)
+                .expect("dependency placement overflows");
             let dependency = NsoLoader::load(
                 exefs
                     .open_entry(dependency_entry)
@@ -152,7 +159,7 @@ fn prepare_modules(
             .expect("load dependency NSO")
             .prepare(
                 PreparationConfig {
-                    image_base: 0x7200_0000,
+                    image_base: dependency_base,
                     address_limit: 0x8000_0000,
                 },
                 &deterministic_runtime_export,
