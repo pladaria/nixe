@@ -13,7 +13,7 @@ pub mod ir;
 pub mod location;
 pub mod memory;
 pub mod profile;
-mod semantics;
+pub mod semantics;
 pub mod state;
 pub mod translate;
 pub mod vcpu;
