@@ -20,6 +20,9 @@ pub enum ControlTarget {
         address: Operand,
         execution_state: ExecutionState,
     },
+    /// A32 `BX`/`BLX`-style target whose bit zero selects T32 versus A32 at
+    /// runtime. The backend masks the address according to the selected state.
+    A32Interworking { address: Operand },
 }
 
 /// Architectural exception exit classification.
@@ -155,6 +158,10 @@ mod tests {
                 .into(),
             execution_state: ExecutionState::A64,
         };
+        let interworking = ControlTarget::A32Interworking {
+            address: super::super::value::Immediate::Address(GuestVirtualAddress::new(0x3001))
+                .into(),
+        };
         let exits = [
             Terminator::Direct { target: direct },
             Terminator::Indirect { target: indirect },
@@ -170,5 +177,9 @@ mod tests {
         assert!(matches!(exits[1], Terminator::Indirect { .. }));
         assert!(matches!(exits[2], Terminator::Call { .. }));
         assert!(matches!(exits[3], Terminator::Return { .. }));
+        assert!(matches!(
+            interworking,
+            ControlTarget::A32Interworking { .. }
+        ));
     }
 }

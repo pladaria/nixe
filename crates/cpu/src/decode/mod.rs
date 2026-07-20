@@ -192,7 +192,7 @@ mod tests {
                 location(profile, ExecutionState::A64),
                 0xd503_201f_u32.into()
             ),
-            DecodeResult::RecognizedUnimplemented(_)
+            DecodeResult::Decoded(_)
         ));
         assert!(matches!(
             decode(
@@ -200,7 +200,7 @@ mod tests {
                 location(profile, ExecutionState::A64),
                 0x1400_0000_u32.into()
             ),
-            DecodeResult::RecognizedUnimplemented(_)
+            DecodeResult::Decoded(_)
         ));
         assert!(matches!(
             decode(

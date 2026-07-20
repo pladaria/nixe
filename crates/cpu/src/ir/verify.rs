@@ -4,6 +4,7 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    address::GuestVirtualAddress,
     location::{ExecutionState, InstructionSize, LocationDescriptor},
     memory::MemoryAccessClass,
 };
@@ -127,6 +128,11 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
             metadata.sources.len()
         )));
     }
+    if metadata.budget_safepoint.guest_instruction_cost != metadata.guest_instruction_count {
+        return Err(VerificationError::metadata(
+            "budget safepoint cost does not match the guest instruction count",
+        ));
+    }
     if metadata.sources[0].location != metadata.start {
         return Err(VerificationError::metadata(
             "the first instruction source does not match the block start",
@@ -156,6 +162,15 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
                 "source {index} has a misaligned instruction address"
             )));
         }
+        if matches!(
+            source.location.execution_state,
+            ExecutionState::A32 | ExecutionState::T32
+        ) && source.location.pc.get() > u64::from(u32::MAX)
+        {
+            return Err(VerificationError::metadata(format!(
+                "source {index} lies outside the 32-bit address domain"
+            )));
+        }
         verify_encoding_width(
             index,
             source.location.execution_state,
@@ -166,9 +181,16 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
         byte_count = byte_count
             .checked_add(size)
             .ok_or_else(|| VerificationError::metadata("instruction byte count overflow"))?;
-        next_pc = next_pc.checked_add(u64::from(size)).ok_or_else(|| {
-            VerificationError::metadata("instruction source range overflows guest address space")
-        })?;
+        next_pc = match source.location.execution_state {
+            ExecutionState::A64 => next_pc.checked_add(u64::from(size)).ok_or_else(|| {
+                VerificationError::metadata(
+                    "instruction source range overflows guest address space",
+                )
+            })?,
+            ExecutionState::A32 | ExecutionState::T32 => {
+                GuestVirtualAddress::new(u64::from((next_pc.get() as u32).wrapping_add(size)))
+            }
+        };
 
         for dependency in source.dependencies.iter() {
             if let Some(generation) = generations.insert(dependency.page, dependency.generation)
@@ -978,7 +1000,9 @@ fn verify_terminator(
     block: &IrBlock,
 ) -> Result<(), VerificationError> {
     let check_target = |target: &ControlTarget| {
-        if let ControlTarget::Indirect { address, .. } = target {
+        if let ControlTarget::Indirect { address, .. }
+        | ControlTarget::A32Interworking { address } = target
+        {
             verify_terminator_operand(*address, definitions, IrType::Address, "indirect target")?;
         }
         Ok(())
@@ -1078,7 +1102,7 @@ fn verify_exits(block: &IrBlock) -> Result<(), VerificationError> {
         kind,
         target: match target {
             ControlTarget::Direct { pc, .. } => Some(*pc),
-            ControlTarget::Indirect { .. } => None,
+            ControlTarget::Indirect { .. } | ControlTarget::A32Interworking { .. } => None,
         },
     };
     let expected: Vec<_> = match &block.terminator {

@@ -54,7 +54,7 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0002_0001),
         coverage_id: CoverageId::new(0x0002_0001),
         priority: 0,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
     InstructionPattern {
         name: "b",
@@ -68,7 +68,7 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0002_0002),
         coverage_id: CoverageId::new(0x0002_0002),
         priority: 0,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
     InstructionPattern {
         name: "movs",
@@ -98,7 +98,7 @@ pub static PATTERNS_32: &[InstructionPattern] = &[InstructionPattern {
     semantic_id: SemanticId::new(0x0002_0004),
     coverage_id: CoverageId::new(0x0002_0004),
     priority: 0,
-    support: DecodeSupport::RecognizedUnimplemented,
+    support: DecodeSupport::Ready,
 }];
 
 static TABLE_16: OnceLock<DecoderTable> = OnceLock::new();

@@ -72,6 +72,15 @@ impl IrBuilder {
         }
     }
 
+    /// Replaces provisional metadata collected by a streaming frontend.
+    ///
+    /// Translation loops may emit operations before the final source list and
+    /// terminator exits are known. Full consistency is still enforced by
+    /// [`Self::finish`].
+    pub(crate) fn replace_metadata(&mut self, metadata: BlockMetadata) {
+        self.metadata = metadata;
+    }
+
     /// Inserts one operation and allocates monotonically increasing result IDs.
     ///
     /// The supplied types are checked against the operation semantics before
