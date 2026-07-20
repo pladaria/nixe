@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+swiitx-cpu.workspace = true
+swiitx-loader-executable.workspace = true
+
+[dev-dependencies]
+swiitx-loader-content.workspace = true
+swiitx-loader-storage.workspace = true
