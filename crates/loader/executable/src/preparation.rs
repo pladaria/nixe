@@ -110,6 +110,99 @@ pub trait SymbolResolver {
     fn resolve(&self, symbol: ExternalSymbol<'_>) -> SymbolResolution;
 }
 
+/// One NSO and its final caller-selected placement in an atomic link batch.
+#[derive(Clone, Copy, Debug)]
+pub struct NsoBatchModule<'a> {
+    pub image: &'a NsoImage,
+    pub config: PreparationConfig,
+}
+
+/// One explicit runtime-provided symbol available after module definitions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeExport<'a> {
+    pub name: &'a [u8],
+    pub address: u64,
+}
+
+/// Collects a complete process scope and atomically prepares every NSO.
+///
+/// `scope` is a permutation of module indices in lookup precedence. Visible
+/// strong definitions are unique process-wide; a strong definition replaces
+/// weak definitions, while the first weak definition in scope order wins.
+/// Runtime exports are consulted only when no module defines a name.
+pub fn prepare_nso_batch(
+    modules: &[NsoBatchModule<'_>],
+    scope: &[usize],
+    runtime_exports: &[RuntimeExport<'_>],
+) -> Result<Vec<PreparedModule>, PrepareError> {
+    if modules.is_empty() || modules.len() > 64 {
+        return Err(PrepareError::new("invalid NSO batch module count"));
+    }
+    if scope.len() != modules.len() {
+        return Err(PrepareError::new(
+            "symbol scope must contain every batch module exactly once",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for index in scope {
+        if *index >= modules.len() || !seen.insert(*index) {
+            return Err(PrepareError::new(
+                "symbol scope is not a permutation of batch modules",
+            ));
+        }
+    }
+
+    let mut definitions: BTreeMap<Vec<u8>, CollectedDefinition> = BTreeMap::new();
+    for index in scope {
+        let module = modules[*index];
+        for definition in collect_nso_definitions(module.image, module.config.image_base)? {
+            match definitions.get(&definition.name) {
+                Some(existing) if existing.strong && definition.strong => {
+                    return Err(PrepareError::new(format!(
+                        "duplicate strong symbol {}",
+                        String::from_utf8_lossy(&definition.name)
+                    )));
+                }
+                Some(existing) if existing.strong || !definition.strong => {}
+                _ => {
+                    definitions.insert(definition.name.clone(), definition);
+                }
+            }
+        }
+    }
+    let mut runtime = BTreeMap::new();
+    for export in runtime_exports {
+        if export.name.is_empty() || export.name.contains(&0) {
+            return Err(PrepareError::new("runtime export has an invalid name"));
+        }
+        if runtime
+            .insert(export.name.to_vec(), export.address)
+            .is_some()
+        {
+            return Err(PrepareError::new(format!(
+                "duplicate runtime export {}",
+                String::from_utf8_lossy(export.name)
+            )));
+        }
+    }
+    let resolver = |symbol: ExternalSymbol<'_>| {
+        definitions
+            .get(symbol.name())
+            .map(|definition| SymbolResolution::Address(definition.address))
+            .or_else(|| {
+                runtime
+                    .get(symbol.name())
+                    .copied()
+                    .map(SymbolResolution::Address)
+            })
+            .unwrap_or(SymbolResolution::Unresolved)
+    };
+    modules
+        .iter()
+        .map(|module| module.image.prepare(module.config, &resolver))
+        .collect()
+}
+
 impl<F> SymbolResolver for F
 where
     F: for<'a> Fn(ExternalSymbol<'a>) -> SymbolResolution,
@@ -813,7 +906,93 @@ struct ElfSymbol {
     size: u64,
 }
 
+struct CollectedDefinition {
+    name: Vec<u8>,
+    address: u64,
+    strong: bool,
+}
+
+fn collect_nso_definitions(
+    image: &NsoImage,
+    image_base: u64,
+) -> Result<Vec<CollectedDefinition>, PrepareError> {
+    let Some(mod0_offset) = image.mod0().map(Mod0Metadata::header_offset) else {
+        return Ok(Vec::new());
+    };
+    let regions = materialize(image.executable())?;
+    let dynamic = parse_dynamic(&regions, parse_mod0(&regions, mod0_offset)?.dynamic_offset)?;
+    if !dynamic.values.contains_key(&DT_SYMTAB) {
+        return Ok(Vec::new());
+    }
+    let read_only = image
+        .executable()
+        .segments()
+        .iter()
+        .find(|segment| segment.kind() == crate::ExecutableSegmentKind::ReadOnly)
+        .ok_or_else(|| PrepareError::new("NSO has no read-only segment"))?;
+    let hints = TableHints {
+        strings: Some((
+            checked_add(
+                read_only.memory_offset(),
+                image.metadata().dynamic_string_table().offset(),
+                "NSO string-table offset",
+            )?,
+            image.metadata().dynamic_string_table().size(),
+        )),
+        symbols: Some((
+            checked_add(
+                read_only.memory_offset(),
+                image.metadata().dynamic_symbol_table().offset(),
+                "NSO symbol-table offset",
+            )?,
+            image.metadata().dynamic_symbol_table().size(),
+        )),
+    };
+    let tables = SymbolTables::parse(&regions, &dynamic, hints, &[])?;
+    let mut definitions = Vec::new();
+    for (index, symbol) in tables.symbols.iter().enumerate().skip(1) {
+        if symbol.section == 0 {
+            continue;
+        }
+        let binding = symbol.info >> 4;
+        let visibility = symbol.other & 3;
+        if visibility == 1 || visibility == 2 || binding == 0 {
+            continue;
+        }
+        if !matches!(binding, 1 | 2) {
+            return Err(PrepareError::new(format!(
+                "defined symbol {index} has unsupported binding {binding}"
+            )));
+        }
+        validate_logical_range(&regions, symbol.value, 1, "defined symbol")?;
+        let name = tables.name(index as u32)?.to_vec();
+        if name.is_empty() {
+            continue;
+        }
+        definitions.push(CollectedDefinition {
+            name,
+            address: checked_add(image_base, symbol.value, "defined symbol address")?,
+            strong: binding == 1,
+        });
+    }
+    Ok(definitions)
+}
+
 impl SymbolTables {
+    fn name(&self, index: u32) -> Result<&[u8], PrepareError> {
+        let symbol = self
+            .symbols
+            .get(index as usize)
+            .ok_or_else(|| PrepareError::new(format!("invalid symbol {index}")))?;
+        let tail = self.strings.get(symbol.name as usize..).ok_or_else(|| {
+            PrepareError::new(format!("symbol {index} name offset is outside DT_STRTAB"))
+        })?;
+        let end = tail.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            PrepareError::new(format!("symbol {index} name has no bounded terminator"))
+        })?;
+        Ok(&tail[..end])
+    }
+
     fn parse(
         regions: &[WorkingRegion],
         dynamic: &DynamicInfo,
@@ -891,14 +1070,22 @@ impl SymbolTables {
         if symbol.section != 0 {
             return checked_add(image_base, symbol.value, "defined symbol address");
         }
-        let start = symbol.name as usize;
-        let tail = self.strings.get(start..).ok_or_else(|| {
-            PrepareError::new(format!("symbol {index} name offset is outside DT_STRTAB"))
-        })?;
-        let end = tail.iter().position(|byte| *byte == 0).ok_or_else(|| {
-            PrepareError::new(format!("symbol {index} name has no bounded terminator"))
-        })?;
-        let name = &tail[..end];
+        if binding == 0 {
+            return Err(PrepareError::new(format!(
+                "{context} references an undefined local symbol"
+            )));
+        }
+        if !matches!(binding, 1 | 2) {
+            return Err(PrepareError::new(format!(
+                "{context} references a symbol with unsupported binding {binding}"
+            )));
+        }
+        if visibility != 0 {
+            return Err(PrepareError::new(format!(
+                "{context} references an undefined non-default-visibility symbol"
+            )));
+        }
+        let name = self.name(index)?;
         let external = ExternalSymbol {
             name,
             binding,
@@ -1355,6 +1542,22 @@ mod tests {
         bytes
     }
 
+    fn nso_defining_external_with(binding: u8, visibility: u8) -> Vec<u8> {
+        let mut bytes = synthetic_nso();
+        // Dynamic symbol 1 lives at read-only offset 0x500. Make it a visible
+        // strong definition in the text segment.
+        let symbol = 0x1100 + 0x500 + ELF64_SYM_SIZE as usize;
+        bytes[symbol + 4] = binding << 4;
+        bytes[symbol + 5] = visibility;
+        bytes[symbol + 6..symbol + 8].copy_from_slice(&1_u16.to_le_bytes());
+        put_u64(&mut bytes, symbol + 8, 0x100);
+        bytes
+    }
+
+    fn nso_defining_external() -> Vec<u8> {
+        nso_defining_external_with(1, 0)
+    }
+
     #[test]
     fn prepares_synthetic_nro_and_nso_through_public_entry_points() {
         let config = PreparationConfig {
@@ -1380,6 +1583,129 @@ mod tests {
             prepared_nro.read_image(0x2000, 0x1800),
             prepared_nso.read_image(0x2000, 0x1800)
         );
+    }
+
+    #[test]
+    fn batch_linking_collects_forward_definitions_before_relocation() {
+        let consumer = NsoLoader::load(storage(synthetic_nso())).unwrap();
+        let provider = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let modules = [
+            NsoBatchModule {
+                image: &consumer,
+                config: PreparationConfig {
+                    image_base: 0x7100_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &provider,
+                config: PreparationConfig {
+                    image_base: 0x7110_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+        ];
+        let prepared = prepare_nso_batch(&modules, &[0, 1], &[]).unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &(0x7110_0100_u64).to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn batch_linking_rejects_duplicate_strong_definitions_atomically() {
+        let first = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let second = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let modules = [
+            NsoBatchModule {
+                image: &first,
+                config: PreparationConfig {
+                    image_base: 0x7100_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &second,
+                config: PreparationConfig {
+                    image_base: 0x7110_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+        ];
+        let error = prepare_nso_batch(&modules, &[0, 1], &[]).unwrap_err();
+        assert!(error.reason().contains("duplicate strong symbol external"));
+    }
+
+    #[test]
+    fn batch_scope_applies_binding_visibility_runtime_and_unresolved_rules() {
+        let consumer = NsoLoader::load(storage(synthetic_nso())).unwrap();
+        let weak = NsoLoader::load(storage(nso_defining_external_with(2, 0))).unwrap();
+        let strong = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let configs = [0x7100_0000, 0x7110_0000, 0x7120_0000];
+        let modules = [
+            NsoBatchModule {
+                image: &consumer,
+                config: PreparationConfig {
+                    image_base: configs[0],
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &weak,
+                config: PreparationConfig {
+                    image_base: configs[1],
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &strong,
+                config: PreparationConfig {
+                    image_base: configs[2],
+                    address_limit: 0x7200_0000,
+                },
+            },
+        ];
+        let prepared = prepare_nso_batch(
+            &modules,
+            &[1, 2, 0],
+            &[RuntimeExport {
+                name: b"external",
+                address: 0x6000_0000,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &(configs[2] + 0x100).to_le_bytes()
+        );
+
+        let hidden = NsoLoader::load(storage(nso_defining_external_with(1, 2))).unwrap();
+        let hidden_modules = [
+            NsoBatchModule {
+                image: &consumer,
+                config: modules[0].config,
+            },
+            NsoBatchModule {
+                image: &hidden,
+                config: modules[1].config,
+            },
+        ];
+        let prepared = prepare_nso_batch(
+            &hidden_modules,
+            &[1, 0],
+            &[RuntimeExport {
+                name: b"external",
+                address: 0x6000_0000,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &0x6000_0000_u64.to_le_bytes()
+        );
+        let error = prepare_nso_batch(&hidden_modules[..1], &[0], &[]).unwrap_err();
+        assert!(error.reason().contains("unresolved symbol external"));
     }
 
     fn prepare_nro_bytes(bytes: Vec<u8>) -> Result<PreparedModule, PrepareError> {

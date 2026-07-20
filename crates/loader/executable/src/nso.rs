@@ -344,7 +344,7 @@ fn parse_nso(storage: StorageRef) -> Result<NsoImage, LoadError> {
         .ok_or_else(|| invalid("image memory extent overflows"))?;
     validate_memory(&raw, data_memory_size)?;
 
-    let mod0 = parse_mod0(&loaded[0], raw[0], raw[2], bss_size, image_extent)?;
+    let mod0 = parse_mod0(&loaded, &raw, raw[2], bss_size, image_extent)?;
     let segments = raw
         .into_iter()
         .zip(loaded)
@@ -541,17 +541,17 @@ fn load_segment(storage: &StorageRef, segment: RawSegment) -> Result<StorageRef,
 }
 
 fn parse_mod0(
-    text: &StorageRef,
-    text_raw: RawSegment,
+    loaded: &[StorageRef],
+    raw: &[RawSegment; 3],
     data: RawSegment,
     bss_size: u64,
     image_extent: u64,
 ) -> Result<Option<Mod0Metadata>, LoadError> {
-    if text_raw.decompressed_size < 8 {
+    if raw[0].decompressed_size < 8 {
         return Err(invalid("text segment is too small for the MOD0 locator"));
     }
     let mut locator = [0; 4];
-    text.read_at(4, &mut locator)?;
+    loaded[0].read_at(4, &mut locator)?;
     let header_offset = u64::from(u32::from_le_bytes(locator));
     if header_offset == 0 {
         return Ok(None);
@@ -559,18 +559,23 @@ fn parse_mod0(
     let end = header_offset
         .checked_add(MOD0_SIZE)
         .ok_or_else(|| invalid("MOD0 header range overflows"))?;
-    if end > text_raw.decompressed_size {
-        return Err(invalid("MOD0 header is outside the text segment"));
-    }
+    let (segment, storage) = raw
+        .iter()
+        .zip(loaded)
+        .find(|(segment, _)| {
+            header_offset >= segment.memory_offset
+                && segment
+                    .memory_offset
+                    .checked_add(segment.decompressed_size)
+                    .is_some_and(|segment_end| end <= segment_end)
+        })
+        .ok_or_else(|| invalid("MOD0 header is outside the initialized image segments"))?;
     let mut bytes = [0; MOD0_SIZE as usize];
-    text.read_at(header_offset, &mut bytes)?;
+    storage.read_at(header_offset - segment.memory_offset, &mut bytes)?;
     if &bytes[..4] != b"MOD0" {
         return Err(invalid("expected MOD0 magic"));
     }
-    let base = text_raw
-        .memory_offset
-        .checked_add(header_offset)
-        .ok_or_else(|| invalid("MOD0 base overflows"))?;
+    let base = header_offset;
     let resolve = |offset| resolve_signed(base, read_i32(&bytes, offset), image_extent);
     let dynamic_offset = resolve(4)?;
     let bss_start = resolve(8)?;
@@ -942,6 +947,26 @@ mod tests {
         assert_eq!(mod0.dynamic_offset(), 0x30);
         assert_eq!(mod0.bss_range(), 0x2040..0x2081);
         assert_eq!(mod0.exception_frame_header_range(), 0x40..0x50);
+    }
+
+    #[test]
+    fn accepts_mod0_in_an_initialized_non_text_segment() {
+        let (mut bytes, _) = fixture([false; 3]);
+        let text_file = read_u32(&bytes, 0x10) as usize;
+        let read_only_file = read_u32(&bytes, 0x20) as usize;
+        put_u32(&mut bytes, text_file + 4, 0x1020);
+        let base = 0x1020_i32;
+        bytes[read_only_file + 0x20..read_only_file + 0x24].copy_from_slice(b"MOD0");
+        put_i32(&mut bytes, read_only_file + 0x24, 0x1040 - base);
+        put_i32(&mut bytes, read_only_file + 0x28, 0x2040 - base);
+        put_i32(&mut bytes, read_only_file + 0x2c, 0x2081 - base);
+        put_i32(&mut bytes, read_only_file + 0x30, 0x1040 - base);
+        put_i32(&mut bytes, read_only_file + 0x34, 0x1050 - base);
+        put_i32(&mut bytes, read_only_file + 0x38, 0x1060 - base);
+        let image = load(bytes).unwrap();
+        let mod0 = image.mod0().unwrap();
+        assert_eq!(mod0.header_offset(), 0x1020);
+        assert_eq!(mod0.dynamic_offset(), 0x1040);
     }
 
     #[test]

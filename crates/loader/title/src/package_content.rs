@@ -7,6 +7,7 @@ use swiitx_loader_content::{
 };
 use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
 
+use crate::{ContentType, PackageFormat, PackageMetadata};
 use crate::{ControlIcon, ControlMetadata};
 
 pub(crate) trait PackageContent {
@@ -84,18 +85,10 @@ impl PackageContent for Hfs0Archive {
     }
 
     fn open_entry_at(&self, index: usize) -> Result<StorageRef, LoadError> {
-        let entry = &self.entries()[index];
-        let integrity = self.validate_entry(entry)?;
-        if !integrity.is_valid() {
-            return Err(LoadError::invalid(
-                "HFS0 package content",
-                format!(
-                    "entry {:?} failed its advertised hash validation",
-                    entry.name()
-                ),
-            ));
-        }
-        self.open_entry(entry)
+        // Opening canonical launch content must remain lazy. Whole-entry HFS0
+        // hashing belongs to the explicit archive-verification path; the NCA
+        // loader validates the metadata and sections actually consumed.
+        self.open_entry(&self.entries()[index])
     }
 }
 
@@ -370,6 +363,119 @@ fn hex(bytes: &[u8]) -> String {
         result.push(char::from(DIGITS[usize::from(byte & 0x0F)]));
     }
     result
+}
+
+pub(crate) fn open_canonical_content(
+    package: &PackageMetadata,
+    content: &swiitx_loader_content::CnmtContentInfo,
+    format: PackageFormat,
+    keys: Option<&dyn NcaKeyProvider>,
+) -> Result<swiitx_loader_content::NcaArchive, LoadError> {
+    let expected_name = format!("{}.nca", hex(&content.content_id));
+    let storage = match format {
+        PackageFormat::Nsp => {
+            let archive = swiitx_loader_content::NspLoader::load(package.source.clone())?;
+            open_canonical_entry(&archive, &expected_name, content.size)?
+        }
+        PackageFormat::Nsz => {
+            let archive = swiitx_loader_content::NszLoader::load(package.source.clone())?;
+            open_canonical_entry(&archive, &expected_name, content.size)?
+        }
+        PackageFormat::Xci => {
+            let archive = swiitx_loader_content::XciLoader::load(package.source.clone())?;
+            open_canonical_entry(
+                archive.secure_partition()?.archive(),
+                &expected_name,
+                content.size,
+            )?
+        }
+        PackageFormat::Xcz => {
+            let archive = swiitx_loader_content::XczLoader::load(package.source.clone())?;
+            open_canonical_entry(archive.secure_partition()?, &expected_name, content.size)?
+        }
+    };
+    let nca = match keys {
+        Some(keys) => NcaLoader::load_with_key_provider(storage, keys)?,
+        None => NcaLoader::load(storage)?,
+    };
+    let expected_type = match content.content_type {
+        CnmtContentType::Program => NcaContentType::Program,
+        CnmtContentType::Data => NcaContentType::Data,
+        CnmtContentType::Control => NcaContentType::Control,
+        CnmtContentType::Meta => NcaContentType::Meta,
+        CnmtContentType::HtmlDocument | CnmtContentType::LegalInformation => NcaContentType::Manual,
+        CnmtContentType::DeltaFragment | CnmtContentType::Unknown(_) => {
+            return Err(LoadError::invalid(
+                "canonical package content",
+                format!(
+                    "unsupported canonical content type {}",
+                    content.content_type
+                ),
+            ));
+        }
+    };
+    if nca.header().content_type() != expected_type {
+        return Err(LoadError::invalid(
+            "canonical package content",
+            format!(
+                "{expected_name} is {:?}, expected {expected_type:?}",
+                nca.header().content_type()
+            ),
+        ));
+    }
+    let expected_title_id = match package.content_type {
+        ContentType::Patch => package.application_id.get(),
+        ContentType::Application | ContentType::AddOnContent | ContentType::Delta => {
+            package.title_id.get()
+        }
+    };
+    if nca.header().title_id() != expected_title_id {
+        return Err(LoadError::invalid(
+            "canonical package content",
+            format!(
+                "{expected_name} has title ID {:016X}, expected {expected_title_id:016X}",
+                nca.header().title_id()
+            ),
+        ));
+    }
+    Ok(nca)
+}
+
+fn open_canonical_entry<C: PackageContent + ?Sized>(
+    archive: &C,
+    expected_name: &str,
+    expected_size: u64,
+) -> Result<StorageRef, LoadError> {
+    let matches = (0..archive.entry_count())
+        .filter(|index| {
+            archive
+                .entry_name(*index)
+                .eq_ignore_ascii_case(expected_name)
+        })
+        .collect::<Vec<_>>();
+    let index = match matches.as_slice() {
+        [index] => *index,
+        [] => {
+            return Err(LoadError::invalid(
+                "canonical package content",
+                format!("{expected_name} is missing"),
+            ));
+        }
+        _ => {
+            return Err(LoadError::invalid(
+                "canonical package content",
+                format!("{expected_name} is duplicated or case-ambiguous"),
+            ));
+        }
+    };
+    let actual_size = archive.entry_size(index);
+    if actual_size != expected_size {
+        return Err(LoadError::invalid(
+            "canonical package content",
+            format!("{expected_name} has size {actual_size}, expected {expected_size}"),
+        ));
+    }
+    archive.open_entry_at(index)
 }
 
 pub(crate) fn import_ticket_keys<C: PackageContent + ?Sized>(

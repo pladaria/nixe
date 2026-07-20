@@ -69,6 +69,39 @@ impl TitleCatalog {
         Self::scan_directory_impl(path.as_ref(), Some(keys), options)
     }
 
+    /// Catalogues exactly one supported package without decryption keys.
+    pub fn load_package(path: impl AsRef<Path>) -> Result<Self, TitleError> {
+        Self::load_package_impl(path.as_ref(), None)
+    }
+
+    /// Catalogues exactly one supported package using caller-owned NCA keys.
+    pub fn load_package_with_key_set(
+        path: impl AsRef<Path>,
+        keys: &mut NcaKeySet,
+    ) -> Result<Self, TitleError> {
+        Self::load_package_impl(path.as_ref(), Some(keys))
+    }
+
+    fn load_package_impl(path: &Path, keys: Option<&mut NcaKeySet>) -> Result<Self, TitleError> {
+        let metadata = fs::metadata(path).map_err(|source| TitleError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(TitleError::Package {
+                path: path.to_owned(),
+                source: LoadError::invalid("title package", "path is not a regular file"),
+            });
+        }
+        let format = package_format(path).ok_or_else(|| TitleError::Package {
+            path: path.to_owned(),
+            source: LoadError::invalid("title package", "unsupported package extension"),
+        })?;
+        let mut catalog = Self::new();
+        add_package_path(&mut catalog, path, format, keys)?;
+        Ok(catalog)
+    }
+
     fn scan_directory_impl(
         path: &Path,
         mut keys: Option<&mut NcaKeySet>,
@@ -102,87 +135,7 @@ impl TitleCatalog {
         for candidate in candidates {
             let format = package_format(&candidate)
                 .expect("catalog candidates must have a supported package format");
-            let storage = FileStorage::open(&candidate).map_err(|source| TitleError::Package {
-                path: candidate.clone(),
-                source: LoadError::Storage(source),
-            })?;
-            let storage: StorageRef = Arc::new(storage);
-            match format {
-                PackageFormat::Nsp => {
-                    let archive =
-                        NspLoader::load(storage.clone()).map_err(|source| TitleError::Package {
-                            path: candidate.clone(),
-                            source,
-                        })?;
-                    add_package_contents(
-                        &mut catalog,
-                        &candidate,
-                        storage,
-                        &archive,
-                        keys.as_deref_mut(),
-                        false,
-                    )?;
-                }
-                PackageFormat::Nsz => {
-                    let archive =
-                        NszLoader::load(storage.clone()).map_err(|source| TitleError::Package {
-                            path: candidate.clone(),
-                            source,
-                        })?;
-                    add_package_contents(
-                        &mut catalog,
-                        &candidate,
-                        storage,
-                        &archive,
-                        keys.as_deref_mut(),
-                        false,
-                    )?;
-                }
-                PackageFormat::Xci => {
-                    let archive =
-                        XciLoader::load(storage.clone()).map_err(|source| TitleError::Package {
-                            path: candidate.clone(),
-                            source,
-                        })?;
-                    let secure =
-                        archive
-                            .secure_partition()
-                            .map_err(|source| TitleError::Package {
-                                path: candidate.clone(),
-                                source,
-                            })?;
-                    add_package_contents(
-                        &mut catalog,
-                        &candidate,
-                        storage,
-                        secure.archive(),
-                        keys.as_deref_mut(),
-                        true,
-                    )?;
-                }
-                PackageFormat::Xcz => {
-                    let archive =
-                        XczLoader::load(storage.clone()).map_err(|source| TitleError::Package {
-                            path: candidate.clone(),
-                            source,
-                        })?;
-                    let secure =
-                        archive
-                            .secure_partition()
-                            .map_err(|source| TitleError::Package {
-                                path: candidate.clone(),
-                                source,
-                            })?;
-                    add_package_contents(
-                        &mut catalog,
-                        &candidate,
-                        storage,
-                        secure,
-                        keys.as_deref_mut(),
-                        true,
-                    )?;
-                }
-            }
+            add_package_path(&mut catalog, &candidate, format, keys.as_deref_mut())?;
         }
 
         Ok(catalog)
@@ -228,6 +181,43 @@ impl TitleCatalog {
     }
 }
 
+fn add_package_path(
+    catalog: &mut TitleCatalog,
+    path: &Path,
+    format: PackageFormat,
+    keys: Option<&mut NcaKeySet>,
+) -> Result<(), TitleError> {
+    let storage = FileStorage::open(path).map_err(|source| TitleError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let storage: StorageRef = Arc::new(storage);
+    let package_error = |source| TitleError::Package {
+        path: path.to_owned(),
+        source,
+    };
+    match format {
+        PackageFormat::Nsp => {
+            let archive = NspLoader::load(storage.clone()).map_err(package_error)?;
+            add_package_contents(catalog, path, storage, &archive, keys, false, format)
+        }
+        PackageFormat::Nsz => {
+            let archive = NszLoader::load(storage.clone()).map_err(package_error)?;
+            add_package_contents(catalog, path, storage, &archive, keys, false, format)
+        }
+        PackageFormat::Xci => {
+            let archive = XciLoader::load(storage.clone()).map_err(package_error)?;
+            let secure = archive.secure_partition().map_err(package_error)?;
+            add_package_contents(catalog, path, storage, secure.archive(), keys, true, format)
+        }
+        PackageFormat::Xcz => {
+            let archive = XczLoader::load(storage.clone()).map_err(package_error)?;
+            let secure = archive.secure_partition().map_err(package_error)?;
+            add_package_contents(catalog, path, storage, secure, keys, true, format)
+        }
+    }
+}
+
 fn add_package_contents<C: PackageContent + ?Sized>(
     catalog: &mut TitleCatalog,
     path: &Path,
@@ -235,6 +225,7 @@ fn add_package_contents<C: PackageContent + ?Sized>(
     contents: &C,
     mut keys: Option<&mut NcaKeySet>,
     ignore_unsupported_metadata: bool,
+    source_format: PackageFormat,
 ) -> Result<(), TitleError> {
     if let Some(keys) = keys.as_deref_mut() {
         let _warnings = import_ticket_keys(contents, keys);
@@ -262,6 +253,7 @@ fn add_package_contents<C: PackageContent + ?Sized>(
                 });
             }
         };
+        package.set_source_format(source_format);
         let control_metadata = load_control_metadata(contents, &content_meta, key_provider)
             .map_err(|source| TitleError::Package {
                 path: path.to_owned(),

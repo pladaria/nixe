@@ -29,3 +29,4 @@ cargo test -p swiitx-loader-content --test external_nca -- --ignored
 cargo test -p swiitx-loader-executable --test real_npdm -- --ignored
 cargo test -p swiitx-loader-executable --test real_nso -- --ignored
 cargo test -p swiitx-runtime --test real_prepared_module_memory -- --ignored
+cargo test -p swiitx-runtime --test real_launch_plan -- --ignored

@@ -422,6 +422,8 @@ dependencies = [
  "swiitx-loader-content",
  "swiitx-loader-executable",
  "swiitx-loader-storage",
+ "swiitx-loader-title",
+ "tempfile",
 ]
 
 [[package]]
