@@ -133,12 +133,69 @@ pub struct FetchedCode<T> {
     pub dependencies: CodeDependencies,
 }
 
+/// Contiguous virtual extent of one code page.
+///
+/// The extent belongs to the memory backend rather than a CPU profile: real
+/// process mappings may use different page sizes, and frontend block formation
+/// must not assume the synthetic backend's 4 KiB granule.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CodePageSpan {
+    /// First byte covered by the page.
+    pub start: GuestVirtualAddress,
+    /// First byte after the page. `None` represents a page ending at 2^64.
+    pub end_exclusive: Option<GuestVirtualAddress>,
+}
+
+impl CodePageSpan {
+    /// Creates a validated non-empty span containing `address`.
+    #[must_use]
+    pub const fn containing(
+        start: GuestVirtualAddress,
+        end_exclusive: Option<GuestVirtualAddress>,
+        address: GuestVirtualAddress,
+    ) -> Option<Self> {
+        let after_start = address.get() >= start.get();
+        let before_end = match end_exclusive {
+            Some(end) => start.get() < end.get() && address.get() < end.get(),
+            None => true,
+        };
+        if after_start && before_end {
+            Some(Self {
+                start,
+                end_exclusive,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether `address` lies in this span.
+    #[must_use]
+    pub const fn contains(self, address: GuestVirtualAddress) -> bool {
+        address.get() >= self.start.get()
+            && match self.end_exclusive {
+                Some(end) => address.get() < end.get(),
+                None => true,
+            }
+    }
+}
+
 /// Read-only instruction view of a final process address space.
 ///
 /// Implementations enforce execute permission and the alignment implied by the
 /// operation. Returned integers are canonical bit patterns; implementations
 /// must decode guest bytes explicitly and never rely on host endianness.
 pub trait InstructionMemory {
+    /// Returns the virtual code-page extent containing `address`.
+    ///
+    /// Translators use this only as a block-cut boundary. Fetch methods remain
+    /// authoritative for mapping, permission, byte, and generation checks.
+    fn code_page_span(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<CodePageSpan, InstructionFetchFault>;
+
     /// Fetches a 16-bit T32 halfword at a two-byte-aligned address.
     fn fetch16(
         &self,
@@ -934,6 +991,34 @@ fn fail_install_if_requested(
 }
 
 impl InstructionMemory for SyntheticMemory {
+    fn code_page_span(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<CodePageSpan, InstructionFetchFault> {
+        let page_start = GuestVirtualAddress::new(
+            address.get() / SYNTHETIC_PAGE_SIZE as u64 * SYNTHETIC_PAGE_SIZE as u64,
+        );
+        let inner = self.inner.borrow();
+        let mapping = mapping_at(&inner, address_space, address).ok_or_else(|| {
+            InstructionFetchFault::new(
+                address_space,
+                address,
+                InstructionFetchFaultReason::Unmapped,
+            )
+        })?;
+        if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
+            return Err(InstructionFetchFault::new(
+                address_space,
+                address,
+                InstructionFetchFaultReason::ExecutePermissionDenied,
+            ));
+        }
+        let end_exclusive = page_start.checked_add(SYNTHETIC_PAGE_SIZE as u64);
+        Ok(CodePageSpan::containing(page_start, end_exclusive, address)
+            .expect("synthetic page arithmetic contains its source address"))
+    }
+
     fn fetch16(
         &self,
         address_space: AddressSpaceId,
@@ -1229,6 +1314,26 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    fn code_page_spans_support_backend_defined_sizes_and_top_of_address_space() {
+        let small = CodePageSpan::containing(
+            GuestVirtualAddress::new(0x4000),
+            Some(GuestVirtualAddress::new(0x8000)),
+            GuestVirtualAddress::new(0x7fff),
+        )
+        .unwrap();
+        assert!(small.contains(GuestVirtualAddress::new(0x4000)));
+        assert!(!small.contains(GuestVirtualAddress::new(0x8000)));
+
+        let top = CodePageSpan::containing(
+            GuestVirtualAddress::new(0xffff_ffff_ffff_f000),
+            None,
+            GuestVirtualAddress::MAX,
+        )
+        .unwrap();
+        assert!(top.contains(GuestVirtualAddress::MAX));
+    }
 
     const SPACE: AddressSpaceId = AddressSpaceId::new(7);
     const CODE: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);

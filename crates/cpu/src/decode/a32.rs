@@ -40,7 +40,7 @@ pub static PATTERNS: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0001_0001),
         coverage_id: CoverageId::new(0x0001_0001),
         priority: 0,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
     InstructionPattern {
         name: "b",
@@ -54,7 +54,7 @@ pub static PATTERNS: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0001_0002),
         coverage_id: CoverageId::new(0x0001_0002),
         priority: 0,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
 ];
 

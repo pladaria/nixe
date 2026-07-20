@@ -67,6 +67,16 @@ pub struct BlockExit {
     pub target: Option<GuestVirtualAddress>,
 }
 
+/// Backend-visible dispatch budget and safepoint annotation.
+///
+/// A backend polls at the block boundary and charges the completed guest
+/// instruction count. The frontend records policy only; it does not access a
+/// scheduler or vCPU budget directly.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BudgetSafepoint {
+    pub guest_instruction_cost: u32,
+}
+
 /// Metadata collected while translating one bounded unit.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockMetadata {
@@ -76,6 +86,8 @@ pub struct BlockMetadata {
     pub guest_byte_count: u32,
     /// Number of guest instructions represented.
     pub guest_instruction_count: u32,
+    /// Dispatch budget charged when this block executes.
+    pub budget_safepoint: BudgetSafepoint,
     /// Ordered static exits; indirect and runtime exits remain explicit entries.
     pub exits: Box<[BlockExit]>,
     /// Physical code pages and generations observed during translation.
@@ -99,6 +111,9 @@ impl BlockMetadata {
             start,
             guest_byte_count,
             guest_instruction_count,
+            budget_safepoint: BudgetSafepoint {
+                guest_instruction_cost: guest_instruction_count,
+            },
             exits: exits.into(),
             code_dependencies: code_dependencies.into(),
             sources: sources.into(),
