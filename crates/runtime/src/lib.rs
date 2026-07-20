@@ -5,8 +5,11 @@ mod launcher;
 mod module_memory;
 mod process_builder;
 
-pub use launch_plan::LaunchPlan;
-pub use launcher::Launcher;
+pub use launch_plan::{
+    AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,
+    MountProvenance, PackagedIdentity, ReadOnlyMount,
+};
+pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
 pub use module_memory::{
     BackendInstallError, InstallStage, ModuleInstallError, ModuleMemoryBackend, PageRequest,
     install_prepared_module,

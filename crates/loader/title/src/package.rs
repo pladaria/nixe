@@ -2,11 +2,13 @@ use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 
 use swiitx_loader_content::{
-    ApplicationVersion, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
+    ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
+    NcaArchive, NcaKeyProvider,
 };
 use swiitx_loader_storage::StorageRef;
 
-use crate::ControlMetadata;
+use crate::package_content::open_canonical_content;
+use crate::{ControlMetadata, PackageFormat};
 
 /// Identifies an application to which base, patch, and add-on content belongs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -108,6 +110,7 @@ pub struct PackageMetadata {
     control_metadata: Option<ControlMetadata>,
     /// Canonical binary metadata used to compare and resolve package revisions.
     canonical_content_meta: CnmtContentMeta,
+    source_format: Option<PackageFormat>,
 }
 
 impl PackageMetadata {
@@ -162,12 +165,32 @@ impl PackageMetadata {
             source,
             control_metadata: None,
             canonical_content_meta: content_meta.clone(),
+            source_format: None,
         })
     }
 
     /// Returns the canonical binary content metadata retained for resolution.
     pub fn canonical_content_meta(&self) -> &CnmtContentMeta {
         &self.canonical_content_meta
+    }
+
+    /// Opens one NCA selected by this package's canonical CNMT record.
+    ///
+    /// Metadata constructed directly with [`Self::from_content_meta`] has no
+    /// container locator and cannot be reopened. Catalog discovery attaches
+    /// that locator without retaining a mutable package parser.
+    pub fn open_content(
+        &self,
+        content: &CnmtContentInfo,
+        keys: Option<&dyn NcaKeyProvider>,
+    ) -> Result<NcaArchive, swiitx_loader_storage::LoadError> {
+        let format = self.source_format.ok_or_else(|| {
+            swiitx_loader_storage::LoadError::invalid(
+                "canonical package content",
+                "package metadata has no container locator",
+            )
+        })?;
+        open_canonical_content(self, content, format, keys)
     }
 
     /// Returns parsed Control NCA metadata attached while loading the package.
@@ -177,6 +200,10 @@ impl PackageMetadata {
 
     pub(crate) fn set_control_metadata(&mut self, metadata: Option<ControlMetadata>) {
         self.control_metadata = metadata;
+    }
+
+    pub(crate) fn set_source_format(&mut self, format: PackageFormat) {
+        self.source_format = Some(format);
     }
 
     /// Returns the patch title declared by an application package.
@@ -221,6 +248,7 @@ impl Debug for PackageMetadata {
             .field("content_type", &self.content_type)
             .field("control_metadata", &self.control_metadata)
             .field("canonical_content_meta", &self.canonical_content_meta)
+            .field("source_format", &self.source_format)
             .field("source", &"<storage>")
             .finish()
     }
