@@ -144,7 +144,7 @@ pub enum MountProvenance {
 }
 
 /// Lazy read-only RomFS view used by later process mount creation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReadOnlyMount {
     provenance: MountProvenance,
     content_id: Option<[u8; 16]>,
@@ -176,7 +176,7 @@ impl ReadOnlyMount {
 }
 
 /// One resolved add-on title and its canonically ordered Data mounts.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AddOnContent {
     title_id: TitleId,
     version: ApplicationVersion,

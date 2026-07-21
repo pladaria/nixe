@@ -18,14 +18,16 @@ use swiitx_loader_executable::{
     SymbolResolution, prepare_nso_batch,
 };
 
-use crate::{LaunchKind, LaunchModuleImage, LaunchPlan, install_prepared_module};
+use crate::{
+    ExecutionReport, LaunchKind, LaunchModuleImage, LaunchPlan, ProcessExecutionError,
+    ProcessExecutionStatus, ProcessTeardownReport, install_prepared_module,
+};
 
 const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
 const DEFAULT_HOME_BREW_STACK_SIZE: u64 = 0x10_0000;
 const MODULE_GUARD_SIZE: u64 = 0x1_0000;
 const RESOURCE_GUARD_SIZE: u64 = 0x1_0000;
 const TLS_SIZE: u64 = SYNTHETIC_PAGE_SIZE as u64;
-const MAIN_THREAD_HANDLE: u32 = 1;
 const HOME_BREW_CONFIG_ENTRY_SIZE: usize = 24;
 const HOME_BREW_MAIN_THREAD_HANDLE_KEY: u32 = 1;
 
@@ -93,6 +95,9 @@ pub struct RunnableProcess {
     modules: Box<[PreparedModule]>,
     entry_module: usize,
     main_thread: MainThread,
+    mounts: crate::ProcessMountNamespace,
+    handles: crate::HandleTable,
+    execution: crate::execution::ProcessExecutionControl,
 }
 
 impl RunnableProcess {
@@ -124,6 +129,85 @@ impl RunnableProcess {
     #[must_use]
     pub const fn main_thread(&self) -> &MainThread {
         &self.main_thread
+    }
+
+    /// Returns the immutable process-local filesystem namespace.
+    #[must_use]
+    pub const fn mounts(&self) -> &crate::ProcessMountNamespace {
+        &self.mounts
+    }
+
+    /// Returns the process-local kernel-object handle table.
+    #[must_use]
+    pub const fn handles(&self) -> &crate::HandleTable {
+        &self.handles
+    }
+
+    /// Returns mutable handle access for future syscall/IPC dispatch.
+    pub const fn handles_mut(&mut self) -> &mut crate::HandleTable {
+        &mut self.handles
+    }
+
+    /// Returns the host-side lifecycle state of this process.
+    #[must_use]
+    pub const fn execution_status(&self) -> ProcessExecutionStatus {
+        self.execution.status()
+    }
+
+    /// Requests a stop before the next reference-engine instruction.
+    pub fn request_safepoint(&mut self) {
+        self.execution.request_safepoint();
+    }
+
+    /// Publishes runtime event bits to be observed at the next safepoint.
+    pub fn post_event(&self, mask: u32) {
+        self.execution.post_event(mask);
+    }
+
+    /// Resumes a process suspended by an exception or scheduling instruction.
+    pub fn resume(&mut self) -> bool {
+        self.execution.resume()
+    }
+
+    /// Marks the process exited. Resource release occurs in [`Self::teardown`]
+    /// or when the process is dropped.
+    pub fn terminate(&mut self) -> bool {
+        self.execution.terminate()
+    }
+
+    /// Runs a bounded slice through the independent reference interpreter.
+    ///
+    /// This is the executable baseline used before an IR evaluator or native
+    /// backend exists. It intentionally does not claim to execute translated IR.
+    pub fn run_reference(
+        &mut self,
+        instruction_budget: u64,
+    ) -> Result<ExecutionReport, ProcessExecutionError> {
+        crate::execution::run_reference(
+            &mut self.execution,
+            self.cpu,
+            &self.memory,
+            &mut self.main_thread.state,
+            instruction_budget,
+        )
+    }
+
+    /// Consumes the process and deterministically releases all process-owned resources.
+    #[must_use]
+    pub fn teardown(self) -> ProcessTeardownReport {
+        ProcessTeardownReport {
+            previous_status: self.execution.status(),
+            threads_released: 1,
+            modules_released: self.modules.len(),
+            mappings_released: self
+                .modules
+                .iter()
+                .map(|module| module.mappings().len())
+                .sum(),
+            physical_pages_released: self.memory.physical_page_count(),
+            mounts_released: self.mounts.mount_count(),
+            handles_released: self.handles.len(),
+        }
     }
 
     /// Translates and verifies the initialized entry block through process memory.
@@ -247,6 +331,12 @@ impl ProcessBuilder {
         let placements = module_placements(plan, self.config.image_base, address_space)?;
         let modules = prepare_modules(plan, &placements, address_space)?;
         let entry_module = plan.entry_module_index();
+        let mut handles = crate::HandleTable::new();
+        let main_thread_handle = handles
+            .insert(crate::HandleObject::Thread { thread_id: 1 })
+            .map_err(|error| {
+                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
+            })?;
 
         let mut memory = SyntheticMemory::new();
         for module in &modules {
@@ -294,7 +384,7 @@ impl ProcessBuilder {
                 &mut memory,
                 self.config.address_space_id,
                 address,
-                MAIN_THREAD_HANDLE,
+                main_thread_handle,
             )?;
             Some(address)
         } else {
@@ -308,12 +398,12 @@ impl ProcessBuilder {
             entry,
             stack_top,
             tls_base,
-            MAIN_THREAD_HANDLE,
+            main_thread_handle,
             abi_context,
         )?;
         let main_thread = MainThread {
             state,
-            handle: MAIN_THREAD_HANDLE,
+            handle: main_thread_handle,
             stack_bottom,
             stack_top,
             tls_base,
@@ -326,6 +416,9 @@ impl ProcessBuilder {
             modules: modules.into_boxed_slice(),
             entry_module,
             main_thread,
+            mounts: crate::ProcessMountNamespace::from_launch_plan(plan),
+            handles,
+            execution: crate::execution::ProcessExecutionControl::default(),
         };
         process.translate_entry()?;
         Ok(process)
@@ -673,7 +766,7 @@ mod tests {
             GuestVirtualAddress::new(0x0020_0000),
             GuestVirtualAddress::new(0x0080_0000),
             GuestVirtualAddress::new(0x0090_0000),
-            MAIN_THREAD_HANDLE,
+            1,
             None,
         )
         .unwrap();
@@ -684,7 +777,7 @@ mod tests {
         assert_eq!(state.read_r(a32_register(13)), 0x0080_0000);
         assert_eq!(state.tpidrurw(), 0x0090_0000);
         assert_eq!(state.tpidruro(), 0x0090_0000);
-        assert_eq!(state.read_r(a32_register(1)), MAIN_THREAD_HANDLE);
+        assert_eq!(state.read_r(a32_register(1)), 1);
     }
 
     #[test]
@@ -710,6 +803,12 @@ mod tests {
         let ThreadCpuState::A64(state) = &process.main_thread().state else {
             panic!("homebrew fixture must initialize A64");
         };
+        assert_eq!(
+            process.handles().get(process.main_thread().handle),
+            Some(&crate::HandleObject::Thread { thread_id: 1 })
+        );
+        assert!(process.mounts().primary().is_none());
+        assert!(process.mounts().add_ons().is_empty());
         assert_eq!(state.pc(), entry.get());
         assert_eq!(
             state.read_x(A64Register::StackPointer),
@@ -747,7 +846,7 @@ mod tests {
                 )
                 .unwrap()
                 .value,
-            MemoryValue::U64(u64::from(MAIN_THREAD_HANDLE))
+            MemoryValue::U64(u64::from(process.main_thread().handle))
         );
         assert_eq!(
             process
@@ -831,5 +930,126 @@ mod tests {
             .unwrap();
         let after = process.memory.fetch32(space, entry).unwrap().dependencies;
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let entry = process.entry_module().entry_address();
+
+        let report = process.run_reference(1).unwrap();
+        assert_eq!(report.instructions_executed, 1);
+        assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
+        assert_eq!(
+            process.execution_status(),
+            crate::ProcessExecutionStatus::Ready
+        );
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        assert_eq!(state.pc(), entry + 0x80);
+    }
+
+    #[test]
+    fn reference_execution_observes_safepoints_before_fetch() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let entry = process.entry_module().entry_address();
+        process.request_safepoint();
+
+        let report = process.run_reference(10).unwrap();
+        assert_eq!(report.instructions_executed, 0);
+        assert_eq!(report.stop, crate::ExecutionStop::Safepoint);
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        assert_eq!(state.pc(), entry);
+    }
+
+    #[test]
+    fn reference_execution_observes_pending_events_before_fetch() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        process.post_event(0b0101);
+
+        let report = process.run_reference(10).unwrap();
+        assert_eq!(report.instructions_executed, 0);
+        assert_eq!(
+            report.stop,
+            crate::ExecutionStop::PendingEvent { mask: 0b0101 }
+        );
+    }
+
+    #[test]
+    fn reference_execution_propagates_instruction_fetch_faults() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let ThreadCpuState::A64(state) = &mut process.main_thread.state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        state.set_pc(0x1000);
+
+        let error = process.run_reference(1).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::ProcessExecutionError::InstructionFetch {
+                instructions_executed: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            process.execution_status(),
+            crate::ProcessExecutionStatus::Faulted
+        );
+    }
+
+    #[test]
+    fn architectural_exception_suspends_until_runtime_resumes_thread() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+
+        let report = process.run_reference(2).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::Exception {
+                kind: swiitx_cpu::ir::terminator::ExceptionKind::UndefinedInstruction,
+                ..
+            }
+        ));
+        assert_eq!(
+            process.execution_status(),
+            crate::ProcessExecutionStatus::Suspended
+        );
+        assert!(matches!(
+            process.run_reference(1),
+            Err(crate::ProcessExecutionError::NotRunnable {
+                status: crate::ProcessExecutionStatus::Suspended
+            })
+        ));
+        assert!(process.resume());
+        assert_eq!(
+            process.execution_status(),
+            crate::ProcessExecutionStatus::Ready
+        );
+    }
+
+    #[test]
+    fn teardown_reports_resources_owned_by_the_process() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        assert!(process.terminate());
+
+        let report = process.teardown();
+        assert_eq!(
+            report.previous_status,
+            crate::ProcessExecutionStatus::Exited
+        );
+        assert_eq!(report.threads_released, 1);
+        assert_eq!(report.modules_released, 1);
+        assert!(report.mappings_released > 0);
+        assert!(report.physical_pages_released > 0);
+        assert_eq!(report.mounts_released, 0);
+        assert_eq!(report.handles_released, 1);
     }
 }
