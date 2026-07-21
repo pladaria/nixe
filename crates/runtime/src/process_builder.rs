@@ -12,7 +12,9 @@ use swiitx_cpu::memory::{
 };
 use swiitx_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use swiitx_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
-use swiitx_cpu::translate::{BlockTranslationConfig, translate_block};
+use swiitx_cpu::translate::{
+    BlockTranslationConfig, BlockTranslationReport, translate_block, translate_block_report,
+};
 use swiitx_loader_executable::{
     AddressSpaceType, ExternalSymbol, NsoBatchModule, PreparationConfig, PreparedModule,
     SymbolResolution, prepare_nso_batch,
@@ -219,27 +221,51 @@ impl RunnableProcess {
 
     /// Translates and verifies the initialized entry block through process memory.
     pub fn translate_entry(&self) -> Result<IrBlock, ProcessBuildError> {
-        let start = LocationDescriptor::new(
-            GuestVirtualAddress::new(self.entry_module().entry_address()),
-            self.main_thread.state.execution_state(),
-            self.cpu.profile().id(),
-        );
         translate_block(
             BlockTranslationConfig::default(),
             &self.cpu.profile(),
             self.cpu.address_space_id(),
-            start,
+            self.entry_location(),
             &self.memory,
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))
     }
 
+    /// Translates the entry block with source disassembly and a structured
+    /// failure report. This path is opt-in and never runs during normal build.
+    #[must_use]
+    pub fn translate_entry_report(&self) -> BlockTranslationReport {
+        translate_block_report(
+            BlockTranslationConfig::default(),
+            &self.cpu.profile(),
+            self.cpu.address_space_id(),
+            self.entry_location(),
+            &self.memory,
+        )
+    }
+
     /// Produces the deterministic verified-IR dump used by the first integration milestone.
     pub fn print_entry_ir(&self) -> Result<String, ProcessBuildError> {
-        Ok(print_block(
-            &self.translate_entry()?,
-            IrPrintOptions::default(),
-        ))
+        let block = self
+            .translate_entry_report()
+            .into_result()
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))?;
+        Ok(print_block(&block, IrPrintOptions::default()))
+    }
+
+    /// Produces the compact source, dependency, end-reason, and IR report used
+    /// for entry-point bring-up without attaching a native debugger.
+    #[must_use]
+    pub fn print_entry_report(&self) -> String {
+        self.translate_entry_report().print()
+    }
+
+    fn entry_location(&self) -> LocationDescriptor {
+        LocationDescriptor::new(
+            GuestVirtualAddress::new(self.entry_module().entry_address()),
+            self.main_thread.state.execution_state(),
+            self.cpu.profile().id(),
+        )
     }
 }
 
@@ -803,6 +829,12 @@ mod tests {
         let dump = process.print_entry_ir().unwrap();
         assert!(dump.contains(" A64 "));
         assert!(dump.contains("raw=0x14000020"));
+        assert!(dump.contains("guest=\"b imm=#128\""));
+        let report = process.print_entry_report();
+        assert!(report.starts_with("swiitx-frontend-block-report-v1\n"));
+        assert!(report.contains("outcome=translated end=direct-branch"));
+        assert!(report.contains("ir-dump stage=pre-optimization"));
+        assert!(report.contains("dependency page="));
         assert_eq!(
             process.main_thread().state.execution_state(),
             ExecutionState::A64

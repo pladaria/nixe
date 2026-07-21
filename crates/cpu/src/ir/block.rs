@@ -77,6 +77,61 @@ pub struct BudgetSafepoint {
     pub guest_instruction_cost: u32,
 }
 
+/// Exact frontend policy or semantic event which ended a translated block.
+///
+/// This is deliberately separate from [`Terminator`]. A page-boundary or
+/// instruction-limit cut uses an ordinary direct terminator to continue at the
+/// next guest PC, but remains observably different from a guest branch.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BlockEndReason {
+    /// Metadata was assembled directly rather than by the block translator.
+    ExplicitTerminator,
+    /// A guest unconditional direct branch ended the block.
+    DirectBranch,
+    /// A guest conditional branch ended the block.
+    ConditionalBranch,
+    /// A guest computed branch ended the block.
+    IndirectBranch,
+    /// A guest call ended the block.
+    Call,
+    /// A guest return ended the block.
+    Return,
+    /// A precise architectural exception ended the block.
+    Exception,
+    /// The next instruction must execute once in the reference interpreter.
+    InterpreterFallback,
+    /// Neither the lifter nor interpreter supports the instruction.
+    UnsupportedInstruction,
+    /// The configured guest-instruction bound was reached.
+    InstructionLimit,
+    /// Continuing would cross the code-page span in which translation began.
+    PageBoundary,
+    /// The instruction and page limits were reached at the same guest PC.
+    InstructionLimitAtPageBoundary,
+    /// A runtime/dispatcher stop ended a manually assembled block.
+    RuntimeStop,
+}
+
+impl core::fmt::Display for BlockEndReason {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::ExplicitTerminator => "explicit-terminator",
+            Self::DirectBranch => "direct-branch",
+            Self::ConditionalBranch => "conditional-branch",
+            Self::IndirectBranch => "indirect-branch",
+            Self::Call => "call",
+            Self::Return => "return",
+            Self::Exception => "exception",
+            Self::InterpreterFallback => "interpreter-fallback",
+            Self::UnsupportedInstruction => "unsupported-instruction",
+            Self::InstructionLimit => "instruction-limit",
+            Self::PageBoundary => "page-boundary",
+            Self::InstructionLimitAtPageBoundary => "instruction-limit+page-boundary",
+            Self::RuntimeStop => "runtime-stop",
+        })
+    }
+}
+
 /// Metadata collected while translating one bounded unit.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockMetadata {
@@ -88,6 +143,8 @@ pub struct BlockMetadata {
     pub guest_instruction_count: u32,
     /// Dispatch budget charged when this block executes.
     pub budget_safepoint: BudgetSafepoint,
+    /// Exact reason translation stopped after the recorded sources.
+    pub end_reason: BlockEndReason,
     /// Ordered static exits; indirect and runtime exits remain explicit entries.
     pub exits: Box<[BlockExit]>,
     /// Physical code pages and generations observed during translation.
@@ -114,10 +171,18 @@ impl BlockMetadata {
             budget_safepoint: BudgetSafepoint {
                 guest_instruction_cost: guest_instruction_count,
             },
+            end_reason: BlockEndReason::ExplicitTerminator,
             exits: exits.into(),
             code_dependencies: code_dependencies.into(),
             sources: sources.into(),
         }
+    }
+
+    /// Attaches the translator's exact block-cut reason.
+    #[must_use]
+    pub const fn with_end_reason(mut self, end_reason: BlockEndReason) -> Self {
+        self.end_reason = end_reason;
+        self
     }
 }
 

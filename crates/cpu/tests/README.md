@@ -24,3 +24,15 @@ cargo test-differential
 ```
 
 Robustness fuzzing is documented in [`fuzz/README.md`](../../../fuzz/README.md).
+
+## Single-block diagnostics
+
+`translate_raw_block_report` accepts raw little-endian bytes, a base guest PC,
+an execution state, and a CPU profile. It runs the ordinary decoder, lifter, IR
+builder, and verifier against a bounded synthetic instruction view, then emits
+a deterministic report containing source disassembly, pre-optimization IR,
+the exact block-end reason, and every physical code-page generation.
+
+`translate_block_report` provides the same opt-in report path for an existing
+process-memory implementation. Ordinary `translate_block` calls do not compute
+disassembly strings or print IR.

@@ -3,6 +3,7 @@
 mod a32;
 mod a64;
 pub mod block;
+pub mod observability;
 mod t32;
 
 pub use block::{
@@ -10,6 +11,10 @@ pub use block::{
     MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION, a32_interworking_target, conditional_terminator,
     direct_branch_target, emit_call, indirect_interworking_target, indirect_target,
     translate_block,
+};
+pub use observability::{
+    BlockReportEndReason, BlockTranslationFailureReason, BlockTranslationReport,
+    translate_block_report, translate_raw_block_report,
 };
 
 #[cfg(test)]
