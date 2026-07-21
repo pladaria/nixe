@@ -94,7 +94,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::{address::GuestVirtualAddress, coverage::CoverageId, location::InstructionSize};
+    use crate::{
+        address::GuestVirtualAddress,
+        coverage::CoverageId,
+        location::InstructionSize,
+        profile::{CapabilityStatus, InstructionFeature},
+    };
 
     fn location(profile: GuestCpuProfile, state: ExecutionState) -> LocationDescriptor {
         LocationDescriptor::new(GuestVirtualAddress::new(0x1000), state, profile.id())
@@ -106,6 +111,57 @@ mod tests {
                 decoded
             }
             other => panic!("expected recognized instruction, got {other:?}"),
+        }
+    }
+
+    // Encoding families and instruction semantics are traced to Arm DDI 0602
+    // (A64) and Arm DDI 0597 (A32/T32). See `crates/cpu/tests/README.md`.
+    // These are independent expectations, not output copied from an assembler.
+    #[test]
+    fn raw_encoding_goldens_cover_every_decoder_family() {
+        let profile = GuestCpuProfile::switch_1();
+        let cases = [
+            (ExecutionState::A64, 0x1400_0000_u32.into(), "b"),
+            (ExecutionState::A64, 0xd503_3bbf_u32.into(), "barrier"),
+            (
+                ExecutionState::A64,
+                0x9100_4423_u32.into(),
+                "add-sub-immediate",
+            ),
+            (
+                ExecutionState::A64,
+                0xf940_0020_u32.into(),
+                "load-store-unsigned",
+            ),
+            (ExecutionState::A64, 0x4e20_1c00_u32.into(), "simd-bitwise"),
+            (ExecutionState::A32, 0xeaff_ffff_u32.into(), "b"),
+            (
+                ExecutionState::A32,
+                0xe3a0_0001_u32.into(),
+                "data-processing",
+            ),
+            (
+                ExecutionState::A32,
+                0xe590_1000_u32.into(),
+                "load-store-single",
+            ),
+            (ExecutionState::A32, 0xf200_0110_u32.into(), "neon-bitwise"),
+            (ExecutionState::T32, 0xe7ff_u16.into(), "b"),
+            (ExecutionState::T32, 0x237f_u16.into(), "movs"),
+            (ExecutionState::T32, 0x4801_u16.into(), "load-literal"),
+        ];
+
+        for (state, encoding, expected_name) in cases {
+            let decoded = opcode(decode(&profile, location(profile, state), encoding));
+            assert_eq!(
+                decoded.encoding, encoding,
+                "decoder did not preserve raw encoding for {state} {encoding}"
+            );
+            assert_eq!(
+                decoded.instruction.pattern().name,
+                expected_name,
+                "raw golden mismatch for {state} {encoding}"
+            );
         }
     }
 
@@ -126,10 +182,52 @@ mod tests {
                 CoverageId::new(0x0000_0002),
             ),
             (
+                ExecutionState::A64,
+                InstructionEncoding::from_u32(0xd503_3bbf),
+                "barrier",
+                CoverageId::new(0x0000_000e),
+            ),
+            (
+                ExecutionState::A64,
+                InstructionEncoding::from_u32(0x9100_4423),
+                "add-sub-immediate",
+                CoverageId::new(0x0000_0003),
+            ),
+            (
+                ExecutionState::A64,
+                InstructionEncoding::from_u32(0xf940_0020),
+                "load-store-unsigned",
+                CoverageId::new(0x0000_0023),
+            ),
+            (
+                ExecutionState::A64,
+                InstructionEncoding::from_u32(0x4e20_1c00),
+                "simd-bitwise",
+                CoverageId::new(0x0000_0030),
+            ),
+            (
                 ExecutionState::A32,
                 InstructionEncoding::from_u32(0xeaff_ffff),
                 "b imm=#-4, cond=#14",
                 CoverageId::new(0x0001_0002),
+            ),
+            (
+                ExecutionState::A32,
+                InstructionEncoding::from_u32(0xe3a0_0001),
+                "data-processing",
+                CoverageId::new(0x0001_0010),
+            ),
+            (
+                ExecutionState::A32,
+                InstructionEncoding::from_u32(0xe590_1000),
+                "load-store-single",
+                CoverageId::new(0x0001_0020),
+            ),
+            (
+                ExecutionState::A32,
+                InstructionEncoding::from_u32(0xf200_0110),
+                "neon-bitwise",
+                CoverageId::new(0x0001_0031),
             ),
             (
                 ExecutionState::T32,
@@ -142,6 +240,12 @@ mod tests {
                 InstructionEncoding::from_u16(0x237f),
                 "movs dst=r3, imm=#127",
                 CoverageId::new(0x0002_0003),
+            ),
+            (
+                ExecutionState::T32,
+                InstructionEncoding::from_u16(0x4801),
+                "load-literal",
+                CoverageId::new(0x0002_0020),
             ),
             (
                 ExecutionState::T32,
@@ -209,6 +313,59 @@ mod tests {
                 location(profile, ExecutionState::A64),
                 0_u32.into()
             ),
+            DecodeResult::Unallocated { .. }
+        ));
+    }
+
+    // Arm DDI 0487 defines feature-dependent instruction availability. This
+    // test exercises the actual decoder gate rather than only the profile API.
+    #[test]
+    fn decoder_profile_feature_goldens_cover_enabled_disabled_and_unknown() {
+        let enabled = GuestCpuProfile::switch_1();
+        let disabled = enabled
+            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Disabled);
+        let unknown = GuestCpuProfile::switch_2_native();
+        let encoding = InstructionEncoding::from_u32(0x4e20_1c00); // AND V0.16B,V0.16B,V0.16B
+
+        assert!(matches!(
+            decode(&enabled, location(enabled, ExecutionState::A64), encoding),
+            DecodeResult::Decoded(_)
+        ));
+        assert!(matches!(
+            decode(
+                &disabled,
+                location(disabled, ExecutionState::A64),
+                encoding
+            ),
+            DecodeResult::ProfileDisabled { rejection, .. }
+                if rejection.feature == InstructionFeature::AdvancedSimd
+                    && rejection.status == CapabilityStatus::Disabled
+        ));
+        assert!(matches!(
+            decode(
+                &unknown,
+                location(unknown, ExecutionState::A64),
+                encoding
+            ),
+            DecodeResult::ProfileDisabled { rejection, .. }
+                if rejection.feature == InstructionFeature::AdvancedSimd
+                    && rejection.status == CapabilityStatus::Unknown
+        ));
+
+        // Use a conditional-space VFP encoding so feature rejection remains
+        // independently observable from A32 unconditional-space allocation.
+        let a32_simd = InstructionEncoding::from_u32(0xee00_0a00);
+        assert!(matches!(
+            decode(&enabled, location(enabled, ExecutionState::A32), a32_simd),
+            DecodeResult::RecognizedUnimplemented(_)
+        ));
+        assert!(matches!(
+            decode(&disabled, location(disabled, ExecutionState::A32), a32_simd),
+            DecodeResult::ProfileDisabled { .. }
+        ));
+
+        assert!(matches!(
+            decode(&unknown, location(unknown, ExecutionState::A32), a32_simd),
             DecodeResult::Unallocated { .. }
         ));
     }

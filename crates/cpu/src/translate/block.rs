@@ -544,6 +544,286 @@ mod tests {
         LocationDescriptor::new(GuestVirtualAddress::new(pc), state, profile.id())
     }
 
+    fn operation_family(kind: &OperationKind) -> &'static str {
+        match kind {
+            OperationKind::Constant(_) => "constant",
+            OperationKind::Scalar(_) => "scalar",
+            OperationKind::Address(_) => "address",
+            OperationKind::ReadState(_) => "read-state",
+            OperationKind::WriteState { .. } => "write-state",
+            OperationKind::Flags(_) => "flags",
+            OperationKind::Memory(_) => "memory",
+            OperationKind::Barrier(_) => "barrier",
+            OperationKind::CacheMaintenance(_) => "cache-maintenance",
+            OperationKind::Exclusive(_) => "exclusive",
+            OperationKind::Atomic(_) => "atomic",
+            OperationKind::Vector(_) => "vector",
+            OperationKind::FloatingPoint(_) => "floating-point",
+            OperationKind::Helper(_) => "helper",
+        }
+    }
+
+    fn terminator_family(terminator: &Terminator) -> &'static str {
+        match terminator {
+            Terminator::Direct { .. } => "direct",
+            Terminator::Conditional { .. } => "conditional",
+            Terminator::Indirect { .. } => "indirect",
+            Terminator::Call { .. } => "call",
+            Terminator::Return { .. } => "return",
+            Terminator::Exception { .. } => "exception",
+            Terminator::InterpretOne { .. } => "interpret-one",
+            Terminator::UnsupportedInstruction { .. } => "unsupported",
+            Terminator::Stop { .. } => "stop",
+        }
+    }
+
+    // The encodings and expected instruction names trace Arm DDI 0602 and
+    // DDI 0597. See `crates/cpu/tests/README.md`. The projection intentionally
+    // excludes temporary SSA IDs while retaining semantic operation families.
+    #[test]
+    fn disassembly_and_ir_goldens_cover_every_implemented_lifter_family() {
+        struct Case {
+            state: ExecutionState,
+            bytes: &'static [u8],
+            expected_sources: &'static [&'static str],
+            required_operation: Option<&'static str>,
+            expected_terminator: &'static str,
+        }
+
+        let cases = [
+            Case {
+                state: ExecutionState::A64,
+                bytes: &[0x00, 0x00, 0x00, 0x14],
+                expected_sources: &["b imm=#0"],
+                required_operation: None,
+                expected_terminator: "direct",
+            },
+            Case {
+                state: ExecutionState::A64,
+                bytes: &[
+                    0xbf, 0x3b, 0x03, 0xd5, // dmb ish
+                    0x01, 0x00, 0x00, 0xd4, // svc #0
+                ],
+                expected_sources: &["barrier", "svc"],
+                required_operation: Some("barrier"),
+                expected_terminator: "exception",
+            },
+            Case {
+                state: ExecutionState::A64,
+                bytes: &[
+                    0x23, 0x44, 0x00, 0x91, // add x3,x1,#17
+                    0x01, 0x00, 0x00, 0xd4,
+                ],
+                expected_sources: &["add-sub-immediate", "svc"],
+                required_operation: Some("scalar"),
+                expected_terminator: "exception",
+            },
+            Case {
+                state: ExecutionState::A64,
+                bytes: &[
+                    0x20, 0x00, 0x40, 0xf9, // ldr x0,[x1]
+                    0x01, 0x00, 0x00, 0xd4,
+                ],
+                expected_sources: &["load-store-unsigned", "svc"],
+                required_operation: Some("memory"),
+                expected_terminator: "exception",
+            },
+            Case {
+                state: ExecutionState::A64,
+                bytes: &[
+                    0x00, 0x1c, 0x20, 0x4e, // and v0.16b,v0.16b,v0.16b
+                    0x01, 0x00, 0x00, 0xd4,
+                ],
+                expected_sources: &["simd-bitwise", "svc"],
+                required_operation: Some("helper"),
+                expected_terminator: "exception",
+            },
+            Case {
+                state: ExecutionState::A32,
+                bytes: &[0xff, 0xff, 0xff, 0xea],
+                expected_sources: &["b imm=#-4, cond=#14"],
+                required_operation: None,
+                expected_terminator: "direct",
+            },
+            Case {
+                state: ExecutionState::A32,
+                bytes: &[0x01, 0x00, 0xa0, 0xe3],
+                expected_sources: &["data-processing"],
+                required_operation: None,
+                expected_terminator: "interpret-one",
+            },
+            Case {
+                state: ExecutionState::A32,
+                bytes: &[0x00, 0x10, 0x90, 0xe5],
+                expected_sources: &["load-store-single"],
+                required_operation: None,
+                expected_terminator: "interpret-one",
+            },
+            Case {
+                state: ExecutionState::A32,
+                bytes: &[0x10, 0x01, 0x00, 0xf2],
+                expected_sources: &["neon-bitwise"],
+                required_operation: None,
+                expected_terminator: "interpret-one",
+            },
+            Case {
+                state: ExecutionState::T32,
+                bytes: &[0xff, 0xe7],
+                expected_sources: &["b imm=#-2"],
+                required_operation: Some("flags"),
+                expected_terminator: "conditional",
+            },
+            Case {
+                state: ExecutionState::T32,
+                bytes: &[0x7f, 0x23],
+                expected_sources: &["movs dst=r3, imm=#127"],
+                required_operation: None,
+                expected_terminator: "interpret-one",
+            },
+            Case {
+                state: ExecutionState::T32,
+                bytes: &[0x01, 0x48],
+                expected_sources: &["load-literal"],
+                required_operation: None,
+                expected_terminator: "interpret-one",
+            },
+        ];
+
+        let profile = GuestCpuProfile::switch_1();
+        for case in cases {
+            let mut memory = memory_with_pages(0x1000, 1);
+            put(&mut memory, 1, 0, case.bytes);
+            let block = translate_block(
+                BlockTranslationConfig::default(),
+                &profile,
+                SPACE,
+                start(profile, 0x1000, case.state),
+                &memory,
+            )
+            .unwrap();
+            let sources = block
+                .metadata
+                .sources
+                .iter()
+                .map(|source| {
+                    let decoded =
+                        match crate::decode::decode(&profile, source.location, source.encoding) {
+                            DecodeResult::Decoded(decoded)
+                            | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
+                            result => panic!("golden source no longer decodes: {result:?}"),
+                        };
+                    crate::decode::disassemble(&decoded.instruction).to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                case.expected_sources,
+                "state={}",
+                case.state
+            );
+            assert_eq!(
+                terminator_family(&block.terminator),
+                case.expected_terminator,
+                "state={} sources={sources:?}",
+                case.state
+            );
+            if let Some(required) = case.required_operation {
+                assert!(
+                    block
+                        .operations
+                        .iter()
+                        .any(|operation| operation_family(&operation.kind) == required),
+                    "state={} sources={sources:?} lacks {required} IR",
+                    case.state
+                );
+            } else {
+                assert!(
+                    block.operations.is_empty(),
+                    "state={} sources={sources:?} unexpectedly emitted IR",
+                    case.state
+                );
+            }
+
+            let printed =
+                crate::ir::print::print_block(&block, crate::ir::print::IrPrintOptions::default());
+            assert_eq!(
+                printed,
+                crate::ir::print::print_block(&block, crate::ir::print::IrPrintOptions::default())
+            );
+        }
+    }
+
+    #[test]
+    fn translated_instruction_terminator_classes_have_stable_boundaries() {
+        let profile = GuestCpuProfile::switch_1();
+        let cases = [
+            (ExecutionState::A64, 0x1400_0000_u32, "direct"),
+            (ExecutionState::A64, 0x5400_0000_u32, "conditional"),
+            (ExecutionState::A64, 0xd61f_0000_u32, "indirect"),
+            (ExecutionState::A64, 0x9400_0000_u32, "call"),
+            (ExecutionState::A64, 0xd65f_03c0_u32, "return"),
+            (ExecutionState::A64, 0xd400_0001_u32, "exception"),
+        ];
+        for (state, encoding, expected) in cases {
+            let mut memory = memory_with_pages(0x1000, 1);
+            put(&mut memory, 1, 0, &encoding.to_le_bytes());
+            let block = translate_block(
+                BlockTranslationConfig::default(),
+                &profile,
+                SPACE,
+                start(profile, 0x1000, state),
+                &memory,
+            )
+            .unwrap();
+            assert_eq!(terminator_family(&block.terminator), expected);
+            assert_eq!(block.metadata.guest_instruction_count, 1);
+        }
+
+        for (encoding, expected) in [(0x2001_u16, "interpret-one"), (0x0000, "interpret-one")] {
+            let mut memory = memory_with_pages(0x1000, 1);
+            put(&mut memory, 1, 0, &encoding.to_le_bytes());
+            let block = translate_block(
+                BlockTranslationConfig::default(),
+                &profile,
+                SPACE,
+                start(profile, 0x1000, ExecutionState::T32),
+                &memory,
+            )
+            .unwrap();
+            assert_eq!(terminator_family(&block.terminator), expected);
+            assert_eq!(block.metadata.guest_instruction_count, 1);
+        }
+
+        let mut unsupported = memory_with_pages(0x1000, 1);
+        put(&mut unsupported, 1, 0, &0xd503_20df_u32.to_le_bytes());
+        let block = translate_block(
+            BlockTranslationConfig::default(),
+            &profile,
+            SPACE,
+            start(profile, 0x1000, ExecutionState::A64),
+            &unsupported,
+        )
+        .unwrap();
+        assert_eq!(terminator_family(&block.terminator), "unsupported");
+        assert_eq!(block.metadata.guest_instruction_count, 1);
+
+        // Stop is a dispatcher boundary rather than an instruction-produced
+        // exit, but its block metadata classification is still part of the IR
+        // contract.
+        let stop = Terminator::Stop {
+            source: start(profile, 0x1000, ExecutionState::A64),
+            reason: crate::ir::terminator::StopReason::TranslationLimit,
+        };
+        assert_eq!(terminator_family(&stop), "stop");
+        assert!(matches!(
+            exits_for_terminator(&stop).as_slice(),
+            [BlockExit {
+                kind: BlockExitKind::Stop,
+                target: None,
+            }]
+        ));
+    }
+
     #[test]
     fn translates_each_execution_state_and_calculates_direct_targets() {
         let profile = GuestCpuProfile::switch_1();
