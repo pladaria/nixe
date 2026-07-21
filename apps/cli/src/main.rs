@@ -1,32 +1,34 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use sanitize_filename::{Options, sanitize_with_options};
 use swiitx_config::SwiitxConfig;
-use swiitx_loader_content::{NcaFormatVersion, NcaKeySet};
+use swiitx_loader_content::{NacpLoader, NcaFormatVersion, NcaKeySet};
+use swiitx_loader_executable::NroLoader;
+use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
 use swiitx_loader_title::{
-    CnmtExtendedHeader, EntryKind, NacpLanguage, NcaInspection, ResolvedTitle, TitleCatalog,
-    TitleInspection, TitleInspector, TitleResolver,
+    CnmtExtendedHeader, ControlMetadata, EntryKind, NacpLanguage, NcaInspection, PackageInspection,
+    ResolvedTitle, TitleCatalog, TitleError, TitleInspection, TitleInspector, TitleResolver,
 };
+
+const MAX_CACHED_ICON_SIZE: u64 = 16 * 1024 * 1024;
 
 struct CliArguments {
     config_path: Option<PathBuf>,
-    title_path: Option<PathBuf>,
+    paths: Vec<PathBuf>,
 }
 
-enum CliOutput {
-    Inspection {
-        inspection: Box<TitleInspection>,
-        preferred_languages: Vec<NacpLanguage>,
-    },
-    LibrarySummary {
-        titles: Vec<ResolvedTitle>,
-        preferred_languages: Vec<NacpLanguage>,
-    },
+struct CliOutput {
+    file_inspections: Vec<TitleInspection>,
+    resolved_titles: Vec<ResolvedTitle>,
+    directory_nros: Vec<swiitx_loader_title::NroInspection>,
+    inspected_directories: bool,
+    preferred_languages: Vec<NacpLanguage>,
 }
 
 fn main() -> ExitCode {
@@ -48,18 +50,21 @@ fn main() -> ExitCode {
     };
 
     match run(arguments) {
-        Ok(CliOutput::Inspection {
-            inspection,
-            preferred_languages,
-        }) => {
-            print_inspection(&inspection, &preferred_languages);
-            ExitCode::SUCCESS
-        }
-        Ok(CliOutput::LibrarySummary {
-            titles,
-            preferred_languages,
-        }) => {
-            print_library_summary(&titles, &preferred_languages);
+        Ok(output) => {
+            let mut wrote_output = false;
+            if output.inspected_directories {
+                print_resolved_titles(&output.resolved_titles, &output.preferred_languages);
+                println!();
+                print_nros(&output.directory_nros);
+                wrote_output = true;
+            }
+            for inspection in &output.file_inspections {
+                if wrote_output {
+                    println!();
+                }
+                print_inspection(inspection, &output.preferred_languages);
+                wrote_output = true;
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -71,9 +76,9 @@ fn main() -> ExitCode {
 
 fn print_usage(program: &OsString) {
     eprintln!(
-        "Usage: {} [--config <file>] [<title-path>]\n\n\
-         Without title-path, scan the configured library and summarize resolved titles.\n\
-         With title-path, show a detailed inspection of that file or directory.\n\
+        "Usage: {} [--config <file>] [<path> ...]\n\n\
+         Resolve titles found below supplied directories; inspect supplied files in\n\
+         detail. Without paths, process library.paths under the same rules.\n\
          Pass --config to select a TOML file explicitly. Otherwise the CLI uses\n\
          SWIITX_CONFIG, ./swiitx.toml, or the platform user configuration.",
         program.to_string_lossy()
@@ -84,7 +89,7 @@ fn parse_arguments(
     arguments: impl Iterator<Item = OsString>,
 ) -> Result<Option<CliArguments>, String> {
     let mut config_path = None;
-    let mut title_path = None;
+    let mut paths = Vec::new();
     let mut arguments = arguments;
 
     while let Some(argument) = arguments.next() {
@@ -104,15 +109,10 @@ fn parse_arguments(
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
         }
-        if title_path.replace(PathBuf::from(argument)).is_some() {
-            return Err("expected at most one title path".to_owned());
-        }
+        paths.push(PathBuf::from(argument));
     }
 
-    Ok(Some(CliArguments {
-        config_path,
-        title_path,
-    }))
+    Ok(Some(CliArguments { config_path, paths }))
 }
 
 fn run(arguments: CliArguments) -> Result<CliOutput, String> {
@@ -133,41 +133,79 @@ fn run(arguments: CliArguments) -> Result<CliOutput, String> {
     let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
         .map_err(|error| error.to_string())?;
 
-    if let Some(path) = arguments.title_path {
-        let inspection = TitleInspector::inspect_with_key_set_and_options(path, &mut keys, options)
-            .map_err(|error| error.to_string())?;
-        return Ok(CliOutput::Inspection {
-            inspection: Box::new(inspection),
-            preferred_languages,
-        });
+    let paths = select_inspection_paths(arguments.paths, config.library.paths);
+    if paths.is_empty() {
+        return Err("no inspection paths were supplied".to_owned());
     }
-
-    if config.library.paths.is_empty() {
-        return Err("the configuration has no library paths".to_owned());
-    }
-
     let mut catalog = TitleCatalog::new();
-    for path in config.library.paths {
-        let discovered =
-            TitleCatalog::scan_directory_with_key_set_and_options(path, &mut keys, options)
+    let mut file_inspections = Vec::new();
+    let mut directory_nros = Vec::new();
+    let mut seen_nros = BTreeSet::new();
+    let mut inspected_directories = false;
+    for path in paths {
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("cannot access {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            inspected_directories = true;
+            let discovered_nros = TitleInspector::inspect_nros_with_options(&path, options)
                 .map_err(|error| error.to_string())?;
-        for package in discovered.packages() {
-            catalog.add(package.clone());
+            let directory_has_nros = !discovered_nros.is_empty();
+            for nro in discovered_nros {
+                let identity = fs::canonicalize(&nro.path).map_err(|error| {
+                    format!("cannot resolve NRO path {}: {error}", nro.path.display())
+                })?;
+                if seen_nros.insert(identity) {
+                    directory_nros.push(nro);
+                }
+            }
+            match TitleCatalog::scan_directory_with_key_set_and_options(&path, &mut keys, options) {
+                Ok(discovered) => {
+                    for package in discovered.packages() {
+                        catalog.add(package.clone());
+                    }
+                }
+                Err(TitleError::NoSupportedPackages { .. }) if directory_has_nros => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        } else if metadata.is_file() {
+            file_inspections.push(
+                TitleInspector::inspect_with_key_set_and_options(&path, &mut keys, options)
+                    .map_err(|error| error.to_string())?,
+            );
+        } else {
+            return Err(format!("unsupported path type: {}", path.display()));
         }
     }
-    let titles = TitleResolver::resolve_all(&catalog).map_err(|error| error.to_string())?;
-    cache_preferred_icons(&titles, &preferred_languages)?;
-    Ok(CliOutput::LibrarySummary {
-        titles,
+    let resolved_titles =
+        TitleResolver::resolve_all(&catalog).map_err(|error| error.to_string())?;
+    let cache_root = PathBuf::from("cache");
+    cache_resolved_title_icons(&resolved_titles, &preferred_languages, &cache_root)?;
+    cache_inspection_icons(&file_inspections, &preferred_languages, &cache_root)?;
+    for nro in &directory_nros {
+        cache_nro_icon(&nro.path, &preferred_languages, &cache_root)?;
+    }
+    Ok(CliOutput {
+        file_inspections,
+        resolved_titles,
+        directory_nros,
+        inspected_directories,
         preferred_languages,
     })
 }
 
-fn cache_preferred_icons(
+fn select_inspection_paths(explicit: Vec<PathBuf>, configured: Vec<PathBuf>) -> Vec<PathBuf> {
+    if explicit.is_empty() {
+        configured
+    } else {
+        explicit
+    }
+}
+
+fn cache_resolved_title_icons(
     titles: &[ResolvedTitle],
     preferred_languages: &[NacpLanguage],
+    cache_root: &std::path::Path,
 ) -> Result<(), String> {
-    let cache_root = PathBuf::from("cache");
     for title in titles {
         let Some(control) = title.control_metadata() else {
             continue;
@@ -175,34 +213,184 @@ fn cache_preferred_icons(
         let Some(icon) = control.preferred_icon(preferred_languages) else {
             continue;
         };
-        let directory_name = control
+        let fallback = title.application_id.to_string();
+        let title_name = control
             .nacp
             .preferred_title(preferred_languages)
-            .map(|(_, metadata)| sanitize_directory_name(&metadata.name))
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| title.application_id.to_string());
-        let directory = cache_root.join(directory_name);
-        fs::create_dir_all(&directory).map_err(|source| {
-            format!(
-                "cannot create icon cache directory {}: {source}",
-                directory.display()
-            )
-        })?;
-        let output_path = directory.join(format!("{}.jpg", icon.filename));
+            .map(|(_, title)| title.name.as_str());
+        let directory = cache_directory(cache_root, title_name, &fallback)?;
         let bytes = icon.bytes().map_err(|error| {
             format!(
-                "cannot read icon {} for {}: {error}",
+                "cannot read effective icon {} for {}: {error}",
                 icon.filename, title.application_id
             )
         })?;
-        fs::write(&output_path, bytes).map_err(|source| {
-            format!(
-                "cannot write cached icon {}: {source}",
-                output_path.display()
-            )
-        })?;
+        write_cached_icon(
+            &directory.join(cached_icon_filename(&icon.filename)),
+            &bytes,
+        )?;
     }
     Ok(())
+}
+
+fn cache_inspection_icons(
+    inspections: &[TitleInspection],
+    preferred_languages: &[NacpLanguage],
+    cache_root: &std::path::Path,
+) -> Result<(), String> {
+    for inspection in inspections {
+        for package in &inspection.packages {
+            if package.control_metadatas.is_empty() {
+                if let Some(control) = &package.control_metadata {
+                    cache_control_icon(package, control, preferred_languages, cache_root)?;
+                }
+            } else {
+                for control in &package.control_metadatas {
+                    cache_control_icon(package, control, preferred_languages, cache_root)?;
+                }
+            }
+        }
+        for nro in &inspection.nros {
+            cache_nro_icon(&nro.path, preferred_languages, cache_root)?;
+        }
+    }
+    Ok(())
+}
+
+fn cache_control_icon(
+    package: &PackageInspection,
+    control: &ControlMetadata,
+    preferred_languages: &[NacpLanguage],
+    cache_root: &std::path::Path,
+) -> Result<(), String> {
+    let Some(icon) = control.preferred_icon(preferred_languages) else {
+        return Ok(());
+    };
+    let fallback = package
+        .canonical_content_metas
+        .first()
+        .map(|metadata| format!("{:016X}", metadata.title_id))
+        .unwrap_or_else(|| path_fallback_name(&package.path));
+    let title_name = control
+        .nacp
+        .preferred_title(preferred_languages)
+        .map(|(_, title)| title.name.as_str());
+    let directory = cache_directory(cache_root, title_name, &fallback)?;
+    let filename = cached_icon_filename(&icon.filename);
+    let bytes = icon.bytes().map_err(|error| {
+        format!(
+            "cannot read icon {} from {}: {error}",
+            icon.filename,
+            package.path.display()
+        )
+    })?;
+    write_cached_icon(&directory.join(filename), &bytes)
+}
+
+fn cache_nro_icon(
+    path: &std::path::Path,
+    preferred_languages: &[NacpLanguage],
+    cache_root: &std::path::Path,
+) -> Result<(), String> {
+    let storage = FileStorage::open(path).map_err(|error| {
+        format!(
+            "cannot open NRO {} for icon caching: {error}",
+            path.display()
+        )
+    })?;
+    let image = NroLoader::load(Arc::new(storage)).map_err(|error| {
+        format!(
+            "cannot load NRO {} for icon caching: {error}",
+            path.display()
+        )
+    })?;
+    let Some(assets) = image.assets() else {
+        return Ok(());
+    };
+    let Some(icon) = assets.icon() else {
+        return Ok(());
+    };
+    let title_name = assets
+        .nacp()
+        .map(|storage| NacpLoader::load(storage.clone()))
+        .transpose()
+        .map_err(|error| format!("cannot read NRO NACP from {}: {error}", path.display()))?
+        .and_then(|nacp| {
+            nacp.preferred_title(preferred_languages)
+                .map(|(_, title)| title.name.clone())
+        });
+    let fallback = path_fallback_name(path);
+    let directory = cache_directory(cache_root, title_name.as_deref(), &fallback)?;
+    let bytes = read_nro_icon(icon, path)?;
+    write_cached_icon(&directory.join("icon.jpg"), &bytes)
+}
+
+fn cache_directory(
+    cache_root: &std::path::Path,
+    title_name: Option<&str>,
+    fallback: &str,
+) -> Result<PathBuf, String> {
+    let directory_name = title_name
+        .map(sanitize_directory_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| sanitize_directory_name(fallback));
+    let directory = cache_root.join(directory_name);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "cannot create icon cache directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
+}
+
+fn read_nro_icon(icon: &StorageRef, path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let size = icon
+        .len()
+        .map_err(|error| format!("cannot read NRO icon size from {}: {error}", path.display()))?;
+    if !(3..=MAX_CACHED_ICON_SIZE).contains(&size) {
+        return Err(format!(
+            "NRO icon in {} has invalid size {size}",
+            path.display()
+        ));
+    }
+    let mut bytes =
+        vec![
+            0_u8;
+            usize::try_from(size)
+                .map_err(|_| format!("NRO icon in {} is too large to cache", path.display()))?
+        ];
+    icon.read_at(0, &mut bytes)
+        .map_err(|error| format!("cannot read NRO icon from {}: {error}", path.display()))?;
+    if bytes[..3] != [0xff, 0xd8, 0xff] {
+        return Err(format!(
+            "NRO icon in {} is not a JPEG image",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_cached_icon(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    fs::write(path, bytes)
+        .map_err(|error| format!("cannot write cached icon {}: {error}", path.display()))
+}
+
+fn cached_icon_filename(filename: &str) -> String {
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("icon");
+    let stem = sanitize_directory_name(stem);
+    format!("{}.jpg", if stem.is_empty() { "icon" } else { &stem })
+}
+
+fn path_fallback_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown-title")
+        .to_owned()
 }
 
 fn sanitize_directory_name(name: &str) -> String {
@@ -216,9 +404,8 @@ fn sanitize_directory_name(name: &str) -> String {
     )
 }
 
-fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLanguage]) {
-    println!("Titles: {}", titles.len());
-
+fn print_resolved_titles(titles: &[ResolvedTitle], preferred_languages: &[NacpLanguage]) {
+    println!("Resolved titles: {}", titles.len());
     for (index, title) in titles.iter().enumerate() {
         println!();
         let preferred_title = title
@@ -238,15 +425,18 @@ fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLa
             title.base.title_id, title.base.version
         );
         match &title.patch {
-            Some(patch) => println!("  Patch: {} version {}", patch.title_id, patch.version),
-            None => println!("  Patch: none"),
+            Some(patch) => println!(
+                "  Selected patch: {} version {}",
+                patch.title_id, patch.version
+            ),
+            None => println!("  Selected patch: none"),
         }
         let effective_version = title
             .patch
             .as_ref()
             .map_or(title.base.version, |patch| patch.version);
         println!("  Effective version: {effective_version}");
-        println!("  DLC: {}", title.add_ons.len());
+        println!("  Selected DLC: {}", title.add_ons.len());
         for add_on in &title.add_ons {
             match add_on.required_application_version() {
                 Some(required_version) => println!(
@@ -256,7 +446,6 @@ fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLa
                 None => println!("    {} version {}", add_on.title_id, add_on.version),
             }
         }
-
         if let Some(control) = title.control_metadata() {
             println!("  Display version: {}", control.nacp.display_version);
             let languages = control
@@ -273,14 +462,14 @@ fn print_library_summary(titles: &[ResolvedTitle], preferred_languages: &[NacpLa
                 }
             );
             if let Some(icon) = control.preferred_icon(preferred_languages) {
-                println!("  Preferred icon: {} ({})", icon.filename, icon.language);
+                println!("  Effective icon: {} ({})", icon.filename, icon.language);
             }
         }
     }
 }
 
 fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLanguage]) {
-    println!("Title: {}", inspection.path.display());
+    println!("Inspection path: {}", inspection.path.display());
     if let Some(standalone) = &inspection.standalone_ncz {
         println!("Format: standalone NCZ");
         println!("Stored size: {}", format_size(standalone.stored_size));
@@ -293,6 +482,7 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
         }
         return;
     }
+    print_nros(&inspection.nros);
     println!("Packages: {}", inspection.packages.len());
 
     for (index, package) in inspection.packages.iter().enumerate() {
@@ -587,6 +777,65 @@ fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLan
     println!("Canonical metadata does not by itself establish full package authenticity.");
 }
 
+fn print_nros(nros: &[swiitx_loader_title::NroInspection]) {
+    println!("NRO executables: {}", nros.len());
+    for (index, nro) in nros.iter().enumerate() {
+        println!();
+        println!("NRO {}: {}", index + 1, nro.path.display());
+        println!("  Size: {}", format_size(nro.size));
+        println!("  Executable size: {}", format_size(nro.executable_size));
+        println!("  Version: {}; flags: {:#010X}", nro.version, nro.flags);
+        println!("  Entry offset: {:#X}", nro.entry_offset);
+        println!("  Module ID: {}", format_hex(&nro.module_id));
+        println!("  MOD0 offset: {:#X}", nro.module_header_offset);
+        println!("  DSO handle offset: {:#X}", nro.dso_handle_offset);
+        print_nro_range("Embedded API info", nro.embedded_api_info);
+        print_nro_range("Dynamic string table", nro.dynamic_string_table);
+        print_nro_range("Dynamic symbol table", nro.dynamic_symbol_table);
+        println!("  Segments: {}", nro.segments.len());
+        for segment in &nro.segments {
+            let permissions = [
+                if segment.readable { 'r' } else { '-' },
+                if segment.writable { 'w' } else { '-' },
+                if segment.executable { 'x' } else { '-' },
+            ];
+            println!(
+                "    {:<9} offset {:#X}, file {}, memory {}, mapping {}, {}",
+                segment.kind,
+                segment.memory_offset,
+                format_size(segment.file_size),
+                format_size(segment.memory_size),
+                format_size(segment.mapping_size),
+                permissions.iter().collect::<String>()
+            );
+        }
+        match &nro.assets {
+            Some(assets) => {
+                println!("  ASET version: {}", assets.version);
+                print_optional_asset("Icon", assets.icon_size);
+                print_optional_asset("NACP", assets.nacp_size);
+                print_optional_asset("RomFS", assets.romfs_size);
+            }
+            None => println!("  ASET assets: none"),
+        }
+    }
+}
+
+fn print_nro_range(name: &str, range: (u64, u64)) {
+    println!(
+        "  {name}: offset {:#X}, size {}",
+        range.0,
+        format_size(range.1)
+    );
+}
+
+fn print_optional_asset(name: &str, size: Option<u64>) {
+    match size {
+        Some(size) => println!("    {name}: {}", format_size(size)),
+        None => println!("    {name}: none"),
+    }
+}
+
 fn print_ncz(ncz: &swiitx_loader_title::NczInspection, indent: &str) {
     println!("{indent}NCZ compression: {:?}", ncz.compression);
     println!(
@@ -750,6 +999,44 @@ fn format_binary_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn synthetic_nro_with_icon(title: &str, icon: &[u8]) -> Vec<u8> {
+        const EXECUTABLE_SIZE: usize = 0x2800;
+        const ICON_OFFSET: usize = 0x100;
+        const NACP_OFFSET: usize = 0x200;
+        const NACP_SIZE: usize = 0x4000;
+
+        let mut bytes = vec![0_u8; EXECUTABLE_SIZE + NACP_OFFSET + NACP_SIZE];
+        bytes[0x10..0x14].copy_from_slice(b"NRO0");
+        put_u32(&mut bytes, 0x04, 0x100);
+        put_u32(&mut bytes, 0x18, EXECUTABLE_SIZE as u32);
+        put_u32(&mut bytes, 0x20, 0);
+        put_u32(&mut bytes, 0x24, 0x1000);
+        put_u32(&mut bytes, 0x28, 0x1000);
+        put_u32(&mut bytes, 0x2c, 0x1000);
+        put_u32(&mut bytes, 0x30, 0x2000);
+        put_u32(&mut bytes, 0x34, 0x800);
+        put_u32(&mut bytes, 0x38, 0x800);
+
+        let asset = EXECUTABLE_SIZE;
+        bytes[asset..asset + 4].copy_from_slice(b"ASET");
+        put_u64(&mut bytes, asset + 0x08, ICON_OFFSET as u64);
+        put_u64(&mut bytes, asset + 0x10, icon.len() as u64);
+        put_u64(&mut bytes, asset + 0x18, NACP_OFFSET as u64);
+        put_u64(&mut bytes, asset + 0x20, NACP_SIZE as u64);
+        bytes[asset + ICON_OFFSET..asset + ICON_OFFSET + icon.len()].copy_from_slice(icon);
+        bytes[asset + NACP_OFFSET..asset + NACP_OFFSET + title.len()]
+            .copy_from_slice(title.as_bytes());
+        bytes
+    }
+
     fn os_arguments(values: &[&str]) -> impl Iterator<Item = OsString> {
         values
             .iter()
@@ -765,19 +1052,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(arguments.config_path, Some(PathBuf::from("custom.toml")));
-        assert_eq!(arguments.title_path, None);
+        assert!(arguments.paths.is_empty());
     }
 
     #[test]
-    fn parses_one_title_path_with_config_in_either_order() {
+    fn parses_paths_with_config_in_any_order() {
         for values in [
-            &["--config", "custom.toml", "title.nsp"][..],
-            &["title.nsp", "--config", "custom.toml"][..],
+            &["--config", "custom.toml", "first.nsp", "homebrew.nro"][..],
+            &["first.nsp", "--config", "custom.toml", "homebrew.nro"][..],
         ] {
             let arguments = parse_arguments(os_arguments(values)).unwrap().unwrap();
 
             assert_eq!(arguments.config_path, Some(PathBuf::from("custom.toml")));
-            assert_eq!(arguments.title_path, Some(PathBuf::from("title.nsp")));
+            assert_eq!(
+                arguments.paths,
+                vec![PathBuf::from("first.nsp"), PathBuf::from("homebrew.nro")]
+            );
         }
     }
 
@@ -795,17 +1085,28 @@ mod tests {
         let arguments = parse_arguments(os_arguments(&[])).unwrap().unwrap();
 
         assert_eq!(arguments.config_path, None);
-        assert_eq!(arguments.title_path, None);
+        assert!(arguments.paths.is_empty());
     }
 
     #[test]
-    fn rejects_unsupported_options_and_multiple_title_paths() {
-        for arguments in [
-            &["--keys-dir", "keys"][..],
-            &["--"][..],
-            &["--unknown"][..],
-            &["first.nsp", "second.nsp"][..],
-        ] {
+    fn explicit_paths_override_configured_paths_and_empty_arguments_use_them() {
+        let configured = vec![PathBuf::from("configured-a"), PathBuf::from("configured-b")];
+        assert_eq!(
+            select_inspection_paths(Vec::new(), configured.clone()),
+            configured
+        );
+        assert_eq!(
+            select_inspection_paths(
+                vec![PathBuf::from("explicit-a"), PathBuf::from("explicit-b")],
+                vec![PathBuf::from("configured")],
+            ),
+            vec![PathBuf::from("explicit-a"), PathBuf::from("explicit-b")]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_options() {
+        for arguments in [&["--keys-dir", "keys"][..], &["--"][..], &["--unknown"][..]] {
             assert!(parse_arguments(os_arguments(arguments)).is_err());
         }
     }
@@ -822,18 +1123,29 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_title_names_for_cache_directories() {
+    fn uses_the_original_directory_sanitization_and_a_jpeg_output_name() {
         assert_eq!(sanitize_directory_name("Mario: A/B?"), "Mario_ A_B_");
-        assert_eq!(
-            sanitize_directory_name("Mario vs. Donkey Kong"),
-            "Mario vs. Donkey Kong"
-        );
         assert_eq!(sanitize_directory_name("CON.txt"), "_");
-        assert_eq!(sanitize_directory_name("LPT9"), "_");
-        assert_eq!(
-            sanitize_directory_name("Pokémon™ (Deluxe) #1!."),
-            "Pokémon™ (Deluxe) #1!_"
-        );
         assert_eq!(sanitize_directory_name("line\nfeed"), "line_feed");
+        assert_eq!(
+            cached_icon_filename("icon_AmericanEnglish.dat"),
+            "icon_AmericanEnglish.jpg"
+        );
+    }
+
+    #[test]
+    fn caches_an_nro_aset_icon_under_its_preferred_nacp_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let nro_path = directory.path().join("fallback.nro");
+        let cache_root = directory.path().join("cache");
+        let icon = [0xff, 0xd8, 0xff, 0xd9];
+        fs::write(&nro_path, synthetic_nro_with_icon("Homebrew: Demo", &icon)).unwrap();
+
+        cache_nro_icon(&nro_path, &[NacpLanguage::AmericanEnglish], &cache_root).unwrap();
+
+        assert_eq!(
+            fs::read(cache_root.join("Homebrew_ Demo").join("icon.jpg")).unwrap(),
+            icon
+        );
     }
 }

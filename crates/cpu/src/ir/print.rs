@@ -4,6 +4,26 @@ use core::fmt::Write;
 
 use super::{block::IrBlock, types::IrType, value::Value};
 
+/// Position of an IR dump in the frontend/backend optimization pipeline.
+///
+/// The frontend currently emits only pre-optimization IR. Keeping the stage in
+/// the public diagnostic contract lets future optimization passes publish a
+/// comparable post-optimization dump without changing the format or API.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IrDumpStage {
+    PreOptimization,
+    PostOptimization,
+}
+
+impl core::fmt::Display for IrDumpStage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::PreOptimization => "pre-optimization",
+            Self::PostOptimization => "post-optimization",
+        })
+    }
+}
+
 /// Optional source comments included in a textual IR dump.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrPrintOptions {
@@ -39,7 +59,12 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
     .expect("writing to a String cannot fail");
 
     for source in &block.metadata.sources {
-        write!(output, "  source {}", source.location.pc).expect("writing to a String cannot fail");
+        write!(
+            output,
+            "  source pc={} state={}",
+            source.location.pc, source.location.execution_state
+        )
+        .expect("writing to a String cannot fail");
         if options.raw_encoding_comments {
             write!(output, " ; raw={}", source.encoding).expect("writing to a String cannot fail");
         }
@@ -58,6 +83,8 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
         )
         .expect("writing to a String cannot fail");
     }
+    writeln!(output, "  end-reason {}", block.metadata.end_reason)
+        .expect("writing to a String cannot fail");
     for (index, operation) in block.operations.iter().enumerate() {
         output.push_str("  ");
         write_results(
@@ -78,6 +105,18 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
             .expect("writing to a String cannot fail");
     }
     output.push_str("end\n");
+    output
+}
+
+/// Prints a stable stage-labelled IR dump.
+///
+/// Callers pass the block produced at the named stage. No optimization is
+/// performed by this function, and printing remains entirely opt-in.
+#[must_use]
+pub fn print_ir_dump(block: &IrBlock, stage: IrDumpStage, options: IrPrintOptions) -> String {
+    let mut output = String::new();
+    writeln!(output, "ir-dump stage={stage}").expect("writing to a String cannot fail");
+    output.push_str(&print_block(block, options));
     output
 }
 
@@ -177,8 +216,9 @@ mod tests {
         let actual = print_block(&block(), IrPrintOptions::default());
         let expected = concat!(
             "block 0x0000000000001000 A64 profile=0x0000000000000001 bytes=4 instructions=1\n",
-            "  source 0x0000000000001000 ; raw=0xd503201f ; guest=\"nop\"\n",
+            "  source pc=0x0000000000001000 state=A64 ; raw=0xd503201f ; guest=\"nop\"\n",
             "  dependency page=0x0000000000000002 generation=0x0000000000000003\n",
+            "  end-reason explicit-terminator\n",
             "  %0:i64 = op0 Constant(I64(7)) effects=OperationEffects { side_effects: EffectSet(0), may_fault: false } source=0x0000000000001000\n",
             "  terminator Direct { target: Direct { pc: GuestVirtualAddress(4100), execution_state: A64 } }\n",
             "  exit Direct target=Some(GuestVirtualAddress(4100))\n",
@@ -197,8 +237,28 @@ mod tests {
                 disassembly_comments: false,
             },
         );
-        assert!(output.contains("  source 0x0000000000001000\n"));
+        assert!(output.contains("  source pc=0x0000000000001000 state=A64\n"));
         assert!(!output.contains("raw="));
         assert!(!output.contains("guest="));
+    }
+
+    #[test]
+    fn staged_dump_api_distinguishes_pre_and_post_optimization_ir() {
+        let pre = print_ir_dump(
+            &block(),
+            IrDumpStage::PreOptimization,
+            IrPrintOptions::default(),
+        );
+        let post = print_ir_dump(
+            &block(),
+            IrDumpStage::PostOptimization,
+            IrPrintOptions::default(),
+        );
+        assert!(pre.starts_with("ir-dump stage=pre-optimization\n"));
+        assert!(post.starts_with("ir-dump stage=post-optimization\n"));
+        assert_eq!(
+            pre.lines().skip(1).collect::<Vec<_>>(),
+            post.lines().skip(1).collect::<Vec<_>>()
+        );
     }
 }

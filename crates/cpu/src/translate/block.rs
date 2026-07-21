@@ -7,7 +7,9 @@ use crate::{
     decode::{DecodeResult, DecodedOpcode, OperandId, OperandValue},
     error::{FrontendError, FrontendInternalError, InvalidIr},
     ir::{
-        block::{BlockExit, BlockExitKind, BlockMetadata, InstructionSource, IrBlock},
+        block::{
+            BlockEndReason, BlockExit, BlockExitKind, BlockMetadata, InstructionSource, IrBlock,
+        },
         builder::{BuildError, IrBuilder},
         op::{OperationKind, StateRegister},
         terminator::{ControlTarget, Terminator},
@@ -100,6 +102,27 @@ pub fn translate_block(
     start: LocationDescriptor,
     memory: &impl InstructionMemory,
 ) -> Result<IrBlock, FrontendError> {
+    translate_block_internal(config, profile, address_space, start, memory, false)
+}
+
+pub(crate) fn translate_block_with_disassembly(
+    config: BlockTranslationConfig,
+    profile: &GuestCpuProfile,
+    address_space: AddressSpaceId,
+    start: LocationDescriptor,
+    memory: &impl InstructionMemory,
+) -> Result<IrBlock, FrontendError> {
+    translate_block_internal(config, profile, address_space, start, memory, true)
+}
+
+fn translate_block_internal(
+    config: BlockTranslationConfig,
+    profile: &GuestCpuProfile,
+    address_space: AddressSpaceId,
+    start: LocationDescriptor,
+    memory: &impl InstructionMemory,
+    capture_disassembly: bool,
+) -> Result<IrBlock, FrontendError> {
     validate_start(profile, start)?;
     if config.max_guest_instructions.get() > MAX_GUEST_INSTRUCTIONS_PER_BLOCK {
         return Err(internal(
@@ -118,12 +141,15 @@ pub fn translate_block(
     let mut sources = Vec::new();
     let mut dependencies = Vec::new();
     let mut pc = start.pc;
-    let terminator = loop {
+    let (terminator, end_reason) = loop {
         if !sources.is_empty() && !first_page.contains(pc) {
-            break direct_branch(ControlTarget::Direct {
-                pc,
-                execution_state: start.execution_state,
-            });
+            break (
+                direct_branch(ControlTarget::Direct {
+                    pc,
+                    execution_state: start.execution_state,
+                }),
+                BlockEndReason::PageBoundary,
+            );
         }
 
         let location = LocationDescriptor::new(pc, start.execution_state, profile.id());
@@ -134,16 +160,24 @@ pub fn translate_block(
                 dependencies.push(dependency);
             }
         }
-        sources.push(InstructionSource::new(
-            location,
-            encoding,
-            fetched_dependencies,
-        ));
+        let mut source = InstructionSource::new(location, encoding, fetched_dependencies);
 
         let operations_before_lift = builder.operation_count();
         let outcome = match crate::decode::decode(profile, location, encoding) {
-            DecodeResult::Decoded(decoded) => lift_decoded(&mut builder, &decoded),
+            DecodeResult::Decoded(decoded) => {
+                if capture_disassembly {
+                    source = source.with_disassembly(
+                        crate::decode::disassemble(&decoded.instruction).to_string(),
+                    );
+                }
+                lift_decoded(&mut builder, &decoded)
+            }
             DecodeResult::RecognizedUnimplemented(decoded) => {
+                if capture_disassembly {
+                    source = source.with_disassembly(
+                        crate::decode::disassemble(&decoded.instruction).to_string(),
+                    );
+                }
                 if crate::interpreter::has_semantics(&decoded) {
                     LiftOutcome::Terminate(interpret_terminator(&decoded))
                 } else {
@@ -153,9 +187,33 @@ pub fn translate_block(
                     ))
                 }
             }
-            DecodeResult::Unallocated { .. }
-            | DecodeResult::Reserved { .. }
-            | DecodeResult::ProfileDisabled { .. } => {
+            DecodeResult::Unallocated { reason, .. } => {
+                if capture_disassembly {
+                    source = source.with_disassembly(format!("<unallocated: {reason}>"));
+                }
+                LiftOutcome::Terminate(Terminator::Exception {
+                    source: location,
+                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    syndrome: None,
+                })
+            }
+            DecodeResult::Reserved { name, reason, .. } => {
+                if capture_disassembly {
+                    source = source.with_disassembly(format!("<{name}: reserved: {reason}>"));
+                }
+                LiftOutcome::Terminate(Terminator::Exception {
+                    source: location,
+                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    syndrome: None,
+                })
+            }
+            DecodeResult::ProfileDisabled {
+                name, rejection, ..
+            } => {
+                if capture_disassembly {
+                    source =
+                        source.with_disassembly(format!("<{name}: profile-disabled: {rejection}>"));
+                }
                 LiftOutcome::Terminate(Terminator::Exception {
                     source: location,
                     kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
@@ -163,6 +221,7 @@ pub fn translate_block(
                 })
             }
         };
+        sources.push(source);
         let emitted_operations = builder
             .operation_count()
             .checked_sub(operations_before_lift)
@@ -176,23 +235,36 @@ pub fn translate_block(
         match outcome {
             LiftOutcome::Continue => {
                 pc = next_pc;
-                if sources.len() == config.max_guest_instructions.get() as usize
-                    || !first_page.contains(pc)
-                {
-                    break direct_branch(ControlTarget::Direct {
-                        pc,
-                        execution_state: start.execution_state,
-                    });
+                let instruction_limit =
+                    sources.len() == config.max_guest_instructions.get() as usize;
+                let page_boundary = !first_page.contains(pc);
+                if instruction_limit || page_boundary {
+                    let reason = match (instruction_limit, page_boundary) {
+                        (true, true) => BlockEndReason::InstructionLimitAtPageBoundary,
+                        (true, false) => BlockEndReason::InstructionLimit,
+                        (false, true) => BlockEndReason::PageBoundary,
+                        (false, false) => unreachable!("a block-cut condition was checked"),
+                    };
+                    break (
+                        direct_branch(ControlTarget::Direct {
+                            pc,
+                            execution_state: start.execution_state,
+                        }),
+                        reason,
+                    );
                 }
             }
-            LiftOutcome::Terminate(terminator) => break terminator,
+            LiftOutcome::Terminate(terminator) => {
+                let reason = end_reason_for_terminator(&terminator);
+                break (terminator, reason);
+            }
             LiftOutcome::Interpret(coverage_id) => {
                 let decoded = match crate::decode::decode(profile, location, encoding) {
                     DecodeResult::Decoded(decoded)
                     | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
                     _ => unreachable!("lifter outcome requires a decoded instruction"),
                 };
-                break if crate::interpreter::has_semantics(&decoded) {
+                let terminator = if crate::interpreter::has_semantics(&decoded) {
                     Terminator::InterpretOne {
                         source: location,
                         encoding,
@@ -204,6 +276,8 @@ pub fn translate_block(
                         "lifter requested fallback but interpreter semantics are unavailable",
                     )
                 };
+                let reason = end_reason_for_terminator(&terminator);
+                break (terminator, reason);
             }
         }
     };
@@ -219,10 +293,25 @@ pub fn translate_block(
         exits_for_terminator(&terminator),
         dependencies,
         sources,
-    );
+    )
+    .with_end_reason(end_reason);
     builder.replace_metadata(metadata);
     builder.terminate(terminator).map_err(build_error)?;
     builder.finish().map_err(build_error)
+}
+
+const fn end_reason_for_terminator(terminator: &Terminator) -> BlockEndReason {
+    match terminator {
+        Terminator::Direct { .. } => BlockEndReason::DirectBranch,
+        Terminator::Conditional { .. } => BlockEndReason::ConditionalBranch,
+        Terminator::Indirect { .. } => BlockEndReason::IndirectBranch,
+        Terminator::Call { .. } => BlockEndReason::Call,
+        Terminator::Return { .. } => BlockEndReason::Return,
+        Terminator::Exception { .. } => BlockEndReason::Exception,
+        Terminator::InterpretOne { .. } => BlockEndReason::InterpreterFallback,
+        Terminator::UnsupportedInstruction { .. } => BlockEndReason::UnsupportedInstruction,
+        Terminator::Stop { .. } => BlockEndReason::RuntimeStop,
+    }
 }
 
 fn validate_start(
@@ -805,14 +894,44 @@ mod tests {
     fn translated_instruction_terminator_classes_have_stable_boundaries() {
         let profile = GuestCpuProfile::switch_1();
         let cases = [
-            (ExecutionState::A64, 0x1400_0000_u32, "direct"),
-            (ExecutionState::A64, 0x5400_0000_u32, "conditional"),
-            (ExecutionState::A64, 0xd61f_0000_u32, "indirect"),
-            (ExecutionState::A64, 0x9400_0000_u32, "call"),
-            (ExecutionState::A64, 0xd65f_03c0_u32, "return"),
-            (ExecutionState::A64, 0xd400_0001_u32, "exception"),
+            (
+                ExecutionState::A64,
+                0x1400_0000_u32,
+                "direct",
+                BlockEndReason::DirectBranch,
+            ),
+            (
+                ExecutionState::A64,
+                0x5400_0000_u32,
+                "conditional",
+                BlockEndReason::ConditionalBranch,
+            ),
+            (
+                ExecutionState::A64,
+                0xd61f_0000_u32,
+                "indirect",
+                BlockEndReason::IndirectBranch,
+            ),
+            (
+                ExecutionState::A64,
+                0x9400_0000_u32,
+                "call",
+                BlockEndReason::Call,
+            ),
+            (
+                ExecutionState::A64,
+                0xd65f_03c0_u32,
+                "return",
+                BlockEndReason::Return,
+            ),
+            (
+                ExecutionState::A64,
+                0xd400_0001_u32,
+                "exception",
+                BlockEndReason::Exception,
+            ),
         ];
-        for (state, encoding, expected) in cases {
+        for (state, encoding, expected, end_reason) in cases {
             let mut memory = memory_with_pages(0x1000, 1);
             put(&mut memory, 1, 0, &encoding.to_le_bytes());
             let block = translate_block(
@@ -824,6 +943,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(terminator_family(&block.terminator), expected);
+            assert_eq!(block.metadata.end_reason, end_reason);
             assert_eq!(block.metadata.guest_instruction_count, 1);
         }
 
@@ -839,6 +959,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(terminator_family(&block.terminator), expected);
+            assert_eq!(
+                block.metadata.end_reason,
+                BlockEndReason::InterpreterFallback
+            );
             assert_eq!(block.metadata.guest_instruction_count, 1);
         }
 
@@ -853,6 +977,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(terminator_family(&block.terminator), "unsupported");
+        assert_eq!(
+            block.metadata.end_reason,
+            BlockEndReason::UnsupportedInstruction
+        );
         assert_eq!(block.metadata.guest_instruction_count, 1);
 
         // Stop is a dispatcher boundary rather than an instruction-produced
@@ -1026,6 +1154,7 @@ mod tests {
             block.metadata.exits[0].target,
             Some(GuestVirtualAddress::new(0x1008))
         );
+        assert_eq!(block.metadata.end_reason, BlockEndReason::InstructionLimit);
     }
 
     #[test]
@@ -1048,6 +1177,7 @@ mod tests {
         assert_eq!(block.metadata.guest_instruction_count, 1);
         assert_eq!(block.metadata.guest_byte_count, 4);
         assert_eq!(block.metadata.code_dependencies.len(), 2);
+        assert_eq!(block.metadata.end_reason, BlockEndReason::PageBoundary);
         assert_eq!(
             block.metadata.exits[0].target,
             Some(GuestVirtualAddress::new(

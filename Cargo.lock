@@ -362,7 +362,10 @@ dependencies = [
  "sanitize-filename",
  "swiitx-config",
  "swiitx-loader-content",
+ "swiitx-loader-executable",
+ "swiitx-loader-storage",
  "swiitx-loader-title",
+ "tempfile",
 ]
 
 [[package]]
@@ -420,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "swiitx-loader-content",
+ "swiitx-loader-executable",
  "swiitx-loader-storage",
  "tempfile",
  "zstd",

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -10,6 +11,7 @@ use swiitx_loader_content::{
     NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NczCompressionKind, NczLoader,
     NspLoader, NszLoader, SystemVersion, XciHeader, XciLoader, XciPartitionKind, XczLoader,
 };
+use swiitx_loader_executable::{NroLoader, NroRange};
 use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
@@ -115,6 +117,65 @@ pub struct StandaloneNczInspection {
     pub ncz: NczInspection,
     pub nca: Option<NcaInspection>,
     pub nca_warning: Option<String>,
+}
+
+/// Semantic role of a validated NRO segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NroSegmentKind {
+    Text,
+    ReadOnly,
+    Data,
+}
+
+impl Display for NroSegmentKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Text => "text",
+            Self::ReadOnly => "read-only",
+            Self::Data => "data",
+        })
+    }
+}
+
+/// One validated loadable segment from a standalone NRO executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NroSegmentInspection {
+    pub kind: NroSegmentKind,
+    pub memory_offset: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub mapping_size: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// Optional homebrew assets appended to a standalone NRO executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NroAssetsInspection {
+    pub version: u32,
+    pub icon_size: Option<u64>,
+    pub nacp_size: Option<u64>,
+    pub romfs_size: Option<u64>,
+}
+
+/// Validated metadata from a standalone NRO executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NroInspection {
+    pub path: PathBuf,
+    pub size: u64,
+    pub version: u32,
+    pub flags: u32,
+    pub executable_size: u64,
+    pub entry_offset: u64,
+    pub module_id: [u8; 32],
+    pub module_header_offset: u64,
+    pub dso_handle_offset: u64,
+    pub embedded_api_info: (u64, u64),
+    pub dynamic_string_table: (u64, u64),
+    pub dynamic_symbol_table: (u64, u64),
+    pub segments: Vec<NroSegmentInspection>,
+    pub assets: Option<NroAssetsInspection>,
 }
 
 /// One nested partition reported while inspecting an XCI.
@@ -281,17 +342,76 @@ pub struct TitleInspection {
     pub path: PathBuf,
     /// Supported packages successfully inspected below the path.
     pub packages: Vec<PackageInspection>,
+    /// Standalone NRO executables successfully inspected below the path.
+    pub nros: Vec<NroInspection>,
     /// Regular files skipped because their format is not supported yet.
     pub ignored_files: Vec<PathBuf>,
     /// Standalone NCZ information when the explicit input is an `.ncz` file.
     pub standalone_ncz: Option<StandaloneNczInspection>,
 }
 
-/// Inspects title packages without loading their payloads into memory.
+/// Inspects title packages and standalone NRO executables lazily.
 #[derive(Debug)]
 pub struct TitleInspector;
 
 impl TitleInspector {
+    /// Inspects multiple package files or directories in caller-provided order.
+    pub fn inspect_paths<P, I>(paths: I) -> Result<Vec<TitleInspection>, InspectError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = P>,
+    {
+        Self::inspect_paths_with_options(paths, DirectoryScanOptions::default())
+    }
+
+    /// Inspects multiple paths using the supplied directory options.
+    pub fn inspect_paths_with_options<P, I>(
+        paths: I,
+        options: DirectoryScanOptions,
+    ) -> Result<Vec<TitleInspection>, InspectError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = P>,
+    {
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_owned())
+            .collect();
+        Self::inspect_paths_impl(paths, None, options)
+    }
+
+    /// Inspects multiple paths with one shared caller-owned key set.
+    pub fn inspect_paths_with_key_set<P, I>(
+        paths: I,
+        keys: &mut NcaKeySet,
+    ) -> Result<Vec<TitleInspection>, InspectError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = P>,
+    {
+        Self::inspect_paths_with_key_set_and_options(paths, keys, DirectoryScanOptions::default())
+    }
+
+    /// Inspects multiple paths with one shared caller-owned key set.
+    ///
+    /// Ticket keys imported while inspecting an earlier path remain available
+    /// to every later path in the caller-provided order.
+    pub fn inspect_paths_with_key_set_and_options<P, I>(
+        paths: I,
+        keys: &mut NcaKeySet,
+        options: DirectoryScanOptions,
+    ) -> Result<Vec<TitleInspection>, InspectError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = P>,
+    {
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_owned())
+            .collect();
+        Self::inspect_paths_impl(paths, Some(keys), options)
+    }
+
     /// Inspects one package file or recursively scans a directory.
     pub fn inspect(path: impl AsRef<Path>) -> Result<TitleInspection, InspectError> {
         Self::inspect_with_options(path, DirectoryScanOptions::default())
@@ -323,6 +443,50 @@ impl TitleInspector {
         Self::inspect_impl(path.as_ref(), Some(keys), options)
     }
 
+    /// Finds and validates standalone NRO executables without inspecting title packages.
+    pub fn inspect_nros_with_options(
+        path: impl AsRef<Path>,
+        options: DirectoryScanOptions,
+    ) -> Result<Vec<NroInspection>, InspectError> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path).map_err(|source| InspectError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        let candidates = if metadata.is_file() {
+            vec![path.to_owned()]
+        } else if metadata.is_dir() {
+            directory_files(path, options).map_err(|error| InspectError::Io {
+                path: error.path,
+                source: error.source,
+            })?
+        } else {
+            return Err(InspectError::UnsupportedPath(path.to_owned()));
+        };
+
+        candidates
+            .into_iter()
+            .filter(|candidate| has_extension(candidate, "nro"))
+            .map(|candidate| inspect_nro(&candidate))
+            .collect()
+    }
+
+    fn inspect_paths_impl(
+        paths: Vec<PathBuf>,
+        mut keys: Option<&mut NcaKeySet>,
+        options: DirectoryScanOptions,
+    ) -> Result<Vec<TitleInspection>, InspectError> {
+        if paths.is_empty() {
+            return Err(InspectError::NoPaths);
+        }
+        let mut inspections = Vec::with_capacity(paths.len());
+        for path in paths {
+            inspections.push(Self::inspect_impl(&path, keys.as_deref_mut(), options)?);
+        }
+        deduplicate_inspections(&mut inspections)?;
+        Ok(inspections)
+    }
+
     fn inspect_impl(
         path: &Path,
         mut keys: Option<&mut NcaKeySet>,
@@ -342,6 +506,7 @@ impl TitleInspector {
             return Ok(TitleInspection {
                 path: path.to_owned(),
                 packages: Vec::new(),
+                nros: Vec::new(),
                 ignored_files: Vec::new(),
                 standalone_ncz: Some(inspect_standalone_ncz(path, keys.as_deref())?),
             });
@@ -359,6 +524,7 @@ impl TitleInspector {
         };
 
         let mut packages = Vec::new();
+        let mut nros = Vec::new();
         let mut ignored_files = Vec::new();
         for candidate in candidates {
             match package_format(&candidate) {
@@ -374,42 +540,94 @@ impl TitleInspector {
                 Some(PackageFormat::Xcz) => {
                     packages.push(inspect_xcz(&candidate, keys.as_deref_mut())?)
                 }
+                None if has_extension(&candidate, "nro") => nros.push(inspect_nro(&candidate)?),
                 None => ignored_files.push(candidate),
             }
         }
 
-        if packages.is_empty() {
+        if packages.is_empty() && nros.is_empty() {
             return Err(InspectError::NoSupportedPackages(path.to_owned()));
         }
 
         Ok(TitleInspection {
             path: path.to_owned(),
             packages,
+            nros,
             ignored_files,
             standalone_ncz: None,
         })
     }
 }
 
+fn deduplicate_inspections(inspections: &mut [TitleInspection]) -> Result<(), InspectError> {
+    let mut seen = BTreeSet::new();
+    for inspection in inspections {
+        let mut packages = Vec::with_capacity(inspection.packages.len());
+        for package in std::mem::take(&mut inspection.packages) {
+            if insert_unique_path(&mut seen, &package.path)? {
+                packages.push(package);
+            }
+        }
+        inspection.packages = packages;
+
+        let mut nros = Vec::with_capacity(inspection.nros.len());
+        for nro in std::mem::take(&mut inspection.nros) {
+            if insert_unique_path(&mut seen, &nro.path)? {
+                nros.push(nro);
+            }
+        }
+        inspection.nros = nros;
+
+        let mut ignored = Vec::with_capacity(inspection.ignored_files.len());
+        for path in std::mem::take(&mut inspection.ignored_files) {
+            if insert_unique_path(&mut seen, &path)? {
+                ignored.push(path);
+            }
+        }
+        inspection.ignored_files = ignored;
+
+        let keep_standalone = inspection
+            .standalone_ncz
+            .as_ref()
+            .map(|ncz| insert_unique_path(&mut seen, &ncz.path))
+            .transpose()?;
+        if keep_standalone == Some(false) {
+            inspection.standalone_ncz = None;
+        }
+    }
+    Ok(())
+}
+
+fn insert_unique_path(seen: &mut BTreeSet<PathBuf>, path: &Path) -> Result<bool, InspectError> {
+    let identity = fs::canonicalize(path).map_err(|source| InspectError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(seen.insert(identity))
+}
+
 /// Errors produced while inspecting a local title path.
 #[derive(Debug)]
 pub enum InspectError {
+    /// The caller supplied no inspection roots.
+    NoPaths,
     /// A local file-system operation failed.
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// A package could not be parsed.
+    /// A supported input could not be parsed.
     Package { path: PathBuf, source: LoadError },
     /// The supplied path is neither a regular file nor a directory.
     UnsupportedPath(PathBuf),
-    /// No supported package was found at the supplied path.
+    /// No supported package or executable was found at the supplied path.
     NoSupportedPackages(PathBuf),
 }
 
 impl Display for InspectError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NoPaths => formatter.write_str("no inspection paths were supplied"),
             Self::Io { path, source } => {
                 write!(formatter, "cannot access {}: {source}", path.display())
             }
@@ -421,11 +639,99 @@ impl Display for InspectError {
             }
             Self::NoSupportedPackages(path) => write!(
                 formatter,
-                "no supported title packages found at {}",
+                "no supported title packages or NRO executables found at {}",
                 path.display()
             ),
         }
     }
+}
+
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+fn inspect_nro(path: &Path) -> Result<NroInspection, InspectError> {
+    let storage = FileStorage::open(path).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let size = storage.len().map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source: LoadError::Storage(source),
+    })?;
+    let image = NroLoader::load(Arc::new(storage)).map_err(|source| InspectError::Package {
+        path: path.to_owned(),
+        source,
+    })?;
+    let executable = image.executable();
+    let metadata = image.metadata();
+    let segments = executable
+        .segments()
+        .iter()
+        .map(|segment| {
+            let permissions = segment.permissions();
+            NroSegmentInspection {
+                kind: match segment.kind() {
+                    swiitx_loader_executable::ExecutableSegmentKind::Text => NroSegmentKind::Text,
+                    swiitx_loader_executable::ExecutableSegmentKind::ReadOnly => {
+                        NroSegmentKind::ReadOnly
+                    }
+                    swiitx_loader_executable::ExecutableSegmentKind::Data => NroSegmentKind::Data,
+                },
+                memory_offset: segment.memory_offset(),
+                file_size: segment.file_size(),
+                memory_size: segment.memory_size(),
+                mapping_size: segment.mapping_size(),
+                readable: permissions.is_readable(),
+                writable: permissions.is_writable(),
+                executable: permissions.is_executable(),
+            }
+        })
+        .collect();
+    let assets = image
+        .assets()
+        .map(|assets| -> Result<_, LoadError> {
+            Ok(NroAssetsInspection {
+                version: assets.version(),
+                icon_size: asset_size(assets.icon())?,
+                nacp_size: asset_size(assets.nacp())?,
+                romfs_size: asset_size(assets.romfs())?,
+            })
+        })
+        .transpose()
+        .map_err(|source| InspectError::Package {
+            path: path.to_owned(),
+            source,
+        })?;
+
+    Ok(NroInspection {
+        path: path.to_owned(),
+        size,
+        version: metadata.version(),
+        flags: metadata.flags(),
+        executable_size: metadata.executable_size(),
+        entry_offset: executable.entry_offset(),
+        module_id: *executable.module_id(),
+        module_header_offset: metadata.module_header_offset(),
+        dso_handle_offset: metadata.dso_handle_offset(),
+        embedded_api_info: range_tuple(metadata.embedded_api_info()),
+        dynamic_string_table: range_tuple(metadata.dynamic_string_table()),
+        dynamic_symbol_table: range_tuple(metadata.dynamic_symbol_table()),
+        segments,
+        assets,
+    })
+}
+
+fn range_tuple(range: NroRange) -> (u64, u64) {
+    (range.offset(), range.size())
+}
+
+fn asset_size(asset: Option<&StorageRef>) -> Result<Option<u64>, LoadError> {
+    asset
+        .map(|storage| storage.len().map_err(LoadError::Storage))
+        .transpose()
 }
 
 impl Error for InspectError {
@@ -433,7 +739,7 @@ impl Error for InspectError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Package { source, .. } => Some(source),
-            Self::UnsupportedPath(_) | Self::NoSupportedPackages(_) => None,
+            Self::NoPaths | Self::UnsupportedPath(_) | Self::NoSupportedPackages(_) => None,
         }
     }
 }
@@ -1169,6 +1475,33 @@ mod tests {
         }
     }
 
+    fn synthetic_nro() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x2800];
+        bytes[0x10..0x14].copy_from_slice(b"NRO0");
+        put_u32(&mut bytes, 0x04, 0x100);
+        put_u32(&mut bytes, 0x14, 7);
+        put_u32(&mut bytes, 0x18, 0x2800);
+        put_u32(&mut bytes, 0x1c, 0x55aa);
+        put_u32(&mut bytes, 0x20, 0);
+        put_u32(&mut bytes, 0x24, 0x1000);
+        put_u32(&mut bytes, 0x28, 0x1000);
+        put_u32(&mut bytes, 0x2c, 0x1000);
+        put_u32(&mut bytes, 0x30, 0x2000);
+        put_u32(&mut bytes, 0x34, 0x800);
+        put_u32(&mut bytes, 0x38, 0x800);
+        for (index, byte) in bytes[0x40..0x60].iter_mut().enumerate() {
+            *byte = u8::try_from(index).unwrap();
+        }
+        put_u32(&mut bytes, 0x60, 0x2040);
+        put_u32(&mut bytes, 0x68, 0x1100);
+        put_u32(&mut bytes, 0x6c, 0x20);
+        put_u32(&mut bytes, 0x70, 0x1200);
+        put_u32(&mut bytes, 0x74, 0x30);
+        put_u32(&mut bytes, 0x78, 0x1300);
+        put_u32(&mut bytes, 0x7c, 0x48);
+        bytes
+    }
+
     #[test]
     fn classifies_common_nsp_entries() {
         assert_eq!(entry_kind("meta.cnmt.nca"), EntryKind::MetaContentArchive);
@@ -1202,6 +1535,92 @@ mod tests {
         assert_eq!(standalone.ncz.logical_size, 0x4000 + tail.len() as u64);
         assert!(standalone.nca.is_none());
         assert!(standalone.nca_warning.is_some());
+    }
+
+    #[test]
+    fn inspects_a_standalone_nro_as_a_supported_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("homebrew.NRO");
+        fs::write(&path, synthetic_nro()).unwrap();
+
+        let inspection = TitleInspector::inspect(&path).unwrap();
+
+        assert!(inspection.packages.is_empty());
+        assert!(inspection.ignored_files.is_empty());
+        assert!(inspection.standalone_ncz.is_none());
+        assert_eq!(inspection.nros.len(), 1);
+        let nro = &inspection.nros[0];
+        assert_eq!(nro.path, path);
+        assert_eq!(nro.size, 0x2800);
+        assert_eq!(nro.executable_size, 0x2800);
+        assert_eq!(nro.module_header_offset, 0x100);
+        assert_eq!(nro.segments.len(), 3);
+        assert_eq!(nro.segments[0].kind, NroSegmentKind::Text);
+        assert!(nro.segments[0].executable);
+        assert_eq!(nro.segments[2].kind, NroSegmentKind::Data);
+        assert!(nro.segments[2].writable);
+    }
+
+    #[test]
+    fn directory_inspection_includes_nros_instead_of_ignoring_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let nro_path = directory.path().join("homebrew.nro");
+        let ignored_path = directory.path().join("readme.txt");
+        fs::write(&nro_path, synthetic_nro()).unwrap();
+        fs::write(&ignored_path, b"unsupported").unwrap();
+
+        let inspection = TitleInspector::inspect(directory.path()).unwrap();
+
+        assert!(inspection.packages.is_empty());
+        assert_eq!(inspection.nros.len(), 1);
+        assert_eq!(inspection.nros[0].path, nro_path);
+        assert_eq!(inspection.ignored_files, vec![ignored_path]);
+
+        let nros = TitleInspector::inspect_nros_with_options(
+            directory.path(),
+            DirectoryScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(nros.len(), 1);
+        assert_eq!(nros[0].path, inspection.nros[0].path);
+    }
+
+    #[test]
+    fn multipath_inspection_preserves_root_order_and_uses_the_same_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.nro");
+        let second = directory.path().join("second.NRO");
+        fs::write(&first, synthetic_nro()).unwrap();
+        fs::write(&second, synthetic_nro()).unwrap();
+
+        let inspections = TitleInspector::inspect_paths([&first, &second]).unwrap();
+
+        assert_eq!(inspections.len(), 2);
+        assert_eq!(inspections[0].path, first);
+        assert_eq!(inspections[0].nros[0].path, inspections[0].path);
+        assert_eq!(inspections[1].path, second);
+        assert_eq!(inspections[1].nros[0].path, inspections[1].path);
+    }
+
+    #[test]
+    fn multipath_inspection_rejects_an_empty_root_set() {
+        assert!(matches!(
+            TitleInspector::inspect_paths(Vec::<PathBuf>::new()),
+            Err(InspectError::NoPaths)
+        ));
+    }
+
+    #[test]
+    fn multipath_inspection_keeps_only_the_first_overlapping_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let nro = directory.path().join("overlap.nro");
+        fs::write(&nro, synthetic_nro()).unwrap();
+
+        let inspections = TitleInspector::inspect_paths([directory.path(), nro.as_path()]).unwrap();
+
+        assert_eq!(inspections.len(), 2);
+        assert_eq!(inspections[0].nros.len(), 1);
+        assert!(inspections[1].nros.is_empty());
     }
 
     fn zstd_bytes(bytes: &[u8]) -> Vec<u8> {

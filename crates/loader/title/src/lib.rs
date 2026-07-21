@@ -16,7 +16,8 @@ pub use discovery::{DirectoryScanOptions, PackageFormat};
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,
-    NcaInspection, NcaSectionInspection, NczInspection, NczSectionInspection, PackageInspection,
+    NcaInspection, NcaSectionInspection, NczInspection, NczSectionInspection, NroAssetsInspection,
+    NroInspection, NroSegmentInspection, NroSegmentKind, PackageInspection,
     StandaloneNczInspection, TitleInspection, TitleInspector, XciInspection,
     XciPartitionInspection,
 };

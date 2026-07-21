@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 swiitx-loader-content.workspace = true
+swiitx-loader-executable.workspace = true
 swiitx-loader-storage.workspace = true
 
 [dev-dependencies]

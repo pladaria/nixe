@@ -816,7 +816,8 @@ mod tests {
                 block.terminator
             );
             let printed = print_block(&block, Default::default());
-            assert!(printed.contains("source 0x0000000000001000 ; raw="));
+            assert!(printed.contains("source pc=0x0000000000001000 state="));
+            assert!(printed.contains(" ; raw="));
             assert!(printed.contains("terminator "));
         }
 

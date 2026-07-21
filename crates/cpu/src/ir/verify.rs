@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    block::{BlockExit, BlockExitKind, IrBlock},
+    block::{BlockEndReason, BlockExit, BlockExitKind, IrBlock},
     op::{
         AddressOperation, AtomicOperation, CacheMaintenanceOperation, ExclusiveOperation,
         FlagOperation, FloatingPointOperation, GuestAddressWidth, IrOperation, LaneType,
@@ -102,8 +102,43 @@ pub fn verify_block(block: &IrBlock) -> Result<(), VerificationError> {
         }
     }
     verify_terminator(&block.terminator, &definitions, block)?;
+    verify_end_reason(block)?;
     verify_exits(block)?;
     Ok(())
+}
+
+fn verify_end_reason(block: &IrBlock) -> Result<(), VerificationError> {
+    let reason = block.metadata.end_reason;
+    let matches_terminator = match reason {
+        BlockEndReason::ExplicitTerminator => true,
+        BlockEndReason::DirectBranch => matches!(block.terminator, Terminator::Direct { .. }),
+        BlockEndReason::ConditionalBranch => {
+            matches!(block.terminator, Terminator::Conditional { .. })
+        }
+        BlockEndReason::IndirectBranch => matches!(block.terminator, Terminator::Indirect { .. }),
+        BlockEndReason::Call => matches!(block.terminator, Terminator::Call { .. }),
+        BlockEndReason::Return => matches!(block.terminator, Terminator::Return { .. }),
+        BlockEndReason::Exception => matches!(block.terminator, Terminator::Exception { .. }),
+        BlockEndReason::InterpreterFallback => {
+            matches!(block.terminator, Terminator::InterpretOne { .. })
+        }
+        BlockEndReason::UnsupportedInstruction => {
+            matches!(block.terminator, Terminator::UnsupportedInstruction { .. })
+        }
+        BlockEndReason::InstructionLimit
+        | BlockEndReason::PageBoundary
+        | BlockEndReason::InstructionLimitAtPageBoundary => {
+            matches!(block.terminator, Terminator::Direct { .. })
+        }
+        BlockEndReason::RuntimeStop => matches!(block.terminator, Terminator::Stop { .. }),
+    };
+    if matches_terminator {
+        Ok(())
+    } else {
+        Err(VerificationError::metadata(format!(
+            "block end reason {reason} is inconsistent with its terminator"
+        )))
+    }
 }
 
 pub(crate) fn verify_operation_for_builder(
@@ -1506,6 +1541,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ordered union")
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_mismatched_block_end_reasons() {
+        let mut wrong_branch = valid_block(Vec::new());
+        wrong_branch.metadata.end_reason = BlockEndReason::ConditionalBranch;
+        assert!(
+            verify_block(&wrong_branch)
+                .unwrap_err()
+                .to_string()
+                .contains("conditional-branch is inconsistent")
         );
     }
 

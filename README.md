@@ -53,6 +53,12 @@ Milestones:
 
 ## Testing
 
+Run
+
+```
+cargo test-all
+```
+
 ### Integration tests against real titles
 
 To run integration tests against caller-owned titles, copy `.env.integration.example` to
@@ -77,6 +83,12 @@ aarch64-linux-gnu-gcc --version
 arm-linux-gnueabihf-gcc --version
 ```
 
+Then run
+
+```bash
+cargo test-diff
+```
+
 ### Fuzz tests
 
 CPU decoder, translation, IR verifier, and diagnostic fuzz targets require a nightly Rust toolchain
@@ -85,15 +97,11 @@ and `cargo-fuzz`:
 ```bash
 rustup toolchain install nightly
 cargo install cargo-fuzz
-cargo fuzzer
+cargo fuzz-all
 ```
 
 The aggregate alias runs 10,000 iterations for each target. See [fuzz/README.md](fuzz/README.md) for
 target-specific commands and configuration.
-
-## License
-
-Swiitx is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).
 
 ## Contributing
 
@@ -110,3 +118,7 @@ using only software and data they are legally entitled to use.
 
 Nintendo Switch and Nintendo Switch 2 are trademarks of Nintendo. This project is independent and is not
 affiliated with, sponsored by, or endorsed by Nintendo or NVIDIA.
+
+## License
+
+Swiitx is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).

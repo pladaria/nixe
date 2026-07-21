@@ -1119,6 +1119,24 @@ Instrumentation is inserted through IR or block hooks selected before
 translation. Production blocks contain no unconditional callback on every
 instruction.
 
+The frontend exposes a separate opt-in block-report path. Normal translation
+does not construct disassembly strings. When requested, the report records each
+instruction's guest PC, execution state, raw encoding, deterministic
+disassembly, the verified pre-optimization IR, the exact semantic or policy
+reason the block ended, and the ordered physical code-page identities and
+generations observed by instruction fetch. Page-boundary and instruction-limit
+cuts remain distinguishable from guest direct branches even though all three
+resume through a direct guest target.
+
+IR dumps carry an explicit `pre-optimization` or `post-optimization` stage. The
+frontend currently produces only the former; the latter is an interface
+contract for future passes. Fetch failures produce a structured block report
+with a `fetch-fault` end reason rather than a partial valid IR block. Reports use
+only guest-domain and stable semantic identities, deterministic ordering, and
+no raw host pointers. A raw-byte helper supplies the same report for bounded
+single-block commands and regression fixtures without bypassing the ordinary
+decoder, lifter, builder, or verifier.
+
 ## 25. Validation strategy
 
 ### 25.1 Unit tests
