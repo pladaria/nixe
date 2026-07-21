@@ -12,3 +12,6 @@ preferred_languages = [
   "AmericanEnglish",
 ]
 keys = "./keys/"
+
+[diagnostics]
+report_detail = "detailed"

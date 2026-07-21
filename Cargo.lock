@@ -418,6 +418,7 @@ dependencies = [
 name = "swiitx-runtime"
 version = "0.1.0"
 dependencies = [
+ "swiitx-config",
  "swiitx-cpu",
  "swiitx-loader-content",
  "swiitx-loader-executable",

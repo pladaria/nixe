@@ -286,6 +286,7 @@ fn unsupported_terminator(
     Terminator::UnsupportedInstruction {
         source: decoded.location,
         encoding: decoded.encoding,
+        coverage_id: decoded.instruction.coverage_id().get(),
         disassembly: crate::decode::disassemble(&decoded.instruction)
             .to_string()
             .into(),

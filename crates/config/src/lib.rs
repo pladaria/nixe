@@ -24,6 +24,8 @@ pub struct SwiitxConfig {
     pub library: LibraryConfig,
     /// System-wide preferences and caller-owned key location.
     pub system: SystemConfig,
+    /// Cross-cutting diagnostic preferences consumed by application runtimes.
+    pub diagnostics: DiagnosticsConfig,
     source_path: PathBuf,
 }
 
@@ -68,6 +70,9 @@ impl SwiitxConfig {
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
                 keys: resolve_path(base_directory, raw.system.keys),
+            },
+            diagnostics: DiagnosticsConfig {
+                report_detail: raw.diagnostics.report_detail,
             },
             source_path,
         })
@@ -121,6 +126,24 @@ pub struct SystemConfig {
     pub preferred_languages: Vec<NacpLanguage>,
     /// Directory containing caller-owned `prod.keys` and optional `title.keys`.
     pub keys: PathBuf,
+}
+
+/// User preference for the amount of context retained in diagnostic reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticReportDetail {
+    /// Retain bounded local context useful during emulator development.
+    #[default]
+    Detailed,
+    /// Retain only minimal context suitable for public sharing.
+    Sanitized,
+}
+
+/// Cross-cutting diagnostics configuration shared by applications.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticsConfig {
+    /// Detail level requested for CPU, backend, GPU, and runtime reports.
+    pub report_detail: DiagnosticReportDetail,
 }
 
 /// Errors produced while locating or loading shared configuration.
@@ -182,6 +205,8 @@ struct RawConfig {
     version: u32,
     library: RawLibraryConfig,
     system: RawSystemConfig,
+    #[serde(default)]
+    diagnostics: RawDiagnosticsConfig,
 }
 
 #[derive(Deserialize)]
@@ -198,6 +223,13 @@ struct RawSystemConfig {
     #[serde(deserialize_with = "deserialize_languages")]
     preferred_languages: Vec<NacpLanguage>,
     keys: PathBuf,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiagnosticsConfig {
+    #[serde(default)]
+    report_detail: DiagnosticReportDetail,
 }
 
 const fn default_recursive_scan() -> bool {
@@ -320,6 +352,10 @@ mod tests {
             vec![NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]
         );
         assert_eq!(config.system.keys, base.join("./keys"));
+        assert_eq!(
+            config.diagnostics.report_detail,
+            DiagnosticReportDetail::Detailed
+        );
     }
 
     #[test]
@@ -338,6 +374,32 @@ mod tests {
         let config = SwiitxConfig::load(&file.path).unwrap();
 
         assert!(config.library.recursive_scan);
+        assert_eq!(
+            config.diagnostics.report_detail,
+            DiagnosticReportDetail::Detailed
+        );
+    }
+
+    #[test]
+    fn loads_explicit_sanitized_diagnostic_policy() {
+        let file = TemporaryConfig::new(
+            r#"
+                version = 1
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                [diagnostics]
+                report_detail = "sanitized"
+            "#,
+        );
+
+        let config = SwiitxConfig::load(&file.path).unwrap();
+        assert_eq!(
+            config.diagnostics.report_detail,
+            DiagnosticReportDetail::Sanitized
+        );
     }
 
     #[test]
