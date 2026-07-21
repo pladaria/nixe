@@ -379,6 +379,17 @@ name = "swiitx-cpu"
 version = "0.1.0"
 
 [[package]]
+name = "swiitx-horizon"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "swiitx-loader-storage",
+ "swiitx-loader-title",
+ "swiitx-runtime",
+ "tempfile",
+]
+
+[[package]]
 name = "swiitx-loader-content"
 version = "0.1.0"
 dependencies = [

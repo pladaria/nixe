@@ -1,0 +1,13 @@
+[package]
+name = "swiitx-horizon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swiitx-loader-storage.workspace = true
+swiitx-loader-title.workspace = true
+swiitx-runtime.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true

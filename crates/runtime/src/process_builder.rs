@@ -148,6 +148,13 @@ impl RunnableProcess {
         &mut self.handles
     }
 
+    /// Borrows the console-neutral resources needed by a platform service layer.
+    pub fn mounts_and_handles_mut(
+        &mut self,
+    ) -> (&crate::ProcessMountNamespace, &mut crate::HandleTable) {
+        (&self.mounts, &mut self.handles)
+    }
+
     /// Returns the host-side lifecycle state of this process.
     #[must_use]
     pub const fn execution_status(&self) -> ProcessExecutionStatus {
@@ -333,7 +340,7 @@ impl ProcessBuilder {
         let entry_module = plan.entry_module_index();
         let mut handles = crate::HandleTable::new();
         let main_thread_handle = handles
-            .insert(crate::HandleObject::Thread { thread_id: 1 })
+            .insert(crate::ThreadObject::new(1))
             .map_err(|error| {
                 ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
             })?;
@@ -804,8 +811,10 @@ mod tests {
             panic!("homebrew fixture must initialize A64");
         };
         assert_eq!(
-            process.handles().get(process.main_thread().handle),
-            Some(&crate::HandleObject::Thread { thread_id: 1 })
+            process
+                .handles()
+                .get_as::<crate::ThreadObject>(process.main_thread().handle),
+            Some(&crate::ThreadObject::new(1))
         );
         assert!(process.mounts().primary().is_none());
         assert!(process.mounts().add_ons().is_empty());

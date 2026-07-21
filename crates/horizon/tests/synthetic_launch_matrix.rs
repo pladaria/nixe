@@ -2,6 +2,9 @@ mod support;
 
 use std::fs;
 
+use swiitx_horizon::{
+    DirectoryEntryKind, HorizonProcess, IpcRequest, IpcResponse, IpcResultCode, IpcService,
+};
 use swiitx_runtime::{
     LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, ProcessBuilder,
 };
@@ -9,7 +12,38 @@ use swiitx_runtime::{
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
     build_nsp, build_romfs, build_xci, content_id, data_content, program_content,
+    program_content_without_services,
 };
+
+#[test]
+fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = Package {
+        title_id: APPLICATION_ID,
+        version: 0,
+        kind: MetaKind::Application,
+        contents: vec![
+            program_content_without_services(content_id(1), &[("main", 1)]),
+            data_content(
+                content_id(2),
+                APPLICATION_ID,
+                1,
+                build_romfs(&[("file", b"bytes")]),
+            ),
+        ],
+    };
+    fs::write(directory.path().join("restricted.nsp"), build_nsp(&package)).unwrap();
+    let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
+    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    assert_eq!(
+        process.connect_ipc_service(IpcService::FileSystem),
+        Err(IpcResultCode::ACCESS_DENIED)
+    );
+    assert_eq!(
+        process.connect_ipc_service(IpcService::AddOnContent),
+        Err(IpcResultCode::ACCESS_DENIED)
+    );
+}
 
 #[test]
 fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
@@ -168,8 +202,131 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .unwrap();
     assert_eq!(&second_content_bytes, b"second");
 
-    let process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = ProcessBuilder::new().build(&plan).unwrap();
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);
+    exercise_read_only_ipc(&mut process);
     let _ = process.teardown();
+}
+
+fn exercise_read_only_ipc(process: &mut swiitx_runtime::RunnableProcess) {
+    let filesystem_session = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(primary) = process
+        .dispatch_ipc(filesystem_session, IpcRequest::OpenPrimaryFileSystem)
+        .unwrap()
+    else {
+        panic!("filesystem service must return a filesystem handle");
+    };
+    let IpcResponse::Handle(root) = process
+        .dispatch_ipc(primary, IpcRequest::OpenDirectory { path: "/".into() })
+        .unwrap()
+    else {
+        panic!("opening the root must return a directory handle");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(root, IpcRequest::GetDirectoryEntryCount)
+            .unwrap(),
+        IpcResponse::Size(2)
+    );
+    let duplicate_root = process.handles_mut().duplicate(root).unwrap();
+    let IpcResponse::DirectoryEntries(first) = process
+        .dispatch_ipc(root, IpcRequest::ReadDirectory { max_entries: 1 })
+        .unwrap()
+    else {
+        panic!("directory read must return entries");
+    };
+    assert_eq!(first[0].name(), "keep");
+    assert_eq!(first[0].kind(), DirectoryEntryKind::File);
+    let IpcResponse::DirectoryEntries(second) = process
+        .dispatch_ipc(duplicate_root, IpcRequest::ReadDirectory { max_entries: 1 })
+        .unwrap()
+    else {
+        panic!("duplicated directory handle must preserve its shared cursor");
+    };
+    assert_eq!(second[0].name(), "replace");
+
+    let IpcResponse::Handle(file) = process
+        .dispatch_ipc(
+            primary,
+            IpcRequest::OpenFile {
+                path: "/replace".into(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening a file must return a file handle");
+    };
+    assert_eq!(
+        process.dispatch_ipc(file, IpcRequest::GetFileSize).unwrap(),
+        IpcResponse::Size(4)
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(file, IpcRequest::ReadFile { offset: 1, size: 8 })
+            .unwrap(),
+        IpcResponse::Data(b"ew!".to_vec())
+    );
+
+    let add_on_session = process
+        .connect_ipc_service(IpcService::AddOnContent)
+        .unwrap();
+    assert_eq!(
+        process
+            .dispatch_ipc(add_on_session, IpcRequest::GetAddOnContentCount)
+            .unwrap(),
+        IpcResponse::Size(2)
+    );
+    let IpcResponse::AddOnContentEntries(entries) = process
+        .dispatch_ipc(
+            add_on_session,
+            IpcRequest::ListAddOnContent {
+                offset: 0,
+                max_entries: 10,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("add-on listing must return metadata entries");
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
+    assert_eq!(entries[0].version, 9);
+    assert_eq!(entries[0].mount_count, 1);
+
+    let IpcResponse::Handle(add_on_filesystem) = process
+        .dispatch_ipc(
+            add_on_session,
+            IpcRequest::OpenAddOnContent {
+                title_id: entries[0].title_id,
+                mount_index: 0,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("authorized add-on must return a filesystem handle");
+    };
+    let IpcResponse::Handle(revision) = process
+        .dispatch_ipc(
+            add_on_filesystem,
+            IpcRequest::OpenFile {
+                path: "/revision".into(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("add-on filesystem must open its own files");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(revision, IpcRequest::ReadFile { offset: 0, size: 3 })
+            .unwrap(),
+        IpcResponse::Data(b"new".to_vec())
+    );
+
+    process.handles_mut().close(file).unwrap();
+    assert_eq!(
+        process.dispatch_ipc(file, IpcRequest::GetFileSize),
+        Err(IpcResultCode::INVALID_HANDLE)
+    );
 }
