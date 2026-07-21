@@ -22,3 +22,5 @@ Run the optional QEMU oracle with:
 ```bash
 cargo test-differential
 ```
+
+Robustness fuzzing is documented in [`fuzz/README.md`](../../../fuzz/README.md).

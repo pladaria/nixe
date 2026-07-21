@@ -610,6 +610,44 @@ mod tests {
     }
 
     #[test]
+    fn narrow_zero_register_stores_use_w_register_width_before_truncation() {
+        let block = translate(&[
+            0x3924_d0ff, // strb wzr,[x7,#2356]
+            0x7900_00ff, // strh wzr,[x7]
+            0x0880_fcff, // stlrb wzr,[x7]
+            0x0800_7cff, // stxrb w0,wzr,[x7]
+            0xd400_0001,
+        ]);
+        let stores = block
+            .operations
+            .iter()
+            .filter_map(|operation| match operation.kind {
+                OperationKind::Memory(MemoryOperation::Store {
+                    value, descriptor, ..
+                }) => Some((value.ty(), descriptor.value_type())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stores,
+            [
+                (IrType::I8, IrType::I8),
+                (IrType::I16, IrType::I16),
+                (IrType::I8, IrType::I8),
+            ]
+        );
+        assert!(block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Exclusive(ExclusiveOperation::Store {
+                value,
+                descriptor,
+                ..
+            }) if value.ty() == IrType::I8 && descriptor.value_type() == IrType::I8
+        )));
+    }
+
+    #[test]
     fn signed_literal_and_acquire_release_transfers_do_not_fall_back() {
         let block = translate(&[
             0x9800_0000, // ldrsw x0, literal

@@ -97,13 +97,7 @@ fn memory_transfer(
     let opc = u32::from(fields.opc);
     let rt = fields.rt;
     if opc == 0 {
-        let value = read_gpr(
-            builder,
-            source,
-            rt,
-            descriptor.value_type(),
-            Register31::Zero,
-        )?;
+        let value = read_store_value(builder, source, rt, descriptor)?;
         builder.emit(
             source,
             &[],
@@ -155,6 +149,32 @@ fn memory_transfer(
     }
     write_gpr(builder, source, rt, value, Register31::Zero)?;
     Ok(true)
+}
+
+fn read_store_value(
+    builder: &mut IrBuilder,
+    source: LocationDescriptor,
+    rt: u8,
+    descriptor: MemoryDescriptor,
+) -> Result<Operand, BuildError> {
+    let register_type = if descriptor.access.size == MemoryAccessSize::Doubleword {
+        IrType::I64
+    } else {
+        IrType::I32
+    };
+    let mut value = read_gpr(builder, source, rt, register_type, Register31::Zero)?;
+    if register_type != descriptor.value_type() {
+        value = scalar(
+            builder,
+            source,
+            descriptor.value_type(),
+            ScalarOperation::Truncate {
+                value,
+                to: descriptor.value_type(),
+            },
+        )?;
+    }
+    Ok(value)
 }
 
 fn lift_literal_load(
@@ -458,13 +478,7 @@ fn lift_acquire_release(
             Register31::Zero,
         )?;
     } else {
-        let value = read_gpr(
-            builder,
-            decoded.location,
-            rt,
-            descriptor.value_type(),
-            Register31::Zero,
-        )?;
+        let value = read_store_value(builder, decoded.location, rt, descriptor)?;
         builder.emit(
             decoded.location,
             &[],
@@ -513,13 +527,7 @@ fn lift_exclusive(
             Register31::Zero,
         )?;
     } else {
-        let value = read_gpr(
-            builder,
-            decoded.location,
-            fields.rt,
-            descriptor.value_type(),
-            Register31::Zero,
-        )?;
+        let value = read_store_value(builder, decoded.location, fields.rt, descriptor)?;
         let succeeded = emit_one(
             builder,
             decoded.location,

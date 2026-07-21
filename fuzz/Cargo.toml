@@ -1,0 +1,43 @@
+[package]
+name = "swiitx-cpu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+swiitx-cpu = { path = "../crates/cpu" }
+
+[[bin]]
+name = "decoder"
+path = "fuzz_targets/decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "translation"
+path = "fuzz_targets/translation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ir_verifier"
+path = "fuzz_targets/ir_verifier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diagnostics"
+path = "fuzz_targets/diagnostics.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

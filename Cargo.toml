@@ -9,8 +9,9 @@ members = [
     "crates/loader/storage",
     "crates/loader/title",
     "crates/runtime",
+    "tools/xtask",
 ]
-exclude = ["crates/vendor/ruzstd-zbic"]
+exclude = ["crates/vendor/ruzstd-zbic", "fuzz"]
 resolver = "3"
 
 [workspace.package]

@@ -4,6 +4,9 @@ target/
 # Rust tooling backups and profiling data
 **/*.rs.bk
 *.profraw
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 
 # Local environment files
 .env

@@ -22,6 +22,21 @@ use crate::{
 /// Default maximum number of guest instructions in one translation block.
 pub const DEFAULT_MAX_GUEST_INSTRUCTIONS: NonZeroU32 = NonZeroU32::new(64).unwrap();
 
+/// Absolute allocation bound accepted for one translation block.
+///
+/// Normal runtime policy uses [`DEFAULT_MAX_GUEST_INSTRUCTIONS`]. This larger
+/// ceiling prevents malformed configuration from turning translation into an
+/// unbounded allocation even if a future memory implementation exposes pages
+/// larger than the synthetic test page.
+pub const MAX_GUEST_INSTRUCTIONS_PER_BLOCK: u32 = 4_096;
+
+/// Maximum IR expansion allowed for one guest instruction.
+///
+/// The value deliberately leaves headroom for exact architectural semantics;
+/// exceeding it is treated as a frontend implementation error rather than
+/// allowing an accidental expansion loop to consume unbounded memory.
+pub const MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION: usize = 64;
+
 /// Bounded policy used by the lazy block translator.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlockTranslationConfig {
@@ -86,6 +101,11 @@ pub fn translate_block(
     memory: &impl InstructionMemory,
 ) -> Result<IrBlock, FrontendError> {
     validate_start(profile, start)?;
+    if config.max_guest_instructions.get() > MAX_GUEST_INSTRUCTIONS_PER_BLOCK {
+        return Err(internal(
+            "configured guest instruction limit exceeds the frontend allocation bound",
+        ));
+    }
     let first_page = memory.code_page_span(address_space, start.pc)?;
     if !first_page.contains(start.pc) {
         return Err(internal(
@@ -120,6 +140,7 @@ pub fn translate_block(
             fetched_dependencies,
         ));
 
+        let operations_before_lift = builder.operation_count();
         let outcome = match crate::decode::decode(profile, location, encoding) {
             DecodeResult::Decoded(decoded) => lift_decoded(&mut builder, &decoded),
             DecodeResult::RecognizedUnimplemented(decoded) => {
@@ -142,6 +163,15 @@ pub fn translate_block(
                 })
             }
         };
+        let emitted_operations = builder
+            .operation_count()
+            .checked_sub(operations_before_lift)
+            .ok_or_else(|| internal("IR operation count moved backwards during lifting"))?;
+        if emitted_operations > MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION {
+            return Err(internal(
+                "one guest instruction exceeded the frontend IR operation bound",
+            ));
+        }
 
         match outcome {
             LiftOutcome::Continue => {
@@ -575,6 +605,24 @@ mod tests {
             Terminator::UnsupportedInstruction { .. } => "unsupported",
             Terminator::Stop { .. } => "stop",
         }
+    }
+
+    #[test]
+    fn rejects_configuration_above_the_hard_allocation_bound() {
+        let profile = GuestCpuProfile::switch_1();
+        let memory = memory_with_pages(0x1000, 1);
+        let result = translate_block(
+            BlockTranslationConfig {
+                max_guest_instructions: NonZeroU32::new(MAX_GUEST_INSTRUCTIONS_PER_BLOCK + 1)
+                    .unwrap(),
+            },
+            &profile,
+            SPACE,
+            start(profile, 0x1000, ExecutionState::A64),
+            &memory,
+        );
+
+        assert!(matches!(result, Err(FrontendError::Internal(_))));
     }
 
     // The encodings and expected instruction names trace Arm DDI 0602 and
