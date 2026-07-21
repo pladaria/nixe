@@ -52,6 +52,14 @@ impl ProcessMountNamespace {
             .find(|add_on| add_on.title_id() == title_id)
     }
 
+    /// Applies the effective NPDM service access-control list. Homebrew has no
+    /// NPDM and is allowed to reach a platform service registry.
+    pub fn allows_service(&self, name: &[u8]) -> bool {
+        self.policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows_client(name))
+    }
+
     pub(crate) fn mount_count(&self) -> usize {
         usize::from(self.primary.is_some())
             + self

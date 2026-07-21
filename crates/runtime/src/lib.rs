@@ -14,7 +14,10 @@ pub use execution::{
     ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExecutionStatus,
     ProcessTeardownReport,
 };
-pub use handle::{HandleError, HandleObject, HandleTable};
+pub use handle::{
+    EventObject, HandleError, HandleObject, HandleTable, HandleValue, MAX_SHARED_MEMORY_BYTES,
+    SharedMemoryObject, ThreadObject,
+};
 pub use launch_plan::{
     AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,
     MountProvenance, PackagedIdentity, ReadOnlyMount,
