@@ -10,3 +10,20 @@ pub use block::{
     conditional_terminator, direct_branch_target, emit_call, indirect_interworking_target,
     indirect_target, translate_block,
 };
+
+#[cfg(test)]
+mod normalization_tests {
+    #[test]
+    fn aarch32_lifters_cannot_decode_raw_instruction_bits() {
+        let forbidden = concat!("encoding.", "bits()");
+        for (state, source) in [
+            ("A32", include_str!("a32.rs")),
+            ("T32", include_str!("t32.rs")),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{state} lifter bypasses typed normalization"
+            );
+        }
+    }
+}

@@ -124,9 +124,9 @@ pub fn coverage_table(profile: &GuestCpuProfile) -> Vec<CoverageEntry> {
 fn all_pattern_tables() -> [&'static [InstructionPattern]; 4] {
     [
         decode::a64::patterns(),
-        decode::a32::PATTERNS,
-        decode::t32::PATTERNS_16,
-        decode::t32::PATTERNS_32,
+        decode::a32::patterns(),
+        decode::t32::patterns_16(),
+        decode::t32::patterns_32(),
     ]
 }
 
@@ -205,10 +205,15 @@ pub(crate) const fn interpreter_coverage(
         {
             EngineCoverage::Implemented
         }
-        ExecutionState::A32 if matches!(id, 0x0001_0001..=0x0001_0004) => {
+        ExecutionState::A32
+            if matches!(
+                id,
+                0x0001_0001..=0x0001_0021 | 0x0001_0023 | 0x0001_0031..=0x0001_0033
+            ) =>
+        {
             EngineCoverage::Implemented
         }
-        ExecutionState::T32 if matches!(id, 0x0002_0001..=0x0002_0005) => {
+        ExecutionState::T32 if matches!(id, 0x0002_0001..=0x0002_0005 | 0x0002_0007..=0x0002_000b | 0x0002_0010..=0x0002_002a) => {
             EngineCoverage::Implemented
         }
         _ => EngineCoverage::Missing,
@@ -764,24 +769,38 @@ mod tests {
                 GuestPhysicalPageId::new(1),
                 MemoryPermissions::READ_EXECUTE,
             ));
-            let bytes = match fixture.encoding.size() {
-                InstructionSize::Bits16 => fixture.encoding.bits().to_le_bytes()[..2].to_vec(),
-                InstructionSize::Bits32 => fixture.encoding.bits().to_le_bytes().to_vec(),
+            let bytes = match (fixture.state, fixture.encoding.size()) {
+                (ExecutionState::T32, InstructionSize::Bits32) => {
+                    let bits = fixture.encoding.bits();
+                    let first = (bits >> 16) as u16;
+                    let second = bits as u16;
+                    [first.to_le_bytes(), second.to_le_bytes()].concat()
+                }
+                (_, InstructionSize::Bits16) => fixture.encoding.bits().to_le_bytes()[..2].to_vec(),
+                (_, InstructionSize::Bits32) => fixture.encoding.bits().to_le_bytes().to_vec(),
             };
             assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &bytes));
             assert_eq!(SYNTHETIC_PAGE_SIZE, 4096);
             let block = translate_block(
-                BlockTranslationConfig::default(),
+                BlockTranslationConfig {
+                    max_guest_instructions: core::num::NonZeroU32::new(1).unwrap(),
+                },
                 &profile,
                 AddressSpaceId::new(1),
                 decoded.location,
                 &memory,
             )
             .unwrap();
-            assert!(!matches!(
-                block.terminator,
-                Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
-            ));
+            assert!(
+                !matches!(
+                    block.terminator,
+                    Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
+                ),
+                "completion fixture {:?} {} lowered to {:?}",
+                fixture.state,
+                fixture.coverage_id,
+                block.terminator
+            );
             let printed = print_block(&block, Default::default());
             assert!(printed.contains("source 0x0000000000001000 ; raw="));
             assert!(printed.contains("terminator "));

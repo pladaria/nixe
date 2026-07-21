@@ -6,6 +6,7 @@
 
 mod a32;
 mod a64;
+mod aarch32;
 mod t32;
 
 use core::fmt;
@@ -301,8 +302,8 @@ fn execute_decoded(
 ) -> Result<InterpreterOutcome, InterpreterError> {
     match (state, decoded.location.execution_state) {
         (ThreadCpuState::A64(state), ExecutionState::A64) => a64::execute(context, state, decoded),
-        (ThreadCpuState::A32(state), ExecutionState::A32) => a32::execute(state, decoded),
-        (ThreadCpuState::A32(state), ExecutionState::T32) => t32::execute(state, decoded),
+        (ThreadCpuState::A32(state), ExecutionState::A32) => a32::execute(context, state, decoded),
+        (ThreadCpuState::A32(state), ExecutionState::T32) => t32::execute(context, state, decoded),
         _ => Err(InterpreterError::ContextMismatch {
             source: decoded.location,
             reason: "architectural state representation does not match execution state".into(),

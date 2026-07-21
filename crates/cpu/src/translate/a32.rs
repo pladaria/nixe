@@ -1,7 +1,10 @@
 //! A32-to-IR translation.
 
 use crate::{
-    decode::{DecodedOpcode, OperandId, OperandValue},
+    decode::{
+        DecodedOpcode,
+        a32::{A32Instruction, control::Instruction as ControlInstruction, normalize},
+    },
     ir::{
         builder::IrBuilder,
         op::{Condition, FlagOperation, OperationKind, StateRegister},
@@ -12,15 +15,19 @@ use crate::{
     location::{DecodedInstruction, ExecutionState},
 };
 
-use super::block::{LiftOutcome, conditional_terminator, direct_branch_target};
+use super::block::{LiftOutcome, conditional_terminator};
 
 pub(crate) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> LiftOutcome {
-    match decoded.instruction.pattern().name {
-        "nop" => LiftOutcome::Continue,
-        "b" => lift_branch(builder, decoded),
+    let normalized = normalize(&decoded.instruction, decoded.encoding);
+    match normalized.instruction {
+        A32Instruction::Control(ControlInstruction::Nop) => LiftOutcome::Continue,
+        A32Instruction::Control(ControlInstruction::Branch {
+            link: false,
+            displacement,
+        }) => lift_branch(builder, decoded, normalized.condition, displacement),
         _ => LiftOutcome::Interpret(decoded.instruction.coverage_id()),
     }
 }
@@ -28,10 +35,17 @@ pub(crate) fn lift(
 fn lift_branch(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
+    condition: Condition,
+    displacement: i32,
 ) -> LiftOutcome {
-    let target = direct_branch_target(decoded)
-        .expect("validated A32 branch displacement always produces an aligned target");
-    let condition = decoded_condition(decoded);
+    let target = ControlTarget::Direct {
+        pc: crate::address::GuestVirtualAddress::new(u64::from(
+            (decoded.location.pc.get() as u32)
+                .wrapping_add(8)
+                .wrapping_add_signed(displacement),
+        )),
+        execution_state: ExecutionState::A32,
+    };
     if condition == Condition::Al {
         return LiftOutcome::Terminate(super::block::direct_branch(target));
     }
@@ -44,13 +58,6 @@ fn lift_branch(
         execution_state: ExecutionState::A32,
     };
     LiftOutcome::Terminate(conditional_terminator(condition, target, fallthrough))
-}
-
-fn decoded_condition(decoded: &DecodedInstruction<DecodedOpcode>) -> Condition {
-    match decoded.instruction.operands().get(OperandId::Condition) {
-        Some(OperandValue::Unsigned(value)) => Condition::from_encoding(value as u8),
-        _ => unreachable!("A32 conditional pattern has a validated condition operand"),
-    }
 }
 
 fn evaluate_condition(

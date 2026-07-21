@@ -2,6 +2,7 @@
 
 pub mod a32;
 pub mod a64;
+pub mod aarch32;
 pub mod t32;
 pub mod table;
 
@@ -161,9 +162,9 @@ mod tests {
     fn all_shipped_tables_are_consistent_and_ids_are_globally_unique() {
         let tables = [
             a64::patterns(),
-            a32::PATTERNS,
-            t32::PATTERNS_16,
-            t32::PATTERNS_32,
+            a32::patterns(),
+            t32::patterns_16(),
+            t32::patterns_32(),
         ];
         let mut coverage = BTreeSet::new();
         let mut semantics = BTreeSet::new();
