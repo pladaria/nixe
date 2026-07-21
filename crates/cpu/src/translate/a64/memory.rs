@@ -45,6 +45,7 @@ pub(super) fn descriptor(
         access: MemoryAccess::new(size, MemoryAlignment::Unaligned, ordering, class),
         byte_order: ByteOrder::Little,
         volatility: Volatility::NonVolatile,
+        privilege: MemoryPrivilege::Current,
     }
 }
 
@@ -74,14 +75,7 @@ fn address_add(
     base: Operand,
     offset: i64,
 ) -> Result<Operand, BuildError> {
-    let raw = binary(
-        builder,
-        source,
-        IntegerBinaryKind::Add,
-        base,
-        Immediate::I64(offset as u64).into(),
-    )?;
-    bitcast(builder, source, raw, IrType::Address)
+    guest_address_offset(builder, source, base, Immediate::I64(offset as u64).into())
 }
 
 pub(super) fn base_address(
@@ -89,7 +83,8 @@ pub(super) fn base_address(
     source: LocationDescriptor,
     rn: u8,
 ) -> Result<Operand, BuildError> {
-    read_gpr(builder, source, rn, IrType::I64, Register31::StackPointer)
+    let raw = read_gpr(builder, source, rn, IrType::I64, Register31::StackPointer)?;
+    guest_address_from_integer(builder, source, raw)
 }
 
 fn memory_transfer(
@@ -177,19 +172,13 @@ fn lift_literal_load(
         3 => return Ok(interpret(decoded)), // PRFM literal
         _ => unreachable!(),
     };
-    let address = bitcast(
-        builder,
-        decoded.location,
-        Immediate::I64(
-            decoded
-                .location
-                .pc
-                .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2)
-                .get(),
-        )
-        .into(),
-        IrType::Address,
-    )?;
+    let address = Immediate::Address(
+        decoded
+            .location
+            .pc
+            .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2),
+    )
+    .into();
     let descriptor = descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal);
     let loaded = emit_one(
         builder,
@@ -265,7 +254,7 @@ fn lift_load_store_indexed(
     let address = if matches!(instruction, A64MemoryInstruction::PreIndex(_)) {
         address_add(builder, decoded.location, base, offset)?
     } else {
-        bitcast(builder, decoded.location, base, IrType::Address)?
+        base
     };
     if !memory_transfer(
         builder,
@@ -277,13 +266,8 @@ fn lift_load_store_indexed(
         return Ok(interpret(decoded));
     }
     if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) {
-        let updated = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Add,
-            base,
-            Immediate::I64(offset as u64).into(),
-        )?;
+        let updated_address = address_add(builder, decoded.location, base, offset)?;
+        let updated = guest_address_to_integer(builder, decoded.location, updated_address)?;
         write_gpr(
             builder,
             decoded.location,
@@ -330,14 +314,7 @@ fn lift_load_store_register(
         &[IrType::I64],
         OperationEffects::default(),
     )?[0];
-    let raw = binary(
-        builder,
-        decoded.location,
-        IntegerBinaryKind::Add,
-        base,
-        offset.into(),
-    )?;
-    let address = bitcast(builder, decoded.location, raw, IrType::Address)?;
+    let address = guest_address_offset(builder, decoded.location, base, offset.into())?;
     if !memory_transfer(
         builder,
         decoded.location,
@@ -380,17 +357,11 @@ fn lift_load_store_pair(
     let base = base_address(builder, decoded.location, rn)?;
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
     let transfer_base = if mode == 3 {
-        binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Add,
-            base,
-            Immediate::I64(offset as u64).into(),
-        )?
+        address_add(builder, decoded.location, base, offset)?
     } else {
         base
     };
-    let first_address = bitcast(builder, decoded.location, transfer_base, IrType::Address)?;
+    let first_address = transfer_base;
     let second_address = address_add(
         builder,
         decoded.location,
@@ -439,13 +410,8 @@ fn lift_load_store_pair(
         }
     }
     if matches!(mode, 1 | 3) {
-        let updated = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Add,
-            base,
-            Immediate::I64(offset as u64).into(),
-        )?;
+        let updated_address = address_add(builder, decoded.location, base, offset)?;
+        let updated = guest_address_to_integer(builder, decoded.location, updated_address)?;
         write_gpr(
             builder,
             decoded.location,
@@ -465,7 +431,7 @@ fn lift_acquire_release(
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
-    let address = bitcast(builder, decoded.location, base, IrType::Address)?;
+    let address = base;
     let load = matches!(instruction, A64MemoryInstruction::LoadAcquire(_));
     let ordering = if load {
         MemoryOrdering::Acquire
@@ -520,7 +486,7 @@ fn lift_exclusive(
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
-    let address = bitcast(builder, decoded.location, base, IrType::Address)?;
+    let address = base;
     let ordered = fields.ordered;
     let ordering = match (instruction, ordered) {
         (A64MemoryInstruction::LoadExclusive(_), true) => MemoryOrdering::Acquire,

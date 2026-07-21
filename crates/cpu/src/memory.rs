@@ -1487,6 +1487,74 @@ mod tests {
         assert_eq!(denied.reason, DataAccessFaultReason::WritePermissionDenied);
     }
 
+    #[test]
+    fn cross_page_store_validates_the_whole_access_before_committing() {
+        let mut memory = SyntheticMemory::new();
+        assert!(memory.add_ram_page(PAGE_1));
+        assert!(memory.add_ram_page(PAGE_2));
+        assert!(memory.initialize_ram(PAGE_1, SYNTHETIC_PAGE_SIZE - 2, &[0xaa, 0xbb]));
+        assert!(memory.initialize_ram(PAGE_2, 0, &[0xcc, 0xdd]));
+        assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_WRITE));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x2000),
+            PAGE_2,
+            MemoryPermissions::READ,
+        ));
+        let access = MemoryAccess::new(
+            MemoryAccessSize::Word,
+            MemoryAlignment::Unaligned,
+            MemoryOrdering::Relaxed,
+            MemoryAccessClass::Normal,
+        );
+        let address = GuestVirtualAddress::new(0x1ffe);
+
+        let fault = memory
+            .write(SPACE, address, access, MemoryValue::U32(0x1122_3344))
+            .unwrap_err();
+        assert_eq!(fault.address, GuestVirtualAddress::new(0x2000));
+        assert_eq!(fault.reason, DataAccessFaultReason::WritePermissionDenied);
+
+        let first_half = memory
+            .read(
+                SPACE,
+                address,
+                MemoryAccess::new(
+                    MemoryAccessSize::Halfword,
+                    MemoryAlignment::Unaligned,
+                    MemoryOrdering::Relaxed,
+                    MemoryAccessClass::Normal,
+                ),
+            )
+            .unwrap();
+        assert_eq!(first_half.value, MemoryValue::U16(0xbbaa));
+    }
+
+    #[test]
+    fn data_aliases_share_one_physical_page_identity_and_contents() {
+        let mut memory = code_memory();
+        assert!(memory.map_page(SPACE, ALIAS, PAGE_1, MemoryPermissions::READ_WRITE));
+        let alias_info = memory.mapping_info(SPACE, ALIAS).unwrap();
+        let original_info = memory.mapping_info(SPACE, CODE).unwrap();
+        assert_eq!(alias_info.physical_page, original_info.physical_page);
+
+        memory
+            .write(
+                SPACE,
+                ALIAS,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0x5566_7788),
+            )
+            .unwrap();
+        assert_eq!(
+            memory
+                .read(SPACE, CODE, MemoryAccess::normal(MemoryAccessSize::Word))
+                .unwrap()
+                .value,
+            MemoryValue::U32(0x5566_7788)
+        );
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum MmioEvent {
         Read(u64, MemoryAccess),

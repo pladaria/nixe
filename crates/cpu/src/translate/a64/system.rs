@@ -211,7 +211,7 @@ fn lift_system(
             IrType::I64,
             Register31::Zero,
         )?;
-        Some(bitcast(builder, decoded.location, raw, IrType::Address)?)
+        Some(guest_address_from_integer(builder, decoded.location, raw)?)
     } else {
         None
     };

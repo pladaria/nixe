@@ -12,11 +12,12 @@ use crate::{
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
-            ArithmeticFlagOutput, BarrierAccess, BarrierDomain, BarrierOperation, ByteOrder,
-            CacheMaintenanceKind, CacheMaintenanceOperation, Condition, EffectSet,
-            ExclusiveOperation, FlagOperation, HelperOperation, IntegerBinaryKind,
-            IntegerPredicate, MemoryDescriptor, MemoryOperation, OperationEffects, OperationKind,
-            ScalarOperation, ShiftKind, StateRegister, Volatility,
+            AddressOperation, ArithmeticFlagOutput, BarrierAccess, BarrierDomain, BarrierOperation,
+            ByteOrder, CacheMaintenanceKind, CacheMaintenanceOperation, Condition, EffectSet,
+            ExclusiveOperation, FlagOperation, GuestAddressWidth, HelperOperation,
+            IntegerBinaryKind, IntegerPredicate, MemoryDescriptor, MemoryOperation,
+            MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation, ShiftKind,
+            StateRegister, Volatility,
         },
         terminator::{ControlTarget, ExceptionKind, Terminator},
         types::IrType,
@@ -174,17 +175,55 @@ fn write_gpr(
     Ok(())
 }
 
-fn bitcast(
+fn guest_address_from_integer(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
     value: Operand,
-    to: IrType,
 ) -> Result<Operand, BuildError> {
     Ok(emit_one(
         builder,
         source,
-        to,
-        OperationKind::Scalar(ScalarOperation::Bitcast { value, to }),
+        IrType::Address,
+        OperationKind::Address(AddressOperation::FromInteger {
+            value,
+            width: GuestAddressWidth::Bits64,
+        }),
+    )?
+    .into())
+}
+
+fn guest_address_offset(
+    builder: &mut IrBuilder,
+    source: LocationDescriptor,
+    base: Operand,
+    offset: Operand,
+) -> Result<Operand, BuildError> {
+    Ok(emit_one(
+        builder,
+        source,
+        IrType::Address,
+        OperationKind::Address(AddressOperation::Offset {
+            base,
+            offset,
+            width: GuestAddressWidth::Bits64,
+        }),
+    )?
+    .into())
+}
+
+fn guest_address_to_integer(
+    builder: &mut IrBuilder,
+    source: LocationDescriptor,
+    address: Operand,
+) -> Result<Operand, BuildError> {
+    Ok(emit_one(
+        builder,
+        source,
+        IrType::I64,
+        OperationKind::Address(AddressOperation::ToInteger {
+            address,
+            to: IrType::I64,
+        }),
     )?
     .into())
 }
@@ -593,6 +632,99 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn memory_ir_keeps_guest_addresses_descriptors_and_fault_ordering() {
+        let block = translate(&[
+            0x1000_0000, // adr x0, #0
+            0x9000_0001, // adrp x1, #0
+            0x5800_0002, // ldr x2, literal
+            0xf840_1083, // ldur x3, [x4, #1]
+            0xf840_8cc5, // ldr x5, [x6, #8]!
+            0xf840_8507, // ldr x7, [x8], #8
+            0xd400_0001, // svc #0
+        ]);
+
+        let address_results = block
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, OperationKind::Address(_)))
+            .flat_map(|operation| operation.results.iter())
+            .collect::<Vec<_>>();
+        assert!(!address_results.is_empty());
+        assert!(
+            address_results
+                .iter()
+                .all(|result| { matches!(result.ty, IrType::Address | IrType::I64) })
+        );
+
+        let memory = block
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, operation)| match operation.kind {
+                OperationKind::Memory(MemoryOperation::Load {
+                    address,
+                    descriptor,
+                }) => Some((index, operation.source, address, descriptor)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(memory.len(), 4);
+        for (_, source, address, descriptor) in &memory {
+            assert_eq!(address.ty(), IrType::Address);
+            assert_eq!(descriptor.access.ordering, MemoryOrdering::Relaxed);
+            assert_eq!(descriptor.access.class, MemoryAccessClass::Normal);
+            assert_eq!(descriptor.privilege, MemoryPrivilege::Current);
+            assert!(source.pc.get() >= 0x1008);
+        }
+        assert!(matches!(
+            memory[0].2,
+            Operand::Immediate(Immediate::Address(address))
+                if address == GuestVirtualAddress::new(0x1008)
+        ));
+        assert_eq!(memory[1].3.access.alignment, MemoryAlignment::Unaligned);
+
+        for (pc, base_register) in [(0x1010, 6), (0x1014, 8)] {
+            let access_index = memory
+                .iter()
+                .find(|(_, source, _, _)| source.pc == GuestVirtualAddress::new(pc))
+                .unwrap()
+                .0;
+            let writeback_index = block
+                .operations
+                .iter()
+                .enumerate()
+                .find_map(|(index, operation)| {
+                    matches!(
+                        operation.kind,
+                        OperationKind::WriteState {
+                            register: StateRegister::A64X(register),
+                            ..
+                        } if register.index() == base_register
+                    )
+                    .then_some(index)
+                })
+                .unwrap();
+            assert!(
+                access_index < writeback_index,
+                "writeback must remain after the potentially faulting access"
+            );
+        }
+
+        let unscaled = memory[1].3;
+        assert_eq!(unscaled.access.size, MemoryAccessSize::Doubleword);
+        assert_eq!(
+            block
+                .operations
+                .iter()
+                .filter(|operation| operation.source.pc == GuestVirtualAddress::new(0x100c))
+                .filter(|operation| matches!(operation.kind, OperationKind::Memory(_)))
+                .count(),
+            1,
+            "one guest access must not be split in frontend IR, even if it crosses a page"
+        );
     }
 
     #[test]

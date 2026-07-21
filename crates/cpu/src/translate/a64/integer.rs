@@ -1042,11 +1042,16 @@ fn lift_adr(
     } else {
         decoded.location.pc.wrapping_offset(immediate)
     };
+    let value = guest_address_to_integer(
+        builder,
+        decoded.location,
+        Immediate::Address(address).into(),
+    )?;
     write_gpr(
         builder,
         decoded.location,
         fields.rd,
-        Immediate::I64(address.get()).into(),
+        value,
         Register31::Zero,
     )?;
     Ok(LiftOutcome::Continue)

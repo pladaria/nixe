@@ -217,6 +217,33 @@ pub enum ScalarOperation {
     Bitcast { value: Operand, to: IrType },
 }
 
+/// Architectural width used when guest-address arithmetic wraps.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GuestAddressWidth {
+    /// AArch32 virtual-address arithmetic.
+    Bits32,
+    /// AArch64 virtual-address arithmetic.
+    Bits64,
+}
+
+/// Guest-address operations kept separate from host pointers and storage offsets.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AddressOperation {
+    /// Converts architectural integer bits into a guest virtual address.
+    FromInteger {
+        value: Operand,
+        width: GuestAddressWidth,
+    },
+    /// Adds a signed architectural offset, wrapping at the guest address width.
+    Offset {
+        base: Operand,
+        offset: Operand,
+        width: GuestAddressWidth,
+    },
+    /// Converts a guest virtual address back to architectural integer bits.
+    ToInteger { address: Operand, to: IrType },
+}
+
 /// All Arm condition encodings, shared by A64 and AArch32 consumers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Condition {
@@ -311,6 +338,15 @@ pub enum Volatility {
     Volatile,
 }
 
+/// Privilege regime under which a guest data access is checked.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MemoryPrivilege {
+    /// Use the privilege of the currently executing guest context.
+    Current,
+    /// Force the architectural unprivileged-access checks.
+    Unprivileged,
+}
+
 /// Common semantic descriptor for typed memory operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryDescriptor {
@@ -320,6 +356,8 @@ pub struct MemoryDescriptor {
     pub byte_order: ByteOrder,
     /// Explicit observability independent of the access class.
     pub volatility: Volatility,
+    /// Guest privilege regime used for translation and permission checks.
+    pub privilege: MemoryPrivilege,
 }
 
 impl MemoryDescriptor {
@@ -339,12 +377,19 @@ impl MemoryDescriptor {
 /// Typed ordinary memory operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryOperation {
-    /// Read from a guest address.
+    /// Read one complete architectural access from a guest address.
+    ///
+    /// A backend may use multiple host operations internally, but it must keep
+    /// this as one precise guest access when a page or protection boundary is
+    /// crossed.
     Load {
         address: Operand,
         descriptor: MemoryDescriptor,
     },
-    /// Write to a guest address.
+    /// Write one complete architectural access to a guest address.
+    ///
+    /// Permission and mapping checks for the whole range precede any visible
+    /// partial write on a precise slow path.
     Store {
         address: Operand,
         value: Operand,
@@ -637,6 +682,7 @@ pub struct HelperOperation {
 pub enum OperationKind {
     Constant(super::value::Immediate),
     Scalar(ScalarOperation),
+    Address(AddressOperation),
     ReadState(StateRegister),
     WriteState {
         register: StateRegister,
@@ -762,7 +808,9 @@ impl OperationKind {
     #[must_use]
     pub fn derived_effects(&self) -> OperationEffects {
         match self {
-            Self::Constant(_) | Self::Scalar(_) | Self::Flags(_) => OperationEffects::default(),
+            Self::Constant(_) | Self::Scalar(_) | Self::Address(_) | Self::Flags(_) => {
+                OperationEffects::default()
+            }
             Self::Vector(operation) => {
                 let status = match operation {
                     VectorOperation::Narrow {
@@ -931,6 +979,7 @@ mod tests {
             ),
             byte_order: ByteOrder::Little,
             volatility: Volatility::Volatile,
+            privilege: MemoryPrivilege::Current,
         };
         let operation = IrOperation::new(
             location(),
@@ -1027,6 +1076,7 @@ mod tests {
             ),
             byte_order: ByteOrder::Little,
             volatility: Volatility::NonVolatile,
+            privilege: MemoryPrivilege::Current,
         };
         let address = Immediate::Address(GuestVirtualAddress::new(0xa000)).into();
         let barrier = OperationKind::Barrier(BarrierOperation::DataMemory {
