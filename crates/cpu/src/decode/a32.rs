@@ -78,7 +78,7 @@ pub static PATTERNS: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0001_0003),
         coverage_id: CoverageId::new(0x0001_0003),
         priority: 2,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
     InstructionPattern {
         name: "blx-immediate",
@@ -92,7 +92,7 @@ pub static PATTERNS: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0001_0004),
         coverage_id: CoverageId::new(0x0001_0004),
         priority: 2,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
 ];
 

@@ -45,6 +45,7 @@ Milestones:
   - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
   - [x] IR foundation: typed block construction, verification, deterministic printing, and shared canonical semantic primitives.
   - [x] Declarative decoder framework: indexed A64/A32/T32 classification, typed operands, profile gating, and stable coverage IDs.
+  - [x] A64 scalar frontend: bounded block translation with control flow, integer and memory lifting, explicit flags, guest addresses, and precise memory semantics.
 
 ## Legal Notice
 

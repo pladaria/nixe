@@ -526,7 +526,8 @@ mod tests {
             Terminator::Exception { .. }
         ));
 
-        // The same architectural write is visible before an interpreter exit.
+        // The same architectural write is visible before a deterministic
+        // unsupported exit when neither execution engine implements the hint.
         let fallback = translate(&[0xf100_0400, 0xd503_20df]);
         assert!(fallback.operations.iter().any(|operation| matches!(
             operation.kind,
@@ -537,7 +538,7 @@ mod tests {
         )));
         assert!(matches!(
             fallback.terminator,
-            Terminator::InterpretOne { .. }
+            Terminator::UnsupportedInstruction { .. }
         ));
     }
 
