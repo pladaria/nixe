@@ -12,4 +12,5 @@ swiitx-loader-storage.workspace = true
 swiitx-loader-title.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true
