@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     decode::{
         DecodedOpcode,
-        a64::{A64Instruction, SystemOperation},
+        a64::system::{Instruction as SystemInstruction, Operands as SystemOperands},
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
@@ -14,25 +14,24 @@ use super::LiftOutcome;
 pub(super) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    instruction: A64Instruction,
-    operation: SystemOperation,
+    instruction: SystemInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fields = instruction.fields;
-    match operation {
-        SystemOperation::Hint => lift_hint(builder, decoded, fields),
-        SystemOperation::ReadRegister => lift_mrs(builder, decoded, fields),
-        SystemOperation::WriteRegister => lift_msr(builder, decoded, fields),
-        SystemOperation::Barrier => lift_barrier(builder, decoded, fields),
-        SystemOperation::System => lift_system(builder, decoded, fields),
+    let fields = instruction.operands();
+    match instruction {
+        SystemInstruction::Hint(_) => lift_hint(builder, decoded, fields),
+        SystemInstruction::ReadRegister(_) => lift_mrs(builder, decoded, fields),
+        SystemInstruction::WriteRegister(_) => lift_msr(builder, decoded, fields),
+        SystemInstruction::Barrier(_) => lift_barrier(builder, decoded, fields),
+        SystemInstruction::System(_) => lift_system(builder, decoded, fields),
     }
 }
 
 fn lift_hint(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let immediate = u32::from(fields.field_5_7);
+    let immediate = u32::from(fields.hint);
     if immediate == 0 {
         return Ok(LiftOutcome::Continue);
     }
@@ -69,7 +68,7 @@ fn system_register(system_key: u32) -> Option<StateRegister> {
 fn lift_mrs(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let Some(register) = system_register(fields.system_key) else {
         return Ok(interpret(decoded));
@@ -96,7 +95,7 @@ fn lift_mrs(
     write_gpr(
         builder,
         decoded.location,
-        fields.rd,
+        fields.rt,
         value,
         Register31::Zero,
     )?;
@@ -106,7 +105,7 @@ fn lift_mrs(
 fn lift_msr(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let Some(register) = system_register(fields.system_key) else {
         return Ok(interpret(decoded));
@@ -117,7 +116,7 @@ fn lift_msr(
     let mut value = read_gpr(
         builder,
         decoded.location,
-        fields.rd,
+        fields.rt,
         IrType::I64,
         Register31::Zero,
     )?;
@@ -169,10 +168,10 @@ fn barrier_scope(option: u8) -> Option<(BarrierDomain, BarrierAccess)> {
 fn lift_barrier(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let opcode = u32::from(fields.rn & 7);
-    let option = (u32::from(fields.field_8_4)) as u8;
+    let opcode = u32::from(fields.barrier_opcode);
+    let option = fields.barrier_option;
     let operation = match opcode {
         4 | 5 => {
             let Some((domain, access)) = barrier_scope(option) else {
@@ -194,7 +193,7 @@ fn lift_barrier(
 fn lift_system(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let (kind, uses_address) = match fields.system_key {
         0xd508_7500 => (CacheMaintenanceKind::InstructionInvalidate, false), // IC IALLU
@@ -208,7 +207,7 @@ fn lift_system(
         let raw = read_gpr(
             builder,
             decoded.location,
-            fields.rd,
+            fields.rt,
             IrType::I64,
             Register31::Zero,
         )?;

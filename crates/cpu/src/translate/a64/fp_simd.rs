@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     decode::{
         DecodedOpcode,
-        a64::{A64Instruction, FpSimdOperation},
+        a64::fp_simd::{Instruction as FpSimdInstruction, Operands as FpSimdOperands},
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
@@ -14,32 +14,33 @@ use super::LiftOutcome;
 pub(super) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    instruction: A64Instruction,
-    operation: FpSimdOperation,
+    instruction: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fields = instruction.fields;
-    match operation {
-        FpSimdOperation::Bitwise
-        | FpSimdOperation::Integer
-        | FpSimdOperation::ScalarTwoSource
-        | FpSimdOperation::ScalarMove
-        | FpSimdOperation::CompareRegister
-        | FpSimdOperation::CompareZero => lift_fp_simd_compute(builder, decoded, fields, operation),
-        FpSimdOperation::SignedIntToFloat
-        | FpSimdOperation::UnsignedIntToFloat
-        | FpSimdOperation::FloatToSignedInt
-        | FpSimdOperation::FloatToUnsignedInt
-        | FpSimdOperation::MoveToGeneral
-        | FpSimdOperation::MoveFromGeneral => {
-            lift_fp_conversion(builder, decoded, fields, operation)
+    let fields = instruction.operands();
+    match instruction {
+        FpSimdInstruction::Bitwise(_)
+        | FpSimdInstruction::Integer(_)
+        | FpSimdInstruction::ScalarTwoSource(_)
+        | FpSimdInstruction::ScalarMove(_)
+        | FpSimdInstruction::CompareRegister(_)
+        | FpSimdInstruction::CompareZero(_) => {
+            lift_fp_simd_compute(builder, decoded, fields, instruction)
         }
-        FpSimdOperation::MemoryUnsigned
-        | FpSimdOperation::MemoryUnscaled
-        | FpSimdOperation::MemoryPostIndex
-        | FpSimdOperation::MemoryPreIndex
-        | FpSimdOperation::MemoryRegister
-        | FpSimdOperation::MemoryLiteral => {
-            lift_fp_simd_memory(builder, decoded, fields, operation)
+        FpSimdInstruction::SignedIntToFloat(_)
+        | FpSimdInstruction::UnsignedIntToFloat(_)
+        | FpSimdInstruction::FloatToSignedInt(_)
+        | FpSimdInstruction::FloatToUnsignedInt(_)
+        | FpSimdInstruction::MoveToGeneral(_)
+        | FpSimdInstruction::MoveFromGeneral(_) => {
+            lift_fp_conversion(builder, decoded, fields, instruction)
+        }
+        FpSimdInstruction::MemoryUnsigned(_)
+        | FpSimdInstruction::MemoryUnscaled(_)
+        | FpSimdInstruction::MemoryPostIndex(_)
+        | FpSimdInstruction::MemoryPreIndex(_)
+        | FpSimdInstruction::MemoryRegister(_)
+        | FpSimdInstruction::MemoryLiteral(_) => {
+            lift_fp_simd_memory(builder, decoded, fields, instruction)
         }
     }
 }
@@ -80,24 +81,26 @@ fn vector_write(
 fn lift_fp_simd_compute(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: FpSimdOperation,
+    fields: FpSimdOperands,
+    operation: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
     let first = vector_read(builder, decoded.location, fields.rn)?;
     if matches!(
         operation,
-        FpSimdOperation::Bitwise | FpSimdOperation::Integer | FpSimdOperation::ScalarMove
+        FpSimdInstruction::Bitwise(_)
+            | FpSimdInstruction::Integer(_)
+            | FpSimdInstruction::ScalarMove(_)
     ) {
         let mut arguments = vec![first];
-        if operation != FpSimdOperation::ScalarMove {
+        if !matches!(operation, FpSimdInstruction::ScalarMove(_)) {
             arguments.push(vector_read(builder, decoded.location, fields.rm)?);
             arguments.push(vector_read(builder, decoded.location, fields.rd)?);
         }
         arguments.push(Immediate::I32(fields.helper_token.helper_abi_value()).into());
         let name = match operation {
-            FpSimdOperation::Bitwise => "a64.simd.bitwise",
-            FpSimdOperation::Integer => "a64.simd.integer-arithmetic-compare",
-            FpSimdOperation::ScalarMove => "a64.fp.scalar-move",
+            FpSimdInstruction::Bitwise(_) => "a64.simd.bitwise",
+            FpSimdInstruction::Integer(_) => "a64.simd.integer-arithmetic-compare",
+            FpSimdInstruction::ScalarMove(_) => "a64.fp.scalar-move",
             _ => unreachable!(),
         };
         let result = helper(
@@ -114,9 +117,9 @@ fn lift_fp_simd_compute(
 
     let compare = matches!(
         operation,
-        FpSimdOperation::CompareRegister | FpSimdOperation::CompareZero
+        FpSimdInstruction::CompareRegister(_) | FpSimdInstruction::CompareZero(_)
     );
-    let second = if operation == FpSimdOperation::CompareZero {
+    let second = if matches!(operation, FpSimdInstruction::CompareZero(_)) {
         Immediate::V128(0).into()
     } else {
         vector_read(builder, decoded.location, fields.rm)?
@@ -180,17 +183,21 @@ fn lift_fp_simd_compute(
 fn lift_fp_conversion(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: FpSimdOperation,
+    fields: FpSimdOperands,
+    operation: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    if u32::from(fields.field_22_2) > 1 {
+    if u32::from(fields.opc) > 1 {
         return Ok(interpret(decoded));
     }
-    let width = integer::integer_width(fields);
+    let width = if fields.size & 2 != 0 {
+        IrType::I64
+    } else {
+        IrType::I32
+    };
     let rn = fields.rn;
     let rd = fields.rd;
 
-    if operation == FpSimdOperation::MoveToGeneral {
+    if matches!(operation, FpSimdInstruction::MoveToGeneral(_)) {
         let vector = vector_read(builder, decoded.location, rn)?;
         let result = helper(
             builder,
@@ -212,7 +219,7 @@ fn lift_fp_conversion(
         )?;
         return Ok(LiftOutcome::Continue);
     }
-    if operation == FpSimdOperation::MoveFromGeneral {
+    if matches!(operation, FpSimdInstruction::MoveFromGeneral(_)) {
         let integer = read_gpr(builder, decoded.location, rn, width, Register31::Zero)?;
         let result = helper(
             builder,
@@ -249,14 +256,14 @@ fn lift_fp_conversion(
     );
     let int_to_float = matches!(
         operation,
-        FpSimdOperation::SignedIntToFloat | FpSimdOperation::UnsignedIntToFloat
+        FpSimdInstruction::SignedIntToFloat(_) | FpSimdInstruction::UnsignedIntToFloat(_)
     );
     let results = if int_to_float {
         let integer = read_gpr(builder, decoded.location, rn, width, Register31::Zero)?;
         helper(
             builder,
             decoded.location,
-            if operation == FpSimdOperation::SignedIntToFloat {
+            if matches!(operation, FpSimdInstruction::SignedIntToFloat(_)) {
                 "a64.fp.signed-int-to-float"
             } else {
                 "a64.fp.unsigned-int-to-float"
@@ -275,7 +282,7 @@ fn lift_fp_conversion(
         helper(
             builder,
             decoded.location,
-            if operation == FpSimdOperation::FloatToSignedInt {
+            if matches!(operation, FpSimdInstruction::FloatToSignedInt(_)) {
                 "a64.fp.float-to-signed-int"
             } else {
                 "a64.fp.float-to-unsigned-int"
@@ -315,10 +322,10 @@ fn lift_fp_conversion(
 fn lift_fp_simd_memory(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: FpSimdOperation,
+    fields: FpSimdOperands,
+    operation: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let literal = operation == FpSimdOperation::MemoryLiteral;
+    let literal = matches!(operation, FpSimdInstruction::MemoryLiteral(_));
     let size = if literal {
         match fields.size {
             0 => MemoryAccessSize::Word,
@@ -326,7 +333,7 @@ fn lift_fp_simd_memory(
             2 => MemoryAccessSize::Quadword,
             _ => return Ok(interpret(decoded)),
         }
-    } else if fields.bit23 {
+    } else if fields.quad {
         MemoryAccessSize::Quadword
     } else {
         memory::size_from_bits(u32::from(fields.size))
@@ -346,8 +353,8 @@ fn lift_fp_simd_memory(
         )?
     } else {
         let base = memory::base_address(builder, decoded.location, rn)?;
-        if operation == FpSimdOperation::MemoryRegister {
-            let option = u32::from(fields.field_13_3);
+        if matches!(operation, FpSimdInstruction::MemoryRegister(_)) {
+            let option = u32::from(fields.option);
             if option & 2 == 0 {
                 return Ok(interpret(decoded));
             }
@@ -358,7 +365,7 @@ fn lift_fp_simd_memory(
                 IrType::I64,
                 Register31::Zero,
             )?;
-            let shift = if fields.bit12 {
+            let shift = if fields.scaled {
                 size.bytes().trailing_zeros() as u8
             } else {
                 0
@@ -384,12 +391,12 @@ fn lift_fp_simd_memory(
             )?;
             bitcast(builder, decoded.location, raw, IrType::Address)?
         } else {
-            let offset = if operation == FpSimdOperation::MemoryUnsigned {
-                i64::from(u32::from(fields.field_10_12)) * size.bytes() as i64
+            let offset = if matches!(operation, FpSimdInstruction::MemoryUnsigned(_)) {
+                i64::from(u32::from(fields.immediate_12)) * size.bytes() as i64
             } else {
-                sign_extend(u64::from(u32::from(fields.field_12_9)), 9)
+                sign_extend(u64::from(u32::from(fields.immediate_9)), 9)
             };
-            let transfer_base = if operation == FpSimdOperation::MemoryPostIndex {
+            let transfer_base = if matches!(operation, FpSimdInstruction::MemoryPostIndex(_)) {
                 base
             } else {
                 binary(
@@ -402,7 +409,7 @@ fn lift_fp_simd_memory(
             };
             if matches!(
                 operation,
-                FpSimdOperation::MemoryPreIndex | FpSimdOperation::MemoryPostIndex
+                FpSimdInstruction::MemoryPreIndex(_) | FpSimdInstruction::MemoryPostIndex(_)
             ) {
                 writeback = Some(binary(
                     builder,
@@ -417,7 +424,7 @@ fn lift_fp_simd_memory(
     };
     let descriptor = memory::descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal);
     let rt = fields.rd;
-    if literal || fields.bit22 {
+    if literal || fields.load {
         let raw = emit_one(
             builder,
             decoded.location,
