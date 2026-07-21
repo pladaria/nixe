@@ -11,12 +11,13 @@ mod t32;
 use core::fmt;
 
 use crate::{
-    address::GuestVirtualAddress,
+    address::{AddressSpaceId, GuestVirtualAddress},
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
     ir::terminator::{ExceptionKind, Terminator},
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
-    profile::GuestCpuProfile,
+    memory::{CpuMemory, DataAccessFault},
+    profile::{GuestCpuProfile, ProcessCpuContext},
     state::ThreadCpuState,
 };
 
@@ -43,7 +44,7 @@ pub struct InterpreterPolicy {
 }
 
 /// Successful result of executing exactly one interpreted instruction.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum InterpreterOutcome {
     /// One instruction retired and dispatch must continue at this location.
     Resume(LocationDescriptor),
@@ -56,6 +57,49 @@ pub enum InterpreterOutcome {
     /// The instruction handed control to the scheduler without retiring into
     /// the ordinary dispatcher path.
     Scheduled { source: LocationDescriptor },
+    /// A data access raised a precise fault before the instruction completed.
+    DataAbort {
+        source: LocationDescriptor,
+        fault: DataAccessFault,
+    },
+}
+
+/// Immutable process and memory services visible to one interpreter step.
+///
+/// Runtime-owned scheduling and cache-maintenance callbacks will be added as
+/// narrow interfaces when their contracts are implemented. Keeping memory in
+/// this context avoids embedding address-space assumptions in architectural
+/// thread state.
+#[derive(Clone, Copy)]
+pub struct InterpreterContext<'a> {
+    process: ProcessCpuContext,
+    memory: Option<&'a dyn CpuMemory>,
+}
+
+impl<'a> InterpreterContext<'a> {
+    #[must_use]
+    pub const fn new(process: ProcessCpuContext) -> Self {
+        Self {
+            process,
+            memory: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_memory(mut self, memory: &'a dyn CpuMemory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    #[must_use]
+    pub const fn process(self) -> ProcessCpuContext {
+        self.process
+    }
+
+    #[must_use]
+    pub const fn memory(self) -> Option<&'a dyn CpuMemory> {
+        self.memory
+    }
 }
 
 /// Deterministic interpreter/fallback failure.
@@ -158,6 +202,17 @@ pub fn execute_fallback(
     state: &mut ThreadCpuState,
     terminator: &Terminator,
 ) -> Result<InterpreterOutcome, InterpreterError> {
+    let context = InterpreterContext::new(ProcessCpuContext::new(*profile, AddressSpaceId::new(0)));
+    execute_fallback_with_context(policy, context, state, terminator)
+}
+
+/// Executes a fallback with the process address space and data memory exposed.
+pub fn execute_fallback_with_context(
+    policy: InterpreterPolicy,
+    context: InterpreterContext<'_>,
+    state: &mut ThreadCpuState,
+    terminator: &Terminator,
+) -> Result<InterpreterOutcome, InterpreterError> {
     let Terminator::InterpretOne {
         source,
         encoding,
@@ -173,8 +228,9 @@ pub fn execute_fallback(
             coverage_id,
         });
     }
-    validate_context(profile, state, *source)?;
-    let decoded = match decode::decode(profile, *source, *encoding) {
+    let profile = context.process().profile();
+    validate_context(&profile, state, *source)?;
+    let decoded = match decode::decode(&profile, *source, *encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
         DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {
             return Ok(InterpreterOutcome::Exception {
@@ -197,7 +253,7 @@ pub fn execute_fallback(
             reason: "terminator coverage ID does not match decoded instruction".into(),
         });
     }
-    execute_decoded(state, &decoded)
+    execute_decoded(context, state, &decoded)
 }
 
 /// Executes one already-fetched instruction as a reference-engine step.
@@ -206,11 +262,22 @@ pub fn execute_one(
     state: &mut ThreadCpuState,
     encoding: InstructionEncoding,
 ) -> Result<InterpreterOutcome, InterpreterError> {
-    let source = current_location(profile, state);
-    validate_context(profile, state, source)?;
-    match decode::decode(profile, source, encoding) {
+    let context = InterpreterContext::new(ProcessCpuContext::new(*profile, AddressSpaceId::new(0)));
+    execute_one_with_context(context, state, encoding)
+}
+
+/// Executes one instruction with process address-space and memory services.
+pub fn execute_one_with_context(
+    context: InterpreterContext<'_>,
+    state: &mut ThreadCpuState,
+    encoding: InstructionEncoding,
+) -> Result<InterpreterOutcome, InterpreterError> {
+    let profile = context.process().profile();
+    let source = current_location(&profile, state);
+    validate_context(&profile, state, source)?;
+    match decode::decode(&profile, source, encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
-            execute_decoded(state, &decoded)
+            execute_decoded(context, state, &decoded)
         }
         DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {
             Ok(InterpreterOutcome::Exception {
@@ -228,11 +295,12 @@ pub fn execute_one(
 }
 
 fn execute_decoded(
+    context: InterpreterContext<'_>,
     state: &mut ThreadCpuState,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<InterpreterOutcome, InterpreterError> {
     match (state, decoded.location.execution_state) {
-        (ThreadCpuState::A64(state), ExecutionState::A64) => a64::execute(state, decoded),
+        (ThreadCpuState::A64(state), ExecutionState::A64) => a64::execute(context, state, decoded),
         (ThreadCpuState::A32(state), ExecutionState::A32) => a32::execute(state, decoded),
         (ThreadCpuState::A32(state), ExecutionState::T32) => t32::execute(state, decoded),
         _ => Err(InterpreterError::ContextMismatch {

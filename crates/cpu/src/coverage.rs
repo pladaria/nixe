@@ -195,7 +195,13 @@ pub(crate) const fn interpreter_coverage(
     let id = coverage_id.get();
     match state {
         ExecutionState::A64
-            if matches!(id, 0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a) =>
+            if matches!(
+                id,
+                0x0000_0001..=0x0000_000a
+                    | 0x0000_000c..=0x0000_000e
+                    | 0x0000_0010..=0x0000_001d
+                    | 0x0000_0020..=0x0000_002a
+            ) =>
         {
             EngineCoverage::Implemented
         }
@@ -708,11 +714,15 @@ mod tests {
         assert_eq!(branch.completion, CompletionCoverage::Lifted);
 
         let integer = entry(&switch_1, CoverageId::new(0x0000_0003));
-        assert_eq!(integer.interpreter, EngineCoverage::Missing);
+        assert_eq!(integer.interpreter, EngineCoverage::Implemented);
         assert_eq!(integer.lifter, EngineCoverage::Implemented);
         assert_eq!(integer.completion, CompletionCoverage::Incomplete);
 
         let simd = entry(&switch_1, CoverageId::new(0x0000_0030));
+        assert_eq!(simd.decoder, DecoderCoverage::Available);
+
+        let switch_2 = coverage_table(&GuestCpuProfile::switch_2_native());
+        let simd = entry(&switch_2, CoverageId::new(0x0000_0030));
         assert!(matches!(
             simd.decoder,
             DecoderCoverage::ProfileDisabled {
@@ -721,7 +731,6 @@ mod tests {
             }
         ));
 
-        let switch_2 = coverage_table(&GuestCpuProfile::switch_2_native());
         assert_eq!(
             entry(&switch_2, CoverageId::new(0x0001_0001)).decoder,
             DecoderCoverage::ExecutionStateDisabled
