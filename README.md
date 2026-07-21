@@ -77,6 +77,20 @@ aarch64-linux-gnu-gcc --version
 arm-linux-gnueabihf-gcc --version
 ```
 
+### Fuzz tests
+
+CPU decoder, translation, IR verifier, and diagnostic fuzz targets require a nightly Rust toolchain
+and `cargo-fuzz`:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+cargo fuzzer
+```
+
+The aggregate alias runs 10,000 iterations for each target. See [fuzz/README.md](fuzz/README.md) for
+target-specific commands and configuration.
+
 ## License
 
 Swiitx is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).

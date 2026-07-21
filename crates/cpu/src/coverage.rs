@@ -12,6 +12,16 @@ use crate::{
 /// Maximum local instruction context retained for one missing instruction.
 pub const MAX_SURROUNDING_INSTRUCTION_BYTES: usize = 32;
 
+/// Maximum number of unique missing-instruction records retained per tracker.
+///
+/// Counts for already-known records continue to saturate after this limit is
+/// reached, while new records are dropped. This bounds process-local memory and
+/// the size of deterministic diagnostic exports.
+pub const MAX_MISSING_INSTRUCTION_RECORDS: usize = 4_096;
+
+/// Conservative upper bound for either text export of one full tracker.
+pub const MAX_MISSING_INSTRUCTION_EXPORT_BYTES: usize = 2 * 1024 * 1024;
+
 /// Stable, explicitly assigned identity for one architectural instruction.
 ///
 /// Values are grouped by execution state and must not be renumbered when table
@@ -546,6 +556,10 @@ impl MissingInstructionTracker {
         }
         self.total_observations = self.total_observations.saturating_add(1);
         let key = MissingInstructionKey::new(observation.coverage_id, observation.encoding);
+        if !self.records.contains_key(&key) && self.records.len() >= MAX_MISSING_INSTRUCTION_RECORDS
+        {
+            return false;
+        }
         match self.records.entry(key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(MissingInstructionRecord {
@@ -939,6 +953,32 @@ mod tests {
                 maximum: MAX_SURROUNDING_INSTRUCTION_BYTES,
             }
         );
+    }
+
+    #[test]
+    fn tracker_and_exports_have_hard_resource_bounds() {
+        let mut tracker = MissingInstructionTracker::new();
+        for index in 0..=MAX_MISSING_INSTRUCTION_RECORDS {
+            let recorded = tracker.record(
+                MissingInstructionObservation::new(
+                    CoverageId::new(index as u32),
+                    InstructionEncoding::from_u32(index as u32),
+                    GuestVirtualAddress::new(index as u64 * 4),
+                    ModuleIdentity::new(index as u64),
+                    ExecutionState::A64,
+                    [0xaa; MAX_SURROUNDING_INSTRUCTION_BYTES],
+                )
+                .unwrap(),
+            );
+            assert_eq!(recorded, index < MAX_MISSING_INSTRUCTION_RECORDS);
+        }
+
+        assert_eq!(
+            tracker.unique_instructions(),
+            MAX_MISSING_INSTRUCTION_RECORDS
+        );
+        assert!(tracker.export_sanitized().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
+        assert!(tracker.export_detailed().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
     }
 
     fn entry(table: &[CoverageEntry], id: CoverageId) -> &CoverageEntry {

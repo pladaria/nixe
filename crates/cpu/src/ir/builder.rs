@@ -81,6 +81,12 @@ impl IrBuilder {
         self.metadata = metadata;
     }
 
+    /// Returns the number of operations emitted into this block so far.
+    #[must_use]
+    pub(crate) const fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+
     /// Inserts one operation and allocates monotonically increasing result IDs.
     ///
     /// The supplied types are checked against the operation semantics before
