@@ -1,10 +1,12 @@
 //! Runtime orchestration for preparing and starting emulated processes.
 
+mod diagnostics;
 mod launch_plan;
 mod launcher;
 mod module_memory;
 mod process_builder;
 
+pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use launch_plan::{
     AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,
     MountProvenance, PackagedIdentity, ReadOnlyMount,

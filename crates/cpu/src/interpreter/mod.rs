@@ -117,31 +117,34 @@ impl std::error::Error for InterpreterError {}
 /// Returns the independently tracked engine coverage for a decoded opcode.
 #[must_use]
 pub fn instruction_support(decoded: &DecodedInstruction<DecodedOpcode>) -> InstructionSupport {
-    let id = decoded.instruction.coverage_id().get();
-    match (decoded.location.execution_state, id) {
-        (ExecutionState::A64, 0x0000_0038 | 0x0000_0039) => {
-            InstructionSupport::RecognizedUnsupported
-        }
-        (ExecutionState::A32, 0x0001_0003 | 0x0001_0004) | (ExecutionState::T32, 0x0002_0003) => {
-            InstructionSupport::InterpreterOnly
-        }
-        _ => InstructionSupport::Lifted,
+    let interpreter = crate::coverage::interpreter_coverage(
+        decoded.location.execution_state,
+        decoded.instruction.coverage_id(),
+    );
+    let lifter = crate::coverage::lifter_coverage(
+        decoded.location.execution_state,
+        decoded.instruction.coverage_id(),
+    );
+    match (interpreter, lifter) {
+        (
+            crate::coverage::EngineCoverage::Implemented,
+            crate::coverage::EngineCoverage::Implemented,
+        ) => InstructionSupport::Lifted,
+        (
+            crate::coverage::EngineCoverage::Implemented,
+            crate::coverage::EngineCoverage::Missing,
+        ) => InstructionSupport::InterpreterOnly,
+        (crate::coverage::EngineCoverage::Missing, _) => InstructionSupport::RecognizedUnsupported,
     }
 }
 
 /// Returns whether the reference engine has executable semantics for this ID.
 #[must_use]
 pub fn has_semantics(decoded: &DecodedInstruction<DecodedOpcode>) -> bool {
-    match decoded.location.execution_state {
-        ExecutionState::A64 => matches!(
-            crate::decode::a64::normalize(&decoded.instruction, decoded.encoding),
-            crate::decode::a64::A64Instruction::Control(_)
-        ),
-        ExecutionState::A32 | ExecutionState::T32 => !matches!(
-            instruction_support(decoded),
-            InstructionSupport::RecognizedUnsupported
-        ),
-    }
+    crate::coverage::interpreter_coverage(
+        decoded.location.execution_state,
+        decoded.instruction.coverage_id(),
+    ) == crate::coverage::EngineCoverage::Implemented
 }
 
 /// Executes the instruction represented by one JIT fallback terminator.

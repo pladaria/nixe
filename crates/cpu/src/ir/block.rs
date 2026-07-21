@@ -311,6 +311,7 @@ mod tests {
             Terminator::UnsupportedInstruction {
                 source: location(0x1000),
                 encoding: InstructionEncoding::from_u32(0),
+                coverage_id: 1,
                 disassembly: "unknown".into(),
                 reason: "coverage pending".into(),
             },

@@ -999,6 +999,65 @@ Tests and validation tools may enable strict fallback policy. Strict mode reject
 every `InterpretOne` dispatch before architectural state is mutated, turning
 unexpected fallback coverage into a deterministic test failure.
 
+### 23.1 Coverage discovery
+
+Frontend coverage is generated from the A64, A32, T32-16, and T32-32
+declarative decoder registries for a selected `GuestCpuProfile`. Every row
+reports decoder availability after execution-state and feature gating, plus
+independently maintained reference-interpreter and IR-lifter availability. A
+decoder entry therefore remains visible when a profile disables it or either
+execution engine is incomplete.
+
+`Lifted` is a completion claim, not merely evidence that a lifter match arm
+exists. The generated row may use that state only after it has decoder
+classification, reference semantics or an explicit architectural exception, IR
+lowering, stable printer output, and a redistributable regression fixture. The
+fixture registry is tested by decoding, lowering, verifying, and printing each
+completed entry. An instruction added because of a workload report must add its
+minimal encoding to that registry and retain a focused semantic test.
+
+One `MissingInstructionTracker` belongs to one process or title scope. It
+deduplicates recognized unsupported instructions by stable coverage ID and exact
+raw encoding, retains the first PC, opaque runtime-assigned module identity,
+execution state, and at most 32 bytes of local instruction context, and counts
+total frequency independently from unique occurrences. Runtime integration
+feeds `UnsupportedInstruction` terminators into this tracker.
+
+The tracker supports both detailed and sanitized exports. Detailed reports are
+the default and include the bounded byte window required for local debugging.
+Sanitized reports contain only one raw instruction, guest addresses, opaque
+numeric identities, and counters; selecting this policy also prevents the
+tracker from retaining surrounding bytes. Neither mode accepts module paths,
+title names, or arbitrary caller-provided strings. A report can be reduced to
+`MissingInstructionFixture`, which carries only coverage ID, encoding, and
+execution state for a regression test.
+
+### 23.2 Diagnostics configuration ownership
+
+Diagnostic detail is a runtime policy, not an intrinsic CPU-profile property
+and not a debug-versus-release compile-time choice. Application configuration
+loads a user-facing `diagnostics.report_detail` value. The runtime normalizes it
+into one immutable `DiagnosticsPolicy` for the emulation session, and
+`ProcessBuilder` retains that policy while constructing process resources.
+`Detailed` is the default in every build profile; applications may explicitly
+select `Sanitized`.
+
+The complete runtime policy may later cover CPU missing-instruction reports, IR
+dumps, AMD64 code dumps, GPU command diagnostics, and runtime event logs. It is
+never passed wholesale into a subsystem. Instead, the runtime derives narrow
+immutable views such as `CpuDiagnosticsConfig`; future backend and GPU crates
+must receive equivalent subsystem-specific views. This preserves the dependency
+direction: CPU code does not depend on the application configuration crate,
+runtime types, graphics APIs, file paths, CLI behavior, or report destinations.
+
+The CPU view currently selects whether missing-instruction collection is
+enabled and whether its detail is `Detailed` or `Sanitized`. It also exposes
+whether the runtime should fetch surrounding bytes, avoiding unnecessary guest
+memory reads in sanitized mode. The tracker owns no output path and performs no
+I/O. A later diagnostics sink may route structured reports to console, files, or
+developer tools without changing decoder, lifter, interpreter, or backend APIs.
+No mutable global diagnostics configuration is permitted.
+
 ## 24. Debugging and instrumentation
 
 Required developer features are:
