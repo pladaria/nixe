@@ -1374,6 +1374,9 @@ mod tests {
             .fetch32(SPACE, CODE.checked_add(2).unwrap())
             .unwrap_err();
         let denied = memory.fetch16(SPACE, ALIAS).unwrap_err();
+        let unmapped = memory
+            .fetch16(SPACE, GuestVirtualAddress::new(0x9000))
+            .unwrap_err();
 
         assert_eq!(
             misaligned.reason,
@@ -1385,6 +1388,7 @@ mod tests {
             denied.reason,
             InstructionFetchFaultReason::ExecutePermissionDenied
         );
+        assert_eq!(unmapped.reason, InstructionFetchFaultReason::Unmapped);
     }
 
     #[test]
