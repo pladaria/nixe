@@ -62,6 +62,178 @@ fn interpreter_only_t32_movs_executes_once_and_resumes_at_next_pc() {
 }
 
 #[test]
+fn a32_mvp_executes_predicated_integer_flags_and_interworking() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.set_instruction_address(0x1000).unwrap();
+
+    execute_one(&profile, &mut state, 0xe3a0_0001_u32.into()).unwrap(); // MOV R0,#1
+    execute_one(&profile, &mut state, 0xe280_1002_u32.into()).unwrap(); // ADD R1,R0,#2
+    execute_one(&profile, &mut state, 0xe351_0003_u32.into()).unwrap(); // CMP R1,#3
+    execute_one(&profile, &mut state, 0x13a0_2009_u32.into()).unwrap(); // MOVNE R2,#9 (skipped)
+
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a32.read_r(A32GeneralRegister::new(1).unwrap()), 3);
+    assert_eq!(a32.read_r(A32GeneralRegister::new(2).unwrap()), 0);
+    assert!(a32.cpsr().zero());
+    a32.write_r(A32GeneralRegister::new(3).unwrap(), 0x2001);
+    execute_one(&profile, &mut state, 0xe12f_ff13_u32.into()).unwrap(); // BX R3
+    let ThreadCpuState::A32(a32) = state else {
+        unreachable!()
+    };
+    assert_eq!(a32.execution_state(), ExecutionState::T32);
+    assert_eq!(a32.instruction_address(), 0x2000);
+}
+
+#[test]
+fn a32_and_t32_mvp_memory_families_use_the_shared_process_context() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(47);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(94);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE
+    ));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+
+    let mut a32_state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut a32_state else {
+        unreachable!()
+    };
+    a32.set_instruction_address(0x2000).unwrap();
+    a32.write_r(A32GeneralRegister::new(0).unwrap(), 0xfeed_beef);
+    a32.write_r(A32GeneralRegister::new(1).unwrap(), 0x1000);
+    execute_one_with_context(context, &mut a32_state, 0xe581_0004_u32.into()).unwrap(); // STR R0,[R1,#4]
+    execute_one_with_context(context, &mut a32_state, 0xe591_2004_u32.into()).unwrap(); // LDR R2,[R1,#4]
+    let ThreadCpuState::A32(a32) = &a32_state else {
+        unreachable!()
+    };
+    assert_eq!(a32.read_r(A32GeneralRegister::new(2).unwrap()), 0xfeed_beef);
+
+    let mut t32_state = ThreadCpuState::A32(Box::new(crate::state::A32State::t32()));
+    let ThreadCpuState::A32(t32) = &mut t32_state else {
+        unreachable!()
+    };
+    t32.set_instruction_address(0x3000).unwrap();
+    t32.write_r(A32GeneralRegister::new(0).unwrap(), 0x1234_5678);
+    t32.write_r(A32GeneralRegister::new(1).unwrap(), 0x1000);
+    execute_one_with_context(
+        context,
+        &mut t32_state,
+        InstructionEncoding::from_u16(0x6048),
+    )
+    .unwrap(); // STR R0,[R1,#4]
+    execute_one_with_context(
+        context,
+        &mut t32_state,
+        InstructionEncoding::from_u16(0x684a),
+    )
+    .unwrap(); // LDR R2,[R1,#4]
+    let ThreadCpuState::A32(t32) = t32_state else {
+        unreachable!()
+    };
+    assert_eq!(t32.read_r(A32GeneralRegister::new(2).unwrap()), 0x1234_5678);
+}
+
+#[test]
+fn t32_mvp_tracks_it_and_executes_wide_branch_link() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A32(Box::new(crate::state::A32State::t32()));
+    let ThreadCpuState::A32(t32) = &mut state else {
+        unreachable!()
+    };
+    t32.set_instruction_address(0x1000).unwrap();
+
+    execute_one(&profile, &mut state, InstructionEncoding::from_u16(0x2000)).unwrap(); // MOVS R0,#0 (Z=1)
+    execute_one(&profile, &mut state, InstructionEncoding::from_u16(0xbf18)).unwrap(); // IT NE
+    execute_one(&profile, &mut state, InstructionEncoding::from_u16(0x2107)).unwrap(); // MOV R1,#7 (skipped)
+    let ThreadCpuState::A32(t32) = &state else {
+        unreachable!()
+    };
+    assert_eq!(t32.read_r(A32GeneralRegister::new(1).unwrap()), 0);
+    assert!(!t32.cpsr().it_state().is_active());
+
+    execute_one(
+        &profile,
+        &mut state,
+        InstructionEncoding::from_u32(0xf000_f800),
+    )
+    .unwrap(); // BL +0
+    let ThreadCpuState::A32(t32) = state else {
+        unreachable!()
+    };
+    assert_eq!(t32.instruction_address(), 0x100a);
+    assert_eq!(t32.read_r(A32GeneralRegister::new(14).unwrap()), 0x100b);
+}
+
+#[test]
+fn a32_neon_aliases_execute_bitwise_and_lane_integer_operations() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.write_q(0, 0x0102_0304_0506_0708_1112_1314_1516_1718);
+
+    execute_one(&profile, &mut state, 0xf200_0150_u32.into()).unwrap(); // VAND Q0,Q0,Q0
+    execute_one(&profile, &mut state, 0xf200_0840_u32.into()).unwrap(); // VADD.I8 Q0,Q0,Q0
+
+    let ThreadCpuState::A32(a32) = state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a32.read_q(0).unwrap(),
+        0x0204_0608_0a0c_0e10_2224_2628_2a2c_2e30
+    );
+    assert_eq!(a32.read_d(0).unwrap(), 0x2224_2628_2a2c_2e30);
+}
+
+#[test]
+fn a32_neon_single_register_memory_transfer_round_trips_d_registers() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(48);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(95);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE
+    ));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.write_r(A32GeneralRegister::new(0).unwrap(), 0x1000);
+    a32.write_d(0, 0x0123_4567_89ab_cdef);
+
+    execute_one_with_context(context, &mut state, 0xf400_070f_u32.into()).unwrap(); // VST1.8 {D0},[R0]
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.write_d(0, 0);
+    execute_one_with_context(context, &mut state, 0xf420_070f_u32.into()).unwrap(); // VLD1.8 {D0},[R0]
+
+    let ThreadCpuState::A32(a32) = state else {
+        unreachable!()
+    };
+    assert_eq!(a32.read_d(0), Some(0x0123_4567_89ab_cdef));
+}
+
+#[test]
 fn strict_mode_rejects_fallback_before_mutating_state() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A32(Box::new(crate::state::A32State::t32()));

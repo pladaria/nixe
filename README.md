@@ -47,6 +47,7 @@ Milestones:
   - [x] Declarative decoder framework: indexed A64/A32/T32 classification, typed operands, profile gating, and stable coverage IDs.
   - [x] A64 scalar frontend: bounded block translation with control flow, integer and memory lifting, explicit flags, guest addresses, and precise memory semantics.
   - [x] Reference execution and fallback: modular scalar interpretation, process-aware memory access, precise faults, and actionable missing-instruction reports.
+  - [x] Switch 1 scalar execution states: modular A32/T32 decoding and reference execution with conditions, IT state, memory, and correct interworking.
 
 ## Legal Notice
 

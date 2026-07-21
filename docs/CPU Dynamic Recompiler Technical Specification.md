@@ -333,6 +333,22 @@ shift-with-carry, bit masks, saturation, floating-point conversion, vector lane
 selection, and memory ordering. The interpreter and lifter must not maintain two
 independent handwritten interpretations of difficult rules.
 
+The A32 and T32 tables feed distinct typed normalizers and then share an
+encoding-independent AArch32 operand model for data processing, barrel shifts,
+ordinary memory, multiple transfer, and vector operations. A32 conditions and
+the unconditional encoding space remain A32-owned; T32 instruction width,
+ITSTATE, PC rules, and halfword assembly remain T32-owned. Family lifters and
+reference-interpreter modules consume normalized instructions and must never
+re-extract fields from `InstructionEncoding`.
+
+The scalar Switch 1 MVP includes predicated A32 integer execution, common T32
+16-bit forms, selected T32 32-bit forms, ordinary, multiple, and initial NEON
+memory transfers, exceptions, calls, and A32/T32 interworking. Exact A32 VFP
+semantics remain explicit fallback until the architectural FP provider exists.
+A32 acquire/release and exclusive execution remains a Phase 4 item until
+`CpuMemory` exposes reservation identity and generation; recognizing an encoding
+must not be mistaken for implementing its memory-model semantics.
+
 Generated conformance tests should enumerate boundary encodings and verify that
 decoder patterns neither overlap unexpectedly nor leave declared instructions
 unreachable.

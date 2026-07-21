@@ -1,7 +1,10 @@
 //! T32-to-IR translation.
 
 use crate::{
-    decode::{DecodedOpcode, OperandId, OperandValue},
+    decode::{
+        DecodedOpcode,
+        t32::{T32Instruction, control::Instruction as ControlInstruction, normalize},
+    },
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
@@ -16,7 +19,7 @@ use crate::{
     state::a32::{Cpsr, ItState},
 };
 
-use super::block::{LiftOutcome, conditional_terminator, direct_branch_target};
+use super::block::{LiftOutcome, conditional_terminator};
 
 pub(crate) fn lift(
     builder: &mut IrBuilder,
@@ -29,13 +32,19 @@ fn lift_inner(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<LiftOutcome, BuildError> {
-    match decoded.instruction.pattern().name {
-        "it" => lift_it(builder, decoded),
-        "nop" | "nop.w" => {
+    match normalize(&decoded.instruction, decoded.encoding) {
+        T32Instruction::Control(ControlInstruction::It {
+            first_condition,
+            mask,
+        }) => lift_it(builder, decoded, first_condition, mask),
+        T32Instruction::Control(ControlInstruction::Nop) => {
             advance_it_state(builder, decoded.location)?;
             Ok(LiftOutcome::Continue)
         }
-        "b" => lift_branch(builder, decoded),
+        T32Instruction::Control(ControlInstruction::Branch {
+            condition: None,
+            displacement,
+        }) => lift_branch(builder, decoded, displacement),
         _ => Ok(LiftOutcome::Interpret(decoded.instruction.coverage_id())),
     }
 }
@@ -43,12 +52,10 @@ fn lift_inner(
 fn lift_it(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
+    first_condition: u8,
+    mask: u8,
 ) -> Result<LiftOutcome, BuildError> {
-    let immediate = match decoded.instruction.operands().get(OperandId::Immediate) {
-        Some(OperandValue::Unsigned(value)) => value as u8,
-        _ => unreachable!("T32 IT has a validated immediate operand"),
-    };
-    let Some(it_state) = ItState::from_encoding(immediate >> 4, immediate & 0xf) else {
+    let Some(it_state) = ItState::from_encoding(first_condition, mask) else {
         return Ok(LiftOutcome::Interpret(decoded.instruction.coverage_id()));
     };
 
@@ -66,9 +73,16 @@ fn lift_it(
 fn lift_branch(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
+    displacement: i32,
 ) -> Result<LiftOutcome, BuildError> {
-    let target = direct_branch_target(decoded)
-        .expect("validated T32 branch displacement always produces an aligned target");
+    let target = ControlTarget::Direct {
+        pc: crate::address::GuestVirtualAddress::new(u64::from(
+            (decoded.location.pc.get() as u32)
+                .wrapping_add(4)
+                .wrapping_add_signed(displacement),
+        )),
+        execution_state: ExecutionState::T32,
+    };
     let condition = current_it_condition(builder, decoded.location)?;
     let fallthrough = ControlTarget::Direct {
         pc: decoded.location.pc.wrapping_offset(2),
