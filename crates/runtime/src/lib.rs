@@ -16,4 +16,7 @@ pub use module_memory::{
     BackendInstallError, InstallStage, ModuleInstallError, ModuleMemoryBackend, PageRequest,
     install_prepared_module,
 };
-pub use process_builder::ProcessBuilder;
+pub use process_builder::{
+    MainThread, ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage,
+    ProcessBuilder, RunnableProcess,
+};
