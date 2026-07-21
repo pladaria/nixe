@@ -491,7 +491,10 @@ mod tests {
     use super::*;
     use crate::{
         address::{CodeGeneration, GuestPhysicalPageId},
-        ir::{op::OperationKind, terminator::ControlTarget},
+        ir::{
+            op::{Condition, FlagOperation, OperationKind, StateRegister},
+            terminator::ControlTarget,
+        },
         memory::{
             CodeDependencies, CodePageDependency, MemoryPermissions, SYNTHETIC_PAGE_SIZE,
             SyntheticMemory,
@@ -562,10 +565,95 @@ mod tests {
         .unwrap();
         assert!(matches!(
             block.terminator,
-            Terminator::Direct {
-                target: ControlTarget::Direct { pc, execution_state: ExecutionState::T32 }
+            Terminator::Conditional {
+                taken: ControlTarget::Direct {
+                    pc,
+                    execution_state: ExecutionState::T32,
+                },
+                fallthrough: ControlTarget::Direct {
+                    pc: fallthrough,
+                    execution_state: ExecutionState::T32,
+                },
+                ..
             } if pc == GuestVirtualAddress::new(0x1006)
+                && fallthrough == GuestVirtualAddress::new(0x1002)
         ));
+    }
+
+    #[test]
+    fn a32_branch_condition_is_an_explicit_cpsr_consumer() {
+        let profile = GuestCpuProfile::switch_1();
+        let mut memory = memory_with_pages(0x1000, 1);
+        put(&mut memory, 1, 0, &0x1a00_0000_u32.to_le_bytes()); // b.ne +0
+        let block = translate_block(
+            BlockTranslationConfig::default(),
+            &profile,
+            SPACE,
+            start(profile, 0x1000, ExecutionState::A32),
+            &memory,
+        )
+        .unwrap();
+
+        assert!(block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::ReadState(StateRegister::A32Cpsr)
+        )));
+        assert!(block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::Evaluate {
+                condition: Condition::Ne,
+                ..
+            })
+        )));
+        assert!(matches!(
+            block.terminator,
+            Terminator::Conditional {
+                taken: ControlTarget::Direct { pc, .. },
+                fallthrough: ControlTarget::Direct { pc: fallthrough, .. },
+                ..
+            } if pc == GuestVirtualAddress::new(0x1008)
+                && fallthrough == GuestVirtualAddress::new(0x1004)
+        ));
+    }
+
+    #[test]
+    fn t32_itstate_is_explicitly_installed_consumed_and_advanced() {
+        let profile = GuestCpuProfile::switch_1();
+        let mut memory = memory_with_pages(0x1000, 1);
+        put(&mut memory, 1, 0, &0xbf08_u16.to_le_bytes()); // it eq
+        put(&mut memory, 1, 2, &0xe001_u16.to_le_bytes()); // b +2
+        let block = translate_block(
+            BlockTranslationConfig::default(),
+            &profile,
+            SPACE,
+            start(profile, 0x1000, ExecutionState::T32),
+            &memory,
+        )
+        .unwrap();
+
+        assert_eq!(block.metadata.guest_instruction_count, 2);
+        assert_eq!(
+            block
+                .operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation.kind,
+                    OperationKind::WriteState {
+                        register: StateRegister::A32Cpsr,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::EvaluateEncoded {
+                nv_is_unconditional: false,
+                ..
+            })
+        )));
+        assert!(matches!(block.terminator, Terminator::Conditional { .. }));
     }
 
     #[test]

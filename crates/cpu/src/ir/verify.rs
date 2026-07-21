@@ -371,10 +371,23 @@ fn verify_scalar(
             let ty = same_integer(index, lhs, rhs, "binary operands")?;
             expect_results(index, results, &[ty])
         }
-        ScalarOperation::AddWithCarry { lhs, rhs, carry_in } => {
+        ScalarOperation::AddWithCarry {
+            lhs,
+            rhs,
+            carry_in,
+            flags,
+        } => {
             let ty = same_integer(index, lhs, rhs, "add-with-carry operands")?;
             expect_type(index, carry_in, IrType::I1, "carry input")?;
-            expect_results(index, results, &[ty, IrType::I1, IrType::I1])
+            match flags {
+                crate::ir::op::ArithmeticFlagOutput::None => expect_results(index, results, &[ty]),
+                crate::ir::op::ArithmeticFlagOutput::Carry => {
+                    expect_results(index, results, &[ty, IrType::I1])
+                }
+                crate::ir::op::ArithmeticFlagOutput::CarryAndOverflow => {
+                    expect_results(index, results, &[ty, IrType::I1, IrType::I1])
+                }
+            }
         }
         ScalarOperation::UnsignedOverflow {
             lhs, rhs, result, ..
@@ -470,6 +483,13 @@ fn verify_flags(
         }
         FlagOperation::Evaluate { flags, .. } => {
             expect_type(index, flags, IrType::Flags, "condition flags")?;
+            expect_results(index, results, &[IrType::I1])
+        }
+        FlagOperation::EvaluateEncoded {
+            flags, condition, ..
+        } => {
+            expect_type(index, flags, IrType::Flags, "condition flags")?;
+            expect_type(index, condition, IrType::I32, "encoded condition")?;
             expect_results(index, results, &[IrType::I1])
         }
         FlagOperation::Materialize { flags } => {
@@ -902,9 +922,9 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
         OperationKind::Scalar(operation) => match *operation {
             ScalarOperation::Binary { lhs, rhs, .. }
             | ScalarOperation::Compare { lhs, rhs, .. } => operands.extend([lhs, rhs]),
-            ScalarOperation::AddWithCarry { lhs, rhs, carry_in } => {
-                operands.extend([lhs, rhs, carry_in])
-            }
+            ScalarOperation::AddWithCarry {
+                lhs, rhs, carry_in, ..
+            } => operands.extend([lhs, rhs, carry_in]),
             ScalarOperation::UnsignedOverflow {
                 lhs, rhs, result, ..
             }
@@ -935,6 +955,9 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
             FlagOperation::Evaluate { flags, .. } | FlagOperation::Materialize { flags } => {
                 operands.push(flags)
             }
+            FlagOperation::EvaluateEncoded {
+                flags, condition, ..
+            } => operands.extend([flags, condition]),
         },
         OperationKind::Memory(operation) => match *operation {
             MemoryOperation::Load { address, .. } => operands.push(address),

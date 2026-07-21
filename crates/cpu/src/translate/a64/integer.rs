@@ -136,14 +136,24 @@ fn emit_add_sub(
     } else {
         rhs
     };
+    let result_types: &[IrType] = if spec.set_flags {
+        &[spec.width, IrType::I1, IrType::I1]
+    } else {
+        &[spec.width]
+    };
     let results: Vec<_> = builder
         .emit(
             source,
-            &[spec.width, IrType::I1, IrType::I1],
+            result_types,
             OperationKind::Scalar(ScalarOperation::AddWithCarry {
                 lhs,
                 rhs,
                 carry_in: Immediate::I1(spec.subtract).into(),
+                flags: if spec.set_flags {
+                    ArithmeticFlagOutput::CarryAndOverflow
+                } else {
+                    ArithmeticFlagOutput::None
+                },
             }),
         )?
         .iter()
@@ -366,14 +376,24 @@ fn lift_add_sub_carry(
         )?;
     }
     let carry = carry_in(builder, decoded.location)?;
+    let result_types: &[IrType] = if fields.set_flags {
+        &[width, IrType::I1, IrType::I1]
+    } else {
+        &[width]
+    };
     let values: Vec<_> = builder
         .emit(
             decoded.location,
-            &[width, IrType::I1, IrType::I1],
+            result_types,
             OperationKind::Scalar(ScalarOperation::AddWithCarry {
                 lhs,
                 rhs,
                 carry_in: carry,
+                flags: if fields.set_flags {
+                    ArithmeticFlagOutput::CarryAndOverflow
+                } else {
+                    ArithmeticFlagOutput::None
+                },
             }),
         )?
         .iter()
@@ -700,6 +720,7 @@ fn proposed_compare_flags(
                 lhs,
                 rhs,
                 carry_in: Immediate::I1(subtract).into(),
+                flags: ArithmeticFlagOutput::CarryAndOverflow,
             }),
         )?
         .iter()
@@ -754,7 +775,7 @@ fn lift_conditional_compare(
     let cond = evaluate_condition(
         builder,
         decoded.location,
-        condition(u32::from(fields.condition)),
+        Condition::from_encoding(fields.condition),
     )?;
     let selected = scalar(
         builder,
@@ -813,7 +834,7 @@ fn lift_conditional_select(
     let cond = evaluate_condition(
         builder,
         decoded.location,
-        condition(u32::from(fields.condition)),
+        Condition::from_encoding(fields.condition),
     )?;
     let result = scalar(
         builder,

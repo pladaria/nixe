@@ -12,11 +12,11 @@ use crate::{
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
-            BarrierAccess, BarrierDomain, BarrierOperation, ByteOrder, CacheMaintenanceKind,
-            CacheMaintenanceOperation, Condition, EffectSet, ExclusiveOperation, FlagOperation,
-            HelperOperation, IntegerBinaryKind, IntegerPredicate, MemoryDescriptor,
-            MemoryOperation, OperationEffects, OperationKind, ScalarOperation, ShiftKind,
-            StateRegister, Volatility,
+            ArithmeticFlagOutput, BarrierAccess, BarrierDomain, BarrierOperation, ByteOrder,
+            CacheMaintenanceKind, CacheMaintenanceOperation, Condition, EffectSet,
+            ExclusiveOperation, FlagOperation, HelperOperation, IntegerBinaryKind,
+            IntegerPredicate, MemoryDescriptor, MemoryOperation, OperationEffects, OperationKind,
+            ScalarOperation, ShiftKind, StateRegister, Volatility,
         },
         terminator::{ControlTarget, ExceptionKind, Terminator},
         types::IrType,
@@ -80,28 +80,6 @@ fn direct_target(source: LocationDescriptor, displacement: i64) -> ControlTarget
 fn sign_extend(value: u64, bits: u8) -> i64 {
     let shift = 64 - bits;
     ((value << shift) as i64) >> shift
-}
-
-fn condition(bits: u32) -> Condition {
-    match bits & 0xf {
-        0 => Condition::Eq,
-        1 => Condition::Ne,
-        2 => Condition::Cs,
-        3 => Condition::Cc,
-        4 => Condition::Mi,
-        5 => Condition::Pl,
-        6 => Condition::Vs,
-        7 => Condition::Vc,
-        8 => Condition::Hi,
-        9 => Condition::Ls,
-        10 => Condition::Ge,
-        11 => Condition::Lt,
-        12 => Condition::Gt,
-        13 => Condition::Le,
-        14 => Condition::Al,
-        15 => Condition::Nv,
-        _ => unreachable!(),
-    }
 }
 
 fn emit_one(
@@ -444,6 +422,84 @@ mod tests {
             block.metadata.exits[1].target,
             Some(GuestVirtualAddress::new(0x100c))
         );
+    }
+
+    #[test]
+    fn arithmetic_requests_only_live_flags_and_materializes_them_before_exit() {
+        // add x0,x0,#1; svc #0
+        let without_flags = translate(&[0x9100_0400, 0xd400_0001]);
+        let add = without_flags
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    OperationKind::Scalar(ScalarOperation::AddWithCarry { .. })
+                )
+            })
+            .unwrap();
+        assert_eq!(add.results.iter().count(), 1);
+        assert!(matches!(
+            add.kind,
+            OperationKind::Scalar(ScalarOperation::AddWithCarry {
+                flags: ArithmeticFlagOutput::None,
+                ..
+            })
+        ));
+        assert!(!without_flags.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteState {
+                register: StateRegister::A64Nzcv,
+                ..
+            }
+        )));
+
+        // subs x0,x0,#1; svc #0
+        let with_flags = translate(&[0xf100_0400, 0xd400_0001]);
+        let subtract = with_flags
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    OperationKind::Scalar(ScalarOperation::AddWithCarry { .. })
+                )
+            })
+            .unwrap();
+        assert_eq!(subtract.results.iter().count(), 3);
+        assert!(matches!(
+            subtract.kind,
+            OperationKind::Scalar(ScalarOperation::AddWithCarry {
+                carry_in: Operand::Immediate(Immediate::I1(true)),
+                flags: ArithmeticFlagOutput::CarryAndOverflow,
+                ..
+            })
+        ));
+        assert!(with_flags.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteState {
+                register: StateRegister::A64Nzcv,
+                ..
+            }
+        )));
+        assert!(matches!(
+            with_flags.terminator,
+            Terminator::Exception { .. }
+        ));
+
+        // The same architectural write is visible before an interpreter exit.
+        let fallback = translate(&[0xf100_0400, 0xd503_20df]);
+        assert!(fallback.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteState {
+                register: StateRegister::A64Nzcv,
+                ..
+            }
+        )));
+        assert!(matches!(
+            fallback.terminator,
+            Terminator::InterpretOne { .. }
+        ));
     }
 
     #[test]

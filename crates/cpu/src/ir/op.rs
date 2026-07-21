@@ -144,6 +144,17 @@ pub enum IntegerPredicate {
     SignedLessThanOrEqual,
 }
 
+/// Architectural flag outputs requested from one arithmetic operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArithmeticFlagOutput {
+    /// Produce only the arithmetic result.
+    None,
+    /// Also produce the unsigned carry/no-borrow bit.
+    Carry,
+    /// Also produce carry/no-borrow and signed overflow.
+    CarryAndOverflow,
+}
+
 /// Explicit scalar integer operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScalarOperation {
@@ -158,6 +169,7 @@ pub enum ScalarOperation {
         lhs: Operand,
         rhs: Operand,
         carry_in: Operand,
+        flags: ArithmeticFlagOutput,
     },
     /// Derives unsigned overflow from two operands and a result.
     UnsignedOverflow {
@@ -226,6 +238,37 @@ pub enum Condition {
     Nv,
 }
 
+impl Condition {
+    /// Decodes the complete four-bit Arm condition space.
+    #[must_use]
+    pub const fn from_encoding(encoding: u8) -> Self {
+        match encoding & 0xf {
+            0 => Self::Eq,
+            1 => Self::Ne,
+            2 => Self::Cs,
+            3 => Self::Cc,
+            4 => Self::Mi,
+            5 => Self::Pl,
+            6 => Self::Vs,
+            7 => Self::Vc,
+            8 => Self::Hi,
+            9 => Self::Ls,
+            10 => Self::Ge,
+            11 => Self::Lt,
+            12 => Self::Gt,
+            13 => Self::Le,
+            14 => Self::Al,
+            15 => Self::Nv,
+            _ => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub const fn encoding(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Lazy flag creation, consumption, and architectural materialization.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FlagOperation {
@@ -243,6 +286,12 @@ pub enum FlagOperation {
     Evaluate {
         flags: Operand,
         condition: Condition,
+    },
+    /// Evaluates a runtime four-bit condition encoding, used by Thumb ITSTATE.
+    EvaluateEncoded {
+        flags: Operand,
+        condition: Operand,
+        nv_is_unconditional: bool,
     },
     /// Materializes lazy flags as packed I32 architectural bits.
     Materialize { flags: Operand },
@@ -845,6 +894,14 @@ mod tests {
     }
 
     #[test]
+    fn condition_encoding_round_trips_the_complete_architectural_space() {
+        for encoding in 0..16 {
+            let condition = Condition::from_encoding(encoding);
+            assert_eq!(condition.encoding(), encoding);
+        }
+    }
+
+    #[test]
     fn state_accesses_are_semantic_and_typed() {
         let register = StateRegister::A64V(RegisterIndex::new(31).unwrap());
         let operation = IrOperation::new(
@@ -910,6 +967,7 @@ mod tests {
                 lhs: Immediate::I64(1).into(),
                 rhs: Immediate::I64(2).into(),
                 carry_in: Immediate::I1(false).into(),
+                flags: ArithmeticFlagOutput::CarryAndOverflow,
             }),
         );
 

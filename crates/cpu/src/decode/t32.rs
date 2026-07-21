@@ -40,6 +40,12 @@ const MOV16_FIELDS: &[OperandField] = &[
         kind: OperandKind::Unsigned,
     },
 ];
+const IT_FIELDS: &[OperandField] = &[OperandField {
+    id: OperandId::Immediate,
+    lsb: 0,
+    width: 8,
+    kind: OperandKind::Unsigned,
+}];
 
 pub static PATTERNS_16: &[InstructionPattern] = &[
     InstructionPattern {
@@ -53,7 +59,21 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         required_features: NO_FEATURES,
         semantic_id: SemanticId::new(0x0002_0001),
         coverage_id: CoverageId::new(0x0002_0001),
-        priority: 0,
+        priority: 2,
+        support: DecodeSupport::Ready,
+    },
+    InstructionPattern {
+        name: "it",
+        execution_state: ExecutionState::T32,
+        size: InstructionSize::Bits16,
+        mask: 0xff00,
+        value: 0xbf00,
+        operands: IT_FIELDS,
+        reserved_constraints: NO_CONSTRAINTS,
+        required_features: NO_FEATURES,
+        semantic_id: SemanticId::new(0x0002_0005),
+        coverage_id: CoverageId::new(0x0002_0005),
+        priority: 1,
         support: DecodeSupport::Ready,
     },
     InstructionPattern {

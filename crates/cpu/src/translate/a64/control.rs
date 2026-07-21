@@ -78,7 +78,7 @@ fn lift_conditional_branch(
     fields: ControlOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let source = decoded.location;
-    let cond = evaluate_condition(builder, source, condition(u32::from(fields.condition)))?;
+    let cond = evaluate_condition(builder, source, Condition::from_encoding(fields.condition))?;
     let displacement = sign_extend(u64::from(fields.immediate_19), 19) << 2;
     Ok(LiftOutcome::Terminate(conditional_terminator(
         cond,
