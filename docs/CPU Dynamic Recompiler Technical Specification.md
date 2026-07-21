@@ -141,6 +141,17 @@ Profile data must be backed by public documentation, lawful black-box tests, or
 other redistributable research. Unverified fields remain explicit open
 questions.
 
+### 4.1 Recorded Switch 1 Advanced SIMD decision
+
+The built-in Switch 1 profile enables the architectural `AdvancedSimd` decoder
+feature. This is not inferred from games or host capabilities: Arm documents
+Advanced SIMD/NEON as mandatory for Armv8-A, and NVIDIA's public Tegra X1
+documentation identifies NEON on the Cortex-A57 CPU cores. This decision enables
+classification of the relevant A64 encodings; it does not claim that the current
+interpreter or backend implements every FP/SIMD operation. The provisional
+Switch 2 native profile keeps this feature `Unknown` until separately verified
+evidence establishes its guest-visible contract.
+
 ## 5. System architecture
 
 ```text
@@ -962,6 +973,20 @@ Tier counters should be sampled or incremented cheaply; an atomic counter on
 every block execution is not acceptable. Optimization must be disabled in
 deterministic validation modes.
 
+One interpreter step receives an immutable execution context containing
+`ProcessCpuContext` and a narrow `CpuMemory` view. Architectural register state
+remains in `ThreadCpuState`; address-space identity and memory services do not.
+This lets scalar loads/stores return structured data faults without making the
+interpreter depend on the loader or runtime implementation. Scheduler/event and
+cache-maintenance callbacks will be added to this context only when those runtime
+contracts exist. Until then, instructions requiring them remain explicit
+fallbacks rather than approximate no-ops.
+
+The Phase 1 scalar MVP covers A64 control flow, integer/address generation,
+supported user-visible system registers and barriers, and ordinary scalar memory
+including acquire/release accesses. FP/SIMD, exclusives, atomics, and the
+multicore memory model remain Phase 4 work and do not hold the scalar MVP open.
+
 ## 23. Fallback policy
 
 Fallback is per instruction or block, not per title. When the lifter encounters
@@ -1326,7 +1351,8 @@ lowering code.
 The following require prototypes or additional lawful research before becoming
 decisions:
 
-- Exact Switch 1 CPU feature profiles and visible system-register behavior.
+- Remaining Switch 1 CPU feature details and visible system-register behavior;
+  the mandatory Armv8-A Advanced SIMD capability is already recorded.
 - Whether verified Switch 2 native process metadata permits any execution state
   other than A64; the provisional native profile remains A64-only meanwhile.
 - Exact Switch 2 architecture revision, instruction extensions, visible system
@@ -1354,6 +1380,11 @@ alternatives, benchmark/test method, and compatibility impact.
 
 ## 31. References
 
+- [Arm: Runtime detection of CPU features on an Armv8-A CPU](https://developer.arm.com/community/arm-community-blogs/b/operating-systems-blog/posts/runtime-detection-of-cpu-features-on-an-armv8-a-cpu)
+  — records that Armv8-A makes Advanced SIMD/NEON mandatory for AArch32 and
+  AArch64.
+- [NVIDIA Tegra X1 Series SoC Technical Reference Manual](https://forums.developer.nvidia.com/uploads/short-url/4pA0RhQeOC4TEwqPuGNml7uV4Nb.pdf)
+  — public SoC documentation identifying NEON on the Cortex-A57 CPU complex.
 - [Dynarmic project overview](https://github.com/azahar-emu/dynarmic) and
   [design documentation](https://github.com/azahar-emu/dynarmic/blob/master/docs/Design.md)
   — focused ARM dynamic recompilation, typed SSA IR, explicit flags, block

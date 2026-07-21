@@ -399,7 +399,8 @@ impl GuestCpuProfile {
             Self::SWITCH_1_ID,
             ArchitectureRevision::Armv8A,
             ExecutionStateSet::A64_A32_T32,
-            InstructionFeatures::all_unknown(),
+            InstructionFeatures::all_unknown()
+                .with(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled),
             AddressSpaceProfile::UNKNOWN,
             FloatingPointProfile::UNKNOWN,
             CacheMaintenanceProfile::UNKNOWN,
@@ -658,7 +659,13 @@ mod tests {
 
     #[test]
     fn switch_1_process_metadata_can_select_each_supported_frontend() {
-        let process = ProcessCpuContext::new(GuestCpuProfile::switch_1(), AddressSpaceId::new(9));
+        let profile = GuestCpuProfile::switch_1();
+        let process = ProcessCpuContext::new(profile, AddressSpaceId::new(9));
+
+        assert_eq!(
+            profile.instruction_feature_status(InstructionFeature::AdvancedSimd),
+            CapabilityStatus::Enabled
+        );
 
         for state in [
             ExecutionState::A64,

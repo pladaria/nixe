@@ -46,6 +46,7 @@ Milestones:
   - [x] IR foundation: typed block construction, verification, deterministic printing, and shared canonical semantic primitives.
   - [x] Declarative decoder framework: indexed A64/A32/T32 classification, typed operands, profile gating, and stable coverage IDs.
   - [x] A64 scalar frontend: bounded block translation with control flow, integer and memory lifting, explicit flags, guest addresses, and precise memory semantics.
+  - [x] Reference execution and fallback: modular scalar interpretation, process-aware memory access, precise faults, and actionable missing-instruction reports.
 
 ## Legal Notice
 
