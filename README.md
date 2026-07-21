@@ -51,6 +51,40 @@ Milestones:
   - [x] Reference execution and fallback: modular scalar interpretation, process-aware memory access, precise faults, and actionable missing-instruction reports.
   - [x] Switch 1 scalar execution states: modular A32/T32 decoding and reference execution with conditions, IT state, memory, and correct interworking.
 
+## Testing
+
+### Integration tests against real titles
+
+To run integration tests against caller-owned titles, copy `.env.integration.example` to
+`.env.integration`, configure the paths, and run `./scripts/test-integration.sh`.
+
+### Differential tests
+
+Optional CPU differential tests require QEMU user-mode (`qemu-aarch64` and `qemu-arm`), the Rust
+`aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` targets, and their cross-linkers.
+
+```bash
+sudo apt update && sudo apt install qemu-user gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+```
+
+Verify with
+
+```bash
+qemu-aarch64 --version
+qemu-arm --version
+aarch64-linux-gnu-gcc --version
+arm-linux-gnueabihf-gcc --version
+```
+
+## License
+
+Swiitx is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Legal Notice
 
 This project is intended for lawful education, research, interoperability, and preservation work. It does not
@@ -62,12 +96,3 @@ using only software and data they are legally entitled to use.
 
 Nintendo Switch and Nintendo Switch 2 are trademarks of Nintendo. This project is independent and is not
 affiliated with, sponsored by, or endorsed by Nintendo or NVIDIA.
-
-## Testing
-
-To run integration tests against caller-owned titles, copy `.env.integration.example` to
-`.env.integration`, configure the paths, and run `./scripts/test-integration.sh`.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
