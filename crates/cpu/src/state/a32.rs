@@ -35,6 +35,51 @@ impl A32GeneralRegister {
 #[repr(transparent)]
 pub struct Cpsr(u32);
 
+/// Architectural Thumb ITSTATE value in its contiguous eight-bit form.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct ItState(u8);
+
+impl ItState {
+    #[must_use]
+    pub const fn from_encoding(first_condition: u8, mask: u8) -> Option<Self> {
+        if first_condition < 14 && mask & 0xf != 0 {
+            Some(Self((first_condition << 4) | (mask & 0xf)))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        self.0 != 0
+    }
+
+    #[must_use]
+    pub const fn current_condition(self) -> Option<crate::ir::op::Condition> {
+        if self.is_active() {
+            Some(crate::ir::op::Condition::from_encoding(self.0 >> 4))
+        } else {
+            None
+        }
+    }
+
+    /// Applies the architectural `ITAdvance()` transition.
+    #[must_use]
+    pub const fn advance(self) -> Self {
+        if self.0 & 7 == 0 {
+            Self(0)
+        } else {
+            Self((self.0 & 0xe0) | ((self.0 << 1) & 0x1f))
+        }
+    }
+}
+
 impl Cpsr {
     pub const N: u32 = 1 << 31;
     pub const Z: u32 = 1 << 30;
@@ -42,6 +87,9 @@ impl Cpsr {
     pub const V: u32 = 1 << 28;
     pub const Q: u32 = 1 << 27;
     pub const T: u32 = 1 << 5;
+    pub const IT_LOW_MASK: u32 = 0b11 << 25;
+    pub const IT_HIGH_MASK: u32 = 0b11_1111 << 10;
+    pub const IT_MASK: u32 = Self::IT_LOW_MASK | Self::IT_HIGH_MASK;
     /// User mode is the reset mode for frontend-created process threads.
     pub const USER_MODE: u32 = 0b1_0000;
 
@@ -91,6 +139,20 @@ impl Cpsr {
     #[must_use]
     pub const fn overflow(self) -> bool {
         self.0 & Self::V != 0
+    }
+
+    #[must_use]
+    pub const fn it_state(self) -> ItState {
+        let low = ((self.0 >> 25) & 3) as u8;
+        let high = ((self.0 >> 10) & 0x3f) as u8;
+        ItState((high << 2) | low)
+    }
+
+    #[must_use]
+    pub const fn with_it_state(self, state: ItState) -> Self {
+        let value = state.bits();
+        let packed = ((value as u32 & 3) << 25) | ((value as u32 >> 2) << 10);
+        Self((self.0 & !Self::IT_MASK) | packed)
     }
 }
 
@@ -403,6 +465,7 @@ mod tests {
     use core::mem::{align_of, size_of};
 
     use super::*;
+    use crate::ir::op::Condition;
 
     fn r(index: u8) -> A32GeneralRegister {
         A32GeneralRegister::new(index).unwrap()
@@ -443,6 +506,29 @@ mod tests {
         );
         assert_eq!(state.execution_state(), ExecutionState::T32);
         assert_eq!(state.cpsr().bits() & !Cpsr::T, bits);
+    }
+
+    #[test]
+    fn itstate_round_trips_through_split_cpsr_fields_and_advances() {
+        let state = ItState::from_encoding(Condition::Ne.encoding(), 0b1100).unwrap();
+        let cpsr = Cpsr::from_bits(Cpsr::N | Cpsr::C | Cpsr::T).with_it_state(state);
+
+        assert_eq!(cpsr.it_state(), state);
+        assert_eq!(state.current_condition(), Some(Condition::Ne));
+        assert_eq!(state.advance().bits(), 0x18);
+        assert_eq!(state.advance().current_condition(), Some(Condition::Ne));
+        assert!(!state.advance().advance().is_active());
+        assert_eq!(
+            cpsr.bits() & (Cpsr::N | Cpsr::C | Cpsr::T),
+            Cpsr::N | Cpsr::C | Cpsr::T
+        );
+    }
+
+    #[test]
+    fn itstate_rejects_reserved_conditions_and_empty_masks() {
+        assert_eq!(ItState::from_encoding(Condition::Al.encoding(), 8), None);
+        assert_eq!(ItState::from_encoding(Condition::Nv.encoding(), 8), None);
+        assert_eq!(ItState::from_encoding(Condition::Eq.encoding(), 0), None);
     }
 
     #[test]

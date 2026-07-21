@@ -127,7 +127,7 @@ mod tests {
             (
                 ExecutionState::A32,
                 InstructionEncoding::from_u32(0xeaff_ffff),
-                "b imm=#-4",
+                "b imm=#-4, cond=#14",
                 CoverageId::new(0x0001_0002),
             ),
             (
