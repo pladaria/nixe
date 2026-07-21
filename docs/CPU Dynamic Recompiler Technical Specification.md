@@ -342,7 +342,11 @@ I1, I8, I16, I32, I64, I128, F16, F32, F64, V64, V128, Address
 ```
 
 The distinction between integer bits, floating-point values, vector values, and
-guest addresses catches lowering mistakes. Bitcasts are explicit.
+guest addresses catches lowering mistakes. Guest addresses use dedicated
+integer-to-address, address-offset, and address-to-integer operations with an
+explicit 32- or 64-bit architectural wrapping width. General bitcasts cannot
+enter or leave the address domain. Consequently, frontend IR cannot contain a
+host pointer or a loader-storage offset disguised as a guest address.
 
 ### 9.2 Operation groups
 
@@ -351,7 +355,8 @@ The first complete IR should cover:
 - Integer arithmetic, carry, overflow, shifts, rotates, bit operations.
 - Comparisons and condition evaluation.
 - Guest register and architectural-state reads/writes.
-- Typed loads and stores with alignment, byte order, access class, and ordering.
+- Typed loads and stores with direction, size, alignment, byte order, ordering,
+  privilege regime, access class, and source PC.
 - Acquire, release, barriers, exclusive accesses, and atomic read-modify-write.
 - Floating-point arithmetic, conversion, comparison, and status updates.
 - Vector lane, arithmetic, permute, widening, narrowing, and saturation ops.
@@ -361,6 +366,13 @@ The first complete IR should cover:
 
 An operation that may trap carries a `LocationDescriptor` containing at least
 the guest PC and execution context required by the exception model.
+
+Each memory operation represents one complete architectural access. The
+frontend does not split an access at a page boundary: the backend may select a
+fast path for a proven single-page access or a precise slow path that validates
+the whole range before committing visible effects. Pre- and post-indexed base
+writeback is emitted after the potentially faulting access so optimization and
+lowering preserve exception ordering.
 
 ### 9.3 Flags
 

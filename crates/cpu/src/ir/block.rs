@@ -254,6 +254,7 @@ mod tests {
                         access: MemoryAccess::normal(MemoryAccessSize::Doubleword),
                         byte_order: ByteOrder::Little,
                         volatility: Volatility::NonVolatile,
+                        privilege: crate::ir::op::MemoryPrivilege::Current,
                     },
                 }),
             ),

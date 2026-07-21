@@ -62,7 +62,7 @@ fn lift_branch_register(
         return Ok(LiftOutcome::Interpret(crate::coverage::CoverageId::new(5)));
     }
     let address_bits = read_gpr(builder, source, rn, IrType::I64, Register31::Zero)?;
-    let address = bitcast(builder, source, address_bits, IrType::Address)?;
+    let address = guest_address_from_integer(builder, source, address_bits)?;
     let target = indirect_target(address, ExecutionState::A64);
     Ok(match masked {
         0xd61f_0000 => LiftOutcome::Terminate(Terminator::Indirect { target }),

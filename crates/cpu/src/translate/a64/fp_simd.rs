@@ -345,12 +345,7 @@ fn lift_fp_simd_memory(
             .location
             .pc
             .wrapping_offset(sign_extend(u64::from(fields.immediate_19), 19) << 2);
-        bitcast(
-            builder,
-            decoded.location,
-            Immediate::I64(target.get()).into(),
-            IrType::Address,
-        )?
+        Immediate::Address(target).into()
     } else {
         let base = memory::base_address(builder, decoded.location, rn)?;
         if matches!(operation, FpSimdInstruction::MemoryRegister(_)) {
@@ -382,14 +377,7 @@ fn lift_fp_simd_memory(
                 &[IrType::I64],
                 OperationEffects::default(),
             )?[0];
-            let raw = binary(
-                builder,
-                decoded.location,
-                IntegerBinaryKind::Add,
-                base,
-                offset.into(),
-            )?;
-            bitcast(builder, decoded.location, raw, IrType::Address)?
+            guest_address_offset(builder, decoded.location, base, offset.into())?
         } else {
             let offset = if matches!(operation, FpSimdInstruction::MemoryUnsigned(_)) {
                 i64::from(u32::from(fields.immediate_12)) * size.bytes() as i64
@@ -399,10 +387,9 @@ fn lift_fp_simd_memory(
             let transfer_base = if matches!(operation, FpSimdInstruction::MemoryPostIndex(_)) {
                 base
             } else {
-                binary(
+                guest_address_offset(
                     builder,
                     decoded.location,
-                    IntegerBinaryKind::Add,
                     base,
                     Immediate::I64(offset as u64).into(),
                 )?
@@ -411,15 +398,19 @@ fn lift_fp_simd_memory(
                 operation,
                 FpSimdInstruction::MemoryPreIndex(_) | FpSimdInstruction::MemoryPostIndex(_)
             ) {
-                writeback = Some(binary(
+                let updated_address = guest_address_offset(
                     builder,
                     decoded.location,
-                    IntegerBinaryKind::Add,
                     base,
                     Immediate::I64(offset as u64).into(),
+                )?;
+                writeback = Some(guest_address_to_integer(
+                    builder,
+                    decoded.location,
+                    updated_address,
                 )?);
             }
-            bitcast(builder, decoded.location, transfer_base, IrType::Address)?
+            transfer_base
         }
     };
     let descriptor = memory::descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal);

@@ -12,9 +12,10 @@ use crate::{
 use super::{
     block::{BlockExit, BlockExitKind, IrBlock},
     op::{
-        AtomicOperation, CacheMaintenanceOperation, ExclusiveOperation, FlagOperation,
-        FloatingPointOperation, IrOperation, LaneType, MemoryOperation, OperationKind,
-        ScalarOperation, StateRegister, VectorArrangement, VectorOperation, Volatility,
+        AddressOperation, AtomicOperation, CacheMaintenanceOperation, ExclusiveOperation,
+        FlagOperation, FloatingPointOperation, GuestAddressWidth, IrOperation, LaneType,
+        MemoryOperation, OperationKind, ScalarOperation, StateRegister, VectorArrangement,
+        VectorOperation, Volatility,
     },
     terminator::{ControlTarget, Terminator},
     types::IrType,
@@ -331,6 +332,7 @@ fn verify_operation_types(index: usize, operation: &IrOperation) -> Result<(), V
             expect_results(index, &results, &[])
         }
         OperationKind::Scalar(scalar) => verify_scalar(index, scalar, &results),
+        OperationKind::Address(address) => verify_address(index, address, &results),
         OperationKind::Flags(flags) => verify_flags(index, flags, &results),
         OperationKind::Memory(memory) => verify_memory(index, memory, &results),
         OperationKind::Barrier(_) => expect_results(index, &results, &[]),
@@ -357,6 +359,46 @@ fn verify_operation_types(index: usize, operation: &IrOperation) -> Result<(), V
                 return Err(error("an operation cannot define more than three results"));
             }
             Ok(())
+        }
+    }
+}
+
+fn verify_address(
+    index: usize,
+    operation: &AddressOperation,
+    results: &[Value],
+) -> Result<(), VerificationError> {
+    match *operation {
+        AddressOperation::FromInteger { value, width } => {
+            let expected = match width {
+                GuestAddressWidth::Bits32 => IrType::I32,
+                GuestAddressWidth::Bits64 => IrType::I64,
+            };
+            expect_type(index, value, expected, "guest-address source")?;
+            expect_results(index, results, &[IrType::Address])
+        }
+        AddressOperation::Offset {
+            base,
+            offset,
+            width,
+        } => {
+            expect_type(index, base, IrType::Address, "guest-address base")?;
+            let expected = match width {
+                GuestAddressWidth::Bits32 => IrType::I32,
+                GuestAddressWidth::Bits64 => IrType::I64,
+            };
+            expect_type(index, offset, expected, "guest-address offset")?;
+            expect_results(index, results, &[IrType::Address])
+        }
+        AddressOperation::ToInteger { address, to } => {
+            expect_type(index, address, IrType::Address, "guest address")?;
+            if !matches!(to, IrType::I32 | IrType::I64) {
+                return Err(VerificationError::operation(
+                    index,
+                    "guest addresses can only convert to I32 or I64",
+                ));
+            }
+            expect_results(index, results, &[to])
         }
     }
 }
@@ -444,11 +486,13 @@ fn verify_scalar(
         ScalarOperation::Bitcast { value, to } => {
             if to == IrType::Flags
                 || value.ty() == IrType::Flags
+                || to == IrType::Address
+                || value.ty() == IrType::Address
                 || to.bit_width() != value.ty().bit_width()
             {
                 return Err(VerificationError::operation(
                     index,
-                    "bitcast source and destination must have equal fixed widths",
+                    "bitcast requires equal fixed non-address widths; use an address operation for guest addresses",
                 ));
             }
             expect_results(index, results, &[to])
@@ -944,6 +988,11 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
             | ScalarOperation::Truncate { value, .. }
             | ScalarOperation::Bitcast { value, .. } => operands.push(value),
         },
+        OperationKind::Address(operation) => match *operation {
+            AddressOperation::FromInteger { value, .. } => operands.push(value),
+            AddressOperation::Offset { base, offset, .. } => operands.extend([base, offset]),
+            AddressOperation::ToInteger { address, .. } => operands.push(address),
+        },
         OperationKind::Flags(operation) => match *operation {
             FlagOperation::FromArithmetic {
                 result,
@@ -1207,9 +1256,9 @@ mod tests {
         ir::{
             block::{BlockMetadata, InstructionSource},
             op::{
-                AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation, ByteOrder,
-                EffectSet, IntegerBinaryKind, MemoryDescriptor, OperationEffects, OperationResults,
-                ScalarOperation,
+                AddressOperation, AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation,
+                ByteOrder, EffectSet, GuestAddressWidth, IntegerBinaryKind, MemoryDescriptor,
+                OperationEffects, OperationResults, ScalarOperation,
             },
             terminator::ControlTarget,
             value::{Immediate, Value},
@@ -1235,6 +1284,40 @@ mod tests {
             page: GuestPhysicalPageId::new(2),
             generation: CodeGeneration::new(4),
         }
+    }
+
+    #[test]
+    fn guest_address_operations_enforce_architectural_widths() {
+        let a32_source = LocationDescriptor::new(
+            GuestVirtualAddress::new(0xffff_fffc),
+            ExecutionState::A32,
+            CpuProfileId::new(9),
+        );
+        let a32_pc_relative = IrOperation::new(
+            a32_source,
+            OperationResults::one(Value::new(ValueId::new(0), IrType::Address)),
+            OperationKind::Address(AddressOperation::Offset {
+                base: Immediate::Address(a32_source.pc).into(),
+                offset: Immediate::I32(8).into(),
+                width: GuestAddressWidth::Bits32,
+            }),
+        );
+        verify_operation_types(0, &a32_pc_relative).unwrap();
+
+        let malformed = IrOperation::new(
+            location(0x1000),
+            OperationResults::one(Value::new(ValueId::new(0), IrType::Address)),
+            OperationKind::Scalar(ScalarOperation::Bitcast {
+                value: Immediate::I64(0x1000).into(),
+                to: IrType::Address,
+            }),
+        );
+        assert!(
+            verify_operation_types(0, &malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("address operation")
+        );
     }
 
     fn direct_terminator() -> Terminator {
@@ -1356,6 +1439,7 @@ mod tests {
             ),
             byte_order: ByteOrder::Little,
             volatility: Volatility::Volatile,
+            privilege: crate::ir::op::MemoryPrivilege::Current,
         };
         let atomic_descriptor = MemoryDescriptor {
             access: MemoryAccess::new(
@@ -1366,6 +1450,7 @@ mod tests {
             ),
             byte_order: ByteOrder::Little,
             volatility: Volatility::NonVolatile,
+            privilege: crate::ir::op::MemoryPrivilege::Current,
         };
         let mut malformed = [
             IrOperation::new(
