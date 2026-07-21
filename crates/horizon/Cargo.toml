@@ -2,6 +2,7 @@
 name = "swiitx-horizon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 swiitx-loader-storage.workspace = true
