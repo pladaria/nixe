@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use sanitize_filename::{Options, sanitize_with_options};
 use swiitx_config::SwiitxConfig;
-use swiitx_loader_content::{NacpLoader, NcaFormatVersion, NcaKeySet};
+use swiitx_loader_content::{ApplicationControlProperty, NacpLoader, NcaFormatVersion, NcaKeySet};
 use swiitx_loader_executable::NroLoader;
 use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
 use swiitx_loader_title::{
-    CnmtExtendedHeader, ControlMetadata, EntryKind, NacpLanguage, NcaInspection, PackageInspection,
-    ResolvedTitle, TitleCatalog, TitleError, TitleInspection, TitleInspector, TitleResolver,
+    CnmtExtendedHeader, ControlMetadata, DirectoryScanOptions, EntryKind, NacpLanguage,
+    NcaInspection, NroInspection, PackageInspection, ResolvedTitle, TitleCatalog, TitleInspection,
+    TitleInspector, TitleResolver,
 };
 
 const MAX_CACHED_ICON_SIZE: u64 = 16 * 1024 * 1024;
@@ -25,10 +26,19 @@ struct CliArguments {
 
 struct CliOutput {
     file_inspections: Vec<TitleInspection>,
-    resolved_titles: Vec<ResolvedTitle>,
-    directory_nros: Vec<swiitx_loader_title::NroInspection>,
-    inspected_directories: bool,
+    library_titles: Option<Vec<LibraryTitle>>,
     preferred_languages: Vec<NacpLanguage>,
+}
+
+enum LibraryTitle {
+    Installed(Box<ResolvedTitle>),
+    Homebrew(Box<HomebrewTitle>),
+}
+
+struct HomebrewTitle {
+    inspection: NroInspection,
+    control: Option<ApplicationControlProperty>,
+    icon: Option<Vec<u8>>,
 }
 
 fn main() -> ExitCode {
@@ -52,10 +62,8 @@ fn main() -> ExitCode {
     match run(arguments) {
         Ok(output) => {
             let mut wrote_output = false;
-            if output.inspected_directories {
-                print_resolved_titles(&output.resolved_titles, &output.preferred_languages);
-                println!();
-                print_nros(&output.directory_nros);
+            if let Some(titles) = &output.library_titles {
+                print_library_titles(titles, &output.preferred_languages);
                 wrote_output = true;
             }
             for inspection in &output.file_inspections {
@@ -139,34 +147,22 @@ fn run(arguments: CliArguments) -> Result<CliOutput, String> {
     }
     let mut catalog = TitleCatalog::new();
     let mut file_inspections = Vec::new();
-    let mut directory_nros = Vec::new();
-    let mut seen_nros = BTreeSet::new();
-    let mut inspected_directories = false;
+    let mut homebrew_titles = Vec::new();
+    let mut seen_library_files = BTreeSet::new();
+    let mut has_library_paths = false;
     for path in paths {
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("cannot access {}: {error}", path.display()))?;
         if metadata.is_dir() {
-            inspected_directories = true;
-            let discovered_nros = TitleInspector::inspect_nros_with_options(&path, options)
-                .map_err(|error| error.to_string())?;
-            let directory_has_nros = !discovered_nros.is_empty();
-            for nro in discovered_nros {
-                let identity = fs::canonicalize(&nro.path).map_err(|error| {
-                    format!("cannot resolve NRO path {}: {error}", nro.path.display())
-                })?;
-                if seen_nros.insert(identity) {
-                    directory_nros.push(nro);
-                }
-            }
-            match TitleCatalog::scan_directory_with_key_set_and_options(&path, &mut keys, options) {
-                Ok(discovered) => {
-                    for package in discovered.packages() {
-                        catalog.add(package.clone());
-                    }
-                }
-                Err(TitleError::NoSupportedPackages { .. }) if directory_has_nros => {}
-                Err(error) => return Err(error.to_string()),
-            }
+            has_library_paths = true;
+            scan_library_directory(
+                &path,
+                options,
+                &mut keys,
+                &mut catalog,
+                &mut homebrew_titles,
+                &mut seen_library_files,
+            )?;
         } else if metadata.is_file() {
             file_inspections.push(
                 TitleInspector::inspect_with_key_set_and_options(&path, &mut keys, options)
@@ -176,21 +172,113 @@ fn run(arguments: CliArguments) -> Result<CliOutput, String> {
             return Err(format!("unsupported path type: {}", path.display()));
         }
     }
-    let resolved_titles =
-        TitleResolver::resolve_all(&catalog).map_err(|error| error.to_string())?;
+    let mut library_titles = TitleResolver::resolve_all(&catalog)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|title| LibraryTitle::Installed(Box::new(title)))
+        .chain(
+            homebrew_titles
+                .into_iter()
+                .map(|title| LibraryTitle::Homebrew(Box::new(title))),
+        )
+        .collect::<Vec<_>>();
+    sort_library_titles(&mut library_titles, &preferred_languages);
     let cache_root = PathBuf::from("cache");
-    cache_resolved_title_icons(&resolved_titles, &preferred_languages, &cache_root)?;
+    cache_library_title_icons(&library_titles, &preferred_languages, &cache_root)?;
     cache_inspection_icons(&file_inspections, &preferred_languages, &cache_root)?;
-    for nro in &directory_nros {
-        cache_nro_icon(&nro.path, &preferred_languages, &cache_root)?;
-    }
     Ok(CliOutput {
         file_inspections,
-        resolved_titles,
-        directory_nros,
-        inspected_directories,
+        library_titles: has_library_paths.then_some(library_titles),
         preferred_languages,
     })
+}
+
+fn scan_library_directory(
+    root: &std::path::Path,
+    options: DirectoryScanOptions,
+    keys: &mut NcaKeySet,
+    catalog: &mut TitleCatalog,
+    homebrew_titles: &mut Vec<HomebrewTitle>,
+    seen_files: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    let candidates = directory_files(root, options)?;
+    let supported = candidates
+        .into_iter()
+        .filter(|path| is_package(path) || has_extension(path, "nro"))
+        .collect::<Vec<_>>();
+    if supported.is_empty() {
+        return Err(format!(
+            "no supported title packages or NRO executables found at {}",
+            root.display()
+        ));
+    }
+
+    for path in supported {
+        let identity = fs::canonicalize(&path)
+            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+        if !seen_files.insert(identity) {
+            continue;
+        }
+        if has_extension(&path, "nro") {
+            let mut inspection =
+                TitleInspector::inspect_with_key_set_and_options(&path, keys, options)
+                    .map_err(|error| error.to_string())?;
+            let nro = inspection.nros.pop().ok_or_else(|| {
+                format!("NRO inspection returned no title for {}", path.display())
+            })?;
+            homebrew_titles.push(load_homebrew_title(nro)?);
+        } else {
+            let discovered = TitleCatalog::load_package_with_key_set(&path, keys)
+                .map_err(|error| error.to_string())?;
+            for package in discovered.packages() {
+                catalog.add(package.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn directory_files(
+    root: &std::path::Path,
+    options: DirectoryScanOptions,
+) -> Result<Vec<PathBuf>, String> {
+    let mut directories = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read directory {}: {error}", directory.display()))?;
+        let mut nested = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("cannot read directory {}: {error}", directory.display())
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if file_type.is_file() {
+                files.push(path);
+            } else if options.recursive && file_type.is_dir() {
+                nested.push(path);
+            }
+        }
+        nested.sort_by(|left, right| right.cmp(left));
+        directories.extend(nested);
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_package(path: &std::path::Path) -> bool {
+    ["nsp", "nsz", "xci", "xcz"]
+        .into_iter()
+        .any(|extension| has_extension(path, extension))
+}
+
+fn has_extension(path: &std::path::Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn select_inspection_paths(explicit: Vec<PathBuf>, configured: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -201,34 +289,104 @@ fn select_inspection_paths(explicit: Vec<PathBuf>, configured: Vec<PathBuf>) -> 
     }
 }
 
-fn cache_resolved_title_icons(
-    titles: &[ResolvedTitle],
+fn load_homebrew_title(inspection: NroInspection) -> Result<HomebrewTitle, String> {
+    let path = &inspection.path;
+    let storage = FileStorage::open(path)
+        .map_err(|error| format!("cannot open NRO {}: {error}", path.display()))?;
+    let image = NroLoader::load(Arc::new(storage))
+        .map_err(|error| format!("cannot load NRO {}: {error}", path.display()))?;
+    let Some(assets) = image.assets() else {
+        return Ok(HomebrewTitle {
+            inspection,
+            control: None,
+            icon: None,
+        });
+    };
+    let control = assets
+        .nacp()
+        .map(|storage| NacpLoader::load(storage.clone()))
+        .transpose()
+        .map_err(|error| format!("cannot read NRO NACP from {}: {error}", path.display()))?;
+    let icon = assets
+        .icon()
+        .map(|storage| read_nro_icon(storage, path))
+        .transpose()?;
+    Ok(HomebrewTitle {
+        inspection,
+        control,
+        icon,
+    })
+}
+
+fn sort_library_titles(titles: &mut [LibraryTitle], preferred_languages: &[NacpLanguage]) {
+    titles.sort_by_cached_key(|title| library_title_sort_key(title, preferred_languages));
+}
+
+fn library_title_sort_key(
+    title: &LibraryTitle,
+    preferred_languages: &[NacpLanguage],
+) -> (String, String) {
+    match title {
+        LibraryTitle::Installed(title) => {
+            let name = title
+                .control_metadata()
+                .and_then(|control| control.nacp.preferred_title(preferred_languages))
+                .map_or_else(
+                    || title.application_id.to_string(),
+                    |(_, metadata)| metadata.name.clone(),
+                );
+            (name.to_lowercase(), title.application_id.to_string())
+        }
+        LibraryTitle::Homebrew(title) => {
+            let path = &title.inspection.path;
+            let name = title
+                .control
+                .as_ref()
+                .and_then(|control| control.preferred_title(preferred_languages))
+                .map_or_else(
+                    || path_fallback_name(path),
+                    |(_, metadata)| metadata.name.clone(),
+                );
+            (name.to_lowercase(), path.to_string_lossy().into_owned())
+        }
+    }
+}
+
+fn cache_library_title_icons(
+    titles: &[LibraryTitle],
     preferred_languages: &[NacpLanguage],
     cache_root: &std::path::Path,
 ) -> Result<(), String> {
     for title in titles {
-        let Some(control) = title.control_metadata() else {
-            continue;
-        };
-        let Some(icon) = control.preferred_icon(preferred_languages) else {
-            continue;
-        };
-        let fallback = title.application_id.to_string();
-        let title_name = control
-            .nacp
-            .preferred_title(preferred_languages)
-            .map(|(_, title)| title.name.as_str());
-        let directory = cache_directory(cache_root, title_name, &fallback)?;
-        let bytes = icon.bytes().map_err(|error| {
-            format!(
-                "cannot read effective icon {} for {}: {error}",
-                icon.filename, title.application_id
-            )
-        })?;
-        write_cached_icon(
-            &directory.join(cached_icon_filename(&icon.filename)),
-            &bytes,
-        )?;
+        match title {
+            LibraryTitle::Installed(title) => {
+                let Some(control) = title.control_metadata() else {
+                    continue;
+                };
+                let Some(icon) = control.preferred_icon(preferred_languages) else {
+                    continue;
+                };
+                let fallback = title.application_id.to_string();
+                let title_name = control
+                    .nacp
+                    .preferred_title(preferred_languages)
+                    .map(|(_, title)| title.name.as_str());
+                let directory = cache_directory(cache_root, title_name, &fallback)?;
+                let bytes = icon.bytes().map_err(|error| {
+                    format!(
+                        "cannot read effective icon {} for {}: {error}",
+                        icon.filename, title.application_id
+                    )
+                })?;
+                write_cached_icon(
+                    &directory.join(cached_icon_filename(&icon.filename)),
+                    &bytes,
+                )?;
+            }
+            LibraryTitle::Homebrew(title) => {
+                cache_homebrew_icon(title, preferred_languages, cache_root)?;
+            }
+        }
     }
     Ok(())
 }
@@ -251,7 +409,8 @@ fn cache_inspection_icons(
             }
         }
         for nro in &inspection.nros {
-            cache_nro_icon(&nro.path, preferred_languages, cache_root)?;
+            let title = load_homebrew_title(nro.clone())?;
+            cache_homebrew_icon(&title, preferred_languages, cache_root)?;
         }
     }
     Ok(())
@@ -287,42 +446,23 @@ fn cache_control_icon(
     write_cached_icon(&directory.join(filename), &bytes)
 }
 
-fn cache_nro_icon(
-    path: &std::path::Path,
+fn cache_homebrew_icon(
+    title: &HomebrewTitle,
     preferred_languages: &[NacpLanguage],
     cache_root: &std::path::Path,
 ) -> Result<(), String> {
-    let storage = FileStorage::open(path).map_err(|error| {
-        format!(
-            "cannot open NRO {} for icon caching: {error}",
-            path.display()
-        )
-    })?;
-    let image = NroLoader::load(Arc::new(storage)).map_err(|error| {
-        format!(
-            "cannot load NRO {} for icon caching: {error}",
-            path.display()
-        )
-    })?;
-    let Some(assets) = image.assets() else {
+    let Some(icon) = &title.icon else {
         return Ok(());
     };
-    let Some(icon) = assets.icon() else {
-        return Ok(());
-    };
-    let title_name = assets
-        .nacp()
-        .map(|storage| NacpLoader::load(storage.clone()))
-        .transpose()
-        .map_err(|error| format!("cannot read NRO NACP from {}: {error}", path.display()))?
-        .and_then(|nacp| {
-            nacp.preferred_title(preferred_languages)
-                .map(|(_, title)| title.name.clone())
-        });
+    let path = &title.inspection.path;
+    let title_name = title.control.as_ref().and_then(|control| {
+        control
+            .preferred_title(preferred_languages)
+            .map(|(_, title)| title.name.clone())
+    });
     let fallback = path_fallback_name(path);
     let directory = cache_directory(cache_root, title_name.as_deref(), &fallback)?;
-    let bytes = read_nro_icon(icon, path)?;
-    write_cached_icon(&directory.join("icon.jpg"), &bytes)
+    write_cached_icon(&directory.join("icon.jpg"), icon)
 }
 
 fn cache_directory(
@@ -404,68 +544,149 @@ fn sanitize_directory_name(name: &str) -> String {
     )
 }
 
-fn print_resolved_titles(titles: &[ResolvedTitle], preferred_languages: &[NacpLanguage]) {
-    println!("Resolved titles: {}", titles.len());
+fn print_library_titles(titles: &[LibraryTitle], preferred_languages: &[NacpLanguage]) {
+    println!("Titles: {}", titles.len());
     for (index, title) in titles.iter().enumerate() {
         println!();
-        let preferred_title = title
-            .control_metadata()
-            .and_then(|control| control.nacp.preferred_title(preferred_languages));
-        match preferred_title {
-            Some((language, metadata)) => {
-                println!("Title {}: {}", index + 1, metadata.name);
-                println!("  Publisher: {}", metadata.publisher);
-                println!("  Language: {language}");
+        match title {
+            LibraryTitle::Installed(title) => {
+                print_installed_title(index, title, preferred_languages)
             }
-            None => println!("Title {}: {}", index + 1, title.application_id),
-        }
-        println!("  Application ID: {}", title.application_id);
-        println!(
-            "  Base: {} version {}",
-            title.base.title_id, title.base.version
-        );
-        match &title.patch {
-            Some(patch) => println!(
-                "  Selected patch: {} version {}",
-                patch.title_id, patch.version
-            ),
-            None => println!("  Selected patch: none"),
-        }
-        let effective_version = title
-            .patch
-            .as_ref()
-            .map_or(title.base.version, |patch| patch.version);
-        println!("  Effective version: {effective_version}");
-        println!("  Selected DLC: {}", title.add_ons.len());
-        for add_on in &title.add_ons {
-            match add_on.required_application_version() {
-                Some(required_version) => println!(
-                    "    {} version {} (requires application version {})",
-                    add_on.title_id, add_on.version, required_version
-                ),
-                None => println!("    {} version {}", add_on.title_id, add_on.version),
-            }
-        }
-        if let Some(control) = title.control_metadata() {
-            println!("  Display version: {}", control.nacp.display_version);
-            let languages = control
-                .supported_languages()
-                .iter()
-                .map(|language| language.to_string())
-                .collect::<Vec<_>>();
-            println!(
-                "  Supported languages: {}",
-                if languages.is_empty() {
-                    "none".to_owned()
-                } else {
-                    languages.join(", ")
-                }
-            );
-            if let Some(icon) = control.preferred_icon(preferred_languages) {
-                println!("  Effective icon: {} ({})", icon.filename, icon.language);
+            LibraryTitle::Homebrew(title) => {
+                print_homebrew_title(index, title, preferred_languages)
             }
         }
     }
+}
+
+fn print_installed_title(
+    index: usize,
+    title: &ResolvedTitle,
+    preferred_languages: &[NacpLanguage],
+) {
+    let preferred_title = title
+        .control_metadata()
+        .and_then(|control| control.nacp.preferred_title(preferred_languages));
+    match preferred_title {
+        Some((language, metadata)) => {
+            println!("Title {}: {}", index + 1, metadata.name);
+            println!("  Type: installed application");
+            println!("  Publisher: {}", metadata.publisher);
+            println!("  Language: {language}");
+        }
+        None => {
+            println!("Title {}: {}", index + 1, title.application_id);
+            println!("  Type: installed application");
+        }
+    }
+    println!("  Application ID: {}", title.application_id);
+    println!(
+        "  Base: {} version {}",
+        title.base.title_id, title.base.version
+    );
+    match &title.patch {
+        Some(patch) => println!(
+            "  Selected patch: {} version {}",
+            patch.title_id, patch.version
+        ),
+        None => println!("  Selected patch: none"),
+    }
+    let effective_version = title
+        .patch
+        .as_ref()
+        .map_or(title.base.version, |patch| patch.version);
+    println!("  Effective version: {effective_version}");
+    println!("  Selected DLC: {}", title.add_ons.len());
+    for add_on in &title.add_ons {
+        match add_on.required_application_version() {
+            Some(required_version) => println!(
+                "    {} version {} (requires application version {})",
+                add_on.title_id, add_on.version, required_version
+            ),
+            None => println!("    {} version {}", add_on.title_id, add_on.version),
+        }
+    }
+    if let Some(control) = title.control_metadata() {
+        println!("  Display version: {}", control.nacp.display_version);
+        let languages = control
+            .supported_languages()
+            .iter()
+            .map(|language| language.to_string())
+            .collect::<Vec<_>>();
+        println!(
+            "  Supported languages: {}",
+            if languages.is_empty() {
+                "none".to_owned()
+            } else {
+                languages.join(", ")
+            }
+        );
+        if let Some(icon) = control.preferred_icon(preferred_languages) {
+            println!("  Effective icon: {} ({})", icon.filename, icon.language);
+        }
+    }
+}
+
+fn print_homebrew_title(index: usize, title: &HomebrewTitle, preferred_languages: &[NacpLanguage]) {
+    let preferred_title = title
+        .control
+        .as_ref()
+        .and_then(|control| control.preferred_title(preferred_languages));
+    match preferred_title {
+        Some((language, metadata)) => {
+            println!("Title {}: {}", index + 1, metadata.name);
+            println!("  Type: homebrew NRO");
+            println!("  Publisher: {}", metadata.publisher);
+            println!("  Language: {language}");
+        }
+        None => {
+            println!(
+                "Title {}: {}",
+                index + 1,
+                path_fallback_name(&title.inspection.path)
+            );
+            println!("  Type: homebrew NRO");
+        }
+    }
+    println!("  Path: {}", title.inspection.path.display());
+    if let Some(control) = &title.control {
+        println!("  Display version: {}", control.display_version);
+        let languages = control
+            .supported_languages
+            .iter()
+            .map(|language| language.to_string())
+            .collect::<Vec<_>>();
+        println!(
+            "  Supported languages: {}",
+            if languages.is_empty() {
+                "none".to_owned()
+            } else {
+                languages.join(", ")
+            }
+        );
+    }
+    println!(
+        "  Icon: {}",
+        if title.icon.is_some() {
+            "available"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "  RomFS: {}",
+        if title
+            .inspection
+            .assets
+            .as_ref()
+            .and_then(|assets| assets.romfs_size)
+            .is_some()
+        {
+            "available"
+        } else {
+            "none"
+        }
+    );
 }
 
 fn print_inspection(inspection: &TitleInspection, preferred_languages: &[NacpLanguage]) {
@@ -1141,11 +1362,51 @@ mod tests {
         let icon = [0xff, 0xd8, 0xff, 0xd9];
         fs::write(&nro_path, synthetic_nro_with_icon("Homebrew: Demo", &icon)).unwrap();
 
-        cache_nro_icon(&nro_path, &[NacpLanguage::AmericanEnglish], &cache_root).unwrap();
+        let mut inspection = TitleInspector::inspect(&nro_path).unwrap();
+        let title = load_homebrew_title(inspection.nros.pop().unwrap()).unwrap();
+        cache_homebrew_icon(&title, &[NacpLanguage::AmericanEnglish], &cache_root).unwrap();
 
         assert_eq!(
             fs::read(cache_root.join("Homebrew_ Demo").join("icon.jpg")).unwrap(),
             icon
         );
+    }
+
+    #[test]
+    fn directory_scan_exposes_an_nro_as_a_library_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let nro_path = nested.join("demo.nro");
+        fs::write(
+            &nro_path,
+            synthetic_nro_with_icon("Homebrew Demo", &[0xff, 0xd8, 0xff, 0xd9]),
+        )
+        .unwrap();
+        fs::write(directory.path().join("ignored.txt"), b"ignored").unwrap();
+
+        let mut keys = NcaKeySet::from_text("", None).unwrap();
+        let mut catalog = TitleCatalog::new();
+        let mut homebrew = Vec::new();
+        scan_library_directory(
+            directory.path(),
+            DirectoryScanOptions::default(),
+            &mut keys,
+            &mut catalog,
+            &mut homebrew,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(catalog.packages().is_empty());
+        assert_eq!(homebrew.len(), 1);
+        assert_eq!(homebrew[0].inspection.path, nro_path);
+        let (_, title) = homebrew[0]
+            .control
+            .as_ref()
+            .unwrap()
+            .preferred_title(&[NacpLanguage::AmericanEnglish])
+            .unwrap();
+        assert_eq!(title.name, "Homebrew Demo");
     }
 }

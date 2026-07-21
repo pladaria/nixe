@@ -443,34 +443,6 @@ impl TitleInspector {
         Self::inspect_impl(path.as_ref(), Some(keys), options)
     }
 
-    /// Finds and validates standalone NRO executables without inspecting title packages.
-    pub fn inspect_nros_with_options(
-        path: impl AsRef<Path>,
-        options: DirectoryScanOptions,
-    ) -> Result<Vec<NroInspection>, InspectError> {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|source| InspectError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        let candidates = if metadata.is_file() {
-            vec![path.to_owned()]
-        } else if metadata.is_dir() {
-            directory_files(path, options).map_err(|error| InspectError::Io {
-                path: error.path,
-                source: error.source,
-            })?
-        } else {
-            return Err(InspectError::UnsupportedPath(path.to_owned()));
-        };
-
-        candidates
-            .into_iter()
-            .filter(|candidate| has_extension(candidate, "nro"))
-            .map(|candidate| inspect_nro(&candidate))
-            .collect()
-    }
-
     fn inspect_paths_impl(
         paths: Vec<PathBuf>,
         mut keys: Option<&mut NcaKeySet>,
@@ -1575,14 +1547,6 @@ mod tests {
         assert_eq!(inspection.nros.len(), 1);
         assert_eq!(inspection.nros[0].path, nro_path);
         assert_eq!(inspection.ignored_files, vec![ignored_path]);
-
-        let nros = TitleInspector::inspect_nros_with_options(
-            directory.path(),
-            DirectoryScanOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(nros.len(), 1);
-        assert_eq!(nros[0].path, inspection.nros[0].path);
     }
 
     #[test]
