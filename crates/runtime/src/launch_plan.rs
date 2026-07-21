@@ -259,6 +259,10 @@ impl LaunchPlan {
     pub fn entry_module(&self) -> &LaunchModule {
         &self.modules[self.entry_module]
     }
+    /// Returns the entry module's stable index in [`Self::modules`].
+    pub const fn entry_module_index(&self) -> usize {
+        self.entry_module
+    }
     /// Returns module indices in process-wide symbol lookup precedence.
     pub fn symbol_scope(&self) -> &[usize] {
         &self.symbol_scope
