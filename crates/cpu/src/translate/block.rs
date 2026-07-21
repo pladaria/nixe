@@ -123,21 +123,24 @@ pub fn translate_block(
         let outcome = match crate::decode::decode(profile, location, encoding) {
             DecodeResult::Decoded(decoded) => lift_decoded(&mut builder, &decoded),
             DecodeResult::RecognizedUnimplemented(decoded) => {
-                LiftOutcome::Terminate(interpret_terminator(&decoded))
+                if crate::interpreter::has_semantics(&decoded) {
+                    LiftOutcome::Terminate(interpret_terminator(&decoded))
+                } else {
+                    LiftOutcome::Terminate(unsupported_terminator(
+                        &decoded,
+                        "neither the lifter nor interpreter implements this instruction",
+                    ))
+                }
             }
-            DecodeResult::Unallocated { reason, .. } => LiftOutcome::Terminate(
-                unsupported_terminator(location, encoding, format!("unallocated: {reason}")),
-            ),
-            DecodeResult::Reserved { name, reason, .. } => LiftOutcome::Terminate(
-                unsupported_terminator(location, encoding, format!("reserved {name}: {reason}")),
-            ),
-            DecodeResult::ProfileDisabled {
-                name, rejection, ..
-            } => LiftOutcome::Terminate(unsupported_terminator(
-                location,
-                encoding,
-                format!("profile-disabled {name}: {rejection}"),
-            )),
+            DecodeResult::Unallocated { .. }
+            | DecodeResult::Reserved { .. }
+            | DecodeResult::ProfileDisabled { .. } => {
+                LiftOutcome::Terminate(Terminator::Exception {
+                    source: location,
+                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    syndrome: None,
+                })
+            }
         };
 
         match outcome {
@@ -154,10 +157,22 @@ pub fn translate_block(
             }
             LiftOutcome::Terminate(terminator) => break terminator,
             LiftOutcome::Interpret(coverage_id) => {
-                break Terminator::InterpretOne {
-                    source: location,
-                    encoding,
-                    coverage_id: coverage_id.get(),
+                let decoded = match crate::decode::decode(profile, location, encoding) {
+                    DecodeResult::Decoded(decoded)
+                    | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
+                    _ => unreachable!("lifter outcome requires a decoded instruction"),
+                };
+                break if crate::interpreter::has_semantics(&decoded) {
+                    Terminator::InterpretOne {
+                        source: location,
+                        encoding,
+                        coverage_id: coverage_id.get(),
+                    }
+                } else {
+                    unsupported_terminator(
+                        &decoded,
+                        "lifter requested fallback but interpreter semantics are unavailable",
+                    )
                 };
             }
         }
@@ -265,13 +280,15 @@ fn interpret_terminator(decoded: &DecodedInstruction<DecodedOpcode>) -> Terminat
 }
 
 fn unsupported_terminator(
-    source: LocationDescriptor,
-    encoding: InstructionEncoding,
+    decoded: &DecodedInstruction<DecodedOpcode>,
     reason: impl Into<Box<str>>,
 ) -> Terminator {
     Terminator::UnsupportedInstruction {
-        source,
-        encoding,
+        source: decoded.location,
+        encoding: decoded.encoding,
+        disassembly: crate::decode::disassemble(&decoded.instruction)
+            .to_string()
+            .into(),
         reason: reason.into(),
     }
 }
@@ -711,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_and_interpreter_fallbacks_cut_immediately() {
+    fn exceptions_unsupported_and_interpreter_fallbacks_cut_immediately() {
         let profile = GuestCpuProfile::switch_1();
         let mut unallocated = memory_with_pages(0x1000, 1);
         put(&mut unallocated, 1, 0, &0_u32.to_le_bytes());
@@ -725,7 +742,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             block.terminator,
-            Terminator::UnsupportedInstruction { .. }
+            Terminator::Exception {
+                kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                ..
+            }
         ));
 
         let mut recognized = memory_with_pages(0x2000, 1);
@@ -738,6 +758,28 @@ mod tests {
             SPACE,
             start(profile, 0x2000, ExecutionState::A64),
             &recognized,
+        )
+        .unwrap();
+        assert!(matches!(
+            block.terminator,
+            Terminator::UnsupportedInstruction {
+                source,
+                encoding,
+                ref disassembly,
+                ..
+            } if source == start(profile, 0x2000, ExecutionState::A64)
+                && encoding == InstructionEncoding::from_u32(0xd503_20df)
+                && !disassembly.is_empty()
+        ));
+
+        let mut interpreter_only = memory_with_pages(0x3000, 1);
+        put(&mut interpreter_only, 1, 0, &0x2001_u16.to_le_bytes());
+        let block = translate_block(
+            BlockTranslationConfig::default(),
+            &profile,
+            SPACE,
+            start(profile, 0x3000, ExecutionState::T32),
+            &interpreter_only,
         )
         .unwrap();
         assert!(matches!(block.terminator, Terminator::InterpretOne { .. }));

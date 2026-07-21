@@ -102,7 +102,7 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         semantic_id: SemanticId::new(0x0002_0003),
         coverage_id: CoverageId::new(0x0002_0003),
         priority: 0,
-        support: DecodeSupport::RecognizedUnimplemented,
+        support: DecodeSupport::Ready,
     },
 ];
 

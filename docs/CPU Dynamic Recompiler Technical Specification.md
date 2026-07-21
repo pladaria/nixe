@@ -979,6 +979,26 @@ Fallback helpers declare:
 Unknown instructions do not become no-ops. Profile-disabled or unallocated
 encodings take the correct exception path.
 
+Interpreter availability and IR-lifter availability are tracked independently.
+An instruction may therefore be decoded and executed by the reference engine
+before it can be lowered to IR. In that case translation ends immediately before
+the instruction with an `InterpretOne` terminator carrying its location, raw
+encoding, and stable coverage ID. The dispatcher validates those fields against
+the live architectural state, executes exactly that instruction, and resumes at
+the interpreter-produced PC. Exceptions and scheduler exits do not synthesize a
+normal fallthrough.
+
+`UnsupportedInstruction` is reserved for recognized encodings implemented by
+neither engine. Its diagnostic contains the raw encoding, deterministic
+disassembly, CPU profile through the source location, and the exact guest PC and
+execution state. Unallocated, reserved, and profile-disabled encodings instead
+leave through the architectural undefined-instruction exception path. No path
+may silently skip an instruction or manufacture a successful result.
+
+Tests and validation tools may enable strict fallback policy. Strict mode rejects
+every `InterpretOne` dispatch before architectural state is mutated, turning
+unexpected fallback coverage into a deterministic test failure.
+
 ## 24. Debugging and instrumentation
 
 Required developer features are:

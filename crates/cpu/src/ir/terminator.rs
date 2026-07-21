@@ -84,6 +84,9 @@ pub enum Terminator {
     UnsupportedInstruction {
         source: LocationDescriptor,
         encoding: InstructionEncoding,
+        /// Deterministic decoder-produced disassembly.
+        disassembly: Box<str>,
+        /// Why neither execution engine can handle the instruction.
         reason: Box<str>,
     },
     /// Non-architectural dispatch/runtime stop.
@@ -139,6 +142,7 @@ mod tests {
         let unsupported = Terminator::UnsupportedInstruction {
             source: location(),
             encoding: InstructionEncoding::from_u16(0xffff),
+            disassembly: "udf #255".into(),
             reason: "missing semantics".into(),
         };
 
