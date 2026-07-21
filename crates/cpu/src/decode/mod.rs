@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn all_shipped_tables_are_consistent_and_ids_are_globally_unique() {
         let tables = [
-            a64::PATTERNS,
+            a64::patterns(),
             a32::PATTERNS,
             t32::PATTERNS_16,
             t32::PATTERNS_32,

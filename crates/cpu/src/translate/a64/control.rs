@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     decode::{
         DecodedOpcode,
-        a64::{A64Instruction, ControlOperation},
+        a64::control::{Instruction as ControlInstruction, Operands as ControlOperands},
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
@@ -14,34 +14,35 @@ use super::{LiftOutcome, direct_target, emit_call, next_pc, sign_extend};
 pub(super) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    instruction: A64Instruction,
-    operation: ControlOperation,
+    instruction: ControlInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fields = instruction.fields;
+    let fields = instruction.operands();
     let source = decoded.location;
-    Ok(match operation {
-        ControlOperation::Nop => LiftOutcome::Continue,
-        ControlOperation::BranchImmediate => {
+    Ok(match instruction {
+        ControlInstruction::Nop(_) => LiftOutcome::Continue,
+        ControlInstruction::BranchImmediate(_) => {
             LiftOutcome::Terminate(super::super::block::direct_branch(direct_target(
                 source,
                 sign_extend(u64::from(fields.immediate_26), 26) << 2,
             )))
         }
-        ControlOperation::BranchLinkImmediate => {
+        ControlInstruction::BranchLinkImmediate(_) => {
             let target =
                 direct_target(source, sign_extend(u64::from(fields.immediate_26), 26) << 2);
             LiftOutcome::Terminate(emit_call(builder, source, target, next_pc(source))?)
         }
-        ControlOperation::BranchRegister => lift_branch_register(builder, decoded, fields)?,
-        ControlOperation::ConditionalBranch => lift_conditional_branch(builder, decoded, fields)?,
-        ControlOperation::CompareBranch => lift_compare_branch(builder, decoded, fields)?,
-        ControlOperation::TestBranch => lift_test_branch(builder, decoded, fields)?,
-        ControlOperation::SupervisorCall => LiftOutcome::Terminate(exception(
+        ControlInstruction::BranchRegister(_) => lift_branch_register(builder, decoded, fields)?,
+        ControlInstruction::ConditionalBranch(_) => {
+            lift_conditional_branch(builder, decoded, fields)?
+        }
+        ControlInstruction::CompareBranch(_) => lift_compare_branch(builder, decoded, fields)?,
+        ControlInstruction::TestBranch(_) => lift_test_branch(builder, decoded, fields)?,
+        ControlInstruction::SupervisorCall(_) => LiftOutcome::Terminate(exception(
             source,
             crate::ir::terminator::ExceptionKind::SupervisorCall,
             Some(u64::from(fields.immediate_16)),
         )),
-        ControlOperation::Breakpoint => LiftOutcome::Terminate(exception(
+        ControlInstruction::Breakpoint(_) => LiftOutcome::Terminate(exception(
             source,
             crate::ir::terminator::ExceptionKind::Breakpoint,
             Some(u64::from(fields.immediate_16)),
@@ -52,7 +53,7 @@ pub(super) fn lift(
 fn lift_branch_register(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: ControlOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let source = decoded.location;
     let masked = fields.branch_register_key;
@@ -74,10 +75,10 @@ fn lift_branch_register(
 fn lift_conditional_branch(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: ControlOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let source = decoded.location;
-    let cond = evaluate_condition(builder, source, condition(u32::from(fields.low4)))?;
+    let cond = evaluate_condition(builder, source, condition(u32::from(fields.condition)))?;
     let displacement = sign_extend(u64::from(fields.immediate_19), 19) << 2;
     Ok(LiftOutcome::Terminate(conditional_terminator(
         cond,
@@ -89,10 +90,10 @@ fn lift_conditional_branch(
 fn lift_compare_branch(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: ControlOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let source = decoded.location;
-    let width = if fields.bit31 {
+    let width = if fields.width_64 {
         IrType::I64
     } else {
         IrType::I32
@@ -103,7 +104,7 @@ fn lift_compare_branch(
     } else {
         Immediate::I32(0)
     };
-    let predicate = if !fields.bit24 {
+    let predicate = if !fields.nonzero {
         IntegerPredicate::Equal
     } else {
         IntegerPredicate::NotEqual
@@ -129,10 +130,10 @@ fn lift_compare_branch(
 fn lift_test_branch(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: ControlOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let source = decoded.location;
-    let bit_index = (u32::from(fields.bit31) << 5) | u32::from(fields.field_19_5);
+    let bit_index = u32::from(fields.bit_index);
     let value = read_gpr(builder, source, fields.rd, IrType::I64, Register31::Zero)?;
     let tested = binary(
         builder,
@@ -141,7 +142,7 @@ fn lift_test_branch(
         value,
         Immediate::I64(1_u64 << bit_index).into(),
     )?;
-    let predicate = if !fields.bit24 {
+    let predicate = if !fields.nonzero {
         IntegerPredicate::Equal
     } else {
         IntegerPredicate::NotEqual

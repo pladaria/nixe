@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     decode::{
         DecodedOpcode,
-        a64::{A64Instruction, IntegerOperation},
+        a64::integer::{Instruction as IntegerInstruction, Operands as IntegerOperands},
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
@@ -14,35 +14,36 @@ use super::LiftOutcome;
 pub(super) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    instruction: A64Instruction,
-    operation: IntegerOperation,
+    instruction: IntegerInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fields = instruction.fields;
-    match operation {
-        IntegerOperation::MoveWide => lift_move_wide(builder, decoded, fields),
-        IntegerOperation::AddSubImmediate => lift_add_sub_immediate(builder, decoded, fields),
-        IntegerOperation::AddSubShifted => lift_add_sub_shifted(builder, decoded, fields),
-        IntegerOperation::AddSubExtended => lift_add_sub_extended(builder, decoded, fields),
-        IntegerOperation::AddSubCarry => lift_add_sub_carry(builder, decoded, fields),
-        IntegerOperation::LogicalImmediate => lift_logical_immediate(builder, decoded, fields),
-        IntegerOperation::LogicalShifted => lift_logical_shifted(builder, decoded, fields),
-        IntegerOperation::Bitfield => lift_bitfield(builder, decoded, fields),
-        IntegerOperation::Extract => lift_extract(builder, decoded, fields),
-        IntegerOperation::TwoSource => lift_two_source(builder, decoded, fields),
-        IntegerOperation::ConditionalCompareRegister
-        | IntegerOperation::ConditionalCompareImmediate => {
+    let fields = instruction.operands();
+    match instruction {
+        IntegerInstruction::MoveWide(_) => lift_move_wide(builder, decoded, fields),
+        IntegerInstruction::AddSubImmediate(_) => lift_add_sub_immediate(builder, decoded, fields),
+        IntegerInstruction::AddSubShifted(_) => lift_add_sub_shifted(builder, decoded, fields),
+        IntegerInstruction::AddSubExtended(_) => lift_add_sub_extended(builder, decoded, fields),
+        IntegerInstruction::AddSubCarry(_) => lift_add_sub_carry(builder, decoded, fields),
+        IntegerInstruction::LogicalImmediate(_) => lift_logical_immediate(builder, decoded, fields),
+        IntegerInstruction::LogicalShifted(_) => lift_logical_shifted(builder, decoded, fields),
+        IntegerInstruction::Bitfield(_) => lift_bitfield(builder, decoded, fields),
+        IntegerInstruction::Extract(_) => lift_extract(builder, decoded, fields),
+        IntegerInstruction::TwoSource(_) => lift_two_source(builder, decoded, fields),
+        IntegerInstruction::ConditionalCompareRegister(_)
+        | IntegerInstruction::ConditionalCompareImmediate(_) => {
             lift_conditional_compare(builder, decoded, fields)
         }
-        IntegerOperation::ConditionalSelect => lift_conditional_select(builder, decoded, fields),
-        IntegerOperation::ThreeSource => lift_three_source(builder, decoded, fields),
-        IntegerOperation::OneSource => lift_one_source(builder, decoded, fields),
-        IntegerOperation::Adr => lift_adr(builder, decoded, fields, false),
-        IntegerOperation::Adrp => lift_adr(builder, decoded, fields, true),
+        IntegerInstruction::ConditionalSelect(_) => {
+            lift_conditional_select(builder, decoded, fields)
+        }
+        IntegerInstruction::ThreeSource(_) => lift_three_source(builder, decoded, fields),
+        IntegerInstruction::OneSource(_) => lift_one_source(builder, decoded, fields),
+        IntegerInstruction::Adr(_) => lift_adr(builder, decoded, fields, false),
+        IntegerInstruction::Adrp(_) => lift_adr(builder, decoded, fields, true),
     }
 }
 
-pub(super) fn integer_width(fields: A64Fields) -> IrType {
-    if fields.bit31 {
+pub(super) fn integer_width(fields: IntegerOperands) -> IrType {
+    if fields.width_64 {
         IrType::I64
     } else {
         IrType::I32
@@ -60,16 +61,16 @@ fn immediate_for(width: IrType, value: u64) -> Immediate {
 fn lift_move_wide(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let hw = u32::from(fields.field_21_2);
+    let hw = u32::from(fields.opcode_2);
     if width == IrType::I32 && hw >= 2 {
         return Ok(interpret(decoded));
     }
     let shift = hw * 16;
     let imm = u64::from(u32::from(fields.immediate_16)) << shift;
-    let opc = u32::from((fields.bit30 as u8) * 2 + fields.bit29 as u8);
+    let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
     let value: Operand = match opc {
         0 => immediate_for(width, !imm).into(), // MOVN, truncated by the immediate type
         2 => immediate_for(width, imm).into(),  // MOVZ
@@ -169,7 +170,7 @@ fn emit_add_sub(
 fn lift_add_sub_immediate(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let lhs = read_gpr(
@@ -179,9 +180,9 @@ fn lift_add_sub_immediate(
         width,
         Register31::StackPointer,
     )?;
-    let shift = if fields.bit22 { 12 } else { 0 };
-    let rhs = immediate_for(width, u64::from(u32::from(fields.field_10_12)) << shift).into();
-    let set_flags = fields.bit29;
+    let shift = if fields.n { 12 } else { 0 };
+    let rhs = immediate_for(width, u64::from(u32::from(fields.immediate_12)) << shift).into();
+    let set_flags = fields.set_flags;
     emit_add_sub(
         builder,
         decoded.location,
@@ -189,7 +190,7 @@ fn lift_add_sub_immediate(
         rhs,
         AddSubSpec {
             width,
-            subtract: fields.bit30,
+            subtract: fields.subtract,
             set_flags,
             destination: fields.rd,
             destination_register31: if set_flags {
@@ -205,15 +206,15 @@ fn lift_add_sub_immediate(
 fn shifted_register(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
-    fields: A64Fields,
+    fields: IntegerOperands,
     width: IrType,
     index: u8,
 ) -> Result<Option<Operand>, BuildError> {
-    let amount = u32::from(fields.field_10_6);
+    let amount = u32::from(fields.shift_amount);
     if width == IrType::I32 && amount >= 32 {
         return Ok(None);
     }
-    let kind = match u32::from(fields.field_22_2) {
+    let kind = match u32::from(fields.shift_kind) {
         0 => ShiftKind::LogicalLeft,
         1 => ShiftKind::LogicalRight,
         2 => ShiftKind::ArithmeticRight,
@@ -240,9 +241,9 @@ fn shifted_register(
 fn lift_add_sub_shifted(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    if u32::from(fields.field_22_2) == 3 {
+    if u32::from(fields.shift_kind) == 3 {
         return Ok(interpret(decoded));
     }
     let width = integer_width(fields);
@@ -263,8 +264,8 @@ fn lift_add_sub_shifted(
         rhs,
         AddSubSpec {
             width,
-            subtract: fields.bit30,
-            set_flags: fields.bit29,
+            subtract: fields.subtract,
+            set_flags: fields.set_flags,
             destination: fields.rd,
             destination_register31: Register31::Zero,
         },
@@ -275,10 +276,10 @@ fn lift_add_sub_shifted(
 fn lift_add_sub_extended(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let shift = u32::from(fields.field_10_3);
+    let shift = u32::from(fields.small_shift);
     if shift > 4 {
         return Ok(interpret(decoded));
     }
@@ -289,7 +290,7 @@ fn lift_add_sub_extended(
         width,
         Register31::Zero,
     )?;
-    let extension = (u32::from(fields.field_13_3)) as u64;
+    let extension = (u32::from(fields.extension)) as u64;
     let result = helper(
         builder,
         decoded.location,
@@ -309,7 +310,7 @@ fn lift_add_sub_extended(
         width,
         Register31::StackPointer,
     )?;
-    let set_flags = fields.bit29;
+    let set_flags = fields.set_flags;
     emit_add_sub(
         builder,
         decoded.location,
@@ -317,7 +318,7 @@ fn lift_add_sub_extended(
         result.into(),
         AddSubSpec {
             width,
-            subtract: fields.bit30,
+            subtract: fields.subtract,
             set_flags,
             destination: fields.rd,
             destination_register31: if set_flags {
@@ -337,7 +338,7 @@ fn carry_in(builder: &mut IrBuilder, source: LocationDescriptor) -> Result<Opera
 fn lift_add_sub_carry(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let lhs = read_gpr(
@@ -354,7 +355,7 @@ fn lift_add_sub_carry(
         width,
         Register31::Zero,
     )?;
-    let subtract = fields.bit30;
+    let subtract = fields.subtract;
     if subtract {
         rhs = binary(
             builder,
@@ -384,7 +385,7 @@ fn lift_add_sub_carry(
         values[0].into(),
         Register31::Zero,
     )?;
-    if fields.bit29 {
+    if fields.set_flags {
         arithmetic_flags(
             builder,
             decoded.location,
@@ -420,14 +421,14 @@ fn logical_result(
 fn lift_logical_immediate(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let size = if width == IrType::I64 { 64 } else { 32 };
     let Ok(immediate) = decode_a64_logical_immediate(
-        fields.bit22,
-        (u32::from(fields.field_16_6)) as u8,
-        (u32::from(fields.field_10_6)) as u8,
+        fields.n,
+        (u32::from(fields.immediate_6_high)) as u8,
+        (u32::from(fields.shift_amount)) as u8,
         size,
     ) else {
         return Ok(interpret(decoded));
@@ -439,7 +440,7 @@ fn lift_logical_immediate(
         width,
         Register31::Zero,
     )?;
-    let opc = u32::from((fields.bit30 as u8) * 2 + fields.bit29 as u8);
+    let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
     let result = logical_result(
         builder,
         decoded.location,
@@ -463,14 +464,14 @@ fn lift_logical_immediate(
 fn lift_logical_shifted(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let Some(mut rhs) = shifted_register(builder, decoded.location, fields, width, fields.rm)?
     else {
         return Ok(interpret(decoded));
     };
-    if fields.bit21 {
+    if fields.invert {
         rhs = binary(
             builder,
             decoded.location,
@@ -486,7 +487,7 @@ fn lift_logical_shifted(
         width,
         Register31::Zero,
     )?;
-    let opc = u32::from((fields.bit30 as u8) * 2 + fields.bit29 as u8);
+    let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
     let result = logical_result(builder, decoded.location, opc, lhs, rhs)?;
     write_gpr(
         builder,
@@ -504,14 +505,14 @@ fn lift_logical_shifted(
 fn lift_bitfield(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let n = fields.bit22;
-    if n != (width == IrType::I64) || (width == IrType::I32 && fields.bit15) {
+    let n = fields.n;
+    if n != (width == IrType::I64) || (width == IrType::I32 && fields.subtract_product) {
         return Ok(interpret(decoded));
     }
-    let opc = u32::from((fields.bit30 as u8) * 2 + fields.bit29 as u8);
+    let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
     if opc == 3 {
         return Ok(interpret(decoded));
     }
@@ -542,8 +543,8 @@ fn lift_bitfield(
         vec![
             destination,
             source_value,
-            Immediate::I8(fields.field_16_6).into(),
-            Immediate::I8((u32::from(fields.field_10_6)) as u8).into(),
+            Immediate::I8(fields.immediate_6_high).into(),
+            Immediate::I8((u32::from(fields.shift_amount)) as u8).into(),
         ],
         &[width],
         OperationEffects::default(),
@@ -561,11 +562,11 @@ fn lift_bitfield(
 fn lift_extract(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let lsb = u32::from(fields.field_10_6);
-    if (fields.bit22) != (width == IrType::I64) || (width == IrType::I32 && lsb >= 32) {
+    let lsb = u32::from(fields.shift_amount);
+    if (fields.n) != (width == IrType::I64) || (width == IrType::I32 && lsb >= 32) {
         return Ok(interpret(decoded));
     }
     let first = read_gpr(
@@ -603,10 +604,10 @@ fn lift_extract(
 fn lift_two_source(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let opcode = u32::from(fields.field_10_6);
+    let opcode = u32::from(fields.shift_amount);
     let lhs = read_gpr(
         builder,
         decoded.location,
@@ -719,7 +720,7 @@ fn proposed_compare_flags(
 fn lift_conditional_compare(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let lhs = read_gpr(
@@ -729,8 +730,8 @@ fn lift_conditional_compare(
         width,
         Register31::Zero,
     )?;
-    let rhs = if fields.bit11 {
-        immediate_for(width, u64::from(u32::from(fields.field_16_5))).into()
+    let rhs = if fields.immediate_form {
+        immediate_for(width, u64::from(u32::from(fields.rm))).into()
     } else {
         read_gpr(
             builder,
@@ -741,19 +742,19 @@ fn lift_conditional_compare(
         )?
     };
     let proposed =
-        proposed_compare_flags(builder, decoded.location, width, lhs, rhs, fields.bit30)?;
+        proposed_compare_flags(builder, decoded.location, width, lhs, rhs, fields.subtract)?;
     let fallback = emit_one(
         builder,
         decoded.location,
         IrType::Flags,
         OperationKind::Flags(FlagOperation::FromPacked {
-            value: Immediate::I32(u32::from(fields.low4) << 28).into(),
+            value: Immediate::I32(u32::from(fields.nzcv) << 28).into(),
         }),
     )?;
     let cond = evaluate_condition(
         builder,
         decoded.location,
-        condition(u32::from(fields.field_12_4)),
+        condition(u32::from(fields.condition)),
     )?;
     let selected = scalar(
         builder,
@@ -772,7 +773,7 @@ fn lift_conditional_compare(
 fn lift_conditional_select(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let true_value = read_gpr(
@@ -789,7 +790,7 @@ fn lift_conditional_select(
         width,
         Register31::Zero,
     )?;
-    let op = fields.bit30;
+    let op = fields.subtract;
     let op2 = fields.bit10;
     if op {
         false_value = binary(
@@ -812,7 +813,7 @@ fn lift_conditional_select(
     let cond = evaluate_condition(
         builder,
         decoded.location,
-        condition(u32::from(fields.field_12_4)),
+        condition(u32::from(fields.condition)),
     )?;
     let result = scalar(
         builder,
@@ -837,15 +838,15 @@ fn lift_conditional_select(
 fn lift_three_source(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let opcode = u32::from(fields.field_21_3);
+    let opcode = u32::from(fields.opcode_3);
     if opcode != 0 {
         if matches!(opcode, 2 | 6) && (u32::from(fields.ra)) != 31 {
             return Ok(interpret(decoded));
         }
-        let name = match (opcode, fields.bit15) {
+        let name = match (opcode, fields.subtract_product) {
             (1, false) => "a64.smaddl",
             (1, true) => "a64.smsubl",
             (2, false) => "a64.smulh",
@@ -932,7 +933,7 @@ fn lift_three_source(
     let result = binary(
         builder,
         decoded.location,
-        if fields.bit15 {
+        if fields.subtract_product {
             IntegerBinaryKind::Subtract
         } else {
             IntegerBinaryKind::Add
@@ -953,10 +954,10 @@ fn lift_three_source(
 fn lift_one_source(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
-    let opcode = u32::from(fields.field_10_6);
+    let opcode = u32::from(fields.shift_amount);
     let input = read_gpr(
         builder,
         decoded.location,
@@ -1010,7 +1011,7 @@ fn lift_one_source(
 fn lift_adr(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: IntegerOperands,
     page_relative: bool,
 ) -> Result<LiftOutcome, BuildError> {
     let immediate = sign_extend(u64::from(fields.adr_immediate), 21);

@@ -8,10 +8,7 @@ mod system;
 
 use crate::{
     address::GuestVirtualAddress,
-    decode::{
-        DecodedOpcode,
-        a64::{A64Fields, A64Operation},
-    },
+    decode::{DecodedOpcode, a64::A64Instruction},
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
@@ -51,17 +48,13 @@ fn lift_inner(
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<LiftOutcome, BuildError> {
     let instruction = crate::decode::a64::normalize(&decoded.instruction, decoded.encoding);
-    let outcome = match instruction.operation {
-        A64Operation::Control(operation) => {
-            control::lift(builder, decoded, instruction, operation)?
-        }
-        A64Operation::System(operation) => system::lift(builder, decoded, instruction, operation)?,
-        A64Operation::Integer(operation) => {
-            integer::lift(builder, decoded, instruction, operation)?
-        }
-        A64Operation::Memory(operation) => memory::lift(builder, decoded, instruction, operation)?,
-        A64Operation::FpSimd(operation) => fp_simd::lift(builder, decoded, instruction, operation)?,
-        A64Operation::RecognizedFallback => interpret(decoded),
+    let outcome = match instruction {
+        A64Instruction::Control(instruction) => control::lift(builder, decoded, instruction)?,
+        A64Instruction::System(instruction) => system::lift(builder, decoded, instruction)?,
+        A64Instruction::Integer(instruction) => integer::lift(builder, decoded, instruction)?,
+        A64Instruction::Memory(instruction) => memory::lift(builder, decoded, instruction)?,
+        A64Instruction::FpSimd(instruction) => fp_simd::lift(builder, decoded, instruction)?,
+        A64Instruction::RecognizedFallback { .. } => interpret(decoded),
     };
     Ok(outcome)
 }

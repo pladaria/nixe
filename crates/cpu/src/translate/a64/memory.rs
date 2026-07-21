@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     decode::{
         DecodedOpcode,
-        a64::{A64Instruction, MemoryOperation as A64MemoryOperation},
+        a64::memory::{Instruction as A64MemoryInstruction, Operands as MemoryOperands},
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
@@ -14,25 +14,24 @@ use super::LiftOutcome;
 pub(super) fn lift(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    instruction: A64Instruction,
-    operation: A64MemoryOperation,
+    instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fields = instruction.fields;
-    match operation {
-        A64MemoryOperation::Literal => lift_literal_load(builder, decoded, fields),
-        A64MemoryOperation::Unsigned => lift_load_store_unsigned(builder, decoded, fields),
-        A64MemoryOperation::Unscaled
-        | A64MemoryOperation::PostIndex
-        | A64MemoryOperation::PreIndex => {
-            lift_load_store_indexed(builder, decoded, fields, operation)
+    let fields = instruction.operands();
+    match instruction {
+        A64MemoryInstruction::Literal(_) => lift_literal_load(builder, decoded, fields),
+        A64MemoryInstruction::Unsigned(_) => lift_load_store_unsigned(builder, decoded, fields),
+        A64MemoryInstruction::Unscaled(_)
+        | A64MemoryInstruction::PostIndex(_)
+        | A64MemoryInstruction::PreIndex(_) => {
+            lift_load_store_indexed(builder, decoded, fields, instruction)
         }
-        A64MemoryOperation::Register => lift_load_store_register(builder, decoded, fields),
-        A64MemoryOperation::Pair => lift_load_store_pair(builder, decoded, fields),
-        A64MemoryOperation::LoadAcquire | A64MemoryOperation::StoreRelease => {
-            lift_acquire_release(builder, decoded, fields, operation)
+        A64MemoryInstruction::Register(_) => lift_load_store_register(builder, decoded, fields),
+        A64MemoryInstruction::Pair(_) => lift_load_store_pair(builder, decoded, fields),
+        A64MemoryInstruction::LoadAcquire(_) | A64MemoryInstruction::StoreRelease(_) => {
+            lift_acquire_release(builder, decoded, fields, instruction)
         }
-        A64MemoryOperation::LoadExclusive | A64MemoryOperation::StoreExclusive => {
-            lift_exclusive(builder, decoded, fields, operation)
+        A64MemoryInstruction::LoadExclusive(_) | A64MemoryInstruction::StoreExclusive(_) => {
+            lift_exclusive(builder, decoded, fields, instruction)
         }
     }
 }
@@ -96,12 +95,12 @@ pub(super) fn base_address(
 fn memory_transfer(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
-    fields: A64Fields,
+    fields: MemoryOperands,
     address: Operand,
     descriptor: MemoryDescriptor,
 ) -> Result<bool, BuildError> {
-    let opc = u32::from(fields.field_22_2);
-    let rt = fields.rd;
+    let opc = u32::from(fields.opc);
+    let rt = fields.rt;
     if opc == 0 {
         let value = read_gpr(
             builder,
@@ -166,7 +165,7 @@ fn memory_transfer(
 fn lift_literal_load(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let opc = u32::from(fields.size);
     if opc == 3 {
@@ -217,7 +216,7 @@ fn lift_literal_load(
     write_gpr(
         builder,
         decoded.location,
-        fields.rd,
+        fields.rt,
         value,
         Register31::Zero,
     )?;
@@ -227,7 +226,7 @@ fn lift_literal_load(
 fn lift_load_store_unsigned(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
@@ -235,7 +234,7 @@ fn lift_load_store_unsigned(
         builder,
         decoded.location,
         base,
-        i64::from(u32::from(fields.field_10_12)) * size.bytes() as i64,
+        i64::from(u32::from(fields.immediate_12)) * size.bytes() as i64,
     )?;
     if !memory_transfer(
         builder,
@@ -252,18 +251,18 @@ fn lift_load_store_unsigned(
 fn lift_load_store_indexed(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: A64MemoryOperation,
+    fields: MemoryOperands,
+    instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let rn = fields.rn;
-    let rt = fields.rd;
-    if operation != A64MemoryOperation::Unscaled && rn != 31 && rn == rt {
+    let rt = fields.rt;
+    if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) && rn != 31 && rn == rt {
         return Ok(interpret(decoded));
     }
     let base = base_address(builder, decoded.location, rn)?;
-    let offset = sign_extend(u64::from(u32::from(fields.field_12_9)), 9);
-    let address = if operation == A64MemoryOperation::PreIndex {
+    let offset = sign_extend(u64::from(u32::from(fields.immediate_9)), 9);
+    let address = if matches!(instruction, A64MemoryInstruction::PreIndex(_)) {
         address_add(builder, decoded.location, base, offset)?
     } else {
         bitcast(builder, decoded.location, base, IrType::Address)?
@@ -277,7 +276,7 @@ fn lift_load_store_indexed(
     )? {
         return Ok(interpret(decoded));
     }
-    if operation != A64MemoryOperation::Unscaled {
+    if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) {
         let updated = binary(
             builder,
             decoded.location,
@@ -299,7 +298,7 @@ fn lift_load_store_indexed(
 fn lift_load_store_register(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
@@ -310,11 +309,11 @@ fn lift_load_store_register(
         IrType::I64,
         Register31::Zero,
     )?;
-    let option = u32::from(fields.field_13_3);
+    let option = u32::from(fields.option);
     if option & 2 == 0 {
         return Ok(interpret(decoded));
     }
-    let shift = if fields.bit12 {
+    let shift = if fields.scaled {
         size.bytes().trailing_zeros() as u8
     } else {
         0
@@ -354,7 +353,7 @@ fn lift_load_store_register(
 fn lift_load_store_pair(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
+    fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let opc = u32::from(fields.size);
     if opc == 3 {
@@ -371,15 +370,15 @@ fn lift_load_store_pair(
         IrType::I64
     };
     let rn = fields.rn;
-    let rt = fields.rd;
-    let rt2 = fields.ra;
-    let mode = u32::from(fields.field_23_2);
-    let load = fields.bit22;
+    let rt = fields.rt;
+    let rt2 = fields.rt2;
+    let mode = u32::from(fields.mode);
+    let load = fields.load;
     if (load && rt == rt2) || (matches!(mode, 1 | 3) && rn != 31 && (rn == rt || rn == rt2)) {
         return Ok(interpret(decoded));
     }
     let base = base_address(builder, decoded.location, rn)?;
-    let offset = sign_extend(u64::from(fields.field_15_7), 7) * size.bytes() as i64;
+    let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
     let transfer_base = if mode == 3 {
         binary(
             builder,
@@ -402,7 +401,7 @@ fn lift_load_store_pair(
         return Ok(interpret(decoded));
     }
     let descriptor = descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal);
-    for (rt, address) in [(fields.rd, first_address), (fields.ra, second_address)] {
+    for (rt, address) in [(fields.rt, first_address), (fields.rt2, second_address)] {
         if load {
             let mut value: Operand = emit_one(
                 builder,
@@ -461,20 +460,20 @@ fn lift_load_store_pair(
 fn lift_acquire_release(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: A64MemoryOperation,
+    fields: MemoryOperands,
+    instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
     let address = bitcast(builder, decoded.location, base, IrType::Address)?;
-    let load = operation == A64MemoryOperation::LoadAcquire;
+    let load = matches!(instruction, A64MemoryInstruction::LoadAcquire(_));
     let ordering = if load {
         MemoryOrdering::Acquire
     } else {
         MemoryOrdering::Release
     };
     let descriptor = aligned_descriptor(size, ordering, MemoryAccessClass::Normal);
-    let rt = fields.rd;
+    let rt = fields.rt;
     if load {
         let value = emit_one(
             builder,
@@ -516,21 +515,21 @@ fn lift_acquire_release(
 fn lift_exclusive(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
-    fields: A64Fields,
-    operation: A64MemoryOperation,
+    fields: MemoryOperands,
+    instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
     let size = size_from_bits(u32::from(fields.size));
     let base = base_address(builder, decoded.location, fields.rn)?;
     let address = bitcast(builder, decoded.location, base, IrType::Address)?;
-    let ordered = fields.bit15;
-    let ordering = match (operation, ordered) {
-        (A64MemoryOperation::LoadExclusive, true) => MemoryOrdering::Acquire,
-        (A64MemoryOperation::StoreExclusive, true) => MemoryOrdering::Release,
+    let ordered = fields.ordered;
+    let ordering = match (instruction, ordered) {
+        (A64MemoryInstruction::LoadExclusive(_), true) => MemoryOrdering::Acquire,
+        (A64MemoryInstruction::StoreExclusive(_), true) => MemoryOrdering::Release,
         (_, false) => MemoryOrdering::Relaxed,
         _ => unreachable!(),
     };
     let descriptor = aligned_descriptor(size, ordering, MemoryAccessClass::Exclusive);
-    if operation == A64MemoryOperation::LoadExclusive {
+    if matches!(instruction, A64MemoryInstruction::LoadExclusive(_)) {
         let value = emit_one(
             builder,
             decoded.location,
@@ -543,7 +542,7 @@ fn lift_exclusive(
         write_gpr(
             builder,
             decoded.location,
-            fields.rd,
+            fields.rt,
             value.into(),
             Register31::Zero,
         )?;
@@ -551,7 +550,7 @@ fn lift_exclusive(
         let value = read_gpr(
             builder,
             decoded.location,
-            fields.rd,
+            fields.rt,
             descriptor.value_type(),
             Register31::Zero,
         )?;
