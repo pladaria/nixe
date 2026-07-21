@@ -16,3 +16,9 @@ expectations.
 Use stable document identifiers in comments and reviews. A dated document
 revision may additionally be recorded when behavior differs between revisions,
 but tests should not depend on network access or scrape Arm's website.
+
+Run the optional QEMU oracle with:
+
+```bash
+cargo test-differential
+```
