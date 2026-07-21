@@ -42,6 +42,7 @@ Milestones:
   - [x] Atomic installation of prepared executable mappings into permission-aware process memory.
   - [x] Deterministic launch plans and loader coordination for packaged titles, DLC, and NRO homebrew.
   - [x] Runtime entry-point integration: NPDM-driven process setup, initialized main-thread ABI, and verified entry-block translation.
+  - [x] Bounded reference execution with safepoints, structured faults, process-local handles and mounts, and deterministic teardown.
 - **CPU**
   - [x] CPU contracts: A64/A32/T32 profiles and state, plus permission-aware synthetic process memory and instruction fetching.
   - [x] IR foundation: typed block construction, verification, deterministic printing, and shared canonical semantic primitives.
