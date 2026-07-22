@@ -8,7 +8,7 @@ use swiitx_cpu::ir::block::IrBlock;
 use swiitx_cpu::ir::print::{IrPrintOptions, print_block};
 use swiitx_cpu::location::{ExecutionState, LocationDescriptor};
 use swiitx_cpu::memory::{
-    MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory, SyntheticRamPage,
+    MemoryMappingPurpose, MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory, SyntheticRamPage,
 };
 use swiitx_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use swiitx_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
@@ -20,9 +20,14 @@ use swiitx_loader_executable::{
     SymbolResolution, prepare_nso_batch,
 };
 
+use crate::exception_dispatch::ExceptionProcessMetadata;
 use crate::{
-    ExecutionReport, LaunchKind, LaunchModuleImage, LaunchPlan, ProcessExecutionError,
-    ProcessExecutionStatus, ProcessTeardownReport, install_prepared_module,
+    ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatcher,
+    ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume, ExceptionRouteError,
+    ExceptionTerminationReason, ExceptionTerminationScope, ExceptionThreadContext, ExecutionReport,
+    ExecutionStop, LaunchKind, LaunchModuleImage, LaunchPlan, ProcessExecutionError,
+    ProcessExecutionStatus, ProcessExit, ProcessExitCause, ProcessTeardownReport, ThreadExit,
+    install_prepared_module,
 };
 
 const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
@@ -32,6 +37,9 @@ const RESOURCE_GUARD_SIZE: u64 = 0x1_0000;
 const TLS_SIZE: u64 = SYNTHETIC_PAGE_SIZE as u64;
 const HOME_BREW_CONFIG_ENTRY_SIZE: usize = 24;
 const HOME_BREW_MAIN_THREAD_HANDLE_KEY: u32 = 1;
+const HOME_BREW_EXIT_PROCESS_INSTRUCTION: u32 = 0xd400_00e1;
+const DEFAULT_PHYSICAL_MEMORY_LIMIT: u64 = 0x4000_0000;
+const HORIZON_REGION_ALIGNMENT: u64 = 0x20_0000;
 
 /// Runtime interpretation of the address-space selector validated by NPDM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +48,14 @@ pub enum ProcessAddressSpace {
     Bit32NoReserved,
     Bit64Old,
     Bit64,
+}
+
+/// Horizon kernel generation governing process virtual-region availability.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProcessMemoryLayoutProfile {
+    Horizon1,
+    #[default]
+    Horizon2Plus,
 }
 
 impl ProcessAddressSpace {
@@ -52,47 +68,254 @@ impl ProcessAddressSpace {
         }
     }
 
-    const fn exclusive_limit(self) -> u64 {
+    pub const fn exclusive_limit(self) -> u64 {
         match self {
             Self::Bit32 | Self::Bit32NoReserved => 1_u64 << 32,
-            Self::Bit64Old | Self::Bit64 => u64::MAX,
+            Self::Bit64Old => 1_u64 << 36,
+            Self::Bit64 => 1_u64 << 39,
         }
+    }
+}
+
+/// One reserved guest-virtual region reported through platform process APIs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessVirtualRegion {
+    base: GuestVirtualAddress,
+    size: u64,
+}
+
+impl ProcessVirtualRegion {
+    #[must_use]
+    pub const fn new(base: GuestVirtualAddress, size: u64) -> Self {
+        Self { base, size }
+    }
+
+    #[must_use]
+    pub const fn base(self) -> GuestVirtualAddress {
+        self.base
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    const fn end(self) -> u64 {
+        self.base.get() + self.size
+    }
+}
+
+/// Runtime-owned Horizon process virtual-memory layout.
+///
+/// Region dimensions and the 39-bit placement policy follow the public
+/// Atmosphere `svc_memory_map.hpp` and `KPageTableBase::InitializeForProcess`
+/// definitions. The ASLR window may contain the concrete heap, alias, and
+/// stack reservations; it is not a disjoint allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessMemoryLayout {
+    aslr: ProcessVirtualRegion,
+    heap: ProcessVirtualRegion,
+    alias: ProcessVirtualRegion,
+    stack: ProcessVirtualRegion,
+    memory_capacity: u64,
+}
+
+impl ProcessMemoryLayout {
+    fn for_address_space(
+        profile: ProcessMemoryLayoutProfile,
+        address_space: ProcessAddressSpace,
+        process_code_start: u64,
+        process_code_end: u64,
+        memory_capacity: u64,
+    ) -> Result<Self, ProcessBuildError> {
+        if profile == ProcessMemoryLayoutProfile::Horizon1
+            && address_space == ProcessAddressSpace::Bit64
+        {
+            return Err(error(
+                ProcessBuildStage::Metadata,
+                "39-bit process address spaces require Horizon 2.0.0 or newer",
+            ));
+        }
+        let (aslr, alias, heap, stack) = match address_space {
+            ProcessAddressSpace::Bit32 => (
+                region(0x0020_0000, 0xffe0_0000),
+                region(0x4000_0000, 0x4000_0000),
+                region(0x8000_0000, 0x4000_0000),
+                region(0x0020_0000, 0x3fe0_0000),
+            ),
+            ProcessAddressSpace::Bit32NoReserved => (
+                region(0x0020_0000, 0xffe0_0000),
+                region(0x4000_0000, 0),
+                region(0x4000_0000, 0x8000_0000),
+                region(0x0020_0000, 0x3fe0_0000),
+            ),
+            ProcessAddressSpace::Bit64Old => (
+                region(0x0800_0000, 0xf_f800_0000),
+                region(0x8000_0000, 0x1_8000_0000),
+                region(0x2_0000_0000, 0x2_0000_0000),
+                region(0x0800_0000, 0x7800_0000),
+            ),
+            ProcessAddressSpace::Bit64 => {
+                let code_start = process_code_start & !(HORIZON_REGION_ALIGNMENT - 1);
+                let code_end = align_up(process_code_end, HORIZON_REGION_ALIGNMENT)?;
+                let aslr = region(0x0800_0000, (1_u64 << 39) - 0x0800_0000);
+                if code_start < aslr.base().get() || code_end > aslr.end() {
+                    return Err(error(
+                        ProcessBuildStage::Placement,
+                        "process code is outside the 39-bit Horizon ASLR window",
+                    ));
+                }
+
+                let [_, stack, alias, heap] = layout_39_bit_regions(aslr, code_start, code_end)?;
+                (aslr, alias, heap, stack)
+            }
+        };
+        Ok(Self {
+            aslr,
+            heap,
+            alias,
+            stack,
+            memory_capacity,
+        })
+    }
+
+    #[must_use]
+    pub const fn aslr(self) -> ProcessVirtualRegion {
+        self.aslr
+    }
+
+    #[must_use]
+    pub const fn heap(self) -> ProcessVirtualRegion {
+        self.heap
+    }
+
+    #[must_use]
+    pub const fn alias(self) -> ProcessVirtualRegion {
+        self.alias
+    }
+
+    #[must_use]
+    pub const fn stack(self) -> ProcessVirtualRegion {
+        self.stack
+    }
+
+    /// Returns the process commit limit used for memory accounting.
+    #[must_use]
+    pub const fn memory_capacity(self) -> u64 {
+        self.memory_capacity
     }
 }
 
 /// Caller-controlled process identities and relocatable image placement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessBuildConfig {
+    pub process_id: u64,
     pub address_space_id: AddressSpaceId,
     pub cpu_profile: GuestCpuProfile,
+    pub memory_layout_profile: ProcessMemoryLayoutProfile,
     pub image_base: GuestVirtualAddress,
+    /// Physical-memory resource limit assigned to the emulated process.
+    pub physical_memory_limit: u64,
 }
 
 impl Default for ProcessBuildConfig {
     fn default() -> Self {
         Self {
+            process_id: 1,
             address_space_id: AddressSpaceId::new(1),
             cpu_profile: GuestCpuProfile::switch_1(),
+            memory_layout_profile: ProcessMemoryLayoutProfile::Horizon2Plus,
             image_base: GuestVirtualAddress::new(DEFAULT_IMAGE_BASE),
+            physical_memory_limit: DEFAULT_PHYSICAL_MEMORY_LIMIT,
         }
     }
+}
+
+const fn region(base: u64, size: u64) -> ProcessVirtualRegion {
+    ProcessVirtualRegion::new(GuestVirtualAddress::new(base), size)
+}
+
+fn layout_39_bit_regions(
+    aslr: ProcessVirtualRegion,
+    code_start: u64,
+    code_end: u64,
+) -> Result<[ProcessVirtualRegion; 4], ProcessBuildError> {
+    // Region kinds use Horizon's deterministic no-ASLR ordering:
+    // kernel-map, stack, alias, heap.
+    let sizes = [0x10_0000_0000, 0x8000_0000, 0x10_0000_0000, 0x2_0000_0000];
+    let mut by_descending_size = [(0_usize, sizes[0]); 4];
+    for (kind, entry) in by_descending_size.iter_mut().enumerate() {
+        *entry = (kind, sizes[kind]);
+    }
+    by_descending_size.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+
+    let allocation_starts = [aslr.base().get(), code_end];
+    let mut allocation_sizes = [code_start - aslr.base().get(), aslr.end() - code_end];
+    let mut assignment = [usize::MAX; 4];
+    for (kind, size) in by_descending_size {
+        let allocation = usize::from(allocation_sizes[1] >= allocation_sizes[0]);
+        if allocation_sizes[allocation] < size {
+            return Err(error(
+                ProcessBuildStage::Placement,
+                "39-bit Horizon regions do not fit around process code",
+            ));
+        }
+        allocation_sizes[allocation] -= size;
+        assignment[kind] = allocation;
+    }
+
+    let mut result = [region(0, 0); 4];
+    for (allocation, start) in allocation_starts.into_iter().enumerate() {
+        let mut cursor = start;
+        for kind in 0..sizes.len() {
+            if assignment[kind] == allocation {
+                result[kind] = region(cursor, sizes[kind]);
+                cursor = cursor.checked_add(sizes[kind]).ok_or_else(|| {
+                    error(ProcessBuildStage::Placement, "Horizon region overflows")
+                })?;
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Fully initialized main thread returned by [`ProcessBuilder`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MainThread {
+    object: crate::ThreadObject,
+    exit: Option<ThreadExit>,
     pub state: ThreadCpuState,
     pub handle: u32,
     pub stack_bottom: GuestVirtualAddress,
     pub stack_top: GuestVirtualAddress,
     pub tls_base: GuestVirtualAddress,
     pub abi_context: Option<GuestVirtualAddress>,
+    /// Runtime-owned guest address installed as the original NRO link register.
+    pub loader_return: Option<GuestVirtualAddress>,
+}
+
+impl MainThread {
+    /// Returns the runtime-owned thread identity independently of guest handles.
+    #[must_use]
+    pub const fn object(&self) -> crate::ThreadObject {
+        self.object
+    }
+
+    /// Returns the immutable termination record once this thread has exited.
+    #[must_use]
+    pub const fn exit(&self) -> Option<ThreadExit> {
+        self.exit
+    }
 }
 
 /// A process whose executable bytes are visible only through process memory.
 pub struct RunnableProcess {
+    process_id: u64,
     cpu: ProcessCpuContext,
     address_space: ProcessAddressSpace,
+    memory_layout: ProcessMemoryLayout,
+    heap_size: u64,
+    initial_memory_size: u64,
     memory: SyntheticMemory,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
@@ -104,6 +327,11 @@ pub struct RunnableProcess {
 
 impl RunnableProcess {
     #[must_use]
+    pub const fn process_id(&self) -> u64 {
+        self.process_id
+    }
+
+    #[must_use]
     pub const fn cpu_context(&self) -> ProcessCpuContext {
         self.cpu
     }
@@ -111,6 +339,17 @@ impl RunnableProcess {
     #[must_use]
     pub const fn address_space(&self) -> ProcessAddressSpace {
         self.address_space
+    }
+
+    #[must_use]
+    pub const fn memory_layout(&self) -> ProcessMemoryLayout {
+        self.memory_layout
+    }
+
+    /// Returns the currently committed process heap size.
+    #[must_use]
+    pub const fn heap_size(&self) -> u64 {
+        self.heap_size
     }
 
     #[must_use]
@@ -131,6 +370,11 @@ impl RunnableProcess {
     #[must_use]
     pub const fn main_thread(&self) -> &MainThread {
         &self.main_thread
+    }
+
+    /// Returns mutable main-thread state for runtime scheduling and ABI setup.
+    pub const fn main_thread_mut(&mut self) -> &mut MainThread {
+        &mut self.main_thread
     }
 
     /// Returns the immutable process-local filesystem namespace.
@@ -163,6 +407,12 @@ impl RunnableProcess {
         self.execution.status()
     }
 
+    /// Returns the process exit record retained until teardown.
+    #[must_use]
+    pub const fn exit(&self) -> Option<ProcessExit> {
+        self.execution.exit()
+    }
+
     /// Requests a stop before the next reference-engine instruction.
     pub fn request_safepoint(&mut self) {
         self.execution.request_safepoint();
@@ -181,7 +431,21 @@ impl RunnableProcess {
     /// Marks the process exited. Resource release occurs in [`Self::teardown`]
     /// or when the process is dropped.
     pub fn terminate(&mut self) -> bool {
-        self.execution.terminate()
+        let exit = ProcessExit {
+            cause: ProcessExitCause::HostRequested,
+            exit_code: 0,
+            source: None,
+            thread_id: self.main_thread.object.thread_id(),
+        };
+        let terminated = self.execution.terminate(exit);
+        if terminated {
+            self.main_thread.exit = Some(ThreadExit {
+                requested_scope: ExceptionTerminationScope::Process,
+                exit_code: 0,
+                source: None,
+            });
+        }
+        terminated
     }
 
     /// Runs a bounded slice through the independent reference interpreter.
@@ -192,13 +456,157 @@ impl RunnableProcess {
         &mut self,
         instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        crate::execution::run_reference(
+        let report = crate::execution::run_reference(
             &mut self.execution,
             self.cpu,
             &self.memory,
             &mut self.main_thread.state,
             instruction_budget,
-        )
+            self.main_thread.loader_return,
+        )?;
+        if let ExecutionStop::LoaderReturn {
+            source,
+            result_code,
+        } = &report.stop
+        {
+            let thread_id = self.main_thread.object.thread_id();
+            let exit = ProcessExit {
+                cause: ProcessExitCause::LoaderReturned,
+                exit_code: *result_code,
+                source: Some(*source),
+                thread_id,
+            };
+            let transitioned = self.execution.terminate(exit);
+            debug_assert!(transitioned);
+            self.main_thread.exit = Some(ThreadExit {
+                requested_scope: ExceptionTerminationScope::Process,
+                exit_code: *result_code,
+                source: Some(*source),
+            });
+        }
+        Ok(report)
+    }
+
+    /// Routes and atomically applies one supervisor-call decision.
+    ///
+    /// A normal handler must return [`ExceptionResume::Next`]; this method then
+    /// advances past the SVC exactly once. Retry is explicit, suspension keeps
+    /// its selected continuation non-runnable, and faults retain the SVC source
+    /// for deterministic diagnostics.
+    pub fn route_supervisor_call<D: ExceptionDispatcher>(
+        &mut self,
+        stop: &ExecutionStop,
+        dispatcher: &mut D,
+    ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
+        let request = stop
+            .exception_dispatch_request()
+            .filter(|request| {
+                request.kind() == swiitx_cpu::exception::ExceptionKind::SupervisorCall
+            })
+            .ok_or(ExceptionRouteError::NotSupervisorCall)?;
+        if self.execution.status() != ProcessExecutionStatus::Suspended {
+            return Err(ExceptionRouteError::ProcessNotSuspended {
+                status: self.execution.status(),
+            });
+        }
+        let current = crate::execution::current_location(self.cpu, &self.main_thread.state);
+        if request.source() != current {
+            return Err(ExceptionRouteError::SourceMismatch {
+                requested: request.source(),
+                current,
+            });
+        }
+        let handle = self.main_thread.handle;
+        let object = self.main_thread.object;
+        let process = ExceptionProcessContext::new(
+            ExceptionProcessMetadata {
+                process_id: self.process_id,
+                cpu: self.cpu,
+                address_space_limit: self.address_space.exclusive_limit(),
+                memory_layout: self.memory_layout,
+                initial_memory_size: self.initial_memory_size,
+            },
+            &mut self.heap_size,
+            &self.memory,
+            &self.mounts,
+            &mut self.handles,
+        );
+        let thread = ExceptionThreadContext::new(object, handle, &mut self.main_thread.state);
+        let mut context = ExceptionDispatchContext::new(process, thread);
+        let outcome = dispatcher.dispatch(&mut context, request);
+        self.apply_supervisor_call_outcome(request.source(), outcome)
+    }
+
+    fn apply_supervisor_call_outcome<F>(
+        &mut self,
+        source: LocationDescriptor,
+        outcome: ExceptionDispatchOutcome<F>,
+    ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
+        match outcome {
+            ExceptionDispatchOutcome::Resume(continuation) => {
+                let target = supervisor_call_continuation(source, continuation)?;
+                install_continuation(self.cpu, &mut self.main_thread.state, target)?;
+                let transitioned = self.execution.resume();
+                debug_assert!(transitioned);
+                Ok(ExceptionHandlingResult::Resumed)
+            }
+            ExceptionDispatchOutcome::Suspend(continuation) => {
+                let target = supervisor_call_continuation(source, continuation)?;
+                install_continuation(self.cpu, &mut self.main_thread.state, target)?;
+                Ok(ExceptionHandlingResult::Suspended)
+            }
+            ExceptionDispatchOutcome::Reject { diagnostic } => {
+                let target = supervisor_call_continuation(source, ExceptionResume::Next)?;
+                install_continuation(self.cpu, &mut self.main_thread.state, target)?;
+                let transitioned = self.execution.resume();
+                debug_assert!(transitioned);
+                Ok(ExceptionHandlingResult::Rejected(diagnostic))
+            }
+            ExceptionDispatchOutcome::Terminate {
+                scope,
+                exit_code,
+                reason,
+            } => {
+                install_continuation(self.cpu, &mut self.main_thread.state, source)?;
+                let thread_id = self.main_thread.object.thread_id();
+                let exit = ProcessExit {
+                    cause: match reason {
+                        ExceptionTerminationReason::Break { reason, info, size } => {
+                            ProcessExitCause::GuestBreak { reason, info, size }
+                        }
+                        ExceptionTerminationReason::Requested => match scope {
+                            ExceptionTerminationScope::CurrentThread => {
+                                ProcessExitCause::LastThreadExited
+                            }
+                            ExceptionTerminationScope::Process => {
+                                ProcessExitCause::ProcessRequested
+                            }
+                        },
+                    },
+                    exit_code,
+                    source: Some(source),
+                    thread_id,
+                };
+                let transitioned = self.execution.terminate(exit);
+                debug_assert!(transitioned);
+                self.main_thread.exit = Some(ThreadExit {
+                    requested_scope: scope,
+                    exit_code,
+                    source: Some(source),
+                });
+                Ok(ExceptionHandlingResult::Terminated {
+                    scope,
+                    exit_code,
+                    reason,
+                })
+            }
+            ExceptionDispatchOutcome::Fault(fault) => {
+                install_continuation(self.cpu, &mut self.main_thread.state, source)?;
+                let transitioned = self.execution.fault();
+                debug_assert!(transitioned);
+                Ok(ExceptionHandlingResult::Fault(fault))
+            }
+        }
     }
 
     /// Consumes the process and deterministically releases all process-owned resources.
@@ -206,6 +614,7 @@ impl RunnableProcess {
     pub fn teardown(self) -> ProcessTeardownReport {
         ProcessTeardownReport {
             previous_status: self.execution.status(),
+            exit: self.execution.exit(),
             threads_released: 1,
             modules_released: self.modules.len(),
             mappings_released: self
@@ -267,6 +676,73 @@ impl RunnableProcess {
             self.cpu.profile().id(),
         )
     }
+}
+
+fn supervisor_call_continuation(
+    source: LocationDescriptor,
+    continuation: ExceptionResume,
+) -> Result<LocationDescriptor, ExceptionRouteError> {
+    match continuation {
+        ExceptionResume::Retry => Ok(source),
+        ExceptionResume::At(target) => Ok(target),
+        ExceptionResume::Next => {
+            let width = match source.execution_state {
+                ExecutionState::A64 | ExecutionState::A32 => 4,
+                ExecutionState::T32 => 2,
+            };
+            let pc = source
+                .pc
+                .checked_add(width)
+                .ok_or(ExceptionRouteError::ContinuationAddressOverflow { source })?;
+            Ok(LocationDescriptor::new(
+                pc,
+                source.execution_state,
+                source.profile_id,
+            ))
+        }
+    }
+}
+
+fn install_continuation(
+    cpu: ProcessCpuContext,
+    state: &mut ThreadCpuState,
+    target: LocationDescriptor,
+) -> Result<(), ExceptionRouteError> {
+    let current = state.execution_state();
+    let expected_profile = cpu.profile().id();
+    if target.profile_id != expected_profile {
+        return Err(ExceptionRouteError::ContinuationProfileMismatch {
+            source: crate::execution::current_location(cpu, state),
+            target,
+        });
+    }
+    if !target.is_aligned() {
+        return Err(ExceptionRouteError::InvalidContinuationTarget { target });
+    }
+    match state {
+        ThreadCpuState::A64(state) if target.execution_state == ExecutionState::A64 => {
+            state.set_pc(target.pc.get());
+        }
+        ThreadCpuState::A32(state) if target.execution_state != ExecutionState::A64 => {
+            let pc = u32::try_from(target.pc.get())
+                .map_err(|_| ExceptionRouteError::InvalidContinuationTarget { target })?;
+            let cpsr = state
+                .cpsr()
+                .with_execution_state(target.execution_state)
+                .expect("AArch32 continuation state was already validated");
+            state.set_cpsr(cpsr);
+            state
+                .set_instruction_address(pc)
+                .map_err(|_| ExceptionRouteError::InvalidContinuationTarget { target })?;
+        }
+        ThreadCpuState::A64(_) | ThreadCpuState::A32(_) => {
+            return Err(ExceptionRouteError::IncompatibleContinuationState {
+                current,
+                target: target.execution_state,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Stage at which process construction failed.
@@ -363,32 +839,64 @@ impl ProcessBuilder {
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Metadata, error))?;
         let placements = module_placements(plan, self.config.image_base, address_space)?;
         let modules = prepare_modules(plan, &placements, address_space)?;
+        let process_code_start = modules
+            .iter()
+            .map(PreparedModule::image_base)
+            .min()
+            .ok_or_else(|| error(ProcessBuildStage::Placement, "launch plan has no modules"))?;
+        let process_code_end = modules
+            .iter()
+            .map(|module| module.image_base().saturating_add(module.image_extent()))
+            .max()
+            .ok_or_else(|| error(ProcessBuildStage::Placement, "launch plan has no modules"))?;
+        let memory_layout = ProcessMemoryLayout::for_address_space(
+            self.config.memory_layout_profile,
+            address_space,
+            process_code_start,
+            process_code_end,
+            self.config.physical_memory_limit,
+        )?;
         let entry_module = plan.entry_module_index();
         let mut handles = crate::HandleTable::new();
-        let main_thread_handle = handles
-            .insert(crate::ThreadObject::new(1))
-            .map_err(|error| {
-                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
-            })?;
+        let main_thread_object = crate::ThreadObject::new(1);
+        let main_thread_handle = handles.insert(main_thread_object).map_err(|error| {
+            ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
+        })?;
 
         let mut memory = SyntheticMemory::new();
         for module in &modules {
             install_prepared_module(&mut memory, self.config.address_space_id, module)
                 .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+            for mapping in module.mappings() {
+                let mutable = mapping.permissions().is_writable();
+                let purpose = match (matches!(abi, InitialProcessAbi::Homebrew), mutable) {
+                    (true, true) => MemoryMappingPurpose::ModuleCodeMutable,
+                    (true, false) => MemoryMappingPurpose::ModuleCodeStatic,
+                    (false, true) => MemoryMappingPurpose::CodeMutable,
+                    (false, false) => MemoryMappingPurpose::CodeStatic,
+                };
+                if !memory.set_mapping_purpose(
+                    self.config.address_space_id,
+                    GuestVirtualAddress::new(mapping.guest_address()),
+                    mapping.bytes().len() as u64,
+                    purpose,
+                ) {
+                    return Err(error(
+                        ProcessBuildStage::Mapping,
+                        "installed module mapping could not retain its purpose",
+                    ));
+                }
+            }
         }
 
-        let resource_start = align_up(
-            modules
-                .iter()
-                .map(|module| module.image_base() + module.image_extent())
-                .max()
-                .ok_or_else(|| error(ProcessBuildStage::Placement, "launch plan has no modules"))?
-                .checked_add(RESOURCE_GUARD_SIZE)
-                .ok_or_else(|| error(ProcessBuildStage::Placement, "resource base overflows"))?,
-            SYNTHETIC_PAGE_SIZE as u64,
-        )?;
         let stack_size = align_up(stack_size.max(SYNTHETIC_PAGE_SIZE as u64), TLS_SIZE)?;
-        let stack_bottom = GuestVirtualAddress::new(resource_start);
+        if stack_size + (RESOURCE_GUARD_SIZE * 3) + (TLS_SIZE * 2) > memory_layout.stack().size() {
+            return Err(error(
+                ProcessBuildStage::Placement,
+                "main-thread resources exceed the reserved stack region",
+            ));
+        }
+        let stack_bottom = memory_layout.stack().base();
         let stack_top = stack_bottom
             .checked_add(stack_size)
             .ok_or_else(|| error(ProcessBuildStage::Placement, "main stack overflows"))?;
@@ -408,7 +916,18 @@ impl ProcessBuilder {
             tls_base,
             TLS_SIZE,
         )?;
-        let abi_context = if matches!(abi, InitialProcessAbi::Homebrew) {
+        if !memory.set_mapping_purpose(
+            self.config.address_space_id,
+            tls_base,
+            TLS_SIZE,
+            MemoryMappingPurpose::ThreadLocal,
+        ) {
+            return Err(error(
+                ProcessBuildStage::Mapping,
+                "installed TLS mapping could not retain its purpose",
+            ));
+        }
+        let (abi_context, loader_return) = if matches!(abi, InitialProcessAbi::Homebrew) {
             let address = tls_base
                 .checked_add(TLS_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "ABI context overflows"))?;
@@ -419,9 +938,22 @@ impl ProcessBuilder {
                 address,
                 main_thread_handle,
             )?;
-            Some(address)
+            let loader_return = address
+                .checked_add(SYNTHETIC_PAGE_SIZE as u64 + RESOURCE_GUARD_SIZE)
+                .ok_or_else(|| error(ProcessBuildStage::Placement, "loader return overflows"))?;
+            validate_range(
+                address_space,
+                loader_return.get(),
+                SYNTHETIC_PAGE_SIZE as u64,
+            )?;
+            install_homebrew_loader_return(
+                &mut memory,
+                self.config.address_space_id,
+                loader_return,
+            )?;
+            (Some(address), Some(loader_return))
         } else {
-            None
+            (None, None)
         };
 
         let entry = GuestVirtualAddress::new(modules[entry_module].entry_address());
@@ -433,18 +965,41 @@ impl ProcessBuilder {
             tls_base,
             main_thread_handle,
             abi_context,
+            loader_return,
         )?;
         let main_thread = MainThread {
+            object: main_thread_object,
+            exit: None,
             state,
             handle: main_thread_handle,
             stack_bottom,
             stack_top,
             tls_base,
             abi_context,
+            loader_return,
         };
+        let initial_memory_size = u64::try_from(memory.physical_page_count())
+            .ok()
+            .and_then(|pages| pages.checked_mul(SYNTHETIC_PAGE_SIZE as u64))
+            .ok_or_else(|| {
+                error(
+                    ProcessBuildStage::Mapping,
+                    "process memory accounting overflows",
+                )
+            })?;
+        if initial_memory_size > memory_layout.memory_capacity() {
+            return Err(error(
+                ProcessBuildStage::Mapping,
+                "initial process mappings exceed the configured physical-memory limit",
+            ));
+        }
         let process = RunnableProcess {
+            process_id: self.config.process_id,
             cpu,
             address_space,
+            memory_layout,
+            heap_size: 0,
+            initial_memory_size,
             memory,
             modules: modules.into_boxed_slice(),
             entry_module,
@@ -568,7 +1123,7 @@ fn prepare_modules(
     };
     let unresolved = |_: ExternalSymbol<'_>| SymbolResolution::Unresolved;
     let module = image
-        .prepare(placements[0], &unresolved)
+        .prepare_for_guest_relocation(placements[0], &unresolved)
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error))?;
     validate_range(address_space, module.image_base(), module.image_extent())?;
     Ok(vec![module])
@@ -624,6 +1179,39 @@ fn install_homebrew_context(
         .map_err(|failure| ProcessBuildError::new(ProcessBuildStage::Mapping, failure.reason))
 }
 
+fn install_homebrew_loader_return(
+    memory: &mut SyntheticMemory,
+    address_space: AddressSpaceId,
+    address: GuestVirtualAddress,
+) -> Result<(), ProcessBuildError> {
+    let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
+    // If an execution engine misses the runtime return-address boundary, the
+    // mapped fallback still performs the ABI-prescribed process exit.
+    page[..4].copy_from_slice(&HOME_BREW_EXIT_PROCESS_INSTRUCTION.to_le_bytes());
+    memory
+        .install_ram_pages_atomic(
+            address_space,
+            &[SyntheticRamPage {
+                virtual_address: address,
+                bytes: &page,
+                permissions: MemoryPermissions::READ_EXECUTE,
+            }],
+        )
+        .map_err(|failure| ProcessBuildError::new(ProcessBuildStage::Mapping, failure.reason))?;
+    if !memory.set_mapping_purpose(
+        address_space,
+        address,
+        SYNTHETIC_PAGE_SIZE as u64,
+        MemoryMappingPurpose::CodeStatic,
+    ) {
+        return Err(error(
+            ProcessBuildStage::Mapping,
+            "loader return mapping could not retain its purpose",
+        ));
+    }
+    Ok(())
+}
+
 fn initialize_thread(
     state: &mut ThreadCpuState,
     entry: GuestVirtualAddress,
@@ -631,6 +1219,7 @@ fn initialize_thread(
     tls_base: GuestVirtualAddress,
     main_thread_handle: u32,
     abi_context: Option<GuestVirtualAddress>,
+    loader_return: Option<GuestVirtualAddress>,
 ) -> Result<(), ProcessBuildError> {
     match state {
         ThreadCpuState::A64(state) => {
@@ -649,6 +1238,10 @@ fn initialize_thread(
                 } else {
                     u64::from(main_thread_handle)
                 },
+            );
+            state.write_x(
+                A64Register::General(a64_register(30)),
+                loader_return.map_or(0, GuestVirtualAddress::get),
             );
         }
         ThreadCpuState::A32(state) => {
@@ -723,7 +1316,9 @@ fn error(stage: ProcessBuildStage, cause: impl Display) -> ProcessBuildError {
 mod tests {
     use std::fs;
 
+    use swiitx_cpu::exception::ExceptionKind;
     use swiitx_cpu::ir::terminator::{ControlTarget, Terminator};
+    use swiitx_cpu::location::InstructionEncoding;
     use swiitx_cpu::memory::{
         CpuMemory, InstructionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions,
         MemoryValue, SYNTHETIC_PAGE_SIZE,
@@ -731,6 +1326,98 @@ mod tests {
 
     use super::*;
     use crate::{Launcher, LauncherInput};
+
+    #[derive(Default)]
+    struct RecordingSupervisorCallDispatcher {
+        expected_encoding: Option<InstructionEncoding>,
+        observed: Option<(crate::ExceptionDispatchRequest, AddressSpaceId, u64, u32)>,
+    }
+
+    impl crate::ExceptionDispatcher for RecordingSupervisorCallDispatcher {
+        type Fault = &'static str;
+
+        fn dispatch(
+            &mut self,
+            context: &mut crate::ExceptionDispatchContext<'_>,
+            request: crate::ExceptionDispatchRequest,
+        ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
+            let address_space = context.process().cpu().address_space_id();
+            let encoding = match request.source().execution_state {
+                ExecutionState::A64 | ExecutionState::A32 => context
+                    .process()
+                    .memory()
+                    .fetch32(address_space, request.source().pc)
+                    .map(|value| InstructionEncoding::from_u32(value.bits))
+                    .unwrap(),
+                ExecutionState::T32 => context
+                    .process()
+                    .memory()
+                    .fetch16(address_space, request.source().pc)
+                    .map(|value| InstructionEncoding::from_u16(value.bits))
+                    .unwrap(),
+            };
+            assert_eq!(Some(encoding), self.expected_encoding);
+            assert!(
+                context
+                    .process()
+                    .handles()
+                    .get_as::<crate::ThreadObject>(context.thread().handle())
+                    .is_some()
+            );
+
+            let thread_id = context.thread().object().thread_id();
+            let handle = context.thread().handle();
+            assert_eq!(
+                context.thread().state().execution_state(),
+                request.source().execution_state
+            );
+            match context.thread_mut().state_mut() {
+                ThreadCpuState::A64(state) => state.write_x(
+                    swiitx_cpu::state::a64::A64Register::General(a64_register(0)),
+                    0xfeed_face,
+                ),
+                ThreadCpuState::A32(state) => state.write_r(a32_register(0), 0xfeed_face),
+            }
+            self.observed = Some((request, address_space, thread_id, handle));
+            crate::ExceptionDispatchOutcome::Suspend(crate::ExceptionResume::Retry)
+        }
+    }
+
+    struct FixedSupervisorCallDispatcher<F> {
+        outcome: Option<crate::ExceptionDispatchOutcome<F>>,
+    }
+
+    impl<F> crate::ExceptionDispatcher for FixedSupervisorCallDispatcher<F> {
+        type Fault = F;
+
+        fn dispatch(
+            &mut self,
+            _context: &mut crate::ExceptionDispatchContext<'_>,
+            _request: crate::ExceptionDispatchRequest,
+        ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
+            self.outcome.take().expect("dispatcher is called once")
+        }
+    }
+
+    struct PcMutatingSupervisorCallDispatcher<F> {
+        outcome: Option<crate::ExceptionDispatchOutcome<F>>,
+    }
+
+    impl<F> crate::ExceptionDispatcher for PcMutatingSupervisorCallDispatcher<F> {
+        type Fault = F;
+
+        fn dispatch(
+            &mut self,
+            context: &mut crate::ExceptionDispatchContext<'_>,
+            _request: crate::ExceptionDispatchRequest,
+        ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
+            match context.thread_mut().state_mut() {
+                ThreadCpuState::A64(state) => state.set_pc(0x1000),
+                ThreadCpuState::A32(state) => state.set_instruction_address(0x1000).unwrap(),
+            }
+            self.outcome.take().expect("dispatcher is called once")
+        }
+    }
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -757,6 +1444,44 @@ mod tests {
                 MemoryValue::U32(encoding),
             )
             .unwrap();
+    }
+
+    fn process_stopped_at_svc(
+        execution_state: ExecutionState,
+    ) -> (RunnableProcess, crate::ExecutionReport, u64) {
+        let encoding = match execution_state {
+            ExecutionState::A64 => 0xd400_4681,
+            ExecutionState::A32 => 0xef12_3456,
+            ExecutionState::T32 => 0xbf00_df7b,
+        };
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut process, encoding);
+        let entry = process.entry_module().entry_address();
+        if execution_state != ExecutionState::A64 {
+            let mut state = match execution_state {
+                ExecutionState::A32 => swiitx_cpu::state::A32State::a32(),
+                ExecutionState::T32 => swiitx_cpu::state::A32State::t32(),
+                ExecutionState::A64 => unreachable!(),
+            };
+            state
+                .set_instruction_address(u32::try_from(entry).unwrap())
+                .unwrap();
+            process.main_thread.state = ThreadCpuState::A32(Box::new(state));
+        }
+        let report = process.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::SupervisorCall { .. }
+        ));
+        (process, report, entry)
+    }
+
+    fn instruction_address(state: &ThreadCpuState) -> u64 {
+        match state {
+            ThreadCpuState::A64(state) => state.pc(),
+            ThreadCpuState::A32(state) => u64::from(state.instruction_address()),
+        }
     }
 
     fn synthetic_nro() -> Vec<u8> {
@@ -814,6 +1539,77 @@ mod tests {
     }
 
     #[test]
+    fn horizon_layout_profiles_keep_allocation_windows_and_resource_limits_distinct() {
+        let code_start = 0x7100_0000;
+        let code_end = 0x7100_4000;
+        let limit = 0x1234_0000;
+        let layout = ProcessMemoryLayout::for_address_space(
+            ProcessMemoryLayoutProfile::Horizon2Plus,
+            ProcessAddressSpace::Bit64,
+            code_start,
+            code_end,
+            limit,
+        )
+        .unwrap();
+        assert_eq!(layout.aslr().base().get(), 0x0800_0000);
+        assert_eq!(layout.aslr().end(), 1_u64 << 39);
+        assert!(layout.aslr().base().get() <= layout.stack().base().get());
+        assert!(layout.stack().end() <= layout.aslr().end());
+        assert!(layout.alias().end() <= layout.aslr().end());
+        assert!(layout.heap().end() <= layout.aslr().end());
+        assert!(layout.stack().base().get() >= 0x7120_0000);
+        assert_eq!(layout.alias().size(), 0x10_0000_0000);
+        assert_eq!(layout.heap().size(), 0x2_0000_0000);
+        assert_eq!(layout.stack().size(), 0x8000_0000);
+        assert_eq!(layout.memory_capacity(), limit);
+
+        let high_code_start = 0x64_0000_0000;
+        let high_layout = ProcessMemoryLayout::for_address_space(
+            ProcessMemoryLayoutProfile::Horizon2Plus,
+            ProcessAddressSpace::Bit64,
+            high_code_start,
+            high_code_start + HORIZON_REGION_ALIGNMENT,
+            limit,
+        )
+        .unwrap();
+        assert!(high_layout.heap().end() <= high_code_start);
+
+        let without_alias = ProcessMemoryLayout::for_address_space(
+            ProcessMemoryLayoutProfile::Horizon2Plus,
+            ProcessAddressSpace::Bit32NoReserved,
+            0x0020_0000,
+            0x0040_0000,
+            limit,
+        )
+        .unwrap();
+        assert_eq!(without_alias.alias().size(), 0);
+        assert_eq!(without_alias.heap().base().get(), 0x4000_0000);
+        assert_eq!(without_alias.heap().size(), 0x8000_0000);
+
+        let deprecated = ProcessMemoryLayout::for_address_space(
+            ProcessMemoryLayoutProfile::Horizon1,
+            ProcessAddressSpace::Bit64Old,
+            0x0800_0000,
+            0x0820_0000,
+            limit,
+        )
+        .unwrap();
+        assert_eq!(deprecated.aslr().end(), 1_u64 << 36);
+        assert_eq!(deprecated.alias().size(), 0x1_8000_0000);
+        assert_eq!(deprecated.heap().size(), 0x2_0000_0000);
+        assert!(
+            ProcessMemoryLayout::for_address_space(
+                ProcessMemoryLayoutProfile::Horizon1,
+                ProcessAddressSpace::Bit64,
+                code_start,
+                code_end,
+                limit,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn a32_thread_initialization_uses_32_bit_pc_stack_and_tls() {
         let cpu = ProcessCpuContext::new(GuestCpuProfile::switch_1(), AddressSpaceId::new(7));
         let configuration = cpu.thread_configuration(ExecutionState::A32).unwrap();
@@ -824,6 +1620,7 @@ mod tests {
             GuestVirtualAddress::new(0x0080_0000),
             GuestVirtualAddress::new(0x0090_0000),
             1,
+            None,
             None,
         )
         .unwrap();
@@ -889,6 +1686,27 @@ mod tests {
             state.read_x(A64Register::General(a64_register(1))),
             u64::MAX
         );
+        let loader_return = process.main_thread().loader_return.unwrap();
+        assert_eq!(
+            state.read_x(A64Register::General(a64_register(30))),
+            loader_return.get()
+        );
+        assert_eq!(
+            process
+                .memory()
+                .mapping_info(process.cpu_context().address_space_id(), loader_return)
+                .unwrap()
+                .permissions,
+            MemoryPermissions::READ_EXECUTE
+        );
+        assert_eq!(
+            process
+                .memory()
+                .fetch32(process.cpu_context().address_space_id(), loader_return)
+                .unwrap()
+                .bits,
+            HOME_BREW_EXIT_PROCESS_INSTRUCTION
+        );
         assert_eq!(
             process
                 .memory()
@@ -927,6 +1745,68 @@ mod tests {
                 .value,
             MemoryValue::U32(0)
         );
+    }
+
+    #[test]
+    fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut process, 0xd65f_03c0); // RET X30
+        let loader_return = process.main_thread().loader_return.unwrap();
+        let ThreadCpuState::A64(state) = &mut process.main_thread.state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        state.write_x(A64Register::General(a64_register(0)), 0x1234_5678);
+
+        let report = process.run_reference(1).unwrap();
+
+        assert_eq!(report.instructions_executed, 1);
+        assert_eq!(
+            report.stop,
+            crate::ExecutionStop::LoaderReturn {
+                source: LocationDescriptor::new(
+                    loader_return,
+                    ExecutionState::A64,
+                    process.cpu_context().profile().id(),
+                ),
+                result_code: 0x1234_5678,
+            }
+        );
+        assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+        assert_eq!(
+            process.exit(),
+            Some(ProcessExit {
+                cause: ProcessExitCause::LoaderReturned,
+                exit_code: 0x1234_5678,
+                source: Some(LocationDescriptor::new(
+                    loader_return,
+                    ExecutionState::A64,
+                    process.cpu_context().profile().id(),
+                )),
+                thread_id: 1,
+            })
+        );
+        assert_eq!(
+            process.main_thread().exit(),
+            Some(ThreadExit {
+                requested_scope: ExceptionTerminationScope::Process,
+                exit_code: 0x1234_5678,
+                source: Some(LocationDescriptor::new(
+                    loader_return,
+                    ExecutionState::A64,
+                    process.cpu_context().profile().id(),
+                )),
+            })
+        );
+        assert!(matches!(
+            process.run_reference(1),
+            Err(ProcessExecutionError::NotRunnable {
+                status: ProcessExecutionStatus::Exited,
+                ..
+            })
+        ));
+        let teardown = process.teardown();
+        assert_eq!(teardown.exit.unwrap().exit_code, 0x1234_5678);
     }
 
     #[test]
@@ -1006,6 +1886,7 @@ mod tests {
         let report = process.run_reference(1).unwrap();
         assert_eq!(report.instructions_executed, 1);
         assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
+        assert!(report.stop.exception_dispatch_request().is_none());
         assert!(!report.trace.enabled());
         assert!(report.trace.entries().is_empty());
         assert_eq!(
@@ -1133,6 +2014,10 @@ mod tests {
             .unwrap();
         replace_entry_instruction(&mut profile_disabled, 0x4e22_1c20);
         let report = profile_disabled.run_reference(1).unwrap();
+        assert_eq!(
+            report.stop.exception_dispatch_request().unwrap().kind(),
+            swiitx_cpu::exception::ExceptionKind::UndefinedInstruction
+        );
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::ProfileDisabled { .. }
@@ -1142,6 +2027,10 @@ mod tests {
         let mut unallocated = ProcessBuilder::new().build(&plan).unwrap();
         replace_entry_instruction(&mut unallocated, 0);
         let report = unallocated.run_reference(1).unwrap();
+        assert_eq!(
+            report.stop.exception_dispatch_request().unwrap().kind(),
+            swiitx_cpu::exception::ExceptionKind::UndefinedInstruction
+        );
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::UnallocatedEncoding { .. }
@@ -1156,10 +2045,16 @@ mod tests {
         let mut svc = ProcessBuilder::new().build(&plan).unwrap();
         replace_entry_instruction(&mut svc, 0xd400_0841); // SVC #0x42
         let report = svc.run_reference(1).unwrap();
+        let dispatch = report.stop.exception_dispatch_request().unwrap();
+        assert_eq!(
+            dispatch.kind(),
+            swiitx_cpu::exception::ExceptionKind::SupervisorCall
+        );
+        assert_eq!(dispatch.syndrome(), Some(0x42));
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::SupervisorCall {
-                immediate: Some(0x42),
+                immediate: 0x42,
                 ..
             }
         ));
@@ -1168,10 +2063,16 @@ mod tests {
         let mut breakpoint = ProcessBuilder::new().build(&plan).unwrap();
         replace_entry_instruction(&mut breakpoint, 0xd420_2460); // BRK #0x123
         let report = breakpoint.run_reference(1).unwrap();
+        let dispatch = report.stop.exception_dispatch_request().unwrap();
+        assert_eq!(
+            dispatch.kind(),
+            swiitx_cpu::exception::ExceptionKind::Breakpoint
+        );
+        assert_eq!(dispatch.syndrome(), Some(0x123));
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::ArchitecturalException {
-                kind: swiitx_cpu::ir::terminator::ExceptionKind::Breakpoint,
+                kind: swiitx_cpu::exception::ExceptionKind::Breakpoint,
                 syndrome: Some(0x123),
                 ..
             }
@@ -1188,11 +2089,199 @@ mod tests {
             0x1000,
         );
         let report = data_fault.run_reference(1).unwrap();
+        assert_eq!(
+            report.stop.exception_dispatch_request().unwrap().kind(),
+            swiitx_cpu::exception::ExceptionKind::DataAbort
+        );
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::DataFault { .. }
         ));
         assert!(report.to_string().contains("data-fault"));
+    }
+
+    #[test]
+    fn supervisor_calls_route_a64_a32_and_t32_with_current_runtime_context() {
+        let cases = [
+            (ExecutionState::A64, 0xd400_4681, 0x234),
+            (ExecutionState::A32, 0xef12_3456, 0x12_3456),
+            (ExecutionState::T32, 0xbf00_df7b, 0x7b),
+        ];
+
+        for (execution_state, encoding, immediate) in cases {
+            let (_directory, plan) = plan();
+            let mut process = ProcessBuilder::new().build(&plan).unwrap();
+            replace_entry_instruction(&mut process, encoding);
+            let entry = process.entry_module().entry_address();
+            if execution_state != ExecutionState::A64 {
+                let mut state = match execution_state {
+                    ExecutionState::A32 => swiitx_cpu::state::A32State::a32(),
+                    ExecutionState::T32 => swiitx_cpu::state::A32State::t32(),
+                    ExecutionState::A64 => unreachable!(),
+                };
+                state
+                    .set_instruction_address(u32::try_from(entry).unwrap())
+                    .unwrap();
+                process.main_thread.state = ThreadCpuState::A32(Box::new(state));
+            }
+
+            let report = process.run_reference(1).unwrap();
+            let expected_encoding = match execution_state {
+                ExecutionState::T32 => InstructionEncoding::from_u16(encoding as u16),
+                ExecutionState::A64 | ExecutionState::A32 => {
+                    InstructionEncoding::from_u32(encoding)
+                }
+            };
+            let mut dispatcher = RecordingSupervisorCallDispatcher {
+                expected_encoding: Some(expected_encoding),
+                observed: None,
+            };
+            let outcome = process
+                .route_supervisor_call(&report.stop, &mut dispatcher)
+                .unwrap();
+
+            assert_eq!(outcome, crate::ExceptionHandlingResult::Suspended);
+            let (request, address_space, thread_id, handle) = dispatcher.observed.unwrap();
+            assert_eq!(request.kind(), ExceptionKind::SupervisorCall);
+            assert_eq!(request.syndrome(), Some(immediate));
+            assert_eq!(request.source().pc.get(), entry);
+            assert_eq!(request.source().execution_state, execution_state);
+            assert_eq!(address_space, process.cpu_context().address_space_id());
+            assert_eq!(thread_id, 1);
+            assert_eq!(handle, process.main_thread().handle);
+            match &process.main_thread().state {
+                ThreadCpuState::A64(state) => assert_eq!(
+                    state.read_x(swiitx_cpu::state::a64::A64Register::General(a64_register(
+                        0
+                    ))),
+                    0xfeed_face
+                ),
+                ThreadCpuState::A32(state) => {
+                    assert_eq!(state.read_r(a32_register(0)), 0xfeed_face)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn handled_supervisor_calls_advance_once_in_a64_a32_and_t32() {
+        let cases = [
+            (ExecutionState::A64, 4_u64),
+            (ExecutionState::A32, 4_u64),
+            (ExecutionState::T32, 2_u64),
+        ];
+
+        for (execution_state, width) in cases {
+            let (mut process, report, entry) = process_stopped_at_svc(execution_state);
+            let mut dispatcher = FixedSupervisorCallDispatcher {
+                outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
+                    crate::ExceptionResume::Next,
+                )),
+            };
+
+            let result = process
+                .route_supervisor_call(&report.stop, &mut dispatcher)
+                .unwrap();
+
+            assert_eq!(result, crate::ExceptionHandlingResult::Resumed);
+            assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
+            assert_eq!(
+                instruction_address(&process.main_thread.state),
+                entry + width
+            );
+            let next = process.run_reference(1).unwrap();
+            assert!(!matches!(
+                next.stop,
+                crate::ExecutionStop::SupervisorCall { source, .. } if source.pc.get() == entry
+            ));
+        }
+    }
+
+    #[test]
+    fn supervisor_call_retry_is_explicit_and_reexecutes_the_source() {
+        for execution_state in [
+            ExecutionState::A64,
+            ExecutionState::A32,
+            ExecutionState::T32,
+        ] {
+            let (mut process, report, entry) = process_stopped_at_svc(execution_state);
+            let mut dispatcher = PcMutatingSupervisorCallDispatcher {
+                outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
+                    crate::ExceptionResume::Retry,
+                )),
+            };
+
+            assert_eq!(
+                process
+                    .route_supervisor_call(&report.stop, &mut dispatcher)
+                    .unwrap(),
+                crate::ExceptionHandlingResult::Resumed
+            );
+            assert_eq!(instruction_address(&process.main_thread.state), entry);
+            let retried = process.run_reference(1).unwrap();
+            assert!(matches!(
+                retried.stop,
+                crate::ExecutionStop::SupervisorCall { source, .. } if source.pc.get() == entry
+            ));
+        }
+    }
+
+    #[test]
+    fn suspended_supervisor_call_installs_continuation_without_becoming_runnable() {
+        let (mut process, report, entry) = process_stopped_at_svc(ExecutionState::A64);
+        let mut dispatcher = FixedSupervisorCallDispatcher {
+            outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Suspend(
+                crate::ExceptionResume::Next,
+            )),
+        };
+
+        assert_eq!(
+            process
+                .route_supervisor_call(&report.stop, &mut dispatcher)
+                .unwrap(),
+            crate::ExceptionHandlingResult::Suspended
+        );
+        assert_eq!(instruction_address(&process.main_thread.state), entry + 4);
+        assert_eq!(
+            process.execution_status(),
+            ProcessExecutionStatus::Suspended
+        );
+        assert!(matches!(
+            process.run_reference(1),
+            Err(crate::ProcessExecutionError::NotRunnable {
+                status: ProcessExecutionStatus::Suspended,
+                ..
+            })
+        ));
+        assert!(process.resume());
+        assert_eq!(instruction_address(&process.main_thread.state), entry + 4);
+    }
+
+    #[test]
+    fn faulted_supervisor_call_retains_source_and_cannot_run() {
+        let (mut process, report, entry) = process_stopped_at_svc(ExecutionState::A64);
+        let mut dispatcher = PcMutatingSupervisorCallDispatcher {
+            outcome: Some(crate::ExceptionDispatchOutcome::Fault(
+                "svc dispatch failed",
+            )),
+        };
+
+        assert_eq!(
+            process
+                .route_supervisor_call(&report.stop, &mut dispatcher)
+                .unwrap(),
+            crate::ExceptionHandlingResult::Fault("svc dispatch failed")
+        );
+        assert_eq!(instruction_address(&process.main_thread.state), entry);
+        assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+        assert!(matches!(
+            process.run_reference(1),
+            Err(crate::ProcessExecutionError::NotRunnable {
+                status: ProcessExecutionStatus::Faulted,
+                ..
+            })
+        ));
+        assert!(!process.resume());
     }
 
     #[test]
@@ -1262,11 +2351,23 @@ mod tests {
         let (_directory, plan) = plan();
         let mut process = ProcessBuilder::new().build(&plan).unwrap();
         assert!(process.terminate());
+        assert_eq!(
+            process.exit().unwrap().cause,
+            crate::ProcessExitCause::HostRequested
+        );
+        assert_eq!(
+            process.main_thread().exit().unwrap().requested_scope,
+            crate::ExceptionTerminationScope::Process
+        );
 
         let report = process.teardown();
         assert_eq!(
             report.previous_status,
             crate::ProcessExecutionStatus::Exited
+        );
+        assert_eq!(
+            report.exit.unwrap().cause,
+            crate::ProcessExitCause::HostRequested
         );
         assert_eq!(report.threads_released, 1);
         assert_eq!(report.modules_released, 1);

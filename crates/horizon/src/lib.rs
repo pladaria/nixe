@@ -5,6 +5,8 @@
 
 mod ipc;
 mod object;
+mod svc;
+mod svc_dispatch;
 
 pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
@@ -13,4 +15,11 @@ pub use ipc::{
 pub use object::{
     DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
     ReadOnlyFileSystem,
+};
+pub use svc::{
+    HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,
+};
+pub use svc_dispatch::{
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonSvcCoverageEntry,
+    HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, MAX_WAIT_HANDLES,
 };

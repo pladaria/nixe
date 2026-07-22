@@ -20,7 +20,7 @@ pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
 pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange, NsoSegmentCompression};
 pub use preparation::{
     ExternalSymbol, MappingRegion, NsoBatchModule, PreparationConfig, PrepareError, PreparedModule,
-    RuntimeExport, SymbolResolution, SymbolResolver, prepare_nso_batch,
+    RelocationState, RuntimeExport, SymbolResolution, SymbolResolver, prepare_nso_batch,
 };
 
 /// Identifies the source executable format.

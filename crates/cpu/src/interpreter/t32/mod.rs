@@ -72,14 +72,14 @@ fn execute_it(
     if state.cpsr().it_state().is_active() {
         return Ok(InterpreterOutcome::Exception {
             source: decoded.location,
-            kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+            kind: crate::exception::ExceptionKind::UndefinedInstruction,
             syndrome: None,
         });
     }
     let Some(it_state) = ItState::from_encoding(first_condition, mask) else {
         return Ok(InterpreterOutcome::Exception {
             source: decoded.location,
-            kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+            kind: crate::exception::ExceptionKind::UndefinedInstruction,
             syndrome: None,
         });
     };

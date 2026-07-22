@@ -88,7 +88,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-exclusive",
-        0x3fe0_fc00,
+        0x3fe0_7c00,
         0x0840_7c00,
         0x0000_002b,
         145,
@@ -97,7 +97,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "store-exclusive",
-        0x3f20_fc00,
+        0x3f20_7c00,
         0x0800_7c00,
         0x0000_002c,
         144,

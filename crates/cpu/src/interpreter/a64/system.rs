@@ -6,21 +6,23 @@ use crate::{
         a64::system::{Instruction, Operands},
     },
     location::{DecodedInstruction, LocationDescriptor},
+    profile::{CapabilityStatus, InstructionFeature},
     state::a64::{A64State, Nzcv},
 };
 
 use super::{advance, read, resume, write};
-use crate::interpreter::{InterpreterError, InterpreterOutcome};
+use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
 
 pub(super) fn execute(
+    context: InterpreterContext<'_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
 ) -> Result<InterpreterOutcome, InterpreterError> {
     let fields = instruction.operands();
     let outcome = match instruction {
-        Instruction::Hint(_) => execute_hint(state, decoded.location, fields),
-        Instruction::ReadRegister(_) => execute_mrs(state, fields),
+        Instruction::Hint(_) => execute_hint(context, state, decoded.location, fields),
+        Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
         Instruction::WriteRegister(_) => execute_msr(state, fields),
         Instruction::Barrier(_) => execute_barrier(fields),
         Instruction::System(_) => false,
@@ -32,23 +34,54 @@ pub(super) fn execute(
     Ok(resume(state, decoded))
 }
 
-fn execute_hint(_state: &mut A64State, _source: LocationDescriptor, fields: Operands) -> bool {
+fn execute_hint(
+    context: InterpreterContext<'_>,
+    _state: &mut A64State,
+    _source: LocationDescriptor,
+    fields: Operands,
+) -> bool {
     match fields.hint {
         0 => true,
         // YIELD/WFE/WFI/SEV/SEVL require scheduler/event callbacks. Treating
         // them as no-ops would make this reference engine an invalid oracle.
         1..=5 => false,
+        // BTI is encoded in the HINT space. On a profile where FEAT_BTI is
+        // absent these encodings retain their architectural hint behavior;
+        // enabled or unknown profiles require the future branch-type state.
+        32 | 34 | 36 | 38 => matches!(
+            context
+                .process()
+                .profile()
+                .instruction_feature_status(InstructionFeature::BranchTargetIdentification),
+            CapabilityStatus::Disabled
+        ),
         _ => false,
     }
 }
 
-fn execute_mrs(state: &mut A64State, fields: Operands) -> bool {
+fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> bool {
     let value = match fields.system_key {
         0xd53b_4200 => u64::from(state.nzcv().bits()),
         0xd53b_4400 => u64::from(state.fpcr()),
         0xd53b_4420 => u64::from(state.fpsr()),
         0xd53b_d040 => state.tpidr_el0(),
         0xd53b_d060 => state.tpidrro_el0(),
+        0xd53b_00e0 => {
+            let profile = context.process().profile().cache_maintenance();
+            let crate::profile::ProfileValue::Known(bytes) = profile.data_zero_block_bytes else {
+                return false;
+            };
+            if bytes < 4 || !bytes.is_power_of_two() {
+                return false;
+            }
+            let block_size = bytes.trailing_zeros() - 2;
+            let prohibited = match profile.user_cache_maintenance {
+                CapabilityStatus::Enabled => 0,
+                CapabilityStatus::Disabled => 1 << 4,
+                CapabilityStatus::Unknown => return false,
+            };
+            u64::from(prohibited | block_size)
+        }
         _ => return false,
     };
     write(state, fields.rt, 64, false, value);

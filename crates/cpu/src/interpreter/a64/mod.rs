@@ -1,6 +1,7 @@
 //! A64 reference interpretation split by architectural instruction family.
 
 mod control;
+mod fp_simd;
 mod integer;
 mod memory;
 mod system;
@@ -21,14 +22,17 @@ pub(super) fn execute(
 ) -> Result<InterpreterOutcome, InterpreterError> {
     match crate::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
         A64Instruction::Control(instruction) => control::execute(state, decoded, instruction),
-        A64Instruction::System(instruction) => system::execute(state, decoded, instruction),
+        A64Instruction::System(instruction) => {
+            system::execute(context, state, decoded, instruction)
+        }
         A64Instruction::Integer(instruction) => integer::execute(state, decoded, instruction),
         A64Instruction::Memory(instruction) => {
             memory::execute(context, state, decoded, instruction)
         }
-        A64Instruction::FpSimd(_) | A64Instruction::RecognizedFallback { .. } => {
-            Err(super::unsupported(decoded))
+        A64Instruction::FpSimd(instruction) => {
+            fp_simd::execute(context, state, decoded, instruction)
         }
+        A64Instruction::RecognizedFallback { .. } => Err(super::unsupported(decoded)),
     }
 }
 

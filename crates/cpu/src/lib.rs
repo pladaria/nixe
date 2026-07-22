@@ -8,6 +8,7 @@ pub mod address;
 pub mod coverage;
 pub mod decode;
 pub mod error;
+pub mod exception;
 pub mod interpreter;
 pub mod ir;
 pub mod location;

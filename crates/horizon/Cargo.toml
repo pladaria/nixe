@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+swiitx-cpu.workspace = true
 swiitx-loader-storage.workspace = true
 swiitx-loader-title.workspace = true
 swiitx-runtime.workspace = true

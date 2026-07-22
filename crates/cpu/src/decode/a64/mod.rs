@@ -60,7 +60,9 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 => A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits)),
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_0049 => {
+            A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
+        }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
     }
 }
@@ -198,6 +200,8 @@ mod tests {
             .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled);
         let cases = [
             (0x4e20_1c00, "simd-bitwise"),
+            (0x4e01_0c20, "simd-duplicate-general"),
+            (0xad01_0060, "fp-simd-load-store-pair"),
             (0x4e20_8400, "simd-integer"),
             (0x1e61_2800, "fp-scalar-two-source"),
             (0x1e60_4000, "fp-scalar-move"),

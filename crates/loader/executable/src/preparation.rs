@@ -17,6 +17,7 @@ const MAX_RELOCATIONS: usize = 1_000_000;
 const ELF64_DYN_SIZE: u64 = 16;
 const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
+const ELF64_RELR_SIZE: u64 = 8;
 
 const DT_NULL: i64 = 0;
 const DT_HASH: i64 = 4;
@@ -254,7 +255,14 @@ impl MappingRegion {
     }
 }
 
-/// A completely validated and relocated module ready for a runtime mapper.
+/// Whether relocation is complete or intentionally delegated to guest startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocationState {
+    Applied,
+    PendingGuestRuntime,
+}
+
+/// A completely validated module ready for a runtime mapper.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedModule {
     format: ExecutableFormat,
@@ -262,6 +270,7 @@ pub struct PreparedModule {
     image_base: u64,
     image_extent: u64,
     entry_address: u64,
+    relocation_state: RelocationState,
     mappings: Box<[MappingRegion]>,
 }
 
@@ -289,6 +298,11 @@ impl PreparedModule {
     /// Returns the relocated guest entry address.
     pub const fn entry_address(&self) -> u64 {
         self.entry_address
+    }
+
+    /// Returns whether pointers were relocated by the host or by guest startup.
+    pub const fn relocation_state(&self) -> RelocationState {
+        self.relocation_state
     }
 
     /// Returns sorted, non-overlapping immutable mappings.
@@ -368,6 +382,37 @@ impl NroImage {
             hints,
             config,
             resolver,
+            RelocationState::Applied,
+        )
+    }
+
+    /// Validates and materializes an NRO whose real ABI startup relocates itself.
+    ///
+    /// Dynamic records are parsed and validated with the same bounds as host
+    /// relocation, but their writes remain pending for the guest runtime.
+    pub fn prepare_for_guest_relocation(
+        &self,
+        config: PreparationConfig,
+        resolver: &impl SymbolResolver,
+    ) -> Result<PreparedModule, PrepareError> {
+        let module_offset = self.metadata().module_header_offset();
+        let hints = TableHints {
+            strings: Some((
+                self.metadata().dynamic_string_table().offset(),
+                self.metadata().dynamic_string_table().size(),
+            )),
+            symbols: Some((
+                self.metadata().dynamic_symbol_table().offset(),
+                self.metadata().dynamic_symbol_table().size(),
+            )),
+        };
+        prepare(
+            self.executable(),
+            module_offset.then_some_nonzero(),
+            hints,
+            config,
+            resolver,
+            RelocationState::PendingGuestRuntime,
         )
     }
 }
@@ -409,6 +454,7 @@ impl NsoImage {
             hints,
             config,
             resolver,
+            RelocationState::Applied,
         )
     }
 }
@@ -444,6 +490,7 @@ fn prepare(
     hints: TableHints,
     config: PreparationConfig,
     resolver: &impl SymbolResolver,
+    relocation_state: RelocationState,
 ) -> Result<PreparedModule, PrepareError> {
     if !config.image_base.is_multiple_of(PAGE_SIZE) {
         return Err(PrepareError::new("image base is not page aligned"));
@@ -481,7 +528,14 @@ fn prepare(
     if let Some(offset) = mod0_offset {
         let mod0 = parse_mod0(&regions, offset)?;
         let dynamic = parse_dynamic(&regions, mod0.dynamic_offset)?;
-        apply_dynamic(&mut regions, &dynamic, hints, config.image_base, resolver)?;
+        apply_dynamic(
+            &mut regions,
+            &dynamic,
+            hints,
+            config.image_base,
+            resolver,
+            relocation_state == RelocationState::Applied,
+        )?;
     }
 
     let mappings = regions
@@ -502,6 +556,7 @@ fn prepare(
         image_base: config.image_base,
         image_extent,
         entry_address,
+        relocation_state,
         mappings,
     })
 }
@@ -705,9 +760,6 @@ fn reject_unsupported_dynamic(info: &DynamicInfo) -> Result<(), PrepareError> {
         (DT_REL, "DT_REL"),
         (DT_RELSZ, "DT_RELSZ"),
         (DT_RELENT, "DT_RELENT"),
-        (DT_RELR, "DT_RELR"),
-        (DT_RELRSZ, "DT_RELRSZ"),
-        (DT_RELRENT, "DT_RELRENT"),
     ] {
         if info.values.contains_key(&tag) {
             return Err(PrepareError::new(format!(
@@ -724,9 +776,11 @@ fn apply_dynamic(
     hints: TableHints,
     image_base: u64,
     resolver: &impl SymbolResolver,
+    commit: bool,
 ) -> Result<(), PrepareError> {
     let rela = relocation_range(dynamic, DT_RELA, DT_RELASZ, "RELA")?;
     let plt = relocation_range(dynamic, DT_JMPREL, DT_PLTRELSZ, "PLT RELA")?;
+    let relr = relr_range(dynamic)?;
     if plt.is_some() && dynamic.values.get(&DT_PLTREL).copied() != Some(DT_RELA as u64) {
         return Err(PrepareError::new("DT_PLTREL is not DT_RELA"));
     }
@@ -796,6 +850,7 @@ fn apply_dynamic(
             }
         }
     }
+    let relr_writes = decode_relr(regions, relr, image_base, &mut targets, records.len())?;
     if let Some(relative_count) = dynamic.values.get(&DT_RELACOUNT) {
         let regular_count = rela.map_or(0, |(_, size)| size / ELF64_RELA_SIZE);
         if *relative_count > regular_count {
@@ -804,57 +859,191 @@ fn apply_dynamic(
             ));
         }
     }
-    if records.is_empty() {
-        return Ok(());
-    }
-    let tables = SymbolTables::parse(regions, dynamic, hints, &records)?;
-    let mut writes = Vec::with_capacity(records.len());
-    for relocation in &records {
-        let value = match relocation.kind {
-            R_AARCH64_RELATIVE => {
-                if relocation.symbol != 0 {
+    let mut writes = Vec::with_capacity(records.len() + relr_writes.len());
+    if !records.is_empty() {
+        let tables = SymbolTables::parse(regions, dynamic, hints, &records)?;
+        for relocation in &records {
+            let value = match relocation.kind {
+                R_AARCH64_RELATIVE => {
+                    if relocation.symbol != 0 {
+                        return Err(PrepareError::new(format!(
+                            "{} has a nonzero symbol index",
+                            relocation.description
+                        )));
+                    }
+                    checked_signed_add(image_base, relocation.addend, &relocation.description)?
+                }
+                R_AARCH64_ABS64 => {
+                    let symbol = tables.resolve(
+                        relocation.symbol,
+                        image_base,
+                        resolver,
+                        &relocation.description,
+                    )?;
+                    checked_signed_add(symbol, relocation.addend, &relocation.description)?
+                }
+                R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
+                    if relocation.addend != 0 {
+                        return Err(PrepareError::new(format!(
+                            "{} has a nonzero addend",
+                            relocation.description
+                        )));
+                    }
+                    tables.resolve(
+                        relocation.symbol,
+                        image_base,
+                        resolver,
+                        &relocation.description,
+                    )?
+                }
+                kind => {
                     return Err(PrepareError::new(format!(
-                        "{} has a nonzero symbol index",
+                        "{} has unsupported AArch64 type {kind}",
                         relocation.description
                     )));
                 }
-                checked_signed_add(image_base, relocation.addend, &relocation.description)?
+            };
+            writes.push((relocation.target, value));
+        }
+    }
+    writes.extend(relr_writes);
+    if commit {
+        for (target, value) in writes {
+            write_u64(regions, target, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn relr_range(dynamic: &DynamicInfo) -> Result<Option<(u64, u64)>, PrepareError> {
+    let range = match (dynamic.values.get(&DT_RELR), dynamic.values.get(&DT_RELRSZ)) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(PrepareError::new(
+                "RELR address and size tags must appear together",
+            ));
+        }
+        (Some(address), Some(size)) => {
+            if size % ELF64_RELR_SIZE != 0 {
+                return Err(PrepareError::new("RELR size is not a multiple of 8"));
             }
-            R_AARCH64_ABS64 => {
-                let symbol = tables.resolve(
-                    relocation.symbol,
+            Some((*address, *size))
+        }
+    };
+    match (range, dynamic.values.get(&DT_RELRENT)) {
+        (None, Some(_)) => Err(PrepareError::new("DT_RELRENT appears without a RELR table")),
+        (_, Some(entry_size)) if *entry_size != ELF64_RELR_SIZE => {
+            Err(PrepareError::new("DT_RELRENT is not 8 bytes"))
+        }
+        _ => Ok(range),
+    }
+}
+
+fn decode_relr(
+    regions: &[WorkingRegion],
+    range: Option<(u64, u64)>,
+    image_base: u64,
+    targets: &mut BTreeSet<u64>,
+    existing_count: usize,
+) -> Result<Vec<(u64, u64)>, PrepareError> {
+    let Some((offset, size)) = range else {
+        return Ok(Vec::new());
+    };
+    validate_logical_range(regions, offset, size, "RELR")?;
+    let entry_count = size / ELF64_RELR_SIZE;
+    if entry_count > MAX_RELOCATIONS as u64 {
+        return Err(PrepareError::new("RELR exceeds the relocation limit"));
+    }
+
+    let mut writes = Vec::new();
+    let mut next_target = None;
+    for index in 0..entry_count {
+        let entry_offset = checked_add(offset, index * ELF64_RELR_SIZE, "RELR entry offset")?;
+        let entry = read(regions, entry_offset, ELF64_RELR_SIZE, true)
+            .ok_or_else(|| PrepareError::new(format!("RELR entry {index} is outside memory")))?;
+        let encoded = read_u64(entry, 0);
+        if encoded & 1 == 0 {
+            append_relr_write(
+                regions,
+                encoded,
+                image_base,
+                targets,
+                &mut writes,
+                existing_count,
+                index,
+            )?;
+            next_target = Some(checked_add(encoded, 8, "RELR next target")?);
+            continue;
+        }
+
+        let bitmap_base = next_target.ok_or_else(|| {
+            PrepareError::new(format!(
+                "RELR bitmap entry {index} has no preceding address"
+            ))
+        })?;
+        for bit in 1..64_u32 {
+            if encoded & (1_u64 << bit) != 0 {
+                let target =
+                    checked_add(bitmap_base, u64::from(bit - 1) * 8, "RELR bitmap target")?;
+                append_relr_write(
+                    regions,
+                    target,
                     image_base,
-                    resolver,
-                    &relocation.description,
+                    targets,
+                    &mut writes,
+                    existing_count,
+                    index,
                 )?;
-                checked_signed_add(symbol, relocation.addend, &relocation.description)?
             }
-            R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
-                if relocation.addend != 0 {
-                    return Err(PrepareError::new(format!(
-                        "{} has a nonzero addend",
-                        relocation.description
-                    )));
-                }
-                tables.resolve(
-                    relocation.symbol,
-                    image_base,
-                    resolver,
-                    &relocation.description,
-                )?
-            }
-            kind => {
-                return Err(PrepareError::new(format!(
-                    "{} has unsupported AArch64 type {kind}",
-                    relocation.description
-                )));
-            }
-        };
-        writes.push((relocation.target, value));
+        }
+        next_target = Some(checked_add(
+            bitmap_base,
+            63 * 8,
+            "RELR bitmap continuation",
+        )?);
     }
-    for (target, value) in writes {
-        write_u64(regions, target, value)?;
+    Ok(writes)
+}
+
+fn append_relr_write(
+    regions: &[WorkingRegion],
+    target: u64,
+    image_base: u64,
+    targets: &mut BTreeSet<u64>,
+    writes: &mut Vec<(u64, u64)>,
+    existing_count: usize,
+    entry_index: u64,
+) -> Result<(), PrepareError> {
+    if existing_count + writes.len() >= MAX_RELOCATIONS {
+        return Err(PrepareError::new(
+            "combined relocation count exceeds the relocation limit",
+        ));
     }
+    if !target.is_multiple_of(8) {
+        return Err(PrepareError::new(format!(
+            "RELR entry {entry_index} target is unaligned"
+        )));
+    }
+    let target_region = find_region(regions, target, 8, true).ok_or_else(|| {
+        PrepareError::new(format!(
+            "RELR entry {entry_index} target is outside logical memory"
+        ))
+    })?;
+    if target_region.permissions.is_executable() {
+        return Err(PrepareError::new(format!(
+            "RELR entry {entry_index} targets executable memory"
+        )));
+    }
+    if !targets.insert(target) {
+        return Err(PrepareError::new(format!(
+            "duplicate relocation target {target:#x}"
+        )));
+    }
+    let implicit_addend = read(regions, target, 8, true)
+        .map(|bytes| read_u64(bytes, 0))
+        .ok_or_else(|| PrepareError::new("RELR target disappeared during validation"))?;
+    let value = checked_add(image_base, implicit_addend, "RELR relocation value")?;
+    writes.push((target, value));
     Ok(())
 }
 
@@ -1583,6 +1772,16 @@ mod tests {
             prepared_nro.read_image(0x2000, 0x1800),
             prepared_nso.read_image(0x2000, 0x1800)
         );
+
+        let pending = nro.prepare_for_guest_relocation(config, &resolver).unwrap();
+        assert_eq!(
+            pending.relocation_state(),
+            RelocationState::PendingGuestRuntime
+        );
+        assert_eq!(
+            pending.read_image(0x2000, 8).unwrap(),
+            &0xaaaa_aaaa_aaaa_aaaa_u64.to_le_bytes()
+        );
     }
 
     #[test]
@@ -1738,6 +1937,43 @@ mod tests {
     }
 
     #[test]
+    fn applies_relr_address_and_bitmap_entries_with_implicit_addends() {
+        let mut bytes = synthetic_nro();
+        let read_only = &mut bytes[0x1000..0x2000];
+        dynamic(read_only, 12, DT_RELR, 0x1900);
+        dynamic(read_only, 13, DT_RELRSZ, 16);
+        dynamic(read_only, 14, DT_RELRENT, ELF64_RELR_SIZE);
+        dynamic(read_only, 15, DT_NULL, 0);
+        put_u64(read_only, 0x900, 0x2020);
+        put_u64(read_only, 0x908, 0b111);
+        put_u64(&mut bytes, 0x2020, 0x10);
+        put_u64(&mut bytes, 0x2028, 0x20);
+        put_u64(&mut bytes, 0x2030, 0x30);
+
+        let prepared = prepare_nro_bytes(bytes).unwrap();
+        for (target, addend) in [(0x2020, 0x10_u64), (0x2028, 0x20), (0x2030, 0x30)] {
+            assert_eq!(
+                prepared.read_image(target, 8).unwrap(),
+                &(0x7100_0000_u64 + addend).to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_relr_bitmap_without_address_and_does_not_commit_relocations() {
+        let mut bytes = synthetic_nro();
+        let read_only = &mut bytes[0x1000..0x2000];
+        dynamic(read_only, 12, DT_RELR, 0x1900);
+        dynamic(read_only, 13, DT_RELRSZ, 8);
+        dynamic(read_only, 14, DT_RELRENT, ELF64_RELR_SIZE);
+        dynamic(read_only, 15, DT_NULL, 0);
+        put_u64(read_only, 0x900, 1);
+
+        let error = prepare_nro_bytes(bytes).unwrap_err();
+        assert!(error.reason().contains("no preceding address"));
+    }
+
+    #[test]
     fn rejects_adversarial_dynamic_and_relocation_records() {
         let cases: &[(usize, &[u8], &str)] = &[
             (0x1110, &DT_STRTAB.to_le_bytes(), "duplicated"),
@@ -1779,6 +2015,7 @@ mod tests {
                     address_limit: 0x8000_0000,
                 },
                 &resolver,
+                RelocationState::Applied,
             )
             .unwrap();
             assert_eq!(prepared.entry_address(), base);
@@ -1841,6 +2078,7 @@ mod tests {
                 address_limit: 0x8000_0000,
             },
             &|_: ExternalSymbol<'_>| SymbolResolution::Unresolved,
+            RelocationState::Applied,
         )
         .unwrap_err();
         assert!(error.reason().contains("external"));
@@ -1864,6 +2102,7 @@ mod tests {
                 address_limit: u64::MAX,
             },
             &resolver,
+            RelocationState::Applied,
         )
         .unwrap_err();
         assert!(error.reason().contains("page aligned"));
@@ -1877,6 +2116,7 @@ mod tests {
                 address_limit: u64::MAX,
             },
             &resolver,
+            RelocationState::Applied,
         )
         .unwrap_err();
         assert!(error.reason().contains("guest image extent"));
@@ -1893,6 +2133,7 @@ mod tests {
                 address_limit: 0x8000_0000,
             },
             &resolver,
+            RelocationState::Applied,
         )
         .unwrap_err();
         assert!(error.reason().contains("string table metadata conflicts"));
@@ -1910,6 +2151,7 @@ mod tests {
                 address_limit: 0x8000_0000,
             },
             &resolver,
+            RelocationState::Applied,
         )
         .unwrap();
         assert!(prepared.mapping_at(0x7100_0000).is_some());

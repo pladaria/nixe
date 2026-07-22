@@ -4,13 +4,14 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use swiitx_cpu::address::GuestVirtualAddress;
 use swiitx_cpu::decode::{DecodeResult, decode, disassemble};
 use swiitx_cpu::error::InstructionFetchFault;
 use swiitx_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
+use swiitx_cpu::exception::ExceptionKind;
 use swiitx_cpu::interpreter::{
     InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
 };
-use swiitx_cpu::ir::terminator::ExceptionKind;
 use swiitx_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
 use swiitx_cpu::memory::{InstructionMemory, SyntheticMemory};
 use swiitx_cpu::profile::ProcessCpuContext;
@@ -18,7 +19,7 @@ use swiitx_cpu::state::{RegisterContext, ThreadCpuState};
 use swiitx_cpu::vcpu::VcpuExecutionState;
 use swiitx_cpu::{coverage::CoverageId, memory::DataAccessFault};
 
-use crate::{DiagnosticsPolicy, ReportDetail};
+use crate::{DiagnosticsPolicy, ExceptionDispatchRequest, ExceptionTerminationScope, ReportDetail};
 
 /// Maximum number of guest instructions retained by an enabled trace.
 pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
@@ -167,6 +168,38 @@ pub enum ProcessExecutionStatus {
     Faulted,
 }
 
+/// Stable reason a process entered the exited lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProcessExitCause {
+    /// The host embedding explicitly stopped the process.
+    HostRequested,
+    /// Guest runtime policy requested process-wide termination.
+    ProcessRequested,
+    /// The current thread exited and no other process thread remained.
+    LastThreadExited,
+    /// An NRO returned to the runtime-provided Homebrew ABI loader address.
+    LoaderReturned,
+    /// The guest issued a fatal break with its bounded diagnostic payload.
+    GuestBreak { reason: u64, info: u64, size: u64 },
+}
+
+/// Pointer-free process exit information retained until deterministic teardown.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProcessExit {
+    pub cause: ProcessExitCause,
+    pub exit_code: u64,
+    pub source: Option<LocationDescriptor>,
+    pub thread_id: u64,
+}
+
+/// Pointer-free termination record for one runtime-owned guest thread.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ThreadExit {
+    pub requested_scope: ExceptionTerminationScope,
+    pub exit_code: u64,
+    pub source: Option<LocationDescriptor>,
+}
+
 /// Reason a bounded reference-execution call returned to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionStop {
@@ -200,12 +233,56 @@ pub enum ExecutionStop {
     },
     SupervisorCall {
         source: LocationDescriptor,
-        immediate: Option<u64>,
+        immediate: u32,
     },
     DataFault {
         source: LocationDescriptor,
         fault: DataAccessFault,
     },
+    /// An NRO returned through its original Homebrew ABI link register.
+    LoaderReturn {
+        source: LocationDescriptor,
+        result_code: u64,
+    },
+}
+
+impl ExecutionStop {
+    /// Converts an architectural stop into the engine-neutral runtime dispatch
+    /// request. Non-architectural lifecycle and diagnostic stops return `None`.
+    #[must_use]
+    pub fn exception_dispatch_request(&self) -> Option<ExceptionDispatchRequest> {
+        let (source, kind, syndrome) = match self {
+            Self::ArchitecturalException {
+                source,
+                kind,
+                syndrome,
+            } => (*source, *kind, *syndrome),
+            Self::SupervisorCall { source, immediate } => (
+                *source,
+                ExceptionKind::SupervisorCall,
+                Some(u64::from(*immediate)),
+            ),
+            Self::DataFault { source, .. } => (*source, ExceptionKind::DataAbort, None),
+            Self::ProfileDisabled { error } => (
+                error.instruction.location,
+                ExceptionKind::UndefinedInstruction,
+                None,
+            ),
+            Self::UnallocatedEncoding { error } => (
+                error.instruction.location,
+                ExceptionKind::UndefinedInstruction,
+                None,
+            ),
+            Self::UnsupportedSemantics { .. }
+            | Self::FetchFault { .. }
+            | Self::BudgetExhausted
+            | Self::Safepoint
+            | Self::PendingEvent { .. }
+            | Self::Scheduled { .. }
+            | Self::LoaderReturn { .. } => return None,
+        };
+        Some(ExceptionDispatchRequest::new(source, kind, syndrome))
+    }
 }
 
 impl Display for ExecutionStop {
@@ -244,6 +321,13 @@ impl Display for ExecutionStop {
             Self::DataFault { source, fault } => {
                 write!(formatter, "data-fault source=[{source}] fault={fault:?}")
             }
+            Self::LoaderReturn {
+                source,
+                result_code,
+            } => write!(
+                formatter,
+                "loader-return source=[{source}] result=0x{result_code:016x}"
+            ),
         }
     }
 }
@@ -310,6 +394,7 @@ impl Error for ProcessExecutionError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessTeardownReport {
     pub previous_status: ProcessExecutionStatus,
+    pub exit: Option<ProcessExit>,
     pub threads_released: usize,
     pub modules_released: usize,
     pub mappings_released: usize,
@@ -320,6 +405,7 @@ pub struct ProcessTeardownReport {
 
 pub(crate) struct ProcessExecutionControl {
     status: ProcessExecutionStatus,
+    exit: Option<ProcessExit>,
     vcpu: VcpuExecutionState<()>,
     trace: InstructionTraceRecorder,
 }
@@ -328,6 +414,7 @@ impl ProcessExecutionControl {
     pub(crate) fn new(diagnostics: DiagnosticsPolicy) -> Self {
         Self {
             status: ProcessExecutionStatus::Ready,
+            exit: None,
             vcpu: VcpuExecutionState::new((), 0),
             trace: InstructionTraceRecorder::new(diagnostics),
         }
@@ -335,6 +422,10 @@ impl ProcessExecutionControl {
 
     pub(crate) const fn status(&self) -> ProcessExecutionStatus {
         self.status
+    }
+
+    pub(crate) const fn exit(&self) -> Option<ProcessExit> {
+        self.exit
     }
 
     pub(crate) fn request_safepoint(&mut self) {
@@ -353,7 +444,7 @@ impl ProcessExecutionControl {
         true
     }
 
-    pub(crate) fn terminate(&mut self) -> bool {
+    pub(crate) fn terminate(&mut self, exit: ProcessExit) -> bool {
         if matches!(
             self.status,
             ProcessExecutionStatus::Exited | ProcessExecutionStatus::Faulted
@@ -361,6 +452,15 @@ impl ProcessExecutionControl {
             return false;
         }
         self.status = ProcessExecutionStatus::Exited;
+        self.exit = Some(exit);
+        true
+    }
+
+    pub(crate) fn fault(&mut self) -> bool {
+        if self.status != ProcessExecutionStatus::Suspended {
+            return false;
+        }
+        self.status = ProcessExecutionStatus::Faulted;
         true
     }
 }
@@ -371,6 +471,7 @@ pub(crate) fn run_reference(
     memory: &SyntheticMemory,
     state: &mut ThreadCpuState,
     instruction_budget: u64,
+    loader_return: Option<GuestVirtualAddress>,
 ) -> Result<ExecutionReport, ProcessExecutionError> {
     if control.status != ProcessExecutionStatus::Ready {
         return Err(ProcessExecutionError::NotRunnable {
@@ -383,6 +484,18 @@ pub(crate) fn run_reference(
     let mut executed = 0_u64;
 
     loop {
+        if let Some((source, result_code)) = loader_return_observation(cpu, state, loader_return) {
+            control.status = ProcessExecutionStatus::Suspended;
+            return Ok(ExecutionReport {
+                instructions_executed: executed,
+                stop: ExecutionStop::LoaderReturn {
+                    source,
+                    result_code,
+                },
+                context: state.register_context(),
+                trace: control.trace.snapshot(),
+            });
+        }
         if control.vcpu.dispatch().safepoint_requested() {
             control.vcpu.dispatch_mut().clear_safepoint();
             control.status = ProcessExecutionStatus::Ready;
@@ -426,7 +539,9 @@ pub(crate) fn run_reference(
             }
         };
         let source = current_location(cpu, state);
-        let context = InterpreterContext::new(cpu).with_memory(memory);
+        let context = InterpreterContext::new(cpu)
+            .with_memory(memory)
+            .with_exclusive_monitor(control.vcpu.exclusive_monitor_cell());
         let outcome = match execute_one_with_context(context, state, encoding) {
             Ok(outcome) => outcome,
             Err(InterpreterError::UnsupportedInstruction {
@@ -467,15 +582,12 @@ pub(crate) fn run_reference(
             InterpreterOutcome::Exception {
                 source,
                 kind: ExceptionKind::SupervisorCall,
-                syndrome,
-            } => {
+                syndrome: Some(syndrome),
+            } if let Ok(immediate) = u32::try_from(syndrome) => {
                 control.status = ProcessExecutionStatus::Suspended;
                 return Ok(ExecutionReport {
                     instructions_executed: executed,
-                    stop: ExecutionStop::SupervisorCall {
-                        source,
-                        immediate: syndrome,
-                    },
+                    stop: ExecutionStop::SupervisorCall { source, immediate },
                     context: state.register_context(),
                     trace: control.trace.snapshot(),
                 });
@@ -537,7 +649,29 @@ pub(crate) fn run_reference(
     }
 }
 
-fn current_location(cpu: ProcessCpuContext, state: &ThreadCpuState) -> LocationDescriptor {
+fn loader_return_observation(
+    cpu: ProcessCpuContext,
+    state: &ThreadCpuState,
+    loader_return: Option<GuestVirtualAddress>,
+) -> Option<(LocationDescriptor, u64)> {
+    let return_address = loader_return?;
+    let ThreadCpuState::A64(state) = state else {
+        return None;
+    };
+    (state.pc() == return_address.get()).then(|| {
+        let source =
+            LocationDescriptor::new(return_address, ExecutionState::A64, cpu.profile().id());
+        let result_code = state.read_x(swiitx_cpu::state::a64::A64Register::General(
+            swiitx_cpu::state::a64::A64GeneralRegister::new(0).expect("valid result register"),
+        ));
+        (source, result_code)
+    })
+}
+
+pub(crate) fn current_location(
+    cpu: ProcessCpuContext,
+    state: &ThreadCpuState,
+) -> LocationDescriptor {
     let (pc, execution_state) = match state {
         ThreadCpuState::A64(state) => (state.pc(), ExecutionState::A64),
         ThreadCpuState::A32(state) => (
