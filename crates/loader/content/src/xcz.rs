@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::compressed_package::logical_nca_name;
 use crate::xci::load_compressed_xci;
@@ -142,8 +142,8 @@ impl XczArchive {
 mod tests {
     use std::sync::Arc;
 
+    use nixe_loader_storage::{Storage, StorageError};
     use sha2::{Digest, Sha256};
-    use swiitx_loader_storage::{Storage, StorageError};
 
     use super::*;
 

@@ -1,3 +1,3 @@
-//! Reusable support for Swiix command-line operations.
+//! Reusable support for Nixe command-line operations.
 
 pub mod library;

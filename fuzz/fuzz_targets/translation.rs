@@ -3,7 +3,7 @@
 use core::num::NonZeroU32;
 
 use libfuzzer_sys::fuzz_target;
-use swiitx_cpu::{
+use nixe_cpu::{
     address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     ir::{print::print_block, verify::verify_block},
     location::{ExecutionState, LocationDescriptor},

@@ -8,9 +8,11 @@ fn cpu_remains_independent_of_loader_and_runtime_crates() {
     let manifest = fs::read_to_string(cpu_manifest).expect("CPU manifest must be readable");
     let dependencies = dependency_names(&manifest);
 
-    assert!(!dependencies.iter().any(|dependency| {
-        matches!(*dependency, "swiitx-runtime" | "swiitx-loader-executable")
-    }));
+    assert!(
+        !dependencies
+            .iter()
+            .any(|dependency| { matches!(*dependency, "nixe-runtime" | "nixe-loader-executable") })
+    );
 }
 
 #[test]
@@ -19,8 +21,8 @@ fn runtime_owns_the_cpu_and_executable_loader_dependency_direction() {
     let manifest = fs::read_to_string(manifest_path).expect("runtime manifest must be readable");
     let dependencies = dependency_names(&manifest);
 
-    assert!(dependencies.contains(&"swiitx-cpu"));
-    assert!(dependencies.contains(&"swiitx-loader-executable"));
+    assert!(dependencies.contains(&"nixe-cpu"));
+    assert!(dependencies.contains(&"nixe-loader-executable"));
 }
 
 fn dependency_names(manifest: &str) -> Vec<&str> {

@@ -7,7 +7,7 @@ Applies to: Nintendo Switch and Nintendo Switch 2 research profiles
 
 ## 1. Purpose
 
-This document specifies the intended architecture of the Swiitx CPU execution
+This document specifies the intended architecture of the Nixe CPU execution
 engine. It is a decision framework for implementation rather than a claim that
 all hardware details of either console are already known.
 
@@ -1230,7 +1230,7 @@ Performance work is evidence-driven. Benchmarks separately report:
 
 The baseline target is low enough translation overhead that code is profitable
 after few executions, while producing code fast enough for games without a hot
-tier. Numeric thresholds should be established from Swiitx microbenchmarks on a
+tier. Numeric thresholds should be established from Nixe microbenchmarks on a
 documented host matrix rather than copied from unrelated runtimes.
 
 Optimization order should normally be:
@@ -1278,7 +1278,7 @@ Decision: provisionally accepted.
 
 Justification: Dynarmic is the closest proven design and an important reference,
 but direct integration would place the core CPU engine and substantial C++
-infrastructure outside Swiitx's Rust architecture. Reconsider this if early
+infrastructure outside Nixe's Rust architecture. Reconsider this if early
 execution is prioritized over owning and researching the CPU implementation.
 License compatibility and maintenance status must be re-evaluated at that time.
 

@@ -1,4 +1,4 @@
-//! Shared configuration for Swiix applications.
+//! Shared configuration for Nixe applications.
 
 use std::env;
 use std::error::Error;
@@ -6,18 +6,18 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
-use swiitx_loader_title::{DirectoryScanOptions, NacpLanguage};
 
 /// Configuration file name used during automatic discovery.
-pub const CONFIG_FILE_NAME: &str = "swiitx.toml";
+pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Configuration shared by the CLI and desktop applications.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwiitxConfig {
+pub struct NixeConfig {
     /// Version of the configuration schema.
     pub version: u32,
     /// Title-library locations and discovery behavior.
@@ -29,7 +29,7 @@ pub struct SwiitxConfig {
     source_path: PathBuf,
 }
 
-impl SwiitxConfig {
+impl NixeConfig {
     /// Loads and validates a configuration file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -86,7 +86,7 @@ impl SwiitxConfig {
 
     /// Finds the configuration selected by the environment or conventional paths.
     pub fn discover_path() -> Option<PathBuf> {
-        if let Some(path) = env::var_os("SWIITX_CONFIG").filter(|path| !path.is_empty()) {
+        if let Some(path) = env::var_os("NIXE_CONFIG").filter(|path| !path.is_empty()) {
             return Some(PathBuf::from(path));
         }
 
@@ -275,14 +275,14 @@ fn resolve_path(base_directory: &Path, path: PathBuf) -> PathBuf {
 
 #[cfg(target_os = "windows")]
 fn user_config_path() -> Option<PathBuf> {
-    env::var_os("APPDATA").map(|root| PathBuf::from(root).join("Swiitx").join(CONFIG_FILE_NAME))
+    env::var_os("APPDATA").map(|root| PathBuf::from(root).join("Nixe").join(CONFIG_FILE_NAME))
 }
 
 #[cfg(target_os = "macos")]
 fn user_config_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|root| {
         PathBuf::from(root)
-            .join("Library/Application Support/Swiitx")
+            .join("Library/Application Support/Nixe")
             .join(CONFIG_FILE_NAME)
     })
 }
@@ -292,7 +292,7 @@ fn user_config_path() -> Option<PathBuf> {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|root| PathBuf::from(root).join(".config")))
-        .map(|root| root.join("swiitx").join(CONFIG_FILE_NAME))
+        .map(|root| root.join("nixe").join(CONFIG_FILE_NAME))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -317,7 +317,7 @@ mod tests {
         fn new(contents: &str) -> Self {
             let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
             let directory =
-                env::temp_dir().join(format!("swiitx-config-{}-{sequence}", std::process::id()));
+                env::temp_dir().join(format!("nixe-config-{}-{sequence}", std::process::id()));
             fs::create_dir(&directory).unwrap();
             let path = directory.join(CONFIG_FILE_NAME);
             fs::write(&path, contents).unwrap();
@@ -345,7 +345,7 @@ mod tests {
             "#,
         );
 
-        let config = SwiitxConfig::load(&file.path).unwrap();
+        let config = NixeConfig::load(&file.path).unwrap();
         let base = file.path.parent().unwrap();
 
         assert_eq!(config.source_path(), file.path);
@@ -377,7 +377,7 @@ mod tests {
             "#,
         );
 
-        let config = SwiitxConfig::load(&file.path).unwrap();
+        let config = NixeConfig::load(&file.path).unwrap();
 
         assert!(config.library.recursive_scan);
         assert_eq!(
@@ -403,7 +403,7 @@ mod tests {
             "#,
         );
 
-        let config = SwiitxConfig::load(&file.path).unwrap();
+        let config = NixeConfig::load(&file.path).unwrap();
         assert_eq!(
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Sanitized
@@ -434,7 +434,7 @@ mod tests {
         ] {
             let file = TemporaryConfig::new(contents);
             assert!(matches!(
-                SwiitxConfig::load(&file.path),
+                NixeConfig::load(&file.path),
                 Err(ConfigError::Parse { .. })
             ));
         }
@@ -450,7 +450,7 @@ mod tests {
             "#,
         );
         assert!(matches!(
-            SwiitxConfig::load(&file.path),
+            NixeConfig::load(&file.path),
             Err(ConfigError::UnsupportedVersion { version: 2, .. })
         ));
     }

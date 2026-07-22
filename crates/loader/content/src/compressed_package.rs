@@ -1,4 +1,4 @@
-use swiitx_loader_storage::{LoadError, StorageRef};
+use nixe_loader_storage::{LoadError, StorageRef};
 
 use crate::NczArchive;
 

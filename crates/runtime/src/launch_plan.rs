@@ -1,9 +1,9 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use swiitx_loader_content::{ApplicationVersion, RomFsArchive};
-use swiitx_loader_executable::{EffectiveNpdmPolicy, Npdm, NroImage, NsoImage};
-use swiitx_loader_title::{ApplicationId, ControlMetadata, TitleId};
+use nixe_loader_content::{ApplicationVersion, RomFsArchive};
+use nixe_loader_executable::{EffectiveNpdmPolicy, Npdm, NroImage, NsoImage};
+use nixe_loader_title::{ApplicationId, ControlMetadata, TitleId};
 
 /// Maximum executable modules retained by one launch plan.
 pub const MAX_LAUNCH_MODULES: usize = 64;

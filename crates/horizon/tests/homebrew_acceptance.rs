@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use swiitx_cpu::state::ThreadCpuState;
-use swiitx_cpu::state::a64::{A64GeneralRegister, A64Register};
-use swiitx_horizon::{HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport};
-use swiitx_runtime::{
+use nixe_cpu::state::ThreadCpuState;
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_horizon::{HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport};
+use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
     ProcessExecutionStatus, ProcessExitCause,
 };

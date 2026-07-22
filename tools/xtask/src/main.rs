@@ -34,9 +34,9 @@ fn run_fuzz(arguments: Vec<OsString>) -> ExitCode {
         return run_cargo_fuzz(arguments);
     }
 
-    let runs = env::var("SWIITX_FUZZ_RUNS").unwrap_or_else(|_| DEFAULT_FUZZ_RUNS.to_owned());
+    let runs = env::var("NIXE_FUZZ_RUNS").unwrap_or_else(|_| DEFAULT_FUZZ_RUNS.to_owned());
     if runs.is_empty() || !runs.bytes().all(|byte| byte.is_ascii_digit()) || runs == "0" {
-        return fail("SWIITX_FUZZ_RUNS must be a positive integer");
+        return fail("NIXE_FUZZ_RUNS must be a positive integer");
     }
 
     for target in FUZZ_TARGETS {

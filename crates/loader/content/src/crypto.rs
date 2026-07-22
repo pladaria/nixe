@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use swiitx_loader_storage::{Storage, StorageError, StorageRef};
+use nixe_loader_storage::{Storage, StorageError, StorageRef};
 
 const AES_BLOCK_SIZE: u64 = 0x10;
 

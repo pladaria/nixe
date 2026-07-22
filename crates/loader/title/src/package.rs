@@ -1,11 +1,11 @@
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
     NcaArchive, NcaKeyProvider,
 };
-use swiitx_loader_storage::StorageRef;
+use nixe_loader_storage::StorageRef;
 
 use crate::package_content::open_canonical_content;
 use crate::{ControlMetadata, PackageFormat};
@@ -183,9 +183,9 @@ impl PackageMetadata {
         &self,
         content: &CnmtContentInfo,
         keys: Option<&dyn NcaKeyProvider>,
-    ) -> Result<NcaArchive, swiitx_loader_storage::LoadError> {
+    ) -> Result<NcaArchive, nixe_loader_storage::LoadError> {
         let format = self.source_format.ok_or_else(|| {
-            swiitx_loader_storage::LoadError::invalid(
+            nixe_loader_storage::LoadError::invalid(
                 "canonical package content",
                 "package metadata has no container locator",
             )
@@ -258,8 +258,8 @@ impl Debug for PackageMetadata {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_content::{CnmtInstallType, CnmtPlatform};
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_content::{CnmtInstallType, CnmtPlatform};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

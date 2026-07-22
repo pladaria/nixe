@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use swiitx_cpu::address::{AddressSpaceId, GuestVirtualAddress};
-use swiitx_cpu::error::InstructionFetchFaultReason;
-use swiitx_cpu::memory::{
+use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
+use nixe_cpu::error::InstructionFetchFaultReason;
+use nixe_cpu::memory::{
     CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
     MemoryPermissions, MemoryValue, SyntheticInstallStage, SyntheticMemory,
 };
-use swiitx_loader_executable::{
+use nixe_loader_executable::{
     ExternalSymbol, NroLoader, NsoLoader, PreparationConfig, PreparedModule, SymbolResolution,
 };
-use swiitx_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
-use swiitx_runtime::{
+use nixe_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
+use nixe_runtime::{
     BackendInstallError, InstallStage, ModuleMemoryBackend, PageRequest, install_prepared_module,
 };
 

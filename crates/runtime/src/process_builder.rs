@@ -3,19 +3,19 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use swiitx_cpu::address::{AddressSpaceId, GuestVirtualAddress};
-use swiitx_cpu::ir::block::IrBlock;
-use swiitx_cpu::ir::print::{IrPrintOptions, print_block};
-use swiitx_cpu::location::{ExecutionState, LocationDescriptor};
-use swiitx_cpu::memory::{
+use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
+use nixe_cpu::ir::block::IrBlock;
+use nixe_cpu::ir::print::{IrPrintOptions, print_block};
+use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+use nixe_cpu::memory::{
     MemoryMappingPurpose, MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory, SyntheticRamPage,
 };
-use swiitx_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
-use swiitx_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
-use swiitx_cpu::translate::{
+use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
+use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
+use nixe_cpu::translate::{
     BlockTranslationConfig, BlockTranslationReport, translate_block, translate_block_report,
 };
-use swiitx_loader_executable::{
+use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, NsoBatchModule, PreparationConfig, PreparedModule,
     SymbolResolution, prepare_nso_batch,
 };
@@ -500,9 +500,7 @@ impl RunnableProcess {
     ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
         let request = stop
             .exception_dispatch_request()
-            .filter(|request| {
-                request.kind() == swiitx_cpu::exception::ExceptionKind::SupervisorCall
-            })
+            .filter(|request| request.kind() == nixe_cpu::exception::ExceptionKind::SupervisorCall)
             .ok_or(ExceptionRouteError::NotSupervisorCall)?;
         if self.execution.status() != ProcessExecutionStatus::Suspended {
             return Err(ExceptionRouteError::ProcessNotSuspended {
@@ -826,7 +824,7 @@ impl ProcessBuilder {
     }
 
     #[must_use]
-    pub const fn cpu_diagnostics(&self) -> swiitx_cpu::coverage::CpuDiagnosticsConfig {
+    pub const fn cpu_diagnostics(&self) -> nixe_cpu::coverage::CpuDiagnosticsConfig {
         self.diagnostics.cpu()
     }
 
@@ -1300,8 +1298,8 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, ProcessBuildError> {
         .ok_or_else(|| error(ProcessBuildStage::Placement, "alignment overflows"))
 }
 
-fn a64_register(index: u8) -> swiitx_cpu::state::a64::A64GeneralRegister {
-    swiitx_cpu::state::a64::A64GeneralRegister::new(index).expect("valid ABI register")
+fn a64_register(index: u8) -> nixe_cpu::state::a64::A64GeneralRegister {
+    nixe_cpu::state::a64::A64GeneralRegister::new(index).expect("valid ABI register")
 }
 
 fn a32_register(index: u8) -> A32GeneralRegister {
@@ -1316,10 +1314,10 @@ fn error(stage: ProcessBuildStage, cause: impl Display) -> ProcessBuildError {
 mod tests {
     use std::fs;
 
-    use swiitx_cpu::exception::ExceptionKind;
-    use swiitx_cpu::ir::terminator::{ControlTarget, Terminator};
-    use swiitx_cpu::location::InstructionEncoding;
-    use swiitx_cpu::memory::{
+    use nixe_cpu::exception::ExceptionKind;
+    use nixe_cpu::ir::terminator::{ControlTarget, Terminator};
+    use nixe_cpu::location::InstructionEncoding;
+    use nixe_cpu::memory::{
         CpuMemory, InstructionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions,
         MemoryValue, SYNTHETIC_PAGE_SIZE,
     };
@@ -1373,7 +1371,7 @@ mod tests {
             );
             match context.thread_mut().state_mut() {
                 ThreadCpuState::A64(state) => state.write_x(
-                    swiitx_cpu::state::a64::A64Register::General(a64_register(0)),
+                    nixe_cpu::state::a64::A64Register::General(a64_register(0)),
                     0xfeed_face,
                 ),
                 ThreadCpuState::A32(state) => state.write_r(a32_register(0), 0xfeed_face),
@@ -1460,8 +1458,8 @@ mod tests {
         let entry = process.entry_module().entry_address();
         if execution_state != ExecutionState::A64 {
             let mut state = match execution_state {
-                ExecutionState::A32 => swiitx_cpu::state::A32State::a32(),
-                ExecutionState::T32 => swiitx_cpu::state::A32State::t32(),
+                ExecutionState::A32 => nixe_cpu::state::A32State::a32(),
+                ExecutionState::T32 => nixe_cpu::state::A32State::t32(),
                 ExecutionState::A64 => unreachable!(),
             };
             state
@@ -1513,7 +1511,7 @@ mod tests {
         let builder = ProcessBuilder::new();
         assert_eq!(
             builder.cpu_diagnostics().report_detail,
-            swiitx_cpu::coverage::MissingInstructionReportDetail::Detailed
+            nixe_cpu::coverage::MissingInstructionReportDetail::Detailed
         );
     }
 
@@ -1652,7 +1650,7 @@ mod tests {
         assert!(dump.contains("raw=0x14000020"));
         assert!(dump.contains("guest=\"b imm=#128\""));
         let report = process.print_entry_report();
-        assert!(report.starts_with("swiitx-frontend-block-report-v1\n"));
+        assert!(report.starts_with("nixe-frontend-block-report-v1\n"));
         assert!(report.contains("outcome=translated end=direct-branch"));
         assert!(report.contains("ir-dump stage=pre-optimization"));
         assert!(report.contains("dependency page="));
@@ -1893,7 +1891,7 @@ mod tests {
             process.execution_status(),
             crate::ProcessExecutionStatus::Ready
         );
-        let swiitx_cpu::state::RegisterContext::A64(context) = &report.context else {
+        let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
             panic!("homebrew fixture must report A64 context");
         };
         assert_eq!(context.pc.get(), entry + 0x80);
@@ -1949,7 +1947,7 @@ mod tests {
             report.stop,
             crate::ExecutionStop::FetchFault { .. }
         ));
-        let swiitx_cpu::state::RegisterContext::A64(context) = &report.context else {
+        let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
             panic!("homebrew fixture must report A64 context");
         };
         assert_eq!(context.pc.get(), 0x1000);
@@ -2016,7 +2014,7 @@ mod tests {
         let report = profile_disabled.run_reference(1).unwrap();
         assert_eq!(
             report.stop.exception_dispatch_request().unwrap().kind(),
-            swiitx_cpu::exception::ExceptionKind::UndefinedInstruction
+            nixe_cpu::exception::ExceptionKind::UndefinedInstruction
         );
         assert!(matches!(
             report.stop,
@@ -2029,7 +2027,7 @@ mod tests {
         let report = unallocated.run_reference(1).unwrap();
         assert_eq!(
             report.stop.exception_dispatch_request().unwrap().kind(),
-            swiitx_cpu::exception::ExceptionKind::UndefinedInstruction
+            nixe_cpu::exception::ExceptionKind::UndefinedInstruction
         );
         assert!(matches!(
             report.stop,
@@ -2048,7 +2046,7 @@ mod tests {
         let dispatch = report.stop.exception_dispatch_request().unwrap();
         assert_eq!(
             dispatch.kind(),
-            swiitx_cpu::exception::ExceptionKind::SupervisorCall
+            nixe_cpu::exception::ExceptionKind::SupervisorCall
         );
         assert_eq!(dispatch.syndrome(), Some(0x42));
         assert!(matches!(
@@ -2066,13 +2064,13 @@ mod tests {
         let dispatch = report.stop.exception_dispatch_request().unwrap();
         assert_eq!(
             dispatch.kind(),
-            swiitx_cpu::exception::ExceptionKind::Breakpoint
+            nixe_cpu::exception::ExceptionKind::Breakpoint
         );
         assert_eq!(dispatch.syndrome(), Some(0x123));
         assert!(matches!(
             report.stop,
             crate::ExecutionStop::ArchitecturalException {
-                kind: swiitx_cpu::exception::ExceptionKind::Breakpoint,
+                kind: nixe_cpu::exception::ExceptionKind::Breakpoint,
                 syndrome: Some(0x123),
                 ..
             }
@@ -2085,13 +2083,13 @@ mod tests {
             panic!("homebrew fixture must initialize A64");
         };
         state.write_x(
-            swiitx_cpu::state::a64::A64Register::General(a64_register(1)),
+            nixe_cpu::state::a64::A64Register::General(a64_register(1)),
             0x1000,
         );
         let report = data_fault.run_reference(1).unwrap();
         assert_eq!(
             report.stop.exception_dispatch_request().unwrap().kind(),
-            swiitx_cpu::exception::ExceptionKind::DataAbort
+            nixe_cpu::exception::ExceptionKind::DataAbort
         );
         assert!(matches!(
             report.stop,
@@ -2115,8 +2113,8 @@ mod tests {
             let entry = process.entry_module().entry_address();
             if execution_state != ExecutionState::A64 {
                 let mut state = match execution_state {
-                    ExecutionState::A32 => swiitx_cpu::state::A32State::a32(),
-                    ExecutionState::T32 => swiitx_cpu::state::A32State::t32(),
+                    ExecutionState::A32 => nixe_cpu::state::A32State::a32(),
+                    ExecutionState::T32 => nixe_cpu::state::A32State::t32(),
                     ExecutionState::A64 => unreachable!(),
                 };
                 state
@@ -2151,9 +2149,7 @@ mod tests {
             assert_eq!(handle, process.main_thread().handle);
             match &process.main_thread().state {
                 ThreadCpuState::A64(state) => assert_eq!(
-                    state.read_x(swiitx_cpu::state::a64::A64Register::General(a64_register(
-                        0
-                    ))),
+                    state.read_x(nixe_cpu::state::a64::A64Register::General(a64_register(0))),
                     0xfeed_face
                 ),
                 ThreadCpuState::A32(state) => {

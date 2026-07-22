@@ -1,4 +1,4 @@
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::Pfs0Entry;
 use crate::pfs0::Pfs0Archive;
@@ -64,7 +64,7 @@ impl NspArchive {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

@@ -168,11 +168,11 @@ fn deduplicate<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_content::{
+    use nixe_loader_content::{
         CnmtContentInfo, CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtInstallType,
         CnmtMetaType, CnmtPlatform, NACP_SIZE, NacpLoader,
     };
-    use swiitx_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
+    use nixe_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
 
     use super::*;
 

@@ -1,5 +1,5 @@
 [package]
-name = "swiitx-loader-content"
+name = "nixe-loader-content"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 aes.workspace = true
 sha2.workspace = true
-swiitx-loader-storage.workspace = true
+nixe-loader-storage.workspace = true
 tempfile.workspace = true
 zstd.workspace = true

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use swiitx_cpu::{
+use nixe_cpu::{
     address::GuestVirtualAddress,
     coverage::{
         CoverageId, MAX_MISSING_INSTRUCTION_EXPORT_BYTES, MAX_MISSING_INSTRUCTION_RECORDS,

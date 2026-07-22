@@ -5,14 +5,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-use swiitx_config::SwiitxConfig;
-use swiitx_loader_content::{NacpLoader, NcaKeySet};
-use swiitx_loader_executable::NroLoader;
-use swiitx_loader_storage::{FileStorage, FormatLoader};
-use swiitx_loader_title::{
+use nixe_config::NixeConfig;
+use nixe_loader_content::{NacpLoader, NcaKeySet};
+use nixe_loader_executable::NroLoader;
+use nixe_loader_storage::{FileStorage, FormatLoader};
+use nixe_loader_title::{
     ApplicationId, DirectoryScanOptions, ResolvedTitle, TitleCatalog, TitleResolver,
 };
+use sha2::{Digest, Sha256};
 
 /// A title library resolved from all configured ROM directories.
 pub struct Library {
@@ -23,7 +23,7 @@ pub struct Library {
 
 impl Library {
     /// Scans all configured paths and resolves installed and homebrew titles.
-    pub fn scan(config: &SwiitxConfig) -> Result<Self, String> {
+    pub fn scan(config: &NixeConfig) -> Result<Self, String> {
         if config.library.paths.is_empty() {
             return Err("library.paths does not contain any directories".to_owned());
         }
@@ -119,7 +119,7 @@ pub enum LibraryTitleSource {
     Homebrew(PathBuf),
 }
 
-fn installed_title(title: ResolvedTitle, config: &SwiitxConfig) -> LibraryTitle {
+fn installed_title(title: ResolvedTitle, config: &NixeConfig) -> LibraryTitle {
     let name = title
         .control_metadata()
         .and_then(|control| {
@@ -138,7 +138,7 @@ fn installed_title(title: ResolvedTitle, config: &SwiitxConfig) -> LibraryTitle 
     }
 }
 
-fn load_homebrew(path: &Path, config: &SwiitxConfig) -> Result<LibraryTitle, String> {
+fn load_homebrew(path: &Path, config: &NixeConfig) -> Result<LibraryTitle, String> {
     let storage = FileStorage::open(path)
         .map_err(|error| format!("cannot open NRO {}: {error}", path.display()))?;
     let image = NroLoader::load(Arc::new(storage))

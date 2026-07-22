@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 pub const NACP_SIZE: usize = 0x4000;
 const LANGUAGE_COUNT: usize = 16;
@@ -417,7 +417,7 @@ fn read_u64_array<const N: usize>(bytes: &[u8], offset: usize) -> [u64; N] {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

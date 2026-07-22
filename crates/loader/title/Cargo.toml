@@ -1,13 +1,13 @@
 [package]
-name = "swiitx-loader-title"
+name = "nixe-loader-title"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-swiitx-loader-content.workspace = true
-swiitx-loader-executable.workspace = true
-swiitx-loader-storage.workspace = true
+nixe-loader-content.workspace = true
+nixe-loader-executable.workspace = true
+nixe-loader-storage.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

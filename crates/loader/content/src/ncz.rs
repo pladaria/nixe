@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use swiitx_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
 
 use crate::crypto::apply_ctr_at;
 

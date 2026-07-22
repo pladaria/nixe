@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use swiitx_cli::library::{Library, LibraryTitleSource};
-use swiitx_horizon::HorizonSvcDispatcher;
-use swiitx_runtime::{
+use nixe_cli::library::{Library, LibraryTitleSource};
+use nixe_horizon::HorizonSvcDispatcher;
+use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
     RunnableProcess,
 };
@@ -173,7 +173,7 @@ fn execution_summary(
 fn execution_stop_error(
     stop: &ExecutionStop,
     instructions: u64,
-    report: &swiitx_runtime::ExecutionReport,
+    report: &nixe_runtime::ExecutionReport,
 ) -> String {
     let reason = match stop {
         ExecutionStop::UnsupportedSemantics {
@@ -209,9 +209,9 @@ fn execution_stop_error(
 }
 
 fn log(message: &str) {
-    eprintln!("[swiitx] {message}");
+    eprintln!("[nixe] {message}");
 }
 
 fn warning(message: &str) {
-    eprintln!("[swiitx] warning: {message}");
+    eprintln!("[nixe] warning: {message}");
 }

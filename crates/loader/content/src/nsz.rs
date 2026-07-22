@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::compressed_package::logical_nca_name;
 use crate::{CompressedPackageEntry, NczLoader, Pfs0Archive};
@@ -95,7 +95,7 @@ impl NszArchive {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

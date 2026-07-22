@@ -1,4 +1,4 @@
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::Pfs0Entry;
 use crate::nca::{NcaSection, NcaSectionType};
@@ -103,8 +103,8 @@ impl ExeFsArchive {
 mod tests {
     use std::sync::Arc;
 
+    use nixe_loader_storage::{Storage, StorageError};
     use sha2::{Digest, Sha256};
-    use swiitx_loader_storage::{Storage, StorageError};
 
     use crate::{NcaContentType, NcaLoader};
 

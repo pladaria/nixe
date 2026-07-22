@@ -7,17 +7,17 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use swiitx_cpu::address::GuestVirtualAddress;
-use swiitx_cpu::exception::ExceptionKind;
-use swiitx_cpu::memory::{
+use nixe_cpu::address::GuestVirtualAddress;
+use nixe_cpu::exception::ExceptionKind;
+use nixe_cpu::memory::{
     DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingError,
     MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
     MemoryProtectionErrorReason, MemoryRegionKind, MemoryValue,
 };
-use swiitx_cpu::state::ThreadCpuState;
-use swiitx_cpu::state::a32::A32GeneralRegister;
-use swiitx_cpu::state::a64::{A64GeneralRegister, A64Register};
-use swiitx_runtime::{
+use nixe_cpu::state::ThreadCpuState;
+use nixe_cpu::state::a32::A32GeneralRegister;
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
     HandleTable, ReadableEventObject, SessionObject, ThreadObject, WritableEventObject,
@@ -723,7 +723,7 @@ fn reset_signal(
 fn create_event(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let (writable, readable) = swiitx_runtime::EventObject::create_pair();
+    let (writable, readable) = nixe_runtime::EventObject::create_pair();
     match insert_pair(context.process_mut().handles_mut(), writable, readable) {
         Ok((write_handle, read_handle)) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -770,8 +770,8 @@ fn create_session(
 
 fn insert_pair<A, B>(handles: &mut HandleTable, first: A, second: B) -> Result<(u32, u32), ()>
 where
-    A: swiitx_runtime::HandleValue,
-    B: swiitx_runtime::HandleValue,
+    A: nixe_runtime::HandleValue,
+    B: nixe_runtime::HandleValue,
 {
     let first_handle = handles.insert(first).map_err(|_| ())?;
     match handles.insert(second) {

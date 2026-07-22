@@ -27,13 +27,13 @@ sanitize-filename = "0.6"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
 tempfile = "3.27"
-swiitx-config = { path = "crates/config" }
-swiitx-cpu = { path = "crates/cpu" }
-swiitx-horizon = { path = "crates/horizon" }
-swiitx-loader-content = { path = "crates/loader/content" }
-swiitx-loader-executable = { path = "crates/loader/executable" }
-swiitx-loader-storage = { path = "crates/loader/storage" }
-swiitx-loader-title = { path = "crates/loader/title" }
-swiitx-runtime = { path = "crates/runtime" }
+nixe-config = { path = "crates/config" }
+nixe-cpu = { path = "crates/cpu" }
+nixe-horizon = { path = "crates/horizon" }
+nixe-loader-content = { path = "crates/loader/content" }
+nixe-loader-executable = { path = "crates/loader/executable" }
+nixe-loader-storage = { path = "crates/loader/storage" }
+nixe-loader-title = { path = "crates/loader/title" }
+nixe-runtime = { path = "crates/runtime" }
 toml = "0.8"
 zstd = { version = "0.13", default-features = false }

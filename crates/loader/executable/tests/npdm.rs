@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use swiitx_loader_executable::{AddressSpaceType, NpdmLoader};
-use swiitx_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
+use nixe_loader_executable::{AddressSpaceType, NpdmLoader};
+use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
 
 #[derive(Debug)]
 struct Bytes(Vec<u8>);
@@ -29,7 +29,7 @@ fn put64(data: &mut [u8], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn load(data: Vec<u8>) -> Result<swiitx_loader_executable::Npdm, LoadError> {
+fn load(data: Vec<u8>) -> Result<nixe_loader_executable::Npdm, LoadError> {
     let storage: StorageRef = Arc::new(Bytes(data));
     NpdmLoader::load(storage)
 }

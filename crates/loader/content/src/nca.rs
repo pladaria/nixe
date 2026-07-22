@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 use sha2::{Digest, Sha256};
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
 use crate::BucketTreeHeader;
 use crate::crypto::{ctr_storage, decrypt_ecb_blocks, decrypt_xts, xts_storage};
@@ -970,7 +970,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

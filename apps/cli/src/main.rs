@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     let mut arguments = env::args_os();
     let program = arguments
         .next()
-        .unwrap_or_else(|| OsString::from("swiitx-cli"));
+        .unwrap_or_else(|| OsString::from("nixe-cli"));
 
     let command = match parse_arguments(arguments) {
         Ok(Some(command)) => command,
@@ -96,7 +96,7 @@ fn print_usage(program: &OsStr) {
          Commands:\n  \
            list        List configured titles as title ID and localized name\n  \
            run <id>    Run the configured title selected by ID\n\n\
-         Configuration is discovered from SWIITX_CONFIG, ./swiitx.toml, or the\n\
+         Configuration is discovered from NIXE_CONFIG, ./nixe.toml, or the\n\
          platform user configuration unless --config is supplied.",
         program.to_string_lossy()
     );

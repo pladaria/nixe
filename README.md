@@ -1,4 +1,4 @@
-# Swiitx
+# Nixe
 
 This is an educational and experimental project written in Rust. Its long-term goal is to research and build
 functional emulators for Nintendo Switch and Nintendo Switch 2 while sharing well-defined components between
@@ -121,4 +121,4 @@ affiliated with, sponsored by, or endorsed by Nintendo or NVIDIA.
 
 ## License
 
-Swiitx is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).
+Nixe is licensed under the GNU General Public License version 3 or later. See [LICENSE.txt](LICENSE.txt).

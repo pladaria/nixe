@@ -12,10 +12,10 @@ cargo fuzzer
 ```
 
 The alias runs 10,000 iterations per target. Override that finite budget with
-`SWIITX_FUZZ_RUNS`, or use the ordinary target-specific interface:
+`NIXE_FUZZ_RUNS`, or use the ordinary target-specific interface:
 
 ```bash
-SWIITX_FUZZ_RUNS=100000 cargo fuzzer
+NIXE_FUZZ_RUNS=100000 cargo fuzzer
 cargo +nightly fuzz run decoder
 ```
 

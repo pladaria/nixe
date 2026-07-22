@@ -3,14 +3,14 @@
 use std::env;
 use std::path::PathBuf;
 
-use swiitx_loader_content::NcaKeySet;
-use swiitx_runtime::{LaunchKind, Launcher, LauncherInput, ModuleRole};
+use nixe_loader_content::NcaKeySet;
+use nixe_runtime::{LaunchKind, Launcher, LauncherInput, ModuleRole};
 
 #[test]
 #[ignore = "requires caller-owned title content and keys"]
 fn constructs_a_complete_plan_from_a_real_package() {
-    let package = PathBuf::from(env::var_os("SWIITX_REAL_PACKAGE").expect("SWIITX_REAL_PACKAGE"));
-    let keys_dir = PathBuf::from(env::var_os("SWIITX_KEYS_DIR").expect("SWIITX_KEYS_DIR"));
+    let package = PathBuf::from(env::var_os("NIXE_REAL_PACKAGE").expect("NIXE_REAL_PACKAGE"));
+    let keys_dir = PathBuf::from(env::var_os("NIXE_KEYS_DIR").expect("NIXE_KEYS_DIR"));
     let title_keys = keys_dir.join("title.keys");
     let keys = NcaKeySet::from_files(
         keys_dir.join("prod.keys"),

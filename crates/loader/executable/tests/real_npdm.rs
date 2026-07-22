@@ -3,17 +3,17 @@
 use std::env;
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader,
 };
-use swiitx_loader_executable::NpdmLoader;
-use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
+use nixe_loader_executable::NpdmLoader;
+use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
 
 #[test]
-#[ignore = "requires SWIITX_REAL_NSP and caller-owned keys"]
+#[ignore = "requires NIXE_REAL_NSP and caller-owned keys"]
 fn loads_npdm_from_real_nsp() {
-    let package = env::var_os("SWIITX_REAL_NSP").expect("set SWIITX_REAL_NSP to an NSP path");
-    let keys_dir = env::var_os("SWIITX_KEYS_DIR").expect("set SWIITX_KEYS_DIR to a keys directory");
+    let package = env::var_os("NIXE_REAL_NSP").expect("set NIXE_REAL_NSP to an NSP path");
+    let keys_dir = env::var_os("NIXE_KEYS_DIR").expect("set NIXE_KEYS_DIR to a keys directory");
     let keys_dir = std::path::PathBuf::from(keys_dir);
     let title_keys = keys_dir.join("title.keys");
     let mut keys = NcaKeySet::from_files(
