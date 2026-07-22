@@ -263,6 +263,18 @@ impl Launcher {
         }
     }
 
+    /// Builds a launch plan from a title already resolved by a shared library scan.
+    ///
+    /// This avoids discovering and resolving the same packages again after an
+    /// application has selected a title by ID.
+    pub fn build_resolved_title(
+        resolved: ResolvedTitle,
+        keys: &NcaKeySet,
+    ) -> Result<LaunchPlan, LaunchError> {
+        let context = PathBuf::from(format!("resolved-title-{}", resolved.application_id));
+        build_packaged(&context, resolved, Some(keys))
+    }
+
     fn build_directory(path: &Path, input: &mut LauncherInput) -> Result<LaunchPlan, LaunchError> {
         let catalog = match input.keys.as_mut() {
             Some(keys) => TitleCatalog::scan_directory_with_key_set_and_options(

@@ -5,12 +5,11 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-sanitize-filename.workspace = true
+sha2.workspace = true
 swiitx-config.workspace = true
+swiitx-horizon.workspace = true
 swiitx-loader-content.workspace = true
 swiitx-loader-executable.workspace = true
 swiitx-loader-storage.workspace = true
 swiitx-loader-title.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+swiitx-runtime.workspace = true
