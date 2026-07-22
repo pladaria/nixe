@@ -321,6 +321,31 @@ fn a64_integer_reference_semantics_execute_without_ir() {
 }
 
 #[test]
+fn a64_high_dynamic_tag_comparison_takes_signed_greater_than_branch() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(16), 0x6fff_fff9);
+    a64.write_x(x(13), 0x6fff_fff8);
+
+    execute_one(&profile, &mut state, 0xeb0d_021f_u32.into()).unwrap(); // CMP X16,X13
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert!(!a64.nzcv().negative());
+    assert!(!a64.nzcv().zero());
+    assert!(!a64.nzcv().overflow());
+
+    execute_one(&profile, &mut state, 0x5400_00ec_u32.into()).unwrap(); // B.GT +0x1c
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 0x20);
+}
+
+#[test]
 fn every_a64_scalar_integer_family_has_a_reference_handler() {
     let profile = GuestCpuProfile::switch_1();
     let encodings: [u32; 17] = [
@@ -677,6 +702,52 @@ fn every_a64_ordinary_scalar_memory_family_has_a_reference_handler() {
             "encoding {encoding:#010x}: {outcome:?}"
         );
     }
+}
+
+#[test]
+fn a64_unscaled_load_applies_a_negative_signed_offset_without_writeback() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(49);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+        .write(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            MemoryAccess::normal(MemoryAccessSize::Doubleword),
+            MemoryValue::U64(0x1122_3344_5566_7788),
+        )
+        .unwrap();
+    memory
+        .write(
+            SPACE,
+            GuestVirtualAddress::new(0x1008),
+            MemoryAccess::normal(MemoryAccessSize::Doubleword),
+            MemoryValue::U64(0x8877_6655_4433_2211),
+        )
+        .unwrap();
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(12), 0x1008);
+
+    execute_one_with_context(context, &mut state, 0xf85f_8190_u32.into()).unwrap();
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(16)), 0x1122_3344_5566_7788);
+    assert_eq!(a64.read_x(x(12)), 0x1008);
 }
 
 #[test]

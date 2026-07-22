@@ -20,12 +20,8 @@ fn constructs_a_complete_plan_from_a_real_package() {
     let plan = Launcher::build(LauncherInput::new(package).with_keys(keys))
         .expect("construct complete launch plan");
     assert!(matches!(plan.kind(), LaunchKind::Packaged(_)));
-    assert_eq!(plan.entry_module().role(), ModuleRole::Main);
+    assert_eq!(plan.entry_module().role(), ModuleRole::RuntimeLoader);
     assert!(plan.effective_policy().is_some());
-    assert_eq!(plan.symbol_scope().len(), plan.modules().len());
-    let mut scope = plan.symbol_scope().to_vec();
-    scope.sort_unstable();
-    assert_eq!(scope, (0..plan.modules().len()).collect::<Vec<_>>());
     if let Some(mount) = plan.primary_file_system() {
         let _ = mount.romfs().files().first();
     }

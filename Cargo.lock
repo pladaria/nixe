@@ -182,6 +182,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "log"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -200,6 +206,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "nixe-cli"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nixe-config",
  "nixe-horizon",
  "nixe-loader-content",
@@ -240,6 +247,7 @@ name = "nixe-loader-content"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "log",
  "nixe-loader-storage",
  "sha2",
  "tempfile",
@@ -250,6 +258,7 @@ dependencies = [
 name = "nixe-loader-executable"
 version = "0.1.0"
 dependencies = [
+ "log",
  "lz4_flex",
  "nixe-loader-content",
  "nixe-loader-storage",
@@ -276,6 +285,7 @@ dependencies = [
 name = "nixe-runtime"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nixe-config",
  "nixe-cpu",
  "nixe-loader-content",

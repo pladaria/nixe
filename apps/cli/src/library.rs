@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use nixe_config::NixeConfig;
 use nixe_loader_content::{NacpLoader, NcaKeySet};
@@ -24,6 +25,7 @@ pub struct Library {
 impl Library {
     /// Scans all configured paths and resolves installed and homebrew titles.
     pub fn scan(config: &NixeConfig) -> Result<Self, String> {
+        let scan_started = Instant::now();
         if config.library.paths.is_empty() {
             return Err("library.paths does not contain any directories".to_owned());
         }
@@ -31,14 +33,24 @@ impl Library {
         let prod_keys = config.system.keys.join("prod.keys");
         let title_keys_path = config.system.keys.join("title.keys");
         let title_keys = title_keys_path.is_file().then_some(title_keys_path);
+        let keys_started = Instant::now();
         let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
             .map_err(|error| error.to_string())?;
+        log::debug!("key set loaded in {:?}", keys_started.elapsed());
 
         let mut catalog = TitleCatalog::new();
         let mut homebrew = BTreeMap::new();
         let mut seen_files = BTreeSet::new();
         for root in &config.library.paths {
-            for path in directory_files(root, config.library.scan_options())? {
+            let root_started = Instant::now();
+            let paths = directory_files(root, config.library.scan_options())?;
+            log::debug!(
+                "library directory {} enumerated with {} file(s) in {:?}",
+                root.display(),
+                paths.len(),
+                root_started.elapsed()
+            );
+            for path in paths {
                 if !is_package(&path) && !has_extension(&path, "nro") {
                     continue;
                 }
@@ -49,11 +61,23 @@ impl Library {
                 }
 
                 if has_extension(&path, "nro") {
+                    let package_started = Instant::now();
                     let title = load_homebrew(&path, config)?;
+                    log::trace!(
+                        "homebrew {} catalogued in {:?}",
+                        path.display(),
+                        package_started.elapsed()
+                    );
                     homebrew.entry(title.identifier.clone()).or_insert(title);
                 } else {
+                    let package_started = Instant::now();
                     let discovered = TitleCatalog::load_package_with_key_set(&path, &mut keys)
                         .map_err(|error| error.to_string())?;
+                    log::debug!(
+                        "package {} catalogued in {:?}",
+                        path.display(),
+                        package_started.elapsed()
+                    );
                     for package in discovered.packages() {
                         catalog.add(package.clone());
                     }
@@ -61,7 +85,12 @@ impl Library {
             }
         }
 
+        let resolution_started = Instant::now();
         let installed = TitleResolver::resolve_all(&catalog).map_err(|error| error.to_string())?;
+        log::debug!(
+            "installed title relationships resolved in {:?}",
+            resolution_started.elapsed()
+        );
         let mut titles = installed
             .into_iter()
             .map(|title| installed_title(title, config))
@@ -69,6 +98,11 @@ impl Library {
             .collect::<Vec<_>>();
         titles.sort_by(|left, right| left.identifier.cmp(&right.identifier));
 
+        log::debug!(
+            "library scan produced {} title(s) in {:?}",
+            titles.len(),
+            scan_started.elapsed()
+        );
         Ok(Self { titles, keys })
     }
 

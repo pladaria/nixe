@@ -217,7 +217,6 @@ pub struct LaunchPlan {
     kind: LaunchKind,
     modules: Box<[LaunchModule]>,
     entry_module: usize,
-    symbol_scope: Box<[usize]>,
     primary_file_system: Option<ReadOnlyMount>,
     add_ons: Box<[AddOnContent]>,
     control: Option<ControlMetadata>,
@@ -228,7 +227,6 @@ impl LaunchPlan {
         kind: LaunchKind,
         modules: Vec<LaunchModule>,
         entry_module: usize,
-        symbol_scope: Vec<usize>,
         primary_file_system: Option<ReadOnlyMount>,
         add_ons: Vec<AddOnContent>,
         control: Option<ControlMetadata>,
@@ -237,7 +235,6 @@ impl LaunchPlan {
             kind,
             modules: modules.into_boxed_slice(),
             entry_module,
-            symbol_scope: symbol_scope.into_boxed_slice(),
             primary_file_system,
             add_ons: add_ons.into_boxed_slice(),
             control,
@@ -263,10 +260,6 @@ impl LaunchPlan {
     pub const fn entry_module_index(&self) -> usize {
         self.entry_module
     }
-    /// Returns module indices in process-wide symbol lookup precedence.
-    pub fn symbol_scope(&self) -> &[usize] {
-        &self.symbol_scope
-    }
     pub const fn primary_file_system(&self) -> Option<&ReadOnlyMount> {
         self.primary_file_system.as_ref()
     }
@@ -289,7 +282,6 @@ impl Debug for LaunchPlan {
             .field("kind", &self.kind)
             .field("modules", &self.modules)
             .field("entry_module", &self.entry_module)
-            .field("symbol_scope", &self.symbol_scope)
             .field("primary_file_system", &self.primary_file_system)
             .field("add_ons", &self.add_ons)
             .field("control", &self.control)

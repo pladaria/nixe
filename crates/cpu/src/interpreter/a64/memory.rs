@@ -191,7 +191,10 @@ fn indexed(
     let size = size_from_bits(fields.size);
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_9), 9);
-    let address = if matches!(instruction, Instruction::PreIndex(_)) {
+    let address = if matches!(
+        instruction,
+        Instruction::Unscaled(_) | Instruction::PreIndex(_)
+    ) {
         base.wrapping_add_signed(offset)
     } else {
         base
