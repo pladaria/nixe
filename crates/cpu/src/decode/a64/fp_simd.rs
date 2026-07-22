@@ -8,6 +8,24 @@ const SIMD: &[InstructionFeature] = &[InstructionFeature::AdvancedSimd];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
+        "simd-duplicate-general",
+        0xbf20_fc00,
+        0x0e00_0c00,
+        0x0000_0048,
+        130,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-simd-load-store-pair",
+        0x3e00_0000,
+        0x2c00_0000,
+        0x0000_0049,
+        131,
+        &[],
+        SIMD,
+    ),
+    pattern(
         "simd-bitwise",
         0x9f20_fc00,
         0x0e20_1c00,
@@ -202,8 +220,13 @@ pub struct Operands {
     pub immediate_19: u32,
     pub load: bool,
     pub quad: bool,
+    pub vector_128: bool,
     pub scaled: bool,
     pub helper_token: A64HelperToken,
+    pub immediate_5: u8,
+    pub rt2: u8,
+    pub immediate_7: u8,
+    pub mode: u8,
 }
 
 macro_rules! instructions {
@@ -221,6 +244,8 @@ macro_rules! instructions {
 }
 
 instructions!(
+    DuplicateGeneral,
+    MemoryPair,
     Bitwise,
     Integer,
     ScalarTwoSource,
@@ -254,10 +279,17 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         immediate_19: (bits >> 5) & 0x7ffff,
         load: bits & (1 << 22) != 0,
         quad: bits & (1 << 23) != 0,
+        vector_128: bits & (1 << 30) != 0,
         scaled: bits & (1 << 12) != 0,
         helper_token: A64HelperToken(bits),
+        immediate_5: ((bits >> 16) & 0x1f) as u8,
+        rt2: ((bits >> 10) & 0x1f) as u8,
+        immediate_7: ((bits >> 15) & 0x7f) as u8,
+        mode: ((bits >> 23) & 3) as u8,
     };
     match semantic_id {
+        0x0000_0048 => Instruction::DuplicateGeneral(operands),
+        0x0000_0049 => Instruction::MemoryPair(operands),
         0x0000_0030 => Instruction::Bitwise(operands),
         0x0000_0031 => Instruction::Integer(operands),
         0x0000_0032 => Instruction::ScalarTwoSource(operands),

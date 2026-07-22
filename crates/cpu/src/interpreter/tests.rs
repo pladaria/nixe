@@ -364,12 +364,14 @@ fn a64_system_register_reference_semantics_preserve_thread_state() {
     a64.set_tpidr_el0(0x1234_5678_9abc_def0);
 
     execute_one(&profile, &mut state, 0xd53b_d043_u32.into()).unwrap(); // MRS X3,TPIDR_EL0
+    execute_one(&profile, &mut state, 0xd53b_00e4_u32.into()).unwrap(); // MRS X4,DCZID_EL0
 
     let ThreadCpuState::A64(a64) = state else {
         unreachable!()
     };
     assert_eq!(a64.read_x(x(3)), 0x1234_5678_9abc_def0);
-    assert_eq!(a64.pc(), 4);
+    assert_eq!(a64.read_x(x(4)), 0x14, "DC ZVA is prohibited at EL0");
+    assert_eq!(a64.pc(), 8);
 }
 
 #[test]
@@ -384,12 +386,13 @@ fn a64_basic_system_semantics_are_exact_and_runtime_hints_remain_explicit() {
     execute_one(&profile, &mut state, 0xd51b_d043_u32.into()).unwrap(); // MSR TPIDR_EL0,X3
     execute_one(&profile, &mut state, 0xd503_3bbf_u32.into()).unwrap(); // DMB ISH
     execute_one(&profile, &mut state, 0xd503_3fdf_u32.into()).unwrap(); // ISB
+    execute_one(&profile, &mut state, 0xd503_245f_u32.into()).unwrap(); // BTI C as HINT
 
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
     assert_eq!(a64.tpidr_el0(), 0xfeed_face_cafe_beef);
-    assert_eq!(a64.pc(), 12);
+    assert_eq!(a64.pc(), 16);
 
     let error = execute_one(&profile, &mut state, 0xd503_203f_u32.into()).unwrap_err(); // YIELD
     assert!(matches!(
@@ -399,7 +402,71 @@ fn a64_basic_system_semantics_are_exact_and_runtime_hints_remain_explicit() {
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
-    assert_eq!(a64.pc(), 12, "unsupported scheduler hint must not retire");
+    assert_eq!(a64.pc(), 16, "unsupported scheduler hint must not retire");
+}
+
+#[test]
+fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(1), 0x8877_6655_4433_2211);
+
+    for (encoding, expected) in [
+        (0x4e01_0c20_u32, 0x1111_1111_1111_1111_1111_1111_1111_1111),
+        (0x4e02_0c20, 0x2211_2211_2211_2211_2211_2211_2211_2211),
+        (0x4e04_0c20, 0x4433_2211_4433_2211_4433_2211_4433_2211),
+        (0x4e08_0c20, 0x8877_6655_4433_2211_8877_6655_4433_2211),
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(a64.vector(0), Some(expected), "encoding={encoding:#010x}");
+    }
+}
+
+#[test]
+fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(49);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    let first = 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00;
+    let second = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100;
+    assert!(a64.set_vector(0, first));
+    assert!(a64.set_vector(1, second));
+    a64.write_x(x(4), 0x1000);
+
+    execute_one_with_context(context, &mut state, 0x3d80_0080_u32.into()).unwrap(); // STR Q0,[X4]
+    execute_one_with_context(context, &mut state, 0x3dc0_0082_u32.into()).unwrap(); // LDR Q2,[X4]
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(2), Some(first));
+
+    execute_one_with_context(context, &mut state, 0xad01_0480_u32.into()).unwrap(); // STP Q0,Q1,[X4,#32]
+    execute_one_with_context(context, &mut state, 0xad41_0c82_u32.into()).unwrap(); // LDP Q2,Q3,[X4,#32]
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(2), Some(first));
+    assert_eq!(a64.vector(3), Some(second));
 }
 
 #[test]
@@ -448,6 +515,119 @@ fn a64_memory_reference_semantics_use_process_address_space_and_report_faults() 
             .unwrap()
             .value,
         MemoryValue::U8(0xab),
+    );
+}
+
+#[test]
+fn a64_pair_offset_mode_applies_its_scaled_immediate_without_writeback() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(45);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(92);
+    let profile = GuestCpuProfile::switch_1();
+    let process = ProcessCpuContext::new(profile, SPACE);
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    assert!(memory.initialize_ram(PAGE, 8, &0x1122_3344_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(PAGE, 12, &0xffff_fffe_u32.to_le_bytes()));
+    let context = InterpreterContext::new(process).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(1), 0x1000);
+
+    // LDPSW X0, X2, [X1, #8]
+    execute_one_with_context(context, &mut state, 0x6941_0820_u32.into()).unwrap();
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(0)), 0x1122_3344);
+    assert_eq!(a64.read_x(x(2)), u64::MAX - 1);
+    assert_eq!(a64.read_x(x(1)), 0x1000);
+}
+
+#[test]
+fn a64_exclusive_monitor_uses_physical_identity_and_generation() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(46);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(93);
+    let profile = GuestCpuProfile::switch_1();
+    let process = ProcessCpuContext::new(profile, SPACE);
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    assert!(memory.initialize_ram(PAGE, 0, &7_u32.to_le_bytes()));
+    let monitor = std::cell::RefCell::new(crate::vcpu::ExclusiveMonitorState::default());
+    let context = InterpreterContext::new(process)
+        .with_memory(&memory)
+        .with_exclusive_monitor(&monitor);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(3), 0x1000);
+
+    execute_one_with_context(context, &mut state, 0x885f_fc60_u32.into()).unwrap(); // LDAXR W0,[X3]
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_w(x(0)), 7);
+    a64.write_x(x(0), 9);
+    execute_one_with_context(context, &mut state, 0x8801_fc60_u32.into()).unwrap(); // STLXR W1,W0,[X3]
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_w(x(1)), 0);
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1000),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(9),
+    );
+
+    execute_one_with_context(context, &mut state, 0x885f_fc60_u32.into()).unwrap();
+    memory
+        .write(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            MemoryAccess::normal(MemoryAccessSize::Word),
+            MemoryValue::U32(11),
+        )
+        .unwrap();
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(0), 13);
+    execute_one_with_context(context, &mut state, 0x8801_fc60_u32.into()).unwrap();
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_w(x(1)), 1);
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1000),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(11),
     );
 }
 

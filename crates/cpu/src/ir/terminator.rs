@@ -5,6 +5,10 @@ use crate::{
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
 };
 
+// Preserve the original public path while the architectural type lives outside
+// the IR. New engine-independent code should import `crate::exception`.
+pub use crate::exception::ExceptionKind;
+
 use super::value::Operand;
 
 /// Direct or computed guest control target.
@@ -23,19 +27,6 @@ pub enum ControlTarget {
     /// A32 `BX`/`BLX`-style target whose bit zero selects T32 versus A32 at
     /// runtime. The backend masks the address according to the selected state.
     A32Interworking { address: Operand },
-}
-
-/// Architectural exception exit classification.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ExceptionKind {
-    SupervisorCall,
-    Breakpoint,
-    UndefinedInstruction,
-    InstructionAbort,
-    DataAbort,
-    AlignmentFault,
-    FloatingPoint,
-    SystemRegisterTrap,
 }
 
 /// Reason execution stops without choosing another guest block.

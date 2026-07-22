@@ -86,10 +86,11 @@ pub enum InstructionFeature {
     DotProduct,
     Sve,
     Sve2,
+    BranchTargetIdentification,
 }
 
 impl InstructionFeature {
-    const COUNT: usize = Self::Sve2 as usize + 1;
+    const COUNT: usize = Self::BranchTargetIdentification as usize + 1;
     const ALL: [Self; Self::COUNT] = [
         Self::AdvancedSimd,
         Self::Aes,
@@ -102,6 +103,7 @@ impl InstructionFeature {
         Self::DotProduct,
         Self::Sve,
         Self::Sve2,
+        Self::BranchTargetIdentification,
     ];
 
     /// Stable decoder-table and diagnostic name.
@@ -119,6 +121,7 @@ impl InstructionFeature {
             Self::DotProduct => "dot-product",
             Self::Sve => "sve",
             Self::Sve2 => "sve2",
+            Self::BranchTargetIdentification => "branch-target-identification",
         }
     }
 }
@@ -313,11 +316,13 @@ impl FloatingPointProfile {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CacheMaintenanceProfile {
     pub user_cache_maintenance: CapabilityStatus,
+    pub data_zero_block_bytes: ProfileValue<u32>,
 }
 
 impl CacheMaintenanceProfile {
     pub const UNKNOWN: Self = Self {
         user_cache_maintenance: CapabilityStatus::Unknown,
+        data_zero_block_bytes: ProfileValue::Unknown,
     };
 }
 
@@ -400,10 +405,17 @@ impl GuestCpuProfile {
             ArchitectureRevision::Armv8A,
             ExecutionStateSet::A64_A32_T32,
             InstructionFeatures::all_unknown()
-                .with(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled),
+                .with(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled)
+                .with(
+                    InstructionFeature::BranchTargetIdentification,
+                    CapabilityStatus::Disabled,
+                ),
             AddressSpaceProfile::UNKNOWN,
             FloatingPointProfile::UNKNOWN,
-            CacheMaintenanceProfile::UNKNOWN,
+            CacheMaintenanceProfile {
+                user_cache_maintenance: CapabilityStatus::Disabled,
+                data_zero_block_bytes: ProfileValue::Known(64),
+            },
             ExceptionProfile::UNKNOWN,
             TimerProfile::UNKNOWN,
         )
@@ -519,7 +531,8 @@ impl fmt::Display for GuestCpuProfile {
             "GuestCpuProfile{{id=0x{:016x},architecture={},states={},features=[{}],\
              address-space=[va-bits={},pa-bits={},granule-bytes={}],\
              floating-point=[scalar={},advanced-simd={},fp16={}],\
-             cache-maintenance=[user={}],exceptions=[user-mode={}],timer=[virtual-counter={}]}}",
+             cache-maintenance=[user={},data-zero-block-bytes={}],\
+             exceptions=[user-mode={}],timer=[virtual-counter={}]}}",
             self.id.get(),
             self.architecture,
             self.allowed_execution_states,
@@ -531,6 +544,7 @@ impl fmt::Display for GuestCpuProfile {
             self.floating_point.advanced_simd,
             self.floating_point.fp16,
             self.cache_maintenance.user_cache_maintenance,
+            self.cache_maintenance.data_zero_block_bytes,
             self.exception_model.user_mode_exceptions,
             self.timer_model.virtual_counter,
         )
@@ -723,10 +737,12 @@ mod tests {
             "GuestCpuProfile{id=0x0000000000000002,architecture=unknown,states=A64,\
              features=[advanced-simd=unknown,aes=unknown,sha1=unknown,sha256=unknown,\
              crc32=unknown,large-system-extensions=unknown,fp16=unknown,rdm=unknown,\
-             dot-product=unknown,sve=unknown,sve2=unknown],\
+             dot-product=unknown,sve=unknown,sve2=unknown,\
+             branch-target-identification=unknown],\
              address-space=[va-bits=unknown,pa-bits=unknown,granule-bytes=unknown],\
              floating-point=[scalar=unknown,advanced-simd=unknown,fp16=unknown],\
-             cache-maintenance=[user=unknown],exceptions=[user-mode=unknown],\
+             cache-maintenance=[user=unknown,data-zero-block-bytes=unknown],\
+             exceptions=[user-mode=unknown],\
              timer=[virtual-counter=unknown]}"
         );
     }

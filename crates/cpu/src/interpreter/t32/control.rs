@@ -1,7 +1,8 @@
 use super::{InterpreterError, InterpreterOutcome, branch_error, resume};
 use crate::{
     decode::{DecodedOpcode, t32::control::Instruction},
-    ir::{op::Condition, terminator::ExceptionKind},
+    exception::ExceptionKind,
+    ir::op::Condition,
     location::{DecodedInstruction, InstructionSize},
     semantics::conditions::evaluate_a32,
     state::a32::{A32GeneralRegister, A32State},

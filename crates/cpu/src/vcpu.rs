@@ -4,7 +4,10 @@
 //! They follow an executing vCPU rather than forming the architectural register
 //! file of a guest thread, and they are never part of a save-state format.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    cell::{Ref, RefCell, RefMut},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::address::{CodeGeneration, GuestPhysicalPageId};
 
@@ -83,7 +86,7 @@ impl DispatchState {
 /// depend on a particular software-TLB implementation or geometry.
 pub struct VcpuExecutionState<Tlb> {
     software_tlb: Tlb,
-    exclusive_monitor: ExclusiveMonitorState,
+    exclusive_monitor: RefCell<ExclusiveMonitorState>,
     pending_interrupts: AtomicU32,
     dispatch: DispatchState,
 }
@@ -93,7 +96,7 @@ impl<Tlb> VcpuExecutionState<Tlb> {
     pub const fn new(software_tlb: Tlb, dispatch_budget: u64) -> Self {
         Self {
             software_tlb,
-            exclusive_monitor: ExclusiveMonitorState { reservation: None },
+            exclusive_monitor: RefCell::new(ExclusiveMonitorState { reservation: None }),
             pending_interrupts: AtomicU32::new(0),
             dispatch: DispatchState::new(dispatch_budget),
         }
@@ -110,13 +113,18 @@ impl<Tlb> VcpuExecutionState<Tlb> {
     }
 
     #[must_use]
-    pub const fn exclusive_monitor(&self) -> &ExclusiveMonitorState {
-        &self.exclusive_monitor
+    pub fn exclusive_monitor(&self) -> Ref<'_, ExclusiveMonitorState> {
+        self.exclusive_monitor.borrow()
     }
 
     #[must_use]
-    pub const fn exclusive_monitor_mut(&mut self) -> &mut ExclusiveMonitorState {
-        &mut self.exclusive_monitor
+    pub fn exclusive_monitor_mut(&self) -> RefMut<'_, ExclusiveMonitorState> {
+        self.exclusive_monitor.borrow_mut()
+    }
+
+    #[must_use]
+    pub const fn exclusive_monitor_cell(&self) -> &RefCell<ExclusiveMonitorState> {
+        &self.exclusive_monitor
     }
 
     /// Atomically publishes interrupt/event bits to the executor.

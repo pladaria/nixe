@@ -386,6 +386,7 @@ name = "swiitx-horizon"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "swiitx-cpu",
  "swiitx-loader-storage",
  "swiitx-loader-title",
  "swiitx-runtime",

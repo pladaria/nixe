@@ -71,6 +71,10 @@ pub struct SyntheticMappingInfo {
     pub physical_page: GuestPhysicalPageId,
     /// Exact guest-visible mapping permissions.
     pub permissions: MemoryPermissions,
+    /// Runtime-visible mapping attributes.
+    pub attributes: MemoryAttributes,
+    /// Runtime-assigned semantic state of the mapping.
+    pub purpose: MemoryMappingPurpose,
 }
 
 /// Identity and content version of one physical code page.
@@ -422,6 +426,84 @@ pub enum MemoryRegionKind {
     Device,
 }
 
+/// One contiguous virtual-memory query result.
+///
+/// The CPU contract deliberately exposes only mapping facts needed by generic
+/// runtimes. Platform layers remain responsible for assigning OS-specific
+/// memory-state values.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryQueryResult {
+    pub base: GuestVirtualAddress,
+    pub size: u64,
+    pub region: Option<MemoryRegionKind>,
+    pub permissions: MemoryPermissions,
+    pub attributes: MemoryAttributes,
+    pub purpose: MemoryMappingPurpose,
+}
+
+/// Runtime-assigned purpose of a virtual mapping.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MemoryMappingPurpose {
+    #[default]
+    Normal,
+    CodeStatic,
+    CodeMutable,
+    ModuleCodeStatic,
+    ModuleCodeMutable,
+    ThreadLocal,
+    Heap,
+}
+
+impl MemoryMappingPurpose {
+    /// Returns whether the mapping state permits SVC-style reprotection.
+    #[must_use]
+    pub const fn allows_reprotect(self) -> bool {
+        matches!(
+            self,
+            Self::CodeMutable | Self::ModuleCodeMutable | Self::Heap
+        )
+    }
+
+    /// Returns whether the mapping state permits cache-attribute changes.
+    #[must_use]
+    pub const fn allows_attribute_change(self) -> bool {
+        matches!(
+            self,
+            Self::CodeMutable | Self::ModuleCodeMutable | Self::Heap
+        )
+    }
+}
+
+/// Generic guest-visible attributes retained independently of OS result codes.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct MemoryAttributes(u32);
+
+impl MemoryAttributes {
+    pub const NONE: Self = Self(0);
+    pub const UNCACHED: Self = Self(1 << 3);
+    pub const PERMISSION_LOCKED: Self = Self(1 << 4);
+    pub const KNOWN: Self = Self(Self::UNCACHED.0 | Self::PERMISSION_LOCKED.0);
+
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::KNOWN.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, attributes: Self) -> bool {
+        self.0 & attributes.0 == attributes.0
+    }
+}
+
 /// Successful data-read result.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DataReadResult {
@@ -520,6 +602,106 @@ pub trait CpuMemory: InstructionMemory {
         access: MemoryAccess,
         value: MemoryValue,
     ) -> Result<DataWriteResult, DataAccessFault>;
+
+    /// Queries the maximal contiguous mapping state containing `address`.
+    ///
+    /// `end_exclusive` is supplied by the process address-space policy and
+    /// bounds both mapped and unmapped results.
+    fn query_memory(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        end_exclusive: GuestVirtualAddress,
+    ) -> Option<MemoryQueryResult>;
+
+    /// Loads a value and returns the backend identity required by a local
+    /// exclusive monitor.
+    fn load_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault>;
+
+    /// Conditionally stores if the supplied physical reservation is current.
+    fn store_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+        reservation: crate::vcpu::ExclusiveReservation,
+    ) -> Result<(DataWriteResult, bool), DataAccessFault>;
+}
+
+/// Runtime-facing mutation contract for a process address space.
+///
+/// Execution engines consume [`CpuMemory`]. Kernel policy receives this
+/// narrower extension only while applying validated mapping operations, which
+/// keeps Horizon concepts out of the CPU crate.
+pub trait ProcessMemory: CpuMemory {
+    /// Atomically resizes a zero-initialized mapping from its fixed base.
+    fn resize_zeroed_mapping(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        old_size: u64,
+        new_size: u64,
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+    ) -> Result<(), MemoryMappingError>;
+
+    /// Atomically replaces permissions on a complete page-aligned mapped range.
+    fn set_permissions(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryProtectionError>;
+
+    /// Atomically updates selected attributes on a mapped page-aligned range.
+    fn set_attributes(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        mask: MemoryAttributes,
+        value: MemoryAttributes,
+    ) -> Result<(), MemoryProtectionError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MemoryMappingErrorReason {
+    InvalidRange,
+    AlreadyMapped,
+    MappingStateMismatch,
+    WritableExecutable,
+    ResourceExhausted,
+}
+
+/// Pointer-free reason a runtime mapping resize was rejected.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryMappingError {
+    pub address_space: AddressSpaceId,
+    pub address: GuestVirtualAddress,
+    pub reason: MemoryMappingErrorReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MemoryProtectionErrorReason {
+    InvalidRange,
+    Unmapped,
+    WritableExecutable,
+    PermissionLocked,
+}
+
+/// Pointer-free reason a runtime mapping-protection operation was rejected.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryProtectionError {
+    pub address_space: AddressSpaceId,
+    pub address: GuestVirtualAddress,
+    pub reason: MemoryProtectionErrorReason,
 }
 
 /// Read, write, and execute permissions on a synthetic virtual mapping.
@@ -542,8 +724,14 @@ impl MemoryPermissions {
     /// Writable executable memory, useful for coherency tests.
     pub const READ_WRITE_EXECUTE: Self = Self(Self::READ.0 | Self::WRITE.0 | Self::EXECUTE.0);
 
-    const fn contains(self, permission: Self) -> bool {
+    pub const fn contains(self, permission: Self) -> bool {
         self.0 & permission.0 == permission.0
+    }
+
+    /// Returns the portable read/write/execute bit representation.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
     }
 }
 
@@ -565,11 +753,13 @@ pub trait SyntheticMmio {
 struct Mapping {
     physical_page: GuestPhysicalPageId,
     permissions: MemoryPermissions,
+    purpose: MemoryMappingPurpose,
+    attributes: MemoryAttributes,
 }
 
 enum PhysicalPage {
     Ram {
-        bytes: Box<[u8; SYNTHETIC_PAGE_SIZE]>,
+        bytes: Option<Box<[u8; SYNTHETIC_PAGE_SIZE]>>,
         generation: u64,
     },
     Mmio(Box<dyn SyntheticMmio>),
@@ -720,9 +910,11 @@ impl SyntheticMemory {
                 Mapping {
                     physical_page,
                     permissions: request.permissions,
+                    purpose: MemoryMappingPurpose::Normal,
+                    attributes: MemoryAttributes::NONE,
                 },
                 PhysicalPage::Ram {
-                    bytes: contents,
+                    bytes: Some(contents),
                     generation: 1,
                 },
             ));
@@ -768,8 +960,43 @@ impl SyntheticMemory {
             SyntheticMappingInfo {
                 physical_page: mapping.physical_page,
                 permissions: mapping.permissions,
+                attributes: mapping.attributes,
+                purpose: mapping.purpose,
             }
         })
+    }
+
+    /// Assigns a semantic purpose to an already mapped page-aligned range.
+    ///
+    /// The operation validates the complete range before changing any page.
+    pub fn set_mapping_purpose(
+        &mut self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        purpose: MemoryMappingPurpose,
+    ) -> bool {
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        if size == 0 || !start.is_aligned_to(page_size) || !size.is_multiple_of(page_size) {
+            return false;
+        }
+        let Some(end) = start.get().checked_add(size) else {
+            return false;
+        };
+        let first_page = start.get() / page_size;
+        let end_page = end / page_size;
+        let inner = self.inner.get_mut();
+        if !(first_page..end_page).all(|page| inner.mappings.contains_key(&(address_space, page))) {
+            return false;
+        }
+        for page in first_page..end_page {
+            inner
+                .mappings
+                .get_mut(&(address_space, page))
+                .expect("range was preflighted")
+                .purpose = purpose;
+        }
+        true
     }
 
     /// Returns the number of physical pages currently owned by this backend.
@@ -785,7 +1012,7 @@ impl SyntheticMemory {
             .insert(
                 page,
                 PhysicalPage::Ram {
-                    bytes: Box::new([0; SYNTHETIC_PAGE_SIZE]),
+                    bytes: Some(Box::new([0; SYNTHETIC_PAGE_SIZE])),
                     generation: 0,
                 },
             )
@@ -829,6 +1056,8 @@ impl SyntheticMemory {
                 Mapping {
                     physical_page,
                     permissions,
+                    purpose: MemoryMappingPurpose::Normal,
+                    attributes: MemoryAttributes::NONE,
                 },
             )
             .is_none()
@@ -851,6 +1080,7 @@ impl SyntheticMemory {
         let Some(end) = offset.checked_add(bytes.len()) else {
             return false;
         };
+        let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
         let Some(destination) = contents.get_mut(offset..end) else {
             return false;
         };
@@ -944,7 +1174,9 @@ impl SyntheticMemory {
                     InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
                 ));
             };
-            *destination = contents[page_offset(current)];
+            *destination = contents
+                .as_ref()
+                .map_or(0, |contents| contents[page_offset(current)]);
             let dependency = CodePageDependency {
                 page: mapping.physical_page,
                 generation: CodeGeneration::new(*generation),
@@ -1118,7 +1350,9 @@ impl CpuMemory for SyntheticMemory {
                     else {
                         unreachable!()
                     };
-                    *byte = contents[page_offset(current)];
+                    *byte = contents
+                        .as_ref()
+                        .map_or(0, |contents| contents[page_offset(current)]);
                 }
                 Ok(DataReadResult {
                     value: MemoryValue::from_le_slice(access.size, &bytes[..access.size.bytes()]),
@@ -1206,6 +1440,7 @@ impl CpuMemory for SyntheticMemory {
             else {
                 unreachable!()
             };
+            let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
             contents[page_offset(current)] = byte;
             if !touched_pages.contains(&mapping.physical_page) {
                 touched_pages.push(mapping.physical_page);
@@ -1221,6 +1456,403 @@ impl CpuMemory for SyntheticMemory {
             region: MemoryRegionKind::Ram,
         })
     }
+
+    fn load_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault> {
+        let value = self.read(address_space, address, access)?;
+        let inner = self.inner.borrow();
+        let mapping = mapping_at(&inner, address_space, address).expect("load was validated");
+        let PhysicalPage::Ram { generation, .. } = inner
+            .pages
+            .get(&mapping.physical_page)
+            .expect("mapping references a page")
+        else {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        };
+        Ok((
+            value,
+            crate::vcpu::ExclusiveReservation {
+                page: mapping.physical_page,
+                byte_offset: page_offset(address) as u16,
+                access_size: access.size.bytes() as u8,
+                generation: CodeGeneration::new(*generation),
+            },
+        ))
+    }
+
+    fn store_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+        reservation: crate::vcpu::ExclusiveReservation,
+    ) -> Result<(DataWriteResult, bool), DataAccessFault> {
+        validate_data_access(self, address_space, address, access, DataAccessKind::Write)?;
+        let matches = {
+            let inner = self.inner.borrow();
+            let mapping = mapping_at(&inner, address_space, address).expect("store was validated");
+            let generation = match inner.pages.get(&mapping.physical_page) {
+                Some(PhysicalPage::Ram { generation, .. }) => *generation,
+                _ => {
+                    return Err(DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::MixedRegions,
+                    ));
+                }
+            };
+            reservation.page == mapping.physical_page
+                && usize::from(reservation.byte_offset) == page_offset(address)
+                && usize::from(reservation.access_size) == access.size.bytes()
+                && reservation.generation == CodeGeneration::new(generation)
+        };
+        if !matches {
+            return Ok((
+                DataWriteResult {
+                    region: MemoryRegionKind::Ram,
+                },
+                false,
+            ));
+        }
+        self.write(address_space, address, access, value)
+            .map(|result| (result, true))
+    }
+
+    fn query_memory(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        end_exclusive: GuestVirtualAddress,
+    ) -> Option<MemoryQueryResult> {
+        if address.get() >= end_exclusive.get() {
+            return None;
+        }
+        let inner = self.inner.borrow();
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        let page = address.get() / page_size;
+        let end_page = end_exclusive.get() / page_size;
+        let state = synthetic_mapping_state(&inner, address_space, page);
+
+        let (first_page, last_page_exclusive) = if let Some(state) = state {
+            let mut first = page;
+            while first > 0
+                && synthetic_mapping_state(&inner, address_space, first - 1) == Some(state)
+            {
+                first -= 1;
+            }
+            let mut last = page + 1;
+            while last < end_page
+                && synthetic_mapping_state(&inner, address_space, last) == Some(state)
+            {
+                last += 1;
+            }
+            (first, last)
+        } else {
+            let previous = inner
+                .mappings
+                .range(..(address_space, page))
+                .next_back()
+                .filter(|((space, _), _)| *space == address_space)
+                .map_or(0, |((_, mapped_page), _)| mapped_page.saturating_add(1));
+            let next = inner
+                .mappings
+                .range((address_space, page.saturating_add(1))..)
+                .next()
+                .filter(|((space, _), _)| *space == address_space)
+                .map_or(end_page, |((_, mapped_page), _)| *mapped_page)
+                .min(end_page);
+            (previous.min(page), next.max(page + 1))
+        };
+        let base = first_page.checked_mul(page_size)?;
+        let end = last_page_exclusive.checked_mul(page_size)?;
+        let (region, permissions, purpose, attributes) = state
+            .map(|(region, permissions, purpose, attributes)| {
+                (Some(region), permissions, purpose, attributes)
+            })
+            .unwrap_or((
+                None,
+                MemoryPermissions::NONE,
+                MemoryMappingPurpose::Normal,
+                MemoryAttributes::NONE,
+            ));
+        Some(MemoryQueryResult {
+            base: GuestVirtualAddress::new(base),
+            size: end.checked_sub(base)?,
+            region,
+            permissions,
+            purpose,
+            attributes,
+        })
+    }
+}
+
+impl ProcessMemory for SyntheticMemory {
+    fn resize_zeroed_mapping(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        old_size: u64,
+        new_size: u64,
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+    ) -> Result<(), MemoryMappingError> {
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        let error = |address, reason| MemoryMappingError {
+            address_space,
+            address,
+            reason,
+        };
+        if !start.is_aligned_to(page_size)
+            || !old_size.is_multiple_of(page_size)
+            || !new_size.is_multiple_of(page_size)
+            || start.get().checked_add(old_size.max(new_size)).is_none()
+        {
+            return Err(error(start, MemoryMappingErrorReason::InvalidRange));
+        }
+        if permissions.contains(MemoryPermissions::WRITE)
+            && permissions.contains(MemoryPermissions::EXECUTE)
+        {
+            return Err(error(start, MemoryMappingErrorReason::WritableExecutable));
+        }
+
+        let first_page = start.get() / page_size;
+        let old_end_page = first_page + old_size / page_size;
+        let new_end_page = first_page + new_size / page_size;
+        let mut inner = self.inner.borrow_mut();
+        for page in first_page..old_end_page {
+            let Some(mapping) = inner.mappings.get(&(address_space, page)) else {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryMappingErrorReason::MappingStateMismatch,
+                ));
+            };
+            if mapping.purpose != purpose || mapping.permissions != permissions {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryMappingErrorReason::MappingStateMismatch,
+                ));
+            }
+        }
+        for page in old_end_page..new_end_page {
+            if inner.mappings.contains_key(&(address_space, page)) {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryMappingErrorReason::AlreadyMapped,
+                ));
+            }
+        }
+
+        if new_end_page < old_end_page {
+            for page in new_end_page..old_end_page {
+                let mapping = inner
+                    .mappings
+                    .remove(&(address_space, page))
+                    .expect("shrinking range was preflighted");
+                let still_mapped = inner
+                    .mappings
+                    .values()
+                    .any(|candidate| candidate.physical_page == mapping.physical_page);
+                if !still_mapped {
+                    inner.pages.remove(&mapping.physical_page);
+                }
+            }
+            return Ok(());
+        }
+
+        let additional_pages = new_end_page - old_end_page;
+        let capacity = usize::try_from(additional_pages)
+            .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+        let mut pending = Vec::with_capacity(capacity);
+        let mut next_page_id = inner.next_page_id;
+        for page in old_end_page..new_end_page {
+            while inner
+                .pages
+                .contains_key(&GuestPhysicalPageId::new(next_page_id))
+            {
+                next_page_id = next_page_id
+                    .checked_add(1)
+                    .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+            }
+            let physical_page = GuestPhysicalPageId::new(next_page_id);
+            next_page_id = next_page_id
+                .checked_add(1)
+                .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+            pending.push((page, physical_page));
+        }
+        for (page, physical_page) in pending {
+            inner.pages.insert(
+                physical_page,
+                PhysicalPage::Ram {
+                    bytes: None,
+                    generation: 1,
+                },
+            );
+            inner.mappings.insert(
+                (address_space, page),
+                Mapping {
+                    physical_page,
+                    permissions,
+                    purpose,
+                    attributes: MemoryAttributes::NONE,
+                },
+            );
+        }
+        inner.next_page_id = next_page_id;
+        Ok(())
+    }
+
+    fn set_permissions(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryProtectionError> {
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        let error = |address, reason| MemoryProtectionError {
+            address_space,
+            address,
+            reason,
+        };
+        if size == 0 || !start.is_aligned_to(page_size) || !size.is_multiple_of(page_size) {
+            return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
+        }
+        if permissions.contains(MemoryPermissions::WRITE)
+            && permissions.contains(MemoryPermissions::EXECUTE)
+        {
+            return Err(error(
+                start,
+                MemoryProtectionErrorReason::WritableExecutable,
+            ));
+        }
+        let end = start
+            .get()
+            .checked_add(size)
+            .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
+        let first_page = start.get() / page_size;
+        let end_page = end / page_size;
+        let mut inner = self.inner.borrow_mut();
+        for page in first_page..end_page {
+            let Some(mapping) = inner.mappings.get(&(address_space, page)) else {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryProtectionErrorReason::Unmapped,
+                ));
+            };
+            if mapping
+                .attributes
+                .contains(MemoryAttributes::PERMISSION_LOCKED)
+                && mapping.permissions != permissions
+            {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryProtectionErrorReason::PermissionLocked,
+                ));
+            }
+        }
+        let mut changed_executable_pages = BTreeSet::new();
+        for page in first_page..end_page {
+            let mapping = inner
+                .mappings
+                .get_mut(&(address_space, page))
+                .expect("protection range was preflighted");
+            if mapping.permissions.contains(MemoryPermissions::EXECUTE)
+                != permissions.contains(MemoryPermissions::EXECUTE)
+            {
+                changed_executable_pages.insert(mapping.physical_page);
+            }
+            mapping.permissions = permissions;
+        }
+        for physical_page in changed_executable_pages {
+            if let Some(PhysicalPage::Ram { generation, .. }) = inner.pages.get_mut(&physical_page)
+            {
+                *generation = generation.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_attributes(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        mask: MemoryAttributes,
+        value: MemoryAttributes,
+    ) -> Result<(), MemoryProtectionError> {
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        let error = |address, reason| MemoryProtectionError {
+            address_space,
+            address,
+            reason,
+        };
+        if size == 0
+            || !start.is_aligned_to(page_size)
+            || !size.is_multiple_of(page_size)
+            || value.bits() & !mask.bits() != 0
+        {
+            return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
+        }
+        let end = start
+            .get()
+            .checked_add(size)
+            .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
+        let first_page = start.get() / page_size;
+        let end_page = end / page_size;
+        let mut inner = self.inner.borrow_mut();
+        for page in first_page..end_page {
+            if !inner.mappings.contains_key(&(address_space, page)) {
+                return Err(error(
+                    GuestVirtualAddress::new(page * page_size),
+                    MemoryProtectionErrorReason::Unmapped,
+                ));
+            }
+        }
+        for page in first_page..end_page {
+            let mapping = inner
+                .mappings
+                .get_mut(&(address_space, page))
+                .expect("attribute range was preflighted");
+            let bits = (mapping.attributes.bits() & !mask.bits()) | value.bits();
+            mapping.attributes = MemoryAttributes::from_bits(bits)
+                .expect("existing, masked, and replacement attributes are bounded");
+        }
+        Ok(())
+    }
+}
+
+fn synthetic_mapping_state(
+    inner: &SyntheticMemoryInner,
+    address_space: AddressSpaceId,
+    virtual_page: u64,
+) -> Option<(
+    MemoryRegionKind,
+    MemoryPermissions,
+    MemoryMappingPurpose,
+    MemoryAttributes,
+)> {
+    let mapping = inner.mappings.get(&(address_space, virtual_page))?;
+    let region = match inner.pages.get(&mapping.physical_page)? {
+        PhysicalPage::Ram { .. } => MemoryRegionKind::Ram,
+        PhysicalPage::Mmio(_) => MemoryRegionKind::Device,
+    };
+    Some((
+        region,
+        mapping.permissions,
+        mapping.purpose,
+        mapping.attributes,
+    ))
 }
 
 fn mapping_at(
@@ -1363,6 +1995,50 @@ mod tests {
                 generation: CodeGeneration::new(1)
             }]
         );
+    }
+
+    #[test]
+    fn memory_queries_coalesce_equal_mapping_purpose_and_bound_unmapped_holes() {
+        let mut memory = SyntheticMemory::new();
+        assert!(memory.add_ram_page(PAGE_1));
+        assert!(memory.add_ram_page(PAGE_2));
+        assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
+        assert!(memory.map_page(
+            SPACE,
+            CODE.checked_add(SYNTHETIC_PAGE_SIZE as u64).unwrap(),
+            PAGE_2,
+            MemoryPermissions::READ_EXECUTE
+        ));
+        assert!(memory.set_mapping_purpose(
+            SPACE,
+            CODE,
+            (SYNTHETIC_PAGE_SIZE * 2) as u64,
+            MemoryMappingPurpose::ModuleCodeStatic,
+        ));
+
+        let mapped = memory
+            .query_memory(
+                SPACE,
+                CODE.checked_add(8).unwrap(),
+                GuestVirtualAddress::new(0x1_0000),
+            )
+            .unwrap();
+        assert_eq!(mapped.base, CODE);
+        assert_eq!(mapped.size, (SYNTHETIC_PAGE_SIZE * 2) as u64);
+        assert_eq!(mapped.region, Some(MemoryRegionKind::Ram));
+        assert_eq!(mapped.purpose, MemoryMappingPurpose::ModuleCodeStatic);
+
+        let hole = memory
+            .query_memory(
+                SPACE,
+                GuestVirtualAddress::new(0x4000),
+                GuestVirtualAddress::new(0x1_0000),
+            )
+            .unwrap();
+        assert_eq!(hole.base, GuestVirtualAddress::new(0x3000));
+        assert_eq!(hole.size, 0xd000);
+        assert_eq!(hole.region, None);
+        assert_eq!(hole.permissions, MemoryPermissions::NONE);
     }
 
     #[test]
@@ -1704,5 +2380,73 @@ mod tests {
         assert_eq!(error.stage, SyntheticInstallStage::Preflight);
         assert_eq!(memory.physical_page_count(), 0);
         assert!(memory.mapping_info(SPACE, CODE).is_none());
+    }
+
+    #[test]
+    fn zeroed_mapping_resize_is_lazy_atomic_and_preserves_committed_pages() {
+        let memory = SyntheticMemory::new();
+        let base = GuestVirtualAddress::new(0x20_0000);
+        memory
+            .resize_zeroed_mapping(
+                SPACE,
+                base,
+                0,
+                (SYNTHETIC_PAGE_SIZE * 3) as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        assert_eq!(memory.physical_page_count(), 3);
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    base.checked_add(SYNTHETIC_PAGE_SIZE as u64).unwrap(),
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(0),
+        );
+        memory
+            .write(
+                SPACE,
+                base,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0x1122_3344),
+            )
+            .unwrap();
+
+        let collision = memory
+            .resize_zeroed_mapping(
+                SPACE,
+                base,
+                (SYNTHETIC_PAGE_SIZE * 2) as u64,
+                (SYNTHETIC_PAGE_SIZE * 4) as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap_err();
+        assert_eq!(collision.reason, MemoryMappingErrorReason::AlreadyMapped);
+        assert_eq!(memory.physical_page_count(), 3);
+
+        memory
+            .resize_zeroed_mapping(
+                SPACE,
+                base,
+                (SYNTHETIC_PAGE_SIZE * 3) as u64,
+                SYNTHETIC_PAGE_SIZE as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        assert_eq!(memory.physical_page_count(), 1);
+        assert_eq!(
+            memory
+                .read(SPACE, base, MemoryAccess::normal(MemoryAccessSize::Word),)
+                .unwrap()
+                .value,
+            MemoryValue::U32(0x1122_3344),
+        );
     }
 }

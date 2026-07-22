@@ -105,6 +105,17 @@ impl EventObject {
         }
     }
 
+    /// Creates the writable/readable handle views returned by Horizon's
+    /// `CreateEvent` without duplicating the underlying signal state.
+    #[must_use]
+    pub fn create_pair() -> (WritableEventObject, ReadableEventObject) {
+        let event = Self::new();
+        (
+            WritableEventObject(event.clone()),
+            ReadableEventObject(event),
+        )
+    }
+
     #[must_use]
     pub fn is_signalled(&self) -> bool {
         self.signalled.load(std::sync::atomic::Ordering::Acquire)
@@ -118,6 +129,84 @@ impl EventObject {
     pub fn clear(&self) {
         self.signalled
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Writable side of a kernel event pair.
+#[derive(Clone, Debug)]
+pub struct WritableEventObject(EventObject);
+
+impl WritableEventObject {
+    #[must_use]
+    pub fn is_signalled(&self) -> bool {
+        self.0.is_signalled()
+    }
+
+    pub fn signal(&self) {
+        self.0.signal();
+    }
+
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+}
+
+/// Readable synchronization side of a kernel event pair.
+#[derive(Clone, Debug)]
+pub struct ReadableEventObject(EventObject);
+
+impl ReadableEventObject {
+    #[must_use]
+    pub fn is_signalled(&self) -> bool {
+        self.0.is_signalled()
+    }
+
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+}
+
+/// Endpoint role of one process-local session pair.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SessionEndpoint {
+    Server,
+    Client,
+}
+
+#[derive(Debug)]
+struct SessionIdentity;
+
+/// Minimal session endpoint identity retained until HIPC transport is wired.
+#[derive(Clone, Debug)]
+pub struct SessionObject {
+    identity: Arc<SessionIdentity>,
+    endpoint: SessionEndpoint,
+}
+
+impl SessionObject {
+    #[must_use]
+    pub fn create_pair() -> (Self, Self) {
+        let identity = Arc::new(SessionIdentity);
+        (
+            Self {
+                identity: identity.clone(),
+                endpoint: SessionEndpoint::Server,
+            },
+            Self {
+                identity,
+                endpoint: SessionEndpoint::Client,
+            },
+        )
+    }
+
+    #[must_use]
+    pub const fn endpoint(&self) -> SessionEndpoint {
+        self.endpoint
+    }
+
+    #[must_use]
+    pub fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
     }
 }
 

@@ -9,14 +9,15 @@ mod a64;
 mod aarch32;
 mod t32;
 
-use core::fmt;
+use core::{cell::RefCell, fmt};
 
 use crate::{
     address::{AddressSpaceId, GuestVirtualAddress},
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
     error::{ProfileDisabledInstruction, UnallocatedEncoding},
-    ir::terminator::{ExceptionKind, Terminator},
+    exception::ExceptionKind,
+    ir::terminator::Terminator,
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{CpuMemory, DataAccessFault},
     profile::{GuestCpuProfile, ProcessCpuContext},
@@ -83,6 +84,7 @@ pub enum InterpreterOutcome {
 pub struct InterpreterContext<'a> {
     process: ProcessCpuContext,
     memory: Option<&'a dyn CpuMemory>,
+    exclusive_monitor: Option<&'a RefCell<crate::vcpu::ExclusiveMonitorState>>,
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -91,6 +93,7 @@ impl<'a> InterpreterContext<'a> {
         Self {
             process,
             memory: None,
+            exclusive_monitor: None,
         }
     }
 
@@ -98,6 +101,22 @@ impl<'a> InterpreterContext<'a> {
     pub const fn with_memory(mut self, memory: &'a dyn CpuMemory) -> Self {
         self.memory = Some(memory);
         self
+    }
+
+    #[must_use]
+    pub const fn with_exclusive_monitor(
+        mut self,
+        monitor: &'a RefCell<crate::vcpu::ExclusiveMonitorState>,
+    ) -> Self {
+        self.exclusive_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub const fn exclusive_monitor(
+        self,
+    ) -> Option<&'a RefCell<crate::vcpu::ExclusiveMonitorState>> {
+        self.exclusive_monitor
     }
 
     #[must_use]

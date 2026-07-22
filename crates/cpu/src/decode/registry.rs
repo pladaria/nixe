@@ -31,6 +31,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
                     | 0x0000_0044..=0x0000_0045
+                    | 0x0000_0048..=0x0000_0049
             ) =>
         {
             IMPLEMENTED
@@ -188,6 +189,29 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             let n = bits & (1 << 22) != 0;
             if n != sf || (!sf && imms >= 32) {
                 AllocationStatus::Reserved("invalid extract width fields")
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
+        0x0000_0048 => {
+            let immediate = ((bits >> 16) & 0x1f) as u8;
+            let quad = bits & (1 << 30) != 0;
+            if !immediate.is_power_of_two() {
+                AllocationStatus::Reserved("SIMD duplicate element size is not one-hot")
+            } else if immediate == 8 && !quad {
+                AllocationStatus::Reserved("64-bit SIMD duplicate requires a 128-bit vector")
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
+        0x0000_0049 if bits >> 30 == 3 => {
+            AllocationStatus::Reserved("invalid SIMD pair transfer size")
+        }
+        0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
+            let size = (bits >> 30) as u8;
+            let opc = ((bits >> 22) & 3) as u8;
+            if opc & 2 != 0 && size != 0 {
+                AllocationStatus::Reserved("invalid 128-bit SIMD transfer size")
             } else {
                 AllocationStatus::Allocated
             }

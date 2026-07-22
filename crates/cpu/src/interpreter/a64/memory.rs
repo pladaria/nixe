@@ -39,7 +39,9 @@ pub(super) fn execute(
         Instruction::LoadAcquire(_) | Instruction::StoreRelease(_) => {
             acquire_release(memory, address_space, state, fields, instruction)
         }
-        Instruction::LoadExclusive(_) | Instruction::StoreExclusive(_) => Ok(None),
+        Instruction::LoadExclusive(_) | Instruction::StoreExclusive(_) => {
+            exclusive(context, memory, address_space, state, fields, instruction)
+        }
     };
     match result {
         Ok(Some(())) => {
@@ -52,6 +54,56 @@ pub(super) fn execute(
             fault,
         }),
     }
+}
+
+fn exclusive(
+    context: InterpreterContext<'_>,
+    memory: &dyn CpuMemory,
+    address_space: crate::address::AddressSpaceId,
+    state: &mut A64State,
+    fields: Operands,
+    instruction: Instruction,
+) -> MemoryStep {
+    let Some(monitor) = context.exclusive_monitor() else {
+        return Ok(None);
+    };
+    let size = size_from_bits(fields.size);
+    let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
+    let load = matches!(instruction, Instruction::LoadExclusive(_));
+    let ordering = match (load, fields.ordered) {
+        (true, true) => MemoryOrdering::Acquire,
+        (false, true) => MemoryOrdering::Release,
+        (_, false) => MemoryOrdering::Relaxed,
+    };
+    let descriptor = MemoryAccess::new(
+        size,
+        MemoryAlignment::Natural,
+        ordering,
+        MemoryAccessClass::Exclusive,
+    );
+    if load {
+        let (value, reservation) = memory.load_exclusive(address_space, address, descriptor)?;
+        monitor.borrow_mut().reserve(reservation);
+        write_loaded(state, fields.rt, size, 1, false, value.value);
+    } else {
+        let reservation = monitor.borrow().reservation();
+        monitor.borrow_mut().clear();
+        let succeeded = if let Some(reservation) = reservation {
+            memory
+                .store_exclusive(
+                    address_space,
+                    address,
+                    descriptor,
+                    register_value(state, fields.rt, size),
+                    reservation,
+                )?
+                .1
+        } else {
+            false
+        };
+        write(state, fields.rm, 32, false, u64::from(!succeeded));
+    }
+    Ok(Some(()))
 }
 
 fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> MemoryAccess {
@@ -219,7 +271,7 @@ fn pair(
     }
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
-    let transfer_base = if fields.mode == 3 {
+    let transfer_base = if matches!(fields.mode, 2 | 3) {
         base.wrapping_add_signed(offset)
     } else {
         base

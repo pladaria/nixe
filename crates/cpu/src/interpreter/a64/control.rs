@@ -1,6 +1,7 @@
 use crate::{
     decode::{DecodedOpcode, a64::control::Instruction},
-    ir::{op::Condition, terminator::ExceptionKind},
+    exception::ExceptionKind,
+    ir::op::Condition,
     location::{DecodedInstruction, LocationDescriptor},
     semantics::conditions::evaluate_a64,
     state::a64::A64State,
