@@ -20,6 +20,8 @@ documentation, commits, etc.
 
 - Prefer correctness and clear behavior over premature optimization.
 - Add tests for new behavior whenever practical.
+- When an implementation relies on external references, record those references in nearby code comments and link
+  to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.
 - Keep platform-independent code separate from console-specific behavior.
 - Share code between platforms only when the abstraction is supported by verified technical knowledge.
 - Do not include copyrighted games, firmware, cryptographic keys, leaked material, or other content that
