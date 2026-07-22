@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_horizon::HorizonSvcDispatcher;
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, RunnableProcess,
+    ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess,
 };
 
 use super::load_config;
@@ -20,6 +22,7 @@ pub struct Arguments {
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
+    let interrupted = install_interrupt_handler()?;
     log::info!("scanning configured title library");
     let config = load_config(arguments.config_path)?;
     let scan_started = Instant::now();
@@ -88,7 +91,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     log::info!("starting the reference CPU interpreter");
 
     let execution_started = Instant::now();
-    let execution = execute(&mut process, instruction_trace);
+    let execution = execute(&mut process, instruction_trace, &interrupted);
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
@@ -114,11 +117,17 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         exit_cause,
         exit_code
     );
-    if exit_code == 0 {
-        Ok(())
-    } else {
-        Err(format!("title exited with code {exit_code:#x}"))
-    }
+    classify_exit(teardown.exit)
+}
+
+fn install_interrupt_handler() -> Result<Arc<AtomicBool>, String> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal_flag = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || {
+        signal_flag.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
+    Ok(interrupted)
 }
 
 struct ExecutionSummary {
@@ -127,7 +136,11 @@ struct ExecutionSummary {
     rejected_svc_kinds: usize,
 }
 
-fn execute(process: &mut RunnableProcess, print_trace: bool) -> Result<ExecutionSummary, String> {
+fn execute(
+    process: &mut RunnableProcess,
+    print_trace: bool,
+    interrupted: &AtomicBool,
+) -> Result<ExecutionSummary, String> {
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
@@ -135,6 +148,16 @@ fn execute(process: &mut RunnableProcess, print_trace: bool) -> Result<Execution
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
     loop {
+        if interrupted.load(Ordering::SeqCst) {
+            log::info!("Ctrl+C received; stopping the guest process cleanly");
+            if !process.terminate() {
+                return Err(
+                    "Ctrl+C received, but the guest process could not be terminated cleanly"
+                        .to_owned(),
+                );
+            }
+            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+        }
         let report = process
             .run_reference(if print_trace {
                 1
@@ -204,6 +227,34 @@ fn execute(process: &mut RunnableProcess, print_trace: bool) -> Result<Execution
     }
 }
 
+fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
+    let Some(exit) = exit else {
+        return Err("guest execution ended without an exit record".to_owned());
+    };
+    match exit.cause {
+        ProcessExitCause::ProcessRequested
+        | ProcessExitCause::LastThreadExited
+        | ProcessExitCause::LoaderReturned => {
+            if exit.exit_code == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "title exited normally with non-zero code {:#x} ({:?})",
+                    exit.exit_code, exit.cause
+                ))
+            }
+        }
+        ProcessExitCause::HostRequested => Err(format!(
+            "guest execution was interrupted by the host after a clean shutdown (code {:#x})",
+            exit.exit_code
+        )),
+        ProcessExitCause::GuestBreak { reason, info, size } => Err(format!(
+            "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}, code={:#x}",
+            exit.exit_code
+        )),
+    }
+}
+
 fn execution_summary(
     instructions: u64,
     dispatcher: &HorizonSvcDispatcher,
@@ -252,4 +303,53 @@ fn execution_stop_error(
         _ => format!("unexpected execution stop: {stop}"),
     };
     format!("{reason} after {instructions} instructions; diagnostic: {report}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process_exit(cause: ProcessExitCause, exit_code: u64) -> ProcessExit {
+        ProcessExit {
+            cause,
+            exit_code,
+            source: None,
+            thread_id: 1,
+        }
+    }
+
+    #[test]
+    fn accepts_only_zero_code_normal_guest_terminations() {
+        for cause in [
+            ProcessExitCause::ProcessRequested,
+            ProcessExitCause::LastThreadExited,
+            ProcessExitCause::LoaderReturned,
+        ] {
+            assert_eq!(classify_exit(Some(process_exit(cause, 0))), Ok(()));
+            assert!(classify_exit(Some(process_exit(cause, 7))).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_host_interrupts_and_missing_exit_records() {
+        let interrupted =
+            classify_exit(Some(process_exit(ProcessExitCause::HostRequested, 0))).unwrap_err();
+        assert!(interrupted.contains("interrupted by the host"));
+        assert!(classify_exit(None).is_err());
+    }
+
+    #[test]
+    fn rejects_fatal_guest_breaks_even_when_the_code_is_zero() {
+        let error = classify_exit(Some(process_exit(
+            ProcessExitCause::GuestBreak {
+                reason: 0,
+                info: 0x1234,
+                size: 4,
+            },
+            0,
+        )))
+        .unwrap_err();
+        assert!(error.contains("fatal break"));
+        assert!(error.contains("info=0x1234"));
+    }
 }

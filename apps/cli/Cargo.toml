@@ -5,6 +5,7 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+ctrlc.workspace = true
 log.workspace = true
 sha2.workspace = true
 nixe-config.workspace = true

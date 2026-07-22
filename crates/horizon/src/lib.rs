@@ -4,6 +4,8 @@
 //! layered on its process, mount, and extensible handle primitives.
 
 mod ipc;
+mod ipc_message;
+mod ipc_wire;
 mod object;
 mod svc;
 mod svc_dispatch;
@@ -14,7 +16,7 @@ pub use ipc::{
 };
 pub use object::{
     DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem,
+    ReadOnlyFileSystem, ServiceManagerSession,
 };
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,

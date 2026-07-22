@@ -23,6 +23,7 @@ use nixe_runtime::{
     HandleTable, ReadableEventObject, SessionObject, ThreadObject, WritableEventObject,
 };
 
+use crate::ipc_wire::{IpcWireError, NamedPortResult, SyncRequestResult};
 use crate::{UnsupportedHorizonSvc, decode_horizon_svc};
 
 pub const CURRENT_THREAD_HANDLE: u32 = 0xffff_8000;
@@ -50,6 +51,8 @@ impl HorizonKernelResult {
     pub const INVALID_STATE: Self = Self(0xfa01);
     pub const RESOURCE_LIMIT: Self = Self(0x10801);
     pub const NOT_SUPPORTED: Self = Self(0xfe01);
+    pub const NOT_FOUND: Self = Self(0xf201);
+    pub const OUT_OF_HANDLES: Self = Self(0xd201);
 
     #[must_use]
     pub const fn raw(self) -> u32 {
@@ -134,6 +137,10 @@ pub enum HorizonSvcFault {
     MemoryMapping {
         fault: MemoryMappingError,
     },
+    MalformedIpc {
+        immediate: u32,
+        reason: &'static str,
+    },
 }
 
 impl HorizonSvcFault {
@@ -165,6 +172,7 @@ impl HorizonSvcFault {
                 MemoryMappingErrorReason::WritableExecutable => HorizonKernelResult::INVALID_STATE,
                 MemoryMappingErrorReason::ResourceExhausted => HorizonKernelResult::RESOURCE_LIMIT,
             }),
+            Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -209,6 +217,12 @@ impl Display for HorizonSvcFault {
             }
             Self::MemoryMapping { fault } => {
                 write!(formatter, "Horizon memory mapping failed: {fault:?}")
+            }
+            Self::MalformedIpc { immediate, reason } => {
+                write!(
+                    formatter,
+                    "Horizon SVC {immediate:#x} rejected malformed IPC: {reason}"
+                )
             }
         }
     }
@@ -347,6 +361,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x16 => close_handle(context),
             0x17 => reset_signal(context),
             0x18 => wait_synchronization(context),
+            0x1f => connect_to_named_port(context),
+            0x21 => send_sync_request(context),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
             0x26 => break_process(context),
@@ -374,7 +390,70 @@ const fn svc_support(immediate: u32) -> HorizonSvcSupport {
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x24 | 0x26 | 0x29 | 0x40 => {
             HorizonSvcSupport::Partial
         }
+        0x1f | 0x21 => HorizonSvcSupport::Partial,
         _ => HorizonSvcSupport::Unsupported,
+    }
+}
+
+fn connect_to_named_port(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let name = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
+    match crate::ipc_wire::connect_to_named_port(context.process_mut(), name) {
+        Ok(NamedPortResult::Connected(handle)) => {
+            result(context, HorizonKernelResult::SUCCESS);
+            write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
+            resume()
+        }
+        Ok(NamedPortResult::NotFound) => {
+            result(context, HorizonKernelResult::NOT_FOUND);
+            resume()
+        }
+        Ok(NamedPortResult::NameOutOfRange) => {
+            result(context, HorizonKernelResult::OUT_OF_RANGE);
+            resume()
+        }
+        Ok(NamedPortResult::OutOfHandles) => {
+            result(context, HorizonKernelResult::OUT_OF_HANDLES);
+            resume()
+        }
+        Err(error) => reject_ipc(context, 0x1f, error),
+    }
+}
+
+fn send_sync_request(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let handle = read_register(context.thread().state(), 0) as u32;
+    let tls = match context.thread().state() {
+        ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
+        ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
+    };
+    match crate::ipc_wire::send_sync_request(context.process_mut(), tls, handle) {
+        Ok(SyncRequestResult::Success) => {
+            result(context, HorizonKernelResult::SUCCESS);
+            resume()
+        }
+        Ok(SyncRequestResult::InvalidHandle) => {
+            result(context, HorizonKernelResult::INVALID_HANDLE);
+            resume()
+        }
+        Err(error) => reject_ipc(context, 0x21, error),
+    }
+}
+
+fn reject_ipc(
+    context: &mut ExceptionDispatchContext<'_>,
+    immediate: u32,
+    error: IpcWireError,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    match error {
+        IpcWireError::GuestMemory(fault) => {
+            reject(context, HorizonSvcFault::GuestMemory { immediate, fault })
+        }
+        IpcWireError::Malformed(reason) => {
+            reject(context, HorizonSvcFault::MalformedIpc { immediate, reason })
+        }
     }
 }
 

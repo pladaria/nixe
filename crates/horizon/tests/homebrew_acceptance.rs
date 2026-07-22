@@ -127,7 +127,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 }
 
 #[test]
-fn contemporary_libnx_nro_reaches_the_hipc_phase_without_a_jit() {
+fn contemporary_libnx_nro_enters_service_manager_through_real_hipc() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
@@ -143,20 +143,23 @@ fn contemporary_libnx_nro_reaches_the_hipc_phase_without_a_jit() {
         );
         match &report.stop {
             ExecutionStop::BudgetExhausted => {}
-            ExecutionStop::SupervisorCall {
-                immediate: 0x1f, ..
-            } => break,
             ExecutionStop::SupervisorCall { .. } => {
                 let outcome = process
                     .route_supervisor_call(&report.stop, &mut dispatcher)
                     .unwrap();
-                assert!(
-                    matches!(outcome, ExceptionHandlingResult::Resumed),
-                    "libnx SVC failed at {stop}: {outcome:?}",
-                    stop = report.stop
-                );
+                match outcome {
+                    ExceptionHandlingResult::Resumed => {}
+                    ExceptionHandlingResult::Terminated {
+                        reason: nixe_runtime::ExceptionTerminationReason::Break { .. },
+                        ..
+                    } => break,
+                    _ => panic!(
+                        "libnx SVC failed at {stop}: {outcome:?}",
+                        stop = report.stop
+                    ),
+                }
             }
-            stop => panic!("libnx startup stopped before HIPC: {stop}"),
+            stop => panic!("libnx startup stopped during service-manager bring-up: {stop}"),
         }
     }
 
@@ -168,5 +171,12 @@ fn contemporary_libnx_nro_reaches_the_hipc_phase_without_a_jit() {
             }),
             "libnx did not exercise required SVC {immediate:#x}"
         );
+    }
+    for immediate in [0x1f, 0x21] {
+        assert!(coverage.iter().any(|entry| {
+            entry.immediate == immediate
+                && entry.support == HorizonSvcSupport::Partial
+                && entry.resumed > 0
+        }));
     }
 }

@@ -1,5 +1,6 @@
 [alias]
 cli = ["run", "--package", "nixe-cli", "--"]
+cli-release = ["run", "--release", "--package", "nixe-cli", "--"]
 fmt-check = ["fmt", "--all", "--", "--check"]
 lint = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 test-all = ["test", "--workspace"]
