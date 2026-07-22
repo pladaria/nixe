@@ -73,6 +73,7 @@ impl SwiitxConfig {
             },
             diagnostics: DiagnosticsConfig {
                 report_detail: raw.diagnostics.report_detail,
+                instruction_trace: raw.diagnostics.instruction_trace,
             },
             source_path,
         })
@@ -144,6 +145,8 @@ pub enum DiagnosticReportDetail {
 pub struct DiagnosticsConfig {
     /// Detail level requested for CPU, backend, GPU, and runtime reports.
     pub report_detail: DiagnosticReportDetail,
+    /// Whether runtimes retain a bounded recent guest-instruction trace.
+    pub instruction_trace: bool,
 }
 
 /// Errors produced while locating or loading shared configuration.
@@ -230,6 +233,8 @@ struct RawSystemConfig {
 struct RawDiagnosticsConfig {
     #[serde(default)]
     report_detail: DiagnosticReportDetail,
+    #[serde(default)]
+    instruction_trace: bool,
 }
 
 const fn default_recursive_scan() -> bool {
@@ -356,6 +361,7 @@ mod tests {
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
         );
+        assert!(!config.diagnostics.instruction_trace);
     }
 
     #[test]
@@ -378,6 +384,7 @@ mod tests {
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
         );
+        assert!(!config.diagnostics.instruction_trace);
     }
 
     #[test]
@@ -392,6 +399,7 @@ mod tests {
                 keys = "keys"
                 [diagnostics]
                 report_detail = "sanitized"
+                instruction_trace = true
             "#,
         );
 
@@ -400,6 +408,7 @@ mod tests {
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Sanitized
         );
+        assert!(config.diagnostics.instruction_trace);
     }
 
     #[test]

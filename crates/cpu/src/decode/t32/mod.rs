@@ -6,7 +6,7 @@ pub(crate) mod memory;
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{DecodeSupport, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
 };
 use crate::{
     coverage::CoverageId,
@@ -48,7 +48,6 @@ pub(super) const fn pattern16(
     id: u32,
     priority: u16,
     operands: &'static [OperandField],
-    support: DecodeSupport,
 ) -> InstructionPattern {
     pattern(
         name,
@@ -58,7 +57,6 @@ pub(super) const fn pattern16(
         id,
         priority,
         operands,
-        support,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -69,7 +67,6 @@ pub(super) const fn pattern32(
     id: u32,
     priority: u16,
     operands: &'static [OperandField],
-    support: DecodeSupport,
 ) -> InstructionPattern {
     pattern(
         name,
@@ -79,7 +76,6 @@ pub(super) const fn pattern32(
         id,
         priority,
         operands,
-        support,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -91,7 +87,6 @@ const fn pattern(
     id: u32,
     priority: u16,
     operands: &'static [OperandField],
-    support: DecodeSupport,
 ) -> InstructionPattern {
     InstructionPattern {
         name,
@@ -105,7 +100,8 @@ const fn pattern(
         semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        support,
+        registration: super::registry::registration(ExecutionState::T32, id),
+        allocation_validator: AllocationValidator::T32,
     }
 }
 

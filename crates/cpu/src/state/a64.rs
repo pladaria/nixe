@@ -115,6 +115,19 @@ impl Default for A64State {
 }
 
 impl A64State {
+    /// Copies the general-purpose register and flag subset used by bounded
+    /// runtime diagnostics. SIMD and thread-pointer state are intentionally
+    /// excluded from the compact context.
+    #[must_use]
+    pub fn register_context(&self) -> super::A64RegisterContext {
+        super::A64RegisterContext {
+            x: self.x,
+            sp: self.sp,
+            pc: crate::address::GuestVirtualAddress::new(self.pc),
+            nzcv: self.nzcv,
+        }
+    }
+
     /// Reads an X register. XZR reads as zero.
     #[must_use]
     pub fn read_x(&self, register: A64Register) -> u64 {

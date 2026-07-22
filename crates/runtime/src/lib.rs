@@ -11,8 +11,9 @@ mod process_mount;
 
 pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use execution::{
-    ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExecutionStatus,
-    ProcessTeardownReport,
+    ExecutionReport, ExecutionStop, InstructionTrace, InstructionTraceEntry,
+    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
+    ProcessExecutionError, ProcessExecutionStatus, ProcessTeardownReport,
 };
 pub use handle::{
     EventObject, HandleError, HandleObject, HandleTable, HandleValue, MAX_SHARED_MEMORY_BYTES,

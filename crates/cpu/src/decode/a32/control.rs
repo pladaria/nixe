@@ -1,4 +1,4 @@
-use crate::decode::{DecodeSupport, InstructionPattern, OperandField, OperandId, OperandKind};
+use crate::decode::{InstructionPattern, OperandField, OperandId, OperandKind};
 
 use super::{NO_FEATURES, pattern};
 
@@ -29,7 +29,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         10,
         CONDITION_ONLY,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "b",
@@ -39,7 +38,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         BRANCH,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "bl",
@@ -49,7 +47,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         BRANCH,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "bx",
@@ -59,7 +56,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         CONDITION_ONLY,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "blx-register",
@@ -69,7 +65,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         CONDITION_ONLY,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "blx-immediate",
@@ -79,7 +74,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         NONE,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "svc",
@@ -89,7 +83,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         2,
         CONDITION_ONLY,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "bkpt",
@@ -99,7 +92,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         30,
         CONDITION_ONLY,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 

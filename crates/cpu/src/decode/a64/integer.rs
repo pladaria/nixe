@@ -1,6 +1,6 @@
 //! Normalized integer and address-generation instructions.
 
-use crate::decode::table::{DecodeSupport, InstructionPattern};
+use crate::decode::table::InstructionPattern;
 
 use super::{NO_FEATURES, pattern};
 
@@ -14,7 +14,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         80,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "move-wide",
@@ -24,7 +23,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         79,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "add-sub-shifted",
@@ -34,7 +32,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         66,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "add-sub-extended",
@@ -44,7 +41,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         67,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "add-sub-carry",
@@ -54,7 +50,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         150,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "logical-immediate",
@@ -64,7 +59,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         75,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "logical-shifted",
@@ -74,7 +68,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         65,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "bitfield",
@@ -84,7 +77,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         74,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "extract",
@@ -94,7 +86,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         73,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "data-processing-two-source",
@@ -104,7 +95,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         72,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "conditional-compare-register",
@@ -114,7 +104,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         149,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "conditional-compare-immediate",
@@ -124,7 +113,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         148,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "conditional-select",
@@ -134,7 +122,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         71,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "data-processing-three-source",
@@ -144,7 +131,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         64,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "data-processing-one-source",
@@ -154,7 +140,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         76,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "adr",
@@ -164,7 +149,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         63,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "adrp",
@@ -174,7 +158,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         62,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 

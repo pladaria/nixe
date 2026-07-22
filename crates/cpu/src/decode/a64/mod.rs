@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{DecodeSupport, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
 };
 
 /// Opaque payload forwarded to exact helpers without being decoded by a
@@ -49,7 +49,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
     let bits = encoding.bits();
     let semantic_id = opcode.semantic_id().get();
     match semantic_id {
-        0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a => {
+        0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a | 0x0000_0044..=0x0000_0047 => {
             A64Instruction::Control(control::normalize(semantic_id, bits))
         }
         0x0000_000b..=0x0000_000f => A64Instruction::System(system::normalize(semantic_id, bits)),
@@ -76,7 +76,6 @@ pub(super) const fn pattern(
     priority: u16,
     operands: &'static [OperandField],
     required_features: &'static [InstructionFeature],
-    support: DecodeSupport,
 ) -> InstructionPattern {
     InstructionPattern {
         name,
@@ -90,7 +89,8 @@ pub(super) const fn pattern(
         semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        support,
+        registration: super::registry::registration(ExecutionState::A64, id),
+        allocation_validator: AllocationValidator::A64,
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
         let profile = GuestCpuProfile::switch_1();
         let cases = [
             (0x9400_0000, "bl"),
-            (0xd65f_03c0, "branch-register"),
+            (0xd65f_03c0, "ret"),
             (0x5400_0000, "b.cond"),
             (0xb400_0000, "compare-branch"),
             (0x3600_0000, "test-branch"),

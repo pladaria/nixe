@@ -1,8 +1,6 @@
 //! Normalized control-flow and exception instructions.
 
-use crate::decode::table::{
-    DecodeSupport, InstructionPattern, OperandField, OperandId, OperandKind,
-};
+use crate::decode::table::{InstructionPattern, OperandField, OperandId, OperandKind};
 
 use super::{NO_FEATURES, pattern};
 
@@ -22,7 +20,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         200,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "b",
@@ -32,7 +29,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         199,
         B_FIELDS,
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "bl",
@@ -42,17 +38,51 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         198,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
-        "branch-register",
-        0xfe00_0000,
-        0xd600_0000,
+        "br",
+        0xffff_fc1f,
+        0xd61f_0000,
         0x0000_0005,
-        40,
+        194,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
+    ),
+    pattern(
+        "blr",
+        0xffff_fc1f,
+        0xd63f_0000,
+        0x0000_0044,
+        194,
+        &[],
+        NO_FEATURES,
+    ),
+    pattern(
+        "ret",
+        0xffff_fc1f,
+        0xd65f_0000,
+        0x0000_0045,
+        194,
+        &[],
+        NO_FEATURES,
+    ),
+    pattern(
+        "eret",
+        u32::MAX,
+        0xd69f_03e0,
+        0x0000_0046,
+        194,
+        &[],
+        NO_FEATURES,
+    ),
+    pattern(
+        "drps",
+        u32::MAX,
+        0xd6bf_03e0,
+        0x0000_0047,
+        194,
+        &[],
+        NO_FEATURES,
     ),
     pattern(
         "b.cond",
@@ -62,7 +92,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         197,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "compare-branch",
@@ -72,7 +101,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         78,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "test-branch",
@@ -82,7 +110,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         77,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "svc",
@@ -92,7 +119,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         196,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "brk",
@@ -102,7 +128,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         195,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 
@@ -169,7 +194,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0001 => Instruction::Nop(operands),
         0x0000_0002 => Instruction::BranchImmediate(operands),
         0x0000_0004 => Instruction::BranchLinkImmediate(operands),
-        0x0000_0005 => Instruction::BranchRegister(operands),
+        0x0000_0005 | 0x0000_0044..=0x0000_0047 => Instruction::BranchRegister(operands),
         0x0000_0006 => Instruction::ConditionalBranch(operands),
         0x0000_0007 => Instruction::CompareBranch(operands),
         0x0000_0008 => Instruction::TestBranch(operands),

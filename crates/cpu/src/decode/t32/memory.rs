@@ -1,44 +1,12 @@
 use super::{pattern16, pattern32};
+use crate::decode::InstructionPattern;
 use crate::decode::aarch32::{MemoryOffset, MemorySize, MultipleTransfer, SingleTransfer};
-use crate::decode::{DecodeSupport, InstructionPattern};
 
 pub static PATTERNS_16: &[InstructionPattern] = &[
-    pattern16(
-        "load-literal",
-        0xf800,
-        0x4800,
-        0x0002_0020,
-        5,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "load-store-register",
-        0xf000,
-        0x5000,
-        0x0002_0021,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "load-store-immediate",
-        0xe000,
-        0x6000,
-        0x0002_0022,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "load-store-halfword",
-        0xf000,
-        0x8000,
-        0x0002_0023,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
+    pattern16("load-literal", 0xf800, 0x4800, 0x0002_0020, 5, &[]),
+    pattern16("load-store-register", 0xf000, 0x5000, 0x0002_0021, 1, &[]),
+    pattern16("load-store-immediate", 0xe000, 0x6000, 0x0002_0022, 1, &[]),
+    pattern16("load-store-halfword", 0xf000, 0x8000, 0x0002_0023, 1, &[]),
     pattern16(
         "load-store-sp-relative",
         0xf000,
@@ -46,44 +14,11 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0024,
         1,
         &[],
-        DecodeSupport::Ready,
     ),
-    pattern16(
-        "push",
-        0xfe00,
-        0xb400,
-        0x0002_0025,
-        10,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "pop",
-        0xfe00,
-        0xbc00,
-        0x0002_0026,
-        10,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "store-multiple",
-        0xf800,
-        0xc000,
-        0x0002_0027,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "load-multiple",
-        0xf800,
-        0xc800,
-        0x0002_0028,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
+    pattern16("push", 0xfe00, 0xb400, 0x0002_0025, 10, &[]),
+    pattern16("pop", 0xfe00, 0xbc00, 0x0002_0026, 10, &[]),
+    pattern16("store-multiple", 0xf800, 0xc000, 0x0002_0027, 1, &[]),
+    pattern16("load-multiple", 0xf800, 0xc800, 0x0002_0028, 1, &[]),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
     pattern32(
@@ -93,7 +28,6 @@ pub static PATTERNS_32: &[InstructionPattern] = &[
         0x0002_0029,
         5,
         &[],
-        DecodeSupport::Ready,
     ),
     pattern32(
         "store-word-immediate.w",
@@ -102,7 +36,6 @@ pub static PATTERNS_32: &[InstructionPattern] = &[
         0x0002_002a,
         5,
         &[],
-        DecodeSupport::Ready,
     ),
 ];
 

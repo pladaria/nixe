@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{DecodeSupport, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,7 +65,6 @@ pub(super) const fn pattern(
     priority: u16,
     operands: &'static [OperandField],
     required_features: &'static [InstructionFeature],
-    support: DecodeSupport,
 ) -> InstructionPattern {
     InstructionPattern {
         name,
@@ -79,7 +78,8 @@ pub(super) const fn pattern(
         semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        support,
+        registration: super::registry::registration(ExecutionState::A32, id),
+        allocation_validator: AllocationValidator::A32,
     }
 }
 
@@ -103,24 +103,7 @@ pub(crate) fn decode(
     location: LocationDescriptor,
     encoding: InstructionEncoding,
 ) -> DecodeResult {
-    let result = table().decode(profile, location, encoding);
-    if encoding.bits() >> 28 != 0xf {
-        return result;
-    }
-    match &result {
-        DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded)
-            if matches!(
-                decoded.instruction.semantic_id().get(),
-                0x0001_0006 | 0x0001_0031..=0x0001_0033
-            ) =>
-        {
-            result
-        }
-        _ => DecodeResult::Unallocated {
-            instruction: crate::error::InstructionDiagnostic::new(location, encoding),
-            reason: "encoding is not allocated in the A32 unconditional space",
-        },
-    }
+    table().decode(profile, location, encoding)
 }
 
 #[must_use]

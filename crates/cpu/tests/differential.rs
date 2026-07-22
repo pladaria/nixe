@@ -378,6 +378,9 @@ fn normalize_interpreter(outcome: &InterpreterOutcome) -> NormalizedOutcome {
             fault: fault.clone(),
         },
         InterpreterOutcome::Scheduled { .. } => panic!("scheduled instruction is outside MVP"),
+        InterpreterOutcome::ProfileDisabled(_) | InterpreterOutcome::Unallocated(_) => {
+            panic!("decode rejection is outside generated MVP")
+        }
     }
 }
 

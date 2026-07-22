@@ -1,8 +1,8 @@
+use crate::decode::InstructionPattern;
 use crate::decode::aarch32::{
     ExclusiveTransfer, MemoryOffset, MemorySize, MultipleTransfer, SingleTransfer,
     decode_immediate_shift,
 };
-use crate::decode::{DecodeSupport, InstructionPattern};
 
 use super::{NO_FEATURES, pattern};
 
@@ -15,7 +15,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-extra",
@@ -25,7 +24,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         10,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-single",
@@ -35,7 +33,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-multiple",
@@ -45,7 +42,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-acquire-release",
@@ -55,7 +51,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         25,
         &[],
         NO_FEATURES,
-        DecodeSupport::RecognizedUnimplemented,
     ),
 ];
 

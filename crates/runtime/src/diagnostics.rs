@@ -19,6 +19,8 @@ pub enum ReportDetail {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DiagnosticsPolicy {
     pub report_detail: ReportDetail,
+    /// Opt-in retention of recently executed guest instructions.
+    pub instruction_trace: bool,
     pub missing_instruction_reports: bool,
     pub ir_dumps: bool,
     pub host_code_dumps: bool,
@@ -43,6 +45,7 @@ impl Default for DiagnosticsPolicy {
     fn default() -> Self {
         Self {
             report_detail: ReportDetail::Detailed,
+            instruction_trace: false,
             missing_instruction_reports: true,
             ir_dumps: false,
             host_code_dumps: false,
@@ -58,6 +61,7 @@ impl From<swiitx_config::DiagnosticsConfig> for DiagnosticsPolicy {
                 swiitx_config::DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
                 swiitx_config::DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
             },
+            instruction_trace: config.instruction_trace,
             ..Self::default()
         }
     }
@@ -71,6 +75,7 @@ mod tests {
     fn detailed_reports_are_the_runtime_default() {
         let policy = DiagnosticsPolicy::default();
         assert_eq!(policy.report_detail, ReportDetail::Detailed);
+        assert!(!policy.instruction_trace);
         assert!(policy.missing_instruction_reports);
         assert_eq!(
             policy.cpu().report_detail,
@@ -82,6 +87,7 @@ mod tests {
     fn cpu_receives_only_its_narrow_policy_view() {
         let policy = DiagnosticsPolicy {
             report_detail: ReportDetail::Sanitized,
+            instruction_trace: true,
             missing_instruction_reports: false,
             ir_dumps: true,
             host_code_dumps: true,
@@ -100,8 +106,10 @@ mod tests {
     fn runtime_normalizes_the_application_configuration() {
         let policy = DiagnosticsPolicy::from(swiitx_config::DiagnosticsConfig {
             report_detail: swiitx_config::DiagnosticReportDetail::Sanitized,
+            instruction_trace: true,
         });
         assert_eq!(policy.report_detail, ReportDetail::Sanitized);
+        assert!(policy.instruction_trace);
         assert!(policy.missing_instruction_reports);
     }
 }

@@ -1,6 +1,6 @@
 //! Normalized hints, system-register, barrier, and cache instructions.
 
-use crate::decode::table::{DecodeSupport, InstructionPattern};
+use crate::decode::table::InstructionPattern;
 
 use super::{NO_FEATURES, pattern};
 
@@ -13,7 +13,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         190,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "mrs",
@@ -23,7 +22,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         70,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "msr-register",
@@ -33,7 +31,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         69,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "barrier",
@@ -43,7 +40,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         189,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "system",
@@ -53,7 +49,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         20,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 

@@ -1,17 +1,27 @@
 version = 1
 
 [library]
-paths = [
-  "./roms/",
-]
+# Directories scanned for supported title and homebrew files. Relative paths
+# are resolved from the directory containing this configuration file.
+paths = ["./roms/"]
+# When true, title discovery also scans subdirectories below every library path.
+# When false, only files directly inside each configured directory are scanned.
 recursive_scan = true
 
 [system]
-preferred_languages = [
-  "Spanish",
-  "AmericanEnglish",
-]
+# Languages tried for title metadata, in descending preference order. If a
+# title lacks the first language, the next available configured language is
+# used before the loader's deterministic fallback.
+preferred_languages = ["Spanish", "AmericanEnglish"]
+# Directory containing caller-owned prod.keys and, optionally, title.keys.
+# Relative paths are resolved from the directory containing this file.
 keys = "./keys/"
 
 [diagnostics]
+# Diagnostic context policy. "detailed" retains bounded local debugging
+# context; "sanitized" omits local-only detail and is safer for shared reports.
 report_detail = "detailed"
+# Opt-in history of recently executed guest instructions. When enabled, the
+# runtime retains at most 64 entries. Detailed mode includes bounded
+# disassembly; sanitized mode retains only sequence, guest location and bits.
+instruction_trace = true

@@ -142,6 +142,11 @@ impl Cpsr {
     }
 
     #[must_use]
+    pub const fn saturation(self) -> bool {
+        self.0 & Self::Q != 0
+    }
+
+    #[must_use]
     pub const fn it_state(self) -> ItState {
         let low = ((self.0 >> 25) & 3) as u8;
         let high = ((self.0 >> 10) & 0x3f) as u8;
@@ -207,6 +212,18 @@ impl Default for A32State {
 }
 
 impl A32State {
+    /// Copies the general-purpose register and CPSR subset used by bounded
+    /// runtime diagnostics. VFP/NEON and thread-pointer state are intentionally
+    /// excluded from the compact context.
+    #[must_use]
+    pub fn register_context(&self) -> super::A32RegisterContext {
+        super::A32RegisterContext {
+            r: self.r,
+            pc: crate::address::GuestVirtualAddress::new(u64::from(self.pc)),
+            cpsr: self.cpsr,
+        }
+    }
+
     /// Creates zeroed state in A32 execution state and user mode.
     #[must_use]
     pub const fn a32() -> Self {
