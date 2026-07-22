@@ -1,6 +1,6 @@
 //! Normalized integer memory instructions.
 
-use crate::decode::table::{DecodeSupport, InstructionPattern};
+use crate::decode::table::InstructionPattern;
 
 use super::{NO_FEATURES, pattern};
 
@@ -13,7 +13,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         61,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-unsigned",
@@ -23,7 +22,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         60,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-unscaled",
@@ -33,7 +31,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         120,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-post-index",
@@ -43,7 +40,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         119,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-pre-index",
@@ -53,7 +49,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         118,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-register",
@@ -63,7 +58,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         117,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-store-pair",
@@ -73,7 +67,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         59,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-acquire",
@@ -83,7 +76,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         147,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "store-release",
@@ -93,7 +85,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         146,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "load-exclusive",
@@ -103,7 +94,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         145,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "store-exclusive",
@@ -113,7 +103,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         144,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 

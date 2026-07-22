@@ -15,6 +15,7 @@ use crate::{
     address::{AddressSpaceId, GuestVirtualAddress},
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
+    error::{ProfileDisabledInstruction, UnallocatedEncoding},
     ir::terminator::{ExceptionKind, Terminator},
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{CpuMemory, DataAccessFault},
@@ -63,6 +64,13 @@ pub enum InterpreterOutcome {
         source: LocationDescriptor,
         fault: DataAccessFault,
     },
+    /// Decode succeeded far enough to identify a feature rejected by the
+    /// immutable guest CPU profile. Architecturally this takes the undefined
+    /// instruction path, while diagnostics retain the distinct cause.
+    ProfileDisabled(ProfileDisabledInstruction),
+    /// The encoding is unallocated or violates an architectural reserved-bit
+    /// constraint. Architecturally this takes the undefined instruction path.
+    Unallocated(UnallocatedEncoding),
 }
 
 /// Immutable process and memory services visible to one interpreter step.
@@ -179,6 +187,13 @@ pub fn instruction_support(decoded: &DecodedInstruction<DecodedOpcode>) -> Instr
             crate::coverage::EngineCoverage::Implemented,
             crate::coverage::EngineCoverage::Missing,
         ) => InstructionSupport::InterpreterOnly,
+        (
+            crate::coverage::EngineCoverage::Implemented,
+            crate::coverage::EngineCoverage::EncodingDependent,
+        ) => InstructionSupport::Lifted,
+        (crate::coverage::EngineCoverage::EncodingDependent, _) => {
+            InstructionSupport::InterpreterOnly
+        }
         (crate::coverage::EngineCoverage::Missing, _) => InstructionSupport::RecognizedUnsupported,
     }
 }
@@ -189,7 +204,7 @@ pub fn has_semantics(decoded: &DecodedInstruction<DecodedOpcode>) -> bool {
     crate::coverage::interpreter_coverage(
         decoded.location.execution_state,
         decoded.instruction.coverage_id(),
-    ) == crate::coverage::EngineCoverage::Implemented
+    ) != crate::coverage::EngineCoverage::Missing
 }
 
 /// Executes the instruction represented by one JIT fallback terminator.
@@ -233,20 +248,9 @@ pub fn execute_fallback_with_context(
     validate_context(&profile, state, *source)?;
     let decoded = match decode::decode(&profile, *source, *encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
-        DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {
-            return Ok(InterpreterOutcome::Exception {
-                source: *source,
-                kind: ExceptionKind::UndefinedInstruction,
-                syndrome: None,
-            });
-        }
-        DecodeResult::ProfileDisabled { .. } => {
-            return Ok(InterpreterOutcome::Exception {
-                source: *source,
-                kind: ExceptionKind::UndefinedInstruction,
-                syndrome: None,
-            });
-        }
+        result @ (DecodeResult::Unallocated { .. }
+        | DecodeResult::Reserved { .. }
+        | DecodeResult::ProfileDisabled { .. }) => return Ok(decode_rejection(result)),
     };
     if decoded.instruction.coverage_id() != coverage_id {
         return Err(InterpreterError::ContextMismatch {
@@ -280,18 +284,37 @@ pub fn execute_one_with_context(
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
             execute_decoded(context, state, &decoded)
         }
-        DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {
-            Ok(InterpreterOutcome::Exception {
-                source,
-                kind: ExceptionKind::UndefinedInstruction,
-                syndrome: None,
-            })
+        result @ (DecodeResult::Unallocated { .. }
+        | DecodeResult::Reserved { .. }
+        | DecodeResult::ProfileDisabled { .. }) => Ok(decode_rejection(result)),
+    }
+}
+
+fn decode_rejection(result: DecodeResult) -> InterpreterOutcome {
+    match result {
+        DecodeResult::Unallocated {
+            instruction,
+            reason,
+        } => InterpreterOutcome::Unallocated(UnallocatedEncoding::new(instruction, reason)),
+        DecodeResult::Reserved {
+            instruction,
+            name,
+            reason,
+        } => InterpreterOutcome::Unallocated(UnallocatedEncoding::new(
+            instruction,
+            format!("{name}: reserved: {reason}"),
+        )),
+        DecodeResult::ProfileDisabled {
+            instruction,
+            rejection,
+            ..
+        } => InterpreterOutcome::ProfileDisabled(ProfileDisabledInstruction::new(
+            instruction,
+            rejection,
+        )),
+        DecodeResult::Decoded(_) | DecodeResult::RecognizedUnimplemented(_) => {
+            unreachable!("decode_rejection requires a rejected decode result")
         }
-        DecodeResult::ProfileDisabled { .. } => Ok(InterpreterOutcome::Exception {
-            source,
-            kind: ExceptionKind::UndefinedInstruction,
-            syndrome: None,
-        }),
     }
 }
 

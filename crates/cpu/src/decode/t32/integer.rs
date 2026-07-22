@@ -3,7 +3,7 @@ use crate::{
     decode::aarch32::{
         DataOperation, DataProcessing, Multiply, Shift, ShiftAmount, ShifterOperand,
     },
-    decode::{DecodeSupport, InstructionPattern, OperandField, OperandId, OperandKind},
+    decode::{InstructionPattern, OperandField, OperandId, OperandKind},
     semantics::shifts::A32ShiftKind,
 };
 
@@ -28,17 +28,8 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
                 kind: OperandKind::Unsigned,
             },
         ],
-        DecodeSupport::Ready,
     ),
-    pattern16(
-        "shift-immediate",
-        0xe000,
-        0x0000,
-        0x0002_0010,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
+    pattern16("shift-immediate", 0xe000, 0x0000, 0x0002_0010, 1, &[]),
     pattern16(
         "add-subtract-three-register",
         0xf800,
@@ -46,7 +37,6 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0011,
         10,
         &[],
-        DecodeSupport::Ready,
     ),
     pattern16(
         "immediate-data-processing",
@@ -55,7 +45,6 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0012,
         1,
         &[],
-        DecodeSupport::Ready,
     ),
     pattern16(
         "data-processing-register",
@@ -64,7 +53,6 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0013,
         1,
         &[],
-        DecodeSupport::Ready,
     ),
     pattern16(
         "special-data-processing",
@@ -73,46 +61,13 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0014,
         1,
         &[],
-        DecodeSupport::Ready,
     ),
-    pattern16(
-        "add-pc-sp",
-        0xf000,
-        0xa000,
-        0x0002_0015,
-        1,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "adjust-sp",
-        0xff00,
-        0xb000,
-        0x0002_0016,
-        10,
-        &[],
-        DecodeSupport::Ready,
-    ),
+    pattern16("add-pc-sp", 0xf000, 0xa000, 0x0002_0015, 1, &[]),
+    pattern16("adjust-sp", 0xff00, 0xb000, 0x0002_0016, 10, &[]),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
-    pattern32(
-        "movw",
-        0xfbf0_8000,
-        0xf240_0000,
-        0x0002_0017,
-        10,
-        &[],
-        DecodeSupport::Ready,
-    ),
-    pattern32(
-        "movt",
-        0xfbf0_8000,
-        0xf2c0_0000,
-        0x0002_0018,
-        10,
-        &[],
-        DecodeSupport::Ready,
-    ),
+    pattern32("movw", 0xfbf0_8000, 0xf240_0000, 0x0002_0017, 10, &[]),
+    pattern32("movt", 0xfbf0_8000, 0xf2c0_0000, 0x0002_0018, 10, &[]),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

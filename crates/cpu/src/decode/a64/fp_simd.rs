@@ -1,9 +1,6 @@
 //! Normalized floating-point and Advanced SIMD instructions.
 
-use crate::{
-    decode::table::{DecodeSupport, InstructionPattern},
-    profile::InstructionFeature,
-};
+use crate::{decode::table::InstructionPattern, profile::InstructionFeature};
 
 use super::{A64HelperToken, pattern};
 
@@ -18,7 +15,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         110,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "simd-integer",
@@ -28,7 +24,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         58,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-scalar-two-source",
@@ -38,7 +33,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-store-unsigned",
@@ -48,7 +42,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         122,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-store-unscaled",
@@ -58,7 +51,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         121,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-scalar-move",
@@ -68,7 +60,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         109,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-compare-register",
@@ -78,7 +69,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         108,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-compare-zero",
@@ -88,7 +78,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         107,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "advanced-simd-fallback",
@@ -98,7 +87,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         2,
         &[],
         SIMD,
-        DecodeSupport::RecognizedUnimplemented,
     ),
     pattern(
         "floating-point-fallback",
@@ -108,7 +96,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         1,
         &[],
         SIMD,
-        DecodeSupport::RecognizedUnimplemented,
     ),
     pattern(
         "fp-signed-int-to-float",
@@ -118,7 +105,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         106,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-unsigned-int-to-float",
@@ -128,7 +114,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         105,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-float-to-signed-int",
@@ -138,7 +123,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         104,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-float-to-unsigned-int",
@@ -148,7 +132,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         103,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-move-to-general",
@@ -158,7 +141,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         102,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-move-from-general",
@@ -168,7 +150,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         101,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-store-post-index",
@@ -178,7 +159,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         120,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-store-pre-index",
@@ -188,7 +168,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         119,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-store-register",
@@ -198,7 +177,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         118,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "fp-simd-load-literal",
@@ -208,7 +186,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         123,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
 ];
 

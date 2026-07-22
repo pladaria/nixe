@@ -3,6 +3,7 @@
 pub mod a32;
 pub mod a64;
 pub mod aarch32;
+pub(crate) mod registry;
 pub mod t32;
 pub mod table;
 

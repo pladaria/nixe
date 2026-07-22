@@ -1,8 +1,8 @@
+use crate::decode::InstructionPattern;
 use crate::decode::aarch32::{
     DataOperation, DataProcessing, Multiply, Shift, ShiftAmount, ShifterOperand,
     decode_immediate_shift,
 };
-use crate::decode::{DecodeSupport, InstructionPattern};
 use crate::semantics::shifts::A32ShiftKind;
 
 use super::{NO_FEATURES, pattern};
@@ -16,7 +16,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "movw",
@@ -26,7 +25,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         15,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "movt",
@@ -36,7 +34,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         15,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
     pattern(
         "data-processing",
@@ -46,7 +43,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-        DecodeSupport::Ready,
     ),
 ];
 

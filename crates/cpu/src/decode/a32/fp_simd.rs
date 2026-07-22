@@ -1,9 +1,6 @@
 use super::pattern;
 use crate::decode::aarch32::{VectorDataProcessing, VectorOperation, VectorSize, VectorTransfer};
-use crate::{
-    decode::{DecodeSupport, InstructionPattern},
-    profile::InstructionFeature,
-};
+use crate::{decode::InstructionPattern, profile::InstructionFeature};
 
 const SIMD: &[InstructionFeature] = &[InstructionFeature::AdvancedSimd];
 
@@ -16,7 +13,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         SIMD,
-        DecodeSupport::RecognizedUnimplemented,
     ),
     pattern(
         "neon-bitwise",
@@ -26,7 +22,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         5,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "neon-integer",
@@ -36,7 +31,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
     pattern(
         "neon-memory",
@@ -46,7 +40,6 @@ pub static PATTERNS: &[InstructionPattern] = &[
         5,
         &[],
         SIMD,
-        DecodeSupport::Ready,
     ),
 ];
 

@@ -1,7 +1,7 @@
 use crate::{
     address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     coverage::CoverageId,
-    ir::terminator::{ExceptionKind, Terminator},
+    ir::terminator::Terminator,
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{
         CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, SyntheticMemory,
@@ -261,32 +261,36 @@ fn strict_mode_rejects_fallback_before_mutating_state() {
 }
 
 #[test]
-fn unallocated_and_profile_disabled_encodings_take_exception_paths() {
+fn unallocated_and_profile_disabled_encodings_keep_distinct_undefined_paths() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
     let outcome = execute_one(&profile, &mut state, 0_u32.into()).unwrap();
 
+    let InterpreterOutcome::Unallocated(error) = outcome else {
+        panic!("unallocated encoding was not classified distinctly");
+    };
     assert_eq!(
-        outcome,
-        InterpreterOutcome::Exception {
-            source: source(profile, 0, ExecutionState::A64),
-            kind: ExceptionKind::UndefinedInstruction,
-            syndrome: None,
-        }
+        error.instruction.location,
+        source(profile, 0, ExecutionState::A64)
     );
+    assert_eq!(error.instruction.encoding, 0_u32.into());
 
     // The provisional Switch 2 profile keeps Advanced SIMD unknown, so this
     // recognized vector encoding must not become an implementation fallback.
     let profile = GuestCpuProfile::switch_2_native();
     let mut state = ThreadCpuState::A64(Box::default());
     let outcome = execute_one(&profile, &mut state, 0x4e22_1c20_u32.into()).unwrap();
+    let InterpreterOutcome::ProfileDisabled(error) = outcome else {
+        panic!("profile-disabled encoding was not classified distinctly");
+    };
     assert_eq!(
-        outcome,
-        InterpreterOutcome::Exception {
-            source: source(profile, 0, ExecutionState::A64),
-            kind: ExceptionKind::UndefinedInstruction,
-            syndrome: None,
-        }
+        error.instruction.location,
+        source(profile, 0, ExecutionState::A64)
+    );
+    assert_eq!(error.instruction.encoding, 0x4e22_1c20_u32.into());
+    assert_eq!(
+        error.required_feature,
+        crate::profile::InstructionFeature::AdvancedSimd
     );
 }
 

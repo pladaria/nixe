@@ -41,6 +41,56 @@ pub enum DecodeSupport {
     RecognizedUnimplemented,
 }
 
+/// Availability declared by the implementation registered for one decoder entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EngineAvailability {
+    Implemented,
+    EncodingDependent,
+    Missing,
+}
+
+/// One redistributable encoding which exercises a registered decoder entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RegressionFixture {
+    pub encoding: InstructionEncoding,
+}
+
+/// Authoritative implementation and evidence metadata for one instruction.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InstructionRegistration {
+    pub decoder: DecodeSupport,
+    pub interpreter: EngineAvailability,
+    pub lifter: EngineAvailability,
+    pub regression_fixture: Option<RegressionFixture>,
+}
+
+/// Result of applying instruction-specific architectural allocation rules.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AllocationStatus {
+    Allocated,
+    Reserved(&'static str),
+    Unallocated(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AllocationValidator {
+    A64,
+    A32,
+    T32,
+    AlwaysAllocated,
+}
+
+impl AllocationValidator {
+    fn validate(self, id: SemanticId, bits: u32) -> AllocationStatus {
+        match self {
+            Self::A64 => super::registry::validate_a64(id, bits),
+            Self::A32 => super::registry::validate_a32(id, bits),
+            Self::T32 => super::registry::validate_t32(id, bits),
+            Self::AlwaysAllocated => AllocationStatus::Allocated,
+        }
+    }
+}
+
 /// Architectural register namespace used by an extracted operand.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RegisterClass {
@@ -110,7 +160,8 @@ pub struct InstructionPattern {
     pub coverage_id: CoverageId,
     /// Higher values win intentional overlaps; equal values remain an error.
     pub priority: u16,
-    pub support: DecodeSupport,
+    pub registration: InstructionRegistration,
+    pub allocation_validator: AllocationValidator,
 }
 
 /// A typed value extracted from an instruction encoding.
@@ -301,21 +352,33 @@ impl DecoderTable {
         }
         let bits = encoding.bits();
         let bucket = ((bits >> self.index_shift) & 0xff) as usize;
+        let mut allocation_rejection = None;
         for index in self.buckets[bucket].iter().copied() {
             let pattern = &self.patterns[usize::from(index)];
             if bits & pattern.mask != pattern.value {
                 continue;
+            }
+            match pattern
+                .allocation_validator
+                .validate(pattern.semantic_id, bits)
+            {
+                AllocationStatus::Allocated => {}
+                AllocationStatus::Reserved(reason) => {
+                    allocation_rejection.get_or_insert((true, pattern.name, reason));
+                    continue;
+                }
+                AllocationStatus::Unallocated(reason) => {
+                    allocation_rejection.get_or_insert((false, pattern.name, reason));
+                    continue;
+                }
             }
             if let Some(constraint) = pattern
                 .reserved_constraints
                 .iter()
                 .find(|constraint| bits & constraint.mask != constraint.value)
             {
-                return DecodeResult::Reserved {
-                    instruction: diagnostic,
-                    name: pattern.name,
-                    reason: constraint.reason,
-                };
+                allocation_rejection.get_or_insert((true, pattern.name, constraint.reason));
+                continue;
             }
             if let Some(rejection) = pattern
                 .required_features
@@ -336,16 +399,27 @@ impl DecoderTable {
                     operands: extract_operands(pattern, bits),
                 },
             );
-            return match pattern.support {
+            return match pattern.registration.decoder {
                 DecodeSupport::Ready => DecodeResult::Decoded(decoded),
                 DecodeSupport::RecognizedUnimplemented => {
                     DecodeResult::RecognizedUnimplemented(decoded)
                 }
             };
         }
-        DecodeResult::Unallocated {
-            instruction: diagnostic,
-            reason: "no allocated instruction pattern matched",
+        match allocation_rejection {
+            Some((true, name, reason)) => DecodeResult::Reserved {
+                instruction: diagnostic,
+                name,
+                reason,
+            },
+            Some((false, _, reason)) => DecodeResult::Unallocated {
+                instruction: diagnostic,
+                reason,
+            },
+            None => DecodeResult::Unallocated {
+                instruction: diagnostic,
+                reason: "no allocated instruction pattern matched",
+            },
         }
     }
 
@@ -477,6 +551,15 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
                 });
             }
         }
+        if let Some(fixture) = pattern.registration.regression_fixture
+            && (fixture.encoding.size() != pattern.size
+                || fixture.encoding.bits() & pattern.mask != pattern.value)
+        {
+            return Err(TableError::InvalidPattern {
+                name: pattern.name,
+                reason: "regression fixture does not match its decoder entry",
+            });
+        }
     }
     for (index, left) in patterns.iter().enumerate() {
         for right in &patterns[index + 1..] {
@@ -548,7 +631,13 @@ mod tests {
             semantic_id: SemanticId::new(id),
             coverage_id: CoverageId::new(id),
             priority: 0,
-            support: DecodeSupport::Ready,
+            registration: InstructionRegistration {
+                decoder: DecodeSupport::Ready,
+                interpreter: EngineAvailability::Missing,
+                lifter: EngineAvailability::Missing,
+                regression_fixture: None,
+            },
+            allocation_validator: AllocationValidator::AlwaysAllocated,
         }
     }
 

@@ -1,9 +1,12 @@
 //! Portable reference execution lifecycle for a constructed process.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use swiitx_cpu::decode::{DecodeResult, decode, disassemble};
 use swiitx_cpu::error::InstructionFetchFault;
+use swiitx_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
 use swiitx_cpu::interpreter::{
     InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
 };
@@ -11,8 +14,148 @@ use swiitx_cpu::ir::terminator::ExceptionKind;
 use swiitx_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
 use swiitx_cpu::memory::{InstructionMemory, SyntheticMemory};
 use swiitx_cpu::profile::ProcessCpuContext;
-use swiitx_cpu::state::ThreadCpuState;
+use swiitx_cpu::state::{RegisterContext, ThreadCpuState};
 use swiitx_cpu::vcpu::VcpuExecutionState;
+use swiitx_cpu::{coverage::CoverageId, memory::DataAccessFault};
+
+use crate::{DiagnosticsPolicy, ReportDetail};
+
+/// Maximum number of guest instructions retained by an enabled trace.
+pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
+/// Maximum UTF-8 byte length retained for one detailed disassembly.
+pub const MAX_TRACE_DISASSEMBLY_BYTES: usize = 96;
+/// Maximum number of UTF-8 bytes emitted by an instruction-trace export.
+pub const MAX_INSTRUCTION_TRACE_EXPORT_BYTES: usize = 16 * 1024;
+
+/// One pointer-free instruction observation in execution order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstructionTraceEntry {
+    pub sequence: u64,
+    pub source: LocationDescriptor,
+    pub encoding: InstructionEncoding,
+    /// Present only when the project-wide report detail is `Detailed`.
+    pub disassembly: Option<Box<str>>,
+}
+
+impl Display for InstructionTraceEntry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "#{} source=[{}] encoding={}",
+            self.sequence, self.source, self.encoding
+        )?;
+        if let Some(disassembly) = &self.disassembly {
+            write!(formatter, " disassembly={disassembly}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded snapshot of the most recently executed guest instructions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstructionTrace {
+    enabled: bool,
+    entries: Box<[InstructionTraceEntry]>,
+    discarded: u64,
+}
+
+impl InstructionTrace {
+    /// Returns whether trace capture was enabled for this process.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns retained entries from oldest to newest.
+    #[must_use]
+    pub const fn entries(&self) -> &[InstructionTraceEntry] {
+        &self.entries
+    }
+
+    /// Returns the number of older observations evicted from the bounded trace.
+    #[must_use]
+    pub const fn discarded(&self) -> u64 {
+        self.discarded
+    }
+}
+
+impl Display for InstructionTrace {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.enabled {
+            return formatter.write_str("disabled");
+        }
+        let mut output = format!(
+            "retained={} discarded={}",
+            self.entries.len(),
+            self.discarded
+        );
+        for entry in &self.entries {
+            let line = format!("\n{entry}");
+            if output.len().saturating_add(line.len()) > MAX_INSTRUCTION_TRACE_EXPORT_BYTES {
+                const MARKER: &str = "\n<trace-export-truncated>";
+                if output.len().saturating_add(MARKER.len()) <= MAX_INSTRUCTION_TRACE_EXPORT_BYTES {
+                    output.push_str(MARKER);
+                }
+                break;
+            }
+            output.push_str(&line);
+        }
+        formatter.write_str(&output)
+    }
+}
+
+struct InstructionTraceRecorder {
+    enabled: bool,
+    detailed: bool,
+    entries: VecDeque<InstructionTraceEntry>,
+    next_sequence: u64,
+    discarded: u64,
+}
+
+impl InstructionTraceRecorder {
+    fn new(policy: DiagnosticsPolicy) -> Self {
+        Self {
+            enabled: policy.instruction_trace,
+            detailed: policy.report_detail == ReportDetail::Detailed,
+            entries: VecDeque::new(),
+            next_sequence: 0,
+            discarded: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        cpu: ProcessCpuContext,
+        source: LocationDescriptor,
+        encoding: InstructionEncoding,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        if self.entries.len() == MAX_INSTRUCTION_TRACE_ENTRIES {
+            self.entries.pop_front();
+            self.discarded = self.discarded.saturating_add(1);
+        }
+        let disassembly = self
+            .detailed
+            .then(|| instruction_description(cpu, source, encoding));
+        self.entries.push_back(InstructionTraceEntry {
+            sequence: self.next_sequence,
+            source,
+            encoding,
+            disassembly,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> InstructionTrace {
+        InstructionTrace {
+            enabled: self.enabled,
+            entries: self.entries.iter().cloned().collect(),
+            discarded: self.discarded,
+        }
+    }
+}
 
 /// Host-side lifecycle state of one emulated process.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -27,6 +170,21 @@ pub enum ProcessExecutionStatus {
 /// Reason a bounded reference-execution call returned to the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionStop {
+    UnsupportedSemantics {
+        source: LocationDescriptor,
+        encoding: InstructionEncoding,
+        disassembly: Box<str>,
+        coverage_id: CoverageId,
+    },
+    ProfileDisabled {
+        error: ProfileDisabledInstruction,
+    },
+    UnallocatedEncoding {
+        error: UnallocatedEncoding,
+    },
+    FetchFault {
+        fault: InstructionFetchFault,
+    },
     BudgetExhausted,
     Safepoint,
     PendingEvent {
@@ -35,15 +193,59 @@ pub enum ExecutionStop {
     Scheduled {
         source: LocationDescriptor,
     },
-    Exception {
+    ArchitecturalException {
         source: LocationDescriptor,
         kind: ExceptionKind,
         syndrome: Option<u64>,
     },
-    DataAbort {
+    SupervisorCall {
         source: LocationDescriptor,
-        fault: swiitx_cpu::memory::DataAccessFault,
+        immediate: Option<u64>,
     },
+    DataFault {
+        source: LocationDescriptor,
+        fault: DataAccessFault,
+    },
+}
+
+impl Display for ExecutionStop {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSemantics {
+                source,
+                encoding,
+                disassembly,
+                coverage_id,
+            } => write!(
+                formatter,
+                "unsupported-semantics source=[{source}] encoding={encoding} disassembly={disassembly} coverage={coverage_id}"
+            ),
+            Self::ProfileDisabled { error } => write!(formatter, "profile-disabled {error}"),
+            Self::UnallocatedEncoding { error } => {
+                write!(formatter, "unallocated-encoding {error}")
+            }
+            Self::FetchFault { fault } => write!(formatter, "fetch-fault {fault}"),
+            Self::BudgetExhausted => formatter.write_str("budget-exhausted"),
+            Self::Safepoint => formatter.write_str("safepoint"),
+            Self::PendingEvent { mask } => write!(formatter, "pending-event mask=0x{mask:08x}"),
+            Self::Scheduled { source } => write!(formatter, "scheduled source=[{source}]"),
+            Self::ArchitecturalException {
+                source,
+                kind,
+                syndrome,
+            } => write!(
+                formatter,
+                "architectural-exception source=[{source}] kind={kind:?} syndrome={syndrome:?}"
+            ),
+            Self::SupervisorCall { source, immediate } => write!(
+                formatter,
+                "supervisor-call source=[{source}] immediate={immediate:?}"
+            ),
+            Self::DataFault { source, fault } => {
+                write!(formatter, "data-fault source=[{source}] fault={fault:?}")
+            }
+        }
+    }
 }
 
 /// Result of one bounded reference-execution slice.
@@ -51,6 +253,20 @@ pub enum ExecutionStop {
 pub struct ExecutionReport {
     pub instructions_executed: u64,
     pub stop: ExecutionStop,
+    /// Pointer-free architectural state at the exact stop boundary.
+    pub context: RegisterContext,
+    /// Opt-in bounded history, ordered from oldest to newest.
+    pub trace: InstructionTrace,
+}
+
+impl Display for ExecutionReport {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "instructions={} stop=[{}] registers=[{}] trace=[{}]",
+            self.instructions_executed, self.stop, self.context, self.trace
+        )
+    }
 }
 
 /// Structured runtime failure which prevented an execution slice from ending normally.
@@ -58,36 +274,31 @@ pub struct ExecutionReport {
 pub enum ProcessExecutionError {
     NotRunnable {
         status: ProcessExecutionStatus,
-    },
-    InstructionFetch {
-        instructions_executed: u64,
-        fault: InstructionFetchFault,
+        context: Box<RegisterContext>,
     },
     Interpreter {
         instructions_executed: u64,
         error: InterpreterError,
+        context: Box<RegisterContext>,
     },
 }
 
 impl Display for ProcessExecutionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotRunnable { status } => {
-                write!(formatter, "process is not runnable while {status:?}")
+            Self::NotRunnable { status, context } => {
+                write!(
+                    formatter,
+                    "process is not runnable while {status:?}: registers=[{context}]"
+                )
             }
-            Self::InstructionFetch {
-                instructions_executed,
-                fault,
-            } => write!(
-                formatter,
-                "reference execution failed after {instructions_executed} instructions: {fault}"
-            ),
             Self::Interpreter {
                 instructions_executed,
                 error,
+                context,
             } => write!(
                 formatter,
-                "reference execution failed after {instructions_executed} instructions: {error}"
+                "reference execution failed after {instructions_executed} instructions: {error} registers=[{context}]"
             ),
         }
     }
@@ -110,18 +321,18 @@ pub struct ProcessTeardownReport {
 pub(crate) struct ProcessExecutionControl {
     status: ProcessExecutionStatus,
     vcpu: VcpuExecutionState<()>,
-}
-
-impl Default for ProcessExecutionControl {
-    fn default() -> Self {
-        Self {
-            status: ProcessExecutionStatus::Ready,
-            vcpu: VcpuExecutionState::new((), 0),
-        }
-    }
+    trace: InstructionTraceRecorder,
 }
 
 impl ProcessExecutionControl {
+    pub(crate) fn new(diagnostics: DiagnosticsPolicy) -> Self {
+        Self {
+            status: ProcessExecutionStatus::Ready,
+            vcpu: VcpuExecutionState::new((), 0),
+            trace: InstructionTraceRecorder::new(diagnostics),
+        }
+    }
+
     pub(crate) const fn status(&self) -> ProcessExecutionStatus {
         self.status
     }
@@ -164,6 +375,7 @@ pub(crate) fn run_reference(
     if control.status != ProcessExecutionStatus::Ready {
         return Err(ProcessExecutionError::NotRunnable {
             status: control.status,
+            context: Box::new(state.register_context()),
         });
     }
     control.status = ProcessExecutionStatus::Running;
@@ -177,6 +389,8 @@ pub(crate) fn run_reference(
             return Ok(ExecutionReport {
                 instructions_executed: executed,
                 stop: ExecutionStop::Safepoint,
+                context: state.register_context(),
+                trace: control.trace.snapshot(),
             });
         }
         let events = control.vcpu.take_pending_interrupts();
@@ -185,6 +399,8 @@ pub(crate) fn run_reference(
             return Ok(ExecutionReport {
                 instructions_executed: executed,
                 stop: ExecutionStop::PendingEvent { mask: events },
+                context: state.register_context(),
+                trace: control.trace.snapshot(),
             });
         }
         if control.vcpu.dispatch().budget() == 0 {
@@ -192,24 +408,56 @@ pub(crate) fn run_reference(
             return Ok(ExecutionReport {
                 instructions_executed: executed,
                 stop: ExecutionStop::BudgetExhausted,
+                context: state.register_context(),
+                trace: control.trace.snapshot(),
             });
         }
 
-        let encoding = fetch_current(memory, cpu, state).map_err(|fault| {
-            control.status = ProcessExecutionStatus::Faulted;
-            ProcessExecutionError::InstructionFetch {
-                instructions_executed: executed,
-                fault,
+        let encoding = match fetch_current(memory, cpu, state) {
+            Ok(encoding) => encoding,
+            Err(fault) => {
+                control.status = ProcessExecutionStatus::Faulted;
+                return Ok(ExecutionReport {
+                    instructions_executed: executed,
+                    stop: ExecutionStop::FetchFault { fault },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
+                });
             }
-        })?;
+        };
+        let source = current_location(cpu, state);
         let context = InterpreterContext::new(cpu).with_memory(memory);
-        let outcome = execute_one_with_context(context, state, encoding).map_err(|error| {
-            control.status = ProcessExecutionStatus::Faulted;
-            ProcessExecutionError::Interpreter {
-                instructions_executed: executed,
-                error,
+        let outcome = match execute_one_with_context(context, state, encoding) {
+            Ok(outcome) => outcome,
+            Err(InterpreterError::UnsupportedInstruction {
+                source,
+                encoding,
+                disassembly,
+                coverage_id,
+            }) => {
+                control.status = ProcessExecutionStatus::Faulted;
+                return Ok(ExecutionReport {
+                    instructions_executed: executed,
+                    stop: ExecutionStop::UnsupportedSemantics {
+                        source,
+                        encoding,
+                        disassembly,
+                        coverage_id,
+                    },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
+                });
             }
-        })?;
+            Err(error) => {
+                control.status = ProcessExecutionStatus::Faulted;
+                return Err(ProcessExecutionError::Interpreter {
+                    instructions_executed: executed,
+                    error,
+                    context: Box::new(state.register_context()),
+                });
+            }
+        };
+        control.trace.record(cpu, source, encoding);
         executed += 1;
         let remaining = control.vcpu.dispatch().budget() - 1;
         control.vcpu.dispatch_mut().set_budget(remaining);
@@ -218,17 +466,35 @@ pub(crate) fn run_reference(
             InterpreterOutcome::Resume(_) => {}
             InterpreterOutcome::Exception {
                 source,
+                kind: ExceptionKind::SupervisorCall,
+                syndrome,
+            } => {
+                control.status = ProcessExecutionStatus::Suspended;
+                return Ok(ExecutionReport {
+                    instructions_executed: executed,
+                    stop: ExecutionStop::SupervisorCall {
+                        source,
+                        immediate: syndrome,
+                    },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
+                });
+            }
+            InterpreterOutcome::Exception {
+                source,
                 kind,
                 syndrome,
             } => {
                 control.status = ProcessExecutionStatus::Suspended;
                 return Ok(ExecutionReport {
                     instructions_executed: executed,
-                    stop: ExecutionStop::Exception {
+                    stop: ExecutionStop::ArchitecturalException {
                         source,
                         kind,
                         syndrome,
                     },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
                 });
             }
             InterpreterOutcome::Scheduled { source } => {
@@ -236,17 +502,86 @@ pub(crate) fn run_reference(
                 return Ok(ExecutionReport {
                     instructions_executed: executed,
                     stop: ExecutionStop::Scheduled { source },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
                 });
             }
             InterpreterOutcome::DataAbort { source, fault } => {
                 control.status = ProcessExecutionStatus::Suspended;
                 return Ok(ExecutionReport {
                     instructions_executed: executed,
-                    stop: ExecutionStop::DataAbort { source, fault },
+                    stop: ExecutionStop::DataFault { source, fault },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
+                });
+            }
+            InterpreterOutcome::ProfileDisabled(error) => {
+                control.status = ProcessExecutionStatus::Suspended;
+                return Ok(ExecutionReport {
+                    instructions_executed: executed,
+                    stop: ExecutionStop::ProfileDisabled { error },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
+                });
+            }
+            InterpreterOutcome::Unallocated(error) => {
+                control.status = ProcessExecutionStatus::Suspended;
+                return Ok(ExecutionReport {
+                    instructions_executed: executed,
+                    stop: ExecutionStop::UnallocatedEncoding { error },
+                    context: state.register_context(),
+                    trace: control.trace.snapshot(),
                 });
             }
         }
     }
+}
+
+fn current_location(cpu: ProcessCpuContext, state: &ThreadCpuState) -> LocationDescriptor {
+    let (pc, execution_state) = match state {
+        ThreadCpuState::A64(state) => (state.pc(), ExecutionState::A64),
+        ThreadCpuState::A32(state) => (
+            u64::from(state.instruction_address()),
+            state.execution_state(),
+        ),
+    };
+    LocationDescriptor::new(
+        swiitx_cpu::address::GuestVirtualAddress::new(pc),
+        execution_state,
+        cpu.profile().id(),
+    )
+}
+
+fn instruction_description(
+    cpu: ProcessCpuContext,
+    source: LocationDescriptor,
+    encoding: InstructionEncoding,
+) -> Box<str> {
+    let description = match decode(&cpu.profile(), source, encoding) {
+        DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
+            disassemble(&decoded.instruction).to_string()
+        }
+        DecodeResult::Unallocated { reason, .. } => format!("<unallocated: {reason}>"),
+        DecodeResult::Reserved { name, reason, .. } => {
+            format!("<{name}: reserved: {reason}>")
+        }
+        DecodeResult::ProfileDisabled {
+            name, rejection, ..
+        } => format!("<{name}: profile-disabled: {rejection}>"),
+    };
+    truncate_utf8(description, MAX_TRACE_DISASSEMBLY_BYTES).into()
+}
+
+fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
 }
 
 fn fetch_current(

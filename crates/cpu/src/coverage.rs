@@ -4,7 +4,7 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use crate::{
-    decode::{self, DecodeSupport, InstructionPattern},
+    decode::{self, DecodeSupport, InstructionPattern, table::EngineAvailability},
     location::{ExecutionState, InstructionEncoding, InstructionSize},
     profile::{CapabilityStatus, CpuProfileId, GuestCpuProfile, InstructionFeature},
 };
@@ -66,6 +66,7 @@ pub enum DecoderCoverage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCoverage {
     Implemented,
+    EncodingDependent,
     Missing,
 }
 
@@ -116,9 +117,9 @@ pub struct CoverageEntry {
 
 /// Builds a deterministic coverage table for every decoder entry and state.
 ///
-/// The table is generated from the actual declarative pattern registries. Only
-/// engine availability and completion-test evidence are maintained separately,
-/// so adding a decoder rule cannot silently disappear from coverage output.
+/// The table is generated from the implementation registration attached to
+/// every declarative pattern, so adding a decoder rule cannot silently
+/// disappear from coverage output or disagree with a parallel ID list.
 #[must_use]
 pub fn coverage_table(profile: &GuestCpuProfile) -> Vec<CoverageEntry> {
     let mut result = Vec::new();
@@ -142,8 +143,8 @@ fn all_pattern_tables() -> [&'static [InstructionPattern]; 4] {
 
 fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> CoverageEntry {
     let decoder = decoder_coverage(profile, pattern);
-    let interpreter = interpreter_coverage(pattern.execution_state, pattern.coverage_id);
-    let lifter = lifter_coverage(pattern.execution_state, pattern.coverage_id);
+    let interpreter = engine_coverage(pattern.registration.interpreter);
+    let lifter = engine_coverage(pattern.registration.lifter);
     let enabled = matches!(decoder, DecoderCoverage::Available);
     let evidence = CompletionEvidence {
         decoder_classified: enabled,
@@ -151,8 +152,7 @@ fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) ->
         explicit_exception: false,
         ir_lowering: lifter == EngineCoverage::Implemented,
         printer_output: enabled,
-        regression_fixture: enabled
-            && has_completion_fixture(pattern.execution_state, pattern.coverage_id),
+        regression_fixture: enabled && pattern.registration.regression_fixture.is_some(),
     };
     let completion = if !enabled {
         CompletionCoverage::Unavailable
@@ -192,126 +192,43 @@ fn decoder_coverage(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> 
             };
         }
     }
-    match pattern.support {
+    match pattern.registration.decoder {
         DecodeSupport::Ready => DecoderCoverage::Available,
         DecodeSupport::RecognizedUnimplemented => DecoderCoverage::RecognizedUnimplemented,
     }
 }
 
-pub(crate) const fn interpreter_coverage(
+const fn engine_coverage(availability: EngineAvailability) -> EngineCoverage {
+    match availability {
+        EngineAvailability::Implemented => EngineCoverage::Implemented,
+        EngineAvailability::EncodingDependent => EngineCoverage::EncodingDependent,
+        EngineAvailability::Missing => EngineCoverage::Missing,
+    }
+}
+
+pub(crate) fn interpreter_coverage(
     state: ExecutionState,
     coverage_id: CoverageId,
 ) -> EngineCoverage {
-    let id = coverage_id.get();
-    match state {
-        ExecutionState::A64
-            if matches!(
-                id,
-                0x0000_0001..=0x0000_000a
-                    | 0x0000_000c..=0x0000_000e
-                    | 0x0000_0010..=0x0000_001d
-                    | 0x0000_0020..=0x0000_002a
-            ) =>
-        {
-            EngineCoverage::Implemented
-        }
-        ExecutionState::A32
-            if matches!(
-                id,
-                0x0001_0001..=0x0001_0021 | 0x0001_0023 | 0x0001_0031..=0x0001_0033
-            ) =>
-        {
-            EngineCoverage::Implemented
-        }
-        ExecutionState::T32 if matches!(id, 0x0002_0001..=0x0002_0005 | 0x0002_0007..=0x0002_000b | 0x0002_0010..=0x0002_002a) => {
-            EngineCoverage::Implemented
-        }
-        _ => EngineCoverage::Missing,
-    }
-}
-
-pub(crate) const fn lifter_coverage(
-    state: ExecutionState,
-    coverage_id: CoverageId,
-) -> EngineCoverage {
-    let id = coverage_id.get();
-    match state {
-        ExecutionState::A64
-            if matches!(
-                id,
-                0x0000_0001..=0x0000_000f
-                    | 0x0000_0010..=0x0000_001d
-                    | 0x0000_0020..=0x0000_002c
-                    | 0x0000_0030..=0x0000_0037
-                    | 0x0000_003a..=0x0000_0043
-            ) =>
-        {
-            EngineCoverage::Implemented
-        }
-        ExecutionState::A32 if matches!(id, 0x0001_0001 | 0x0001_0002) => {
-            EngineCoverage::Implemented
-        }
-        ExecutionState::T32
-            if matches!(id, 0x0002_0001 | 0x0002_0002 | 0x0002_0004 | 0x0002_0005) =>
-        {
-            EngineCoverage::Implemented
-        }
-        _ => EngineCoverage::Missing,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CompletionFixture {
-    state: ExecutionState,
-    coverage_id: CoverageId,
-    encoding: InstructionEncoding,
-}
-
-const COMPLETION_FIXTURES: &[CompletionFixture] = &[
-    fixture(ExecutionState::A64, 0x0000_0001, 0xd503_201f),
-    fixture(ExecutionState::A64, 0x0000_0002, 0x1400_0000),
-    fixture(ExecutionState::A64, 0x0000_0004, 0x9400_0000),
-    fixture(ExecutionState::A64, 0x0000_0005, 0xd65f_03c0),
-    fixture(ExecutionState::A64, 0x0000_0006, 0x5400_0000),
-    fixture(ExecutionState::A64, 0x0000_0007, 0x3400_0000),
-    fixture(ExecutionState::A64, 0x0000_0008, 0x3600_0000),
-    fixture(ExecutionState::A64, 0x0000_0009, 0xd400_0001),
-    fixture(ExecutionState::A64, 0x0000_000a, 0xd420_0000),
-    fixture(ExecutionState::A32, 0x0001_0001, 0xe320_f000),
-    fixture(ExecutionState::A32, 0x0001_0002, 0xea00_0000),
-    fixture16(ExecutionState::T32, 0x0002_0001, 0xbf00),
-    fixture16(ExecutionState::T32, 0x0002_0002, 0xe000),
-    fixture16(ExecutionState::T32, 0x0002_0005, 0xbf08),
-    fixture(ExecutionState::T32, 0x0002_0004, 0xf3af_8000),
-];
-
-const fn fixture(state: ExecutionState, coverage_id: u32, encoding: u32) -> CompletionFixture {
-    CompletionFixture {
-        state,
-        coverage_id: CoverageId::new(coverage_id),
-        encoding: InstructionEncoding::from_u32(encoding),
-    }
-}
-
-const fn fixture16(state: ExecutionState, coverage_id: u32, encoding: u16) -> CompletionFixture {
-    CompletionFixture {
-        state,
-        coverage_id: CoverageId::new(coverage_id),
-        encoding: InstructionEncoding::from_u16(encoding),
-    }
-}
-
-fn has_completion_fixture(state: ExecutionState, coverage_id: CoverageId) -> bool {
-    COMPLETION_FIXTURES.iter().any(|fixture| {
-        fixture.state == state
-            && fixture.coverage_id == coverage_id
-            && match state {
-                ExecutionState::A64 | ExecutionState::A32 => {
-                    fixture.encoding.size() == InstructionSize::Bits32
-                }
-                ExecutionState::T32 => true,
-            }
+    registered_pattern(state, coverage_id).map_or(EngineCoverage::Missing, |pattern| {
+        engine_coverage(pattern.registration.interpreter)
     })
+}
+
+pub(crate) fn lifter_coverage(state: ExecutionState, coverage_id: CoverageId) -> EngineCoverage {
+    registered_pattern(state, coverage_id).map_or(EngineCoverage::Missing, |pattern| {
+        engine_coverage(pattern.registration.lifter)
+    })
+}
+
+fn registered_pattern(
+    state: ExecutionState,
+    coverage_id: CoverageId,
+) -> Option<&'static InstructionPattern> {
+    all_pattern_tables()
+        .into_iter()
+        .flatten()
+        .find(|pattern| pattern.execution_state == state && pattern.coverage_id == coverage_id)
 }
 
 /// Runtime-owned opaque identity of the module containing an instruction.
@@ -757,15 +674,173 @@ mod tests {
     }
 
     #[test]
+    fn every_registry_entry_routes_through_decode_normalization_and_disassembly() {
+        let profile = GuestCpuProfile::switch_1()
+            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled);
+        let table = coverage_table(&profile);
+        let expected_entries: usize = all_pattern_tables()
+            .iter()
+            .map(|patterns| patterns.len())
+            .sum();
+        assert_eq!(table.len(), expected_entries);
+
+        for pattern in all_pattern_tables().into_iter().flatten() {
+            assert_eq!(
+                pattern.registration,
+                crate::decode::registry::registration(
+                    pattern.execution_state,
+                    pattern.coverage_id.get()
+                )
+            );
+            let decoded = find_registered_encoding(&profile, pattern).unwrap_or_else(|| {
+                panic!(
+                    "registry entry {} {} has no accepted encoding",
+                    pattern.execution_state, pattern.coverage_id
+                )
+            });
+            let text = decode::disassemble(&decoded.instruction).to_string();
+            assert!(text.starts_with(pattern.name));
+            match pattern.execution_state {
+                ExecutionState::A64 => {
+                    let _ = decode::a64::normalize(&decoded.instruction, decoded.encoding);
+                }
+                ExecutionState::A32 => {
+                    let _ = decode::a32::normalize(&decoded.instruction, decoded.encoding);
+                }
+                ExecutionState::T32 => {
+                    let _ = decode::t32::normalize(&decoded.instruction, decoded.encoding);
+                }
+            }
+
+            let coverage = entry(&table, pattern.coverage_id);
+            assert_eq!(
+                coverage.interpreter,
+                engine_coverage(pattern.registration.interpreter)
+            );
+            assert_eq!(
+                coverage.lifter,
+                engine_coverage(pattern.registration.lifter)
+            );
+            assert_eq!(
+                coverage.evidence.regression_fixture,
+                pattern.registration.regression_fixture.is_some()
+                    && matches!(coverage.decoder, DecoderCoverage::Available)
+            );
+
+            let block = translate_registered_encoding(&profile, &decoded);
+            match pattern.registration.lifter {
+                EngineAvailability::Implemented => assert!(
+                    !matches!(
+                        block.terminator,
+                        Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
+                    ),
+                    "{} {} declares IR lowering but routed to {:?}",
+                    pattern.execution_state,
+                    pattern.coverage_id,
+                    block.terminator
+                ),
+                EngineAvailability::Missing => assert!(
+                    matches!(
+                        block.terminator,
+                        Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
+                    ),
+                    "{} {} declares missing IR lowering but lowered to {:?}",
+                    pattern.execution_state,
+                    pattern.coverage_id,
+                    block.terminator
+                ),
+                EngineAvailability::EncodingDependent => {}
+            }
+        }
+    }
+
+    fn translate_registered_encoding(
+        profile: &GuestCpuProfile,
+        decoded: &crate::location::DecodedInstruction<crate::decode::DecodedOpcode>,
+    ) -> crate::ir::block::IrBlock {
+        let mut memory = SyntheticMemory::new();
+        assert!(memory.add_ram_page(GuestPhysicalPageId::new(1)));
+        assert!(memory.map_page(
+            AddressSpaceId::new(1),
+            GuestVirtualAddress::new(0x1000),
+            GuestPhysicalPageId::new(1),
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let bytes = match (decoded.location.execution_state, decoded.encoding.size()) {
+            (ExecutionState::T32, InstructionSize::Bits32) => {
+                let bits = decoded.encoding.bits();
+                [(bits >> 16) as u16, bits as u16]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            }
+            (_, InstructionSize::Bits16) => decoded.encoding.bits().to_le_bytes()[..2].to_vec(),
+            (_, InstructionSize::Bits32) => decoded.encoding.bits().to_le_bytes().to_vec(),
+        };
+        assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &bytes));
+        translate_block(
+            BlockTranslationConfig {
+                max_guest_instructions: core::num::NonZeroU32::new(1).unwrap(),
+            },
+            profile,
+            AddressSpaceId::new(1),
+            decoded.location,
+            &memory,
+        )
+        .unwrap()
+    }
+
+    fn find_registered_encoding(
+        profile: &GuestCpuProfile,
+        pattern: &'static InstructionPattern,
+    ) -> Option<crate::location::DecodedInstruction<crate::decode::DecodedOpcode>> {
+        let width_mask = match pattern.size {
+            InstructionSize::Bits16 => 0xffff,
+            InstructionSize::Bits32 => u32::MAX,
+        };
+        let variable_mask = !pattern.mask & width_mask;
+        let mut sample = 0_u32;
+        for attempt in 0..65_536_u32 {
+            if attempt != 0 {
+                sample = sample.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            }
+            let bits = pattern.value | (sample & variable_mask);
+            let encoding = match pattern.size {
+                InstructionSize::Bits16 => InstructionEncoding::from_u16(bits as u16),
+                InstructionSize::Bits32 => InstructionEncoding::from_u32(bits),
+            };
+            let location = crate::location::LocationDescriptor::new(
+                GuestVirtualAddress::new(0x1000),
+                pattern.execution_state,
+                profile.id(),
+            );
+            let decoded = match decode::decode(profile, location, encoding) {
+                decode::DecodeResult::Decoded(decoded)
+                | decode::DecodeResult::RecognizedUnimplemented(decoded) => decoded,
+                _ => continue,
+            };
+            if decoded.instruction.coverage_id() == pattern.coverage_id {
+                return Some(decoded);
+            }
+        }
+        None
+    }
+
+    #[test]
     fn every_lifted_completion_fixture_decodes_lowers_and_prints() {
         let profile = GuestCpuProfile::switch_1();
         let table = coverage_table(&profile);
-        for fixture in COMPLETION_FIXTURES {
+        for pattern in all_pattern_tables()
+            .into_iter()
+            .flatten()
+            .filter(|pattern| pattern.registration.regression_fixture.is_some())
+        {
+            let fixture = pattern.registration.regression_fixture.unwrap();
             let decoded = match decode::decode(
                 &profile,
                 crate::location::LocationDescriptor::new(
                     GuestVirtualAddress::new(0x1000),
-                    fixture.state,
+                    pattern.execution_state,
                     profile.id(),
                 ),
                 fixture.encoding,
@@ -773,7 +848,7 @@ mod tests {
                 decode::DecodeResult::Decoded(decoded) => decoded,
                 other => panic!("completion fixture did not decode: {other:?}"),
             };
-            assert_eq!(decoded.instruction.coverage_id(), fixture.coverage_id);
+            assert_eq!(decoded.instruction.coverage_id(), pattern.coverage_id);
 
             let mut memory = SyntheticMemory::new();
             assert!(memory.add_ram_page(GuestPhysicalPageId::new(1)));
@@ -783,7 +858,7 @@ mod tests {
                 GuestPhysicalPageId::new(1),
                 MemoryPermissions::READ_EXECUTE,
             ));
-            let bytes = match (fixture.state, fixture.encoding.size()) {
+            let bytes = match (pattern.execution_state, fixture.encoding.size()) {
                 (ExecutionState::T32, InstructionSize::Bits32) => {
                     let bits = fixture.encoding.bits();
                     let first = (bits >> 16) as u16;
@@ -811,8 +886,8 @@ mod tests {
                     Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
                 ),
                 "completion fixture {:?} {} lowered to {:?}",
-                fixture.state,
-                fixture.coverage_id,
+                pattern.execution_state,
+                pattern.coverage_id,
                 block.terminator
             );
             let printed = print_block(&block, Default::default());
@@ -825,10 +900,13 @@ mod tests {
             .iter()
             .filter(|entry| entry.completion == CompletionCoverage::Lifted)
         {
-            assert!(has_completion_fixture(
-                entry.execution_state,
-                entry.coverage_id
-            ));
+            assert!(
+                registered_pattern(entry.execution_state, entry.coverage_id)
+                    .unwrap()
+                    .registration
+                    .regression_fixture
+                    .is_some()
+            );
         }
     }
 

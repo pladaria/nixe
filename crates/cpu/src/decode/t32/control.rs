@@ -1,5 +1,5 @@
 use super::{pattern16, pattern32};
-use crate::decode::{DecodeSupport, InstructionPattern, OperandField, OperandId, OperandKind};
+use crate::decode::{InstructionPattern, OperandField, OperandId, OperandKind};
 
 const NONE: &[OperandField] = &[];
 const IT_IMM: &[OperandField] = &[OperandField {
@@ -16,98 +16,18 @@ const B_IMM: &[OperandField] = &[OperandField {
 }];
 
 pub static PATTERNS_16: &[InstructionPattern] = &[
-    pattern16(
-        "nop",
-        0xffff,
-        0xbf00,
-        0x0002_0001,
-        30,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "it",
-        0xff00,
-        0xbf00,
-        0x0002_0005,
-        20,
-        IT_IMM,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "hint",
-        0xff0f,
-        0xbf00,
-        0x0002_0006,
-        10,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "b-conditional",
-        0xf000,
-        0xd000,
-        0x0002_0007,
-        1,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "b",
-        0xf800,
-        0xe000,
-        0x0002_0002,
-        1,
-        B_IMM,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "branch-exchange",
-        0xff00,
-        0x4700,
-        0x0002_0008,
-        10,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "svc",
-        0xff00,
-        0xdf00,
-        0x0002_000a,
-        20,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern16(
-        "bkpt",
-        0xff00,
-        0xbe00,
-        0x0002_000b,
-        20,
-        NONE,
-        DecodeSupport::Ready,
-    ),
+    pattern16("nop", 0xffff, 0xbf00, 0x0002_0001, 30, NONE),
+    pattern16("it", 0xff00, 0xbf00, 0x0002_0005, 20, IT_IMM),
+    pattern16("hint", 0xff0f, 0xbf00, 0x0002_0006, 10, NONE),
+    pattern16("b-conditional", 0xf000, 0xd000, 0x0002_0007, 1, NONE),
+    pattern16("b", 0xf800, 0xe000, 0x0002_0002, 1, B_IMM),
+    pattern16("branch-exchange", 0xff00, 0x4700, 0x0002_0008, 10, NONE),
+    pattern16("svc", 0xff00, 0xdf00, 0x0002_000a, 20, NONE),
+    pattern16("bkpt", 0xff00, 0xbe00, 0x0002_000b, 20, NONE),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
-    pattern32(
-        "bl",
-        0xf800_d000,
-        0xf000_d000,
-        0x0002_0009,
-        5,
-        NONE,
-        DecodeSupport::Ready,
-    ),
-    pattern32(
-        "nop.w",
-        u32::MAX,
-        0xf3af_8000,
-        0x0002_0004,
-        30,
-        NONE,
-        DecodeSupport::Ready,
-    ),
+    pattern32("bl", 0xf800_d000, 0xf000_d000, 0x0002_0009, 5, NONE),
+    pattern32("nop.w", u32::MAX, 0xf3af_8000, 0x0002_0004, 30, NONE),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

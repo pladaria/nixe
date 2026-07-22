@@ -451,7 +451,7 @@ impl ProcessBuilder {
             main_thread,
             mounts: crate::ProcessMountNamespace::from_launch_plan(plan),
             handles,
-            execution: crate::execution::ProcessExecutionControl::default(),
+            execution: crate::execution::ProcessExecutionControl::new(self.diagnostics),
         };
         process.translate_entry()?;
         Ok(process)
@@ -725,7 +725,8 @@ mod tests {
 
     use swiitx_cpu::ir::terminator::{ControlTarget, Terminator};
     use swiitx_cpu::memory::{
-        CpuMemory, InstructionMemory, MemoryAccess, MemoryAccessSize, MemoryValue,
+        CpuMemory, InstructionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions,
+        MemoryValue, SYNTHETIC_PAGE_SIZE,
     };
 
     use super::*;
@@ -733,6 +734,29 @@ mod tests {
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn replace_entry_instruction(process: &mut RunnableProcess, encoding: u32) {
+        let address_space = process.cpu.address_space_id();
+        let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
+        let mapping = process.memory.mapping_info(address_space, entry).unwrap();
+        let alias_page = GuestVirtualAddress::new(0x6000_0000);
+        assert!(process.memory.map_page(
+            address_space,
+            alias_page,
+            mapping.physical_page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        let page_offset = entry.get() % SYNTHETIC_PAGE_SIZE as u64;
+        process
+            .memory
+            .write(
+                address_space,
+                GuestVirtualAddress::new(alias_page.get() + page_offset),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(encoding),
+            )
+            .unwrap();
     }
 
     fn synthetic_nro() -> Vec<u8> {
@@ -982,10 +1006,17 @@ mod tests {
         let report = process.run_reference(1).unwrap();
         assert_eq!(report.instructions_executed, 1);
         assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
+        assert!(!report.trace.enabled());
+        assert!(report.trace.entries().is_empty());
         assert_eq!(
             process.execution_status(),
             crate::ProcessExecutionStatus::Ready
         );
+        let swiitx_cpu::state::RegisterContext::A64(context) = &report.context else {
+            panic!("homebrew fixture must report A64 context");
+        };
+        assert_eq!(context.pc.get(), entry + 0x80);
+        assert!(report.to_string().contains("flags=N0Z0C0V0"));
         let ThreadCpuState::A64(state) = &process.main_thread().state else {
             panic!("homebrew fixture must initialize A64");
         };
@@ -1023,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_execution_propagates_instruction_fetch_faults() {
+    fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
         let (_directory, plan) = plan();
         let mut process = ProcessBuilder::new().build(&plan).unwrap();
         let ThreadCpuState::A64(state) = &mut process.main_thread.state else {
@@ -1031,14 +1062,17 @@ mod tests {
         };
         state.set_pc(0x1000);
 
-        let error = process.run_reference(1).unwrap_err();
+        let report = process.run_reference(1).unwrap();
+        assert_eq!(report.instructions_executed, 0);
         assert!(matches!(
-            error,
-            crate::ProcessExecutionError::InstructionFetch {
-                instructions_executed: 0,
-                ..
-            }
+            report.stop,
+            crate::ExecutionStop::FetchFault { .. }
         ));
+        let swiitx_cpu::state::RegisterContext::A64(context) = &report.context else {
+            panic!("homebrew fixture must report A64 context");
+        };
+        assert_eq!(context.pc.get(), 0x1000);
+        assert!(report.to_string().contains("fetch-fault"));
         assert_eq!(
             process.execution_status(),
             crate::ProcessExecutionStatus::Faulted
@@ -1046,17 +1080,14 @@ mod tests {
     }
 
     #[test]
-    fn architectural_exception_suspends_until_runtime_resumes_thread() {
+    fn unallocated_encoding_suspends_until_runtime_resumes_thread() {
         let (_directory, plan) = plan();
         let mut process = ProcessBuilder::new().build(&plan).unwrap();
 
         let report = process.run_reference(2).unwrap();
         assert!(matches!(
             report.stop,
-            crate::ExecutionStop::Exception {
-                kind: swiitx_cpu::ir::terminator::ExceptionKind::UndefinedInstruction,
-                ..
-            }
+            crate::ExecutionStop::UnallocatedEncoding { .. }
         ));
         assert_eq!(
             process.execution_status(),
@@ -1065,7 +1096,8 @@ mod tests {
         assert!(matches!(
             process.run_reference(1),
             Err(crate::ProcessExecutionError::NotRunnable {
-                status: crate::ProcessExecutionStatus::Suspended
+                status: crate::ProcessExecutionStatus::Suspended,
+                ..
             })
         ));
         assert!(process.resume());
@@ -1073,6 +1105,156 @@ mod tests {
             process.execution_status(),
             crate::ProcessExecutionStatus::Ready
         );
+    }
+
+    #[test]
+    fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() {
+        let (_directory, plan) = plan();
+
+        let mut unsupported = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut unsupported, 0xd503_203f); // YIELD
+        let report = unsupported.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::UnsupportedSemantics { .. }
+        ));
+        assert_eq!(
+            unsupported.execution_status(),
+            ProcessExecutionStatus::Faulted
+        );
+        assert!(report.to_string().contains("unsupported-semantics"));
+
+        let mut profile_disabled = ProcessBuilder::new()
+            .with_config(ProcessBuildConfig {
+                cpu_profile: GuestCpuProfile::switch_2_native(),
+                ..ProcessBuildConfig::default()
+            })
+            .build(&plan)
+            .unwrap();
+        replace_entry_instruction(&mut profile_disabled, 0x4e22_1c20);
+        let report = profile_disabled.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::ProfileDisabled { .. }
+        ));
+        assert!(report.to_string().contains("profile-disabled"));
+
+        let mut unallocated = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut unallocated, 0);
+        let report = unallocated.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::UnallocatedEncoding { .. }
+        ));
+        assert!(report.to_string().contains("unallocated-encoding"));
+    }
+
+    #[test]
+    fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
+        let (_directory, plan) = plan();
+
+        let mut svc = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut svc, 0xd400_0841); // SVC #0x42
+        let report = svc.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::SupervisorCall {
+                immediate: Some(0x42),
+                ..
+            }
+        ));
+        assert!(report.to_string().contains("supervisor-call"));
+
+        let mut breakpoint = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut breakpoint, 0xd420_2460); // BRK #0x123
+        let report = breakpoint.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::ArchitecturalException {
+                kind: swiitx_cpu::ir::terminator::ExceptionKind::Breakpoint,
+                syndrome: Some(0x123),
+                ..
+            }
+        ));
+        assert!(report.to_string().contains("architectural-exception"));
+
+        let mut data_fault = ProcessBuilder::new().build(&plan).unwrap();
+        replace_entry_instruction(&mut data_fault, 0xf940_0020); // LDR X0,[X1]
+        let ThreadCpuState::A64(state) = &mut data_fault.main_thread.state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        state.write_x(
+            swiitx_cpu::state::a64::A64Register::General(a64_register(1)),
+            0x1000,
+        );
+        let report = data_fault.run_reference(1).unwrap();
+        assert!(matches!(
+            report.stop,
+            crate::ExecutionStop::DataFault { .. }
+        ));
+        assert!(report.to_string().contains("data-fault"));
+    }
+
+    #[test]
+    fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new()
+            .with_diagnostics(crate::DiagnosticsPolicy {
+                instruction_trace: true,
+                ..crate::DiagnosticsPolicy::default()
+            })
+            .build(&plan)
+            .unwrap();
+        replace_entry_instruction(&mut process, 0x1400_0000); // B #0
+
+        let first = process
+            .run_reference(crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3)
+            .unwrap();
+        assert!(first.trace.enabled());
+        assert_eq!(
+            first.trace.entries().len(),
+            crate::MAX_INSTRUCTION_TRACE_ENTRIES
+        );
+        assert_eq!(first.trace.discarded(), 3);
+        assert_eq!(first.trace.entries()[0].sequence, 3);
+        assert_eq!(
+            first.trace.entries().last().unwrap().sequence,
+            crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 2
+        );
+        assert!(
+            first
+                .trace
+                .entries()
+                .iter()
+                .all(|entry| entry.disassembly.as_deref() == Some("b imm=#0"))
+        );
+        assert!(first.trace.to_string().len() <= crate::MAX_INSTRUCTION_TRACE_EXPORT_BYTES);
+
+        let second = process.run_reference(1).unwrap();
+        assert_eq!(second.trace.discarded(), 4);
+        assert_eq!(second.trace.entries()[0].sequence, 4);
+        assert_eq!(
+            second.trace.entries().last().unwrap().sequence,
+            crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3
+        );
+    }
+
+    #[test]
+    fn sanitized_instruction_trace_omits_detailed_disassembly() {
+        let (_directory, plan) = plan();
+        let mut process = ProcessBuilder::new()
+            .with_diagnostics(crate::DiagnosticsPolicy {
+                report_detail: crate::ReportDetail::Sanitized,
+                instruction_trace: true,
+                ..crate::DiagnosticsPolicy::default()
+            })
+            .build(&plan)
+            .unwrap();
+
+        let report = process.run_reference(1).unwrap();
+        assert_eq!(report.trace.entries().len(), 1);
+        assert!(report.trace.entries()[0].disassembly.is_none());
+        assert!(!report.trace.to_string().contains("disassembly="));
     }
 
     #[test]
