@@ -49,8 +49,9 @@ impl IpcService {
     }
 }
 
-/// Stable semantic result code. A future CMIF adapter maps these to verified
-/// Horizon module/description values without changing semantic service logic.
+/// Stable semantic result code, deliberately distinct from guest-visible
+/// Horizon values. [`crate::HorizonIpcResult::from_semantic`] performs the
+/// contextual conversion at the wire boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct IpcResultCode(u32);
 
@@ -68,8 +69,7 @@ impl IpcResultCode {
     pub const STORAGE_FAILURE: Self = Self(10);
     pub const INTERNAL_STATE: Self = Self(11);
 
-    #[must_use]
-    pub const fn raw(self) -> u32 {
+    pub(crate) const fn semantic_id(self) -> u32 {
         self.0
     }
 }

@@ -11,18 +11,14 @@ use nixe_runtime::ExceptionProcessContext;
 use crate::ipc_message::{
     COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, HipcRequest, MessageError,
 };
-use crate::{IpcDispatcher, IpcResultCode, IpcService, IpcSession, ServiceManagerSession};
+use crate::{
+    HorizonIpcResult, IpcDispatcher, IpcResultCode, IpcService, IpcSession, ServiceManagerSession,
+};
 
 const NAMED_PORT_NAME_SIZE: usize = 12;
 const CMIF_COMMAND_CLOSE: u16 = 2;
 const CMIF_COMMAND_CONTROL: u16 = 5;
 const CMIF_COMMAND_CONTROL_WITH_CONTEXT: u16 = 7;
-const SM_MODULE: u32 = 21;
-const SM_OUT_OF_SESSIONS: u32 = make_result(SM_MODULE, 3);
-const SM_INVALID_CLIENT: u32 = make_result(SM_MODULE, 2);
-const SM_INVALID_SERVICE_NAME: u32 = make_result(SM_MODULE, 6);
-const SM_NOT_REGISTERED: u32 = make_result(SM_MODULE, 7);
-const SM_NOT_ALLOWED: u32 = make_result(SM_MODULE, 8);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IpcWireError {
@@ -113,8 +109,24 @@ pub(crate) fn send_sync_request(
         let response = match request.command_id {
             // QueryPointerBufferSize. Zero makes libnx use map-alias buffers,
             // which the future descriptor bridge can validate explicitly.
-            3 => encode_response(request.token, 0, &0_u16.to_le_bytes(), None),
-            _ => encode_response(request.token, SM_NOT_REGISTERED, &[], None),
+            3 => encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &0_u16.to_le_bytes(),
+                None,
+            ),
+            0 | 1 | 2 | 4 => encode_response(
+                request.token,
+                HorizonIpcResult::CMIF_NOT_SUPPORTED,
+                &[],
+                None,
+            ),
+            _ => encode_response(
+                request.token,
+                HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
+                &[],
+                None,
+            ),
         }?;
         write_bytes(process, tls, &response)?;
         return Ok(SyncRequestResult::Success);
@@ -124,7 +136,12 @@ pub(crate) fn send_sync_request(
     } else {
         let _service = service.expect("session kind was checked");
         (
-            encode_response(request.token, SM_NOT_REGISTERED, &[], None)?,
+            encode_response(
+                request.token,
+                HorizonIpcResult::CMIF_NOT_SUPPORTED,
+                &[],
+                None,
+            )?,
             None,
         )
     };
@@ -153,7 +170,12 @@ fn dispatch_service_manager(
         0 => {
             if !sent_pid || request.data.len() < 8 {
                 return Ok((
-                    encode_response(request.token, SM_INVALID_CLIENT, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_INVALID_CLIENT,
+                        &[],
+                        None,
+                    )?,
                     None,
                 ));
             }
@@ -162,24 +184,42 @@ fn dispatch_service_manager(
                 "sm:RegisterClient associated process {}",
                 process.process_id()
             );
-            Ok((encode_response(request.token, 0, &[], None)?, None))
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
         }
         1 => {
             if !manager.is_registered() {
                 return Ok((
-                    encode_response(request.token, SM_INVALID_CLIENT, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_INVALID_CLIENT,
+                        &[],
+                        None,
+                    )?,
                     None,
                 ));
             }
             let Some(encoded_name) = request.data.get(..8) else {
                 return Ok((
-                    encode_response(request.token, SM_INVALID_SERVICE_NAME, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_INVALID_SERVICE_NAME,
+                        &[],
+                        None,
+                    )?,
                     None,
                 ));
             };
             let Some(name) = decode_service_name(encoded_name) else {
                 return Ok((
-                    encode_response(request.token, SM_INVALID_SERVICE_NAME, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_INVALID_SERVICE_NAME,
+                        &[],
+                        None,
+                    )?,
                     None,
                 ));
             };
@@ -198,7 +238,12 @@ fn dispatch_service_manager(
                     );
                 }
                 return Ok((
-                    encode_response(request.token, SM_NOT_REGISTERED, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_NOT_REGISTERED,
+                        &[],
+                        None,
+                    )?,
                     None,
                 ));
             };
@@ -207,26 +252,46 @@ fn dispatch_service_manager(
                 Ok(handle) => {
                     log::debug!("sm:GetService returned session handle {handle:#x}");
                     Ok((
-                        encode_response(request.token, 0, &[], Some(handle))?,
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            Some(handle),
+                        )?,
                         Some(handle),
                     ))
                 }
                 Err(error) if error == IpcResultCode::ACCESS_DENIED => Ok((
-                    encode_response(request.token, SM_NOT_ALLOWED, &[], None)?,
+                    encode_response(request.token, HorizonIpcResult::SM_NOT_ALLOWED, &[], None)?,
                     None,
                 )),
                 Err(error) if error == IpcResultCode::RESOURCE_LIMIT => Ok((
-                    encode_response(request.token, SM_OUT_OF_SESSIONS, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_OUT_OF_SESSIONS,
+                        &[],
+                        None,
+                    )?,
                     None,
                 )),
                 Err(_) => Ok((
-                    encode_response(request.token, SM_NOT_REGISTERED, &[], None)?,
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SM_NOT_REGISTERED,
+                        &[],
+                        None,
+                    )?,
                     None,
                 )),
             }
         }
         _ => Ok((
-            encode_response(request.token, SM_NOT_REGISTERED, &[], None)?,
+            encode_response(
+                request.token,
+                HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
+                &[],
+                None,
+            )?,
             None,
         )),
     }
@@ -234,14 +299,14 @@ fn dispatch_service_manager(
 
 fn encode_response(
     token: u32,
-    result: u32,
+    result: HorizonIpcResult,
     data: &[u8],
     move_handle: Option<u32>,
 ) -> Result<Vec<u8>, IpcWireError> {
     let move_handle_storage = move_handle.into_iter().collect::<Vec<_>>();
     CmifResponse {
         token,
-        result,
+        result: result.raw(),
         data,
         move_handles: &move_handle_storage,
         ..CmifResponse::default()
@@ -319,10 +384,6 @@ fn add(address: GuestVirtualAddress, offset: usize) -> Result<GuestVirtualAddres
         .ok_or(IpcWireError::Malformed("guest address overflows"))
 }
 
-const fn make_result(module: u32, description: u32) -> u32 {
-    (module & 0x1ff) | ((description & 0x1fff) << 9)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +398,13 @@ mod tests {
 
     #[test]
     fn response_layout_round_trips_libnx_parser_offsets() {
-        let response = encode_response(7, 0, &0x100_u16.to_le_bytes(), Some(0x44)).unwrap();
+        let response = encode_response(
+            7,
+            HorizonIpcResult::SUCCESS,
+            &0x100_u16.to_le_bytes(),
+            Some(0x44),
+        )
+        .unwrap();
         let word = |offset| u32::from_le_bytes(response[offset..offset + 4].try_into().unwrap());
         assert_eq!(word(4) >> 31, 1);
         assert_eq!(word(8), 1 << 5);
@@ -346,5 +413,16 @@ mod tests {
         assert_eq!(word(24), 0);
         assert_eq!(word(28), 7);
         assert_eq!(&response[32..34], &0x100_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn response_encodes_the_typed_horizon_result_without_translation() {
+        let response =
+            encode_response(0x33, HorizonIpcResult::SM_NOT_REGISTERED, &[], None).unwrap();
+        let word = |offset| u32::from_le_bytes(response[offset..offset + 4].try_into().unwrap());
+
+        assert_eq!(word(16), 0x4f43_4653);
+        assert_eq!(word(24), 0xe15);
+        assert_eq!(word(28), 0x33);
     }
 }

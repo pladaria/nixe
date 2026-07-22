@@ -5,6 +5,7 @@
 
 mod ipc;
 mod ipc_message;
+mod ipc_result;
 mod ipc_wire;
 mod object;
 mod svc;
@@ -14,6 +15,7 @@ pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
+pub use ipc_result::HorizonIpcResult;
 pub use object::{
     DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
     ReadOnlyFileSystem, ServiceManagerSession,
