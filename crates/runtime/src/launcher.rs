@@ -4,13 +4,13 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     BktrPatch, CnmtContentInfo, CnmtContentType, CnmtExtendedHeader, NcaArchive, NcaKeyProvider,
     NcaKeySet, NcaSectionType, RomFsLoader,
 };
-use swiitx_loader_executable::{NpdmLoader, NroLoader, NsoLoader};
-use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
-use swiitx_loader_title::{
+use nixe_loader_executable::{NpdmLoader, NroLoader, NsoLoader};
+use nixe_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
+use nixe_loader_title::{
     ApplicationId, DirectoryScanOptions, PackageMetadata, ResolvedTitle, TitleCatalog, TitleError,
     TitleId, TitleResolver,
 };
@@ -398,7 +398,7 @@ fn build_packaged(
         .iter()
         .filter(|section| section.section_type() == NcaSectionType::Pfs0)
     {
-        let archive = swiitx_loader_content::ExeFsLoader::load_nca_section(section)
+        let archive = nixe_loader_content::ExeFsLoader::load_nca_section(section)
             .map_err(|error| LaunchError::load(LaunchStage::ProgramContent, path, error))?;
         if archive.main().is_some() && archive.main_npdm().is_some() {
             exefs_candidates.push(archive);
@@ -468,7 +468,7 @@ fn build_packaged(
 
 fn load_modules(
     path: &Path,
-    exefs: &swiitx_loader_content::ExeFsArchive,
+    exefs: &nixe_loader_content::ExeFsArchive,
 ) -> Result<(Vec<LaunchModule>, usize, Vec<usize>), LaunchError> {
     let mut candidates = Vec::new();
     let mut roles = BTreeSet::new();

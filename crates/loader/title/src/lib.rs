@@ -21,10 +21,7 @@ pub use inspection::{
     StandaloneNczInspection, TitleInspection, TitleInspector, XciInspection,
     XciPartitionInspection,
 };
-pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
-pub use resolved_title::ResolvedTitle;
-pub use resolver::TitleResolver;
-pub use swiitx_loader_content::{
+pub use nixe_loader_content::{
     AddOnContentRegistrationType, ApplicationControlProperty, ApplicationTitle, ApplicationVersion,
     AppropriateAgeForChina, CnmtContentInfo, CnmtContentMeta, CnmtContentMetaInfo, CnmtContentType,
     CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform, ContentMetaVersion,
@@ -33,3 +30,6 @@ pub use swiitx_loader_content::{
     RuntimeParameterDelivery, ScreenshotPolicy, StartupUserAccount, SupportedLanguages,
     SystemVersion, UserAccountSwitchLock, VideoCapturePolicy,
 };
+pub use package::{ApplicationId, ContentType, PackageMetadata, PackageMetadataError, TitleId};
+pub use resolved_title::ResolvedTitle;
+pub use resolver::TitleResolver;

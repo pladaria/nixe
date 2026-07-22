@@ -3,11 +3,11 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use swiitx_cpu::address::{AddressSpaceId, GuestVirtualAddress};
-use swiitx_cpu::memory::{
+use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
+use nixe_cpu::memory::{
     MemoryPermissions as CpuPermissions, SyntheticInstallStage, SyntheticMemory, SyntheticRamPage,
 };
-use swiitx_loader_executable::{MemoryPermissions as LoaderPermissions, PreparedModule};
+use nixe_loader_executable::{MemoryPermissions as LoaderPermissions, PreparedModule};
 
 /// Stage of a module-memory installation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -270,7 +270,7 @@ fn module_error(
 
 impl ModuleMemoryBackend for SyntheticMemory {
     fn page_size(&self) -> usize {
-        swiitx_cpu::memory::SYNTHETIC_PAGE_SIZE
+        nixe_cpu::memory::SYNTHETIC_PAGE_SIZE
     }
 
     fn install_pages_atomic(

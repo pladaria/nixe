@@ -3,14 +3,14 @@
 use std::env;
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, XciLoader,
 };
-use swiitx_loader_executable::{
+use nixe_loader_executable::{
     ExecutableFormat, ExternalSymbol, NsoLoader, NsoSegmentCompression, PreparationConfig,
     SymbolResolution,
 };
-use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
+use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
 
 fn deterministic_runtime_export(symbol: ExternalSymbol<'_>) -> SymbolResolution {
     let hash = symbol
@@ -23,12 +23,12 @@ fn deterministic_runtime_export(symbol: ExternalSymbol<'_>) -> SymbolResolution 
 }
 
 #[test]
-#[ignore = "requires SWIITX_REAL_PACKAGE and caller-owned keys"]
+#[ignore = "requires NIXE_REAL_PACKAGE and caller-owned keys"]
 fn loads_main_nso_from_real_package() {
-    let package = env::var_os("SWIITX_REAL_PACKAGE")
-        .or_else(|| env::var_os("SWIITX_REAL_NSP"))
-        .expect("set SWIITX_REAL_PACKAGE to an NSP or XCI path");
-    let keys_dir = env::var_os("SWIITX_KEYS_DIR").expect("set SWIITX_KEYS_DIR to a keys directory");
+    let package = env::var_os("NIXE_REAL_PACKAGE")
+        .or_else(|| env::var_os("NIXE_REAL_NSP"))
+        .expect("set NIXE_REAL_PACKAGE to an NSP or XCI path");
+    let keys_dir = env::var_os("NIXE_KEYS_DIR").expect("set NIXE_KEYS_DIR to a keys directory");
     let keys_dir = std::path::PathBuf::from(keys_dir);
     let title_keys = keys_dir.join("title.keys");
     let mut keys = NcaKeySet::from_files(
@@ -85,7 +85,7 @@ fn loads_main_nso_from_real_package() {
         keys.insert_encrypted_title_key(rights_id, encrypted_title_key);
     }
 
-    let require_zbic = env::var_os("SWIITX_REQUIRE_ZBIC").is_some();
+    let require_zbic = env::var_os("NIXE_REQUIRE_ZBIC").is_some();
     let mut failures = Vec::new();
     let mut loaded = 0;
     let mut found_zbic = false;

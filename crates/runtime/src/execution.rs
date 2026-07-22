@@ -4,20 +4,20 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use swiitx_cpu::address::GuestVirtualAddress;
-use swiitx_cpu::decode::{DecodeResult, decode, disassemble};
-use swiitx_cpu::error::InstructionFetchFault;
-use swiitx_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
-use swiitx_cpu::exception::ExceptionKind;
-use swiitx_cpu::interpreter::{
+use nixe_cpu::address::GuestVirtualAddress;
+use nixe_cpu::decode::{DecodeResult, decode, disassemble};
+use nixe_cpu::error::InstructionFetchFault;
+use nixe_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
+use nixe_cpu::exception::ExceptionKind;
+use nixe_cpu::interpreter::{
     InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
 };
-use swiitx_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
-use swiitx_cpu::memory::{InstructionMemory, SyntheticMemory};
-use swiitx_cpu::profile::ProcessCpuContext;
-use swiitx_cpu::state::{RegisterContext, ThreadCpuState};
-use swiitx_cpu::vcpu::VcpuExecutionState;
-use swiitx_cpu::{coverage::CoverageId, memory::DataAccessFault};
+use nixe_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
+use nixe_cpu::memory::{InstructionMemory, SyntheticMemory};
+use nixe_cpu::profile::ProcessCpuContext;
+use nixe_cpu::state::{RegisterContext, ThreadCpuState};
+use nixe_cpu::vcpu::VcpuExecutionState;
+use nixe_cpu::{coverage::CoverageId, memory::DataAccessFault};
 
 use crate::{DiagnosticsPolicy, ExceptionDispatchRequest, ExceptionTerminationScope, ReportDetail};
 
@@ -661,8 +661,8 @@ fn loader_return_observation(
     (state.pc() == return_address.get()).then(|| {
         let source =
             LocationDescriptor::new(return_address, ExecutionState::A64, cpu.profile().id());
-        let result_code = state.read_x(swiitx_cpu::state::a64::A64Register::General(
-            swiitx_cpu::state::a64::A64GeneralRegister::new(0).expect("valid result register"),
+        let result_code = state.read_x(nixe_cpu::state::a64::A64Register::General(
+            nixe_cpu::state::a64::A64GeneralRegister::new(0).expect("valid result register"),
         ));
         (source, result_code)
     })
@@ -680,7 +680,7 @@ pub(crate) fn current_location(
         ),
     };
     LocationDescriptor::new(
-        swiitx_cpu::address::GuestVirtualAddress::new(pc),
+        nixe_cpu::address::GuestVirtualAddress::new(pc),
         execution_state,
         cpu.profile().id(),
     )
@@ -730,7 +730,7 @@ fn fetch_current(
             state.execution_state(),
         ),
     };
-    let address = swiitx_cpu::address::GuestVirtualAddress::new(pc);
+    let address = nixe_cpu::address::GuestVirtualAddress::new(pc);
     let address_space = cpu.address_space_id();
     match execution_state {
         ExecutionState::A64 | ExecutionState::A32 => memory
@@ -739,7 +739,7 @@ fn fetch_current(
         ExecutionState::T32 => {
             let first = memory.fetch16(address_space, address)?;
             if execution_state.instruction_size(first.bits)
-                == swiitx_cpu::location::InstructionSize::Bits16
+                == nixe_cpu::location::InstructionSize::Bits16
             {
                 Ok(InstructionEncoding::from_u16(first.bits))
             } else {

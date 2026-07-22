@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use swiitx_cpu::{
+use nixe_cpu::{
     interpreter::{InterpreterOutcome, execute_one},
     location::{ExecutionState, InstructionEncoding},
     profile::GuestCpuProfile,
@@ -76,7 +76,7 @@ fn run_configuration(configuration: OracleConfiguration) {
     );
 
     for (lhs, rhs) in operands(configuration.state) {
-        let expected = swiitx_adds(configuration.state, lhs, rhs);
+        let expected = nixe_adds(configuration.state, lhs, rhs);
         let observed = qemu_adds(&emulator, &runner, configuration.state, lhs, rhs);
         assert_eq!(
             observed, expected,
@@ -95,7 +95,7 @@ impl TestDirectory {
             .expect("system clock is after the Unix epoch")
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "swiitx-qemu-differential-{}-{state}-{nonce}",
+            "nixe-qemu-differential-{}-{state}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create QEMU differential build directory");
@@ -118,23 +118,23 @@ fn configurations() -> [OracleConfiguration; 3] {
         OracleConfiguration {
             state: ExecutionState::A64,
             compiler_default: "aarch64-linux-gnu-gcc",
-            compiler_environment: "SWIITX_AARCH64_CC",
+            compiler_environment: "NIXE_AARCH64_CC",
             emulator_default: "qemu-aarch64",
-            emulator_environment: "SWIITX_QEMU_AARCH64",
+            emulator_environment: "NIXE_QEMU_AARCH64",
         },
         OracleConfiguration {
             state: ExecutionState::A32,
             compiler_default: "arm-linux-gnueabihf-gcc",
-            compiler_environment: "SWIITX_ARM_CC",
+            compiler_environment: "NIXE_ARM_CC",
             emulator_default: "qemu-arm",
-            emulator_environment: "SWIITX_QEMU_ARM",
+            emulator_environment: "NIXE_QEMU_ARM",
         },
         OracleConfiguration {
             state: ExecutionState::T32,
             compiler_default: "arm-linux-gnueabihf-gcc",
-            compiler_environment: "SWIITX_ARM_CC",
+            compiler_environment: "NIXE_ARM_CC",
             emulator_default: "qemu-arm",
-            emulator_environment: "SWIITX_QEMU_ARM",
+            emulator_environment: "NIXE_QEMU_ARM",
         },
     ]
 }
@@ -228,7 +228,7 @@ fn qemu_adds(
     )
 }
 
-fn swiitx_adds(state: ExecutionState, lhs: u64, rhs: u64) -> (u64, u32) {
+fn nixe_adds(state: ExecutionState, lhs: u64, rhs: u64) -> (u64, u32) {
     let profile = GuestCpuProfile::switch_1();
     let (mut state, encoding) = match state {
         ExecutionState::A64 => {
@@ -259,7 +259,7 @@ fn swiitx_adds(state: ExecutionState, lhs: u64, rhs: u64) -> (u64, u32) {
             )
         }
     };
-    let outcome = execute_one(&profile, &mut state, encoding).expect("Swiitx implements ADDS");
+    let outcome = execute_one(&profile, &mut state, encoding).expect("Nixe implements ADDS");
     assert!(matches!(outcome, InterpreterOutcome::Resume(_)));
     match state {
         ThreadCpuState::A64(cpu) => (cpu.read_x(x(0)), cpu.nzcv().bits()),

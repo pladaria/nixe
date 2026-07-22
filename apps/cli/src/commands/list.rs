@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use swiitx_cli::library::Library;
+use nixe_cli::library::Library;
 
 use super::load_config;
 

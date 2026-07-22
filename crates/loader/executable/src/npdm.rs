@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 const META_SIZE: usize = 0x80;
 const ACI0_HEADER_SIZE: usize = 0x40;

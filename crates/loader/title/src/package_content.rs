@@ -1,11 +1,11 @@
 //! Container-independent access to canonical package metadata and Control content.
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     CnmtContentMeta, CnmtContentType, CnmtExtendedHeader, CnmtLoader, Hfs0Archive, NacpLanguage,
     NacpLoader, NcaContentType, NcaKeyProvider, NcaKeySet, NcaLoader, NcaSectionType, NspArchive,
     NszArchive, Pfs0Loader, RomFsLoader, XczPartition,
 };
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::{ContentType, PackageFormat, PackageMetadata};
 use crate::{ControlIcon, ControlMetadata};
@@ -367,22 +367,22 @@ fn hex(bytes: &[u8]) -> String {
 
 pub(crate) fn open_canonical_content(
     package: &PackageMetadata,
-    content: &swiitx_loader_content::CnmtContentInfo,
+    content: &nixe_loader_content::CnmtContentInfo,
     format: PackageFormat,
     keys: Option<&dyn NcaKeyProvider>,
-) -> Result<swiitx_loader_content::NcaArchive, LoadError> {
+) -> Result<nixe_loader_content::NcaArchive, LoadError> {
     let expected_name = format!("{}.nca", hex(&content.content_id));
     let storage = match format {
         PackageFormat::Nsp => {
-            let archive = swiitx_loader_content::NspLoader::load(package.source.clone())?;
+            let archive = nixe_loader_content::NspLoader::load(package.source.clone())?;
             open_canonical_entry(&archive, &expected_name, content.size)?
         }
         PackageFormat::Nsz => {
-            let archive = swiitx_loader_content::NszLoader::load(package.source.clone())?;
+            let archive = nixe_loader_content::NszLoader::load(package.source.clone())?;
             open_canonical_entry(&archive, &expected_name, content.size)?
         }
         PackageFormat::Xci => {
-            let archive = swiitx_loader_content::XciLoader::load(package.source.clone())?;
+            let archive = nixe_loader_content::XciLoader::load(package.source.clone())?;
             open_canonical_entry(
                 archive.secure_partition()?.archive(),
                 &expected_name,
@@ -390,7 +390,7 @@ pub(crate) fn open_canonical_content(
             )?
         }
         PackageFormat::Xcz => {
-            let archive = swiitx_loader_content::XczLoader::load(package.source.clone())?;
+            let archive = nixe_loader_content::XczLoader::load(package.source.clone())?;
             open_canonical_entry(archive.secure_partition()?, &expected_name, content.size)?
         }
     };

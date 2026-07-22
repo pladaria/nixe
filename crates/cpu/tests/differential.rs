@@ -2,8 +2,7 @@ mod support;
 
 use std::num::NonZeroU32;
 
-use support::ir_evaluator::{IrReferenceEvaluator, ReferenceOutcome};
-use swiitx_cpu::{
+use nixe_cpu::{
     address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     interpreter::{InterpreterContext, InterpreterOutcome, execute_one_with_context},
     ir::terminator::ExceptionKind,
@@ -20,6 +19,7 @@ use swiitx_cpu::{
     },
     translate::{BlockTranslationConfig, translate_block},
 };
+use support::ir_evaluator::{IrReferenceEvaluator, ReferenceOutcome};
 
 const ADDRESS_SPACE: AddressSpaceId = AddressSpaceId::new(0x4449_4646);
 const CODE_BASE: u64 = 0x1000;

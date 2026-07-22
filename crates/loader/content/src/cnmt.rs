@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 use crate::version::{
     ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
@@ -580,7 +580,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

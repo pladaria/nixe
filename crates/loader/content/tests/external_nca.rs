@@ -2,17 +2,17 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     CnmtLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, Pfs0Loader,
 };
-use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
+use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
 
 #[test]
 #[ignore = "requires caller-owned NSP and key files"]
 fn opens_and_validates_caller_owned_nsp() {
-    let nsp_path = required_path("SWIITX_TEST_NSP");
-    let prod_keys = required_path("SWIITX_PROD_KEYS");
-    let title_keys = env::var_os("SWIITX_TITLE_KEYS").map(PathBuf::from);
+    let nsp_path = required_path("NIXE_TEST_NSP");
+    let prod_keys = required_path("NIXE_PROD_KEYS");
+    let title_keys = env::var_os("NIXE_TITLE_KEYS").map(PathBuf::from);
     let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref()).unwrap();
 
     let nsp_storage: StorageRef = Arc::new(FileStorage::open(&nsp_path).unwrap());

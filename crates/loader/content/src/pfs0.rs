@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use swiitx_loader_storage::FormatLoader;
-use swiitx_loader_storage::{LoadError, StorageRef, SubStorage};
+use nixe_loader_storage::FormatLoader;
+use nixe_loader_storage::{LoadError, StorageRef, SubStorage};
 
 const HEADER_SIZE: u64 = 0x10;
 const ENTRY_SIZE: u64 = 0x18;

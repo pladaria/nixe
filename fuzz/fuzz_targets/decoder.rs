@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use libfuzzer_sys::fuzz_target;
-use swiitx_cpu::{
+use nixe_cpu::{
     address::GuestVirtualAddress,
     decode::{self, DecodeResult, OperandValue},
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},

@@ -197,6 +197,100 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "nixe-cli"
+version = "0.1.0"
+dependencies = [
+ "nixe-config",
+ "nixe-horizon",
+ "nixe-loader-content",
+ "nixe-loader-executable",
+ "nixe-loader-storage",
+ "nixe-loader-title",
+ "nixe-runtime",
+ "sha2",
+]
+
+[[package]]
+name = "nixe-config"
+version = "0.1.0"
+dependencies = [
+ "nixe-loader-title",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "nixe-cpu"
+version = "0.1.0"
+
+[[package]]
+name = "nixe-horizon"
+version = "0.1.0"
+dependencies = [
+ "nixe-cpu",
+ "nixe-loader-storage",
+ "nixe-loader-title",
+ "nixe-runtime",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "nixe-loader-content"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "nixe-loader-storage",
+ "sha2",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
+name = "nixe-loader-executable"
+version = "0.1.0"
+dependencies = [
+ "lz4_flex",
+ "nixe-loader-content",
+ "nixe-loader-storage",
+ "ruzstd-zbic",
+]
+
+[[package]]
+name = "nixe-loader-storage"
+version = "0.1.0"
+
+[[package]]
+name = "nixe-loader-title"
+version = "0.1.0"
+dependencies = [
+ "nixe-loader-content",
+ "nixe-loader-executable",
+ "nixe-loader-storage",
+ "sha2",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
+name = "nixe-runtime"
+version = "0.1.0"
+dependencies = [
+ "nixe-config",
+ "nixe-cpu",
+ "nixe-loader-content",
+ "nixe-loader-executable",
+ "nixe-loader-storage",
+ "nixe-loader-title",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "nixe-xtask"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,100 +401,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "swiitx-cli"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "swiitx-config",
- "swiitx-horizon",
- "swiitx-loader-content",
- "swiitx-loader-executable",
- "swiitx-loader-storage",
- "swiitx-loader-title",
- "swiitx-runtime",
-]
-
-[[package]]
-name = "swiitx-config"
-version = "0.1.0"
-dependencies = [
- "serde",
- "swiitx-loader-title",
- "toml",
-]
-
-[[package]]
-name = "swiitx-cpu"
-version = "0.1.0"
-
-[[package]]
-name = "swiitx-horizon"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "swiitx-cpu",
- "swiitx-loader-storage",
- "swiitx-loader-title",
- "swiitx-runtime",
- "tempfile",
-]
-
-[[package]]
-name = "swiitx-loader-content"
-version = "0.1.0"
-dependencies = [
- "aes",
- "sha2",
- "swiitx-loader-storage",
- "tempfile",
- "zstd",
-]
-
-[[package]]
-name = "swiitx-loader-executable"
-version = "0.1.0"
-dependencies = [
- "lz4_flex",
- "ruzstd-zbic",
- "swiitx-loader-content",
- "swiitx-loader-storage",
-]
-
-[[package]]
-name = "swiitx-loader-storage"
-version = "0.1.0"
-
-[[package]]
-name = "swiitx-loader-title"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "swiitx-loader-content",
- "swiitx-loader-executable",
- "swiitx-loader-storage",
- "tempfile",
- "zstd",
-]
-
-[[package]]
-name = "swiitx-runtime"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "swiitx-config",
- "swiitx-cpu",
- "swiitx-loader-content",
- "swiitx-loader-executable",
- "swiitx-loader-storage",
- "swiitx-loader-title",
- "tempfile",
-]
-
-[[package]]
-name = "swiitx-xtask"
-version = "0.1.0"
 
 [[package]]
 name = "syn"

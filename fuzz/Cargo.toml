@@ -1,5 +1,5 @@
 [package]
-name = "swiitx-cpu-fuzz"
+name = "nixe-cpu-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-swiitx-cpu = { path = "../crates/cpu" }
+nixe-cpu = { path = "../crates/cpu" }
 
 [[bin]]
 name = "decoder"

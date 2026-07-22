@@ -1,5 +1,5 @@
 [package]
-name = "swiitx-loader-executable"
+name = "nixe-loader-executable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 lz4_flex.workspace = true
 ruzstd-zbic.workspace = true
-swiitx-loader-storage.workspace = true
+nixe-loader-storage.workspace = true
 
 [dev-dependencies]
-swiitx-loader-content.workspace = true
+nixe-loader-content.workspace = true

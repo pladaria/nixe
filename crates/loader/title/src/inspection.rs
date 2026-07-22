@@ -5,14 +5,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ApplicationVersion, CnmtContentMeta, CnmtMetaType, ContentMetaVersion,
     DecodedContentMetaVersion, NcaContentType, NcaDistributionType, NcaEncryptionType,
     NcaFormatVersion, NcaKeySet, NcaLoader, NcaSectionType, NczCompressionKind, NczLoader,
     NspLoader, NszLoader, SystemVersion, XciHeader, XciLoader, XciPartitionKind, XczLoader,
 };
-use swiitx_loader_executable::{NroLoader, NroRange};
-use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
+use nixe_loader_executable::{NroLoader, NroRange};
+use nixe_loader_storage::{FileStorage, FormatLoader, LoadError, Storage, StorageRef};
 
 const MAX_AUXILIARY_METADATA_SIZE: u64 = 1024 * 1024;
 
@@ -646,11 +646,11 @@ fn inspect_nro(path: &Path) -> Result<NroInspection, InspectError> {
             let permissions = segment.permissions();
             NroSegmentInspection {
                 kind: match segment.kind() {
-                    swiitx_loader_executable::ExecutableSegmentKind::Text => NroSegmentKind::Text,
-                    swiitx_loader_executable::ExecutableSegmentKind::ReadOnly => {
+                    nixe_loader_executable::ExecutableSegmentKind::Text => NroSegmentKind::Text,
+                    nixe_loader_executable::ExecutableSegmentKind::ReadOnly => {
                         NroSegmentKind::ReadOnly
                     }
-                    swiitx_loader_executable::ExecutableSegmentKind::Data => NroSegmentKind::Data,
+                    nixe_loader_executable::ExecutableSegmentKind::Data => NroSegmentKind::Data,
                 },
                 memory_offset: segment.memory_offset(),
                 file_size: segment.file_size(),
@@ -1207,7 +1207,7 @@ fn inspect_standalone_ncz(
 fn inspect_entry_nca(
     storage: Result<StorageRef, LoadError>,
     kind: EntryKind,
-    keys: Option<&dyn swiitx_loader_content::NcaKeyProvider>,
+    keys: Option<&dyn nixe_loader_content::NcaKeyProvider>,
 ) -> (Option<NcaInspection>, Option<String>) {
     if !matches!(
         kind,
@@ -1225,7 +1225,7 @@ fn inspect_entry_nca(
     }
 }
 
-fn inspect_ncz_metadata(archive: &swiitx_loader_content::NczArchive) -> NczInspection {
+fn inspect_ncz_metadata(archive: &nixe_loader_content::NczArchive) -> NczInspection {
     NczInspection {
         compression: archive.compression_kind(),
         logical_size: archive.logical_size(),
@@ -1253,7 +1253,7 @@ fn inspect_canonical_metadata<C: PackageContent + ?Sized>(
     }
 }
 
-fn inspect_nca(archive: &swiitx_loader_content::NcaArchive) -> NcaInspection {
+fn inspect_nca(archive: &nixe_loader_content::NcaArchive) -> NcaInspection {
     let header = archive.header();
     NcaInspection {
         format_version: header.version(),
@@ -1424,8 +1424,8 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    use nixe_loader_storage::{StorageError, StorageRef};
     use sha2::{Digest, Sha256};
-    use swiitx_loader_storage::{StorageError, StorageRef};
 
     use super::*;
 
@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(metadata.title_id, 0x0100_1234_5678_9000);
         assert_eq!(
             metadata.content_meta_type,
-            swiitx_loader_content::CnmtMetaType::Application
+            nixe_loader_content::CnmtMetaType::Application
         );
         assert_eq!(metadata.contents.len(), 1);
     }
@@ -1738,14 +1738,14 @@ mod tests {
 
         let title = control
             .nacp
-            .title(swiitx_loader_content::NacpLanguage::AmericanEnglish);
+            .title(nixe_loader_content::NacpLanguage::AmericanEnglish);
         assert_eq!(title.name, "Synthetic title");
         assert_eq!(title.publisher, "Synthetic publisher");
         assert_eq!(control.nacp.display_version, "1.2.3");
         assert_eq!(control.icons().len(), 1);
         assert_eq!(
             control.icons()[0].language,
-            swiitx_loader_content::NacpLanguage::AmericanEnglish
+            nixe_loader_content::NacpLanguage::AmericanEnglish
         );
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
         assert_eq!(
             control
                 .nacp
-                .title(swiitx_loader_content::NacpLanguage::AmericanEnglish)
+                .title(nixe_loader_content::NacpLanguage::AmericanEnglish)
                 .name,
             "Synthetic title"
         );
@@ -1867,7 +1867,7 @@ mod tests {
     fn build_control_nca(title_id: u64) -> Vec<u8> {
         const SECTION_OFFSET: usize = 0xC00;
         const BLOCK_SIZE: usize = 0x10000;
-        let mut nacp = vec![0_u8; swiitx_loader_content::NACP_SIZE];
+        let mut nacp = vec![0_u8; nixe_loader_content::NACP_SIZE];
         nacp[.."Synthetic title".len()].copy_from_slice(b"Synthetic title");
         nacp[0x200..0x200 + "Synthetic publisher".len()].copy_from_slice(b"Synthetic publisher");
         nacp[0x302C..0x3030].copy_from_slice(&1_u32.to_le_bytes());
@@ -2000,7 +2000,7 @@ mod tests {
         nca
     }
 
-    fn load_synthetic_nsp(meta_nca: Vec<u8>) -> swiitx_loader_content::NspArchive {
+    fn load_synthetic_nsp(meta_nca: Vec<u8>) -> nixe_loader_content::NspArchive {
         let nsp_bytes = build_pfs0(&[("meta.cnmt.nca", &meta_nca)]);
         let storage: StorageRef = Arc::new(VecStorage(nsp_bytes));
         NspLoader::load(storage).unwrap()

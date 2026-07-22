@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
 use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, ExecutableSegmentKind, MemoryPermissions,
@@ -551,7 +551,7 @@ fn invalid(reason: impl Into<String>) -> LoadError {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

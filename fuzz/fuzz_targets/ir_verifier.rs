@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use swiitx_cpu::{
+use nixe_cpu::{
     address::{CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
     ir::{
         block::{BlockExit, BlockExitKind, BlockMetadata, InstructionSource, IrBlock},

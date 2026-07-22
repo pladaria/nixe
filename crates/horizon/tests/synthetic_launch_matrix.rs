@@ -2,10 +2,10 @@ mod support;
 
 use std::fs;
 
-use swiitx_horizon::{
+use nixe_horizon::{
     DirectoryEntryKind, HorizonProcess, IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
-use swiitx_runtime::{
+use nixe_runtime::{
     LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, ProcessBuilder,
 };
 
@@ -209,7 +209,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
     let _ = process.teardown();
 }
 
-fn exercise_read_only_ipc(process: &mut swiitx_runtime::RunnableProcess) {
+fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
     let filesystem_session = process.connect_ipc_service(IpcService::FileSystem).unwrap();
     let IpcResponse::Handle(primary) = process
         .dispatch_ipc(filesystem_session, IpcRequest::OpenPrimaryFileSystem)

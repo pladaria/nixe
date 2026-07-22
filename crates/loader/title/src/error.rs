@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use swiitx_loader_storage::LoadError;
+use nixe_loader_storage::LoadError;
 
 use crate::{ApplicationId, ApplicationVersion, ContentType, PackageMetadataError, TitleId};
 

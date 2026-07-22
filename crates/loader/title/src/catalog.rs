@@ -3,10 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use swiitx_loader_content::{
+use nixe_loader_content::{
     CnmtContentMeta, NcaKeyProvider, NcaKeySet, NspLoader, NszLoader, XciLoader, XczLoader,
 };
-use swiitx_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
+use nixe_loader_storage::{FileStorage, FormatLoader, LoadError, StorageRef};
 
 use crate::discovery::{directory_files, package_format};
 use crate::package_content::{
@@ -272,9 +272,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nixe_loader_content::{CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform};
+    use nixe_loader_storage::{Storage, StorageError};
     use sha2::{Digest, Sha256};
-    use swiitx_loader_content::{CnmtExtendedHeader, CnmtInstallType, CnmtMetaType, CnmtPlatform};
-    use swiitx_loader_storage::{Storage, StorageError};
 
     use super::*;
     use crate::{ContentType, TitleResolver};
@@ -290,7 +290,7 @@ mod tests {
         fn new() -> Self {
             let sequence = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "swiitx-title-catalog-{}-{sequence}",
+                "nixe-title-catalog-{}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();

@@ -1,9 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use swiitx_loader_storage::{
-    FormatLoader, LoadError, Storage, StorageError, StorageRef, SubStorage,
-};
+use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef, SubStorage};
 
 use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, ExecutableSegmentKind, MemoryPermissions,

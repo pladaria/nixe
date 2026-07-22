@@ -1,5 +1,5 @@
+use nixe_loader_storage::{LoadError, StorageRef};
 use sha2::{Digest, Sha256};
-use swiitx_loader_storage::{LoadError, StorageRef};
 
 const HASH_SIZE: u64 = 0x20;
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;

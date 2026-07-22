@@ -544,7 +544,7 @@ impl MissingInstructionTracker {
     pub fn export_sanitized(&self) -> String {
         use fmt::Write;
 
-        let mut output = String::from("swiitx-missing-instructions-v1\n");
+        let mut output = String::from("nixe-missing-instructions-v1\n");
         writeln!(
             output,
             "unique={} observations={}",
@@ -574,7 +574,7 @@ impl MissingInstructionTracker {
     pub fn export_detailed(&self) -> String {
         use fmt::Write;
 
-        let mut output = String::from("swiitx-missing-instructions-detailed-v1\n");
+        let mut output = String::from("nixe-missing-instructions-detailed-v1\n");
         writeln!(
             output,
             "unique={} observations={}",
@@ -969,7 +969,7 @@ mod tests {
         assert!(tracker.config().captures_surrounding_instruction_bytes());
         tracker.record(observation(0x1000, &[0xde, 0xad, 0xbe, 0xef]));
         let export = tracker.export();
-        assert!(export.starts_with("swiitx-missing-instructions-detailed-v1"));
+        assert!(export.starts_with("nixe-missing-instructions-detailed-v1"));
         assert!(export.contains("context=deadbeef"));
     }
 

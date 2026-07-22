@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use swiitx_cpu::{
+use nixe_cpu::{
     address::{AddressSpaceId, GuestVirtualAddress},
     ir::{
         block::IrBlock,
@@ -182,10 +182,10 @@ impl<'a> IrReferenceEvaluator<'a> {
                 let width = integer_width(lhs.ty)?;
                 let (result, carry, overflow) = add_with_carry(lhs.bits, rhs.bits, carry_in, width);
                 let mut results = vec![RuntimeValue::new(lhs.ty, result)];
-                if flags != swiitx_cpu::ir::op::ArithmeticFlagOutput::None {
+                if flags != nixe_cpu::ir::op::ArithmeticFlagOutput::None {
                     results.push(RuntimeValue::boolean(carry));
                 }
-                if flags == swiitx_cpu::ir::op::ArithmeticFlagOutput::CarryAndOverflow {
+                if flags == nixe_cpu::ir::op::ArithmeticFlagOutput::CarryAndOverflow {
                     results.push(RuntimeValue::boolean(overflow));
                 }
                 Ok(results)
@@ -334,8 +334,8 @@ impl<'a> IrReferenceEvaluator<'a> {
             AddressOperation::FromInteger { value, width } => {
                 let value = self.operand(value)?.bits;
                 match width {
-                    swiitx_cpu::ir::op::GuestAddressWidth::Bits32 => value as u32 as u64,
-                    swiitx_cpu::ir::op::GuestAddressWidth::Bits64 => value as u64,
+                    nixe_cpu::ir::op::GuestAddressWidth::Bits32 => value as u32 as u64,
+                    nixe_cpu::ir::op::GuestAddressWidth::Bits64 => value as u64,
                 }
             }
             AddressOperation::Offset {
@@ -346,10 +346,10 @@ impl<'a> IrReferenceEvaluator<'a> {
                 let base = self.operand(base)?.bits as u64;
                 let offset = self.operand(offset)?.bits as u64;
                 match width {
-                    swiitx_cpu::ir::op::GuestAddressWidth::Bits32 => {
+                    nixe_cpu::ir::op::GuestAddressWidth::Bits32 => {
                         u64::from((base as u32).wrapping_add(offset as u32))
                     }
-                    swiitx_cpu::ir::op::GuestAddressWidth::Bits64 => base.wrapping_add(offset),
+                    nixe_cpu::ir::op::GuestAddressWidth::Bits64 => base.wrapping_add(offset),
                 }
             }
             AddressOperation::ToInteger { address, to } => {
@@ -398,7 +398,7 @@ impl<'a> IrReferenceEvaluator<'a> {
             } => {
                 let packed = self.operand(flags)?.bits as u32;
                 let encoding = self.operand(condition)?.bits as u8;
-                let condition = swiitx_cpu::ir::op::Condition::from_encoding(encoding);
+                let condition = nixe_cpu::ir::op::Condition::from_encoding(encoding);
                 let result = if nv_is_unconditional {
                     evaluate_a64(condition, packed)
                 } else {

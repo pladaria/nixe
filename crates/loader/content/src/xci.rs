@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 use sha2::{Digest, Sha256};
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
 use crate::{Hfs0Archive, Hfs0Entry, Hfs0HashResult, Hfs0Loader};
 
@@ -438,8 +438,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use std::sync::Arc;
 
+    use nixe_loader_storage::{Storage, StorageError};
     use sha2::{Digest, Sha256};
-    use swiitx_loader_storage::{Storage, StorageError};
 
     use super::*;
 

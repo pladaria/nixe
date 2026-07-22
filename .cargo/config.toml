@@ -1,12 +1,12 @@
 [alias]
-cli = ["run", "--package", "swiitx-cli", "--"]
+cli = ["run", "--package", "nixe-cli", "--"]
 fmt-check = ["fmt", "--all", "--", "--check"]
 lint = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 test-all = ["test", "--workspace"]
 test-diff = [
     "test",
     "--package",
-    "swiitx-cpu",
+    "nixe-cpu",
     "--test",
     "differential",
     "--test",
@@ -15,4 +15,4 @@ test-diff = [
     "--include-ignored",
     "--nocapture",
 ]
-fuzz-all = ["run", "--quiet", "--package", "swiitx-xtask", "--", "fuzz"]
+fuzz-all = ["run", "--quiet", "--package", "nixe-xtask", "--", "fuzz"]

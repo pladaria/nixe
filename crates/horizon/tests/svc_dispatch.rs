@@ -1,18 +1,18 @@
 use std::fs;
 
-use swiitx_cpu::location::ExecutionState;
-use swiitx_cpu::memory::{
+use nixe_cpu::location::ExecutionState;
+use nixe_cpu::memory::{
     CpuMemory, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingPurpose,
     MemoryPermissions, MemoryValue,
 };
-use swiitx_cpu::state::ThreadCpuState;
-use swiitx_cpu::state::a32::A32GeneralRegister;
-use swiitx_cpu::state::a64::{A64GeneralRegister, A64Register};
-use swiitx_horizon::{
+use nixe_cpu::state::ThreadCpuState;
+use nixe_cpu::state::a32::A32GeneralRegister;
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonSvcDispatcher,
     HorizonSvcFault, HorizonSvcSupport,
 };
-use swiitx_runtime::{
+use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
     Launcher, LauncherInput, ProcessBuilder, ProcessExecutionError, ProcessExecutionStatus,
     ProcessExitCause, ReadableEventObject, RunnableProcess, SessionObject, WritableEventObject,
@@ -95,8 +95,8 @@ fn fixture_process_for_state(
         ExecutionState::A64 => state(&mut process).set_pc(test_entry),
         ExecutionState::A32 | ExecutionState::T32 => {
             let mut state = match execution_state {
-                ExecutionState::A32 => swiitx_cpu::state::A32State::a32(),
-                ExecutionState::T32 => swiitx_cpu::state::A32State::t32(),
+                ExecutionState::A32 => nixe_cpu::state::A32State::a32(),
+                ExecutionState::T32 => nixe_cpu::state::A32State::t32(),
                 ExecutionState::A64 => unreachable!(),
             };
             state
@@ -112,7 +112,7 @@ fn x(index: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(index).unwrap())
 }
 
-fn state(process: &mut RunnableProcess) -> &mut swiitx_cpu::state::A64State {
+fn state(process: &mut RunnableProcess) -> &mut nixe_cpu::state::A64State {
     let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
         panic!("homebrew process must use A64")
     };
@@ -236,7 +236,7 @@ fn blocking_wait_suspends_and_retries_in_each_execution_state() {
         // The fixture swaps a Homebrew A64 thread for A32/T32 architectural
         // states; use its low writable data mapping rather than the genuine
         // 64-bit Homebrew stack region for the AArch32 pointer ABI.
-        let handles_address = swiitx_cpu::address::GuestVirtualAddress::new(
+        let handles_address = nixe_cpu::address::GuestVirtualAddress::new(
             process.entry_module().image_base() + 0x2000,
         );
         let (writable, readable) = EventObject::create_pair();
@@ -430,7 +430,7 @@ fn unsignalled_wait_times_out_or_suspends_without_becoming_a_no_op() {
     );
     assert_eq!(
         process.execution_status(),
-        swiitx_runtime::ProcessExecutionStatus::Suspended
+        nixe_runtime::ProcessExecutionStatus::Suspended
     );
 }
 
@@ -665,16 +665,14 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
         .query_memory(
             process.cpu_context().address_space_id(),
             layout.heap().base(),
-            swiitx_cpu::address::GuestVirtualAddress::new(
-                process.address_space().exclusive_limit(),
-            ),
+            nixe_cpu::address::GuestVirtualAddress::new(process.address_space().exclusive_limit()),
         )
         .unwrap();
     assert_eq!(heap.size, 0x20_0000);
     assert_eq!(heap.purpose, MemoryMappingPurpose::Heap);
 
     let code =
-        swiitx_cpu::address::GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
+        nixe_cpu::address::GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
     state(&mut process).write_x(x(0), code.get());
     state(&mut process).write_x(x(1), 0x1000);
     state(&mut process).write_w(x(2), 1);

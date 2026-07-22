@@ -5,11 +5,11 @@
 //! execution loop applies. Neither side assumes that the source was the
 //! reference interpreter, frontend IR, or a native block.
 
-use swiitx_cpu::{
+use nixe_cpu::{
     exception::ExceptionKind,
     location::{ExecutionState, LocationDescriptor},
 };
-use swiitx_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
+use nixe_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
 
 use crate::{
     HandleTable, ProcessExecutionStatus, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
@@ -429,7 +429,7 @@ pub trait ExceptionDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use swiitx_cpu::{
+    use nixe_cpu::{
         address::GuestVirtualAddress,
         exception::ExceptionKind,
         location::{ExecutionState, LocationDescriptor},

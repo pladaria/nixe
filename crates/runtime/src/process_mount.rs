@@ -1,7 +1,7 @@
 //! Process-local read-only filesystem namespace derived from a launch plan.
 
-use swiitx_loader_executable::{EffectiveNpdmPolicy, FileSystemPermissions};
-use swiitx_loader_title::TitleId;
+use nixe_loader_executable::{EffectiveNpdmPolicy, FileSystemPermissions};
+use nixe_loader_title::TitleId;
 
 use crate::{AddOnContent, LaunchPlan, ReadOnlyMount};
 

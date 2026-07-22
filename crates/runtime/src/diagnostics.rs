@@ -1,6 +1,6 @@
 //! Runtime-owned diagnostic policy and subsystem-specific views.
 
-use swiitx_cpu::coverage::{CpuDiagnosticsConfig, MissingInstructionReportDetail};
+use nixe_cpu::coverage::{CpuDiagnosticsConfig, MissingInstructionReportDetail};
 
 /// Amount of diagnostic context retained across emulator subsystems.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -54,12 +54,12 @@ impl Default for DiagnosticsPolicy {
     }
 }
 
-impl From<swiitx_config::DiagnosticsConfig> for DiagnosticsPolicy {
-    fn from(config: swiitx_config::DiagnosticsConfig) -> Self {
+impl From<nixe_config::DiagnosticsConfig> for DiagnosticsPolicy {
+    fn from(config: nixe_config::DiagnosticsConfig) -> Self {
         Self {
             report_detail: match config.report_detail {
-                swiitx_config::DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
-                swiitx_config::DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
+                nixe_config::DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
+                nixe_config::DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
             },
             instruction_trace: config.instruction_trace,
             ..Self::default()
@@ -104,8 +104,8 @@ mod tests {
 
     #[test]
     fn runtime_normalizes_the_application_configuration() {
-        let policy = DiagnosticsPolicy::from(swiitx_config::DiagnosticsConfig {
-            report_detail: swiitx_config::DiagnosticReportDetail::Sanitized,
+        let policy = DiagnosticsPolicy::from(nixe_config::DiagnosticsConfig {
+            report_detail: nixe_config::DiagnosticReportDetail::Sanitized,
             instruction_trace: true,
         });
         assert_eq!(policy.report_detail, ReportDetail::Sanitized);

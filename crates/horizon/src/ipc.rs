@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use swiitx_loader_title::TitleId;
+use nixe_loader_title::TitleId;
 
-use swiitx_runtime::{HandleTable, ProcessMountNamespace, RunnableProcess};
+use nixe_runtime::{HandleTable, ProcessMountNamespace, RunnableProcess};
 
 use crate::{
     DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
@@ -313,7 +313,7 @@ fn dispatch_directory(
 
 fn insert_handle<T>(handles: &mut HandleTable, object: T) -> Result<IpcResponse, IpcResultCode>
 where
-    T: swiitx_runtime::HandleValue,
+    T: nixe_runtime::HandleValue,
 {
     handles
         .insert(object)

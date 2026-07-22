@@ -1,7 +1,7 @@
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ApplicationControlProperty, CnmtContentInfo, NacpLanguage, SupportedLanguages,
 };
-use swiitx_loader_storage::{LoadError, StorageRef};
+use nixe_loader_storage::{LoadError, StorageRef};
 
 const MAX_ICON_SIZE: u64 = 16 * 1024 * 1024;
 

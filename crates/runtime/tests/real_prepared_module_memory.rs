@@ -5,20 +5,20 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use swiitx_cpu::address::{AddressSpaceId, GuestVirtualAddress};
-use swiitx_cpu::memory::{
+use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
+use nixe_cpu::memory::{
     CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
     MemoryPermissions as CpuPermissions, MemoryValue, SYNTHETIC_PAGE_SIZE, SyntheticMemory,
 };
-use swiitx_loader_content::{
+use nixe_loader_content::{
     ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, XciLoader,
 };
-use swiitx_loader_executable::{
+use nixe_loader_executable::{
     ExternalSymbol, MemoryPermissions as LoaderPermissions, NsoLoader, PreparationConfig,
     PreparedModule, SymbolResolution,
 };
-use swiitx_loader_storage::{FileStorage, FormatLoader, StorageRef};
-use swiitx_runtime::install_prepared_module;
+use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
+use nixe_runtime::install_prepared_module;
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(0x100);
 
@@ -232,14 +232,13 @@ fn verify_module(memory: &SyntheticMemory, module: &PreparedModule, pages: &mut 
 }
 
 #[test]
-#[ignore = "requires SWIITX_REAL_PACKAGE and caller-owned keys"]
+#[ignore = "requires NIXE_REAL_PACKAGE and caller-owned keys"]
 fn installs_real_main_and_dependency_into_runtime_memory() {
-    let package = env::var_os("SWIITX_REAL_PACKAGE")
-        .or_else(|| env::var_os("SWIITX_REAL_NSP"))
-        .expect("set SWIITX_REAL_PACKAGE to an NSP or XCI path");
-    let keys_dir = PathBuf::from(
-        env::var_os("SWIITX_KEYS_DIR").expect("set SWIITX_KEYS_DIR to a keys directory"),
-    );
+    let package = env::var_os("NIXE_REAL_PACKAGE")
+        .or_else(|| env::var_os("NIXE_REAL_NSP"))
+        .expect("set NIXE_REAL_PACKAGE to an NSP or XCI path");
+    let keys_dir =
+        PathBuf::from(env::var_os("NIXE_KEYS_DIR").expect("set NIXE_KEYS_DIR to a keys directory"));
     let entries = package_entries(Path::new(&package));
     let keys = load_keys(&keys_dir, &entries);
     let (main, dependency) = prepare_modules(&entries, &keys);

@@ -1495,7 +1495,7 @@ fn read_i64(bytes: &[u8], offset: usize) -> i64 {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
+    use nixe_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
 
     use super::*;
     use crate::{ExecutableSegmentKind, MemoryPermissions, NroLoader, NsoLoader};

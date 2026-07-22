@@ -3,8 +3,8 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
 
-use swiitx_loader_storage::StorageRef;
-use swiitx_runtime::ReadOnlyMount;
+use nixe_loader_storage::StorageRef;
+use nixe_runtime::ReadOnlyMount;
 
 use crate::IpcService;
 

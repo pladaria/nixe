@@ -113,7 +113,7 @@ impl BlockTranslationReport {
     pub fn print(&self) -> String {
         use core::fmt::Write;
 
-        let mut output = String::from("swiitx-frontend-block-report-v1\n");
+        let mut output = String::from("nixe-frontend-block-report-v1\n");
         match self {
             Self::Translated(block) => {
                 writeln!(

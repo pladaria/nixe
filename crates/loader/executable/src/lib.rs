@@ -7,7 +7,7 @@ mod preparation;
 
 use std::fmt::{Debug, Formatter};
 
-use swiitx_loader_storage::StorageRef;
+use nixe_loader_storage::StorageRef;
 
 pub use npdm::{
     AcidFlags, AcidMemoryRegion, AddressSpaceType, EffectiveNpdmPolicy, FileSystemAccess,

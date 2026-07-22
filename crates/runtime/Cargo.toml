@@ -1,16 +1,16 @@
 [package]
-name = "swiitx-runtime"
+name = "nixe-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-swiitx-config.workspace = true
-swiitx-cpu.workspace = true
-swiitx-loader-executable.workspace = true
-swiitx-loader-content.workspace = true
-swiitx-loader-storage.workspace = true
-swiitx-loader-title.workspace = true
+nixe-config.workspace = true
+nixe-cpu.workspace = true
+nixe-loader-executable.workspace = true
+nixe-loader-content.workspace = true
+nixe-loader-storage.workspace = true
+nixe-loader-title.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

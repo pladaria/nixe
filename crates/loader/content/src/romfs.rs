@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use swiitx_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
+use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
 const HEADER_SIZE: u64 = 0x50;
 const DIRECTORY_ENTRY_SIZE: u64 = 0x18;
@@ -457,7 +457,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use swiitx_loader_storage::{Storage, StorageError};
+    use nixe_loader_storage::{Storage, StorageError};
 
     use super::*;
 

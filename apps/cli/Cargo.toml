@@ -1,15 +1,15 @@
 [package]
-name = "swiitx-cli"
+name = "nixe-cli"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
 [dependencies]
 sha2.workspace = true
-swiitx-config.workspace = true
-swiitx-horizon.workspace = true
-swiitx-loader-content.workspace = true
-swiitx-loader-executable.workspace = true
-swiitx-loader-storage.workspace = true
-swiitx-loader-title.workspace = true
-swiitx-runtime.workspace = true
+nixe-config.workspace = true
+nixe-horizon.workspace = true
+nixe-loader-content.workspace = true
+nixe-loader-executable.workspace = true
+nixe-loader-storage.workspace = true
+nixe-loader-title.workspace = true
+nixe-runtime.workspace = true
