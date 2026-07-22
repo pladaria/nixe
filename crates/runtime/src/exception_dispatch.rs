@@ -259,6 +259,14 @@ impl<'a> ExceptionProcessContext<'a> {
     pub const fn handles_mut(&mut self) -> &mut HandleTable {
         self.handles
     }
+
+    /// Borrows the immutable mount namespace and mutable handle table together.
+    ///
+    /// Platform IPC adapters need both resources for an atomic service lookup
+    /// without making the generic runtime depend on a console protocol.
+    pub fn mounts_and_handles_mut(&mut self) -> (&ProcessMountNamespace, &mut HandleTable) {
+        (self.mounts, self.handles)
+    }
 }
 
 /// Current guest thread visible while runtime policy handles an exception.

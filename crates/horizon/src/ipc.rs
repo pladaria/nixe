@@ -1,8 +1,9 @@
 //! Typed semantic IPC dispatcher for the first read-only Horizon services.
 //!
-//! This module deliberately sits below the future HIPC/CMIF wire decoder. Its
+//! This module deliberately sits below the HIPC/CMIF wire codec. Its
 //! requests and responses have bounded, validated semantics that can be called
-//! from tests today and from Horizon SVC dispatch later.
+//! directly from tests and from Horizon SVC dispatch without depending on
+//! guest message layouts.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -38,6 +39,13 @@ impl IpcService {
             Self::FileSystem => b"fsp-srv",
             Self::AddOnContent => b"aoc:u",
         }
+    }
+
+    #[must_use]
+    pub(crate) fn from_name(name: &[u8]) -> Option<Self> {
+        [Self::FileSystem, Self::AddOnContent]
+            .into_iter()
+            .find(|service| service.name() == name)
     }
 }
 
