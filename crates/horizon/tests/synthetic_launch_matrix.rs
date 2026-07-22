@@ -2,11 +2,14 @@ mod support;
 
 use std::fs;
 
+use nixe_cpu::memory::MemoryMappingPurpose;
+use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
 use nixe_horizon::{
     DirectoryEntryKind, HorizonProcess, IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
 use nixe_runtime::{
     LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, ProcessBuilder,
+    RelocationState,
 };
 
 use support::synthetic_packages::{
@@ -160,8 +163,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
             ("sdk", ModuleRole::Sdk),
         ]
     );
-    assert_eq!(plan.entry_module().name(), "main");
-    assert_eq!(plan.symbol_scope(), &[0, 1, 2, 3]);
+    assert_eq!(plan.entry_module().name(), "rtld");
 
     let primary = plan.primary_file_system().unwrap();
     assert_eq!(primary.provenance(), MountProvenance::BaseAndPatch);
@@ -205,8 +207,34 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);
+    assert!(
+        process
+            .modules()
+            .iter()
+            .all(|module| module.relocation_state() == RelocationState::PendingGuestRuntime)
+    );
+    let entry_mapping = process
+        .memory()
+        .mapping_info(
+            process.cpu_context().address_space_id(),
+            nixe_cpu::address::GuestVirtualAddress::new(process.entry_module().entry_address()),
+        )
+        .unwrap();
+    assert_eq!(entry_mapping.purpose, MemoryMappingPurpose::CodeStatic);
+    let ThreadCpuState::A64(state) = &process.main_thread().state else {
+        panic!("synthetic packaged program must initialize AArch64 state");
+    };
+    assert_eq!(state.read_x(A64Register::General(x(0))), 0);
+    assert_eq!(
+        state.read_x(A64Register::General(x(1))),
+        u64::from(process.main_thread().handle)
+    );
     exercise_read_only_ipc(&mut process);
     let _ = process.teardown();
+}
+
+fn x(index: u8) -> nixe_cpu::state::a64::A64GeneralRegister {
+    nixe_cpu::state::a64::A64GeneralRegister::new(index).unwrap()
 }
 
 fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {

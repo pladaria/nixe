@@ -1,5 +1,7 @@
 //! Runtime orchestration for preparing and starting emulated processes.
 
+pub use nixe_loader_executable::RelocationState;
+
 mod diagnostics;
 mod exception_dispatch;
 mod execution;

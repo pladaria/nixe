@@ -271,7 +271,10 @@ fn lift_load_store_indexed(
     }
     let base = base_address(builder, decoded.location, rn)?;
     let offset = sign_extend(u64::from(u32::from(fields.immediate_9)), 9);
-    let address = if matches!(instruction, A64MemoryInstruction::PreIndex(_)) {
+    let address = if matches!(
+        instruction,
+        A64MemoryInstruction::Unscaled(_) | A64MemoryInstruction::PreIndex(_)
+    ) {
         address_add(builder, decoded.location, base, offset)?
     } else {
         base

@@ -16,8 +16,7 @@ use nixe_cpu::translate::{
     BlockTranslationConfig, BlockTranslationReport, translate_block, translate_block_report,
 };
 use nixe_loader_executable::{
-    AddressSpaceType, ExternalSymbol, NsoBatchModule, PreparationConfig, PreparedModule,
-    SymbolResolution, prepare_nso_batch,
+    AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
 
 use crate::exception_dispatch::ExceptionProcessMetadata;
@@ -828,7 +827,10 @@ impl ProcessBuilder {
         self.diagnostics.cpu()
     }
 
-    /// Prepares, relocates, maps, and initializes one runnable process.
+    /// Prepares, maps, and initializes one runnable process.
+    ///
+    /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
+    /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
         let (execution_state, address_space, stack_size, abi) = process_metadata(plan);
         let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
@@ -1090,41 +1092,28 @@ fn prepare_modules(
     placements: &[PreparationConfig],
     address_space: ProcessAddressSpace,
 ) -> Result<Vec<PreparedModule>, ProcessBuildError> {
-    let all_nso = plan
-        .modules()
-        .iter()
-        .all(|module| matches!(module.image(), LaunchModuleImage::Nso(_)));
-    if all_nso {
-        let modules = plan
-            .modules()
-            .iter()
-            .zip(placements)
-            .map(|(module, config)| match module.image() {
-                LaunchModuleImage::Nso(image) => Ok(NsoBatchModule {
-                    image,
-                    config: *config,
-                }),
-                LaunchModuleImage::Nro(_) => unreachable!(),
-            })
-            .collect::<Result<Vec<_>, ProcessBuildError>>()?;
-        return prepare_nso_batch(&modules, plan.symbol_scope(), &[])
-            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error));
-    }
-    if plan.modules().len() != 1 {
-        return Err(error(
-            ProcessBuildStage::Preparation,
-            "mixed NRO/NSO launch plans are unsupported",
-        ));
-    }
-    let LaunchModuleImage::Nro(image) = plan.modules()[0].image() else {
-        unreachable!();
-    };
     let unresolved = |_: ExternalSymbol<'_>| SymbolResolution::Unresolved;
-    let module = image
-        .prepare_for_guest_relocation(placements[0], &unresolved)
-        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error))?;
-    validate_range(address_space, module.image_base(), module.image_extent())?;
-    Ok(vec![module])
+    plan.modules()
+        .iter()
+        .zip(placements)
+        .map(|(module, config)| {
+            let prepared = match module.image() {
+                LaunchModuleImage::Nso(image) => {
+                    image.prepare_for_guest_relocation(*config, &unresolved)
+                }
+                LaunchModuleImage::Nro(image) => {
+                    image.prepare_for_guest_relocation(*config, &unresolved)
+                }
+            }
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error))?;
+            validate_range(
+                address_space,
+                prepared.image_base(),
+                prepared.image_extent(),
+            )?;
+            Ok(prepared)
+        })
+        .collect()
 }
 
 fn install_zero_pages(

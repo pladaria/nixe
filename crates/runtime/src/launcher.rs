@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use nixe_loader_content::{
     BktrPatch, CnmtContentInfo, CnmtContentType, CnmtExtendedHeader, NcaArchive, NcaKeyProvider,
@@ -352,7 +353,6 @@ impl Launcher {
             LaunchKind::Homebrew,
             vec![module],
             0,
-            vec![0],
             primary,
             Vec::new(),
             None,
@@ -365,6 +365,7 @@ fn build_packaged(
     resolved: ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<LaunchPlan, LaunchError> {
+    let build_started = Instant::now();
     if resolved.add_ons.len() > MAX_LAUNCH_ADD_ONS {
         return Err(LaunchError::invalid(
             LaunchStage::AddOnContent,
@@ -384,6 +385,7 @@ fn build_packaged(
                 .application(resolved.application_id)
                 .title_id(effective.title_id)
         })?;
+    let program_started = Instant::now();
     let program = effective
         .open_content(program_record, keys)
         .map_err(|error| {
@@ -392,6 +394,8 @@ fn build_packaged(
                 .title_id(effective.title_id)
                 .content(program_record.content_id)
         })?;
+    log::debug!("program NCA opened in {:?}", program_started.elapsed());
+    let exefs_started = Instant::now();
     let mut exefs_candidates = Vec::new();
     for section in program
         .sections()
@@ -420,6 +424,8 @@ fn build_packaged(
             .content(program_record.content_id));
         }
     };
+    log::debug!("ExeFS located and parsed in {:?}", exefs_started.elapsed());
+    let npdm_started = Instant::now();
     let npdm_entry = exefs.main_npdm().ok_or_else(|| {
         LaunchError::invalid(
             LaunchStage::ProcessMetadata,
@@ -445,9 +451,27 @@ fn build_packaged(
         )
         .application(resolved.application_id));
     }
-    let (modules, entry_module, symbol_scope) = load_modules(path, &exefs)?;
+    log::debug!("main.npdm loaded in {:?}", npdm_started.elapsed());
+    let modules_started = Instant::now();
+    let (modules, entry_module) = load_modules(path, &exefs)?;
+    log::debug!(
+        "{} executable module(s) loaded in {:?}",
+        modules.len(),
+        modules_started.elapsed()
+    );
+    let primary_started = Instant::now();
     let primary = load_primary_mount(path, &resolved, effective, &program, keys)?;
+    log::debug!(
+        "primary filesystem resolved in {:?}",
+        primary_started.elapsed()
+    );
+    let add_ons_started = Instant::now();
     let add_ons = load_add_ons(path, &resolved, keys)?;
+    log::debug!(
+        "{} add-on(s) resolved in {:?}",
+        add_ons.len(),
+        add_ons_started.elapsed()
+    );
     let identity = PackagedIdentity::new(
         resolved.application_id,
         effective.title_id,
@@ -455,21 +479,25 @@ fn build_packaged(
         program_record.content_id,
         npdm,
     );
-    Ok(LaunchPlan::new(
+    let plan = LaunchPlan::new(
         LaunchKind::Packaged(Box::new(identity)),
         modules,
         entry_module,
-        symbol_scope,
         primary,
         add_ons,
         resolved.control_metadata().cloned(),
-    ))
+    );
+    log::debug!(
+        "packaged launch plan built in {:?}",
+        build_started.elapsed()
+    );
+    Ok(plan)
 }
 
 fn load_modules(
     path: &Path,
     exefs: &nixe_loader_content::ExeFsArchive,
-) -> Result<(Vec<LaunchModule>, usize, Vec<usize>), LaunchError> {
+) -> Result<(Vec<LaunchModule>, usize), LaunchError> {
     let mut candidates = Vec::new();
     let mut roles = BTreeSet::new();
     for entry in exefs.entries() {
@@ -517,6 +545,7 @@ fn load_modules(
     let mut modules = Vec::with_capacity(candidates.len());
     let mut module_ids = BTreeSet::new();
     for (role, name, entry) in candidates {
+        let module_started = Instant::now();
         let storage = exefs.open_entry(entry).map_err(|error| {
             LaunchError::load(LaunchStage::ExecutableModules, path, error).module(&name)
         })?;
@@ -536,16 +565,24 @@ fn load_modules(
             role,
             LaunchModuleImage::Nso(image),
         ));
+        let module = modules.last().expect("module was just inserted");
+        log::debug!(
+            "module {} ({:?}) loaded in {:?}",
+            module.name(),
+            module.role(),
+            module_started.elapsed()
+        );
     }
     let entry = modules
         .iter()
-        .position(|module| module.role() == ModuleRole::Main)
+        .position(|module| module.role() == ModuleRole::RuntimeLoader)
+        .or_else(|| {
+            modules
+                .iter()
+                .position(|module| module.role() == ModuleRole::Main)
+        })
         .expect("validated main module");
-    // Horizon's rtld receives this stable load list. Keeping the topology
-    // explicit allows the executable loader's later batch linker to apply ELF
-    // binding and visibility rules after ProcessBuilder supplies placements.
-    let scope = (0..modules.len()).collect();
-    Ok((modules, entry, scope))
+    Ok((modules, entry))
 }
 
 fn module_role(name: &str) -> Option<ModuleRole> {
@@ -674,6 +711,7 @@ fn mount_nca(
     provenance: MountProvenance,
     content_id: [u8; 16],
 ) -> Result<ReadOnlyMount, LaunchError> {
+    let mount_started = Instant::now();
     let sections = nca
         .sections()
         .iter()
@@ -735,7 +773,13 @@ fn mount_nca(
         )
         .map_err(|error| LaunchError::load(LaunchStage::PrimaryFileSystem, path, error))?
     };
-    Ok(ReadOnlyMount::new(provenance, Some(content_id), romfs))
+    let file_count = romfs.files().len();
+    let mount = ReadOnlyMount::new(provenance, Some(content_id), romfs);
+    log::debug!(
+        "RomFS ({provenance:?}, {file_count} files) indexed in {:?}",
+        mount_started.elapsed()
+    );
+    Ok(mount)
 }
 
 fn load_add_ons(
@@ -928,7 +972,6 @@ mod tests {
             plan.entry_module().image(),
             LaunchModuleImage::Nro(_)
         ));
-        assert_eq!(plan.symbol_scope(), &[0]);
     }
 
     #[test]

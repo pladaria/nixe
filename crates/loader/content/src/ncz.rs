@@ -283,14 +283,26 @@ impl NczCachedStorage {
                 compressed_end,
                 decompressed_end,
                 decoder,
-            } => self.ensure_solid(
-                state.file.as_mut().expect("cache initialized"),
-                *compressed_offset,
-                *compressed_end,
-                decompressed_end,
-                decoder,
-                end,
-            ),
+            } => {
+                let cached_until = PREFIX_SIZE
+                    .checked_add(*decompressed_end)
+                    .ok_or(StorageError::OutOfBounds)?;
+                if end > cached_until {
+                    log::debug!(
+                        "NCZ solid decompression requested: offset={start} bytes, length={} bytes, cached_until={cached_until} bytes, decoding={} bytes",
+                        end - start,
+                        end - cached_until
+                    );
+                }
+                self.ensure_solid(
+                    state.file.as_mut().expect("cache initialized"),
+                    *compressed_offset,
+                    *compressed_end,
+                    decompressed_end,
+                    decoder,
+                    end,
+                )
+            }
         }
     }
 
@@ -310,6 +322,23 @@ impl NczCachedStorage {
             .ok_or(StorageError::OutOfBounds)?;
         let first = tail_start / layout.block_size;
         let last = tail_end.saturating_sub(1) / layout.block_size;
+        let compressed_blocks = (first..=last)
+            .filter(|block_index| {
+                let index = usize::try_from(*block_index)
+                    .expect("validated NCZ block index fits in memory");
+                !valid[index]
+                    && u64::from(layout.compressed_sizes[index])
+                        != layout
+                            .block_size
+                            .min(layout.decompressed_size - *block_index * layout.block_size)
+            })
+            .count();
+        if compressed_blocks != 0 {
+            log::debug!(
+                "NCZ block decompression requested: offset={start} bytes, length={} bytes, blocks={first}..={last}, compressed_blocks={compressed_blocks}",
+                end - start
+            );
+        }
         for block_index in first..=last {
             let index = usize::try_from(block_index).map_err(|_| StorageError::OutOfBounds)?;
             if valid[index] {

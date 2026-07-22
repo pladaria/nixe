@@ -19,6 +19,11 @@ const ELF64_SYM_SIZE: u64 = 24;
 const ELF64_RELA_SIZE: u64 = 24;
 const ELF64_RELR_SIZE: u64 = 8;
 
+const SHN_UNDEF: u16 = 0;
+const SHN_LORESERVE: u16 = 0xff00;
+const SHN_ABS: u16 = 0xfff1;
+const SHN_COMMON: u16 = 0xfff2;
+
 const DT_NULL: i64 = 0;
 const DT_HASH: i64 = 4;
 const DT_STRTAB: i64 = 5;
@@ -128,8 +133,9 @@ pub struct RuntimeExport<'a> {
 /// Collects a complete process scope and atomically prepares every NSO.
 ///
 /// `scope` is a permutation of module indices in lookup precedence. Visible
-/// strong definitions are unique process-wide; a strong definition replaces
-/// weak definitions, while the first weak definition in scope order wins.
+/// strong definitions use the first definition in scope order; a later strong
+/// definition replaces an earlier weak one, while the first weak definition
+/// wins when no strong definition exists.
 /// Runtime exports are consulted only when no module defines a name.
 pub fn prepare_nso_batch(
     modules: &[NsoBatchModule<'_>],
@@ -156,14 +162,12 @@ pub fn prepare_nso_batch(
     let mut definitions: BTreeMap<Vec<u8>, CollectedDefinition> = BTreeMap::new();
     for index in scope {
         let module = modules[*index];
-        for definition in collect_nso_definitions(module.image, module.config.image_base)? {
+        let module_definitions = collect_nso_definitions(module.image, module.config.image_base)
+            .map_err(|error| {
+                PrepareError::new(format!("NSO batch module {index}: {}", error.reason()))
+            })?;
+        for definition in module_definitions {
             match definitions.get(&definition.name) {
-                Some(existing) if existing.strong && definition.strong => {
-                    return Err(PrepareError::new(format!(
-                        "duplicate strong symbol {}",
-                        String::from_utf8_lossy(&definition.name)
-                    )));
-                }
                 Some(existing) if existing.strong || !definition.strong => {}
                 _ => {
                     definitions.insert(definition.name.clone(), definition);
@@ -200,7 +204,15 @@ pub fn prepare_nso_batch(
     };
     modules
         .iter()
-        .map(|module| module.image.prepare(module.config, &resolver))
+        .enumerate()
+        .map(|(index, module)| {
+            module
+                .image
+                .prepare(module.config, &resolver)
+                .map_err(|error| {
+                    PrepareError::new(format!("NSO batch module {index}: {}", error.reason()))
+                })
+        })
         .collect()
 }
 
@@ -424,39 +436,62 @@ impl NsoImage {
         config: PreparationConfig,
         resolver: &impl SymbolResolver,
     ) -> Result<PreparedModule, PrepareError> {
-        let read_only = self
-            .executable()
-            .segments()
-            .iter()
-            .find(|segment| segment.kind() == crate::ExecutableSegmentKind::ReadOnly)
-            .ok_or_else(|| PrepareError::new("NSO has no read-only segment"))?;
-        let hints = TableHints {
-            strings: Some((
-                checked_add(
-                    read_only.memory_offset(),
-                    self.metadata().dynamic_string_table().offset(),
-                    "NSO string-table offset",
-                )?,
-                self.metadata().dynamic_string_table().size(),
-            )),
-            symbols: Some((
-                checked_add(
-                    read_only.memory_offset(),
-                    self.metadata().dynamic_symbol_table().offset(),
-                    "NSO symbol-table offset",
-                )?,
-                self.metadata().dynamic_symbol_table().size(),
-            )),
-        };
         prepare(
             self.executable(),
             self.mod0().map(Mod0Metadata::header_offset),
-            hints,
+            nso_table_hints(self)?,
             config,
             resolver,
             RelocationState::Applied,
         )
     }
+
+    /// Validates and materializes an NSO for the packaged-program ABI.
+    ///
+    /// The original dynamic relocation targets remain untouched. Horizon maps
+    /// NSOs in this state and starts the guest `rtld`, which discovers every
+    /// module through `QueryMemory` and performs process-wide linking itself.
+    pub fn prepare_for_guest_relocation(
+        &self,
+        config: PreparationConfig,
+        resolver: &impl SymbolResolver,
+    ) -> Result<PreparedModule, PrepareError> {
+        prepare(
+            self.executable(),
+            self.mod0().map(Mod0Metadata::header_offset),
+            nso_table_hints(self)?,
+            config,
+            resolver,
+            RelocationState::PendingGuestRuntime,
+        )
+    }
+}
+
+fn nso_table_hints(image: &NsoImage) -> Result<TableHints, PrepareError> {
+    let read_only = image
+        .executable()
+        .segments()
+        .iter()
+        .find(|segment| segment.kind() == crate::ExecutableSegmentKind::ReadOnly)
+        .ok_or_else(|| PrepareError::new("NSO has no read-only segment"))?;
+    Ok(TableHints {
+        strings: Some((
+            checked_add(
+                read_only.memory_offset(),
+                image.metadata().dynamic_string_table().offset(),
+                "NSO string-table offset",
+            )?,
+            image.metadata().dynamic_string_table().size(),
+        )),
+        symbols: Some((
+            checked_add(
+                read_only.memory_offset(),
+                image.metadata().dynamic_symbol_table().offset(),
+                "NSO symbol-table offset",
+            )?,
+            image.metadata().dynamic_symbol_table().size(),
+        )),
+    })
 }
 
 trait NonZeroOption {
@@ -534,7 +569,7 @@ fn prepare(
             hints,
             config.image_base,
             resolver,
-            relocation_state == RelocationState::Applied,
+            relocation_state,
         )?;
     }
 
@@ -776,7 +811,7 @@ fn apply_dynamic(
     hints: TableHints,
     image_base: u64,
     resolver: &impl SymbolResolver,
-    commit: bool,
+    relocation_state: RelocationState,
 ) -> Result<(), PrepareError> {
     let rela = relocation_range(dynamic, DT_RELA, DT_RELASZ, "RELA")?;
     let plt = relocation_range(dynamic, DT_JMPREL, DT_PLTRELSZ, "PLT RELA")?;
@@ -859,6 +894,13 @@ fn apply_dynamic(
             ));
         }
     }
+    log::debug!(
+        "executable relocation metadata: mode={relocation_state:?}, RELA={}, PLT_RELA={}, RELR={}, RELACOUNT={}",
+        rela.map_or(0, |(_, size)| size / ELF64_RELA_SIZE),
+        plt.map_or(0, |(_, size)| size / ELF64_RELA_SIZE),
+        relr.map_or(0, |(_, size)| size / ELF64_RELR_SIZE),
+        dynamic.values.get(&DT_RELACOUNT).copied().unwrap_or(0),
+    );
     let mut writes = Vec::with_capacity(records.len() + relr_writes.len());
     if !records.is_empty() {
         let tables = SymbolTables::parse(regions, dynamic, hints, &records)?;
@@ -874,6 +916,11 @@ fn apply_dynamic(
                     checked_signed_add(image_base, relocation.addend, &relocation.description)?
                 }
                 R_AARCH64_ABS64 => {
+                    if relocation_state == RelocationState::PendingGuestRuntime {
+                        tables
+                            .validate_guest_reference(relocation.symbol, &relocation.description)?;
+                        continue;
+                    }
                     let symbol = tables.resolve(
                         relocation.symbol,
                         image_base,
@@ -888,6 +935,11 @@ fn apply_dynamic(
                             "{} has a nonzero addend",
                             relocation.description
                         )));
+                    }
+                    if relocation_state == RelocationState::PendingGuestRuntime {
+                        tables
+                            .validate_guest_reference(relocation.symbol, &relocation.description)?;
+                        continue;
                     }
                     tables.resolve(
                         relocation.symbol,
@@ -907,7 +959,7 @@ fn apply_dynamic(
         }
     }
     writes.extend(relr_writes);
-    if commit {
+    if relocation_state == RelocationState::Applied {
         for (target, value) in writes {
             write_u64(regions, target, value)?;
         }
@@ -1140,7 +1192,7 @@ fn collect_nso_definitions(
     let tables = SymbolTables::parse(&regions, &dynamic, hints, &[])?;
     let mut definitions = Vec::new();
     for (index, symbol) in tables.symbols.iter().enumerate().skip(1) {
-        if symbol.section == 0 {
+        if symbol.section == SHN_UNDEF {
             continue;
         }
         let binding = symbol.info >> 4;
@@ -1153,14 +1205,20 @@ fn collect_nso_definitions(
                 "defined symbol {index} has unsupported binding {binding}"
             )));
         }
-        validate_logical_range(&regions, symbol.value, 1, "defined symbol")?;
         let name = tables.name(index as u32)?.to_vec();
         if name.is_empty() {
             continue;
         }
+        let context = format!(
+            "defined symbol {index} ({}, section=0x{:04x}, value=0x{:x}, size=0x{:x})",
+            String::from_utf8_lossy(&name),
+            symbol.section,
+            symbol.value,
+            symbol.size
+        );
         definitions.push(CollectedDefinition {
             name,
-            address: checked_add(image_base, symbol.value, "defined symbol address")?,
+            address: defined_symbol_address(symbol, image_base, &regions, &context)?,
             strong: binding == 1,
         });
     }
@@ -1256,8 +1314,13 @@ impl SymbolTables {
         let binding = symbol.info >> 4;
         let symbol_type = symbol.info & 0xf;
         let visibility = symbol.other & 3;
-        if symbol.section != 0 {
-            return checked_add(image_base, symbol.value, "defined symbol address");
+        if symbol.section != SHN_UNDEF {
+            return defined_symbol_address(
+                symbol,
+                image_base,
+                &[],
+                &format!("{context} symbol {index}"),
+            );
         }
         if binding == 0 {
             return Err(PrepareError::new(format!(
@@ -1290,6 +1353,91 @@ impl SymbolTables {
                 String::from_utf8_lossy(name)
             ))),
         }
+    }
+
+    fn validate_guest_reference(&self, index: u32, context: &str) -> Result<(), PrepareError> {
+        let symbol = self.symbols.get(index as usize).ok_or_else(|| {
+            PrepareError::new(format!("{context} references invalid symbol {index}"))
+        })?;
+        if symbol.section != SHN_UNDEF {
+            return match symbol.section {
+                SHN_COMMON => Err(PrepareError::new(format!(
+                    "{context} symbol {index} uses unsupported SHN_COMMON storage"
+                ))),
+                section if section >= SHN_LORESERVE && section != SHN_ABS => {
+                    Err(PrepareError::new(format!(
+                        "{context} symbol {index} uses unsupported reserved section index 0x{section:04x}"
+                    )))
+                }
+                _ => Ok(()),
+            };
+        }
+        let binding = symbol.info >> 4;
+        if binding == 0 {
+            return Err(PrepareError::new(format!(
+                "{context} references an undefined local symbol"
+            )));
+        }
+        if !matches!(binding, 1 | 2) {
+            return Err(PrepareError::new(format!(
+                "{context} references a symbol with unsupported binding {binding}"
+            )));
+        }
+        let visibility = symbol.other & 3;
+        if visibility != 0 {
+            return Err(PrepareError::new(format!(
+                "{context} references an undefined non-default-visibility symbol"
+            )));
+        }
+        self.name(index)?;
+        Ok(())
+    }
+}
+
+fn defined_symbol_address(
+    symbol: &ElfSymbol,
+    image_base: u64,
+    regions: &[WorkingRegion],
+    context: &str,
+) -> Result<u64, PrepareError> {
+    match symbol.section {
+        SHN_ABS => Ok(symbol.value),
+        SHN_COMMON => Err(PrepareError::new(format!(
+            "{context} uses unsupported SHN_COMMON storage"
+        ))),
+        section if section >= SHN_LORESERVE => Err(PrepareError::new(format!(
+            "{context} uses unsupported reserved section index 0x{section:04x}"
+        ))),
+        _ => {
+            if !regions.is_empty() {
+                validate_defined_symbol_range(regions, symbol, context)?;
+            }
+            checked_add(image_base, symbol.value, "defined symbol address")
+        }
+    }
+}
+
+fn validate_defined_symbol_range(
+    regions: &[WorkingRegion],
+    symbol: &ElfSymbol,
+    context: &str,
+) -> Result<(), PrepareError> {
+    if symbol.size != 0 {
+        return validate_logical_range(regions, symbol.value, symbol.size, context);
+    }
+
+    let touches_mapping = regions.iter().any(|region| {
+        region
+            .offset
+            .checked_add(region.logical_size)
+            .is_some_and(|end| symbol.value >= region.offset && symbol.value <= end)
+    });
+    if touches_mapping {
+        Ok(())
+    } else {
+        Err(PrepareError::new(format!(
+            "{context} is outside logical memory"
+        )))
     }
 }
 
@@ -1747,6 +1895,12 @@ mod tests {
         nso_defining_external_with(1, 0)
     }
 
+    fn set_nso_symbol_section_and_value(bytes: &mut [u8], index: usize, section: u16, value: u64) {
+        let symbol = 0x1100 + 0x500 + index * ELF64_SYM_SIZE as usize;
+        bytes[symbol + 6..symbol + 8].copy_from_slice(&section.to_le_bytes());
+        put_u64(bytes, symbol + 8, value);
+    }
+
     #[test]
     fn prepares_synthetic_nro_and_nso_through_public_entry_points() {
         let config = PreparationConfig {
@@ -1774,6 +1928,16 @@ mod tests {
         );
 
         let pending = nro.prepare_for_guest_relocation(config, &resolver).unwrap();
+        assert_eq!(
+            pending.relocation_state(),
+            RelocationState::PendingGuestRuntime
+        );
+        assert_eq!(
+            pending.read_image(0x2000, 8).unwrap(),
+            &0xaaaa_aaaa_aaaa_aaaa_u64.to_le_bytes()
+        );
+
+        let pending = nso.prepare_for_guest_relocation(config, &resolver).unwrap();
         assert_eq!(
             pending.relocation_state(),
             RelocationState::PendingGuestRuntime
@@ -1813,27 +1977,139 @@ mod tests {
     }
 
     #[test]
-    fn batch_linking_rejects_duplicate_strong_definitions_atomically() {
-        let first = NsoLoader::load(storage(nso_defining_external())).unwrap();
-        let second = NsoLoader::load(storage(nso_defining_external())).unwrap();
+    fn batch_linking_preserves_absolute_definition_addresses() {
+        let consumer = NsoLoader::load(storage(synthetic_nso())).unwrap();
+        let mut provider_bytes = nso_defining_external();
+        set_nso_symbol_section_and_value(&mut provider_bytes, 1, SHN_ABS, 0x1234_5678);
+        let provider = NsoLoader::load(storage(provider_bytes)).unwrap();
         let modules = [
             NsoBatchModule {
-                image: &first,
+                image: &consumer,
                 config: PreparationConfig {
                     image_base: 0x7100_0000,
                     address_limit: 0x7200_0000,
                 },
             },
             NsoBatchModule {
-                image: &second,
+                image: &provider,
                 config: PreparationConfig {
                     image_base: 0x7110_0000,
                     address_limit: 0x7200_0000,
                 },
             },
         ];
-        let error = prepare_nso_batch(&modules, &[0, 1], &[]).unwrap_err();
-        assert!(error.reason().contains("duplicate strong symbol external"));
+
+        let prepared = prepare_nso_batch(&modules, &[0, 1], &[]).unwrap();
+
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &0x1234_5678_u64.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn batch_linking_accepts_zero_sized_definition_at_mapping_end() {
+        let consumer = NsoLoader::load(storage(synthetic_nso())).unwrap();
+        let mut provider_bytes = nso_defining_external();
+        set_nso_symbol_section_and_value(&mut provider_bytes, 1, 1, 0x1000);
+        let provider = NsoLoader::load(storage(provider_bytes)).unwrap();
+        let modules = [
+            NsoBatchModule {
+                image: &consumer,
+                config: PreparationConfig {
+                    image_base: 0x7100_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &provider,
+                config: PreparationConfig {
+                    image_base: 0x7110_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+        ];
+
+        let prepared = prepare_nso_batch(&modules, &[0, 1], &[]).unwrap();
+
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &0x7110_1000_u64.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn relocations_preserve_local_absolute_symbol_addresses() {
+        let mut bytes = synthetic_nso();
+        set_nso_symbol_section_and_value(&mut bytes, 3, SHN_ABS, 0x1234_5678);
+        let nso = NsoLoader::load(storage(bytes)).unwrap();
+        let config = PreparationConfig {
+            image_base: 0x7100_0000,
+            address_limit: 0x7200_0000,
+        };
+
+        let prepared = nso.prepare(config, &resolver).unwrap();
+
+        assert_eq!(
+            prepared.read_image(0x2008, 8).unwrap(),
+            &(0x1234_5678_u64 - 8).to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn batch_linking_reports_unsupported_common_symbol_with_module_context() {
+        let mut provider_bytes = nso_defining_external();
+        set_nso_symbol_section_and_value(&mut provider_bytes, 1, SHN_COMMON, 8);
+        let provider = NsoLoader::load(storage(provider_bytes)).unwrap();
+        let modules = [NsoBatchModule {
+            image: &provider,
+            config: PreparationConfig {
+                image_base: 0x7100_0000,
+                address_limit: 0x7200_0000,
+            },
+        }];
+
+        let error = prepare_nso_batch(&modules, &[0], &[]).unwrap_err();
+
+        assert!(error.reason().contains("NSO batch module 0"));
+        assert!(error.reason().contains("defined symbol 1 (external,"));
+        assert!(error.reason().contains("SHN_COMMON"));
+    }
+
+    #[test]
+    fn batch_linking_uses_first_strong_definition_in_scope_order() {
+        let consumer = NsoLoader::load(storage(synthetic_nso())).unwrap();
+        let first = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let second = NsoLoader::load(storage(nso_defining_external())).unwrap();
+        let modules = [
+            NsoBatchModule {
+                image: &consumer,
+                config: PreparationConfig {
+                    image_base: 0x7100_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &first,
+                config: PreparationConfig {
+                    image_base: 0x7110_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+            NsoBatchModule {
+                image: &second,
+                config: PreparationConfig {
+                    image_base: 0x7120_0000,
+                    address_limit: 0x7200_0000,
+                },
+            },
+        ];
+        let prepared = prepare_nso_batch(&modules, &[1, 2, 0], &[]).unwrap();
+
+        assert_eq!(
+            prepared[0].read_image(0x2018, 8).unwrap(),
+            &0x7110_0100_u64.to_le_bytes()
+        );
     }
 
     #[test]
@@ -2088,6 +2364,32 @@ mod tests {
             .read_at(0, &mut after)
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn guest_relocation_validates_but_defers_external_symbol_resolution() {
+        let (image, hints) = fixture(false);
+        let prepared = prepare(
+            &image,
+            Some(0x100),
+            hints,
+            PreparationConfig {
+                image_base: 0x7100_0000,
+                address_limit: 0x8000_0000,
+            },
+            &|_: ExternalSymbol<'_>| SymbolResolution::Unresolved,
+            RelocationState::PendingGuestRuntime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.relocation_state(),
+            RelocationState::PendingGuestRuntime
+        );
+        assert_eq!(
+            prepared.read_image(0x2018, 8).unwrap(),
+            &0xaaaa_aaaa_aaaa_aaaa_u64.to_le_bytes()
+        );
     }
 
     #[test]
