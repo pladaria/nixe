@@ -97,7 +97,10 @@ fn parse_arguments(
 
     match positionals.as_slice() {
         [command] if command == "list" => Ok(Some(Invocation {
-            command: Command::List(commands::list::Arguments { config_path }),
+            command: Command::List(commands::list::Arguments {
+                config_path,
+                log_level_override: log_level,
+            }),
             log_level: log_level.unwrap_or_default(),
         })),
         [command, identifier] if command == "run" => {
@@ -108,6 +111,7 @@ fn parse_arguments(
             Ok(Some(Invocation {
                 command: Command::Run(commands::run::Arguments {
                     config_path,
+                    log_level_override: log_level,
                     identifier,
                 }),
                 log_level: log_level.unwrap_or_default(),
@@ -128,7 +132,8 @@ fn print_usage(program: &OsStr) {
            list        List configured titles as title ID and localized name\n  \
            run <id>    Run a title\n\n\
          Log levels:\n  \
-           error, warn, info (default), debug, trace\n  \
+           error, warn, info, debug, trace\n  \
+           --log-level overrides diagnostics.log_level from nixe.toml\n  \
            debug reports phase timings; trace also prints every instruction\n\n\
          Configuration is discovered from NIXE_CONFIG, ./nixe.toml, or the\n\
          platform user configuration unless --config is supplied.",
@@ -155,6 +160,7 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(arguments.config_path, None);
+        assert_eq!(arguments.log_level_override, None);
         assert_eq!(invocation.log_level, logging::LogLevel::Info);
     }
 
@@ -182,6 +188,7 @@ mod tests {
                 panic!("expected run command");
             };
             assert_eq!(arguments.config_path, None);
+            assert_eq!(arguments.log_level_override, None);
             assert_eq!(arguments.identifier, identifier);
             assert_eq!(invocation.log_level, logging::LogLevel::Info);
         }
@@ -196,6 +203,14 @@ mod tests {
         ] {
             let invocation = parse_arguments(arguments(values)).unwrap().unwrap();
             assert_eq!(invocation.log_level, logging::LogLevel::Trace);
+            match invocation.command {
+                Command::List(arguments) => {
+                    assert_eq!(arguments.log_level_override, Some(logging::LogLevel::Trace));
+                }
+                Command::Run(arguments) => {
+                    assert_eq!(arguments.log_level_override, Some(logging::LogLevel::Trace));
+                }
+            }
         }
     }
 

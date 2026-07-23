@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use nixe_loader_title::TitleId;
@@ -16,8 +18,8 @@ use nixe_runtime::{
 };
 
 use crate::{
-    DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem,
+    DirectoryEntry, DirectoryEntryKind, HostDirectoryFileSystem, HostFile, IpcSession,
+    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem,
 };
 
 /// Largest path accepted by the semantic filesystem boundary.
@@ -26,6 +28,15 @@ pub const MAX_IPC_PATH_BYTES: usize = 0x300;
 pub const MAX_IPC_READ_BYTES: usize = 1024 * 1024;
 /// Largest number of directory or add-on entries returned by one request.
 pub const MAX_IPC_LIST_ENTRIES: usize = 1024;
+// Guest-visible file and directory mode bits follow libnx's pinned FsOpenMode
+// and FsDirOpenMode definitions:
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/fs.h#L156-L173
+const FILE_OPEN_READ: u32 = 1;
+const FILE_OPEN_WRITE: u32 = 2;
+const FILE_OPEN_APPEND: u32 = 4;
+const DIRECTORY_OPEN_DIRECTORIES: u32 = 1;
+const DIRECTORY_OPEN_FILES: u32 = 2;
+const DIRECTORY_OPEN_NO_FILE_SIZE: u32 = 1 << 31;
 
 /// Stable service identity used by the Horizon service registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -97,16 +108,36 @@ pub struct AddOnContentEntry {
 pub enum IpcRequest {
     SetCurrentProcess,
     OpenPrimaryFileSystem,
+    OpenSdCardFileSystem,
+    CreateFile {
+        path: String,
+        size: u64,
+        option: u32,
+    },
+    CreateDirectory {
+        path: String,
+    },
     OpenFile {
         path: String,
+        mode: u32,
     },
     OpenDirectory {
         path: String,
+        mode: u32,
     },
     GetFileSize,
     ReadFile {
         offset: u64,
         size: usize,
+    },
+    WriteFile {
+        offset: u64,
+        data: Vec<u8>,
+        flush: bool,
+    },
+    FlushFile,
+    SetFileSize {
+        size: u64,
     },
     GetDirectoryEntryCount,
     ReadDirectory {
@@ -197,8 +228,12 @@ impl IpcDispatcher {
             dispatch_session(mounts, handles, session, request)
         } else if let Some(filesystem) = object.downcast_ref::<ReadOnlyFileSystem>().cloned() {
             dispatch_filesystem(mounts, handles, &filesystem, request)
+        } else if let Some(filesystem) = object.downcast_ref::<HostDirectoryFileSystem>().cloned() {
+            dispatch_host_filesystem(mounts, handles, &filesystem, request)
         } else if let Some(file) = object.downcast_ref::<ReadOnlyFile>().cloned() {
             dispatch_file(mounts, &file, request)
+        } else if let Some(file) = object.downcast_ref::<HostFile>() {
+            dispatch_host_file(mounts, file, request)
         } else if let Some(directory) = object.downcast_ref::<ReadOnlyDirectory>().cloned() {
             dispatch_directory(mounts, &directory, request)
         } else {
@@ -225,6 +260,14 @@ fn dispatch_session(
                 .cloned()
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
             insert_handle(handles, ReadOnlyFileSystem::new(mount))
+        }
+        (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
+            require_sd_card_access(mounts)?;
+            let root = mounts
+                .sd_card_root()
+                .map(ToOwned::to_owned)
+                .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
+            insert_handle(handles, HostDirectoryFileSystem::new(root))
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
             u64::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
@@ -340,7 +383,10 @@ fn dispatch_filesystem(
 ) -> Result<IpcResponse, IpcResultCode> {
     require_content_data_read(mounts)?;
     match request {
-        IpcRequest::OpenFile { path } => {
+        IpcRequest::OpenFile { path, mode } => {
+            if mode != FILE_OPEN_READ {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
             let path = normalize_path(&path)?;
             let file = filesystem
                 .mount()
@@ -357,7 +403,7 @@ fn dispatch_filesystem(
                 ReadOnlyFile::new(Arc::from(path), file.size(), storage),
             )
         }
-        IpcRequest::OpenDirectory { path } => {
+        IpcRequest::OpenDirectory { path, .. } => {
             let path = normalize_path(&path)?;
             let entries = directory_entries(filesystem, &path)?;
             insert_handle(
@@ -397,6 +443,181 @@ fn dispatch_file(
     }
 }
 
+fn dispatch_host_filesystem(
+    mounts: &ProcessMountNamespace,
+    handles: &mut HandleTable,
+    filesystem: &HostDirectoryFileSystem,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcResultCode> {
+    require_sd_card_access(mounts)?;
+    match request {
+        IpcRequest::CreateFile { path, size, option } => {
+            if option != 0 {
+                return Err(IpcResultCode::INVALID_ARGUMENT);
+            }
+            let path = normalize_path(&path)?;
+            let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&host_path)
+                .map_err(map_host_io_error)?;
+            if let Err(error) = file.set_len(size) {
+                drop(file);
+                let _ = std::fs::remove_file(host_path);
+                return Err(map_host_io_error(error));
+            }
+            Ok(IpcResponse::None)
+        }
+        IpcRequest::CreateDirectory { path } => {
+            let path = normalize_path(&path)?;
+            let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
+            std::fs::create_dir(host_path).map_err(map_host_io_error)?;
+            Ok(IpcResponse::None)
+        }
+        IpcRequest::OpenFile { path, mode } => {
+            if mode & (FILE_OPEN_READ | FILE_OPEN_WRITE) == 0
+                || mode & !(FILE_OPEN_READ | FILE_OPEN_WRITE | FILE_OPEN_APPEND) != 0
+            {
+                return Err(IpcResultCode::INVALID_ARGUMENT);
+            }
+            let path = normalize_path(&path)?;
+            let host_path = filesystem
+                .resolve_existing(&path)
+                .map_err(map_host_io_error)?;
+            let metadata = std::fs::metadata(&host_path).map_err(map_host_io_error)?;
+            if !metadata.is_file() {
+                return Err(IpcResultCode::NOT_A_FILE);
+            }
+            let readable = mode & FILE_OPEN_READ != 0;
+            let writable = mode & FILE_OPEN_WRITE != 0;
+            let allow_append = mode & FILE_OPEN_APPEND != 0;
+            let file = OpenOptions::new()
+                .read(readable)
+                .write(writable)
+                .open(host_path)
+                .map_err(map_host_io_error)?;
+            insert_handle(
+                handles,
+                HostFile::new(Arc::from(path), file, readable, writable, allow_append),
+            )
+        }
+        IpcRequest::OpenDirectory { path, mode } => {
+            if mode & (DIRECTORY_OPEN_DIRECTORIES | DIRECTORY_OPEN_FILES) == 0
+                || mode
+                    & !(DIRECTORY_OPEN_DIRECTORIES
+                        | DIRECTORY_OPEN_FILES
+                        | DIRECTORY_OPEN_NO_FILE_SIZE)
+                    != 0
+            {
+                return Err(IpcResultCode::INVALID_ARGUMENT);
+            }
+            let path = normalize_path(&path)?;
+            let entries = host_directory_entries(filesystem, &path, mode)?;
+            insert_handle(
+                handles,
+                ReadOnlyDirectory::new(Arc::from(path), entries.into()),
+            )
+        }
+        _ => Err(IpcResultCode::INVALID_COMMAND),
+    }
+}
+
+fn dispatch_host_file(
+    mounts: &ProcessMountNamespace,
+    file: &HostFile,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcResultCode> {
+    require_sd_card_access(mounts)?;
+    match request {
+        IpcRequest::GetFileSize => {
+            let file = file
+                .file()
+                .lock()
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?;
+            Ok(IpcResponse::Size(
+                file.metadata().map_err(map_host_io_error)?.len(),
+            ))
+        }
+        IpcRequest::ReadFile { offset, size } => {
+            if !file.readable() {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
+            if size > MAX_IPC_READ_BYTES {
+                return Err(IpcResultCode::RESOURCE_LIMIT);
+            }
+            let mut file = file
+                .file()
+                .lock()
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?;
+            let file_size = file.metadata().map_err(map_host_io_error)?.len();
+            if offset >= file_size {
+                return Ok(IpcResponse::Data(Vec::new()));
+            }
+            let read_size = usize::try_from((file_size - offset).min(size as u64))
+                .map_err(|_| IpcResultCode::OUT_OF_RANGE)?;
+            let mut data = vec![0; read_size];
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_host_io_error)?;
+            file.read_exact(&mut data).map_err(map_host_io_error)?;
+            Ok(IpcResponse::Data(data))
+        }
+        IpcRequest::WriteFile {
+            offset,
+            data,
+            flush,
+        } => {
+            if !file.writable() {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
+            if data.len() > MAX_IPC_READ_BYTES {
+                return Err(IpcResultCode::RESOURCE_LIMIT);
+            }
+            let allow_append = file.allows_append();
+            let mut file = file
+                .file()
+                .lock()
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?;
+            let end = offset
+                .checked_add(u64::try_from(data.len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?)
+                .ok_or(IpcResultCode::OUT_OF_RANGE)?;
+            if end > file.metadata().map_err(map_host_io_error)?.len() && !allow_append {
+                return Err(IpcResultCode::OUT_OF_RANGE);
+            }
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_host_io_error)?;
+            file.write_all(&data).map_err(map_host_io_error)?;
+            if flush {
+                file.sync_data().map_err(map_host_io_error)?;
+            }
+            Ok(IpcResponse::None)
+        }
+        IpcRequest::FlushFile => {
+            if !file.writable() {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
+            file.file()
+                .lock()
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?
+                .sync_data()
+                .map_err(map_host_io_error)?;
+            Ok(IpcResponse::None)
+        }
+        IpcRequest::SetFileSize { size } => {
+            if !file.writable() {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
+            file.file()
+                .lock()
+                .map_err(|_| IpcResultCode::INTERNAL_STATE)?
+                .set_len(size)
+                .map_err(map_host_io_error)?;
+            Ok(IpcResponse::None)
+        }
+        _ => Err(IpcResultCode::INVALID_COMMAND),
+    }
+}
+
 fn dispatch_directory(
     mounts: &ProcessMountNamespace,
     directory: &ReadOnlyDirectory,
@@ -426,6 +647,14 @@ fn dispatch_directory(
 
 fn require_content_data_read(mounts: &ProcessMountNamespace) -> Result<(), IpcResultCode> {
     if mounts.allows_content_data_read() {
+        Ok(())
+    } else {
+        Err(IpcResultCode::ACCESS_DENIED)
+    }
+}
+
+fn require_sd_card_access(mounts: &ProcessMountNamespace) -> Result<(), IpcResultCode> {
+    if mounts.allows_sd_card_access() {
         Ok(())
     } else {
         Err(IpcResultCode::ACCESS_DENIED)
@@ -524,6 +753,63 @@ fn directory_entries(
         .into_iter()
         .map(|(name, (kind, size))| DirectoryEntry::new(Arc::from(name), kind, size))
         .collect())
+}
+
+fn host_directory_entries(
+    filesystem: &HostDirectoryFileSystem,
+    path: &str,
+    mode: u32,
+) -> Result<Vec<DirectoryEntry>, IpcResultCode> {
+    let host_path = filesystem
+        .resolve_existing(path)
+        .map_err(map_host_io_error)?;
+    let metadata = std::fs::metadata(&host_path).map_err(map_host_io_error)?;
+    if !metadata.is_dir() {
+        return Err(IpcResultCode::NOT_A_DIRECTORY);
+    }
+    let mut entries = BTreeMap::new();
+    for entry in std::fs::read_dir(host_path).map_err(map_host_io_error)? {
+        let entry = entry.map_err(map_host_io_error)?;
+        let file_type = entry.file_type().map_err(map_host_io_error)?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
+        if name.len() > MAX_IPC_PATH_BYTES {
+            continue;
+        }
+        let (kind, size) = if file_type.is_dir() && mode & DIRECTORY_OPEN_DIRECTORIES != 0 {
+            (DirectoryEntryKind::Directory, 0)
+        } else if file_type.is_file() && mode & DIRECTORY_OPEN_FILES != 0 {
+            let size = if mode & DIRECTORY_OPEN_NO_FILE_SIZE != 0 {
+                0
+            } else {
+                entry.metadata().map_err(map_host_io_error)?.len()
+            };
+            (DirectoryEntryKind::File, size)
+        } else {
+            continue;
+        };
+        entries.insert(name, (kind, size));
+        if entries.len() > MAX_IPC_LIST_ENTRIES {
+            return Err(IpcResultCode::RESOURCE_LIMIT);
+        }
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(name, (kind, size))| DirectoryEntry::new(Arc::from(name), kind, size))
+        .collect())
+}
+
+fn map_host_io_error(error: io::Error) -> IpcResultCode {
+    match error.kind() {
+        io::ErrorKind::NotFound => IpcResultCode::PATH_NOT_FOUND,
+        io::ErrorKind::PermissionDenied => IpcResultCode::ACCESS_DENIED,
+        _ => IpcResultCode::STORAGE_FAILURE,
+    }
 }
 
 fn validate_list_limit(limit: usize) -> Result<(), IpcResultCode> {

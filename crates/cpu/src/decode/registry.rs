@@ -34,6 +34,8 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0040..=0x0000_0042
                     | 0x0000_0044..=0x0000_0045
                     | 0x0000_0048..=0x0000_004b
+                    | 0x0000_004e..=0x0000_0058
+                    | 0x0000_0059..=0x0000_005d
             ) =>
         {
             IMPLEMENTED
@@ -81,7 +83,13 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
         _ => MISSING,
     };
     if matches!(state, ExecutionState::A64)
-        && matches!(id, 0x0000_000c..=0x0000_000f | 0x0000_0010..=0x0000_001d | 0x0000_0022..=0x0000_002a)
+        && matches!(
+            id,
+            0x0000_000c..=0x0000_000f
+                | 0x0000_0010..=0x0000_001d
+                | 0x0000_0022..=0x0000_002a
+                | 0x0000_004c..=0x0000_004d
+        )
     {
         interpreter = ENCODING_DEPENDENT;
     }
@@ -210,9 +218,38 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             AllocationStatus::Reserved("invalid SIMD pair transfer size")
         }
         0x0000_0031 => validate_a64_simd_add_sub(bits),
-        0x0000_0038 if bits & 0x9f20_8400 == 0x0e20_8400 => validate_a64_simd_add_sub(bits),
+        0x0000_0038 if bits & 0x9f20_fc00 == 0x0e20_8400 => validate_a64_simd_add_sub(bits),
+        0x0000_0038 if bits & 0xbf20_fc00 == 0x0e20_bc00 => validate_a64_simd_add_pairwise(bits),
+        0x0000_0038
+            if matches!(
+                bits & 0xbf20_fc00,
+                0x0e20_a400 | 0x0e20_ac00 | 0x2e20_a400 | 0x2e20_ac00
+            ) =>
+        {
+            validate_a64_simd_min_max_pairwise(bits)
+        }
+        0x0000_0038 if is_a64_simd_integer_compare(bits) => validate_a64_simd_integer_compare(bits),
+        0x0000_0038 if is_a64_simd_integer_compare_zero(bits) => {
+            validate_a64_simd_integer_compare(bits)
+        }
         0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
         0x0000_004b => validate_a64_umov(bits),
+        0x0000_004e..=0x0000_0058 => validate_a64_simd_integer_compare(bits),
+        0x0000_0059 => validate_a64_simd_add_pairwise(bits),
+        0x0000_005a..=0x0000_005d => validate_a64_simd_min_max_pairwise(bits),
+        0x0000_004c | 0x0000_004d => {
+            // Complete opcode allocation for the Advanced SIMD multiple-structures
+            // class, Arm ARM DDI 0602 (2025-12):
+            // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions
+            let opcode = (bits >> 12) & 0xf;
+            if matches!(opcode, 0 | 2 | 4 | 6 | 7 | 8 | 10) {
+                AllocationStatus::Allocated
+            } else {
+                AllocationStatus::Unallocated(
+                    "unallocated Advanced SIMD multiple-structures opcode",
+                )
+            }
+        }
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
             let size = (bits >> 30) as u8;
             let opc = ((bits >> 22) & 3) as u8;
@@ -234,6 +271,52 @@ fn validate_a64_simd_add_sub(bits: u32) -> AllocationStatus {
     } else {
         AllocationStatus::Allocated
     }
+}
+
+fn validate_a64_simd_add_pairwise(bits: u32) -> AllocationStatus {
+    // ADDP vector arrangements, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
+    if (bits >> 22) & 3 == 3 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit SIMD vector cannot contain a pair of 64-bit lanes")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn validate_a64_simd_min_max_pairwise(bits: u32) -> AllocationStatus {
+    // Pairwise integer minimum/maximum vector arrangements,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMAXP--Signed-Maximum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMINP--Signed-Minimum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMAXP--Unsigned-Maximum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMINP--Unsigned-Minimum-Pairwise--vector--
+    if (bits >> 22) & 3 == 3 {
+        AllocationStatus::Reserved("pairwise integer minimum/maximum has no 64-bit lane form")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn validate_a64_simd_integer_compare(bits: u32) -> AllocationStatus {
+    if (bits >> 22) & 3 == 3 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit SIMD vector cannot contain a 64-bit lane")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn is_a64_simd_integer_compare(bits: u32) -> bool {
+    matches!(
+        bits & 0xbf20_fc00,
+        0x0e20_3400 | 0x2e20_3400 | 0x0e20_3c00 | 0x2e20_3c00 | 0x0e20_8c00 | 0x2e20_8c00
+    )
+}
+
+fn is_a64_simd_integer_compare_zero(bits: u32) -> bool {
+    matches!(
+        bits & 0xbf3f_fc00,
+        0x0e20_8800 | 0x2e20_8800 | 0x0e20_9800 | 0x2e20_9800 | 0x0e20_a800
+    )
 }
 
 fn validate_a64_umov(bits: u32) -> AllocationStatus {
@@ -308,6 +391,11 @@ mod tests {
             0x0e10_3c00, // UMOV with an unsupported 128-bit element
             0x3c22_0820, // SIMD register offset with a reserved extension
             0x0ee2_8420, // SIMD ADD with a reserved one-lane 64-bit arrangement
+            0x0ee2_bc20, // ADDP with a reserved one-lane 64-bit arrangement
+            0x6ee2_a420, // UMAXP has no 64-bit lane form
+            0x0ee1_3420, // SIMD compare with a reserved one-lane 64-bit arrangement
+            0x0ee0_8820, // SIMD zero compare with a reserved one-lane 64-bit arrangement
+            0x4c40_1020, // unallocated SIMD multiple-structures opcode
         ];
         for bits in cases {
             let result = classify(ExecutionState::A64, InstructionEncoding::from_u32(bits));

@@ -2,6 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
+use std::fs::File;
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -162,6 +165,20 @@ mod ipc_session_tests {
         assert!(session.close_object(object_id));
         assert!(session.object(object_id).is_none());
         assert!(!session.close_object(IPC_ROOT_OBJECT_ID));
+    }
+
+    #[test]
+    fn cloned_session_shares_domain_conversion_and_child_objects() {
+        let session = IpcSession::new(IpcService::FileSystem);
+        assert_eq!(session.convert_to_domain(), IPC_ROOT_OBJECT_ID);
+        let cloned = session.clone();
+        assert!(cloned.is_domain());
+
+        let object = HandleObject::new(ThreadObject::new(11));
+        let object_id = cloned.insert_object(object.clone()).unwrap();
+        assert!(session.object(object_id).unwrap().same_identity(&object));
+        assert!(session.close_object(object_id));
+        assert!(cloned.object(object_id).is_none());
     }
 }
 
@@ -738,6 +755,116 @@ impl ReadOnlyFileSystem {
 
     pub(crate) const fn mount(&self) -> &ReadOnlyMount {
         &self.mount
+    }
+}
+
+/// Host-directory filesystem exposed as the removable SD card.
+///
+/// Guest paths are normalized by the semantic IPC layer. Resolution rejects
+/// every symbolic-link component so a guest cannot escape the configured root
+/// through host filesystem indirection.
+#[derive(Clone, Debug)]
+pub struct HostDirectoryFileSystem {
+    root: Arc<PathBuf>,
+}
+
+impl HostDirectoryFileSystem {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+        }
+    }
+
+    pub(crate) fn resolve_existing(&self, guest_path: &str) -> io::Result<PathBuf> {
+        let mut resolved = self.root.as_ref().clone();
+        for component in guest_path.trim_start_matches('/').split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            resolved.push(component);
+            let metadata = std::fs::symlink_metadata(&resolved)?;
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "symbolic links are not exposed through sdmc:",
+                ));
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub(crate) fn resolve_new(&self, guest_path: &str) -> io::Result<PathBuf> {
+        let (parent, name) = guest_path.rsplit_once('/').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SD-card path has no parent")
+        })?;
+        if name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot create the SD-card root",
+            ));
+        }
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let mut resolved = self.resolve_existing(parent)?;
+        resolved.push(name);
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "SD-card entry already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(resolved)
+    }
+}
+
+/// Writable host file opened through the configured SD-card root.
+#[derive(Debug)]
+pub struct HostFile {
+    path: Arc<str>,
+    file: Mutex<File>,
+    readable: bool,
+    writable: bool,
+    allow_append: bool,
+}
+
+impl HostFile {
+    pub(crate) fn new(
+        path: Arc<str>,
+        file: File,
+        readable: bool,
+        writable: bool,
+        allow_append: bool,
+    ) -> Self {
+        Self {
+            path,
+            file: Mutex::new(file),
+            readable,
+            writable,
+            allow_append,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) const fn readable(&self) -> bool {
+        self.readable
+    }
+
+    pub(crate) const fn writable(&self) -> bool {
+        self.writable
+    }
+
+    pub(crate) const fn allows_append(&self) -> bool {
+        self.allow_append
+    }
+
+    pub(crate) fn file(&self) -> &Mutex<File> {
+        &self.file
     }
 }
 

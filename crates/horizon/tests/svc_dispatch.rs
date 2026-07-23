@@ -1837,6 +1837,77 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
 }
 
 #[test]
+fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain() {
+    let (_directory, mut process) =
+        fixture_process(&[svc(0x21), svc(0x21), svc(0x21), svc(0x21), svc(0x21)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let source_handle = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let source_identity = process.handles().get(source_handle).unwrap().clone();
+    let tls = process.main_thread().tls_base;
+
+    let mut convert = [0_u8; 0x100];
+    put_u32(&mut convert, 0, 5);
+    put_u32(&mut convert, 4, 8);
+    put_u32(&mut convert, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert);
+    state(&mut process).write_w(x(0), source_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut clone = convert;
+    put_u32(&mut clone, 24, 2);
+    write_guest_bytes(&process, tls, &clone);
+    state(&mut process).write_w(x(0), source_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(8).unwrap()),
+        1 << 5
+    );
+    let cloned_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert_ne!(cloned_handle, source_handle);
+    let cloned_identity = process.handles().get(cloned_handle).unwrap();
+    assert!(!source_identity.same_identity(cloned_identity));
+    assert!(
+        process
+            .handles()
+            .get_as::<nixe_horizon::IpcSession>(cloned_handle)
+            .is_some()
+    );
+
+    let mut query_pointer_size = convert;
+    put_u32(&mut query_pointer_size, 24, 3);
+    write_guest_bytes(&process, tls, &query_pointer_size);
+    state(&mut process).write_w(x(0), cloned_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    write_guest_bytes(&process, tls, &[2, 0, 0, 0, 0, 0, 0, 0]);
+    state(&mut process).write_w(x(0), cloned_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert!(process.handles().get(cloned_handle).is_none());
+
+    write_guest_bytes(&process, tls, &query_pointer_size);
+    state(&mut process).write_w(x(0), source_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+}
+
+#[test]
 fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     let (_directory, mut process) = fixture_process_with_romfs(
         &[

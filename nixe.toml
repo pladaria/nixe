@@ -8,6 +8,11 @@ paths = ["./roms/"]
 # When false, only files directly inside each configured directory are scanned.
 recursive_scan = true
 
+[filesystem]
+# Host directory exposed to the guest as the removable sdmc: filesystem.
+# Relative paths are resolved from the directory containing this file.
+sd_card = "./storage/sdmc"
+
 [system]
 # Languages tried for title metadata, in descending preference order. If a
 # title lacks the first language, the next available configured language is
@@ -29,10 +34,12 @@ timezone = "Europe/Madrid"
 # fixed_unix_timestamp = 0
 
 [diagnostics]
+# Minimum severity emitted by the CLI logger.
+log_level = "debug"
 # Diagnostic context policy. "detailed" retains bounded local debugging
 # context; "sanitized" omits local-only detail and is safer for shared reports.
 report_detail = "detailed"
 # Opt-in history of recently executed guest instructions. When enabled, the
 # runtime retains at most 64 entries. Detailed mode includes bounded
 # disassembly; sanitized mode retains only sequence, guest location and bits.
-instruction_trace = true
+instruction_trace = false

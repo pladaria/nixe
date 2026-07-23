@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_004b => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -204,6 +204,10 @@ mod tests {
             (0x4e08_3c01, "simd-unsigned-move-to-general"),
             (0xad01_0060, "fp-simd-load-store-pair"),
             (0x4e20_8400, "simd-integer"),
+            (0x4e32_be31, "simd-add-pairwise"),
+            (0x6e31_a631, "simd-unsigned-max-pairwise"),
+            (0x6e21_3ca3, "simd-compare-unsigned-higher-same"),
+            (0x4e20_9823, "simd-compare-zero-equal"),
             (0x1e61_2800, "fp-scalar-two-source"),
             (0x1e60_4000, "fp-scalar-move"),
             (0x1e61_2000, "fp-compare-register"),
@@ -214,6 +218,11 @@ mod tests {
             (0x3dc0_0000, "fp-simd-load-store-unsigned"),
             (0x3c40_0400, "fp-simd-load-store-post-index"),
             (0x9c00_0000, "fp-simd-load-literal"),
+            (0x4c40_a020, "simd-load-store-multiple-structures"),
+            (
+                0x4cdf_a041,
+                "simd-load-store-multiple-structures-post-index",
+            ),
         ];
         for (bits, expected) in cases {
             assert_eq!(

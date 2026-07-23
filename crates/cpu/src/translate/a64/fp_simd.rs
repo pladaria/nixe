@@ -21,7 +21,11 @@ pub(super) fn lift(
         FpSimdInstruction::DuplicateGeneral(_)
         | FpSimdInstruction::MemoryPair(_)
         | FpSimdInstruction::MoveImmediate32(_)
-        | FpSimdInstruction::UnsignedMoveToGeneral(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::UnsignedMoveToGeneral(_)
+        | FpSimdInstruction::MemoryMultipleStructures(_)
+        | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+        | FpSimdInstruction::IntegerCompare(_)
+        | FpSimdInstruction::IntegerPairwise(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)

@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_horizon::{HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport};
+use nixe_horizon::{
+    DirectoryEntryKind, HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport,
+    IpcRequest, IpcResponse, IpcResultCode, IpcService,
+};
 use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
     ProcessExecutionStatus, ProcessExitCause,
@@ -127,14 +130,185 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 }
 
 #[test]
-fn contemporary_libnx_nro_initializes_hid_and_time_then_reaches_libc_time_setup() {
+fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let nro_path = directory.path().join("minimal-a64.nro");
+    fs::write(
+        &nro_path,
+        materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture")),
+    )
+    .unwrap();
+    let sd_card = directory.path().join("sdmc");
+    fs::create_dir(&sd_card).unwrap();
+    fs::write(sd_card.join("hello.txt"), b"hello from sdmc").unwrap();
+    fs::create_dir(sd_card.join("switch")).unwrap();
+
+    let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
+    let mut process = ProcessBuilder::new()
+        .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
+        .build(&plan)
+        .unwrap();
+    let fsp = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(filesystem) = process
+        .dispatch_ipc(fsp, IpcRequest::OpenSdCardFileSystem)
+        .unwrap()
+    else {
+        panic!("opening sdmc: must return a filesystem object");
+    };
+    let IpcResponse::Handle(root) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenDirectory {
+                path: "/".into(),
+                mode: 3,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening the SD-card root must return a directory object");
+    };
+    let IpcResponse::DirectoryEntries(entries) = process
+        .dispatch_ipc(root, IpcRequest::ReadDirectory { max_entries: 8 })
+        .unwrap()
+    else {
+        panic!("reading the SD-card root must return directory entries");
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name(), entry.kind()))
+            .collect::<Vec<_>>(),
+        [
+            ("hello.txt", DirectoryEntryKind::File),
+            ("switch", DirectoryEntryKind::Directory),
+        ]
+    );
+
+    let IpcResponse::Handle(file) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/hello.txt".into(),
+                mode: 1,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening an SD-card file must return a file object");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                file,
+                IpcRequest::ReadFile {
+                    offset: 0,
+                    size: 64,
+                },
+            )
+            .unwrap(),
+        IpcResponse::Data(b"hello from sdmc".to_vec())
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                filesystem,
+                IpcRequest::CreateDirectory {
+                    path: "/config".into(),
+                },
+            )
+            .unwrap(),
+        IpcResponse::None
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                filesystem,
+                IpcRequest::CreateFile {
+                    path: "/config/settings.bin".into(),
+                    size: 4,
+                    option: 0,
+                },
+            )
+            .unwrap(),
+        IpcResponse::None
+    );
+    let IpcResponse::Handle(settings) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/config/settings.bin".into(),
+                mode: 3,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening a writable SD-card file must return a file object");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                settings,
+                IpcRequest::WriteFile {
+                    offset: 1,
+                    data: b"xyz".to_vec(),
+                    flush: true,
+                },
+            )
+            .unwrap(),
+        IpcResponse::None
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(settings, IpcRequest::ReadFile { offset: 0, size: 4 },)
+            .unwrap(),
+        IpcResponse::Data(b"\0xyz".to_vec())
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(settings, IpcRequest::SetFileSize { size: 2 })
+            .unwrap(),
+        IpcResponse::None
+    );
+    assert_eq!(
+        fs::read(sd_card.join("config/settings.bin")).unwrap(),
+        b"\0x"
+    );
+    assert_eq!(
+        process.dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/../outside".into(),
+                mode: 1,
+            },
+        ),
+        Err(IpcResultCode::INVALID_ARGUMENT)
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(directory.path(), sd_card.join("escape")).unwrap();
+        assert_eq!(
+            process.dispatch_ipc(
+                filesystem,
+                IpcRequest::OpenFile {
+                    path: "/escape/nixe.toml".into(),
+                    mode: 1,
+                },
+            ),
+            Err(IpcResultCode::ACCESS_DENIED)
+        );
+    }
+}
+
+#[test]
+fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initialization() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    let reached_libc_time_setup = loop {
+    let reached_video_initialization = loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
@@ -166,18 +340,13 @@ fn contemporary_libnx_nro_initializes_hid_and_time_then_reaches_libc_time_setup(
                     ),
                 }
             }
-            ExecutionStop::UnallocatedEncoding { error }
-                if error.instruction.encoding.bits() == 0x4cdf_a041 =>
-            {
-                break true;
-            }
-            stop => panic!("libnx startup stopped before the libc time-setup frontier: {stop}"),
+            stop => panic!("libnx startup stopped before video initialization: {stop}"),
         }
     };
 
     assert!(
-        reached_libc_time_setup && executed > 9_000,
-        "libnx did not initialize HID/time and reach libc time setup: executed={executed}"
+        reached_video_initialization && executed > 10_800,
+        "libnx did not initialize the filesystem and reach video initialization: executed={executed}"
     );
     let coverage = dispatcher.coverage();
     for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {

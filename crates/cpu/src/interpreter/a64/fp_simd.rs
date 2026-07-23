@@ -1,6 +1,9 @@
 use crate::{
     address::GuestVirtualAddress,
-    decode::{DecodedOpcode, a64::fp_simd::Instruction},
+    decode::{
+        DecodedOpcode,
+        a64::fp_simd::{BitwiseOperation, Instruction, IntegerComparison, PairwiseOperation},
+    },
     location::DecodedInstruction,
     memory::{
         CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
@@ -40,6 +43,36 @@ pub(super) fn execute(
         }
         Instruction::Integer(_) => {
             integer_add_sub(state, fields);
+            None
+        }
+        Instruction::Bitwise(_) => {
+            bitwise(
+                state,
+                fields,
+                fields
+                    .bitwise_operation
+                    .expect("normalized SIMD bitwise operation"),
+            );
+            None
+        }
+        Instruction::IntegerCompare(_) => {
+            integer_compare(
+                state,
+                fields,
+                fields
+                    .integer_comparison
+                    .expect("normalized SIMD integer comparison"),
+            );
+            None
+        }
+        Instruction::IntegerPairwise(_) => {
+            integer_pairwise(
+                state,
+                fields,
+                fields
+                    .pairwise_operation
+                    .expect("normalized SIMD pairwise operation"),
+            );
             None
         }
         Instruction::MemoryUnsigned(_)
@@ -121,6 +154,26 @@ pub(super) fn execute(
                 size,
             ))
         }
+        Instruction::MemoryMultipleStructures(_)
+        | Instruction::MemoryMultipleStructuresPostIndex(_) => {
+            let Some(memory) = context.memory() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            let Some(register_count) = ld1_st1_register_count(fields.structure_opcode) else {
+                return Err(super::super::unsupported(decoded));
+            };
+            Some(vector_multiple_structures(
+                memory,
+                context.process().address_space_id(),
+                state,
+                fields,
+                register_count,
+                matches!(
+                    instruction,
+                    Instruction::MemoryMultipleStructuresPostIndex(_)
+                ),
+            ))
+        }
         _ => return Err(super::super::unsupported(decoded)),
     };
     if let Some(Err(fault)) = result {
@@ -169,6 +222,55 @@ fn vector_pair(
     }
     if matches!(fields.mode, 1 | 3) {
         super::write(state, fields.rn, 64, true, base.wrapping_add_signed(offset));
+    }
+    Ok(())
+}
+
+// LD1/ST1 multiple-structures register-list semantics, Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--multiple-structures---Load-multiple-single-element-structures-to-one--two--three--or-four-registers-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--multiple-structures---Store-multiple-single-element-structures-from-one--two--three--or-four-registers-
+fn ld1_st1_register_count(opcode: u8) -> Option<u8> {
+    match opcode {
+        0b0010 => Some(4),
+        0b0110 => Some(3),
+        0b1010 => Some(2),
+        0b0111 => Some(1),
+        _ => None,
+    }
+}
+
+fn vector_multiple_structures(
+    memory: &dyn CpuMemory,
+    address_space: crate::address::AddressSpaceId,
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    register_count: u8,
+    post_index: bool,
+) -> MemoryStep {
+    let size = if fields.vector_128 {
+        MemoryAccessSize::Quadword
+    } else {
+        MemoryAccessSize::Doubleword
+    };
+    let base = read(state, fields.rn, 64, true);
+    let mut address = GuestVirtualAddress::new(base);
+    for index in 0..register_count {
+        let register = fields.rd.wrapping_add(index) & 31;
+        if fields.load {
+            let value = read_vector(memory, address_space, address, size)?;
+            assert!(state.set_vector(register, value));
+        } else {
+            write_vector(memory, address_space, address, size, state, register)?;
+        }
+        address = address.wrapping_add(size.bytes() as u64);
+    }
+    if post_index {
+        let offset = if fields.rm == 31 {
+            u64::from(register_count) * size.bytes() as u64
+        } else {
+            read(state, fields.rm, 64, false)
+        };
+        super::write(state, fields.rn, 64, true, base.wrapping_add(offset));
     }
     Ok(())
 }
@@ -244,6 +346,166 @@ fn integer_add_sub(state: &mut A64State, fields: crate::decode::a64::fp_simd::Op
             lhs_lane.wrapping_add(rhs_lane)
         } & lane_mask;
         result |= lane << shift;
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// The lower half of the result reduces adjacent pairs from Vn and the upper
+// half reduces adjacent pairs from Vm. ADDP wraps at the element width, while
+// the minimum/maximum forms compare signed or unsigned elements as specified
+// by Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMAXP--Signed-Maximum-Pairwise--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMINP--Signed-Minimum-Pairwise--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMAXP--Unsigned-Maximum-Pairwise--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMINP--Unsigned-Minimum-Pairwise--vector--
+fn integer_pairwise(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    operation: PairwiseOperation,
+) {
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_bits = 8_u8 << fields.opc;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let first = state
+        .vector(fields.rn)
+        .expect("normalized SIMD first source register");
+    let second = state
+        .vector(fields.rm)
+        .expect("normalized SIMD second source register");
+    let lanes_per_source = vector_bits / u32::from(lane_bits);
+    let mut result = 0_u128;
+
+    for (source_index, source) in [first, second].into_iter().enumerate() {
+        for pair in 0..(lanes_per_source / 2) {
+            let first_shift = pair * 2 * u32::from(lane_bits);
+            let second_shift = first_shift + u32::from(lane_bits);
+            let lhs = (source >> first_shift) & lane_mask;
+            let rhs = (source >> second_shift) & lane_mask;
+            let reduced = match operation {
+                PairwiseOperation::Add => lhs.wrapping_add(rhs) & lane_mask,
+                PairwiseOperation::SignedMaximum => {
+                    if sign_extend(lhs as u64, lane_bits) >= sign_extend(rhs as u64, lane_bits) {
+                        lhs
+                    } else {
+                        rhs
+                    }
+                }
+                PairwiseOperation::SignedMinimum => {
+                    if sign_extend(lhs as u64, lane_bits) <= sign_extend(rhs as u64, lane_bits) {
+                        lhs
+                    } else {
+                        rhs
+                    }
+                }
+                PairwiseOperation::UnsignedMaximum => lhs.max(rhs),
+                PairwiseOperation::UnsignedMinimum => lhs.min(rhs),
+            };
+            let destination_lane = source_index as u32 * (lanes_per_source / 2) + pair;
+            result |= reduced << (destination_lane * u32::from(lane_bits));
+        }
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// Whole-vector operation and destination-mask rules for the Advanced SIMD
+// bitwise family, Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/AND--vector---Bitwise-AND--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIC--vector---Bitwise-bit-Clear--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ORR--vector---Bitwise-OR--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ORN--vector---Bitwise-inclusive-OR-NOT--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/EOR--vector---Bitwise-exclusive-OR--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BSL--Bitwise-Select-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIT--Bitwise-Insert-if-True-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIF--Bitwise-Insert-if-False-
+fn bitwise(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    operation: BitwiseOperation,
+) {
+    let first = state
+        .vector(fields.rn)
+        .expect("normalized SIMD source register");
+    let second = state
+        .vector(fields.rm)
+        .expect("normalized SIMD source register");
+    let destination = state
+        .vector(fields.rd)
+        .expect("normalized SIMD destination register");
+    let result = match operation {
+        BitwiseOperation::And => first & second,
+        BitwiseOperation::BitClear => first & !second,
+        BitwiseOperation::Or => first | second,
+        BitwiseOperation::OrNot => first | !second,
+        BitwiseOperation::ExclusiveOr => first ^ second,
+        BitwiseOperation::Select => (destination & first) | (!destination & second),
+        BitwiseOperation::InsertIfTrue => (destination & !second) | (first & second),
+        BitwiseOperation::InsertIfFalse => (destination & second) | (first & !second),
+    };
+    let active_mask = if fields.vector_128 {
+        u128::MAX
+    } else {
+        u128::from(u64::MAX)
+    };
+    assert!(state.set_vector(fields.rd, result & active_mask));
+}
+
+// Per-lane result and signedness rules for the Advanced SIMD register
+// comparisons, Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGT--register---Compare-signed-greater-than--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGE--register---Compare-signed-greater-than-or-equal--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMHI--register---Compare-unsigned-higher--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMHS--register---Compare-unsigned-higher-or-same--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMEQ--register---Compare-bitwise-equal--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMTST--Compare-bitwise-test-bits-nonzero--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGT--zero---Compare-signed-greater-than-zero--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGE--zero---Compare-signed-greater-than-or-equal-to-zero--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMEQ--zero---Compare-bitwise-equal-to-zero--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLE--Compare-signed-less-than-or-equal-to-zero--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLT--Compare-signed-less-than-zero--vector--
+fn integer_compare(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    comparison: IntegerComparison,
+) {
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_bits = 8_u8 << fields.opc;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized SIMD source register");
+    let rhs = if fields.compare_with_zero {
+        0
+    } else {
+        state
+            .vector(fields.rm)
+            .expect("normalized SIMD source register")
+    };
+    let mut result = 0_u128;
+    for shift in (0..vector_bits).step_by(usize::from(lane_bits)) {
+        let lhs_lane = (lhs >> shift) & lane_mask;
+        let rhs_lane = (rhs >> shift) & lane_mask;
+        let matches = match comparison {
+            IntegerComparison::SignedGreaterThan => {
+                sign_extend(lhs_lane as u64, lane_bits) > sign_extend(rhs_lane as u64, lane_bits)
+            }
+            IntegerComparison::UnsignedGreaterThan => lhs_lane > rhs_lane,
+            IntegerComparison::SignedGreaterThanOrEqual => {
+                sign_extend(lhs_lane as u64, lane_bits) >= sign_extend(rhs_lane as u64, lane_bits)
+            }
+            IntegerComparison::UnsignedGreaterThanOrEqual => lhs_lane >= rhs_lane,
+            IntegerComparison::SignedLessThan => {
+                sign_extend(lhs_lane as u64, lane_bits) < sign_extend(rhs_lane as u64, lane_bits)
+            }
+            IntegerComparison::SignedLessThanOrEqual => {
+                sign_extend(lhs_lane as u64, lane_bits) <= sign_extend(rhs_lane as u64, lane_bits)
+            }
+            IntegerComparison::NonzeroBitTest => lhs_lane & rhs_lane != 0,
+            IntegerComparison::Equal => lhs_lane == rhs_lane,
+        };
+        if matches {
+            result |= lane_mask << shift;
+        }
     }
     assert!(state.set_vector(fields.rd, result));
 }

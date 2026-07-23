@@ -126,7 +126,13 @@ fn filesystem_operations_require_effective_content_data_read_permission() {
         .transfer_to(denied.handles_mut(), filesystem)
         .unwrap();
     assert_eq!(
-        denied.dispatch_ipc(transferred, IpcRequest::OpenDirectory { path: "/".into() }),
+        denied.dispatch_ipc(
+            transferred,
+            IpcRequest::OpenDirectory {
+                path: "/".into(),
+                mode: 3,
+            },
+        ),
         Err(IpcResultCode::ACCESS_DENIED)
     );
 
@@ -342,7 +348,13 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
         panic!("filesystem service must return a filesystem handle");
     };
     let IpcResponse::Handle(root) = process
-        .dispatch_ipc(primary, IpcRequest::OpenDirectory { path: "/".into() })
+        .dispatch_ipc(
+            primary,
+            IpcRequest::OpenDirectory {
+                path: "/".into(),
+                mode: 3,
+            },
+        )
         .unwrap()
     else {
         panic!("opening the root must return a directory handle");
@@ -375,6 +387,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
             primary,
             IpcRequest::OpenFile {
                 path: "/replace".into(),
+                mode: 1,
             },
         )
         .unwrap()
@@ -456,6 +469,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
             add_on_filesystem,
             IpcRequest::OpenFile {
                 path: "/revision".into(),
+                mode: 1,
             },
         )
         .unwrap()

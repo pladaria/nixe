@@ -1,5 +1,7 @@
 //! Process-local read-only filesystem namespace derived from a launch plan.
 
+use std::path::{Path, PathBuf};
+
 use nixe_loader_executable::{EffectiveNpdmPolicy, FileSystemPermissions};
 use nixe_loader_title::TitleId;
 
@@ -10,11 +12,12 @@ use crate::{AddOnContent, LaunchPlan, ReadOnlyMount};
 pub struct ProcessMountNamespace {
     primary: Option<ReadOnlyMount>,
     add_ons: Box<[AddOnContent]>,
+    sd_card_root: Option<PathBuf>,
     policy: Option<EffectiveNpdmPolicy>,
 }
 
 impl ProcessMountNamespace {
-    pub(crate) fn from_launch_plan(plan: &LaunchPlan) -> Self {
+    pub(crate) fn from_launch_plan(plan: &LaunchPlan, sd_card_root: Option<PathBuf>) -> Self {
         let policy = plan.effective_policy().cloned();
         let add_ons = plan
             .add_ons()
@@ -26,6 +29,7 @@ impl ProcessMountNamespace {
         Self {
             primary: plan.primary_file_system().cloned(),
             add_ons,
+            sd_card_root,
             policy,
         }
     }
@@ -38,6 +42,11 @@ impl ProcessMountNamespace {
     /// Returns only add-on views authorized by the effective NPDM policy.
     pub fn add_ons(&self) -> &[AddOnContent] {
         &self.add_ons
+    }
+
+    /// Returns the canonical host directory exposed as `sdmc:`, when present.
+    pub fn sd_card_root(&self) -> Option<&Path> {
+        self.sd_card_root.as_deref()
     }
 
     /// Returns the immutable authorization policy associated with these mounts.
@@ -78,8 +87,21 @@ impl ProcessMountNamespace {
         })
     }
 
+    /// Returns whether the process may access the removable SD-card filesystem.
+    ///
+    /// Permission identity follows Atmosphère's pinned filesystem access bits:
+    /// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libstratosphere/include/stratosphere/fssrv/impl/fssrv_access_control_bits.hpp
+    pub fn allows_sd_card_access(&self) -> bool {
+        self.policy.as_ref().is_none_or(|policy| {
+            let permissions = policy.filesystem().permissions();
+            permissions.contains(FileSystemPermissions::SD_CARD)
+                || permissions.contains(FileSystemPermissions::FULL_PERMISSION)
+        })
+    }
+
     pub(crate) fn mount_count(&self) -> usize {
         usize::from(self.primary.is_some())
+            + usize::from(self.sd_card_root.is_some())
             + self
                 .add_ons
                 .iter()

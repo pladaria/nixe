@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 
 use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::ir::block::IrBlock;
@@ -804,6 +805,7 @@ pub struct ProcessBuilder {
     diagnostics: crate::DiagnosticsPolicy,
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
+    sd_card_root: Option<PathBuf>,
 }
 
 impl ProcessBuilder {
@@ -829,6 +831,13 @@ impl ProcessBuilder {
     #[must_use]
     pub fn with_virtual_clock(mut self, virtual_clock: crate::VirtualClock) -> Self {
         self.virtual_clock = virtual_clock;
+        self
+    }
+
+    /// Selects the canonical host directory exposed to the guest as `sdmc:`.
+    #[must_use]
+    pub fn with_sd_card_root(mut self, root: PathBuf) -> Self {
+        self.sd_card_root = Some(root);
         self
     }
 
@@ -1036,7 +1045,7 @@ impl ProcessBuilder {
             modules: modules.into_boxed_slice(),
             entry_module,
             main_thread,
-            mounts: crate::ProcessMountNamespace::from_launch_plan(plan),
+            mounts: crate::ProcessMountNamespace::from_launch_plan(plan, self.sd_card_root.clone()),
             handles,
             execution: crate::execution::ProcessExecutionControl::new(
                 self.diagnostics,

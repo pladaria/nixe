@@ -105,6 +105,7 @@ mod tests {
     #[test]
     fn runtime_normalizes_the_application_configuration() {
         let policy = DiagnosticsPolicy::from(nixe_config::DiagnosticsConfig {
+            log_level: nixe_config::DiagnosticLogLevel::Trace,
             report_detail: nixe_config::DiagnosticReportDetail::Sanitized,
             instruction_trace: true,
         });
