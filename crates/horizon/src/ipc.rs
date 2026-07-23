@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use nixe_loader_title::TitleId;
 
-use nixe_runtime::{HandleTable, ProcessMountNamespace, RunnableProcess};
+use nixe_runtime::{
+    EventObject, HandleObject, HandleTable, ProcessMountNamespace, RunnableProcess,
+};
 
 use crate::{
     DirectoryEntry, DirectoryEntryKind, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
@@ -93,6 +95,7 @@ pub struct AddOnContentEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IpcRequest {
+    SetCurrentProcess,
     OpenPrimaryFileSystem,
     OpenFile {
         path: String,
@@ -110,10 +113,19 @@ pub enum IpcRequest {
         max_entries: usize,
     },
     GetAddOnContentCount,
+    GetIndexedAddOnContentCount,
     ListAddOnContent {
         offset: usize,
         max_entries: usize,
     },
+    ListIndexedAddOnContent {
+        offset: usize,
+        max_entries: usize,
+    },
+    PrepareAddOnContent {
+        horizon_index: u32,
+    },
+    GetAddOnContentListChangedEvent,
     OpenAddOnContent {
         title_id: TitleId,
         mount_index: usize,
@@ -126,6 +138,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     None,
     Handle(u32),
+    Event(u32),
     Size(u64),
     Data(Vec<u8>),
     DirectoryEntries(Vec<DirectoryEntry>),
@@ -158,15 +171,36 @@ impl IpcDispatcher {
         target: u32,
         request: IpcRequest,
     ) -> Result<IpcResponse, IpcResultCode> {
-        let object = handles.get(target).ok_or(IpcResultCode::INVALID_HANDLE)?;
-        if let Some(session) = object.downcast_ref::<IpcSession>().copied() {
+        let object = handles
+            .get(target)
+            .cloned()
+            .ok_or(IpcResultCode::INVALID_HANDLE)?;
+        Self::dispatch_object(mounts, handles, &object, request)
+    }
+
+    pub(crate) fn dispatch_session(
+        mounts: &ProcessMountNamespace,
+        handles: &mut HandleTable,
+        session: &IpcSession,
+        request: IpcRequest,
+    ) -> Result<IpcResponse, IpcResultCode> {
+        dispatch_session(mounts, handles, session, request)
+    }
+
+    pub(crate) fn dispatch_object(
+        mounts: &ProcessMountNamespace,
+        handles: &mut HandleTable,
+        object: &HandleObject,
+        request: IpcRequest,
+    ) -> Result<IpcResponse, IpcResultCode> {
+        if let Some(session) = object.downcast_ref::<IpcSession>() {
             dispatch_session(mounts, handles, session, request)
         } else if let Some(filesystem) = object.downcast_ref::<ReadOnlyFileSystem>().cloned() {
-            dispatch_filesystem(handles, &filesystem, request)
+            dispatch_filesystem(mounts, handles, &filesystem, request)
         } else if let Some(file) = object.downcast_ref::<ReadOnlyFile>().cloned() {
-            dispatch_file(&file, request)
+            dispatch_file(mounts, &file, request)
         } else if let Some(directory) = object.downcast_ref::<ReadOnlyDirectory>().cloned() {
-            dispatch_directory(&directory, request)
+            dispatch_directory(mounts, &directory, request)
         } else {
             Err(IpcResultCode::INVALID_COMMAND)
         }
@@ -176,11 +210,16 @@ impl IpcDispatcher {
 fn dispatch_session(
     mounts: &ProcessMountNamespace,
     handles: &mut HandleTable,
-    session: IpcSession,
+    session: &IpcSession,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
+    if !mounts.allows_service(session.service().name()) {
+        return Err(IpcResultCode::ACCESS_DENIED);
+    }
     match (session.service(), request) {
+        (IpcService::FileSystem, IpcRequest::SetCurrentProcess) => Ok(IpcResponse::None),
         (IpcService::FileSystem, IpcRequest::OpenPrimaryFileSystem) => {
+            require_content_data_read(mounts)?;
             let mount = mounts
                 .primary()
                 .cloned()
@@ -190,6 +229,16 @@ fn dispatch_session(
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
             u64::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
         )),
+        (IpcService::AddOnContent, IpcRequest::GetIndexedAddOnContentCount) => {
+            let count = mounts
+                .add_ons()
+                .iter()
+                .filter(|add_on| add_on.horizon_index().is_some())
+                .count();
+            Ok(IpcResponse::Size(
+                u64::try_from(count).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
+            ))
+        }
         (
             IpcService::AddOnContent,
             IpcRequest::ListAddOnContent {
@@ -217,11 +266,48 @@ fn dispatch_session(
         }
         (
             IpcService::AddOnContent,
+            IpcRequest::ListIndexedAddOnContent {
+                offset,
+                max_entries,
+            },
+        ) => {
+            validate_list_limit(max_entries)?;
+            let entries = mounts
+                .add_ons()
+                .iter()
+                .filter(|add_on| add_on.horizon_index().is_some())
+                .skip(offset)
+                .take(max_entries)
+                .map(add_on_entry)
+                .collect::<Result<Vec<_>, IpcResultCode>>()?;
+            Ok(IpcResponse::AddOnContentEntries(entries))
+        }
+        (IpcService::AddOnContent, IpcRequest::PrepareAddOnContent { horizon_index }) => {
+            if mounts
+                .add_ons()
+                .iter()
+                .any(|add_on| add_on.horizon_index() == Some(horizon_index))
+            {
+                Ok(IpcResponse::None)
+            } else {
+                Err(IpcResultCode::PATH_NOT_FOUND)
+            }
+        }
+        (IpcService::AddOnContent, IpcRequest::GetAddOnContentListChangedEvent) => {
+            let (_writable, readable) = EventObject::create_pair();
+            handles
+                .insert(readable)
+                .map(IpcResponse::Event)
+                .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
+        }
+        (
+            IpcService::AddOnContent,
             IpcRequest::OpenAddOnContent {
                 title_id,
                 mount_index,
             },
         ) => {
+            require_content_data_read(mounts)?;
             let add_on = mounts
                 .add_on(title_id)
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
@@ -236,11 +322,23 @@ fn dispatch_session(
     }
 }
 
+fn add_on_entry(add_on: &nixe_runtime::AddOnContent) -> Result<AddOnContentEntry, IpcResultCode> {
+    Ok(AddOnContentEntry {
+        title_id: add_on.title_id(),
+        version: add_on.version().raw(),
+        horizon_index: add_on.horizon_index(),
+        mount_count: u32::try_from(add_on.mounts().len())
+            .map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
+    })
+}
+
 fn dispatch_filesystem(
+    mounts: &ProcessMountNamespace,
     handles: &mut HandleTable,
     filesystem: &ReadOnlyFileSystem,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
+    require_content_data_read(mounts)?;
     match request {
         IpcRequest::OpenFile { path } => {
             let path = normalize_path(&path)?;
@@ -271,7 +369,12 @@ fn dispatch_filesystem(
     }
 }
 
-fn dispatch_file(file: &ReadOnlyFile, request: IpcRequest) -> Result<IpcResponse, IpcResultCode> {
+fn dispatch_file(
+    mounts: &ProcessMountNamespace,
+    file: &ReadOnlyFile,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcResultCode> {
+    require_content_data_read(mounts)?;
     match request {
         IpcRequest::GetFileSize => Ok(IpcResponse::Size(file.size())),
         IpcRequest::ReadFile { offset, size } => {
@@ -295,9 +398,11 @@ fn dispatch_file(file: &ReadOnlyFile, request: IpcRequest) -> Result<IpcResponse
 }
 
 fn dispatch_directory(
+    mounts: &ProcessMountNamespace,
     directory: &ReadOnlyDirectory,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
+    require_content_data_read(mounts)?;
     match request {
         IpcRequest::GetDirectoryEntryCount => Ok(IpcResponse::Size(
             u64::try_from(directory.entries().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
@@ -316,6 +421,14 @@ fn dispatch_directory(
             Ok(IpcResponse::DirectoryEntries(result))
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
+    }
+}
+
+fn require_content_data_read(mounts: &ProcessMountNamespace) -> Result<(), IpcResultCode> {
+    if mounts.allows_content_data_read() {
+        Ok(())
+    } else {
+        Err(IpcResultCode::ACCESS_DENIED)
     }
 }
 

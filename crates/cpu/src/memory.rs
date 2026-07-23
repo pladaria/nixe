@@ -452,6 +452,7 @@ pub enum MemoryMappingPurpose {
     ModuleCodeMutable,
     ThreadLocal,
     Heap,
+    SharedMemory,
 }
 
 impl MemoryMappingPurpose {

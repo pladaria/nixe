@@ -134,7 +134,7 @@ fn contemporary_libnx_nro_enters_service_manager_through_real_hipc() {
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    loop {
+    let reached_guest_fatal_path = loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
@@ -152,7 +152,7 @@ fn contemporary_libnx_nro_enters_service_manager_through_real_hipc() {
                     ExceptionHandlingResult::Terminated {
                         reason: nixe_runtime::ExceptionTerminationReason::Break { .. },
                         ..
-                    } => break,
+                    } => break true,
                     _ => panic!(
                         "libnx SVC failed at {stop}: {outcome:?}",
                         stop = report.stop
@@ -161,8 +161,12 @@ fn contemporary_libnx_nro_enters_service_manager_through_real_hipc() {
             }
             stop => panic!("libnx startup stopped during service-manager bring-up: {stop}"),
         }
-    }
+    };
 
+    assert!(
+        reached_guest_fatal_path && executed > 7_000,
+        "libnx did not initialize appletOE and reach the hid service frontier: executed={executed}"
+    );
     let coverage = dispatcher.coverage();
     for immediate in [0x01, 0x02, 0x03, 0x06, 0x29] {
         assert!(
@@ -173,10 +177,13 @@ fn contemporary_libnx_nro_enters_service_manager_through_real_hipc() {
         );
     }
     for immediate in [0x1f, 0x21] {
-        assert!(coverage.iter().any(|entry| {
-            entry.immediate == immediate
-                && entry.support == HorizonSvcSupport::Partial
-                && entry.resumed > 0
-        }));
+        assert!(
+            coverage.iter().any(|entry| {
+                entry.immediate == immediate
+                    && entry.support == HorizonSvcSupport::Complete
+                    && entry.resumed > 0
+            }),
+            "missing completed SVC {immediate:#x}; coverage={coverage:?}"
+        );
     }
 }

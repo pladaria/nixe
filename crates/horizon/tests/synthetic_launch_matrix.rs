@@ -15,7 +15,7 @@ use nixe_runtime::{
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
     build_nsp, build_romfs, build_xci, content_id, data_content, program_content,
-    program_content_without_services,
+    program_content_with_fs_permissions, program_content_without_services,
 };
 
 #[test]
@@ -46,6 +46,97 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
         process.connect_ipc_service(IpcService::AddOnContent),
         Err(IpcResultCode::ACCESS_DENIED)
     );
+
+    let permitted_directory = tempfile::tempdir().unwrap();
+    let permitted_package = Package {
+        title_id: APPLICATION_ID,
+        version: 0,
+        kind: MetaKind::Application,
+        contents: vec![program_content(content_id(3), &[("main", 3)])],
+    };
+    fs::write(
+        permitted_directory.path().join("permitted.nsp"),
+        build_nsp(&permitted_package),
+    )
+    .unwrap();
+    let permitted_plan = Launcher::build(LauncherInput::new(permitted_directory.path())).unwrap();
+    let mut permitted = ProcessBuilder::new().build(&permitted_plan).unwrap();
+    let session = permitted
+        .connect_ipc_service(IpcService::FileSystem)
+        .unwrap();
+    let transferred = permitted
+        .handles_mut()
+        .transfer_to(process.handles_mut(), session)
+        .unwrap();
+    assert_eq!(
+        process.dispatch_ipc(transferred, IpcRequest::SetCurrentProcess),
+        Err(IpcResultCode::ACCESS_DENIED)
+    );
+}
+
+#[test]
+fn filesystem_operations_require_effective_content_data_read_permission() {
+    fn build_process(
+        directory: &tempfile::TempDir,
+        filesystem_permissions: u64,
+    ) -> nixe_runtime::RunnableProcess {
+        let package = Package {
+            title_id: APPLICATION_ID,
+            version: 0,
+            kind: MetaKind::Application,
+            contents: vec![
+                program_content_with_fs_permissions(
+                    content_id(1),
+                    &[("main", 1)],
+                    filesystem_permissions,
+                ),
+                data_content(
+                    content_id(2),
+                    APPLICATION_ID,
+                    1,
+                    build_romfs(&[("file", b"bytes")]),
+                ),
+            ],
+        };
+        fs::write(directory.path().join("title.nsp"), build_nsp(&package)).unwrap();
+        let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
+        ProcessBuilder::new().build(&plan).unwrap()
+    }
+
+    let denied_directory = tempfile::tempdir().unwrap();
+    let mut denied = build_process(&denied_directory, 0);
+    let denied_session = denied.connect_ipc_service(IpcService::FileSystem).unwrap();
+    assert_eq!(
+        denied.dispatch_ipc(denied_session, IpcRequest::OpenPrimaryFileSystem),
+        Err(IpcResultCode::ACCESS_DENIED)
+    );
+
+    let allowed_directory = tempfile::tempdir().unwrap();
+    let mut allowed = build_process(&allowed_directory, 1);
+    let allowed_session = allowed.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(filesystem) = allowed
+        .dispatch_ipc(allowed_session, IpcRequest::OpenPrimaryFileSystem)
+        .unwrap()
+    else {
+        panic!("ApplicationInfo must permit mounting content data");
+    };
+
+    let transferred = allowed
+        .handles_mut()
+        .transfer_to(denied.handles_mut(), filesystem)
+        .unwrap();
+    assert_eq!(
+        denied.dispatch_ipc(transferred, IpcRequest::OpenDirectory { path: "/".into() }),
+        Err(IpcResultCode::ACCESS_DENIED)
+    );
+
+    let manager_directory = tempfile::tempdir().unwrap();
+    let mut manager = build_process(&manager_directory, 1 << 11);
+    let manager_session = manager.connect_ipc_service(IpcService::FileSystem).unwrap();
+    assert!(matches!(
+        manager.dispatch_ipc(manager_session, IpcRequest::OpenPrimaryFileSystem),
+        Ok(IpcResponse::Handle(_))
+    ));
 }
 
 #[test]
@@ -150,6 +241,10 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
             & (1 << 63)
             != 0
     );
+    assert_eq!(
+        plan.effective_policy().unwrap().handle_table_size(),
+        Some(0x40)
+    );
     assert!(plan.control_metadata().is_none());
     assert_eq!(
         plan.modules()
@@ -205,6 +300,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
     assert_eq!(&second_content_bytes, b"second");
 
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    assert_eq!(process.handles().capacity_limit(), 0x40);
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);
     assert!(
@@ -321,6 +417,27 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
     assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
     assert_eq!(entries[0].version, 9);
     assert_eq!(entries[0].mount_count, 1);
+    assert_eq!(
+        process.dispatch_ipc(
+            add_on_session,
+            IpcRequest::PrepareAddOnContent {
+                horizon_index: u32::MAX,
+            },
+        ),
+        Err(IpcResultCode::PATH_NOT_FOUND)
+    );
+    let IpcResponse::Event(add_on_event) = process
+        .dispatch_ipc(add_on_session, IpcRequest::GetAddOnContentListChangedEvent)
+        .unwrap()
+    else {
+        panic!("add-on event request must return a readable event handle");
+    };
+    assert!(
+        process
+            .handles()
+            .get_as::<nixe_runtime::ReadableEventObject>(add_on_event)
+            .is_some()
+    );
 
     let IpcResponse::Handle(add_on_filesystem) = process
         .dispatch_ipc(

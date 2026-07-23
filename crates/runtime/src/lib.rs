@@ -26,8 +26,10 @@ pub use execution::{
     ProcessTeardownReport, ThreadExit,
 };
 pub use handle::{
-    EventObject, HandleError, HandleObject, HandleTable, HandleValue, MAX_SHARED_MEMORY_BYTES,
-    ReadableEventObject, SessionEndpoint, SessionObject, SharedMemoryObject, ThreadObject,
+    EventObject, HandleError, HandleObject, HandleTable, HandleValue, MAX_SESSION_REQUESTS,
+    MAX_SHARED_MEMORY_BYTES, PortEndpoint, PortError, PortObject, ProcessObject,
+    ReadableEventObject, SessionEndpoint, SessionError, SessionMessage, SessionObject,
+    SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
     WritableEventObject,
 };
 pub use launch_plan::{

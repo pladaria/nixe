@@ -4,6 +4,7 @@
 //! Atmosphere commit `e468f59c9d369b8ebbffa040f4c9fc201b9f75a8`:
 //! - `libraries/libvapours/include/vapours/results/results_common.hpp`
 //! - `libraries/libvapours/include/vapours/results/{fs,lr,sf,sm}_results.hpp`
+//! - <https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/results/sf_results.hpp>
 
 use crate::{IpcResultCode, IpcService};
 
@@ -29,8 +30,11 @@ impl HorizonIpcResult {
     pub(crate) const SM_NOT_ALLOWED: Self = Self::new(MODULE_SM, 8);
 
     pub const CMIF_NOT_SUPPORTED: Self = Self::new(MODULE_SF, 1);
+    pub const SF_PRECONDITION_VIOLATION: Self = Self::new(MODULE_SF, 3);
+    pub const CMIF_INVALID_IN_HEADER: Self = Self::new(MODULE_SF, 211);
     pub const CMIF_UNKNOWN_COMMAND_ID: Self = Self::new(MODULE_SF, 221);
     pub const CMIF_TARGET_NOT_FOUND: Self = Self::new(MODULE_SF, 261);
+    pub const CMIF_OUT_OF_DOMAIN_ENTRIES: Self = Self::new(MODULE_SF, 301);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
     pub const FS_OUT_OF_RANGE: Self = Self::new(MODULE_FS, 3005);
     pub const FS_ALLOCATION_MEMORY_FAILED: Self = Self::new(MODULE_FS, 3420);
@@ -96,8 +100,16 @@ mod tests {
             (HorizonIpcResult::SM_NOT_REGISTERED, 21, 7, 0xe15),
             (HorizonIpcResult::SM_NOT_ALLOWED, 21, 8, 0x1015),
             (HorizonIpcResult::CMIF_NOT_SUPPORTED, 10, 1, 0x20a),
+            (HorizonIpcResult::SF_PRECONDITION_VIOLATION, 10, 3, 0x60a),
+            (HorizonIpcResult::CMIF_INVALID_IN_HEADER, 10, 211, 0x1a60a),
             (HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID, 10, 221, 0x1ba0a),
             (HorizonIpcResult::CMIF_TARGET_NOT_FOUND, 10, 261, 0x20a0a),
+            (
+                HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
+                10,
+                301,
+                0x25a0a,
+            ),
             (HorizonIpcResult::FS_PATH_NOT_FOUND, 2, 1, 0x202),
             (HorizonIpcResult::FS_OUT_OF_RANGE, 2, 3005, 0x177a02),
             (

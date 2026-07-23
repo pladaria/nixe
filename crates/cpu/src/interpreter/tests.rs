@@ -454,6 +454,30 @@ fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
 }
 
 #[test]
+fn a64_simd_move_immediate_32_expands_lanes_and_clears_inactive_bits() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, u128::MAX));
+    assert!(a64.set_vector(3, u128::MAX));
+
+    execute_one(&profile, &mut state, 0x4f00_041f_u32.into()).unwrap(); // MOVI V31.4S,#0
+    execute_one(&profile, &mut state, 0x0f05_4563_u32.into()).unwrap(); // MOVI V3.2S,#0xab,LSL #16
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(31), Some(0));
+    assert_eq!(
+        a64.vector(3),
+        Some(0x0000_0000_0000_0000_00ab_0000_00ab_0000)
+    );
+    assert_eq!(a64.pc(), 8);
+}
+
+#[test]
 fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(49);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);

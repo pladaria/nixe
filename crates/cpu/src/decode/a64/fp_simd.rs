@@ -97,6 +97,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 MOVI encoding and immediate-expansion rules:
+    // https://documentation-service.arm.com/static/6023d5512cb3723f20208db2
+    pattern(
+        "simd-move-immediate-32",
+        0xbff8_9c00,
+        0x0f00_0400,
+        0x0000_004a,
+        132,
+        &[],
+        SIMD,
+    ),
     pattern(
         "advanced-simd-fallback",
         0x1e00_0000,
@@ -227,6 +238,8 @@ pub struct Operands {
     pub rt2: u8,
     pub immediate_7: u8,
     pub mode: u8,
+    pub immediate_8: u8,
+    pub cmode: u8,
 }
 
 macro_rules! instructions {
@@ -252,6 +265,7 @@ instructions!(
     ScalarMove,
     CompareRegister,
     CompareZero,
+    MoveImmediate32,
     SignedIntToFloat,
     UnsignedIntToFloat,
     FloatToSignedInt,
@@ -286,6 +300,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         rt2: ((bits >> 10) & 0x1f) as u8,
         immediate_7: ((bits >> 15) & 0x7f) as u8,
         mode: ((bits >> 23) & 3) as u8,
+        immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
+        cmode: ((bits >> 12) & 0xf) as u8,
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -296,6 +312,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0035 => Instruction::ScalarMove(operands),
         0x0000_0036 => Instruction::CompareRegister(operands),
         0x0000_0037 => Instruction::CompareZero(operands),
+        0x0000_004a => Instruction::MoveImmediate32(operands),
         0x0000_003a => Instruction::SignedIntToFloat(operands),
         0x0000_003b => Instruction::UnsignedIntToFloat(operands),
         0x0000_003c => Instruction::FloatToSignedInt(operands),

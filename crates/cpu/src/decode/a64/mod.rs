@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_0049 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_004a => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),

@@ -412,6 +412,15 @@ impl KernelCapabilities {
         &self.0
     }
 
+    /// Returns the process handle-table capacity requested by this capability
+    /// stream, when the descriptor is present.
+    pub fn handle_table_size(&self) -> Option<u16> {
+        self.0.iter().find_map(|capability| match capability {
+            KernelCapability::HandleTableSize(size) => Some(*size),
+            _ => None,
+        })
+    }
+
     fn authorized_by(&self, ceiling: &Self) -> bool {
         self.0
             .iter()
@@ -436,6 +445,9 @@ impl EffectiveNpdmPolicy {
     }
     pub const fn kernel_capabilities(&self) -> &KernelCapabilities {
         &self.kernel_capabilities
+    }
+    pub fn handle_table_size(&self) -> Option<u16> {
+        self.kernel_capabilities.handle_table_size()
     }
     pub fn allows_client(&self, name: &[u8]) -> bool {
         self.services.allows_client(name)
@@ -1559,6 +1571,7 @@ mod tests {
         let capabilities = parse_kernel_capabilities(&bytes, 0..bytes.len(), "test KAC").unwrap();
 
         assert_eq!(capabilities.entries().len(), 10);
+        assert_eq!(capabilities.handle_table_size(), Some(0x80));
         assert!(matches!(
             capabilities.entries()[0],
             KernelCapability::ThreadInfo {

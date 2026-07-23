@@ -94,6 +94,7 @@ pub(crate) struct HipcRequest<'a> {
     pub(crate) exchange_buffers: Vec<BufferDescriptor>,
     pub(crate) receive_statics: ReceiveStatics,
     raw: &'a [u8],
+    handle_offset: usize,
     data_offset: usize,
     data_end: usize,
 }
@@ -140,6 +141,7 @@ impl<'a> HipcRequest<'a> {
             (None, 0, 0)
         };
 
+        let handle_offset = offset;
         let (copy_handles, next) = decode_words(raw, offset, copy_handle_count)?;
         offset = next;
         let (move_handles, next) = decode_words(raw, offset, move_handle_count)?;
@@ -187,9 +189,14 @@ impl<'a> HipcRequest<'a> {
             exchange_buffers,
             receive_statics,
             raw,
+            handle_offset,
             data_offset: data_end - data_size,
             data_end,
         })
+    }
+
+    pub(crate) const fn handle_offset(&self) -> usize {
+        self.handle_offset
     }
 
     fn aligned_data(&self) -> Result<&'a [u8], MessageError> {
