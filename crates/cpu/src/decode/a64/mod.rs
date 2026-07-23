@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0061 => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -202,6 +202,9 @@ mod tests {
             (0x4e20_1c00, "simd-bitwise"),
             (0x4e01_0c20, "simd-duplicate-general"),
             (0x4e08_3c01, "simd-unsigned-move-to-general"),
+            (0x6e03_07be, "simd-insert-element"),
+            (0x4e03_1d28, "simd-insert-general"),
+            (0x6f00_05fa, "simd-modified-immediate"),
             (0xad01_0060, "fp-simd-load-store-pair"),
             (0x4e20_8400, "simd-integer"),
             (0x4e32_be31, "simd-add-pairwise"),
@@ -215,6 +218,8 @@ mod tests {
             (0x1e39_0000, "fp-float-to-unsigned-int"),
             (0x9e66_0000, "fp-move-to-general"),
             (0x9e67_0000, "fp-move-from-general"),
+            (0x9eae_0000, "fp-move-to-general"),
+            (0x9eaf_0000, "fp-move-from-general"),
             (0x3dc0_0000, "fp-simd-load-store-unsigned"),
             (0x3c40_0400, "fp-simd-load-store-post-index"),
             (0x9c00_0000, "fp-simd-load-literal"),

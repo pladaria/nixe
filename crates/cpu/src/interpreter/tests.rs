@@ -474,7 +474,7 @@ fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
 }
 
 #[test]
-fn a64_simd_move_immediate_32_expands_lanes_and_clears_inactive_bits() {
+fn a64_simd_modified_immediate_expands_lanes_and_clears_inactive_bits() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
@@ -495,6 +495,57 @@ fn a64_simd_move_immediate_32_expands_lanes_and_clears_inactive_bits() {
         Some(0x0000_0000_0000_0000_00ab_0000_00ab_0000)
     );
     assert_eq!(a64.pc(), 8);
+}
+
+#[test]
+fn a64_simd_modified_immediate_covers_move_negate_merge_and_bitmask_forms() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+
+    for (encoding, register, initial, expected) in [
+        (
+            0x6f00_05fa_u32,
+            26,
+            0,
+            0xffff_fff0_ffff_fff0_ffff_fff0_ffff_fff0,
+        ), // MVNI V26.4S,#0xf
+        (0x6f01_c681, 1, 0, 0xffff_cb00_ffff_cb00_ffff_cb00_ffff_cb00), // MVNI V1.4S,#0x34,MSL #8
+        (0x4f02_a6c2, 2, 0, 0x5600_5600_5600_5600_5600_5600_5600_5600), // MOVI V2.8H,#0x56,LSL #8
+        (
+            0x2f03_8703,
+            3,
+            u128::MAX,
+            0x0000_0000_0000_0000_ff87_ff87_ff87_ff87,
+        ), // MVNI V3.4H,#0x78
+        (
+            0x4f04_5744,
+            4,
+            0x0000_0001_0000_0001_0000_0001_0000_0001,
+            0x009a_0001_009a_0001_009a_0001_009a_0001,
+        ), // ORR V4.4S,#0x9a,LSL #16
+        (
+            0x6f05_b785,
+            5,
+            u128::MAX,
+            0x43ff_43ff_43ff_43ff_43ff_43ff_43ff_43ff,
+        ), // BIC V5.8H,#0xbc,LSL #8
+        (0x4f06_e7c6, 6, 0, 0xdede_dede_dede_dede_dede_dede_dede_dede), // MOVI V6.16B,#0xde
+        (0x6f05_e547, 7, 0, 0xff00_ff00_ff00_ff00_ff00_ff00_ff00_ff00), // MOVI V7.2D,#0xff00ff00ff00ff00
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(register, initial));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
 }
 
 #[test]
@@ -531,6 +582,161 @@ fn a64_simd_unsigned_move_extracts_each_lane_width_and_zero_extends() {
         unreachable!()
     };
     assert_eq!(a64.pc(), 32);
+}
+
+#[test]
+fn a64_simd_insert_element_copies_each_lane_width_and_preserves_other_lanes() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+
+    for (encoding, destination, source, expected) in [
+        (
+            0x6e03_07be_u32,
+            0x1111_1111_1111_1111_1111_1111_1111_1111,
+            0x8877_6655_4433_2211_fedc_ba98_7654_32ab,
+            0x1111_1111_1111_1111_1111_1111_1111_ab11,
+        ), // MOV V30.B[1],V29.B[0]
+        (
+            0x6e0e_7462,
+            u128::MAX,
+            0x1234_8877_6655_4433_2211_fedc_ba98_7654,
+            0xffff_ffff_ffff_ffff_1234_ffff_ffff_ffff,
+        ), // MOV V2.H[3],V3.H[7]
+        (
+            0x6e14_24a4,
+            0,
+            0x8877_6655_4433_2211_fedc_ba98_7654_3210,
+            0x0000_0000_fedc_ba98_0000_0000_0000_0000,
+        ), // MOV V4.S[2],V5.S[1]
+        (
+            0x6e18_04e6,
+            u128::MAX,
+            0x8877_6655_4433_2211_fedc_ba98_7654_3210,
+            0xfedc_ba98_7654_3210_ffff_ffff_ffff_ffff,
+        ), // MOV V6.D[1],V7.D[0]
+    ] {
+        let destination_register = (encoding & 0x1f) as u8;
+        let source_register = ((encoding >> 5) & 0x1f) as u8;
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(destination_register, destination));
+        assert!(a64.set_vector(source_register, source));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(destination_register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+}
+
+#[test]
+fn a64_simd_insert_general_truncates_source_and_preserves_other_lanes() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(9), 0xfedc_ba98_7654_3210);
+    a64.write_x(x(11), 0xfedc_ba98_7654_3210);
+    a64.write_x(x(13), 0xfedc_ba98_7654_3210);
+    a64.write_x(x(15), 0xfedc_ba98_7654_3210);
+
+    for (encoding, register, expected) in [
+        (
+            0x4e03_1d28_u32,
+            8,
+            0xffff_ffff_ffff_ffff_ffff_ffff_ffff_10ff,
+        ), // MOV V8.B[1],W9
+        (0x4e0a_1d6a, 10, 0xffff_ffff_ffff_ffff_ffff_3210_ffff_ffff), // MOV V10.H[2],W11
+        (0x4e1c_1dac, 12, 0x7654_3210_ffff_ffff_ffff_ffff_ffff_ffff), // MOV V12.S[3],W13
+        (0x4e18_1dee, 14, 0xfedc_ba98_7654_3210_ffff_ffff_ffff_ffff), // MOV V14.D[1],X15
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(register, u128::MAX));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+}
+
+#[test]
+fn a64_fmov_to_general_copies_scalar_and_upper_lane_bit_patterns() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, 0x8877_6655_4433_2211_fedc_ba98_7654_3210));
+
+    for (encoding, register, expected) in [
+        (0x1ee6_03e0_u32, 0, 0x3210),            // FMOV W0,H31
+        (0x1e26_03e1, 1, 0x7654_3210),           // FMOV W1,S31
+        (0x9e66_03e2, 2, 0xfedc_ba98_7654_3210), // FMOV X2,D31
+        (0x9eae_03e3, 3, 0x8877_6655_4433_2211), // FMOV X3,V31.D[1]
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.read_x(x(register)),
+            expected,
+            "encoding={encoding:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 16);
+}
+
+#[test]
+fn a64_fmov_from_general_clears_scalar_upper_bits_and_preserves_other_lane() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(9), 0xfedc_ba98_7654_3210);
+    for register in 10..=13 {
+        assert!(a64.set_vector(register, u128::MAX));
+    }
+
+    for (encoding, register, expected) in [
+        (0x1e27_012a_u32, 10, 0x0000_0000_7654_3210), // FMOV S10,W9
+        (0x9e67_012b, 11, 0xfedc_ba98_7654_3210),     // FMOV D11,X9
+        (0x9eaf_012c, 12, 0xfedc_ba98_7654_3210_ffff_ffff_ffff_ffff), // FMOV V12.D[1],X9
+        (0x1ee7_012d, 13, 0x0000_0000_0000_3210),     // FMOV H13,W9
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 16);
 }
 
 #[test]

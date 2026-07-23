@@ -20,8 +20,10 @@ pub(super) fn lift(
     match instruction {
         FpSimdInstruction::DuplicateGeneral(_)
         | FpSimdInstruction::MemoryPair(_)
-        | FpSimdInstruction::MoveImmediate32(_)
+        | FpSimdInstruction::ModifiedImmediate(_)
         | FpSimdInstruction::UnsignedMoveToGeneral(_)
+        | FpSimdInstruction::InsertElement(_)
+        | FpSimdInstruction::InsertGeneral(_)
         | FpSimdInstruction::MemoryMultipleStructures(_)
         | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
         | FpSimdInstruction::IntegerCompare(_)
