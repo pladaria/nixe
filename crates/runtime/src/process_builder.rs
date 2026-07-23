@@ -313,6 +313,7 @@ pub struct RunnableProcess {
     cpu: ProcessCpuContext,
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
+    random_entropy: [u64; 4],
     heap_size: u64,
     initial_memory_size: u64,
     memory: SyntheticMemory,
@@ -521,6 +522,7 @@ impl RunnableProcess {
                 cpu: self.cpu,
                 address_space_limit: self.address_space.exclusive_limit(),
                 memory_layout: self.memory_layout,
+                random_entropy: self.random_entropy,
                 initial_memory_size: self.initial_memory_size,
             },
             &mut self.heap_size,
@@ -833,6 +835,7 @@ impl ProcessBuilder {
     /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
         let (execution_state, address_space, stack_size, abi) = process_metadata(plan);
+        let random_entropy = generate_process_entropy()?;
         let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
         let thread_configuration = cpu
             .thread_configuration(execution_state)
@@ -1007,6 +1010,7 @@ impl ProcessBuilder {
             cpu,
             address_space,
             memory_layout,
+            random_entropy,
             heap_size: 0,
             initial_memory_size,
             memory,
@@ -1020,6 +1024,20 @@ impl ProcessBuilder {
         process.translate_entry()?;
         Ok(process)
     }
+}
+
+fn generate_process_entropy() -> Result<[u64; 4], ProcessBuildError> {
+    let mut bytes = [0_u8; size_of::<[u64; 4]>()];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        ProcessBuildError::new(
+            ProcessBuildStage::Metadata,
+            format_args!("cannot obtain host entropy for the guest process: {error}"),
+        )
+    })?;
+    Ok(std::array::from_fn(|index| {
+        let offset = index * size_of::<u64>();
+        u64::from_le_bytes(bytes[offset..offset + size_of::<u64>()].try_into().unwrap())
+    }))
 }
 
 #[derive(Clone, Copy)]

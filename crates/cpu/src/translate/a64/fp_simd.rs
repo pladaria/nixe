@@ -20,7 +20,8 @@ pub(super) fn lift(
     match instruction {
         FpSimdInstruction::DuplicateGeneral(_)
         | FpSimdInstruction::MemoryPair(_)
-        | FpSimdInstruction::MoveImmediate32(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::MoveImmediate32(_)
+        | FpSimdInstruction::UnsignedMoveToGeneral(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)

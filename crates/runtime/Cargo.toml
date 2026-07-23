@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+getrandom.workspace = true
 log.workspace = true
 nixe-config.workspace = true
 nixe-cpu.workspace = true

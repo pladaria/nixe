@@ -6,7 +6,10 @@ use crate::{
         CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
         MemoryAlignment, MemoryOrdering, MemoryValue,
     },
-    semantics::bits::{BitWidth, replicate},
+    semantics::{
+        bits::{BitWidth, replicate},
+        vector::{LaneWidth, VectorArrangement, extract_lane},
+    },
     state::a64::A64State,
 };
 
@@ -29,6 +32,10 @@ pub(super) fn execute(
         }
         Instruction::MoveImmediate32(_) => {
             move_immediate_32(state, fields);
+            None
+        }
+        Instruction::UnsignedMoveToGeneral(_) => {
+            unsigned_move_to_general(state, fields);
             None
         }
         Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_) => {
@@ -143,6 +150,31 @@ fn move_immediate_32(state: &mut A64State, fields: crate::decode::a64::fp_simd::
     )
     .expect("allocated SIMD immediate arrangement");
     assert!(state.set_vector(fields.rd, value));
+}
+
+fn unsigned_move_to_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let size_shift = fields.immediate_5.trailing_zeros() as u8;
+    let lane_width = match size_shift {
+        0 => LaneWidth::Bits8,
+        1 => LaneWidth::Bits16,
+        2 => LaneWidth::Bits32,
+        3 => LaneWidth::Bits64,
+        _ => unreachable!("allocation validation rejects invalid UMOV element sizes"),
+    };
+    let lane = fields.immediate_5 >> (size_shift + 1);
+    let arrangement =
+        VectorArrangement::new(128, lane_width).expect("allocated UMOV vector arrangement");
+    let vector = state
+        .vector(fields.rn)
+        .expect("normalized UMOV vector register");
+    let value = extract_lane(vector, arrangement, lane).expect("allocated UMOV lane index");
+    super::write(
+        state,
+        fields.rd,
+        if fields.vector_128 { 64 } else { 32 },
+        false,
+        value,
+    );
 }
 
 fn vector_access_size(

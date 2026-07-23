@@ -108,6 +108,17 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 UMOV allocation and operation, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMOV--Unsigned-Move-vector-element-to-general-purpose-register-
+    pattern(
+        "simd-unsigned-move-to-general",
+        0xbfe0_fc00,
+        0x0e00_3c00,
+        0x0000_004b,
+        133,
+        &[],
+        SIMD,
+    ),
     pattern(
         "advanced-simd-fallback",
         0x1e00_0000,
@@ -266,6 +277,7 @@ instructions!(
     CompareRegister,
     CompareZero,
     MoveImmediate32,
+    UnsignedMoveToGeneral,
     SignedIntToFloat,
     UnsignedIntToFloat,
     FloatToSignedInt,
@@ -313,6 +325,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0036 => Instruction::CompareRegister(operands),
         0x0000_0037 => Instruction::CompareZero(operands),
         0x0000_004a => Instruction::MoveImmediate32(operands),
+        0x0000_004b => Instruction::UnsignedMoveToGeneral(operands),
         0x0000_003a => Instruction::SignedIntToFloat(operands),
         0x0000_003b => Instruction::UnsignedIntToFloat(operands),
         0x0000_003c => Instruction::FloatToSignedInt(operands),
