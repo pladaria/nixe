@@ -31,7 +31,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
                     | 0x0000_0044..=0x0000_0045
-                    | 0x0000_0048..=0x0000_0049
+                    | 0x0000_0048..=0x0000_004a
             ) =>
         {
             IMPLEMENTED

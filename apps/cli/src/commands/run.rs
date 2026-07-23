@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_horizon::HorizonSvcDispatcher;
+use nixe_config::InitialOperationMode;
+use nixe_horizon::{HorizonSvcDispatcher, OperationMode};
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess,
@@ -90,8 +91,18 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     );
     log::info!("starting the reference CPU interpreter");
 
+    let initial_operation_mode = match config.system.initial_operation_mode {
+        InitialOperationMode::Handheld => OperationMode::Handheld,
+        InitialOperationMode::Docked => OperationMode::Console,
+    };
+    log::debug!("initial operation mode: {initial_operation_mode:?}");
     let execution_started = Instant::now();
-    let execution = execute(&mut process, instruction_trace, &interrupted);
+    let execution = execute(
+        &mut process,
+        instruction_trace,
+        &interrupted,
+        initial_operation_mode,
+    );
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
@@ -140,8 +151,9 @@ fn execute(
     process: &mut RunnableProcess,
     print_trace: bool,
     interrupted: &AtomicBool,
+    initial_operation_mode: OperationMode,
 ) -> Result<ExecutionSummary, String> {
-    let mut dispatcher = HorizonSvcDispatcher::default();
+    let mut dispatcher = HorizonSvcDispatcher::new(initial_operation_mode);
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let mut next_progress = EXECUTION_PROGRESS_INTERVAL;

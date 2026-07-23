@@ -857,7 +857,16 @@ impl ProcessBuilder {
             self.config.physical_memory_limit,
         )?;
         let entry_module = plan.entry_module_index();
-        let mut handles = crate::HandleTable::new();
+        // ACI0 is the process-requested policy after ACID authorization has
+        // already been checked by the NPDM loader. Horizon uses its
+        // HandleTableSize descriptor as the live per-process handle limit:
+        // https://switchbrew.org/w/index.php?title=NPDM&oldid=14486#HandleTableSize
+        let mut handles = plan
+            .effective_policy()
+            .and_then(|policy| policy.handle_table_size())
+            .map_or_else(crate::HandleTable::new, |size| {
+                crate::HandleTable::with_capacity_limit(usize::from(size))
+            });
         let main_thread_object = crate::ThreadObject::new(1);
         let main_thread_handle = handles.insert(main_thread_object).map_err(|error| {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)

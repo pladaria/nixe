@@ -60,6 +60,24 @@ impl ProcessMountNamespace {
             .is_none_or(|policy| policy.allows_client(name))
     }
 
+    /// Returns whether the process may mount and read program content data.
+    ///
+    /// Horizon derives `CanMountContentDataRead` from `ApplicationInfo`,
+    /// `ContentManager`, or `FullPermission`. Keep this operation-level check
+    /// separate from service access: permission to connect to `fsp-srv` does
+    /// not itself grant access to a content filesystem.
+    ///
+    /// Reference (Atmosphère, commit e468f59):
+    /// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libstratosphere/include/stratosphere/fssrv/impl/fssrv_access_control_bits.hpp#L75-L79
+    pub fn allows_content_data_read(&self) -> bool {
+        self.policy.as_ref().is_none_or(|policy| {
+            let permissions = policy.filesystem().permissions();
+            permissions.contains(FileSystemPermissions::APPLICATION_INFO)
+                || permissions.contains(FileSystemPermissions::CONTENT_MANAGER)
+                || permissions.contains(FileSystemPermissions::FULL_PERMISSION)
+        })
+    }
+
     pub(crate) fn mount_count(&self) -> usize {
         usize::from(self.primary.is_some())
             + self

@@ -13,7 +13,7 @@ use serde::Deserialize;
 pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 
 /// Current configuration schema version.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Configuration shared by the CLI and desktop applications.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +70,7 @@ impl NixeConfig {
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
                 keys: resolve_path(base_directory, raw.system.keys),
+                initial_operation_mode: raw.system.initial_operation_mode,
             },
             diagnostics: DiagnosticsConfig {
                 report_detail: raw.diagnostics.report_detail,
@@ -127,6 +128,18 @@ pub struct SystemConfig {
     pub preferred_languages: Vec<NacpLanguage>,
     /// Directory containing caller-owned `prod.keys` and optional `title.keys`.
     pub keys: PathBuf,
+    /// Operation mode reported to titles when the emulated system starts.
+    pub initial_operation_mode: InitialOperationMode,
+}
+
+/// Initial physical presentation selected for the emulated console.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitialOperationMode {
+    /// The console starts outside its dock.
+    Handheld,
+    /// The console starts connected to its dock.
+    Docked,
 }
 
 /// User preference for the amount of context retained in diagnostic reports.
@@ -226,6 +239,7 @@ struct RawSystemConfig {
     #[serde(deserialize_with = "deserialize_languages")]
     preferred_languages: Vec<NacpLanguage>,
     keys: PathBuf,
+    initial_operation_mode: InitialOperationMode,
 }
 
 #[derive(Default, Deserialize)]
@@ -335,13 +349,14 @@ mod tests {
     fn loads_typed_values_and_resolves_relative_paths() {
         let file = TemporaryConfig::new(
             r#"
-                version = 1
+                version = 2
                 [library]
                 paths = ["./roms", "other"]
                 recursive_scan = false
                 [system]
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
+                initial_operation_mode = "docked"
             "#,
         );
 
@@ -358,6 +373,10 @@ mod tests {
         );
         assert_eq!(config.system.keys, base.join("./keys"));
         assert_eq!(
+            config.system.initial_operation_mode,
+            InitialOperationMode::Docked
+        );
+        assert_eq!(
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
         );
@@ -368,12 +387,13 @@ mod tests {
     fn defaults_recursive_scanning_to_true() {
         let file = TemporaryConfig::new(
             r#"
-                version = 1
+                version = 2
                 [library]
                 paths = []
                 [system]
                 preferred_languages = []
                 keys = "keys"
+                initial_operation_mode = "handheld"
             "#,
         );
 
@@ -391,12 +411,13 @@ mod tests {
     fn loads_explicit_sanitized_diagnostic_policy() {
         let file = TemporaryConfig::new(
             r#"
-                version = 1
+                version = 2
                 [library]
                 paths = []
                 [system]
                 preferred_languages = []
                 keys = "keys"
+                initial_operation_mode = "handheld"
                 [diagnostics]
                 report_detail = "sanitized"
                 instruction_trace = true
@@ -415,21 +436,32 @@ mod tests {
     fn rejects_unknown_fields_languages_and_versions() {
         for contents in [
             r#"
-                version = 1
+                version = 2
                 typo = true
                 [library]
                 paths = []
                 [system]
                 preferred_languages = []
                 keys = "keys"
+                initial_operation_mode = "handheld"
             "#,
             r#"
-                version = 1
+                version = 2
                 [library]
                 paths = []
                 [system]
                 preferred_languages = ["Klingon"]
                 keys = "keys"
+                initial_operation_mode = "handheld"
+            "#,
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "tabletop"
             "#,
         ] {
             let file = TemporaryConfig::new(contents);
@@ -441,17 +473,18 @@ mod tests {
 
         let file = TemporaryConfig::new(
             r#"
-                version = 2
+                version = 1
                 [library]
                 paths = []
                 [system]
                 preferred_languages = []
                 keys = "keys"
+                initial_operation_mode = "handheld"
             "#,
         );
         assert!(matches!(
             NixeConfig::load(&file.path),
-            Err(ConfigError::UnsupportedVersion { version: 2, .. })
+            Err(ConfigError::UnsupportedVersion { version: 1, .. })
         ));
     }
 }

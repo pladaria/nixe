@@ -18,9 +18,9 @@ pub(super) fn lift(
 ) -> Result<LiftOutcome, BuildError> {
     let fields = instruction.operands();
     match instruction {
-        FpSimdInstruction::DuplicateGeneral(_) | FpSimdInstruction::MemoryPair(_) => {
-            Ok(interpret(decoded))
-        }
+        FpSimdInstruction::DuplicateGeneral(_)
+        | FpSimdInstruction::MemoryPair(_)
+        | FpSimdInstruction::MoveImmediate32(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)

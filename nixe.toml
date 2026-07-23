@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 [library]
 # Directories scanned for supported title and homebrew files. Relative paths
@@ -16,6 +16,8 @@ preferred_languages = ["Spanish", "AmericanEnglish"]
 # Directory containing caller-owned prod.keys and, optionally, title.keys.
 # Relative paths are resolved from the directory containing this file.
 keys = "./keys/"
+# Initial mode reported to applications: "handheld" or "docked".
+initial_operation_mode = "handheld"
 
 [diagnostics]
 # Diagnostic context policy. "detailed" retains bounded local debugging

@@ -40,19 +40,28 @@ pub fn content_id(seed: u8) -> [u8; 16] {
 }
 
 pub fn program_content(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
-    program_content_with_npdm_services(id, modules, true)
+    program_content_with_npdm_policy(id, modules, true, 1_u64 << 63)
 }
 
 pub fn program_content_without_services(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
-    program_content_with_npdm_services(id, modules, false)
+    program_content_with_npdm_policy(id, modules, false, 1_u64 << 63)
 }
 
-fn program_content_with_npdm_services(
+pub fn program_content_with_fs_permissions(
+    id: [u8; 16],
+    modules: &[(&str, u8)],
+    filesystem_permissions: u64,
+) -> Content {
+    program_content_with_npdm_policy(id, modules, true, filesystem_permissions)
+}
+
+fn program_content_with_npdm_policy(
     id: [u8; 16],
     modules: &[(&str, u8)],
     include_services: bool,
+    filesystem_permissions: u64,
 ) -> Content {
-    let npdm = build_npdm(APPLICATION_ID, include_services);
+    let npdm = build_npdm(APPLICATION_ID, include_services, filesystem_permissions);
     let module_bytes = modules
         .iter()
         .map(|(name, seed)| ((*name).to_owned(), build_nso(*seed)))
@@ -363,7 +372,7 @@ fn build_nca(title_id: u64, content_type: u8, sections: Vec<NcaSectionFixture>) 
     nca
 }
 
-fn build_npdm(program_id: u64, include_services: bool) -> Vec<u8> {
+fn build_npdm(program_id: u64, include_services: bool, filesystem_permissions: u64) -> Vec<u8> {
     const META: usize = 0x80;
     const ACID_HEADER: usize = 0x240;
     const FAC_SIZE: usize = 0x2c;
@@ -375,7 +384,11 @@ fn build_npdm(program_id: u64, include_services: bool) -> Vec<u8> {
         &[]
     };
     let sac_size = service_access.len();
-    let kac = (0x15_u32 << 5 | 0xf).to_le_bytes();
+    let kac = [
+        (0x15_u32 << 5 | 0xf).to_le_bytes(),
+        (0x40_u32 << 16 | 0x7fff).to_le_bytes(),
+    ]
+    .concat();
     let fac = ACID_HEADER;
     let acid_sac = fac + FAC_SIZE;
     let acid_kac = acid_sac + sac_size;
@@ -410,7 +423,11 @@ fn build_npdm(program_id: u64, include_services: bool) -> Vec<u8> {
     put_u32(&mut data, acid + 0x230, acid_kac as u32);
     put_u32(&mut data, acid + 0x234, kac.len() as u32);
     data[acid + fac] = 1;
-    put_u64(&mut data, acid + fac + 4, 1_u64 << 63);
+    put_u64(
+        &mut data,
+        acid + fac + 4,
+        (1_u64 << 63) | filesystem_permissions,
+    );
     put_u64(&mut data, acid + fac + 0x14, u64::MAX);
     put_u64(&mut data, acid + fac + 0x24, u64::MAX);
     data[acid + acid_sac..acid + acid_sac + sac_size].copy_from_slice(service_access);
@@ -424,7 +441,7 @@ fn build_npdm(program_id: u64, include_services: bool) -> Vec<u8> {
     put_u32(&mut data, aci + 0x30, aci_kac as u32);
     put_u32(&mut data, aci + 0x34, kac.len() as u32);
     data[aci + fah] = 1;
-    put_u64(&mut data, aci + fah + 4, 1_u64 << 63);
+    put_u64(&mut data, aci + fah + 4, filesystem_permissions);
     data[aci + aci_sac..aci + aci_sac + sac_size].copy_from_slice(service_access);
     data[aci + aci_kac..aci + aci_size].copy_from_slice(&kac);
     data

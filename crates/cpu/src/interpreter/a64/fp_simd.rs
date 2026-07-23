@@ -27,6 +27,10 @@ pub(super) fn execute(
             duplicate_general(state, fields);
             None
         }
+        Instruction::MoveImmediate32(_) => {
+            move_immediate_32(state, fields);
+            None
+        }
         Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_) => {
             let Some(memory) = context.memory() else {
                 return Err(super::super::unsupported(decoded));
@@ -125,6 +129,19 @@ fn duplicate_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::
         BitWidth::new(vector_bits).expect("allocated SIMD vector width"),
     )
     .expect("allocated SIMD lane arrangement");
+    assert!(state.set_vector(fields.rd, value));
+}
+
+fn move_immediate_32(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let shift = (fields.cmode >> 1) * 8;
+    let lane = u128::from(fields.immediate_8) << shift;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let value = replicate(
+        lane,
+        BitWidth::new(32).expect("32-bit SIMD immediate lane"),
+        BitWidth::new(vector_bits).expect("allocated SIMD vector width"),
+    )
+    .expect("allocated SIMD immediate arrangement");
     assert!(state.set_vector(fields.rd, value));
 }
 
