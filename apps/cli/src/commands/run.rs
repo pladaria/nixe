@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::InitialOperationMode;
-use nixe_horizon::{HorizonSvcDispatcher, OperationMode};
+use nixe_config::{InitialOperationMode, TimeMode};
+use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment};
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess,
+    ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess, VirtualClock, VirtualClockMode,
 };
 
 use super::load_config;
@@ -78,9 +78,21 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         diagnostics.instruction_trace = true;
         log::info!("instruction trace enabled; execution will be substantially slower");
     }
+    let clock_mode = match config.system.time.mode {
+        TimeMode::Realtime => VirtualClockMode::Realtime,
+        TimeMode::Fixed => VirtualClockMode::Fixed {
+            unix_seconds: config
+                .system
+                .time
+                .fixed_unix_timestamp
+                .expect("fixed time configuration was validated"),
+        },
+    };
+    let virtual_clock = VirtualClock::new(clock_mode);
     let process_started = Instant::now();
     let mut process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
+        .with_virtual_clock(virtual_clock.clone())
         .build(&plan)
         .map_err(|error| error.to_string())?;
     log::debug!("process prepared in {:?}", process_started.elapsed());
@@ -96,12 +108,19 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         InitialOperationMode::Docked => OperationMode::Console,
     };
     log::debug!("initial operation mode: {initial_operation_mode:?}");
+    let time_environment = TimeEnvironment::new(virtual_clock, &config.system.time.timezone)
+        .map_err(|error| format!("cannot create Horizon time environment: {error}"))?;
+    log::debug!(
+        "virtual time: mode={clock_mode:?}, timezone={}",
+        config.system.time.timezone
+    );
     let execution_started = Instant::now();
     let execution = execute(
         &mut process,
         instruction_trace,
         &interrupted,
         initial_operation_mode,
+        time_environment,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -152,8 +171,9 @@ fn execute(
     print_trace: bool,
     interrupted: &AtomicBool,
     initial_operation_mode: OperationMode,
+    time_environment: TimeEnvironment,
 ) -> Result<ExecutionSummary, String> {
-    let mut dispatcher = HorizonSvcDispatcher::new(initial_operation_mode);
+    let mut dispatcher = HorizonSvcDispatcher::new(initial_operation_mode, time_environment);
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let mut next_progress = EXECUTION_PROGRESS_INTERVAL;

@@ -272,6 +272,7 @@ pub struct HorizonSvcDispatcher {
     observed: BTreeMap<u32, HorizonSvcCoverageCounts>,
     unknown_calls: u64,
     initial_operation_mode: crate::OperationMode,
+    time_environment: crate::TimeEnvironment,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), Instant>,
@@ -291,11 +292,15 @@ struct HorizonSvcCoverageCounts {
 impl HorizonSvcDispatcher {
     /// Creates a dispatcher whose applet service reports the selected initial mode.
     #[must_use]
-    pub const fn new(initial_operation_mode: crate::OperationMode) -> Self {
+    pub fn new(
+        initial_operation_mode: crate::OperationMode,
+        time_environment: crate::TimeEnvironment,
+    ) -> Self {
         Self {
             observed: BTreeMap::new(),
             unknown_calls: 0,
             initial_operation_mode,
+            time_environment,
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
@@ -396,8 +401,12 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x18 => wait_synchronization(context),
             0x1f => self.connect_to_named_port(context),
             0x20 => send_sync_request_light(context),
-            0x21 => send_sync_request(context, self.initial_operation_mode),
-            0x22 => send_sync_request_with_user_buffer(context, self.initial_operation_mode),
+            0x21 => send_sync_request(context, self.initial_operation_mode, &self.time_environment),
+            0x22 => send_sync_request_with_user_buffer(
+                context,
+                self.initial_operation_mode,
+                &self.time_environment,
+            ),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
             0x26 => break_process(context),
@@ -428,7 +437,10 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
 
 impl Default for HorizonSvcDispatcher {
     fn default() -> Self {
-        Self::new(crate::OperationMode::default())
+        Self::new(
+            crate::OperationMode::default(),
+            crate::TimeEnvironment::default(),
+        )
     }
 }
 
@@ -568,6 +580,7 @@ impl HorizonSvcDispatcher {
 fn send_sync_request(
     context: &mut ExceptionDispatchContext<'_>,
     initial_operation_mode: crate::OperationMode,
+    time_environment: &crate::TimeEnvironment,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let tls = match context.thread().state() {
@@ -579,6 +592,7 @@ fn send_sync_request(
         tls,
         handle,
         initial_operation_mode,
+        time_environment,
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -594,6 +608,7 @@ fn send_sync_request(
 fn send_sync_request_with_user_buffer(
     context: &mut ExceptionDispatchContext<'_>,
     initial_operation_mode: crate::OperationMode,
+    time_environment: &crate::TimeEnvironment,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let address = read_register(context.thread().state(), 0);
     let size = read_register(context.thread().state(), 1);
@@ -627,6 +642,7 @@ fn send_sync_request_with_user_buffer(
         size,
         handle,
         initial_operation_mode,
+        time_environment,
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -1173,15 +1189,87 @@ fn map_shared_memory(
         result(context, HorizonKernelResult::INVALID_STATE);
         return resume();
     }
+    let mapping_permissions = if permissions == MemoryPermissions::READ {
+        MemoryPermissions::READ_WRITE
+    } else {
+        permissions
+    };
     match context.process().memory().resize_zeroed_mapping(
         context.process().cpu().address_space_id(),
         start,
         0,
         size,
-        permissions,
+        mapping_permissions,
         MemoryMappingPurpose::SharedMemory,
     ) {
         Ok(()) => {
+            let mut backing = vec![0_u8; shared_memory.size()];
+            if shared_memory.read(0, &mut backing).is_err() {
+                let _ = context.process().memory().resize_zeroed_mapping(
+                    context.process().cpu().address_space_id(),
+                    start,
+                    size,
+                    0,
+                    mapping_permissions,
+                    MemoryMappingPurpose::SharedMemory,
+                );
+                return reject(
+                    context,
+                    HorizonSvcFault::MalformedIpc {
+                        immediate: 0x13,
+                        reason: "shared-memory backing cannot satisfy its declared size",
+                    },
+                );
+            }
+            for (offset, byte) in backing
+                .into_iter()
+                .enumerate()
+                .filter(|(_, byte)| *byte != 0)
+            {
+                let Some(address) = start.checked_add(offset as u64) else {
+                    unreachable!("validated shared-memory range contains every backing byte")
+                };
+                if let Err(fault) = context.process().memory().write(
+                    context.process().cpu().address_space_id(),
+                    address,
+                    MemoryAccess::normal(MemoryAccessSize::Byte),
+                    MemoryValue::U8(byte),
+                ) {
+                    let _ = context.process().memory().resize_zeroed_mapping(
+                        context.process().cpu().address_space_id(),
+                        start,
+                        size,
+                        0,
+                        mapping_permissions,
+                        MemoryMappingPurpose::SharedMemory,
+                    );
+                    return reject(
+                        context,
+                        HorizonSvcFault::GuestMemory {
+                            immediate: 0x13,
+                            fault,
+                        },
+                    );
+                }
+            }
+            if permissions != mapping_permissions
+                && let Err(fault) = context.process().memory().set_permissions(
+                    context.process().cpu().address_space_id(),
+                    start,
+                    size,
+                    permissions,
+                )
+            {
+                let _ = context.process().memory().resize_zeroed_mapping(
+                    context.process().cpu().address_space_id(),
+                    start,
+                    size,
+                    0,
+                    mapping_permissions,
+                    MemoryMappingPurpose::SharedMemory,
+                );
+                return reject(context, HorizonSvcFault::MemoryProtection { fault });
+            }
             log::debug!(
                 "mapped temporary shared memory handle {handle:#x} at {start} ({size:#x} bytes)"
             );

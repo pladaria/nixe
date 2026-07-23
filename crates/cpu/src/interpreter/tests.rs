@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    InstructionSupport, InterpreterContext, InterpreterError, InterpreterOutcome,
-    InterpreterPolicy, execute_fallback, execute_one, execute_one_with_context,
+    ArchitecturalTimerSnapshot, InstructionSupport, InterpreterContext, InterpreterError,
+    InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one, execute_one_with_context,
     instruction_support,
 };
 
@@ -400,6 +400,26 @@ fn a64_system_register_reference_semantics_preserve_thread_state() {
 }
 
 #[test]
+fn a64_architectural_timer_registers_use_the_runtime_snapshot() {
+    let profile = GuestCpuProfile::switch_1();
+    let context = InterpreterContext::new(ProcessCpuContext::new(profile, AddressSpaceId::new(0)))
+        .with_architectural_timer(ArchitecturalTimerSnapshot {
+            counter: 0x1234_5678_9abc_def0,
+            frequency: 19_200_000,
+        });
+    let mut state = ThreadCpuState::A64(Box::default());
+
+    execute_one_with_context(context, &mut state, 0xd53b_e001_u32.into()).unwrap(); // MRS X1,CNTFRQ_EL0
+    execute_one_with_context(context, &mut state, 0xd53b_e022_u32.into()).unwrap(); // MRS X2,CNTVCT_EL0
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(1)), 19_200_000);
+    assert_eq!(a64.read_x(x(2)), 0x1234_5678_9abc_def0);
+}
+
+#[test]
 fn a64_basic_system_semantics_are_exact_and_runtime_hints_remain_explicit() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
@@ -615,6 +635,139 @@ fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     };
     assert_eq!(a64.vector(2), Some(first));
     assert_eq!(a64.vector(3), Some(second));
+}
+
+#[test]
+fn a64_simd_pre_and_post_index_transfers_cover_sizes_writeback_and_faults() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(51);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(98);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let value = 0x1122_3344_5566_7788_99aa_bbcc_ddee_ffab_u128;
+
+    // STR Q30,[X1],#16: the exact instruction observed during libnx startup.
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(30, value));
+    a64.write_x(x(1), 0x1000);
+    execute_one_with_context(context, &mut state, 0x3c81_043e_u32.into()).unwrap();
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(1)), 0x1010);
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1000),
+                MemoryAccess::normal(MemoryAccessSize::Quadword),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U128(value),
+    );
+
+    for (index, (size_bits, access_size)) in [
+        (0_u32, MemoryAccessSize::Byte),
+        (1_u32 << 30, MemoryAccessSize::Halfword),
+        (2_u32 << 30, MemoryAccessSize::Word),
+        (3_u32 << 30, MemoryAccessSize::Doubleword),
+        (1_u32 << 23, MemoryAccessSize::Quadword),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let base = 0x1100 + index as u64 * 0x40;
+        let offset = if index.is_multiple_of(2) { 16_i16 } else { -16 };
+        let immediate = u32::from((offset as u16) & 0x01ff) << 12;
+        let expected = match access_size {
+            MemoryAccessSize::Byte => value & u128::from(u8::MAX),
+            MemoryAccessSize::Halfword => value & u128::from(u16::MAX),
+            MemoryAccessSize::Word => value & u128::from(u32::MAX),
+            MemoryAccessSize::Doubleword => value & u128::from(u64::MAX),
+            MemoryAccessSize::Quadword => value,
+        };
+
+        for (mode_bits, pre_index) in [(0x0400_u32, false), (0x0c00, true)] {
+            let store = 0x3c00_0000 | size_bits | immediate | mode_bits | (1 << 5);
+            let load = store | (1 << 22);
+            let transfer_address = if pre_index {
+                base.wrapping_add_signed(i64::from(offset))
+            } else {
+                base
+            };
+
+            let ThreadCpuState::A64(a64) = &mut state else {
+                unreachable!()
+            };
+            assert!(a64.set_vector(0, value));
+            a64.write_x(x(1), base);
+            execute_one_with_context(context, &mut state, store.into()).unwrap();
+            let ThreadCpuState::A64(a64) = &mut state else {
+                unreachable!()
+            };
+            assert_eq!(
+                a64.read_x(x(1)),
+                base.wrapping_add_signed(i64::from(offset)),
+                "store encoding={store:#010x}"
+            );
+            assert!(a64.set_vector(0, u128::MAX));
+            a64.write_x(x(1), base);
+            execute_one_with_context(context, &mut state, load.into()).unwrap();
+
+            let ThreadCpuState::A64(a64) = &state else {
+                unreachable!()
+            };
+            assert_eq!(a64.vector(0), Some(expected), "load encoding={load:#010x}");
+            assert_eq!(
+                a64.read_x(x(1)),
+                base.wrapping_add_signed(i64::from(offset)),
+                "load encoding={load:#010x}"
+            );
+            assert_eq!(
+                memory
+                    .read(
+                        SPACE,
+                        GuestVirtualAddress::new(transfer_address),
+                        MemoryAccess::normal(access_size),
+                    )
+                    .unwrap()
+                    .value,
+                match access_size {
+                    MemoryAccessSize::Byte => MemoryValue::U8(value as u8),
+                    MemoryAccessSize::Halfword => MemoryValue::U16(value as u16),
+                    MemoryAccessSize::Word => MemoryValue::U32(value as u32),
+                    MemoryAccessSize::Doubleword => MemoryValue::U64(value as u64),
+                    MemoryAccessSize::Quadword => MemoryValue::U128(value),
+                },
+                "store encoding={store:#010x}"
+            );
+        }
+    }
+
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(1), 0x4000);
+    let pc = a64.pc();
+    let outcome = execute_one_with_context(context, &mut state, 0x3c81_0420_u32.into()).unwrap();
+    assert!(matches!(outcome, InterpreterOutcome::DataAbort { .. }));
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(1)), 0x4000, "fault must suppress writeback");
+    assert_eq!(a64.pc(), pc, "faulting instruction must not retire");
 }
 
 #[test]

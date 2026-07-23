@@ -19,7 +19,9 @@ pub use ipc_result::HorizonIpcResult;
 pub use object::{
     AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource, HidSession, IpcSession,
     OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, ServiceManagerSession, SystemSettingsSession,
+    ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
+    SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
+    TimeZoneServiceSession,
 };
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,

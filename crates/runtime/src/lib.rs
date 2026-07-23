@@ -11,6 +11,7 @@ mod launcher;
 mod module_memory;
 mod process_builder;
 mod process_mount;
+mod virtual_time;
 
 pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use exception_dispatch::{
@@ -47,3 +48,4 @@ pub use process_builder::{
     RunnableProcess,
 };
 pub use process_mount::ProcessMountNamespace;
+pub use virtual_time::{VirtualClock, VirtualClockMode};

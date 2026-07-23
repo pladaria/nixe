@@ -215,6 +215,8 @@ pub struct ProcessBuildConfig {
     pub image_base: GuestVirtualAddress,
     /// Physical-memory resource limit assigned to the emulated process.
     pub physical_memory_limit: u64,
+    /// Frequency exposed by architectural counter registers.
+    pub architectural_timer_frequency: u64,
 }
 
 impl Default for ProcessBuildConfig {
@@ -226,6 +228,9 @@ impl Default for ProcessBuildConfig {
             memory_layout_profile: ProcessMemoryLayoutProfile::Horizon2Plus,
             image_base: GuestVirtualAddress::new(DEFAULT_IMAGE_BASE),
             physical_memory_limit: DEFAULT_PHYSICAL_MEMORY_LIMIT,
+            // Horizon exposes the Switch 1 system counter at 19.2 MHz:
+            // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#svcGetSystemTick
+            architectural_timer_frequency: 19_200_000,
         }
     }
 }
@@ -798,6 +803,7 @@ impl Error for ProcessBuildError {}
 pub struct ProcessBuilder {
     diagnostics: crate::DiagnosticsPolicy,
     config: ProcessBuildConfig,
+    virtual_clock: crate::VirtualClock,
 }
 
 impl ProcessBuilder {
@@ -819,6 +825,13 @@ impl ProcessBuilder {
         self
     }
 
+    /// Selects the clock source shared by CPU architectural timers and services.
+    #[must_use]
+    pub fn with_virtual_clock(mut self, virtual_clock: crate::VirtualClock) -> Self {
+        self.virtual_clock = virtual_clock;
+        self
+    }
+
     #[must_use]
     pub const fn diagnostics(&self) -> crate::DiagnosticsPolicy {
         self.diagnostics
@@ -834,6 +847,12 @@ impl ProcessBuilder {
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
     /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
+        if self.config.architectural_timer_frequency == 0 {
+            return Err(ProcessBuildError::new(
+                ProcessBuildStage::Metadata,
+                "architectural timer frequency must be nonzero",
+            ));
+        }
         let (execution_state, address_space, stack_size, abi) = process_metadata(plan);
         let random_entropy = generate_process_entropy()?;
         let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
@@ -1019,7 +1038,11 @@ impl ProcessBuilder {
             main_thread,
             mounts: crate::ProcessMountNamespace::from_launch_plan(plan),
             handles,
-            execution: crate::execution::ProcessExecutionControl::new(self.diagnostics),
+            execution: crate::execution::ProcessExecutionControl::new(
+                self.diagnostics,
+                self.virtual_clock.clone(),
+                self.config.architectural_timer_frequency,
+            ),
         };
         process.translate_entry()?;
         Ok(process)

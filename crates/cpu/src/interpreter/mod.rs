@@ -85,6 +85,14 @@ pub struct InterpreterContext<'a> {
     process: ProcessCpuContext,
     memory: Option<&'a dyn CpuMemory>,
     exclusive_monitor: Option<&'a RefCell<crate::vcpu::ExclusiveMonitorState>>,
+    architectural_timer: Option<ArchitecturalTimerSnapshot>,
+}
+
+/// One immutable architectural-timer observation supplied by the runtime.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ArchitecturalTimerSnapshot {
+    pub counter: u64,
+    pub frequency: u64,
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -94,6 +102,7 @@ impl<'a> InterpreterContext<'a> {
             process,
             memory: None,
             exclusive_monitor: None,
+            architectural_timer: None,
         }
     }
 
@@ -110,6 +119,20 @@ impl<'a> InterpreterContext<'a> {
     ) -> Self {
         self.exclusive_monitor = Some(monitor);
         self
+    }
+
+    #[must_use]
+    pub const fn with_architectural_timer(
+        mut self,
+        architectural_timer: ArchitecturalTimerSnapshot,
+    ) -> Self {
+        self.architectural_timer = Some(architectural_timer);
+        self
+    }
+
+    #[must_use]
+    pub const fn architectural_timer(self) -> Option<ArchitecturalTimerSnapshot> {
+        self.architectural_timer
     }
 
     #[must_use]

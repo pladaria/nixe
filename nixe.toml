@@ -19,6 +19,15 @@ keys = "./keys/"
 # Initial mode reported to applications: "handheld" or "docked".
 initial_operation_mode = "handheld"
 
+[system.time]
+# "realtime" anchors to the host clock at launch and advances monotonically.
+# "fixed" freezes wall and monotonic time at fixed_unix_timestamp.
+mode = "realtime"
+# IANA time-zone location exposed by Horizon's time-zone service.
+timezone = "Europe/Madrid"
+# Required only with mode = "fixed".
+# fixed_unix_timestamp = 0
+
 [diagnostics]
 # Diagnostic context policy. "detailed" retains bounded local debugging
 # context; "sanitized" omits local-only detail and is safer for shared reports.

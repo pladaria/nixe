@@ -10,7 +10,8 @@ use nixe_cpu::error::InstructionFetchFault;
 use nixe_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::interpreter::{
-    InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
+    ArchitecturalTimerSnapshot, InterpreterContext, InterpreterError, InterpreterOutcome,
+    execute_one_with_context,
 };
 use nixe_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{InstructionMemory, SyntheticMemory};
@@ -19,7 +20,10 @@ use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu::vcpu::VcpuExecutionState;
 use nixe_cpu::{coverage::CoverageId, memory::DataAccessFault};
 
-use crate::{DiagnosticsPolicy, ExceptionDispatchRequest, ExceptionTerminationScope, ReportDetail};
+use crate::{
+    DiagnosticsPolicy, ExceptionDispatchRequest, ExceptionTerminationScope, ReportDetail,
+    VirtualClock,
+};
 
 /// Maximum number of guest instructions retained by an enabled trace.
 pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
@@ -390,6 +394,15 @@ impl Display for ProcessExecutionError {
 
 impl Error for ProcessExecutionError {}
 
+fn architectural_timer(clock: &VirtualClock, frequency: u64) -> ArchitecturalTimerSnapshot {
+    let elapsed_nanos = clock.elapsed().as_nanos();
+    let ticks = elapsed_nanos.saturating_mul(u128::from(frequency)) / 1_000_000_000;
+    ArchitecturalTimerSnapshot {
+        counter: u64::try_from(ticks).unwrap_or(u64::MAX),
+        frequency,
+    }
+}
+
 /// Summary returned while deterministically consuming process-owned resources.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessTeardownReport {
@@ -408,15 +421,23 @@ pub(crate) struct ProcessExecutionControl {
     exit: Option<ProcessExit>,
     vcpu: VcpuExecutionState<()>,
     trace: InstructionTraceRecorder,
+    virtual_clock: VirtualClock,
+    architectural_timer_frequency: u64,
 }
 
 impl ProcessExecutionControl {
-    pub(crate) fn new(diagnostics: DiagnosticsPolicy) -> Self {
+    pub(crate) fn new(
+        diagnostics: DiagnosticsPolicy,
+        virtual_clock: VirtualClock,
+        architectural_timer_frequency: u64,
+    ) -> Self {
         Self {
             status: ProcessExecutionStatus::Ready,
             exit: None,
             vcpu: VcpuExecutionState::new((), 0),
             trace: InstructionTraceRecorder::new(diagnostics),
+            virtual_clock,
+            architectural_timer_frequency,
         }
     }
 
@@ -541,7 +562,11 @@ pub(crate) fn run_reference(
         let source = current_location(cpu, state);
         let context = InterpreterContext::new(cpu)
             .with_memory(memory)
-            .with_exclusive_monitor(control.vcpu.exclusive_monitor_cell());
+            .with_exclusive_monitor(control.vcpu.exclusive_monitor_cell())
+            .with_architectural_timer(architectural_timer(
+                &control.virtual_clock,
+                control.architectural_timer_frequency,
+            ));
         let outcome = match execute_one_with_context(context, state, encoding) {
             Ok(outcome) => outcome,
             Err(InterpreterError::UnsupportedInstruction {

@@ -47,6 +47,7 @@ impl NixeConfig {
                 version: raw.version,
             });
         }
+        validate_time_config(path, &raw.system.time)?;
 
         let source_path = absolute_path(path).map_err(|source| ConfigError::Io {
             path: path.to_owned(),
@@ -71,6 +72,11 @@ impl NixeConfig {
                 preferred_languages: raw.system.preferred_languages,
                 keys: resolve_path(base_directory, raw.system.keys),
                 initial_operation_mode: raw.system.initial_operation_mode,
+                time: TimeConfig {
+                    mode: raw.system.time.mode,
+                    timezone: raw.system.time.timezone,
+                    fixed_unix_timestamp: raw.system.time.fixed_unix_timestamp,
+                },
             },
             diagnostics: DiagnosticsConfig {
                 report_detail: raw.diagnostics.report_detail,
@@ -130,6 +136,30 @@ pub struct SystemConfig {
     pub keys: PathBuf,
     /// Operation mode reported to titles when the emulated system starts.
     pub initial_operation_mode: InitialOperationMode,
+    /// Initial virtual-time policy.
+    pub time: TimeConfig,
+}
+
+/// Virtual-time preferences shared by application frontends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimeConfig {
+    /// How the guest wall clock advances.
+    pub mode: TimeMode,
+    /// IANA time-zone location reported to Horizon clients.
+    pub timezone: String,
+    /// POSIX timestamp used when `mode` is `fixed`.
+    pub fixed_unix_timestamp: Option<i64>,
+}
+
+/// Guest wall-clock policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeMode {
+    /// Anchor to host time at process launch and advance monotonically.
+    #[default]
+    Realtime,
+    /// Freeze wall and monotonic time at `fixed_unix_timestamp`.
+    Fixed,
 }
 
 /// Initial physical presentation selected for the emulated console.
@@ -177,6 +207,8 @@ pub enum ConfigError {
     },
     /// The document uses a schema version this build cannot interpret.
     UnsupportedVersion { path: PathBuf, version: u32 },
+    /// Virtual-time settings are internally inconsistent or not representable.
+    InvalidTime { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -201,6 +233,11 @@ impl Display for ConfigError {
                 "configuration {} uses unsupported version {version}; expected {CONFIG_VERSION}",
                 path.display()
             ),
+            Self::InvalidTime { path, reason } => write!(
+                formatter,
+                "configuration {} has invalid system.time settings: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -210,7 +247,7 @@ impl Error for ConfigError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::UnsupportedVersion { .. } => None,
+            Self::UnsupportedVersion { .. } | Self::InvalidTime { .. } => None,
         }
     }
 }
@@ -240,6 +277,28 @@ struct RawSystemConfig {
     preferred_languages: Vec<NacpLanguage>,
     keys: PathBuf,
     initial_operation_mode: InitialOperationMode,
+    #[serde(default)]
+    time: RawTimeConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTimeConfig {
+    #[serde(default)]
+    mode: TimeMode,
+    #[serde(default = "default_timezone")]
+    timezone: String,
+    fixed_unix_timestamp: Option<i64>,
+}
+
+impl Default for RawTimeConfig {
+    fn default() -> Self {
+        Self {
+            mode: TimeMode::Realtime,
+            timezone: default_timezone(),
+            fixed_unix_timestamp: None,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -253,6 +312,56 @@ struct RawDiagnosticsConfig {
 
 const fn default_recursive_scan() -> bool {
     true
+}
+
+fn default_timezone() -> String {
+    "UTC".to_owned()
+}
+
+fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
+    let valid_timezone = !time.timezone.is_empty()
+        && time.timezone.len() < 0x24
+        && time.timezone.is_ascii()
+        && !time.timezone.starts_with('/')
+        && !time.timezone.ends_with('/')
+        && time
+            .timezone
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && time
+            .timezone
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'+'));
+    if !valid_timezone {
+        return Err(ConfigError::InvalidTime {
+            path: path.to_owned(),
+            reason: "timezone must be a representable IANA location name".to_owned(),
+        });
+    }
+    // `chrono-tz` embeds the IANA database and gives configuration loading the
+    // same typed location-name validation used by the Horizon service:
+    // https://docs.rs/chrono-tz/0.10.4/chrono_tz/enum.Tz.html
+    if time.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ConfigError::InvalidTime {
+            path: path.to_owned(),
+            reason: format!("timezone {:?} is not in the IANA database", time.timezone),
+        });
+    }
+    match (time.mode, time.fixed_unix_timestamp) {
+        (TimeMode::Realtime, None) | (TimeMode::Fixed, Some(0..)) => Ok(()),
+        (TimeMode::Realtime, Some(_)) => Err(ConfigError::InvalidTime {
+            path: path.to_owned(),
+            reason: "fixed_unix_timestamp is only valid with mode = \"fixed\"".to_owned(),
+        }),
+        (TimeMode::Fixed, None) => Err(ConfigError::InvalidTime {
+            path: path.to_owned(),
+            reason: "mode = \"fixed\" requires fixed_unix_timestamp".to_owned(),
+        }),
+        (TimeMode::Fixed, Some(_)) => Err(ConfigError::InvalidTime {
+            path: path.to_owned(),
+            reason: "fixed_unix_timestamp must be non-negative".to_owned(),
+        }),
+    }
 }
 
 fn deserialize_languages<'de, D>(deserializer: D) -> Result<Vec<NacpLanguage>, D::Error>
@@ -376,6 +485,9 @@ mod tests {
             config.system.initial_operation_mode,
             InitialOperationMode::Docked
         );
+        assert_eq!(config.system.time.mode, TimeMode::Realtime);
+        assert_eq!(config.system.time.timezone, "UTC");
+        assert_eq!(config.system.time.fixed_unix_timestamp, None);
         assert_eq!(
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
@@ -430,6 +542,54 @@ mod tests {
             DiagnosticReportDetail::Sanitized
         );
         assert!(config.diagnostics.instruction_trace);
+    }
+
+    #[test]
+    fn loads_fixed_time_and_validates_iana_location_names() {
+        let file = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [system.time]
+                mode = "fixed"
+                timezone = "Europe/Madrid"
+                fixed_unix_timestamp = 1704067200
+            "#,
+        );
+
+        let config = NixeConfig::load(&file.path).unwrap();
+        assert_eq!(config.system.time.mode, TimeMode::Fixed);
+        assert_eq!(config.system.time.timezone, "Europe/Madrid");
+        assert_eq!(config.system.time.fixed_unix_timestamp, Some(1_704_067_200));
+
+        for invalid_time in [
+            "mode = \"fixed\"\ntimezone = \"Europe/Madrid\"",
+            "mode = \"realtime\"\ntimezone = \"Mars/Olympus\"",
+            "mode = \"realtime\"\ntimezone = \"UTC\"\nfixed_unix_timestamp = 0",
+        ] {
+            let file = TemporaryConfig::new(&format!(
+                r#"
+                    version = 2
+                    [library]
+                    paths = []
+                    [system]
+                    preferred_languages = []
+                    keys = "keys"
+                    initial_operation_mode = "handheld"
+                    [system.time]
+                    {invalid_time}
+                "#
+            ));
+            assert!(matches!(
+                NixeConfig::load(&file.path),
+                Err(ConfigError::InvalidTime { .. })
+            ));
+        }
     }
 
     #[test]

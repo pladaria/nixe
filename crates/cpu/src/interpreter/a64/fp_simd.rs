@@ -42,7 +42,10 @@ pub(super) fn execute(
             integer_add_sub(state, fields);
             None
         }
-        Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_) => {
+        Instruction::MemoryUnsigned(_)
+        | Instruction::MemoryUnscaled(_)
+        | Instruction::MemoryPostIndex(_)
+        | Instruction::MemoryPreIndex(_) => {
             let Some(memory) = context.memory() else {
                 return Err(super::super::unsupported(decoded));
             };
@@ -53,19 +56,35 @@ pub(super) fn execute(
                 Instruction::MemoryUnsigned(_) => {
                     u64::from(fields.immediate_12) * size.bytes() as u64
                 }
-                Instruction::MemoryUnscaled(_) => {
+                Instruction::MemoryUnscaled(_)
+                | Instruction::MemoryPostIndex(_)
+                | Instruction::MemoryPreIndex(_) => {
                     sign_extend(u64::from(fields.immediate_9), 9) as u64
                 }
                 _ => unreachable!(),
             };
-            Some(vector_transfer(
+            let address = if matches!(instruction, Instruction::MemoryPostIndex(_)) {
+                base
+            } else {
+                base.wrapping_add(offset)
+            };
+            let result = vector_transfer(
                 memory,
                 address_space,
                 state,
                 fields,
-                GuestVirtualAddress::new(base.wrapping_add(offset)),
+                GuestVirtualAddress::new(address),
                 size,
-            ))
+            );
+            if result.is_ok()
+                && matches!(
+                    instruction,
+                    Instruction::MemoryPostIndex(_) | Instruction::MemoryPreIndex(_)
+                )
+            {
+                super::write(state, fields.rn, 64, true, base.wrapping_add(offset));
+            }
+            Some(result)
         }
         Instruction::MemoryPair(_) => {
             let Some(memory) = context.memory() else {

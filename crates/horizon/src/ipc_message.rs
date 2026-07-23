@@ -239,9 +239,10 @@ impl<'a> CmifRequest<'a> {
     pub(crate) fn decode(hipc: &HipcRequest<'a>, is_domain: bool) -> Result<Self, MessageError> {
         let command_type = hipc.command_type;
         if command_type == CMIF_COMMAND_CLOSE {
-            if is_domain {
-                return Err(MessageError("session close cannot target a domain object"));
-            }
+            // A domain session is still closed with the ordinary HIPC close
+            // message; domain-object closure instead uses a CMIF domain
+            // header. libnx emits this from serviceClose after conversion:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L195-L209
             if hipc.data_word_bytes() != 0 {
                 return Err(MessageError("CMIF session close contains data words"));
             }

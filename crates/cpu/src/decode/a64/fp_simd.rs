@@ -195,6 +195,10 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 LDR/STR (immediate, SIMD&FP) allocation and operation,
+    // including the signed pre-index and post-index forms, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LDR--immediate--SIMD-FP---Load-SIMD-FP-register--immediate-offset--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/STR--immediate--SIMD-FP---Store-SIMD-FP-register--immediate-offset--
     pattern(
         "fp-simd-load-store-post-index",
         0x3f20_0c00,

@@ -127,14 +127,14 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 }
 
 #[test]
-fn contemporary_libnx_nro_advances_hid_rng_to_simd_post_index_store() {
+fn contemporary_libnx_nro_initializes_hid_and_time_then_enters_application_code() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    let reached_simd_post_index_store = loop {
+    let reached_application_code = loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
@@ -149,27 +149,38 @@ fn contemporary_libnx_nro_advances_hid_rng_to_simd_post_index_store() {
                     .unwrap();
                 match outcome {
                     ExceptionHandlingResult::Resumed => {}
+                    ExceptionHandlingResult::Terminated { .. }
+                        if matches!(
+                            &report.stop,
+                            ExecutionStop::SupervisorCall {
+                                immediate: 0x26,
+                                ..
+                            }
+                        ) =>
+                    {
+                        break true;
+                    }
                     _ => panic!(
                         "libnx SVC failed at {stop}: {outcome:?}",
                         stop = report.stop
                     ),
                 }
             }
-            ExecutionStop::UnsupportedSemantics { encoding, .. }
-                if encoding.bits() == 0x3c81_043e =>
+            ExecutionStop::UnallocatedEncoding { error }
+                if error.instruction.encoding.bits() == 0x4cdf_a041 =>
             {
                 break true;
             }
-            stop => panic!("libnx startup stopped during service-manager bring-up: {stop}"),
+            stop => panic!("libnx startup stopped before entering application code: {stop}"),
         }
     };
 
     assert!(
-        reached_simd_post_index_store && executed > 8_000,
-        "libnx did not advance its HID RNG to a SIMD post-index store: executed={executed}"
+        reached_application_code && executed > 9_000,
+        "libnx did not initialize HID/time and enter application code: executed={executed}"
     );
     let coverage = dispatcher.coverage();
-    for immediate in [0x01, 0x02, 0x03, 0x06, 0x29] {
+    for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {
         assert!(
             coverage.iter().any(|entry| {
                 entry.immediate == immediate && entry.support != HorizonSvcSupport::Unsupported

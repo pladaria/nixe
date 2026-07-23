@@ -1550,7 +1550,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         svc(0x13),
         svc(0x14),
     ]);
-    let mut dispatcher = HorizonSvcDispatcher::new(OperationMode::Console);
+    let mut dispatcher = HorizonSvcDispatcher::new(
+        OperationMode::Console,
+        nixe_horizon::TimeEnvironment::default(),
+    );
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
     state(&mut process).write_x(x(1), name.get());
@@ -1788,9 +1791,11 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let shared_memory = process
         .handles()
         .get_as::<SharedMemoryObject>(shared_memory_handle)
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(shared_memory.size(), 0x40000);
     assert_eq!(shared_memory.remote_permissions(), MemoryPermissions::READ);
+    shared_memory.write(7, &[0x5a]).unwrap();
 
     let mapping_address = process.memory_layout().alias().base();
     state(&mut process).write_w(x(0), shared_memory_handle);
@@ -1802,6 +1807,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(state(&mut process).read_w(x(0)), 0);
+    assert_eq!(
+        read_guest_bytes(&process, mapping_address.checked_add(7).unwrap(), 1),
+        [0x5a]
+    );
     assert_eq!(
         process
             .memory()
