@@ -12,6 +12,8 @@ use nixe_runtime::{
     ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess, VirtualClock, VirtualClockMode,
 };
 
+use crate::logging::LogLevel;
+
 use super::load_config;
 
 const EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
@@ -19,13 +21,27 @@ const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
 
 pub struct Arguments {
     pub config_path: Option<PathBuf>,
+    pub log_level_override: Option<LogLevel>,
     pub identifier: String,
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
     let interrupted = install_interrupt_handler()?;
+    let config = load_config(arguments.config_path, arguments.log_level_override)?;
     log::info!("scanning configured title library");
-    let config = load_config(arguments.config_path)?;
+    std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
+        format!(
+            "cannot create configured SD-card directory {}: {error}",
+            config.filesystem.sd_card.display()
+        )
+    })?;
+    let sd_card_root = std::fs::canonicalize(&config.filesystem.sd_card).map_err(|error| {
+        format!(
+            "cannot resolve configured SD-card directory {}: {error}",
+            config.filesystem.sd_card.display()
+        )
+    })?;
+    log::debug!("SD card host directory: {}", sd_card_root.display());
     let scan_started = Instant::now();
     let library = Library::scan(&config)?;
     log::debug!(
@@ -93,6 +109,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let mut process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
+        .with_sd_card_root(sd_card_root)
         .build(&plan)
         .map_err(|error| error.to_string())?;
     log::debug!("process prepared in {:?}", process_started.elapsed());

@@ -22,6 +22,8 @@ pub struct NixeConfig {
     pub version: u32,
     /// Title-library locations and discovery behavior.
     pub library: LibraryConfig,
+    /// Host-backed filesystem locations exposed to the emulated system.
+    pub filesystem: FileSystemConfig,
     /// System-wide preferences and caller-owned key location.
     pub system: SystemConfig,
     /// Cross-cutting diagnostic preferences consumed by application runtimes.
@@ -68,6 +70,9 @@ impl NixeConfig {
                     .collect(),
                 recursive_scan: raw.library.recursive_scan,
             },
+            filesystem: FileSystemConfig {
+                sd_card: resolve_path(base_directory, raw.filesystem.sd_card),
+            },
             system: SystemConfig {
                 preferred_languages: raw.system.preferred_languages,
                 keys: resolve_path(base_directory, raw.system.keys),
@@ -79,6 +84,7 @@ impl NixeConfig {
                 },
             },
             diagnostics: DiagnosticsConfig {
+                log_level: raw.diagnostics.log_level,
                 report_detail: raw.diagnostics.report_detail,
                 instruction_trace: raw.diagnostics.instruction_trace,
             },
@@ -125,6 +131,13 @@ impl LibraryConfig {
     pub const fn scan_options(&self) -> DirectoryScanOptions {
         DirectoryScanOptions::new().with_recursive(self.recursive_scan)
     }
+}
+
+/// Host-backed filesystem locations exposed through Horizon services.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSystemConfig {
+    /// Directory exposed to the guest as the removable `sdmc:` filesystem.
+    pub sd_card: PathBuf,
 }
 
 /// System-wide preferences shared by applications.
@@ -183,9 +196,23 @@ pub enum DiagnosticReportDetail {
     Sanitized,
 }
 
+/// Minimum severity emitted by application loggers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticLogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
 /// Cross-cutting diagnostics configuration shared by applications.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagnosticsConfig {
+    /// Minimum severity emitted by application loggers.
+    pub log_level: DiagnosticLogLevel,
     /// Detail level requested for CPU, backend, GPU, and runtime reports.
     pub report_detail: DiagnosticReportDetail,
     /// Whether runtimes retain a bounded recent guest-instruction trace.
@@ -257,6 +284,8 @@ impl Error for ConfigError {
 struct RawConfig {
     version: u32,
     library: RawLibraryConfig,
+    #[serde(default)]
+    filesystem: RawFileSystemConfig,
     system: RawSystemConfig,
     #[serde(default)]
     diagnostics: RawDiagnosticsConfig,
@@ -268,6 +297,21 @@ struct RawLibraryConfig {
     paths: Vec<PathBuf>,
     #[serde(default = "default_recursive_scan")]
     recursive_scan: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileSystemConfig {
+    #[serde(default = "default_sd_card_path")]
+    sd_card: PathBuf,
+}
+
+impl Default for RawFileSystemConfig {
+    fn default() -> Self {
+        Self {
+            sd_card: default_sd_card_path(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -305,6 +349,8 @@ impl Default for RawTimeConfig {
 #[serde(deny_unknown_fields)]
 struct RawDiagnosticsConfig {
     #[serde(default)]
+    log_level: DiagnosticLogLevel,
+    #[serde(default)]
     report_detail: DiagnosticReportDetail,
     #[serde(default)]
     instruction_trace: bool,
@@ -316,6 +362,10 @@ const fn default_recursive_scan() -> bool {
 
 fn default_timezone() -> String {
     "UTC".to_owned()
+}
+
+fn default_sd_card_path() -> PathBuf {
+    PathBuf::from("./storage/sdmc")
 }
 
 fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
@@ -462,6 +512,8 @@ mod tests {
                 [library]
                 paths = ["./roms", "other"]
                 recursive_scan = false
+                [filesystem]
+                sd_card = "./custom-sd"
                 [system]
                 preferred_languages = ["Spanish", "AmericanEnglish"]
                 keys = "./keys"
@@ -476,6 +528,7 @@ mod tests {
         assert_eq!(config.library.paths[0], base.join("./roms"));
         assert_eq!(config.library.paths[1], base.join("other"));
         assert!(!config.library.scan_options().recursive);
+        assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
         assert_eq!(
             config.system.preferred_languages,
             vec![NacpLanguage::Spanish, NacpLanguage::AmericanEnglish]
@@ -492,6 +545,7 @@ mod tests {
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
         );
+        assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert!(!config.diagnostics.instruction_trace);
     }
 
@@ -513,6 +567,10 @@ mod tests {
 
         assert!(config.library.recursive_scan);
         assert_eq!(
+            config.filesystem.sd_card,
+            file.path.parent().unwrap().join("./storage/sdmc")
+        );
+        assert_eq!(
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Detailed
         );
@@ -531,6 +589,7 @@ mod tests {
                 keys = "keys"
                 initial_operation_mode = "handheld"
                 [diagnostics]
+                log_level = "trace"
                 report_detail = "sanitized"
                 instruction_trace = true
             "#,
@@ -541,6 +600,7 @@ mod tests {
             config.diagnostics.report_detail,
             DiagnosticReportDetail::Sanitized
         );
+        assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Trace);
         assert!(config.diagnostics.instruction_trace);
     }
 
@@ -622,6 +682,17 @@ mod tests {
                 preferred_languages = []
                 keys = "keys"
                 initial_operation_mode = "tabletop"
+            "#,
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [diagnostics]
+                log_level = "verbose"
             "#,
         ] {
             let file = TemporaryConfig::new(contents);

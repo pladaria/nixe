@@ -19,9 +19,9 @@ use crate::ipc_message::{
 use crate::object::AppletObject;
 use crate::{
     AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HorizonIpcResult,
-    IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode, IpcService, IpcSession,
-    MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES, OperationMode,
-    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
+    HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
+    IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
+    OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
     ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
     SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
     TimeZoneServiceSession,
@@ -153,7 +153,9 @@ pub(crate) fn send_sync_request_from_buffer(
         .cloned();
     let semantic_object = process.handles().get(handle).cloned().filter(|object| {
         object.is::<ReadOnlyFileSystem>()
+            || object.is::<HostDirectoryFileSystem>()
             || object.is::<ReadOnlyFile>()
+            || object.is::<HostFile>()
             || object.is::<ReadOnlyDirectory>()
     });
     if manager.is_none()
@@ -248,6 +250,41 @@ pub(crate) fn send_sync_request_from_buffer(
             write_bytes(process, address, &response)?;
             log::debug!(
                 "{:?} converted to domain with root object {object_id:#x}",
+                String::from_utf8_lossy(service.service().name())
+            );
+            return Ok(SyncRequestResult::Success);
+        }
+        if matches!(request.command_id, 2 | 4)
+            && let Some(service) = &service
+        {
+            // CloneCurrentObject (2) returns a moved session handle. The Ex
+            // form (4) additionally carries a session-manager tag which the
+            // public libnx ABI documents as unused by official servers:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L308-L337
+            // A cloned `IpcSession` has a distinct process-handle object while
+            // retaining the shared domain table of the source connection.
+            let cloned_handle = process
+                .handles_mut()
+                .insert(service.clone())
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let response = match encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                Some(cloned_handle),
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = process.handles_mut().close(cloned_handle);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_bytes(process, address, &response) {
+                let _ = process.handles_mut().close(cloned_handle);
+                return Err(error);
+            }
+            log::debug!(
+                "{:?} cloned session {handle:#x} as {cloned_handle:#x}",
                 String::from_utf8_lossy(service.service().name())
             );
             return Ok(SyncRequestResult::Success);
@@ -684,6 +721,9 @@ fn decode_root_request(
         // IFileSystemProxy::OpenDataFileSystemByCurrentProcess.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L123-L125
         (IpcService::FileSystem, 2) => Ok(Some(IpcRequest::OpenPrimaryFileSystem)),
+        // IFileSystemProxy::OpenSdCardFileSystem returns an IFileSystem object:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L257-L259
+        (IpcService::FileSystem, 18) => Ok(Some(IpcRequest::OpenSdCardFileSystem)),
         // aoc:u command IDs and version ranges:
         // https://switchbrew.org/w/index.php?title=NS_services&oldid=14328#aoc:u
         (IpcService::AddOnContent, 0) => Ok(Some(IpcRequest::GetIndexedAddOnContentCount)),
@@ -732,21 +772,47 @@ fn decode_object_request(
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<Option<IpcRequest>, IpcWireError> {
-    if object.is::<ReadOnlyFileSystem>() {
+    if object.is::<ReadOnlyFileSystem>() || object.is::<HostDirectoryFileSystem>() {
+        let is_host = object.is::<HostDirectoryFileSystem>();
         return match request.command_id {
+            // IFileSystem::CreateFile/CreateDirectory use the same bounded
+            // input-pointer path as open operations:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L816-L840
+            0 if is_host => {
+                let option = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
+                    "create-file request omits its option",
+                ))?;
+                let size = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
+                    "create-file request omits its size",
+                ))?;
+                Ok(Some(IpcRequest::CreateFile {
+                    path: read_path(process, hipc)?,
+                    size,
+                    option,
+                }))
+            }
+            2 if is_host => Ok(Some(IpcRequest::CreateDirectory {
+                path: read_path(process, hipc)?,
+            })),
             // IFileSystem OpenFile/OpenDirectory use one input pointer path
             // and a u32 mode:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L878-L893
             8 => Ok(Some(IpcRequest::OpenFile {
                 path: read_path(process, hipc)?,
+                mode: request_u32(request.data, 0)
+                    .ok_or(IpcWireError::Malformed("open-file request omits its mode"))?,
             })),
             9 => Ok(Some(IpcRequest::OpenDirectory {
                 path: read_path(process, hipc)?,
+                mode: request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
+                    "open-directory request omits its mode",
+                ))?,
             })),
             _ => Ok(None),
         };
     }
-    if object.is::<ReadOnlyFile>() {
+    if object.is::<ReadOnlyFile>() || object.is::<HostFile>() {
+        let is_host = object.is::<HostFile>();
         return match request.command_id {
             // IFile::Read input layout and map-alias output buffer:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L980-L994
@@ -767,6 +833,50 @@ fn decode_object_request(
                     size: requested.min(capacity).min(MAX_IPC_READ_BYTES),
                 }))
             }
+            // IFile::Write carries option/padding/offset/size and one
+            // map-alias input buffer:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L994-L1017
+            1 if is_host => {
+                let option = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
+                    "file write request omits its option",
+                ))?;
+                let offset = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
+                    "file write request omits its offset",
+                ))?;
+                let requested = request_u64(request.data, 16)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(IpcWireError::Malformed(
+                        "file write request size is out of range",
+                    ))?;
+                if requested > MAX_IPC_READ_BYTES {
+                    return Err(IpcWireError::ResourceExhausted);
+                }
+                let descriptor = one_send_buffer(hipc)?;
+                let capacity = usize::try_from(descriptor.size)
+                    .map_err(|_| IpcWireError::Malformed("file input buffer is too large"))?;
+                if requested > capacity {
+                    return Err(IpcWireError::Malformed(
+                        "file write size exceeds its input buffer",
+                    ));
+                }
+                let mut data = vec![0; requested];
+                read_bytes(
+                    process,
+                    GuestVirtualAddress::new(descriptor.address),
+                    &mut data,
+                )?;
+                Ok(Some(IpcRequest::WriteFile {
+                    offset,
+                    data,
+                    flush: option & 1 != 0,
+                }))
+            }
+            2 if is_host => Ok(Some(IpcRequest::FlushFile)),
+            3 if is_host => Ok(Some(IpcRequest::SetFileSize {
+                size: request_u64(request.data, 0).ok_or(IpcWireError::Malformed(
+                    "set-file-size request omits its size",
+                ))?,
+            })),
             4 => Ok(Some(IpcRequest::GetFileSize)),
             _ => Ok(None),
         };
@@ -1004,6 +1114,18 @@ fn one_receive_buffer(hipc: &HipcRequest<'_>) -> Result<BufferDescriptor, IpcWir
         }
         _ => Err(IpcWireError::Malformed(
             "service command requires exactly one output buffer",
+        )),
+    }
+}
+
+fn one_send_buffer(hipc: &HipcRequest<'_>) -> Result<BufferDescriptor, IpcWireError> {
+    match hipc.send_buffers.as_slice() {
+        [descriptor] if descriptor.mode != BufferMode::Invalid => Ok(*descriptor),
+        [_] => Err(IpcWireError::Malformed(
+            "input buffer has an invalid mapping mode",
+        )),
+        _ => Err(IpcWireError::Malformed(
+            "request requires exactly one input buffer",
         )),
     }
 }
@@ -1575,6 +1697,21 @@ mod semantic_wire_tests {
 
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn filesystem_proxy_decodes_the_sd_card_open_command() {
+        let mut command = [0_u8; COMMAND_BUFFER_SIZE];
+        put_u32(&mut command, 0, 4);
+        put_u32(&mut command, 4, 8);
+        put_u32(&mut command, 16, 0x4943_4653);
+        put_u32(&mut command, 24, 18);
+        let hipc = HipcRequest::decode(&command).unwrap();
+        let request = CmifRequest::decode(&hipc, false).unwrap();
+        assert_eq!(
+            decode_root_request(IpcService::FileSystem, &request, &hipc).unwrap(),
+            Some(IpcRequest::OpenSdCardFileSystem)
+        );
     }
 
     #[test]

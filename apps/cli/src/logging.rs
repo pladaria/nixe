@@ -1,6 +1,8 @@
+use std::io::{self, IsTerminal};
 use std::str::FromStr;
 
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
+use nixe_config::DiagnosticLogLevel;
 
 static LOGGER: NixeLogger = NixeLogger;
 
@@ -26,6 +28,18 @@ impl LogLevel {
     }
 }
 
+impl From<DiagnosticLogLevel> for LogLevel {
+    fn from(level: DiagnosticLogLevel) -> Self {
+        match level {
+            DiagnosticLogLevel::Error => Self::Error,
+            DiagnosticLogLevel::Warn => Self::Warn,
+            DiagnosticLogLevel::Info => Self::Info,
+            DiagnosticLogLevel::Debug => Self::Debug,
+            DiagnosticLogLevel::Trace => Self::Trace,
+        }
+    }
+}
+
 impl FromStr for LogLevel {
     type Err = String;
 
@@ -45,8 +59,12 @@ impl FromStr for LogLevel {
 
 pub fn init(level: LogLevel) -> Result<(), SetLoggerError> {
     log::set_logger(&LOGGER)?;
-    log::set_max_level(level.filter());
+    set_level(level);
     Ok(())
+}
+
+pub fn set_level(level: LogLevel) {
+    log::set_max_level(level.filter());
 }
 
 struct NixeLogger;
@@ -60,14 +78,24 @@ impl Log for NixeLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        match record.level() {
-            Level::Error => eprintln!("[nixe] error: {}", record.args()),
-            Level::Warn => eprintln!("[nixe] warning: {}", record.args()),
-            Level::Info => eprintln!("[nixe] {}", record.args()),
-            Level::Debug => eprintln!("[nixe] debug: {}", record.args()),
-            Level::Trace => eprintln!("[nixe] trace: {}", record.args()),
+        match (record.level(), color_enabled()) {
+            (Level::Error, true) => {
+                eprintln!("\x1b[31m[nixe] error: {}\x1b[0m", record.args());
+            }
+            (Level::Warn, true) => {
+                eprintln!("\x1b[33m[nixe] warning: {}\x1b[0m", record.args());
+            }
+            (Level::Error, false) => eprintln!("[nixe] error: {}", record.args()),
+            (Level::Warn, false) => eprintln!("[nixe] warning: {}", record.args()),
+            (Level::Info, _) => eprintln!("[nixe] {}", record.args()),
+            (Level::Debug, _) => eprintln!("[nixe] debug: {}", record.args()),
+            (Level::Trace, _) => eprintln!("[nixe] trace: {}", record.args()),
         }
     }
 
     fn flush(&self) {}
+}
+
+fn color_enabled() -> bool {
+    io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }

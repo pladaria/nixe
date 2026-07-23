@@ -25,6 +25,15 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 Advanced SIMD bitwise operations, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/AND--vector---Bitwise-AND--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIC--vector---Bitwise-bit-Clear--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ORR--vector---Bitwise-OR--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ORN--vector---Bitwise-inclusive-OR-NOT--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/EOR--vector---Bitwise-exclusive-OR--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BSL--Bitwise-Select-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIT--Bitwise-Insert-if-True-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIF--Bitwise-Insert-if-False-
     pattern(
         "simd-bitwise",
         0x9f20_fc00,
@@ -40,10 +49,176 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SUB--vector---Subtract-vector-
     pattern(
         "simd-integer",
-        0x9f20_8400,
+        0x9f20_fc00,
         0x0e20_8400,
         0x0000_0031,
         58,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 Advanced SIMD pairwise integer operations,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMAXP--Signed-Maximum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMINP--Signed-Minimum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMAXP--Unsigned-Maximum-Pairwise--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMINP--Unsigned-Minimum-Pairwise--vector--
+    pattern(
+        "simd-add-pairwise",
+        0xbf20_fc00,
+        0x0e20_bc00,
+        0x0000_0059,
+        151,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-signed-max-pairwise",
+        0xbf20_fc00,
+        0x0e20_a400,
+        0x0000_005a,
+        152,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-signed-min-pairwise",
+        0xbf20_fc00,
+        0x0e20_ac00,
+        0x0000_005b,
+        153,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-max-pairwise",
+        0xbf20_fc00,
+        0x2e20_a400,
+        0x0000_005c,
+        154,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-min-pairwise",
+        0xbf20_fc00,
+        0x2e20_ac00,
+        0x0000_005d,
+        155,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 Advanced SIMD integer comparisons between registers,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGT--register---Compare-signed-greater-than--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGE--register---Compare-signed-greater-than-or-equal--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMHI--register---Compare-unsigned-higher--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMHS--register---Compare-unsigned-higher-or-same--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMEQ--register---Compare-bitwise-equal--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMTST--Compare-bitwise-test-bits-nonzero--vector--
+    pattern(
+        "simd-compare-signed-greater-than",
+        0xbf20_fc00,
+        0x0e20_3400,
+        0x0000_004e,
+        140,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-unsigned-higher",
+        0xbf20_fc00,
+        0x2e20_3400,
+        0x0000_004f,
+        141,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-signed-greater-equal",
+        0xbf20_fc00,
+        0x0e20_3c00,
+        0x0000_0050,
+        142,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-unsigned-higher-same",
+        0xbf20_fc00,
+        0x2e20_3c00,
+        0x0000_0051,
+        143,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-test-nonzero",
+        0xbf20_fc00,
+        0x0e20_8c00,
+        0x0000_0052,
+        144,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-equal",
+        0xbf20_fc00,
+        0x2e20_8c00,
+        0x0000_0053,
+        145,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 Advanced SIMD integer comparisons against zero,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGT--zero---Compare-signed-greater-than-zero--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGE--zero---Compare-signed-greater-than-or-equal-to-zero--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMEQ--zero---Compare-bitwise-equal-to-zero--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLE--Compare-signed-less-than-or-equal-to-zero--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMLT--Compare-signed-less-than-zero--vector--
+    pattern(
+        "simd-compare-zero-signed-greater-than",
+        0xbf3f_fc00,
+        0x0e20_8800,
+        0x0000_0054,
+        146,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-zero-signed-greater-equal",
+        0xbf3f_fc00,
+        0x2e20_8800,
+        0x0000_0055,
+        147,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-zero-equal",
+        0xbf3f_fc00,
+        0x0e20_9800,
+        0x0000_0056,
+        148,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-zero-signed-less-equal",
+        0xbf3f_fc00,
+        0x2e20_9800,
+        0x0000_0057,
+        149,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-compare-zero-signed-less-than",
+        0xbf3f_fc00,
+        0x0e20_a800,
+        0x0000_0058,
+        150,
         &[],
         SIMD,
     ),
@@ -120,6 +295,28 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0e00_3c00,
         0x0000_004b,
         133,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 Advanced SIMD load/store multiple structures allocation and
+    // operation, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--multiple-structures---Load-multiple-single-element-structures-to-one--two--three--or-four-registers-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--multiple-structures---Store-multiple-single-element-structures-from-one--two--three--or-four-registers-
+    pattern(
+        "simd-load-store-multiple-structures",
+        0xbfbf_0000,
+        0x0c00_0000,
+        0x0000_004c,
+        135,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-load-store-multiple-structures-post-index",
+        0xbfa0_0000,
+        0x0c80_0000,
+        0x0000_004d,
+        136,
         &[],
         SIMD,
     ),
@@ -260,6 +457,44 @@ pub struct Operands {
     pub mode: u8,
     pub immediate_8: u8,
     pub cmode: u8,
+    pub structure_opcode: u8,
+    pub bitwise_operation: Option<BitwiseOperation>,
+    pub integer_comparison: Option<IntegerComparison>,
+    pub pairwise_operation: Option<PairwiseOperation>,
+    pub compare_with_zero: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitwiseOperation {
+    And,
+    BitClear,
+    Or,
+    OrNot,
+    ExclusiveOr,
+    Select,
+    InsertIfTrue,
+    InsertIfFalse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerComparison {
+    SignedGreaterThan,
+    UnsignedGreaterThan,
+    SignedGreaterThanOrEqual,
+    UnsignedGreaterThanOrEqual,
+    SignedLessThan,
+    SignedLessThanOrEqual,
+    NonzeroBitTest,
+    Equal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairwiseOperation {
+    Add,
+    SignedMaximum,
+    SignedMinimum,
+    UnsignedMaximum,
+    UnsignedMinimum,
 }
 
 macro_rules! instructions {
@@ -299,6 +534,10 @@ instructions!(
     MemoryPreIndex,
     MemoryRegister,
     MemoryLiteral,
+    MemoryMultipleStructures,
+    MemoryMultipleStructuresPostIndex,
+    IntegerCompare,
+    IntegerPairwise,
 );
 
 pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
@@ -324,6 +563,14 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         mode: ((bits >> 23) & 3) as u8,
         immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
         cmode: ((bits >> 12) & 0xf) as u8,
+        structure_opcode: ((bits >> 12) & 0xf) as u8,
+        bitwise_operation: (semantic_id == 0x0000_0030).then(|| {
+            bitwise_operation(bits)
+                .expect("the SIMD bitwise pattern only contains allocated operations")
+        }),
+        integer_comparison: integer_comparison(semantic_id),
+        pairwise_operation: pairwise_operation(semantic_id),
+        compare_with_zero: matches!(semantic_id, 0x0000_0054..=0x0000_0058),
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -348,6 +595,55 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0041 => Instruction::MemoryPreIndex(operands),
         0x0000_0042 => Instruction::MemoryRegister(operands),
         0x0000_0043 => Instruction::MemoryLiteral(operands),
+        0x0000_004c => Instruction::MemoryMultipleStructures(operands),
+        0x0000_004d => Instruction::MemoryMultipleStructuresPostIndex(operands),
+        0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
+        0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
+    }
+}
+
+#[must_use]
+const fn bitwise_operation(bits: u32) -> Option<BitwiseOperation> {
+    match (((bits >> 29) & 1) << 2) | ((bits >> 22) & 3) {
+        0 => Some(BitwiseOperation::And),
+        1 => Some(BitwiseOperation::BitClear),
+        2 => Some(BitwiseOperation::Or),
+        3 => Some(BitwiseOperation::OrNot),
+        4 => Some(BitwiseOperation::ExclusiveOr),
+        5 => Some(BitwiseOperation::Select),
+        6 => Some(BitwiseOperation::InsertIfTrue),
+        7 => Some(BitwiseOperation::InsertIfFalse),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub(super) const fn integer_comparison(semantic_id: u32) -> Option<IntegerComparison> {
+    match semantic_id {
+        0x0000_004e => Some(IntegerComparison::SignedGreaterThan),
+        0x0000_004f => Some(IntegerComparison::UnsignedGreaterThan),
+        0x0000_0050 => Some(IntegerComparison::SignedGreaterThanOrEqual),
+        0x0000_0051 => Some(IntegerComparison::UnsignedGreaterThanOrEqual),
+        0x0000_0052 => Some(IntegerComparison::NonzeroBitTest),
+        0x0000_0053 => Some(IntegerComparison::Equal),
+        0x0000_0054 => Some(IntegerComparison::SignedGreaterThan),
+        0x0000_0055 => Some(IntegerComparison::SignedGreaterThanOrEqual),
+        0x0000_0056 => Some(IntegerComparison::Equal),
+        0x0000_0057 => Some(IntegerComparison::SignedLessThanOrEqual),
+        0x0000_0058 => Some(IntegerComparison::SignedLessThan),
+        _ => None,
+    }
+}
+
+#[must_use]
+const fn pairwise_operation(semantic_id: u32) -> Option<PairwiseOperation> {
+    match semantic_id {
+        0x0000_0059 => Some(PairwiseOperation::Add),
+        0x0000_005a => Some(PairwiseOperation::SignedMaximum),
+        0x0000_005b => Some(PairwiseOperation::SignedMinimum),
+        0x0000_005c => Some(PairwiseOperation::UnsignedMaximum),
+        0x0000_005d => Some(PairwiseOperation::UnsignedMinimum),
+        _ => None,
     }
 }
