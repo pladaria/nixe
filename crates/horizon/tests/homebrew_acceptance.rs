@@ -127,14 +127,14 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 }
 
 #[test]
-fn contemporary_libnx_nro_completes_hid_virtual_memory_rng() {
+fn contemporary_libnx_nro_advances_hid_rng_to_simd_post_index_store() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    let completed_rng = loop {
+    let reached_simd_post_index_store = loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
@@ -156,7 +156,7 @@ fn contemporary_libnx_nro_completes_hid_virtual_memory_rng() {
                 }
             }
             ExecutionStop::UnsupportedSemantics { encoding, .. }
-                if encoding.bits() == 0x3ce0_69be =>
+                if encoding.bits() == 0x3c81_043e =>
             {
                 break true;
             }
@@ -165,8 +165,8 @@ fn contemporary_libnx_nro_completes_hid_virtual_memory_rng() {
     };
 
     assert!(
-        completed_rng && executed > 8_000,
-        "libnx did not complete its HID virtual-memory RNG: executed={executed}"
+        reached_simd_post_index_store && executed > 8_000,
+        "libnx did not advance its HID RNG to a SIMD post-index store: executed={executed}"
     );
     let coverage = dispatcher.coverage();
     for immediate in [0x01, 0x02, 0x03, 0x06, 0x29] {

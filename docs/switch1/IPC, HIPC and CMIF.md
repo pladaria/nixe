@@ -1,224 +1,226 @@
-# IPC, HIPC y CMIF en Nintendo Switch 1
+# Nintendo Switch 1 IPC, HIPC, and CMIF
 
-Este documento explica el sistema de comunicación entre procesos de Horizon,
-las funciones de HIPC y CMIF, su relación con sesiones, puertos, handles,
-servicios y memoria, y la forma en que Nixe implementa actualmente esas capas.
+This document explains Horizon inter-process communication, the roles of HIPC
+and CMIF, how they interact with ports, sessions, handles, services, SVCs,
+memory, and process permissions, and how those layers are currently
+implemented in Nixe.
 
-La información del protocolo procede de documentación pública y de ingeniería
-inversa de la comunidad. Los nombres de algunos campos no son nombres oficiales
-publicados por Nintendo.
+The protocol information is based on public community reverse engineering.
+Some names are descriptive community names rather than terminology officially
+published by Nintendo.
 
-> **Estado de la implementación de Nixe**
+> **Nixe implementation status**
 >
-> La implementación descrita aquí es funcional, está validada con pruebas y
-> tiene límites defensivos explícitos, pero todavía es parcial y está en
-> evolución. La arquitectura, los servicios disponibles, los comandos
-> implementados, los límites, los códigos de error y algunos detalles de la
-> codificación podrían cambiar a medida que avance la implementación. Este
-> documento describe el estado del repositorio en el momento de escribirlo, no
-> una interfaz estable que el resto del proyecto deba considerar congelada.
+> The implementation described here is functional, bounded, and covered by
+> tests, but it is incomplete and still evolving. The available services,
+> command coverage, limits, result mappings, wire behavior, and internal module
+> boundaries may change as the implementation develops. This document
+> describes the repository at the time of writing; it does not define a stable
+> internal API.
 
-## Resumen en una frase
+## The short version
 
-Una aplicación no llama directamente a una función Rust de un servicio:
-construye un mensaje HIPC/CMIF en memoria, ejecuta una SVC con el handle de una
-sesión y recibe en el mismo búfer una respuesta que puede contener datos,
-handles u objetos de dominio.
+An application does not directly call a Rust function belonging to a service.
+It writes an HIPC/CMIF message into guest memory, invokes an SVC with a session
+handle, and receives a response that may contain data, handles, or CMIF domain
+objects.
 
 ```text
-Aplicación invitada
+Guest application
     │
-    │ escribe un mensaje en el command buffer del TLS
+    │ writes a message into the thread IPC command buffer
     │
-    │ HIPC: transporte, descriptores, PID y handles
-    │ CMIF: objeto, command ID, argumentos y result
+    │ HIPC: transport, descriptors, PID, and handles
+    │ CMIF: object, command ID, arguments, and result
     ▼
 svcSendSyncRequest(handle)
     │
     ▼
-Kernel de Horizon / dispatcher de SVC de Nixe
+Horizon kernel / Nixe SVC dispatcher
     │
-    ├── sesión hacia un servicio emulado por Nixe
-    │       └── decodifica, valida y ejecuta la operación
+    ├── session for a service implemented inside Nixe
+    │       └── decode, validate, dispatch, and encode a response
     │
-    └── sesión genérica hacia otro proceso invitado
-            └── entrega la petición al endpoint servidor
+    └── generic session connected to another guest process
+            └── deliver the request to the guest server endpoint
     │
     ▼
-respuesta HIPC/CMIF en el command buffer
+HIPC/CMIF response in the command buffer
 ```
 
-Los términos esenciales son:
+The essential terms are:
 
-| Término | Papel |
+| Term | Role |
 | --- | --- |
-| IPC | El concepto general de comunicación entre procesos. |
-| HIPC | El formato de transporte de Horizon: cabecera, handles, descriptores de búfer y sección de datos. |
-| CMIF | El protocolo habitual de comandos y objetos que se coloca dentro de la sección de datos de HIPC. |
-| SVC | La entrada desde código invitado al kernel para conectar, enviar, esperar, responder o cerrar. |
-| Puerto | Punto de publicación y creación de sesiones. |
-| Sesión | Canal con endpoint cliente y servidor por el que se intercambian peticiones síncronas. |
-| Handle | Identificador local a un proceso para una sesión u otro objeto del kernel. |
-| Servicio | Interfaz nombrada, por ejemplo `sm:`, `fsp-srv` o `hid`, que acepta comandos. |
-| Dominio CMIF | Multiplexación de varios objetos de servicio mediante IDs sobre una sola sesión/handle. |
+| IPC | The general concept of communication between processes. |
+| HIPC | Horizon's transport format: headers, handles, memory descriptors, and raw data. |
+| CMIF | The common object and command protocol carried inside HIPC raw data. |
+| SVC | The guest-to-kernel entry used to connect, send, wait, reply, or close. |
+| Port | A published connection point from which sessions are created. |
+| Session | A client/server channel used to exchange requests and responses. |
+| Handle | A process-local integer referring to a session or another kernel object. |
+| Service | A named interface such as `sm:`, `fsp-srv`, or `hid`. |
+| CMIF domain | Multiple service objects multiplexed by object ID over one session handle. |
 
-## Las capas y por qué no deben confundirse
+## The layers
 
-IPC no es un único formato. En una llamada normal intervienen varias capas:
+IPC is not one monolithic binary format. A typical request crosses several
+distinct layers:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ Semántica del servicio                                      │
-│ Ej.: IFile::Read(offset, size), GetOperationMode()           │
+│ Service semantics                                            │
+│ Example: IFile::Read(offset, size), GetOperationMode()       │
 ├──────────────────────────────────────────────────────────────┤
 │ CMIF                                                         │
-│ command ID, token, result, argumentos y objetos de dominio   │
+│ Command ID, token/context, result, arguments, domain objects │
 ├──────────────────────────────────────────────────────────────┤
 │ HIPC                                                         │
-│ tipo, handles, PID, descriptores de memoria y raw data       │
+│ Message type, handles, PID, memory descriptors, raw data     │
 ├──────────────────────────────────────────────────────────────┤
-│ Sesión y objetos del kernel                                  │
-│ endpoints cliente/servidor, cola, espera, respuesta, cierre  │
+│ Kernel sessions and objects                                  │
+│ Client/server endpoints, queues, waits, replies, closure     │
 ├──────────────────────────────────────────────────────────────┤
-│ SVC + CPU + memoria virtual                                  │
-│ registros, TLS o user buffer y acceso a memoria invitada     │
+│ SVC, CPU state, and virtual memory                           │
+│ Registers, TLS or user buffer, and guest memory access       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Cada capa responde a una pregunta distinta:
+Each layer answers a different question:
 
-- HIPC dice **cómo transportar** los componentes del mensaje.
-- CMIF dice **qué objeto y comando** se invocan y cómo se expresa el resultado.
-- El servicio dice **qué significa** ese comando.
-- La sesión y el kernel dicen **quién habla con quién** y cuándo se bloquea o
-  despierta un hilo.
-- El handle permite que el proceso se refiera al objeto sin conocer un puntero
-  del kernel o del emulador.
+- HIPC defines **how the message components are transported**.
+- CMIF defines **which object and command are addressed**, how arguments are
+  framed, and how a service result is returned.
+- The service interface defines **what the command means**.
+- The session and kernel define **who communicates with whom**, when a thread
+  waits, and when it resumes.
+- A handle lets a process refer to an object without seeing a kernel or host
+  pointer.
 
-CMIF no reemplaza a HIPC: normalmente viaja dentro de HIPC. HIPC tampoco
-implica necesariamente CMIF. Existe además TIPC, un protocolo más pequeño
-introducido para algunos servicios en versiones posteriores de Horizon, que
-también usa el transporte HIPC. Nixe implementa actualmente el camino CMIF
-descrito en este documento, no una implementación general de TIPC.
+CMIF does not replace HIPC: it normally travels inside an HIPC message. HIPC
+also does not imply CMIF. TIPC is a smaller protocol used by some services on
+later Horizon versions and also travels over the HIPC transport. Nixe
+currently implements the CMIF path described here, not a general TIPC
+implementation.
 
-## Puertos, sesiones, servicios y handles
+## Ports, sessions, services, and handles
 
-### Puerto y sesión
+### Ports and sessions
 
-Un puerto es un punto de conexión. Un servidor publica o administra un puerto y
-los clientes se conectan a él. Cada conexión crea una sesión con dos extremos:
+A port is a connection point. A server publishes or manages a port, and a
+client connects to it. Each successful connection creates a session with two
+endpoints:
 
 ```text
-                 puerto "ejemplo"
-                       │ connect
-                       ▼
-Proceso cliente   endpoint cliente ═════ endpoint servidor   Proceso servidor
-        handle C ───────┘                     └─────── handle S
+                   named or direct port
+                            │ connect
+                            ▼
+Guest client     client endpoint ═══════ server endpoint     Guest server
+    handle C ───────────────┘                  └──────────── handle S
 ```
 
-Los números de handle no tienen por qué coincidir. Cada tabla de handles es
-local al proceso. Ambos handles identifican endpoints relacionados, pero no son
-el mismo entero global.
+Handle values are process-local and therefore do not need to match. The two
+handles identify related endpoints, but they are not one global integer.
 
-Una petición síncrona sigue este ciclo:
+A synchronous request follows this lifecycle:
 
-1. El cliente envía una petición por su endpoint.
-2. Si aún no hay respuesta, su hilo queda suspendido.
-3. El servidor espera con `ReplyAndReceive`, acepta la petición y la procesa.
-4. El servidor responde.
-5. El cliente se despierta y continúa con el resultado.
+1. The client submits a request through its endpoint.
+2. If no response is ready, the client thread is suspended.
+3. The server waits with `ReplyAndReceive`, receives the request, and handles
+   it.
+4. The server submits a response.
+5. The client wakes and continues with the response.
 
-La sesión también conserva el estado de cierre de ambos extremos. Cerrar el
-último handle de un endpoint hace visible el cierre al peer.
+The shared session state also records whether each endpoint remains open.
+Closing the last handle for an endpoint makes the peer closure observable.
 
-### El Service Manager (`sm:`)
+### The Service Manager
 
-Las aplicaciones no suelen conocer el puerto de cada servicio. Primero llaman
-a `ConnectToNamedPort("sm:")`. El resultado es una sesión con el Service
-Manager. Sobre ella realizan:
+Applications normally do not connect to every service port directly. They
+first invoke `ConnectToNamedPort("sm:")`, which returns a session connected to
+the Service Manager:
 
 ```text
 ConnectToNamedPort("sm:")
         │
         ▼
-handle de sesión sm:
-        │ CMIF command 0: RegisterClient, con PID
+sm: session handle
+        │ CMIF command 0: RegisterClient, with PID
         ▼
-cliente registrado
+registered client
         │ CMIF command 1: GetService("fsp-srv")
         ▼
-handle de sesión fsp-srv
+fsp-srv session handle
 ```
 
-`sm:` es por tanto un registro y broker de servicios, no el transporte IPC.
-La petición a `sm:` ya es una petición HIPC/CMIF.
+`sm:` is a service registry and broker. It is not the IPC transport; the
+requests sent to `sm:` are themselves HIPC/CMIF requests.
 
-### Handles copiados y movidos
+### Copy and move handles
 
-HIPC puede incluir dos listas de handles:
+An HIPC message may contain two handle lists:
 
-- **copy handles**: el receptor obtiene otra referencia al mismo objeto; el
-  remitente conserva la suya;
-- **move handles**: la propiedad se transfiere; el handle de origen se consume.
+- a **copy handle** gives the receiver another reference to the same object
+  while the sender keeps its reference;
+- a **move handle** transfers ownership and consumes the source handle.
 
-Esto importa para objetos devueltos por un servicio. Por ejemplo, abrir un
-filesystem o un fichero fuera de un dominio devuelve normalmente un handle
-movido a una nueva sesión/objeto. Un evento o memoria compartida suele
-devolverse como handle copiado según la ABI concreta del comando.
+This distinction matters when services return objects. Opening a filesystem or
+file outside a domain normally returns a moved handle for the child object.
+Events and shared-memory objects may be returned as copied handles when the
+specific command ABI requires it.
 
-Los valores especiales `0xffff8000` y `0xffff8001` representan,
-respectivamente, el hilo y el proceso actuales en operaciones que aceptan esos
-pseudo-handles. No son entradas ordinarias de la tabla de handles.
+The special values `0xffff8000` and `0xffff8001` represent the current thread
+and current process in operations that accept those pseudo-handles. They are
+not normal entries in the process handle table.
 
-## El command buffer y el TLS
+## The command buffer and TLS
 
-En la ruta habitual `SendSyncRequest`, el mensaje está en el command buffer de
-la región local del hilo, el TLS. El registro de sistema de TLS identifica esa
-región:
+For ordinary `SendSyncRequest`, the message occupies the IPC command buffer at
+the beginning of the thread-local region. The CPU's TLS register identifies
+that region:
 
-| Modo de CPU | Registro usado por Nixe |
+| CPU mode | Register used by Nixe |
 | --- | --- |
 | AArch64 | `TPIDR_EL0` |
 | AArch32 | `TPIDRURW` |
 
-Nixe crea y mapea la región TLS al construir el proceso, inicializa el registro
-correspondiente y usa sus primeros `0x100` bytes como command buffer IPC.
-El búfer pertenece al espacio virtual invitado: sus direcciones y las de sus
-descriptores nunca son punteros Rust.
+Nixe allocates and maps TLS while building the process, initializes the
+appropriate register, and treats the first `0x100` bytes as the fixed IPC
+command buffer. This is guest virtual memory. Neither the TLS address nor any
+address contained in a descriptor is a Rust pointer.
 
 ```text
-TLS del hilo invitado
-┌───────────────────────────────┐  ← TPIDR_EL0 / TPIDRURW
-│ command buffer HIPC (0x100)   │
-├───────────────────────────────┤
-│ resto de datos locales        │
-└───────────────────────────────┘
+Guest thread-local region
+┌──────────────────────────────────┐  ← TPIDR_EL0 / TPIDRURW
+│ HIPC command buffer (0x100)      │
+├──────────────────────────────────┤
+│ remaining thread-local storage   │
+└──────────────────────────────────┘
 ```
 
-`SendSyncRequestWithUserBuffer` usa en cambio una dirección y un tamaño
-explícitos. Nixe valida que ambos respeten la alineación de página y que el
-rango no sea vacío ni desborde. La ruta de sesiones genéricas transporta ese
-búfer completo.
+`SendSyncRequestWithUserBuffer` instead receives an explicit guest address and
+size. Nixe checks page alignment, rejects an empty or overflowing range, and
+uses the complete region for the generic guest-session transport.
 
-> **Limitación actual:** el codec de servicios incorporados sigue limitado al
-> command buffer TLS de `0x100` bytes. Por ello, la variante con user buffer no
-> es todavía una ruta utilizable de forma general contra esos servicios: el
-> tamaño exigido por la ABI de la SVC es mayor que el aceptado por ese codec.
-> Esta frontera deberá separarse o generalizarse; es una parte inestable de la
-> implementación.
+> **Current limitation:** the codec used by Nixe's built-in services still
+> assumes the fixed `0x100`-byte TLS command buffer. The user-buffer SVC is
+> therefore not yet a generally usable path for those built-in services: its
+> ABI requires a page-sized region, while that codec rejects input larger than
+> the fixed command buffer. This boundary needs to be separated or generalized
+> and should be considered unstable.
 
-## HIPC: la capa de transporte
+## HIPC: the transport layer
 
-HIPC organiza metadatos y referencias a memoria alrededor de una sección de
-datos. Su disposición conceptual es:
+HIPC places transport metadata and guest-memory references around a raw-data
+section:
 
 ```text
-offset variable
+variable offset
 ┌────────────────────────────────────────────┐
-│ HeaderData: 2 palabras de 32 bits          │
+│ HeaderData: two 32-bit words               │
 ├────────────────────────────────────────────┤
-│ SpecialHeaderData, si existe               │
-│   ├── PID opcional                         │
+│ SpecialHeaderData, when present            │
+│   ├── optional PID                         │
 │   ├── copy handles                         │
 │   └── move handles                         │
 ├────────────────────────────────────────────┤
@@ -227,75 +229,74 @@ offset variable
 │ send / receive / exchange buffer descs.    │
 ├────────────────────────────────────────────┤
 │ raw data words                             │
-│   └── CMIF alineado a 16 bytes             │
+│   └── CMIF data aligned to 16 bytes        │
 ├────────────────────────────────────────────┤
-│ receive-static descriptors, si existen     │
+│ receive-static descriptors, when present   │
 └────────────────────────────────────────────┘
 ```
 
-### Cabecera HIPC
+### HIPC header
 
-Nixe interpreta las dos palabras iniciales así:
+Nixe decodes the initial words as follows:
 
-| Campo | Bits | Significado |
+| Field | Bits | Meaning |
 | --- | ---: | --- |
-| `command_type` | palabra 0, 0..15 | Tipo de mensaje que después interpreta CMIF. |
-| send-static count | palabra 0, 16..19 | Número de descriptores estáticos de entrada. |
-| send-buffer count | palabra 0, 20..23 | Número de buffers enviados. |
-| receive-buffer count | palabra 0, 24..27 | Número de buffers de salida. |
-| exchange-buffer count | palabra 0, 28..31 | Número de buffers bidireccionales. |
-| data-word count | palabra 1, 0..9 | Tamaño de la sección raw en palabras de 32 bits. |
-| receive-static mode | palabra 1, 10..13 | Ninguno, automático o número codificado de entradas. |
-| special-header present | palabra 1, bit 31 | Indica PID y/o listas de handles. |
+| `command_type` | word 0, 0..15 | Message type interpreted by CMIF. |
+| send-static count | word 0, 16..19 | Number of static input descriptors. |
+| send-buffer count | word 0, 20..23 | Number of mapped input buffers. |
+| receive-buffer count | word 0, 24..27 | Number of mapped output buffers. |
+| exchange-buffer count | word 0, 28..31 | Number of bidirectional buffers. |
+| data-word count | word 1, 0..9 | Raw section size in 32-bit words. |
+| receive-static mode | word 1, 10..13 | None, automatic, or an encoded entry count. |
+| special-header present | word 1, bit 31 | Indicates PID and/or handle lists. |
 
-Los bits reservados deben ser cero. Los contadores se validan antes de reservar
-o recorrer memoria. El formato público también define un
-`ReceiveListOffset` en los bits 20..30 de la segunda palabra. El codec actual
-no lo modela como campo independiente y espera la lista después de los raw
-data; ampliar esta parte será necesario para aceptar todas las variantes
-válidas del transporte.
+Reserved bits must be zero. Counts and size calculations are checked before
+memory is reserved or traversed.
 
-### Cabecera especial
+The public format also defines `ReceiveListOffset` in bits 20..30 of the second
+word. Nixe's current codec does not model that value independently and expects
+the receive-static list after the raw data. Supporting every valid transport
+layout will require this area to be extended.
 
-Cuando existe, indica:
+### Special header
 
-- si se envía el PID del proceso;
-- cuántos handles se copian;
-- cuántos handles se mueven.
+When present, the special header states:
 
-El PID no es un argumento de usuario ordinario. El kernel lo rellena o valida
-como identidad del emisor; numerosos comandos, como `sm:RegisterClient`,
-`fsp-srv:SetCurrentProcess`, `hid:CreateAppletResource` y la apertura de
-`appletOE`, requieren que esté presente.
+- whether the sender supplies its process ID;
+- how many handles are copied;
+- how many handles are moved.
 
-### Descriptores de memoria
+The PID is not an ordinary user-selected service argument. The kernel conveys
+the sender's identity, and many commands require it. Examples include
+`sm:RegisterClient`, `fsp-srv:SetCurrentProcess`,
+`hid:CreateAppletResource`, and opening the `appletOE` application proxy.
 
-Los argumentos grandes no caben en el command buffer. HIPC transporta
-descriptores que contienen dirección invitada, tamaño y, cuando corresponde,
-modo de mapeo:
+### Memory descriptors
 
-| Descriptor | Uso conceptual |
+Large arguments do not fit in the command buffer. HIPC descriptors carry a
+guest address, size, and, where applicable, mapping mode:
+
+| Descriptor | Conceptual use |
 | --- | --- |
-| send static / pointer | Región pequeña que el servidor lee mediante un puntero. |
-| send buffer | Región que el cliente entrega como entrada. |
-| receive buffer | Región en la que el servidor escribe la salida. |
-| exchange buffer | Región utilizable en ambas direcciones. |
-| receive static / pointer | Región de salida descrita fuera de la tabla principal. |
+| send static / pointer | A small region read by the server through its pointer buffer. |
+| send buffer | A mapped input region supplied by the client. |
+| receive buffer | A mapped output region written by the server. |
+| exchange buffer | A region usable in both directions. |
+| receive static / pointer | An output region described outside the main descriptor table. |
 
-Los buffers mapeables llevan un modo `Normal`, `NonSecure`, `Invalid` o
-`NonDevice`. El formato divide direcciones y tamaños entre varios campos de
-bits; el codec de Nixe los reconstruye con aritmética comprobada.
+Mapped buffers carry one of the modes `Normal`, `NonSecure`, `Invalid`, or
+`NonDevice`. The binary format splits addresses and sizes across multiple bit
+fields; Nixe reconstructs them with checked arithmetic.
 
-Un descriptor no copia por sí mismo el contenido dentro del command buffer.
-Describe memoria del proceso que el kernel pone a disposición de la operación.
-En la implementación actual de servicios internos, Nixe valida el descriptor y
-lee o escribe directamente la memoria virtual invitada mediante la interfaz de
-memoria emulada.
+A descriptor does not inline the referenced bytes into the command buffer. It
+describes memory that the kernel makes available to the operation. For
+built-in services, Nixe currently validates the descriptor and reads or writes
+the corresponding guest virtual memory through the emulated memory interface.
 
-Ejemplo simplificado de lectura de fichero:
+A simplified file read looks like this:
 
 ```text
-raw CMIF data:
+CMIF raw arguments:
     option = 0
     offset = 0x200
     size   = 0x1000
@@ -304,17 +305,17 @@ HIPC receive-buffer descriptor:
     address = 0x80012000
     size    = 0x1000
 
-servicio IFile::Read
-    ├── lee como máximo min(petición, descriptor, límite de Nixe)
-    ├── escribe bytes en guest[0x80012000..]
-    └── devuelve en CMIF el número de bytes leídos
+IFile::Read
+    ├── reads min(requested size, descriptor capacity, Nixe limit)
+    ├── writes bytes into guest[0x80012000..]
+    └── returns the actual byte count in the CMIF response
 ```
 
-## CMIF: comandos y objetos sobre HIPC
+## CMIF: commands and objects over HIPC
 
-CMIF ocupa la zona alineada a 16 bytes de los raw data words de HIPC. Para una
-sesión no convertida a dominio, la petición contiene una cabecera de entrada de
-16 bytes seguida por argumentos:
+CMIF begins at the 16-byte-aligned portion of the HIPC raw-data words. A
+request on an ordinary non-domain session contains a 16-byte input header
+followed by command-specific arguments:
 
 ```text
 CMIF request
@@ -322,9 +323,9 @@ CMIF request
 │ magic = "SFCI"                    │
 │ version                           │
 │ command ID                        │
-│ token                             │
+│ token / inline context            │
 ├───────────────────────────────────┤
-│ argumentos específicos            │
+│ command-specific arguments        │
 └───────────────────────────────────┘
 
 CMIF response
@@ -332,26 +333,26 @@ CMIF response
 │ magic = "SFCO"                    │
 │ version                           │
 │ Horizon result                    │
-│ token/contexto usado por Nixe     │
+│ token/context value used by Nixe  │
 ├───────────────────────────────────┤
-│ valores de salida                 │
+│ command-specific output values    │
 └───────────────────────────────────┘
 ```
 
-Los magics aparecen como `0x49434653` y `0x4f434653` al leerlos como enteros
-little-endian. El token permite correlacionar la respuesta y las variantes
-`RequestWithContext`/`ControlWithContext` lo usan como contexto. Nixe valida la
-combinación entre versión y tipo de comando.
+The magic values appear as `0x49434653` and `0x4f434653` when interpreted as
+little-endian integers. The context variants carry an inline context value.
+Nixe validates the relationship between the command type and CMIF header
+version.
 
-Nixe escribe actualmente el token de la petición en la última palabra de la
-cabecera de salida. En el formato documentado para Horizon 14.0.0 o posterior,
-esa posición puede representar un `InterfaceId`. La implementación no
-selecciona todavía este detalle según la versión de firmware y debe
-considerarse ligada al perfil antiguo que emula.
+Nixe currently mirrors the request token into the final word of its output
+header. Public documentation assigns that position an `InterfaceId` on
+Horizon 14.0.0 and later. Nixe does not yet select this detail according to
+firmware version, so this behavior belongs to the older CMIF profile currently
+being emulated.
 
-### Tipos CMIF que reconoce Nixe
+### CMIF message types recognized by Nixe
 
-| Valor HIPC | Tipo CMIF |
+| HIPC value | CMIF interpretation |
 | ---: | --- |
 | 1 | Legacy request |
 | 2 | Close |
@@ -361,345 +362,348 @@ considerarse ligada al perfil antiguo que emula.
 | 6 | Request with context |
 | 7 | Control with context |
 
-Los **request** invocan comandos del servicio. Los **control** actúan sobre la
-sesión CMIF, no sobre la interfaz concreta; el control 0 convierte una sesión a
-dominio. El control 3 consulta el tamaño preferido de pointer buffer. El tipo
-close finaliza la sesión.
+A **request** invokes a command on a service object. A **control** acts on the
+CMIF session itself rather than on the service interface. Control command 0
+converts the current session into a domain, and control command 3 queries the
+pointer-buffer size. A close message ends the session.
 
-### Dos clases de resultado
+### Kernel results and service results
 
-Una llamada tiene un resultado del kernel y, si el transporte llegó al
-servicio, otro resultado CMIF:
+One request can produce two distinct results:
 
 ```text
 svcSendSyncRequest
     │
     ├── X0: KernelResult
-    │       ¿era válido el handle y se pudo transportar la petición?
+    │       Was the handle valid and could the request be transported?
     │
     └── CMIF OutHeader.result
-            ¿aceptó el servicio el comando y pudo ejecutarlo?
+            Did the service accept and execute the command?
 ```
 
-Por ejemplo, un handle inexistente produce un error del kernel. En cambio, un
-command ID desconocido en una sesión válida puede completar la SVC con éxito y
-devolver `CMIF_UNKNOWN_COMMAND_ID` dentro de la respuesta. Mezclar ambos niveles
-haría que una aplicación interpretara incorrectamente el fallo.
+For example, a nonexistent session handle produces a kernel result. A valid
+session receiving an unknown command can complete the SVC successfully and
+return `CMIF_UNKNOWN_COMMAND_ID` inside the CMIF response. Combining these
+levels would make guest software misinterpret failures.
 
-Los resultados Horizon se codifican con un módulo de 9 bits y una descripción
-de 13 bits:
+Horizon result values encode a 9-bit module and a 13-bit description:
 
 ```text
 raw result = module | (description << 9)
 ```
 
-Nixe mantiene códigos semánticos internos independientes de los valores
-visibles al invitado y los traduce en la frontera CMIF. Así, un path ausente se
-convierte en un resultado del módulo `fs`, mientras que un add-on ausente puede
-usar el resultado verificado del módulo `lr`. Los errores de framing u objetos
-CMIF usan el módulo `sf`, y los del Service Manager, `sm`.
+Nixe keeps its internal semantic failures separate from guest-visible result
+values and translates them at the CMIF boundary. A missing filesystem path
+becomes an `fs` result, while a missing add-on may become the verified `lr`
+result. CMIF framing and object errors use the `sf` module, and Service Manager
+errors use the `sm` module.
 
-## Objetos CMIF y dominios
+## CMIF objects and domains
 
-### Sesiones normales
+### Ordinary sessions
 
-Sin dominio, un objeto hijo suele necesitar un nuevo handle:
+Without a domain, a child object normally consumes another process handle:
 
 ```text
-handle fsp-srv
+fsp-srv handle
     │ OpenDataFileSystemByCurrentProcess
     ▼
-handle IFileSystem
+IFileSystem handle
     │ OpenFile("/data.bin")
     ▼
-handle IFile
+IFile handle
 ```
 
-Cada objeto vivo consume una entrada de la tabla de handles.
+Every live child consumes an entry in the process handle table.
 
-### Conversión a dominio
+### Domain conversion
 
-El control CMIF 0 convierte la sesión. A partir de entonces, una sola sesión
-transporta mensajes dirigidos a IDs de objeto:
+CMIF control command 0 converts a session into a domain. Subsequent requests
+use one kernel session while addressing multiple objects by ID:
 
 ```text
-un único handle de sesión
+one session handle
         │
-        ├── object ID 1: objeto raíz
+        ├── object ID 1: root service object
         ├── object ID 2: IFileSystem
         ├── object ID 3: IFile
         └── object ID 4: IDirectory
 ```
 
-Una petición de dominio añade antes de la cabecera CMIF:
+A domain request adds a domain header before the normal CMIF header. It
+contains:
 
-- tipo de operación de dominio: enviar mensaje o cerrar objeto;
-- cantidad de objetos de entrada;
-- tamaño del payload CMIF;
-- ID del objeto destino;
-- token y campos reservados;
-- lista de IDs de objetos de entrada después del payload.
+- the domain operation: invoke an object or close an object;
+- the number of input objects;
+- the CMIF payload size;
+- the target object ID;
+- token/context and reserved fields;
+- a list of input object IDs after the CMIF payload.
 
-Una respuesta de dominio puede devolver IDs de objetos hijos en vez de nuevos
-handles. Esto reduce presión sobre la tabla de handles y conserva la identidad
-de todos los objetos bajo la sesión.
+A domain response may return child object IDs instead of new handles. This
+reduces handle-table pressure while keeping every object under the lifetime of
+the parent session.
 
-Cerrar un objeto de dominio elimina ese ID, no el handle de toda la sesión. El
-objeto raíz usa el ID 1 y Nixe no permite cerrarlo como si fuera un hijo.
+Closing a domain child removes that ID without closing the session handle.
+Object ID 1 is the root and Nixe does not allow it to be closed as a child.
 
-Nixe limita actualmente una tabla de dominio a 64 objetos. `IpcSession`
-mantiene objetos genéricos type-erased, mientras que `AppletSession` mantiene
-una tabla especializada de tipos de objeto de applet. Esta duplicidad es una de
-las áreas cuya forma podría cambiar al generalizar la implementación.
+Nixe currently limits each domain table to 64 objects. `IpcSession` retains
+generic type-erased child objects, while `AppletSession` has a specialized
+table of applet object kinds. That duplication is an implementation detail,
+not a permanent architectural boundary, and may change as domain support is
+generalized.
 
-## Recorrido completo de una llamada
+## End-to-end example: opening and reading a file
 
-La apertura y lectura de un fichero ilustra todas las capas:
+The following path shows how the layers cooperate:
 
 ```text
 1. Guest/libnx
    ConnectToNamedPort("sm:")
              │
-2. SVC 0x1f  │  Nixe crea ServiceManagerSession y devuelve un handle
+2. SVC 0x1f  │  Nixe creates ServiceManagerSession
              ▼
-3. sm:RegisterClient (CMIF 0, PID)
+3. sm:RegisterClient (CMIF 0, sends PID)
              │
 4. sm:GetService("fsp-srv") (CMIF 1)
-             │  NPDM SAC autoriza el nombre del servicio
+             │  effective NPDM SAC authorizes the service name
              ▼
-5. handle IFileSystemProxy
+5. IFileSystemProxy session handle
              │ CMIF 1 SetCurrentProcess
              │ CMIF 2 OpenDataFileSystemByCurrentProcess
-             │  permisos FS del NPDM autorizan leer content data
+             │  NPDM filesystem permissions authorize content reads
              ▼
-6. handle/object ID de IFileSystem
+6. IFileSystem handle or domain object ID
              │ CMIF 8 OpenFile
-             │ HIPC send-static/send-buffer contiene "/archivo\0"
+             │ HIPC send-static/send-buffer points to "/file\0"
              ▼
-7. handle/object ID de IFile
+7. IFile handle or domain object ID
              │ CMIF 0 Read(offset, size)
-             │ HIPC receive-buffer señala el destino
+             │ HIPC receive-buffer identifies the destination
              ▼
-8. Nixe lee el ReadOnlyMount/RomFS
-             │ escribe en memoria invitada
+8. Nixe reads the authorized read-only RomFS mount
+             │ writes the result into guest memory
              ▼
-9. respuesta HIPC/CMIF
+9. HIPC/CMIF response
    KernelResult=Success, CMIF result=Success, bytes_read=N
 ```
 
-Esta ruta conecta el loader con IPC:
+The loader and IPC layers meet through the process mount namespace:
 
 ```text
-NSP/XCI/NCA procesados por los loaders
+NSP/XCI/NCA processed by the loaders
                  │
                  ▼
-LaunchPlan + política NPDM efectiva
+LaunchPlan + effective NPDM policy
                  │
                  ▼
 ProcessMountNamespace
-    ├── RomFS base/update
-    ├── add-ons autorizados
-    ├── Service Access Control (SAC)
-    └── permisos de filesystem
+    ├── effective base/update RomFS
+    ├── authorized add-on content
+    ├── Service Access Control
+    └── filesystem permissions
                  │
                  ▼
-servicios fsp-srv y aoc:u
+fsp-srv and aoc:u service semantics
 ```
 
-El servicio no abre libremente archivos del host. Opera sobre mounts de solo
-lectura ya construidos y autorizados para ese proceso.
+The service does not open arbitrary host paths. It operates on read-only mounts
+that the launch pipeline has already resolved and authorized for the process.
 
-## Cómo está organizada la implementación de Nixe
+## Nixe implementation
 
-### Vista de componentes
+### Component overview
 
 ```text
 crates/cpu
-    └── ejecuta SVC y expone registros/estado del hilo
+    └── executes SVC instructions and exposes guest register state
 
 crates/runtime
-    ├── RunnableProcess y memoria virtual
-    ├── TLS del hilo
-    ├── HandleTable / HandleObject
-    ├── PortObject / SessionObject / EventObject / SharedMemoryObject
-    └── ProcessMountNamespace y política efectiva
+    ├── RunnableProcess and guest virtual memory
+    ├── thread TLS
+    ├── HandleTable and HandleObject
+    ├── PortObject, SessionObject, EventObject, SharedMemoryObject
+    └── ProcessMountNamespace and effective policy
 
 crates/horizon
-    ├── svc.rs             registro de números SVC
-    ├── svc_dispatch.rs    ABI de kernel, espera, sesiones y transferencia
-    ├── ipc_message.rs     codec comprobado HIPC/CMIF
-    ├── ipc_wire.rs        puente entre wire, memoria y servicios
-    ├── ipc.rs             peticiones/respuestas semánticas
-    ├── ipc_result.rs      resultados Horizon visibles al guest
-    └── object.rs          objetos y estado de servicios
+    ├── svc.rs             verified SVC number registry
+    ├── svc_dispatch.rs    kernel ABI, waits, sessions, handle transport
+    ├── ipc_message.rs     checked HIPC and CMIF codec
+    ├── ipc_wire.rs        bridge between wire data, memory, and services
+    ├── ipc.rs             typed semantic requests and responses
+    ├── ipc_result.rs      guest-visible Horizon results
+    └── object.rs          service objects and their state
 ```
 
-La separación entre `ipc_wire.rs` e `ipc.rs` es deliberada:
+These module boundaries are useful for understanding the current
+implementation, but they are not intended to be permanent. In particular,
+domain state, built-in service dispatch, and generic kernel session transport
+may be reorganized as broader IPC behavior is implemented.
+
+The current split between `ipc_wire.rs` and `ipc.rs` creates this validation
+boundary:
 
 ```text
-bytes no confiables del guest
+untrusted guest bytes
         │
         ▼
-HipcRequest + CmifRequest comprobados
+checked HipcRequest + CmifRequest
         │
         ▼
-IpcRequest tipada y acotada
+bounded typed IpcRequest
         │
         ▼
-IpcDispatcher semántico
+semantic IpcDispatcher
         │
         ▼
-IpcResponse tipada
+typed IpcResponse
         │
         ▼
-CmifResponse comprobada → bytes para el guest
+checked CmifResponse → guest bytes
 ```
 
-Esto permite probar la lógica de filesystem o add-on sin fabricar mensajes
-binarios, y probar el codec sin montar contenido real.
+This allows service behavior to be tested without manually constructing wire
+messages, and allows the codec to be tested without mounting real content.
 
-### 1. Entrada por SVC
+### 1. SVC entry
 
-`HorizonSvcDispatcher` reconoce las operaciones IPC principales:
+`HorizonSvcDispatcher` recognizes the main IPC-related operations:
 
-| SVC | Operación implementada |
+| SVC | Implemented operation |
 | ---: | --- |
 | `0x1f` | `ConnectToNamedPort` |
 | `0x20` | `SendSyncRequestLight` |
 | `0x21` | `SendSyncRequest` |
 | `0x22` | `SendSyncRequestWithUserBuffer` |
 | `0x40` / `0x41` | `CreateSession` / `AcceptSession` |
-| `0x42` / `0x43` / `0x44` | variantes de `ReplyAndReceive` |
-| `0x70` / `0x71` / `0x72` | crear, administrar y conectar a puertos |
+| `0x42` / `0x43` / `0x44` | `ReplyAndReceive` variants |
+| `0x70` / `0x71` / `0x72` | create, manage, and connect to ports |
 | `0x16` | `CloseHandle` |
 
-Para servicios internos, el dispatcher reconoce el tipo concreto almacenado en
-el handle y ejecuta el puente HIPC/CMIF de `ipc_wire.rs`. Para una
-`SessionObject` genérica, entrega el mensaje a su endpoint servidor. De este
-modo conviven dos caminos:
+When a handle contains a known built-in service object, the dispatcher invokes
+the host-side HIPC/CMIF bridge in `ipc_wire.rs`. When the handle contains a
+generic `SessionObject`, the message is delivered to its guest server endpoint.
+The two paths coexist:
 
 ```text
 SendSyncRequest
     │
-    ├── handle de servicio interno
-    │       └── despacho host-side inmediato y respuesta CMIF
+    ├── built-in service handle
+    │       └── immediate host-side dispatch and CMIF response
     │
-    └── handle de SessionObject genérico
-            ├── captura objetos de los handles enviados
-            ├── encola la petición
-            ├── suspende al cliente
-            ├── ReplyAndReceive del servidor invitado
-            └── materializa handles de respuesta en el cliente
+    └── generic SessionObject handle
+            ├── capture objects referenced by sent handles
+            ├── enqueue the request
+            ├── suspend the client
+            ├── let the guest server ReplyAndReceive
+            └── materialize response handles in the client
 ```
 
-El camino genérico modela servidores invitados y aplica semántica de copia y
-movimiento de objetos entre tablas de handles. Las peticiones de cliente no
-pueden mover handles; las respuestas de servidor sí pueden copiar y mover,
-siguiendo la semántica pública del kernel.
+The generic path models guest IPC servers and preserves copy/move semantics
+between process handle tables. Client requests may copy handles but may not
+move them. Server responses may copy or move them, matching the public kernel
+behavior used as the implementation reference.
 
-### 2. Decodificación defensiva
+### 2. Defensive wire decoding
 
-`ipc_message.rs`, cuando procesa el command buffer fijo de un servicio
-incorporado:
+For the fixed built-in-service command buffer, `ipc_message.rs`:
 
-- rechaza mensajes mayores que el command buffer esperado;
-- comprueba cada suma, multiplicación y alineación;
-- limita descriptores y handles;
-- comprueba bits reservados;
-- valida que tablas y payloads estén dentro del búfer;
-- valida magic, versión, command type y framing de dominio;
-- impide adjuntar objetos de dominio a una respuesta no-domain; y
-- impide que una respuesta exceda el límite HIPC o el TLS.
+- rejects input larger than the expected command buffer;
+- checks additions, multiplications, and alignments;
+- bounds descriptor and handle counts;
+- rejects nonzero reserved fields where implemented;
+- ensures every table and payload remains inside the buffer;
+- validates CMIF magic, version, message type, and domain framing;
+- prevents domain objects from appearing in a non-domain response; and
+- prevents an encoded response from exceeding HIPC or TLS limits.
 
-Un mensaje mal formado no llega a la capa semántica. Los fallos de acceso a
-memoria invitada, framing inválido y agotamiento de recursos se mantienen como
-categorías distintas en `IpcWireError`.
+Malformed wire input never reaches the semantic dispatcher. Guest memory
+faults, malformed messages, and host resource exhaustion remain separate
+`IpcWireError` categories.
 
-### 3. Registro y autorización
+### 3. Service registry and authorization
 
-Nixe expone `sm:` como puerto nombrado incorporado. Después de
-`RegisterClient`, `GetService` puede crear sesiones para:
+Nixe exposes `sm:` as a built-in named port. After `RegisterClient`,
+`GetService` can create sessions for:
 
-| Servicio | Cobertura actual resumida |
+| Service | Current coverage |
 | --- | --- |
-| `fsp-srv` | Apertura del RomFS primario, ficheros y directorios de solo lectura. |
-| `aoc:u` | Conteo/listado/preparación y evento de cambio de add-ons autorizados. |
-| `set:sys` | Versión de firmware emulada para los comandos usados por libnx. |
-| `apm` | Sesión de configuración y modo de rendimiento normal. |
-| `appletOE` | Subconjunto del grafo de objetos de aplicación, mediante dominio. |
-| `hid` | Creación de `IAppletResource` y memoria compartida HID de solo lectura. |
+| `fsp-srv` | Open the primary RomFS and read files/directories. |
+| `aoc:u` | Count, list, prepare, and observe authorized add-on content. |
+| `set:sys` | Return the emulated firmware version for the libnx startup path. |
+| `apm` | Normal performance mode and per-mode configuration storage. |
+| `appletOE` | A subset of the application applet domain object graph. |
+| `hid` | Create `IAppletResource` and return read-only HID shared memory. |
 
-El acceso se decide en dos pasos:
+Authorization is applied at two levels:
 
-1. La Service Access Control de la NPDM efectiva debe permitir conectarse al
-   servicio.
-2. Las operaciones de contenido comprueban además permisos de filesystem como
-   `ApplicationInfo`, `ContentManager` o `FullPermission`.
+1. The effective NPDM Service Access Control must permit connecting to the
+   named service.
+2. Content operations also require filesystem permissions such as
+   `ApplicationInfo`, `ContentManager`, or `FullPermission`.
 
-Los homebrew sin NPDM se tratan actualmente como autorizados para acceder al
-registro de servicios de la plataforma. Esta política también puede
-evolucionar.
+Homebrew processes without an NPDM are currently allowed to access the
+platform service registry. This is current policy rather than a permanent
+guarantee.
 
-### 4. Objetos semánticos
+### 4. Semantic objects
 
-La tabla genérica `HandleTable` almacena objetos type-erased con identidad
-compartida. Los servicios pueden devolver:
+The generic `HandleTable` stores type-erased objects with shared identity.
+IPC-related handles may contain:
 
-- `IpcSession`;
-- `ReadOnlyFileSystem`;
-- `ReadOnlyFile`;
-- `ReadOnlyDirectory`;
-- eventos;
-- memoria compartida;
-- sesiones especializadas de settings, rendimiento, applet o HID.
+- `ServiceManagerSession` or `IpcSession`;
+- `ReadOnlyFileSystem`, `ReadOnlyFile`, or `ReadOnlyDirectory`;
+- events and shared memory;
+- settings, performance, applet, or HID session objects;
+- generic kernel `SessionObject` and `PortObject` endpoints.
 
-Fuera de un dominio, un hijo se inserta en la tabla y se devuelve su handle.
-Dentro de un dominio, Nixe retira el handle temporal de la tabla, conserva el
-objeto en la tabla del dominio y devuelve un object ID.
+Outside a domain, a child is inserted into the process handle table and its
+handle is returned. Inside a domain, Nixe removes the temporary handle,
+retains the same object in the domain table, and returns an object ID.
 
-### 5. Filesystem y add-on content
+### 5. Filesystem and add-on semantics
 
-Las operaciones semánticas se expresan con `IpcRequest`/`IpcResponse`. Entre
-sus límites actuales están:
+The semantic layer uses `IpcRequest` and `IpcResponse` rather than raw CMIF
+fields. Its current defensive limits include:
 
-| Límite | Valor |
+| Limit | Current value |
 | --- | ---: |
-| Path semántico | `0x300` bytes |
-| Lectura individual | 1 MiB |
-| Entradas por listado | 1024 |
-| Entrada de directorio wire | `0x310` bytes |
-| Objetos por dominio | 64 |
+| Semantic path | `0x300` bytes |
+| One file read | 1 MiB |
+| Entries returned by one list request | 1024 |
+| Wire directory-entry record | `0x310` bytes |
+| Objects in one domain table | 64 |
 
-Los paths deben ser UTF-8, absolutos, no vacíos y canónicos: se rechazan NUL,
-componentes vacíos, `.` y `..`, slash final y exceso de longitud. No hay
-resolución de paths del host.
+Paths must be valid UTF-8, absolute, nonempty, and canonical. Nixe rejects NUL
+bytes, empty components, `.` and `..`, a trailing slash, and excessive length.
+No host path resolution occurs.
 
-Los directorios conservan un cursor compartido. Cada `ReadDirectory` avanza el
-cursor, igual que un objeto directorio con estado. Las lecturas de fichero se
-recortan al final del archivo y al tamaño real del descriptor de salida.
+Directory objects retain a shared cursor. Each `ReadDirectory` advances that
+cursor. File reads are bounded by the file end, the output descriptor capacity,
+and Nixe's per-request limit.
 
-### 6. Codificación de la respuesta
+### 6. Response encoding
 
-La capa wire transforma cada `IpcResponse`:
+The wire layer maps typed semantic responses as follows:
 
-| Respuesta semántica | Representación |
+| Semantic response | Wire representation |
 | --- | --- |
-| `None` | CMIF success sin payload. |
-| `Size` | Entero little-endian en el payload CMIF. |
-| `Handle` | Move handle, o object ID si la sesión es un dominio. |
+| `None` | Successful CMIF response without output data. |
+| `Size` | Little-endian integer in the CMIF payload. |
+| `Handle` | Move handle, or object ID when the session is a domain. |
 | `Event` | Copy handle. |
-| `Data` | Bytes en el receive buffer y cantidad en CMIF. |
-| `DirectoryEntries` | Registros de `0x310` bytes en el receive buffer. |
-| `AddOnContentEntries` | Índices `u32` en el receive buffer y cantidad en CMIF. |
+| `Data` | Bytes in the receive buffer and byte count in CMIF. |
+| `DirectoryEntries` | `0x310`-byte records in the receive buffer. |
+| `AddOnContentEntries` | `u32` indices in the receive buffer and count in CMIF. |
 
-Si escribir la respuesta en memoria falla después de crear un handle, Nixe
-cierra el handle recién creado para no filtrar recursos.
+If writing a response to guest memory fails after a new handle has been
+created, Nixe closes that handle to avoid leaking a process resource.
 
-## Servicios y comandos implementados
+## Implemented service commands
 
-Esta tabla es un mapa práctico, no una promesa de cobertura estable:
+This is a practical coverage map, not a stable compatibility contract:
 
-| Objeto | Command IDs principales |
+| Object | Main command IDs |
 | --- | --- |
 | `sm:` | 0 `RegisterClient`, 1 `GetService` |
 | `IFileSystemProxy` (`fsp-srv`) | 1 `SetCurrentProcess`, 2 `OpenDataFileSystemByCurrentProcess` |
@@ -708,77 +712,74 @@ Esta tabla es un mapa práctico, no una promesa de cobertura estable:
 | `IDirectory` | 0 `Read`, 1 `GetEntryCount` |
 | `aoc:u` | 0/2 count, 1/3 list, 6/7 prepare, 8 changed event |
 | `set:sys` | 3/4 firmware version |
-| `apm` raíz | 0 open session, 1 get performance mode |
-| sesión `apm` | 0 set configuration, 1 get configuration |
+| root `apm` | 0 open session, 1 get performance mode |
+| `apm` child session | 0 set configuration, 1 get configuration |
 | `hid` | 0 create applet resource |
-| `IAppletResource` | 0 get shared memory handle |
+| `IAppletResource` | 0 get shared-memory handle |
 
-`appletOE` implementa la conversión a dominio, la apertura de
-`IApplicationProxy` y un subconjunto de `ICommonStateGetter`,
-`ISelfController`, `IWindowController` e `IApplicationFunctions`. Otros hijos
-pueden existir en la tabla de dominio pero responder todavía
-`CMIF_UNKNOWN_COMMAND_ID`.
+`appletOE` supports domain conversion, opening `IApplicationProxy`, and a
+subset of `ICommonStateGetter`, `ISelfController`, `IWindowController`, and
+`IApplicationFunctions`. Other child types may exist in its domain table while
+still returning `CMIF_UNKNOWN_COMMAND_ID` for their methods.
 
-## Qué no debe asumirse todavía
+## Current limitations and unstable areas
 
-La cobertura actual no equivale a una emulación completa de Horizon IPC:
+The present coverage is not a complete implementation of Horizon IPC:
 
-- no todos los servicios ni comandos de Switch están implementados;
-- TIPC no está implementado como protocolo general;
-- `SendSyncRequestWithUserBuffer` funciona como transporte de sesiones
-  genéricas, pero el codec fijo de servicios incorporados no acepta todavía su
-  región de página completa;
-- el codec asume que la receive-static list sigue a los raw data y no aplica
-  todavía todas las variantes de `ReceiveListOffset`;
-- el puente de servicios internos no reproduce todavía todas las reglas de
-  mapeo y cacheabilidad que aplicaría el kernel real a cada descriptor;
-- muchos comandos solo aceptan las formas de descriptor usadas por libnx en
-  las rutas probadas;
-- la emulación de applet, HID y rendimiento devuelve un conjunto mínimo de
-  datos coherentes, no el comportamiento completo del hardware;
-- no hay selección general de ABI de servicio según versión de firmware;
-- algunos límites son defensivos de Nixe y no límites normativos de Horizon;
-- las tablas especializadas y genéricas de dominio podrían unificarse; y
-- los nombres y tipos públicos de la capa semántica pueden cambiar al ampliar
-  servicios de escritura, storage, GPU, audio o red.
+- not every Switch service or command is implemented;
+- TIPC is not implemented as a general protocol;
+- `SendSyncRequestWithUserBuffer` works for generic session transport, but the
+  built-in service codec does not accept its full page-sized region;
+- the codec expects the receive-static list after raw data and does not yet
+  apply every valid `ReceiveListOffset` layout;
+- the built-in service bridge does not reproduce every mapping, permission,
+  cacheability, and copy rule applied by the real kernel to descriptors;
+- several commands accept only the descriptor forms used by the tested libnx
+  call paths;
+- applet, HID, settings, and performance behavior exposes a coherent minimum,
+  not the complete hardware or OS behavior;
+- service ABIs are not selected generally by emulated firmware version;
+- some limits are Nixe safety limits rather than normative Horizon limits;
+- generic and specialized domain tables may be unified later; and
+- semantic types and module boundaries may change when writable storage, GPU,
+  audio, network, and additional system services are introduced.
 
-Por estas razones, al modificar la implementación deben revisarse al menos las
-tablas de comandos, los diagramas de despacho, los límites y la sección de
-resultados de este documento.
+When the implementation changes, the command tables, dispatch diagrams,
+limits, result behavior, and this section should be reviewed.
 
-## Cómo orientarse al depurar
+## Debugging by layer
 
-Ante un fallo IPC conviene identificar primero la capa:
+The first useful step when debugging IPC is to identify the failing layer:
 
-| Síntoma | Capa probable |
+| Symptom | Likely layer |
 | --- | --- |
-| La SVC devuelve `InvalidHandle` | Tabla de handles, endpoint o tipo de sesión. |
-| El hilo queda suspendido indefinidamente | Cola de sesión, servidor, wait/reply o cierre del peer. |
-| La SVC tiene éxito pero CMIF devuelve error | Command ID, argumentos, permisos u operación del servicio. |
-| Se rechaza el mensaje antes del servicio | Cabecera HIPC, offsets, magic/version CMIF o dominio. |
-| El servicio devuelve éxito pero el buffer no cambia | Dirección/tamaño/modo del descriptor o memoria invitada. |
-| Un objeto hijo desaparece o agota handles | Semántica copy/move, cierre o conversión a dominio. |
-| `sm:GetService` rechaza el nombre | Registro del servicio o SAC de NPDM. |
-| `fsp-srv` conecta pero no abre contenido | Permiso FS de NPDM o mount ausente. |
+| The SVC returns `InvalidHandle` | Handle table, endpoint, or session type. |
+| A client remains suspended | Session queue, server wait/reply, or peer closure. |
+| The SVC succeeds but CMIF reports failure | Command ID, arguments, permissions, or service operation. |
+| The request is rejected before dispatch | HIPC header, offsets, CMIF magic/version, or domain framing. |
+| The service succeeds but the output buffer is unchanged | Descriptor address, size, mode, or guest memory. |
+| A child disappears or handles are exhausted | Copy/move ownership, close behavior, or domain conversion. |
+| `sm:GetService` rejects a service name | Service registry or NPDM Service Access Control. |
+| `fsp-srv` connects but cannot open content | NPDM filesystem permission or missing mount. |
 
-El log de `ipc_wire.rs` incluye handle, tipo, command ID, presencia de PID y
-conteos de descriptores y handles. Esa información permite distinguir
-rápidamente framing, routing y semántica.
+`ipc_wire.rs` logs the target handle, CMIF message type, command ID, PID
+presence, descriptor counts, and handle counts. Those fields usually
+distinguish wire framing, routing, and semantic failures quickly.
 
-## Referencias
+## References
 
-- [Switchbrew: HIPC](https://switchbrew.org/wiki/HIPC), descripción de HIPC,
-  CMIF, cabeceras, descriptores y dominios.
-- [Switchbrew: SVC](https://switchbrew.org/wiki/SVC), ABI pública de las
-  supervisor calls de Horizon.
-- [libnx: `sf/service.h`](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h),
-  construcción y ciclo de vida de servicios CMIF usado como referencia fijada
-  por la implementación.
-- [libnx: `sf/cmif.h`](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h),
-  estructuras y helpers CMIF.
-- [libnx: `sf/hipc.h`](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/hipc.h),
-  estructuras y helpers HIPC.
-- [Atmosphère: IPC del kernel](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_ipc.cpp),
-  referencia pública para sesiones, puertos y SVC IPC.
-- [Atmosphère: resultados comunes](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/results/results_common.hpp),
-  codificación de resultados Horizon.
+- [Switchbrew HIPC, fixed revision](https://switchbrew.org/w/index.php?title=HIPC&oldid=14205),
+  including the HIPC layout, CMIF framing, descriptors, domains, and TIPC
+  distinction.
+- [Switchbrew SVC, fixed revision](https://switchbrew.org/w/index.php?title=SVC&oldid=14679),
+  documenting the public Horizon supervisor-call ABI.
+- [libnx `sf/service.h`, pinned commit](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h),
+  used for CMIF service construction, conversion, and lifetime behavior.
+- [libnx `sf/cmif.h`, pinned commit](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h),
+  defining the CMIF helper structures used by the reference client.
+- [libnx `sf/hipc.h`, pinned commit](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/hipc.h),
+  defining the HIPC helper structures used by the reference client.
+- [Atmosphère kernel IPC, pinned commit](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_ipc.cpp),
+  used as the public reference for ports, sessions, and IPC SVC behavior.
+- [Atmosphère common result encoding, pinned commit](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/results/results_common.hpp),
+  documenting the Horizon result layout.

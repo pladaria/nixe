@@ -34,6 +34,10 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 ADD (vector) and SUB (vector) allocation and operation,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADD--vector---Add-vector-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SUB--vector---Subtract-vector-
     pattern(
         "simd-integer",
         0x9f20_8400,
@@ -243,6 +247,7 @@ pub struct Operands {
     pub load: bool,
     pub quad: bool,
     pub vector_128: bool,
+    pub subtract: bool,
     pub scaled: bool,
     pub helper_token: A64HelperToken,
     pub immediate_5: u8,
@@ -306,6 +311,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         load: bits & (1 << 22) != 0,
         quad: bits & (1 << 23) != 0,
         vector_128: bits & (1 << 30) != 0,
+        subtract: bits & (1 << 29) != 0,
         scaled: bits & (1 << 12) != 0,
         helper_token: A64HelperToken(bits),
         immediate_5: ((bits >> 16) & 0x1f) as u8,

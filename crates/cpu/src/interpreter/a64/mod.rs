@@ -82,6 +82,39 @@ fn write(state: &mut A64State, index: u8, width: u8, register31_is_sp: bool, val
     }
 }
 
+// A64 register-offset address generation is shared by integer and SIMD&FP
+// loads/stores. See Arm ARM DDI 0602 (2025-12), "Load/store register
+// (register offset)":
+// https://developer.arm.com/documentation/ddi0602/2025-12/
+fn register_offset_address(
+    state: &A64State,
+    base_register: u8,
+    offset_register: u8,
+    option: u8,
+    scaled: bool,
+    scale: u32,
+) -> Option<GuestVirtualAddress> {
+    if option & 2 == 0 {
+        return None;
+    }
+    let raw = read(state, offset_register, 64, false);
+    let source_width = if option & 1 == 0 { 32 } else { 64 };
+    let mut offset = if source_width == 32 {
+        u64::from(raw as u32)
+    } else {
+        raw
+    };
+    if option & 4 != 0 {
+        offset = sign_extend(offset, source_width) as u64;
+    }
+    if scaled {
+        offset = offset.wrapping_shl(scale);
+    }
+    Some(GuestVirtualAddress::new(
+        read(state, base_register, 64, true).wrapping_add(offset),
+    ))
+}
+
 fn sign_extend(value: u64, bits: u8) -> i64 {
     let shift = 64 - bits;
     ((value << shift) as i64) >> shift

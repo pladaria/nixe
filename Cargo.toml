@@ -4,6 +4,7 @@ members = [
     "crates/config",
     "crates/cpu",
     "crates/horizon",
+    "crates/input",
     "crates/loader/content",
     "crates/loader/executable",
     "crates/loader/storage",
@@ -27,12 +28,17 @@ lz4_flex = "0.11"
 log = "0.4"
 ruzstd-zbic = { path = "crates/vendor/ruzstd-zbic" }
 sanitize-filename = "0.6"
+sdl3 = { version = "=0.18.4", features = [
+    "build-from-source",
+    "build-from-source-unix-console",
+] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
 tempfile = "3.27"
 nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
 nixe-horizon = { path = "crates/horizon" }
+nixe-input = { path = "crates/input" }
 nixe-loader-content = { path = "crates/loader/content" }
 nixe-loader-executable = { path = "crates/loader/executable" }
 nixe-loader-storage = { path = "crates/loader/storage" }

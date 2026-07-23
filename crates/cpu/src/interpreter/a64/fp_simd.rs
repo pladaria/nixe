@@ -13,7 +13,7 @@ use crate::{
     state::a64::A64State,
 };
 
-use super::{advance, read, resume, sign_extend};
+use super::{advance, read, register_offset_address, resume, sign_extend};
 use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
 
 type MemoryStep = Result<(), DataAccessFault>;
@@ -36,6 +36,10 @@ pub(super) fn execute(
         }
         Instruction::UnsignedMoveToGeneral(_) => {
             unsigned_move_to_general(state, fields);
+            None
+        }
+        Instruction::Integer(_) => {
+            integer_add_sub(state, fields);
             None
         }
         Instruction::MemoryUnsigned(_) | Instruction::MemoryUnscaled(_) => {
@@ -72,6 +76,30 @@ pub(super) fn execute(
                 context.process().address_space_id(),
                 state,
                 fields,
+            ))
+        }
+        Instruction::MemoryRegister(_) => {
+            let Some(memory) = context.memory() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            let size = vector_access_size(fields)?;
+            let Some(address) = register_offset_address(
+                state,
+                fields.rn,
+                fields.rm,
+                fields.option,
+                fields.scaled,
+                size.bytes().trailing_zeros(),
+            ) else {
+                return Err(super::super::unsupported(decoded));
+            };
+            Some(vector_transfer(
+                memory,
+                context.process().address_space_id(),
+                state,
+                fields,
+                address,
+                size,
             ))
         }
         _ => return Err(super::super::unsupported(decoded)),
@@ -175,6 +203,30 @@ fn unsigned_move_to_general(state: &mut A64State, fields: crate::decode::a64::fp
         false,
         value,
     );
+}
+
+fn integer_add_sub(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_bits = 8_u8 << fields.opc;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized SIMD source register");
+    let rhs = state
+        .vector(fields.rm)
+        .expect("normalized SIMD source register");
+    let mut result = 0_u128;
+    for shift in (0..vector_bits).step_by(usize::from(lane_bits)) {
+        let lhs_lane = (lhs >> shift) & lane_mask;
+        let rhs_lane = (rhs >> shift) & lane_mask;
+        let lane = if fields.subtract {
+            lhs_lane.wrapping_sub(rhs_lane)
+        } else {
+            lhs_lane.wrapping_add(rhs_lane)
+        } & lane_mask;
+        result |= lane << shift;
+    }
+    assert!(state.set_vector(fields.rd, result));
 }
 
 fn vector_access_size(
