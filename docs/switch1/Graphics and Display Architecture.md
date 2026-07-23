@@ -20,21 +20,40 @@ writes pixels or GPU command streams into memory, and submits buffers for
 presentation.
 
 ```text
-Guest application
-├── software rendering ──► pixels in a framebuffer ───────────────┐
-│                                                                 │
-└── NVN or another 3D stack                                       │
-    ├── shaders, textures, vertex data                            │
-    └── NVIDIA command streams ──► emulated Maxwell GPU ──► image │
-                                                                  │
-                                                                  ▼
-                           VI layer + Binder BufferQueue
-                                      │
-                                      ▼
-                               display compositor
-                                      │
-                                      ▼
-                            Nixe host presentation
+                         GUEST APPLICATION
+                                │
+                 ┌──────────────┴──────────────┐
+                 │                             │
+                 ▼                             ▼
+         SOFTWARE RENDERING              GPU RENDERING
+         CPU writes pixels               NVN prepares:
+             directly                     - commands
+                 │                        - shaders
+                 │                        - textures
+                 │                        - geometry
+                 │                             │
+                 │                             ▼
+                 │                    Emulated Maxwell GPU
+                 │                    executes the commands
+                 │                             │
+                 ▼                             ▼
+        Software framebuffer            GPU render target
+                 │                             │
+                 └──────────────┬──────────────┘
+                                │
+                                ▼
+                       Binder BufferQueue
+                    transfers buffer ownership
+                                │
+                                ▼
+                            VI layer
+                  defines where/how it is displayed
+                                │
+                                ▼
+                      Emulated compositor
+                                │
+                                ▼
+                   Host window or headless sink
 ```
 
 There is no general `svcCreateFramebuffer` call. A framebuffer is a
@@ -63,13 +82,13 @@ The graphics path contains several layers with different responsibilities:
 │ nvdrv, nvmap, GPU address spaces, channels, submissions, fences │
 ├─────────────────────────────────────────────────────────────────┤
 │ Window and buffer transport                                     │
-│ NWindow, Binder relay, IGraphicBufferProducer, BufferQueue       │
+│ NWindow, Binder relay, IGraphicBufferProducer, BufferQueue      │
 ├─────────────────────────────────────────────────────────────────┤
 │ Horizon display services                                        │
 │ VI displays, layers, composition properties, VSync events       │
 ├─────────────────────────────────────────────────────────────────┤
 │ Physical implementation on a Switch                             │
-│ Maxwell GPU, display engine, panel or HDMI output                │
+│ Maxwell GPU, display engine, panel or HDMI output               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
