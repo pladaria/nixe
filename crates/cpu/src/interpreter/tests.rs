@@ -478,6 +478,42 @@ fn a64_simd_move_immediate_32_expands_lanes_and_clears_inactive_bits() {
 }
 
 #[test]
+fn a64_simd_unsigned_move_extracts_each_lane_width_and_zero_extends() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(0, 0x8877_6655_4433_2211_fedc_ba98_7654_3210));
+
+    for (encoding, register, expected) in [
+        (0x0e01_3c01_u32, 1, 0x10),
+        (0x0e1f_3c02, 2, 0x88),
+        (0x0e02_3c03, 3, 0x3210),
+        (0x0e1e_3c04, 4, 0x8877),
+        (0x0e04_3c05, 5, 0x7654_3210),
+        (0x0e1c_3c06, 6, 0x8877_6655),
+        (0x4e08_3c07, 7, 0xfedc_ba98_7654_3210),
+        (0x4e18_3c08, 8, 0x8877_6655_4433_2211),
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.read_x(x(register)),
+            expected,
+            "encoding={encoding:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 32);
+}
+
+#[test]
 fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(49);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);

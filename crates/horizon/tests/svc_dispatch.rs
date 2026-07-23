@@ -2244,6 +2244,69 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
 }
 
 #[test]
+fn random_entropy_get_info_uses_the_invalid_handle_and_process_stable_words() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x29),
+        svc(0x29),
+        svc(0x29),
+        svc(0x29),
+        svc(0x29),
+        svc(0x29),
+        svc(0x29),
+    ]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let mut entropy = [0_u64; 4];
+
+    for (index, value) in entropy.iter_mut().enumerate() {
+        state(&mut process).write_w(x(1), 11);
+        state(&mut process).write_w(x(2), 0);
+        state(&mut process).write_x(x(3), index as u64);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(
+            state(&mut process).read_w(x(0)),
+            HorizonKernelResult::SUCCESS.raw()
+        );
+        *value = state(&mut process).read_x(x(1));
+    }
+
+    state(&mut process).write_w(x(1), 11);
+    state(&mut process).write_w(x(2), 0);
+    state(&mut process).write_x(x(3), 2);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(state(&mut process).read_x(x(1)), entropy[2]);
+
+    state(&mut process).write_w(x(1), 11);
+    state(&mut process).write_w(x(2), CURRENT_PROCESS_HANDLE);
+    state(&mut process).write_x(x(3), 0);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::INVALID_HANDLE.raw()
+    );
+
+    state(&mut process).write_w(x(1), 11);
+    state(&mut process).write_w(x(2), 0);
+    state(&mut process).write_x(x(3), 4);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::INVALID_COMBINATION.raw()
+    );
+}
+
+#[test]
 fn heap_shrinks_to_zero_and_memory_state_capabilities_are_enforced() {
     let (_directory, mut process) = fixture_process(&[svc(0x01), svc(0x01), svc(0x03)]);
     let mut dispatcher = HorizonSvcDispatcher::default();

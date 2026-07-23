@@ -31,7 +31,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
                     | 0x0000_0044..=0x0000_0045
-                    | 0x0000_0048..=0x0000_004a
+                    | 0x0000_0048..=0x0000_004b
             ) =>
         {
             IMPLEMENTED
@@ -207,6 +207,8 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0049 if bits >> 30 == 3 => {
             AllocationStatus::Reserved("invalid SIMD pair transfer size")
         }
+        0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
+        0x0000_004b => validate_a64_umov(bits),
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
             let size = (bits >> 30) as u8;
             let opc = ((bits >> 22) & 3) as u8;
@@ -217,6 +219,18 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             }
         }
         _ => AllocationStatus::Allocated,
+    }
+}
+
+fn validate_a64_umov(bits: u32) -> AllocationStatus {
+    let immediate = ((bits >> 16) & 0x1f) as u8;
+    let destination_64 = bits & (1 << 30) != 0;
+    if immediate == 0 || immediate.trailing_zeros() > 3 {
+        AllocationStatus::Reserved("invalid SIMD element size")
+    } else if destination_64 != (immediate.trailing_zeros() == 3) {
+        AllocationStatus::Reserved("UMOV destination width does not match element size")
+    } else {
+        AllocationStatus::Allocated
     }
 }
 
@@ -274,6 +288,10 @@ mod tests {
             0x1300_8000, // 32-bit bitfield with an out-of-range immediate
             0x1380_8000, // 32-bit extract with an out-of-range lsb
             0x1200_fc00, // reserved all-ones logical immediate
+            0x0e00_3c00, // UMOV with no element size
+            0x0e08_3c00, // UMOV D element into a 32-bit destination
+            0x4e04_3c00, // UMOV S element into a 64-bit destination
+            0x0e10_3c00, // UMOV with an unsupported 128-bit element
         ];
         for bits in cases {
             assert!(

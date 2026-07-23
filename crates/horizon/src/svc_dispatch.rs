@@ -34,6 +34,7 @@ use crate::{UnsupportedHorizonSvc, decode_horizon_svc};
 pub const CURRENT_THREAD_HANDLE: u32 = 0xffff_8000;
 pub const CURRENT_PROCESS_HANDLE: u32 = 0xffff_8001;
 pub const MAX_WAIT_HANDLES: u32 = 0x40;
+const INVALID_HANDLE: u32 = 0;
 const TLS_COMMAND_BUFFER_SIZE: usize = 0x100;
 const USER_BUFFER_ALIGNMENT: u64 = 0x1000;
 const HORIZON_HEAP_ALIGNMENT: u64 = 0x20_0000;
@@ -995,7 +996,30 @@ fn get_info(
     let info_type = read_register(context.thread().state(), 1) as u32;
     let handle = read_register(context.thread().state(), 2) as u32;
     let subtype = read_register(context.thread().state(), 3);
-    if handle != CURRENT_PROCESS_HANDLE || subtype != 0 {
+    // RandomEntropy validation and its four process-owned values follow the
+    // public kernel implementation:
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_info.cpp#L230-L240
+    if info_type == 11 {
+        if handle != INVALID_HANDLE {
+            result(context, HorizonKernelResult::INVALID_HANDLE);
+            return resume();
+        }
+        let Some(value) = usize::try_from(subtype)
+            .ok()
+            .and_then(|index| context.process().random_entropy(index))
+        else {
+            result(context, HorizonKernelResult::INVALID_COMBINATION);
+            return resume();
+        };
+        result(context, HorizonKernelResult::SUCCESS);
+        write_u64(context.thread_mut().state_mut(), 1, value);
+        return resume();
+    }
+    if subtype != 0 {
+        result(context, HorizonKernelResult::INVALID_COMBINATION);
+        return resume();
+    }
+    if handle != CURRENT_PROCESS_HANDLE {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
     }

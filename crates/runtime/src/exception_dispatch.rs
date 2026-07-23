@@ -158,6 +158,7 @@ pub struct ExceptionProcessContext<'a> {
     cpu: ProcessCpuContext,
     address_space_limit: u64,
     memory_layout: ProcessMemoryLayout,
+    random_entropy: [u64; 4],
     heap_size: &'a mut u64,
     initial_memory_size: u64,
     memory: &'a dyn ProcessMemory,
@@ -171,6 +172,7 @@ pub(crate) struct ExceptionProcessMetadata {
     pub cpu: ProcessCpuContext,
     pub address_space_limit: u64,
     pub memory_layout: ProcessMemoryLayout,
+    pub random_entropy: [u64; 4],
     pub initial_memory_size: u64,
 }
 
@@ -187,6 +189,7 @@ impl<'a> ExceptionProcessContext<'a> {
             cpu: metadata.cpu,
             address_space_limit: metadata.address_space_limit,
             memory_layout: metadata.memory_layout,
+            random_entropy: metadata.random_entropy,
             heap_size,
             initial_memory_size: metadata.initial_memory_size,
             memory,
@@ -211,6 +214,16 @@ impl<'a> ExceptionProcessContext<'a> {
     #[must_use]
     pub const fn memory_layout(&self) -> ProcessMemoryLayout {
         self.memory_layout
+    }
+
+    /// Returns one of the four immutable entropy words assigned at process creation.
+    #[must_use]
+    pub const fn random_entropy(&self, index: usize) -> Option<u64> {
+        if index < self.random_entropy.len() {
+            Some(self.random_entropy[index])
+        } else {
+            None
+        }
     }
 
     /// Returns the currently committed heap size.
