@@ -4,6 +4,8 @@
 //! module validates the command buffer in the current thread's TLS and bridges
 //! decoded messages into the service manager and semantic service objects.
 
+use chrono::{Datelike, Offset, Timelike};
+use chrono_tz::OffsetComponents;
 use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::memory::{
     DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
@@ -20,7 +22,9 @@ use crate::{
     IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode, IpcService, IpcSession,
     MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES, OperationMode,
     PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, ServiceManagerSession, SystemSettingsSession,
+    ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
+    SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
+    TimeZoneServiceSession,
 };
 
 pub(crate) const NAMED_PORT_NAME_SIZE: usize = 12;
@@ -88,6 +92,7 @@ pub(crate) fn send_sync_request(
     tls: GuestVirtualAddress,
     handle: u32,
     initial_operation_mode: OperationMode,
+    time_environment: &TimeEnvironment,
 ) -> Result<SyncRequestResult, IpcWireError> {
     send_sync_request_from_buffer(
         process,
@@ -95,6 +100,7 @@ pub(crate) fn send_sync_request(
         COMMAND_BUFFER_SIZE,
         handle,
         initial_operation_mode,
+        time_environment,
     )
 }
 
@@ -104,6 +110,7 @@ pub(crate) fn send_sync_request_from_buffer(
     size: usize,
     handle: u32,
     initial_operation_mode: OperationMode,
+    time_environment: &TimeEnvironment,
 ) -> Result<SyncRequestResult, IpcWireError> {
     let manager = process
         .handles()
@@ -128,6 +135,22 @@ pub(crate) fn send_sync_request_from_buffer(
         .handles()
         .get_as::<HidAppletResource>(handle)
         .cloned();
+    let time = process
+        .handles()
+        .get_as::<TimeServiceSession>(handle)
+        .cloned();
+    let system_clock = process
+        .handles()
+        .get_as::<SystemClockSession>(handle)
+        .cloned();
+    let steady_clock = process
+        .handles()
+        .get_as::<SteadyClockSession>(handle)
+        .cloned();
+    let timezone = process
+        .handles()
+        .get_as::<TimeZoneServiceSession>(handle)
+        .cloned();
     let semantic_object = process.handles().get(handle).cloned().filter(|object| {
         object.is::<ReadOnlyFileSystem>()
             || object.is::<ReadOnlyFile>()
@@ -141,6 +164,10 @@ pub(crate) fn send_sync_request_from_buffer(
         && applet.is_none()
         && hid.is_none()
         && hid_applet_resource.is_none()
+        && time.is_none()
+        && system_clock.is_none()
+        && steady_clock.is_none()
+        && timezone.is_none()
         && semantic_object.is_none()
     {
         return Ok(SyncRequestResult::InvalidHandle);
@@ -257,6 +284,7 @@ pub(crate) fn send_sync_request_from_buffer(
             request,
             hipc.pid.is_some(),
             initial_operation_mode,
+            time_environment,
         )?
     } else if settings.is_some() {
         dispatch_system_settings(process, request, &hipc.receive_statics)?
@@ -270,6 +298,14 @@ pub(crate) fn send_sync_request_from_buffer(
         dispatch_hid(process, &hid, request, &hipc)?
     } else if let Some(resource) = hid_applet_resource {
         dispatch_hid_applet_resource(process, &resource, request)?
+    } else if let Some(time) = time {
+        dispatch_time(process, &time, request)?
+    } else if let Some(clock) = system_clock {
+        dispatch_system_clock(&clock, request)?
+    } else if let Some(clock) = steady_clock {
+        dispatch_steady_clock(&clock, request)?
+    } else if let Some(timezone) = timezone {
+        dispatch_timezone(&timezone, request)?
     } else if let Some(service) = service {
         dispatch_semantic_service(process, &service, request, &hipc)?
     } else if let Some(object) = semantic_object {
@@ -298,6 +334,7 @@ fn dispatch_service_manager(
     request: CmifRequest<'_>,
     sent_pid: bool,
     initial_operation_mode: OperationMode,
+    time_environment: &TimeEnvironment,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     match request.command_id {
         0 => {
@@ -360,12 +397,13 @@ fn dispatch_service_manager(
                 "sm:GetService requested {:?}",
                 String::from_utf8_lossy(name)
             );
-            if matches!(name, b"set:sys" | b"apm" | b"appletOE" | b"hid") {
+            if matches!(name, b"set:sys" | b"apm" | b"appletOE" | b"hid" | b"time:u") {
                 return connect_system_service(
                     process,
                     request.token,
                     name,
                     initial_operation_mode,
+                    time_environment,
                 );
             }
             let Some(service) = IpcService::from_name(name) else {
@@ -443,6 +481,7 @@ fn connect_system_service(
     token: u32,
     name: &[u8],
     initial_operation_mode: OperationMode,
+    time_environment: &TimeEnvironment,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     if !process.mounts().allows_service(name) {
         return Ok((
@@ -466,6 +505,9 @@ fn connect_system_service(
             .map_err(|_| IpcWireError::ResourceExhausted)?;
             process.handles_mut().insert(HidSession::new(shared_memory))
         }
+        b"time:u" => time_environment
+            .create_service()
+            .and_then(|session| process.handles_mut().insert(session)),
         _ => unreachable!("system service name was checked"),
     };
     match handle {
@@ -1280,6 +1322,151 @@ fn dispatch_hid_applet_resource(
     semantic_success(request.token, false, &[], &[handle], &[], None)
 }
 
+fn dispatch_time(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &TimeServiceSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // The static-service object commands, returned child sessions, and copied
+    // shared-memory handle follow the pinned libnx initialization sequence:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L25-L80
+    let child = match request.command_id {
+        0 => Some(HandleObject::new(
+            session.system_clock(SystemClockKind::User),
+        )),
+        1 => Some(HandleObject::new(
+            session.system_clock(SystemClockKind::Network),
+        )),
+        2 => Some(HandleObject::new(session.steady_clock())),
+        3 => Some(HandleObject::new(session.timezone_service())),
+        4 => Some(HandleObject::new(
+            session.system_clock(SystemClockKind::Local),
+        )),
+        20 => {
+            let handle = process
+                .handles_mut()
+                .insert(session.shared_memory())
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            log::debug!("time:u returned shared-memory handle {handle:#x}");
+            return semantic_success(request.token, false, &[], &[handle], &[], None);
+        }
+        _ => return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    };
+    let handle = process
+        .handles_mut()
+        .insert_object(child.expect("time child command was selected"))
+        .map_err(|_| IpcWireError::ResourceExhausted)?;
+    log::debug!(
+        "time:u command {} returned child session handle {handle:#x}",
+        request.command_id
+    );
+    semantic_success(request.token, false, &[], &[], &[], Some(handle))
+}
+
+fn dispatch_system_clock(
+    session: &SystemClockSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // ISystemClock command IDs and scalar layouts:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L160-L185
+    match request.command_id {
+        0 => {
+            let timestamp = session.current_time();
+            semantic_success(
+                request.token,
+                false,
+                &timestamp.to_le_bytes(),
+                &[],
+                &[],
+                None,
+            )
+        }
+        1 => {
+            let Some(timestamp) = request.data.get(..8) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            session
+                .set_current_time(i64::from_le_bytes(timestamp.try_into().unwrap()))
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    }
+}
+
+fn dispatch_steady_clock(
+    session: &SteadyClockSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        0 => {
+            let (time_point, source_id) = session.time_point();
+            let mut data = [0_u8; 0x18];
+            data[..8].copy_from_slice(&time_point.to_le_bytes());
+            data[8..].copy_from_slice(&source_id);
+            semantic_success(request.token, false, &data, &[], &[], None)
+        }
+        200 => semantic_success(request.token, false, &0_i64.to_le_bytes(), &[], &[], None),
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    }
+}
+
+fn dispatch_timezone(
+    session: &TimeZoneServiceSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // ITimeZoneService command 0 returns the fixed 0x24-byte location name:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L187-L194
+    match request.command_id {
+        0 => semantic_success(
+            request.token,
+            false,
+            &session.location_name(),
+            &[],
+            &[],
+            None,
+        ),
+        2 => semantic_success(request.token, false, &1_u32.to_le_bytes(), &[], &[], None),
+        101 => {
+            let Some(timestamp) = request_u64(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let Ok(timestamp) = i64::try_from(timestamp) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            let Some(data) = encode_calendar_time(session.timezone(), timestamp) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            semantic_success(request.token, false, &data, &[], &[], None)
+        }
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    }
+}
+
+fn encode_calendar_time(timezone: chrono_tz::Tz, timestamp: i64) -> Option<[u8; 0x20]> {
+    let utc = chrono::DateTime::from_timestamp(timestamp, 0)?;
+    let local = utc.with_timezone(&timezone);
+    let year = u16::try_from(local.year()).ok()?;
+    let mut data = [0_u8; 0x20];
+    data[..2].copy_from_slice(&year.to_le_bytes());
+    data[2] = local.month() as u8;
+    data[3] = local.day() as u8;
+    data[4] = local.hour() as u8;
+    data[5] = local.minute() as u8;
+    data[6] = local.second() as u8;
+    data[8..12].copy_from_slice(&local.weekday().num_days_from_sunday().to_le_bytes());
+    data[12..16].copy_from_slice(&local.ordinal0().to_le_bytes());
+    let abbreviation = local.format("%Z").to_string();
+    let abbreviation = abbreviation.as_bytes();
+    let abbreviation_len = abbreviation.len().min(8);
+    data[16..16 + abbreviation_len].copy_from_slice(&abbreviation[..abbreviation_len]);
+    let dst = u32::from(local.offset().dst_offset().num_seconds() != 0);
+    data[24..28].copy_from_slice(&dst.to_le_bytes());
+    let offset = local.offset().fix().local_minus_utc();
+    data[28..32].copy_from_slice(&offset.to_le_bytes());
+    Some(data)
+}
+
 fn applet_child(
     session: &AppletSession,
     token: u32,
@@ -1572,6 +1759,33 @@ mod tests {
         assert_eq!(word(16), 0x4f43_4653);
         assert_eq!(word(24), 0xe15);
         assert_eq!(word(28), 0x33);
+    }
+
+    #[test]
+    fn madrid_calendar_conversion_applies_iana_daylight_saving_rules() {
+        let winter = encode_calendar_time(
+            "Europe/Madrid".parse().unwrap(),
+            1_704_067_200, // 2024-01-01 00:00:00 UTC
+        )
+        .unwrap();
+        assert_eq!(&winter[..7], &[0xe8, 0x07, 1, 1, 1, 0, 0]);
+        assert_eq!(u32::from_le_bytes(winter[24..28].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_le_bytes(winter[28..32].try_into().unwrap()),
+            3_600
+        );
+
+        let summer = encode_calendar_time(
+            "Europe/Madrid".parse().unwrap(),
+            1_719_792_000, // 2024-07-01 00:00:00 UTC
+        )
+        .unwrap();
+        assert_eq!(&summer[..7], &[0xe8, 0x07, 7, 1, 2, 0, 0]);
+        assert_eq!(u32::from_le_bytes(summer[24..28].try_into().unwrap()), 1);
+        assert_eq!(
+            i32::from_le_bytes(summer[28..32].try_into().unwrap()),
+            7_200
+        );
     }
 
     #[test]

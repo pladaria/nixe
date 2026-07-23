@@ -5,8 +5,9 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono_tz::Tz;
 use nixe_loader_storage::StorageRef;
-use nixe_runtime::{HandleObject, ReadOnlyMount, SharedMemoryObject};
+use nixe_runtime::{HandleObject, ReadOnlyMount, SharedMemoryObject, VirtualClock};
 
 use crate::IpcService;
 
@@ -202,6 +203,258 @@ impl HidAppletResource {
     pub(crate) fn shared_memory(&self) -> SharedMemoryObject {
         self.shared_memory.clone()
     }
+}
+
+const TIME_SHARED_MEMORY_SIZE: usize = 0x1000;
+const TIME_LOCATION_NAME_SIZE: usize = 0x24;
+const TIME_SOURCE_ID: [u8; 16] = *b"NixeTimeSource01";
+
+/// Initial virtual-time environment injected by the application runtime.
+#[derive(Clone, Debug)]
+pub struct TimeEnvironment {
+    clock: VirtualClock,
+    location_name: [u8; TIME_LOCATION_NAME_SIZE],
+    timezone: Tz,
+}
+
+impl TimeEnvironment {
+    /// Creates an environment with one validated Horizon location name.
+    pub fn new(clock: VirtualClock, timezone: &str) -> Result<Self, &'static str> {
+        if timezone.is_empty() || timezone.len() >= TIME_LOCATION_NAME_SIZE || !timezone.is_ascii()
+        {
+            return Err("timezone is not representable as a Horizon location name");
+        }
+        // Versioned IANA rule parser used by the calendar-conversion commands:
+        // https://docs.rs/chrono-tz/0.10.4/chrono_tz/enum.Tz.html
+        let timezone = timezone
+            .parse::<Tz>()
+            .map_err(|_| "timezone is not present in the IANA database")?;
+        let mut location_name = [0; TIME_LOCATION_NAME_SIZE];
+        let name = timezone.name();
+        location_name[..name.len()].copy_from_slice(name.as_bytes());
+        Ok(Self {
+            clock,
+            location_name,
+            timezone,
+        })
+    }
+
+    pub(crate) fn create_service(&self) -> Result<TimeServiceSession, nixe_runtime::HandleError> {
+        TimeServiceSession::new(self.clone())
+    }
+}
+
+impl Default for TimeEnvironment {
+    fn default() -> Self {
+        Self::new(
+            VirtualClock::new(nixe_runtime::VirtualClockMode::Realtime),
+            "UTC",
+        )
+        .expect("UTC is a representable Horizon location name")
+    }
+}
+
+#[derive(Debug)]
+struct TimeState {
+    clock: VirtualClock,
+    location_name: [u8; TIME_LOCATION_NAME_SIZE],
+    timezone: Tz,
+    shared_memory: SharedMemoryObject,
+    clock_offsets: Mutex<[i64; 3]>,
+}
+
+impl TimeState {
+    fn current_time(&self, kind: SystemClockKind) -> i64 {
+        self.clock.unix_seconds().saturating_add(
+            self.clock_offsets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()],
+        )
+    }
+
+    fn set_current_time(
+        &self,
+        kind: SystemClockKind,
+        unix_seconds: i64,
+    ) -> Result<(), nixe_runtime::HandleError> {
+        self.clock_offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()] =
+            unix_seconds.saturating_sub(self.clock.unix_seconds());
+        let steady_seconds = i64::try_from(self.clock.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let offset = unix_seconds.saturating_sub(steady_seconds);
+        let shared_offset = match kind {
+            SystemClockKind::Network => 0x80,
+            SystemClockKind::User | SystemClockKind::Local => 0x38,
+        };
+        write_system_clock_context(
+            &self.shared_memory,
+            shared_offset,
+            offset,
+            steady_seconds,
+            TIME_SOURCE_ID,
+        )
+    }
+}
+
+/// Client session connected to Horizon's `time:u` static service.
+#[derive(Clone, Debug)]
+pub struct TimeServiceSession {
+    state: Arc<TimeState>,
+}
+
+impl TimeServiceSession {
+    fn new(environment: TimeEnvironment) -> Result<Self, nixe_runtime::HandleError> {
+        let shared_memory = SharedMemoryObject::zeroed_with_remote_permissions(
+            TIME_SHARED_MEMORY_SIZE,
+            nixe_cpu::memory::MemoryPermissions::READ,
+        )?;
+        let elapsed_seconds =
+            i64::try_from(environment.clock.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let wall_anchor = environment
+            .clock
+            .unix_seconds()
+            .saturating_sub(elapsed_seconds);
+        initialise_time_shared_memory(&shared_memory, wall_anchor, TIME_SOURCE_ID)?;
+        Ok(Self {
+            state: Arc::new(TimeState {
+                clock: environment.clock,
+                location_name: environment.location_name,
+                timezone: environment.timezone,
+                shared_memory,
+                clock_offsets: Mutex::new([0; 3]),
+            }),
+        })
+    }
+
+    pub(crate) fn system_clock(&self, kind: SystemClockKind) -> SystemClockSession {
+        SystemClockSession {
+            state: Arc::clone(&self.state),
+            kind,
+        }
+    }
+
+    pub(crate) fn steady_clock(&self) -> SteadyClockSession {
+        SteadyClockSession {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn timezone_service(&self) -> TimeZoneServiceSession {
+        TimeZoneServiceSession {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn shared_memory(&self) -> SharedMemoryObject {
+        self.state.shared_memory.clone()
+    }
+}
+
+/// Kind of one Horizon system clock.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SystemClockKind {
+    User,
+    Network,
+    Local,
+}
+
+impl SystemClockKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::User => 0,
+            Self::Network => 1,
+            Self::Local => 2,
+        }
+    }
+}
+
+/// Horizon `ISystemClock` object.
+#[derive(Clone, Debug)]
+pub struct SystemClockSession {
+    state: Arc<TimeState>,
+    kind: SystemClockKind,
+}
+
+impl SystemClockSession {
+    pub(crate) fn current_time(&self) -> i64 {
+        self.state.current_time(self.kind)
+    }
+
+    pub(crate) fn set_current_time(
+        &self,
+        unix_seconds: i64,
+    ) -> Result<(), nixe_runtime::HandleError> {
+        self.state.set_current_time(self.kind, unix_seconds)
+    }
+}
+
+/// Horizon `ISteadyClock` object.
+#[derive(Clone, Debug)]
+pub struct SteadyClockSession {
+    state: Arc<TimeState>,
+}
+
+impl SteadyClockSession {
+    pub(crate) fn time_point(&self) -> (i64, [u8; 16]) {
+        let seconds = i64::try_from(self.state.clock.elapsed().as_secs()).unwrap_or(i64::MAX);
+        (seconds, TIME_SOURCE_ID)
+    }
+}
+
+/// Horizon `ITimeZoneService` object.
+#[derive(Clone, Debug)]
+pub struct TimeZoneServiceSession {
+    state: Arc<TimeState>,
+}
+
+impl TimeZoneServiceSession {
+    pub(crate) fn location_name(&self) -> [u8; TIME_LOCATION_NAME_SIZE] {
+        self.state.location_name
+    }
+
+    pub(crate) fn timezone(&self) -> Tz {
+        self.state.timezone
+    }
+}
+
+fn initialise_time_shared_memory(
+    memory: &SharedMemoryObject,
+    unix_seconds: i64,
+    source_id: [u8; 16],
+) -> Result<(), nixe_runtime::HandleError> {
+    // libnx's lock-free reader and the three object offsets define this 4 KiB
+    // layout. Both copies begin identical and use an even counter:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L96-L158
+    let mut steady = [0_u8; 0x18];
+    steady[8..].copy_from_slice(&source_id);
+    write_shared_object(memory, 0x00, &steady)?;
+
+    write_system_clock_context(memory, 0x38, unix_seconds, 0, source_id)?;
+    write_system_clock_context(memory, 0x80, unix_seconds, 0, source_id)
+}
+
+fn write_shared_object(
+    memory: &SharedMemoryObject,
+    offset: usize,
+    value: &[u8],
+) -> Result<(), nixe_runtime::HandleError> {
+    memory.write(offset + 8, value)?;
+    memory.write(offset + 8 + value.len(), value)
+}
+
+fn write_system_clock_context(
+    memory: &SharedMemoryObject,
+    offset: usize,
+    clock_offset: i64,
+    steady_time_point: i64,
+    source_id: [u8; 16],
+) -> Result<(), nixe_runtime::HandleError> {
+    let mut context = [0_u8; 0x20];
+    context[..8].copy_from_slice(&clock_offset.to_le_bytes());
+    context[8..16].copy_from_slice(&steady_time_point.to_le_bytes());
+    context[16..].copy_from_slice(&source_id);
+    write_shared_object(memory, offset, &context)
 }
 
 const APPLET_ROOT_OBJECT_ID: u32 = 1;
@@ -433,6 +686,42 @@ mod performance_tests {
         assert_eq!(second.configuration(0), Some(0x1234));
         assert_eq!(second.configuration(2), None);
         assert!(!second.set_configuration(2, 1));
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+    use nixe_runtime::{VirtualClock, VirtualClockMode};
+
+    #[test]
+    fn fixed_time_is_shared_by_every_clock_and_encoded_for_libnx() {
+        let environment = TimeEnvironment::new(
+            VirtualClock::new(VirtualClockMode::Fixed {
+                unix_seconds: 1_704_067_200,
+            }),
+            "Europe/Madrid",
+        )
+        .unwrap();
+        let service = environment.create_service().unwrap();
+
+        assert_eq!(
+            service.system_clock(SystemClockKind::User).current_time(),
+            1_704_067_200
+        );
+        assert_eq!(
+            &service.timezone_service().location_name()[..13],
+            b"Europe/Madrid"
+        );
+
+        let memory = service.shared_memory();
+        let mut user_context = [0_u8; 0x20];
+        memory.read(0x40, &mut user_context).unwrap();
+        assert_eq!(
+            i64::from_le_bytes(user_context[..8].try_into().unwrap()),
+            1_704_067_200
+        );
+        assert_eq!(&user_context[16..], &TIME_SOURCE_ID);
     }
 }
 

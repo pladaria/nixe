@@ -783,6 +783,34 @@ impl SharedMemoryObject {
     pub fn same_backing(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.bytes, &other.bytes)
     }
+
+    /// Copies bytes into the temporary backing shared by every duplicate handle.
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), HandleError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.size)
+            .ok_or(HandleError::InvalidRange)?;
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[offset..end]
+            .copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Copies bytes out of the temporary shared backing.
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), HandleError> {
+        let end = offset
+            .checked_add(output.len())
+            .filter(|end| *end <= self.size)
+            .ok_or(HandleError::InvalidRange)?;
+        output.copy_from_slice(
+            &self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[offset..end],
+        );
+        Ok(())
+    }
 }
 
 /// Deterministic process handle-table failure.
@@ -792,6 +820,7 @@ pub enum HandleError {
     AllocationFailed,
     InvalidHandle(u32),
     ObjectTooLarge(usize),
+    InvalidRange,
 }
 
 impl Display for HandleError {
@@ -804,6 +833,7 @@ impl Display for HandleError {
                 formatter,
                 "runtime object size {size:#x} exceeds its safety limit"
             ),
+            Self::InvalidRange => formatter.write_str("object byte range is outside its backing"),
         }
     }
 }

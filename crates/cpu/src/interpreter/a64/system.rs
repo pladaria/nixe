@@ -66,6 +66,22 @@ fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Op
         0xd53b_4420 => u64::from(state.fpsr()),
         0xd53b_d040 => state.tpidr_el0(),
         0xd53b_d060 => state.tpidrro_el0(),
+        // CNTFRQ_EL0 and CNTVCT_EL0 are runtime-owned architectural timer
+        // observations. Encoding and access semantics:
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTFRQ-EL0--Counter-timer-Frequency-register
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTVCT-EL0--Counter-timer-Virtual-Count-register
+        0xd53b_e000 => {
+            let Some(timer) = context.architectural_timer() else {
+                return false;
+            };
+            timer.frequency
+        }
+        0xd53b_e020 => {
+            let Some(timer) = context.architectural_timer() else {
+                return false;
+            };
+            timer.counter
+        }
         0xd53b_00e0 => {
             let profile = context.process().profile().cache_maintenance();
             let crate::profile::ProfileValue::Known(bytes) = profile.data_zero_block_bytes else {
