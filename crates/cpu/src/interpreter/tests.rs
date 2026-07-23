@@ -514,6 +514,69 @@ fn a64_simd_unsigned_move_extracts_each_lane_width_and_zero_extends() {
 }
 
 #[test]
+fn a64_simd_integer_add_sub_wrap_each_lane_and_clear_inactive_bits() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let arrangements = [
+        (0x0e22_8420_u32, 0x2e22_8420_u32, 8_u8, 64_u8),
+        (0x4e22_8420, 0x6e22_8420, 8, 128),
+        (0x0e62_8420, 0x2e62_8420, 16, 64),
+        (0x4e62_8420, 0x6e62_8420, 16, 128),
+        (0x0ea2_8420, 0x2ea2_8420, 32, 64),
+        (0x4ea2_8420, 0x6ea2_8420, 32, 128),
+        (0x4ee2_8420, 0x6ee2_8420, 64, 128),
+    ];
+
+    for (add, subtract, lane_bits, vector_bits) in arrangements {
+        let lane_mask = (1_u128 << lane_bits) - 1;
+        let lane_count = vector_bits / lane_bits;
+        let active_mask = if vector_bits == 128 {
+            u128::MAX
+        } else {
+            u128::from(u64::MAX)
+        };
+        let ones = (0..lane_count).fold(0_u128, |value, lane| {
+            value | (1_u128 << (u32::from(lane) * u32::from(lane_bits)))
+        });
+        let expected_subtract = (0..lane_count).fold(0_u128, |value, lane| {
+            value | ((lane_mask - 1) << (u32::from(lane) * u32::from(lane_bits)))
+        });
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(1, u128::MAX));
+        assert!(a64.set_vector(2, ones));
+
+        execute_one(&profile, &mut state, add.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(a64.vector(0), Some(0), "ADD encoding={add:#010x}");
+
+        execute_one(&profile, &mut state, subtract.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(0),
+            Some(expected_subtract & active_mask),
+            "SUB encoding={subtract:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, 0x1234_5678_8000_0000_0000_0001_ffff_ffff));
+    assert!(a64.set_vector(30, 0xedcb_a988_8000_0000_ffff_ffff_0000_0001));
+    execute_one(&profile, &mut state, 0x4ebe_87fe_u32.into()).unwrap();
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(0));
+}
+
+#[test]
 fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(49);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);
@@ -552,6 +615,94 @@ fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     };
     assert_eq!(a64.vector(2), Some(first));
     assert_eq!(a64.vector(3), Some(second));
+}
+
+#[test]
+fn a64_simd_register_offset_transfers_cover_extensions_scaling_and_sizes() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(50);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(97);
+    let profile = GuestCpuProfile::switch_1();
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let value = 0x1122_3344_5566_7788_99aa_bbcc_ddee_ffab;
+
+    for (store, load, vector, base, base_value, offset, offset_value, expected) in [
+        (
+            0x3c22_4820_u32,
+            0x3c62_4820_u32,
+            0,
+            1,
+            0x1000,
+            2,
+            0x10,
+            0xab,
+        ),
+        (
+            0x7c25_d883,
+            0x7c65_d883,
+            3,
+            4,
+            0x1040,
+            5,
+            0xffff_fff8,
+            0xffab,
+        ),
+        (0xbc28_68e6, 0xbc68_68e6, 6, 7, 0x1080, 8, 0x20, 0xddee_ffab),
+        (
+            0xfc2b_7949,
+            0xfc6b_7949,
+            9,
+            10,
+            0x1100,
+            11,
+            2,
+            0x99aa_bbcc_ddee_ffab,
+        ),
+        (0x3cae_59ac, 0x3cee_59ac, 12, 13, 0x1200, 14, 3, value),
+        (
+            0x3cb1_fa0f,
+            0x3cf1_fa0f,
+            15,
+            16,
+            0x1300,
+            17,
+            u64::MAX - 1,
+            value,
+        ),
+        (0x3ca0_69be, 0x3ce0_69be, 30, 13, 0x1400, 0, 0, value),
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(vector, value));
+        a64.write_x(x(base), base_value);
+        a64.write_x(x(offset), offset_value);
+
+        execute_one_with_context(context, &mut state, store.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(vector, u128::MAX));
+        execute_one_with_context(context, &mut state, load.into()).unwrap();
+
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(vector),
+            Some(expected),
+            "load encoding={load:#010x}"
+        );
+    }
 }
 
 #[test]

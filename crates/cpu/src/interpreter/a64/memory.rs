@@ -12,7 +12,7 @@ use crate::{
     state::a64::A64State,
 };
 
-use super::{advance, read, resume, sign_extend, write};
+use super::{advance, read, register_offset_address, resume, sign_extend, write};
 use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
 
 type MemoryStep = Result<Option<()>, DataAccessFault>;
@@ -224,24 +224,17 @@ fn register_offset(
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
-    if fields.option & 2 == 0 {
-        return Ok(None);
-    }
     let size = size_from_bits(fields.size);
-    let raw = read(state, fields.rm, 64, false);
-    let source_width = if fields.option & 1 == 0 { 32 } else { 64 };
-    let mut offset = if source_width == 32 {
-        u64::from(raw as u32)
-    } else {
-        raw
+    let Some(address) = register_offset_address(
+        state,
+        fields.rn,
+        fields.rm,
+        fields.option,
+        fields.scaled,
+        size.bytes().trailing_zeros(),
+    ) else {
+        return Ok(None);
     };
-    if fields.option & 4 != 0 {
-        offset = sign_extend(offset, source_width) as u64;
-    }
-    if fields.scaled {
-        offset = offset.wrapping_shl(size.bytes().trailing_zeros());
-    }
-    let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true).wrapping_add(offset));
     transfer(
         memory,
         address_space,

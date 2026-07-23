@@ -7,7 +7,7 @@ use super::{NO_FEATURES, pattern};
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
         "load-literal",
-        0x3b00_0000,
+        0x3f00_0000,
         0x1800_0000,
         0x0000_0022,
         61,
@@ -16,7 +16,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-store-unsigned",
-        0x3b00_0000,
+        0x3f00_0000,
         0x3900_0000,
         0x0000_0023,
         60,
@@ -25,7 +25,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-store-unscaled",
-        0x3b20_0c00,
+        0x3f20_0c00,
         0x3800_0000,
         0x0000_0024,
         120,
@@ -34,7 +34,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-store-post-index",
-        0x3b20_0c00,
+        0x3f20_0c00,
         0x3800_0400,
         0x0000_0025,
         119,
@@ -43,7 +43,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-store-pre-index",
-        0x3b20_0c00,
+        0x3f20_0c00,
         0x3800_0c00,
         0x0000_0026,
         118,
@@ -52,7 +52,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "load-store-register",
-        0x3b20_0c00,
+        0x3f20_0c00,
         0x3820_0800,
         0x0000_0027,
         117,

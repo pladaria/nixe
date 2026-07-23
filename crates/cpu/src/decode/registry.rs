@@ -30,6 +30,8 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_000c..=0x0000_000e
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
+                    | 0x0000_0031
+                    | 0x0000_0042
                     | 0x0000_0044..=0x0000_0045
                     | 0x0000_0048..=0x0000_004b
             ) =>
@@ -207,6 +209,8 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0049 if bits >> 30 == 3 => {
             AllocationStatus::Reserved("invalid SIMD pair transfer size")
         }
+        0x0000_0031 => validate_a64_simd_add_sub(bits),
+        0x0000_0038 if bits & 0x9f20_8400 == 0x0e20_8400 => validate_a64_simd_add_sub(bits),
         0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
         0x0000_004b => validate_a64_umov(bits),
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
@@ -214,11 +218,21 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             let opc = ((bits >> 22) & 3) as u8;
             if opc & 2 != 0 && size != 0 {
                 AllocationStatus::Reserved("invalid 128-bit SIMD transfer size")
+            } else if id == 0x0000_0042 && ((bits >> 13) & 2) == 0 {
+                AllocationStatus::Reserved("invalid SIMD register-offset extension")
             } else {
                 AllocationStatus::Allocated
             }
         }
         _ => AllocationStatus::Allocated,
+    }
+}
+
+fn validate_a64_simd_add_sub(bits: u32) -> AllocationStatus {
+    if (bits >> 22) & 3 == 3 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit SIMD vector cannot contain a 64-bit lane")
+    } else {
+        AllocationStatus::Allocated
     }
 }
 
@@ -292,14 +306,17 @@ mod tests {
             0x0e08_3c00, // UMOV D element into a 32-bit destination
             0x4e04_3c00, // UMOV S element into a 64-bit destination
             0x0e10_3c00, // UMOV with an unsupported 128-bit element
+            0x3c22_0820, // SIMD register offset with a reserved extension
+            0x0ee2_8420, // SIMD ADD with a reserved one-lane 64-bit arrangement
         ];
         for bits in cases {
+            let result = classify(ExecutionState::A64, InstructionEncoding::from_u32(bits));
             assert!(
                 matches!(
-                    classify(ExecutionState::A64, InstructionEncoding::from_u32(bits)),
+                    result,
                     DecodeResult::Reserved { .. } | DecodeResult::Unallocated { .. }
                 ),
-                "encoding {bits:#010x} escaped allocation validation"
+                "encoding {bits:#010x} escaped allocation validation: {result:?}"
             );
         }
     }

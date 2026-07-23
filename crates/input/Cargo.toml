@@ -1,0 +1,8 @@
+[package]
+name = "nixe-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sdl3.workspace = true
