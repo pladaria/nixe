@@ -276,11 +276,15 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
-    // Arm A64 MOVI encoding and immediate-expansion rules:
-    // https://documentation-service.arm.com/static/6023d5512cb3723f20208db2
+    // Arm A64 Advanced SIMD modified-immediate encodings and expansion rules,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/MOVI--Move-Immediate--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/MVNI--Move-Negated-Immediate--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ORR--vector--immediate---Bitwise-inclusive-OR--vector--immediate--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/BIC--vector--immediate---Bitwise-bit-Clear--vector--immediate--
     pattern(
-        "simd-move-immediate-32",
-        0xbff8_9c00,
+        "simd-modified-immediate",
+        0x9ff8_0c00,
         0x0f00_0400,
         0x0000_004a,
         132,
@@ -295,6 +299,29 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0e00_3c00,
         0x0000_004b,
         133,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 INS copies either another vector element or a general-purpose
+    // register into one vector element while preserving every other element,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/INS--element---Insert-vector-element-from-another-vector-element-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/INS--general---Insert-vector-element-from-general-purpose-register-
+    pattern(
+        "simd-insert-element",
+        0xffe0_8400,
+        0x6e00_0400,
+        0x0000_0060,
+        160,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-insert-general",
+        0xffe0_fc00,
+        0x4e00_1c00,
+        0x0000_0061,
+        159,
         &[],
         SIMD,
     ),
@@ -376,7 +403,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-move-to-general",
-        0x5f3f_fc00,
+        0x5f37_fc00,
         0x1e26_0000,
         0x0000_003e,
         102,
@@ -385,7 +412,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-move-from-general",
-        0x5f3f_fc00,
+        0x5f37_fc00,
         0x1e27_0000,
         0x0000_003f,
         101,
@@ -462,6 +489,8 @@ pub struct Operands {
     pub integer_comparison: Option<IntegerComparison>,
     pub pairwise_operation: Option<PairwiseOperation>,
     pub compare_with_zero: bool,
+    pub operation_bit: bool,
+    pub immediate_4: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,8 +549,10 @@ instructions!(
     ScalarMove,
     CompareRegister,
     CompareZero,
-    MoveImmediate32,
+    ModifiedImmediate,
     UnsignedMoveToGeneral,
+    InsertElement,
+    InsertGeneral,
     SignedIntToFloat,
     UnsignedIntToFloat,
     FloatToSignedInt,
@@ -571,6 +602,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         integer_comparison: integer_comparison(semantic_id),
         pairwise_operation: pairwise_operation(semantic_id),
         compare_with_zero: matches!(semantic_id, 0x0000_0054..=0x0000_0058),
+        operation_bit: bits & (1 << 29) != 0,
+        immediate_4: ((bits >> 11) & 0xf) as u8,
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -581,8 +614,10 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0035 => Instruction::ScalarMove(operands),
         0x0000_0036 => Instruction::CompareRegister(operands),
         0x0000_0037 => Instruction::CompareZero(operands),
-        0x0000_004a => Instruction::MoveImmediate32(operands),
+        0x0000_004a => Instruction::ModifiedImmediate(operands),
         0x0000_004b => Instruction::UnsignedMoveToGeneral(operands),
+        0x0000_0060 => Instruction::InsertElement(operands),
+        0x0000_0061 => Instruction::InsertGeneral(operands),
         0x0000_003a => Instruction::SignedIntToFloat(operands),
         0x0000_003b => Instruction::UnsignedIntToFloat(operands),
         0x0000_003c => Instruction::FloatToSignedInt(operands),

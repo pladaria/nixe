@@ -33,12 +33,28 @@ pub(super) fn execute(
             duplicate_general(state, fields);
             None
         }
-        Instruction::MoveImmediate32(_) => {
-            move_immediate_32(state, fields);
+        Instruction::ModifiedImmediate(_) => {
+            modified_immediate(state, fields);
             None
         }
         Instruction::UnsignedMoveToGeneral(_) => {
             unsigned_move_to_general(state, fields);
+            None
+        }
+        Instruction::InsertElement(_) => {
+            insert_element(state, fields);
+            None
+        }
+        Instruction::InsertGeneral(_) => {
+            insert_general(state, fields);
+            None
+        }
+        Instruction::MoveToGeneral(_) => {
+            floating_move_to_general(state, fields);
+            None
+        }
+        Instruction::MoveFromGeneral(_) => {
+            floating_move_from_general(state, fields);
             None
         }
         Instruction::Integer(_) => {
@@ -288,17 +304,66 @@ fn duplicate_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::
     assert!(state.set_vector(fields.rd, value));
 }
 
-fn move_immediate_32(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
-    let shift = (fields.cmode >> 1) * 8;
-    let lane = u128::from(fields.immediate_8) << shift;
-    let vector_bits = if fields.vector_128 { 128 } else { 64 };
-    let value = replicate(
-        lane,
-        BitWidth::new(32).expect("32-bit SIMD immediate lane"),
-        BitWidth::new(vector_bits).expect("allocated SIMD vector width"),
-    )
-    .expect("allocated SIMD immediate arrangement");
-    assert!(state.set_vector(fields.rd, value));
+fn modified_immediate(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let immediate =
+        expand_modified_immediate(fields.cmode, fields.immediate_8, fields.operation_bit);
+    let replicated = u128::from(immediate) | (u128::from(immediate) << 64);
+    let active_mask = if fields.vector_128 {
+        u128::MAX
+    } else {
+        u128::from(u64::MAX)
+    };
+    let previous = state
+        .vector(fields.rd)
+        .expect("normalized modified-immediate destination register");
+    let value = if fields.cmode <= 11 && fields.cmode & 1 != 0 {
+        if fields.operation_bit {
+            previous & replicated
+        } else {
+            previous | replicated
+        }
+    } else {
+        replicated
+    };
+    assert!(state.set_vector(fields.rd, value & active_mask));
+}
+
+fn expand_modified_immediate(cmode: u8, immediate: u8, operation_bit: bool) -> u64 {
+    let immediate = u64::from(immediate);
+    let value = match cmode {
+        0..=7 => {
+            let lane = immediate << ((cmode >> 1) * 8);
+            lane | (lane << 32)
+        }
+        8..=11 => {
+            let lane = immediate << (((cmode >> 1) & 1) * 8);
+            lane | (lane << 16) | (lane << 32) | (lane << 48)
+        }
+        12 => {
+            let lane = (immediate << 8) | 0xff;
+            lane | (lane << 32)
+        }
+        13 => {
+            let lane = (immediate << 16) | 0xffff;
+            lane | (lane << 32)
+        }
+        14 if !operation_bit => immediate * 0x0101_0101_0101_0101,
+        14 => {
+            let mut result = 0_u64;
+            for bit in 0..8 {
+                if immediate & (1 << bit) != 0 {
+                    result |= 0xff << (bit * 8);
+                }
+            }
+            result
+        }
+        _ => unreachable!("allocation validation excludes floating-point immediates"),
+    };
+    if operation_bit && cmode != 14 {
+        !value
+    } else {
+        value
+    }
 }
 
 fn unsigned_move_to_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
@@ -324,6 +389,85 @@ fn unsigned_move_to_general(state: &mut A64State, fields: crate::decode::a64::fp
         false,
         value,
     );
+}
+
+fn insert_element(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let (lane_bits, destination_lane) = insert_lane_shape(fields.immediate_5);
+    let size_shift = lane_bits.trailing_zeros() - 3;
+    let source_lane = fields.immediate_4 >> size_shift;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized INS vector source register");
+    let lane = (source >> (u32::from(source_lane) * lane_bits)) & lane_mask;
+    insert_lane(state, fields.rd, destination_lane, lane_bits, lane);
+}
+
+fn insert_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let (lane_bits, destination_lane) = insert_lane_shape(fields.immediate_5);
+    let lane = read(state, fields.rn, lane_bits as u8, false);
+    insert_lane(
+        state,
+        fields.rd,
+        destination_lane,
+        lane_bits,
+        u128::from(lane),
+    );
+}
+
+fn insert_lane_shape(immediate_5: u8) -> (u32, u8) {
+    let size_shift = immediate_5.trailing_zeros();
+    let lane_bits = 8_u32 << size_shift;
+    let lane = immediate_5 >> (size_shift + 1);
+    (lane_bits, lane)
+}
+
+fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, value: u128) {
+    let shift = u32::from(lane) * lane_bits;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let previous = state
+        .vector(register)
+        .expect("normalized INS destination register");
+    let result = (previous & !(lane_mask << shift)) | ((value & lane_mask) << shift);
+    assert!(state.set_vector(register, result));
+}
+
+// FMOV between general-purpose and SIMD&FP registers copies the bit pattern
+// without numeric conversion. Scalar destinations clear the rest of the
+// SIMD&FP register; the Vd.D[1] form is the exception and preserves Dd.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--general---Floating-point-Move-to-or-from-general-purpose-register-without-conversion-
+fn floating_move_to_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let vector = state
+        .vector(fields.rn)
+        .expect("normalized FMOV SIMD&FP source register");
+    let (width, value) = match (fields.size & 2 != 0, fields.opc) {
+        (false, 0) => (32, vector as u64),        // FMOV Wd, Sn
+        (false, 3) => (32, vector as u16 as u64), // FMOV Wd, Hn
+        (true, 1) => (64, vector as u64),         // FMOV Xd, Dn
+        (true, 2) => (64, (vector >> 64) as u64), // FMOV Xd, Vn.D[1]
+        _ => unreachable!("allocation validation rejects invalid FMOV register widths"),
+    };
+    super::write(state, fields.rd, width, false, value);
+}
+
+fn floating_move_from_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let general_64 = fields.size & 2 != 0;
+    let width = if general_64 { 64 } else { 32 };
+    let value = read(state, fields.rn, width, false);
+    let vector = match (general_64, fields.opc) {
+        (false, 0) => u128::from(value as u32), // FMOV Sd, Wn
+        (false, 3) => u128::from(value as u16), // FMOV Hd, Wn
+        (true, 1) => u128::from(value),         // FMOV Dd, Xn
+        (true, 2) => {
+            let previous = state
+                .vector(fields.rd)
+                .expect("normalized FMOV SIMD&FP destination register");
+            (previous & u128::from(u64::MAX)) | (u128::from(value) << 64)
+        } // FMOV Vd.D[1], Xn
+        _ => unreachable!("allocation validation rejects invalid FMOV register widths"),
+    };
+    assert!(state.set_vector(fields.rd, vector));
 }
 
 fn integer_add_sub(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {

@@ -31,11 +31,13 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
                     | 0x0000_0031
+                    | 0x0000_003e..=0x0000_003f
                     | 0x0000_0040..=0x0000_0042
                     | 0x0000_0044..=0x0000_0045
                     | 0x0000_0048..=0x0000_004b
                     | 0x0000_004e..=0x0000_0058
                     | 0x0000_0059..=0x0000_005d
+                    | 0x0000_0060..=0x0000_0061
             ) =>
         {
             IMPLEMENTED
@@ -89,6 +91,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                 | 0x0000_0010..=0x0000_001d
                 | 0x0000_0022..=0x0000_002a
                 | 0x0000_004c..=0x0000_004d
+                | 0x0000_0060..=0x0000_0061
         )
     {
         interpreter = ENCODING_DEPENDENT;
@@ -217,6 +220,10 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0049 if bits >> 30 == 3 => {
             AllocationStatus::Reserved("invalid SIMD pair transfer size")
         }
+        0x0000_004a if ((bits >> 12) & 0xf) == 0xf => AllocationStatus::Unallocated(
+            "floating-point immediate belongs to a different instruction family",
+        ),
+        0x0000_003e | 0x0000_003f => validate_a64_fp_move_general(bits),
         0x0000_0031 => validate_a64_simd_add_sub(bits),
         0x0000_0038 if bits & 0x9f20_fc00 == 0x0e20_8400 => validate_a64_simd_add_sub(bits),
         0x0000_0038 if bits & 0xbf20_fc00 == 0x0e20_bc00 => validate_a64_simd_add_pairwise(bits),
@@ -234,6 +241,7 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         }
         0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
         0x0000_004b => validate_a64_umov(bits),
+        0x0000_0060 | 0x0000_0061 => validate_a64_simd_insert(id, bits),
         0x0000_004e..=0x0000_0058 => validate_a64_simd_integer_compare(bits),
         0x0000_0059 => validate_a64_simd_add_pairwise(bits),
         0x0000_005a..=0x0000_005d => validate_a64_simd_min_max_pairwise(bits),
@@ -262,6 +270,21 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             }
         }
         _ => AllocationStatus::Allocated,
+    }
+}
+
+fn validate_a64_fp_move_general(bits: u32) -> AllocationStatus {
+    let general_64 = bits & (1 << 31) != 0;
+    let fp_type = (bits >> 22) & 3;
+    if matches!(
+        (general_64, fp_type),
+        (false, 0) | (false, 3) | (true, 1) | (true, 2)
+    ) {
+        AllocationStatus::Allocated
+    } else {
+        AllocationStatus::Unallocated(
+            "floating-point move register widths do not form an allocated encoding",
+        )
     }
 }
 
@@ -329,6 +352,24 @@ fn validate_a64_umov(bits: u32) -> AllocationStatus {
     } else {
         AllocationStatus::Allocated
     }
+}
+
+fn validate_a64_simd_insert(id: u32, bits: u32) -> AllocationStatus {
+    let immediate_5 = ((bits >> 16) & 0x1f) as u8;
+    if immediate_5 == 0 || immediate_5.trailing_zeros() > 3 {
+        return AllocationStatus::Reserved("invalid SIMD insert element size");
+    }
+    if id == 0x0000_0060 {
+        let size_shift = immediate_5.trailing_zeros();
+        let immediate_4 = (bits >> 11) & 0xf;
+        let alignment_mask = (1 << size_shift) - 1;
+        if immediate_4 & alignment_mask != 0 {
+            return AllocationStatus::Reserved(
+                "SIMD insert source index is misaligned for its element size",
+            );
+        }
+    }
+    AllocationStatus::Allocated
 }
 
 #[must_use]
