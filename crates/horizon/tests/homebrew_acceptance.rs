@@ -127,14 +127,14 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 }
 
 #[test]
-fn contemporary_libnx_nro_initializes_hid_and_time_then_enters_application_code() {
+fn contemporary_libnx_nro_initializes_hid_and_time_then_reaches_libc_time_setup() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ProcessBuilder::new().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    let reached_application_code = loop {
+    let reached_libc_time_setup = loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
@@ -171,13 +171,13 @@ fn contemporary_libnx_nro_initializes_hid_and_time_then_enters_application_code(
             {
                 break true;
             }
-            stop => panic!("libnx startup stopped before entering application code: {stop}"),
+            stop => panic!("libnx startup stopped before the libc time-setup frontier: {stop}"),
         }
     };
 
     assert!(
-        reached_application_code && executed > 9_000,
-        "libnx did not initialize HID/time and enter application code: executed={executed}"
+        reached_libc_time_setup && executed > 9_000,
+        "libnx did not initialize HID/time and reach libc time setup: executed={executed}"
     );
     let coverage = dispatcher.coverage();
     for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {
