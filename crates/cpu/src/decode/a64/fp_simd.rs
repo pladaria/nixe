@@ -108,6 +108,48 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 Advanced SIMD element-wise integer minimum/maximum,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMAX--vector---Signed-Maximum--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SMIN--vector---Signed-Minimum--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMAX--vector---Unsigned-Maximum--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMIN--vector---Unsigned-Minimum--vector--
+    pattern(
+        "simd-signed-max",
+        0xbf20_fc00,
+        0x0e20_6400,
+        0x0000_0066,
+        156,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-signed-min",
+        0xbf20_fc00,
+        0x0e20_6c00,
+        0x0000_0067,
+        157,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-max",
+        0xbf20_fc00,
+        0x2e20_6400,
+        0x0000_0068,
+        158,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-min",
+        0xbf20_fc00,
+        0x2e20_6c00,
+        0x0000_0069,
+        159,
+        &[],
+        SIMD,
+    ),
     // Arm A64 Advanced SIMD integer comparisons between registers,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/CMGT--register---Compare-signed-greater-than--vector--
@@ -338,6 +380,18 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0e00_0800,
         0x0000_0064,
         161,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 SHRN/SHRN2 shifts unsigned lane bit patterns right and narrows
+    // them into the lower or upper 64-bit half of the destination:
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHRN--SHRN2--Shift-right-narrow--immediate--
+    pattern(
+        "simd-shift-right-narrow",
+        0xbf80_fc00,
+        0x0f00_8400,
+        0x0000_0065,
+        162,
         &[],
         SIMD,
     ),
@@ -622,6 +676,8 @@ instructions!(
     PermuteTwoSource,
     IntegerCompare,
     IntegerPairwise,
+    IntegerMinMax,
+    ShiftRightNarrow,
 );
 
 pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
@@ -695,6 +751,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0064 => Instruction::PermuteTwoSource(operands),
         0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
         0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
+        0x0000_0065 => Instruction::ShiftRightNarrow(operands),
+        0x0000_0066..=0x0000_0069 => Instruction::IntegerMinMax(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
     }
 }
@@ -752,6 +810,10 @@ const fn pairwise_operation(semantic_id: u32) -> Option<PairwiseOperation> {
         0x0000_005b => Some(PairwiseOperation::SignedMinimum),
         0x0000_005c => Some(PairwiseOperation::UnsignedMaximum),
         0x0000_005d => Some(PairwiseOperation::UnsignedMinimum),
+        0x0000_0066 => Some(PairwiseOperation::SignedMaximum),
+        0x0000_0067 => Some(PairwiseOperation::SignedMinimum),
+        0x0000_0068 => Some(PairwiseOperation::UnsignedMaximum),
+        0x0000_0069 => Some(PairwiseOperation::UnsignedMinimum),
         _ => None,
     }
 }

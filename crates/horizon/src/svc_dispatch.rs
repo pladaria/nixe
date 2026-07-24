@@ -24,7 +24,7 @@ use nixe_runtime::{
     HandleObject, HandleTable, PortEndpoint, PortError, PortObject, ProcessObject,
     ReadableEventObject, SessionEndpoint, SessionError, SessionMessage, SessionObject,
     SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
-    WritableEventObject,
+    TransferMemoryObject, WritableEventObject,
 };
 
 use crate::ipc_message::HipcRequest;
@@ -273,6 +273,7 @@ pub struct HorizonSvcDispatcher {
     unknown_calls: u64,
     initial_operation_mode: crate::OperationMode,
     time_environment: crate::TimeEnvironment,
+    video_system: crate::VideoSystem,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), Instant>,
@@ -296,15 +297,40 @@ impl HorizonSvcDispatcher {
         initial_operation_mode: crate::OperationMode,
         time_environment: crate::TimeEnvironment,
     ) -> Self {
+        Self::new_with_video(
+            initial_operation_mode,
+            time_environment,
+            crate::VideoSystem::default(),
+        )
+    }
+
+    /// Creates a dispatcher publishing display output to the supplied video system.
+    #[must_use]
+    pub fn new_with_video(
+        initial_operation_mode: crate::OperationMode,
+        time_environment: crate::TimeEnvironment,
+        video_system: crate::VideoSystem,
+    ) -> Self {
         Self {
             observed: BTreeMap::new(),
             unknown_calls: 0,
             initial_operation_mode,
             time_environment,
+            video_system,
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn video_system(&self) -> crate::VideoSystem {
+        self.video_system.clone()
+    }
+
+    /// Advances the guest display clock and signals VI VSync when due.
+    pub fn advance_video(&self, elapsed: Duration) -> u64 {
+        self.video_system.advance(elapsed)
     }
 
     #[must_use]
@@ -396,16 +422,23 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x12 => event_clear(context),
             0x13 => map_shared_memory(context),
             0x14 => unmap_shared_memory(context),
+            0x15 => create_transfer_memory(context),
             0x16 => close_handle(context),
             0x17 => reset_signal(context),
             0x18 => wait_synchronization(context),
             0x1f => self.connect_to_named_port(context),
             0x20 => send_sync_request_light(context),
-            0x21 => send_sync_request(context, self.initial_operation_mode, &self.time_environment),
+            0x21 => send_sync_request(
+                context,
+                self.initial_operation_mode,
+                &self.time_environment,
+                &self.video_system,
+            ),
             0x22 => send_sync_request_with_user_buffer(
                 context,
                 self.initial_operation_mode,
                 &self.time_environment,
+                &self.video_system,
             ),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
@@ -446,8 +479,8 @@ impl Default for HorizonSvcDispatcher {
 
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
-        0x07 | 0x0a | 0x10 | 0x13 | 0x14 | 0x16 | 0x20 | 0x21 | 0x22 | 0x25 | 0x40 | 0x41
-        | 0x42 | 0x43 | 0x44 | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
+        0x07 | 0x0a | 0x10 | 0x13 | 0x14 | 0x15 | 0x16 | 0x20 | 0x21 | 0x22 | 0x25 | 0x40
+        | 0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x24 | 0x26 | 0x29 => {
             HorizonSvcSupport::Partial
         }
@@ -581,6 +614,7 @@ fn send_sync_request(
     context: &mut ExceptionDispatchContext<'_>,
     initial_operation_mode: crate::OperationMode,
     time_environment: &crate::TimeEnvironment,
+    video_system: &crate::VideoSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let tls = match context.thread().state() {
@@ -593,6 +627,7 @@ fn send_sync_request(
         handle,
         initial_operation_mode,
         time_environment,
+        video_system,
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -609,6 +644,7 @@ fn send_sync_request_with_user_buffer(
     context: &mut ExceptionDispatchContext<'_>,
     initial_operation_mode: crate::OperationMode,
     time_environment: &crate::TimeEnvironment,
+    video_system: &crate::VideoSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let address = read_register(context.thread().state(), 0);
     let size = read_register(context.thread().state(), 1);
@@ -643,6 +679,7 @@ fn send_sync_request_with_user_buffer(
         handle,
         initial_operation_mode,
         time_environment,
+        video_system,
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -1278,6 +1315,63 @@ fn map_shared_memory(
         }
         Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
     }
+}
+
+fn create_transfer_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    // Public ABI and validation reference:
+    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#CreateTransferMemory
+    let address = read_register(context.thread().state(), 1);
+    let size = read_register(context.thread().state(), 2);
+    let raw_permissions = read_register(context.thread().state(), 3) as u32;
+    let permissions = match raw_permissions {
+        0 => MemoryPermissions::NONE,
+        1 => MemoryPermissions::READ,
+        3 => MemoryPermissions::READ_WRITE,
+        raw => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
+    };
+    if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
+        result(context, HorizonKernelResult::INVALID_SIZE);
+        return resume();
+    }
+    if !address.is_multiple_of(USER_BUFFER_ALIGNMENT)
+        || address
+            .checked_add(size)
+            .is_none_or(|end| end > context.process().address_space_limit())
+    {
+        result(context, HorizonKernelResult::INVALID_ADDRESS);
+        return resume();
+    }
+    let start = GuestVirtualAddress::new(address);
+    let query = context.process().memory().query_memory(
+        context.process().cpu().address_space_id(),
+        start,
+        GuestVirtualAddress::new(context.process().address_space_limit()),
+    );
+    if !query.is_some_and(|query| {
+        query.base.get() <= address
+            && query
+                .base
+                .get()
+                .checked_add(query.size)
+                .is_some_and(|end| end >= address.saturating_add(size))
+    }) {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    }
+    match context
+        .process_mut()
+        .handles_mut()
+        .insert(TransferMemoryObject::new(address, size, permissions))
+    {
+        Ok(handle) => {
+            result(context, HorizonKernelResult::SUCCESS);
+            write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
+        }
+        Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
+    }
+    resume()
 }
 
 fn unmap_shared_memory(

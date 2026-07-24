@@ -10,7 +10,9 @@ use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::memory::{
     DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
 };
-use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, SharedMemoryObject};
+use nixe_runtime::{
+    EventObject, ExceptionProcessContext, HandleObject, SharedMemoryObject, TransferMemoryObject,
+};
 
 use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
@@ -21,10 +23,10 @@ use crate::{
     AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HorizonIpcResult,
     HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
     IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
-    OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
+    NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory,
+    ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
     SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
-    TimeZoneServiceSession,
+    TimeZoneServiceSession, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
 };
 
 pub(crate) const NAMED_PORT_NAME_SIZE: usize = 12;
@@ -93,6 +95,7 @@ pub(crate) fn send_sync_request(
     handle: u32,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
+    video_system: &VideoSystem,
 ) -> Result<SyncRequestResult, IpcWireError> {
     send_sync_request_from_buffer(
         process,
@@ -101,6 +104,7 @@ pub(crate) fn send_sync_request(
         handle,
         initial_operation_mode,
         time_environment,
+        video_system,
     )
 }
 
@@ -111,6 +115,7 @@ pub(crate) fn send_sync_request_from_buffer(
     handle: u32,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
+    video_system: &VideoSystem,
 ) -> Result<SyncRequestResult, IpcWireError> {
     let manager = process
         .handles()
@@ -151,6 +156,8 @@ pub(crate) fn send_sync_request_from_buffer(
         .handles()
         .get_as::<TimeZoneServiceSession>(handle)
         .cloned();
+    let vi = process.handles().get_as::<ViSession>(handle).cloned();
+    let nvdrv = process.handles().get_as::<NvDrvSession>(handle).cloned();
     let semantic_object = process.handles().get(handle).cloned().filter(|object| {
         object.is::<ReadOnlyFileSystem>()
             || object.is::<HostDirectoryFileSystem>()
@@ -170,6 +177,8 @@ pub(crate) fn send_sync_request_from_buffer(
         && system_clock.is_none()
         && steady_clock.is_none()
         && timezone.is_none()
+        && vi.is_none()
+        && nvdrv.is_none()
         && semantic_object.is_none()
     {
         return Ok(SyncRequestResult::InvalidHandle);
@@ -289,6 +298,38 @@ pub(crate) fn send_sync_request_from_buffer(
             );
             return Ok(SyncRequestResult::Success);
         }
+        if matches!(request.command_id, 2 | 4)
+            && let Some(vi) = &vi
+        {
+            let cloned_handle = process
+                .handles_mut()
+                .insert(vi.clone())
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let response = encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                Some(cloned_handle),
+            )?;
+            write_bytes(process, address, &response)?;
+            return Ok(SyncRequestResult::Success);
+        }
+        if matches!(request.command_id, 2 | 4)
+            && let Some(nvdrv) = &nvdrv
+        {
+            let cloned_handle = process
+                .handles_mut()
+                .insert(nvdrv.clone())
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let response = encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                Some(cloned_handle),
+            )?;
+            write_bytes(process, address, &response)?;
+            return Ok(SyncRequestResult::Success);
+        }
         let response = match request.command_id {
             // QueryPointerBufferSize. Zero makes libnx use map-alias buffers,
             // which the future descriptor bridge can validate explicitly.
@@ -322,6 +363,7 @@ pub(crate) fn send_sync_request_from_buffer(
             hipc.pid.is_some(),
             initial_operation_mode,
             time_environment,
+            video_system,
         )?
     } else if settings.is_some() {
         dispatch_system_settings(process, request, &hipc.receive_statics)?
@@ -330,7 +372,7 @@ pub(crate) fn send_sync_request_from_buffer(
     } else if let Some(session) = performance {
         dispatch_performance_session(&session, request)?
     } else if let Some(applet) = applet {
-        dispatch_applet(process, &applet, request, &hipc)?
+        dispatch_applet(process, &applet, request, &hipc, video_system)?
     } else if let Some(hid) = hid {
         dispatch_hid(process, &hid, request, &hipc)?
     } else if let Some(resource) = hid_applet_resource {
@@ -343,6 +385,10 @@ pub(crate) fn send_sync_request_from_buffer(
         dispatch_steady_clock(&clock, request)?
     } else if let Some(timezone) = timezone {
         dispatch_timezone(&timezone, request)?
+    } else if let Some(vi) = vi {
+        dispatch_vi(process, &vi, request, &hipc)?
+    } else if let Some(nvdrv) = nvdrv {
+        dispatch_nvdrv(process, &nvdrv, request, &hipc)?
     } else if let Some(service) = service {
         dispatch_semantic_service(process, &service, request, &hipc)?
     } else if let Some(object) = semantic_object {
@@ -372,6 +418,7 @@ fn dispatch_service_manager(
     sent_pid: bool,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
+    video_system: &VideoSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     match request.command_id {
         0 => {
@@ -442,6 +489,51 @@ fn dispatch_service_manager(
                     initial_operation_mode,
                     time_environment,
                 );
+            }
+            if let Some(kind) = ViServiceKind::from_name(name) {
+                if !process.mounts().allows_service(name) {
+                    return Ok((
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SM_NOT_ALLOWED,
+                            &[],
+                            None,
+                        )?,
+                        None,
+                    ));
+                }
+                let handle = process
+                    .handles_mut()
+                    .insert(ViSession::new(
+                        ViObjectKind::Root(kind),
+                        video_system.clone(),
+                    ))
+                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                return Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+                    Some(handle),
+                ));
+            }
+            if matches!(name, b"nvdrv" | b"nvdrv:a" | b"nvdrv:s") {
+                if !process.mounts().allows_service(name) {
+                    return Ok((
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SM_NOT_ALLOWED,
+                            &[],
+                            None,
+                        )?,
+                        None,
+                    ));
+                }
+                let handle = process
+                    .handles_mut()
+                    .insert(video_system.nvdrv())
+                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                return Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+                    Some(handle),
+                ));
             }
             let Some(service) = IpcService::from_name(name) else {
                 let encoded_name: [u8; 8] = encoded_name
@@ -1263,11 +1355,493 @@ fn dispatch_performance_session(
     }
 }
 
+fn dispatch_vi(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &ViSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let video = session.video();
+    match session.kind() {
+        ViObjectKind::Root(kind) => {
+            if request.command_id != kind.required_root_command() {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+            }
+            vi_child(
+                process,
+                request.token,
+                ViObjectKind::ApplicationDisplay,
+                video,
+            )
+        }
+        ViObjectKind::ApplicationDisplay => match request.command_id {
+            100 => vi_child(process, request.token, ViObjectKind::BinderRelay, video),
+            101 => vi_child(process, request.token, ViObjectKind::SystemDisplay, video),
+            102 => vi_child(process, request.token, ViObjectKind::ManagerDisplay, video),
+            1010 => {
+                let Some(display_id) = video.open_display(request.data.get(..0x40).unwrap_or(&[]))
+                else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                Ok((
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SUCCESS,
+                        &display_id.to_le_bytes(),
+                        None,
+                    )?,
+                    None,
+                ))
+            }
+            1020 => {
+                let Some(display_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = if VideoSystem::display_resolution(display_id).is_some() {
+                    HorizonIpcResult::SUCCESS
+                } else {
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                };
+                cmif_error(request.token, result)
+            }
+            1102 => {
+                let Some(display_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some((width, height)) = VideoSystem::display_resolution(display_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                let mut data = Vec::with_capacity(16);
+                data.extend_from_slice(&i64::from(width).to_le_bytes());
+                data.extend_from_slice(&i64::from(height).to_le_bytes());
+                Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                    None,
+                ))
+            }
+            2020 => {
+                let Some(layer_id) = request_u64(request.data, 0x40) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(layer) = video.layer(layer_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                let descriptor = one_receive_buffer(hipc)?;
+                let native_window = crate::graphics::encode_native_window(layer.binder_id);
+                write_descriptor_bytes(process, descriptor, &native_window)?;
+                Ok((
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SUCCESS,
+                        &(native_window.len() as u64).to_le_bytes(),
+                        None,
+                    )?,
+                    None,
+                ))
+            }
+            2030 => {
+                let Some(display_id) = request_u64(request.data, 8) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(layer) = video.create_layer(display_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                let descriptor = one_receive_buffer(hipc)?;
+                let native_window = crate::graphics::encode_native_window(layer.binder_id);
+                write_descriptor_bytes(process, descriptor, &native_window)?;
+                let mut data = Vec::with_capacity(16);
+                data.extend_from_slice(&layer.id.to_le_bytes());
+                data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
+                Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                    None,
+                ))
+            }
+            2021 | 2031 => {
+                let Some(layer_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = if video.remove_layer(layer_id) {
+                    HorizonIpcResult::SUCCESS
+                } else {
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                };
+                cmif_error(request.token, result)
+            }
+            2101 => {
+                let Some(mode) = request_u32(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(layer_id) = request_u64(request.data, 8) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = if video.set_layer_scaling_mode(layer_id, mode) {
+                    HorizonIpcResult::SUCCESS
+                } else {
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                };
+                cmif_error(request.token, result)
+            }
+            5202 => {
+                let Some(display_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(event) = video.vsync_event(display_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                let handle = process
+                    .handles_mut()
+                    .insert(event)
+                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                Ok((
+                    CmifResponse {
+                        token: request.token,
+                        result: HorizonIpcResult::SUCCESS.raw(),
+                        data: &[],
+                        pid: None,
+                        copy_handles: &[handle],
+                        move_handles: &[],
+                        send_statics: &[],
+                        is_domain: false,
+                        domain_objects: &[],
+                    }
+                    .encode()?,
+                    Some(handle),
+                ))
+            }
+            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        },
+        ViObjectKind::SystemDisplay => match request.command_id {
+            1203 => {
+                let Some(display_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some((width, height)) = VideoSystem::display_resolution(display_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                let mut data = Vec::with_capacity(8);
+                data.extend_from_slice(&width.to_le_bytes());
+                data.extend_from_slice(&height.to_le_bytes());
+                Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                    None,
+                ))
+            }
+            2201 | 2203 | 2205 => Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            )),
+            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        },
+        ViObjectKind::ManagerDisplay => match request.command_id {
+            2010 | 2012 => {
+                let Some(display_id) = request_u64(request.data, 8) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(layer) = video.create_layer(display_id) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                if request.command_id == 2012 {
+                    let descriptor = one_receive_buffer(hipc)?;
+                    let native_window = crate::graphics::encode_native_window(layer.binder_id);
+                    write_descriptor_bytes(process, descriptor, &native_window)?;
+                    let mut data = Vec::with_capacity(16);
+                    data.extend_from_slice(&layer.id.to_le_bytes());
+                    data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
+                    return Ok((
+                        encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                        None,
+                    ));
+                }
+                Ok((
+                    encode_response(
+                        request.token,
+                        HorizonIpcResult::SUCCESS,
+                        &layer.id.to_le_bytes(),
+                        None,
+                    )?,
+                    None,
+                ))
+            }
+            2011 => {
+                let Some(layer_id) = request_u64(request.data, 0) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = if video.remove_layer(layer_id) {
+                    HorizonIpcResult::SUCCESS
+                } else {
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                };
+                cmif_error(request.token, result)
+            }
+            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        },
+        ViObjectKind::BinderRelay => dispatch_binder_relay(process, video, request, hipc),
+    }
+}
+
+fn dispatch_binder_relay(
+    process: &mut ExceptionProcessContext<'_>,
+    video: &VideoSystem,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let Some(binder_id) = request_u32(request.data, 0).map(|value| value as i32) else {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    };
+    match request.command_id {
+        0 | 3 => {
+            let Some(code) = request_u32(request.data, 4) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let input = one_send_buffer(hipc)?;
+            let output = one_receive_buffer(hipc)?;
+            let input_size = usize::try_from(input.size)
+                .map_err(|_| IpcWireError::Malformed("Binder input buffer is too large"))?;
+            let mut encoded = vec![0_u8; input_size];
+            read_bytes(
+                process,
+                GuestVirtualAddress::new(input.address),
+                &mut encoded,
+            )?;
+            let transaction = video
+                .transact_binder(binder_id, code, &encoded)
+                .map_err(|error| IpcWireError::Malformed(error.0))?;
+            log::debug!(
+                "Binder producer {binder_id} completed transaction {code:#x}{}",
+                if transaction.queued.is_some() {
+                    " and queued a frame"
+                } else {
+                    ""
+                }
+            );
+            write_descriptor_bytes(process, output, &transaction.reply)?;
+            if let Some((slot, buffer)) = transaction.queued {
+                let allocation = video.nvdrv().allocation_by_id(buffer.nvmap_id).ok_or(
+                    IpcWireError::Malformed("queued graphic buffer references an unknown nvmap ID"),
+                )?;
+                let cpu_address = allocation.cpu_address.ok_or(IpcWireError::Malformed(
+                    "queued nvmap allocation has no CPU backing address",
+                ))?;
+                if buffer.plane_size == 0
+                    || buffer.plane_size > u64::from(buffer.total_size)
+                    || u64::from(buffer.offset)
+                        .checked_add(buffer.plane_size)
+                        .is_none_or(|end| end > u64::from(allocation.size))
+                {
+                    return Err(IpcWireError::Malformed(
+                        "queued graphic-buffer plane exceeds its nvmap allocation",
+                    ));
+                }
+                let plane_size = usize::try_from(buffer.plane_size).map_err(|_| {
+                    IpcWireError::Malformed("queued graphic-buffer plane is too large")
+                })?;
+                let address = cpu_address.checked_add(u64::from(buffer.offset)).ok_or(
+                    IpcWireError::Malformed("queued graphic-buffer address overflows"),
+                )?;
+                let mut bytes = vec![0_u8; plane_size];
+                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+                video
+                    .queue_software_frame(binder_id, slot, &buffer, &bytes)
+                    .map_err(|error| IpcWireError::Malformed(error.0))?;
+            }
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+        1 => {
+            if request.data.len() < 12 || video.binder_event(binder_id).is_none() {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+        2 => {
+            let Some(event) = video.binder_event(binder_id) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            let handle = process
+                .handles_mut()
+                .insert(event)
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            Ok((
+                CmifResponse {
+                    token: request.token,
+                    result: HorizonIpcResult::SUCCESS.raw(),
+                    data: &[],
+                    pid: None,
+                    copy_handles: &[handle],
+                    move_handles: &[],
+                    send_statics: &[],
+                    is_domain: false,
+                    domain_objects: &[],
+                }
+                .encode()?,
+                Some(handle),
+            ))
+        }
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    }
+}
+
+fn dispatch_nvdrv(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &NvDrvSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        0 => {
+            let descriptor = one_send_buffer(hipc)?;
+            let size = usize::try_from(descriptor.size)
+                .map_err(|_| IpcWireError::Malformed("nvdrv device path is too large"))?;
+            if size == 0 || size > 0x100 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let mut path = vec![0_u8; size];
+            read_bytes(
+                process,
+                GuestVirtualAddress::new(descriptor.address),
+                &mut path,
+            )?;
+            let (fd, error) = match session.open(&path) {
+                Ok(fd) => (fd, crate::nvdrv::NV_SUCCESS),
+                Err(error) => (0, error),
+            };
+            let mut data = Vec::with_capacity(8);
+            data.extend_from_slice(&fd.to_le_bytes());
+            data.extend_from_slice(&error.to_le_bytes());
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &data, None)?,
+                None,
+            ))
+        }
+        1 => {
+            let Some(fd) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let Some(ioctl) = request_u32(request.data, 4) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let input_descriptor = one_send_buffer(hipc)?;
+            let output_descriptor = one_receive_buffer(hipc)?;
+            let input_size = usize::try_from(input_descriptor.size)
+                .map_err(|_| IpcWireError::Malformed("nvdrv ioctl input is too large"))?;
+            if input_size > 0x1000 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let mut input = vec![0_u8; input_size];
+            read_bytes(
+                process,
+                GuestVirtualAddress::new(input_descriptor.address),
+                &mut input,
+            )?;
+            let (output, error) = session.ioctl(fd, ioctl, &input);
+            log::debug!("nvdrv ioctl fd={fd} request={ioctl:#010x} result={error:#x}");
+            write_descriptor_bytes(process, output_descriptor, &output)?;
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &error.to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        2 => {
+            let Some(fd) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let error = session.close(fd);
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &error.to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        3 => {
+            let Some(_transfer_size) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if hipc.copy_handles.len() != 2
+                || hipc.copy_handles[0] != crate::CURRENT_PROCESS_HANDLE
+                || process
+                    .handles()
+                    .get_as::<TransferMemoryObject>(hipc.copy_handles[1])
+                    .is_none()
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            session.initialize();
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+        4 => {
+            let Some(_fd) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let (_writable, readable) = EventObject::create_pair();
+            let handle = process
+                .handles_mut()
+                .insert(readable)
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let error = crate::nvdrv::NV_SUCCESS;
+            Ok((
+                CmifResponse {
+                    token: request.token,
+                    result: HorizonIpcResult::SUCCESS.raw(),
+                    data: &error.to_le_bytes(),
+                    pid: None,
+                    copy_handles: &[handle],
+                    move_handles: &[],
+                    send_statics: &[],
+                    is_domain: false,
+                    domain_objects: &[],
+                }
+                .encode()?,
+                Some(handle),
+            ))
+        }
+        8 => Ok((
+            encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+            None,
+        )),
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+    }
+}
+
+fn vi_child(
+    process: &mut ExceptionProcessContext<'_>,
+    token: u32,
+    kind: ViObjectKind,
+    video: &VideoSystem,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let handle = process
+        .handles_mut()
+        .insert(ViSession::new(kind, video.clone()))
+        .map_err(|_| IpcWireError::ResourceExhausted)?;
+    Ok((
+        encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+        Some(handle),
+    ))
+}
+
 fn dispatch_applet(
     process: &mut ExceptionProcessContext<'_>,
     session: &AppletSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    video_system: &VideoSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
@@ -1381,6 +1955,15 @@ fn dispatch_applet(
             _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
         },
         AppletObject::SelfController => match request.command_id {
+            40 => {
+                let Some(layer) = video_system.create_layer(1) else {
+                    return applet_error(
+                        request.token,
+                        HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                    );
+                };
+                applet_data(request.token, &layer.id.to_le_bytes())
+            }
             11..=13 => applet_data(request.token, &[]),
             _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
         },
@@ -1411,18 +1994,40 @@ fn dispatch_hid(
     // libnx opens IAppletResource with command 0, sends the process ID, and
     // supplies the applet-resource user ID as one u64:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L800-L808
-    if request.command_id != 0 {
-        return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+    match request.command_id {
+        0 => {
+            if hipc.pid.is_none() || request.data.len() < 8 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = process
+                .handles_mut()
+                .insert(session.create_applet_resource())
+                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            log::debug!("hid created IAppletResource handle {handle:#x}");
+            semantic_success(request.token, false, &[], &[], &[], Some(handle))
+        }
+        // These commands only configure which Npad records HID should publish.
+        // The shared memory currently remains in its valid disconnected/zeroed
+        // state, so acknowledging them is sufficient until host input lands.
+        // ABI: libnx hid.c at dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb.
+        100 if hipc.pid.is_some() && request.data.len() >= 16 => {
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        102 if hipc.pid.is_some()
+            && request.data.len() >= 8
+            && matches!(
+                (hipc.send_statics.as_slice(), hipc.send_buffers.as_slice()),
+                ([_], []) | ([], [_])
+            ) =>
+        {
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        103 if hipc.pid.is_some() && request.data.len() >= 8 => {
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        100 | 102 | 103 => cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER),
+        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
     }
-    if hipc.pid.is_none() || request.data.len() < 8 {
-        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-    }
-    let handle = process
-        .handles_mut()
-        .insert(session.create_applet_resource())
-        .map_err(|_| IpcWireError::ResourceExhausted)?;
-    log::debug!("hid created IAppletResource handle {handle:#x}");
-    semantic_success(request.token, false, &[], &[], &[], Some(handle))
 }
 
 fn dispatch_hid_applet_resource(

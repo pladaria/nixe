@@ -31,7 +31,7 @@ pub use handle::{
     MAX_SHARED_MEMORY_BYTES, PortEndpoint, PortError, PortObject, ProcessObject,
     ReadableEventObject, SessionEndpoint, SessionError, SessionMessage, SessionObject,
     SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
-    WritableEventObject,
+    TransferMemoryObject, WritableEventObject,
 };
 pub use launch_plan::{
     AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,

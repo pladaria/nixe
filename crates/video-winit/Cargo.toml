@@ -1,0 +1,10 @@
+[package]
+name = "nixe-video-winit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixe-video.workspace = true
+softbuffer.workspace = true
+winit.workspace = true

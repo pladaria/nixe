@@ -308,11 +308,11 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
-    let reached_video_initialization = loop {
+    loop {
         let report = process.run_reference(512).unwrap();
         executed += report.instructions_executed;
         assert!(
-            executed <= 20_000,
+            executed <= 100_000,
             "libnx startup exceeded its acceptance bound"
         );
         match &report.stop {
@@ -322,17 +322,10 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
                     .route_supervisor_call(&report.stop, &mut dispatcher)
                     .unwrap();
                 match outcome {
-                    ExceptionHandlingResult::Resumed => {}
-                    ExceptionHandlingResult::Terminated { .. }
-                        if matches!(
-                            &report.stop,
-                            ExecutionStop::SupervisorCall {
-                                immediate: 0x26,
-                                ..
-                            }
-                        ) =>
-                    {
-                        break true;
+                    ExceptionHandlingResult::Resumed => {
+                        if dispatcher.video_system().active_layer_count() > 0 {
+                            break;
+                        }
                     }
                     _ => panic!(
                         "libnx SVC failed at {stop}: {outcome:?}",
@@ -342,10 +335,10 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
             }
             stop => panic!("libnx startup stopped before video initialization: {stop}"),
         }
-    };
+    }
 
     assert!(
-        reached_video_initialization && executed > 10_800,
+        executed > 10_800,
         "libnx did not initialize the filesystem and reach video initialization: executed={executed}"
     );
     let coverage = dispatcher.coverage();

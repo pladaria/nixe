@@ -30,7 +30,9 @@ pub(super) fn lift(
         | FpSimdInstruction::MemorySingleStructurePostIndex(_)
         | FpSimdInstruction::PermuteTwoSource(_)
         | FpSimdInstruction::IntegerCompare(_)
-        | FpSimdInstruction::IntegerPairwise(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::IntegerPairwise(_)
+        | FpSimdInstruction::IntegerMinMax(_) => Ok(interpret(decoded)),
+        FpSimdInstruction::ShiftRightNarrow(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)

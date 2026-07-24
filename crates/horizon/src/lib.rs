@@ -3,19 +3,24 @@
 //! Runtime stays console-agnostic; Horizon-specific sessions and services are
 //! layered on its process, mount, and extensible handle primitives.
 
+mod graphics;
 mod ipc;
 mod ipc_message;
 mod ipc_result;
 mod ipc_wire;
+mod nvdrv;
 mod object;
+mod parcel;
 mod svc;
 mod svc_dispatch;
 
+pub use graphics::{ViObjectKind, ViServiceKind, ViSession, VideoSystem};
 pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
+pub use nvdrv::{NvDrvSession, NvMapAllocation};
 pub use object::{
     AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource, HidSession,
     HostDirectoryFileSystem, HostFile, IpcSession, OperationMode, PerformanceManagerSession,

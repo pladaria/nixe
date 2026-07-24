@@ -390,13 +390,15 @@ fn a64_system_register_reference_semantics_preserve_thread_state() {
 
     execute_one(&profile, &mut state, 0xd53b_d043_u32.into()).unwrap(); // MRS X3,TPIDR_EL0
     execute_one(&profile, &mut state, 0xd53b_00e4_u32.into()).unwrap(); // MRS X4,DCZID_EL0
+    execute_one(&profile, &mut state, 0xd53b_0025_u32.into()).unwrap(); // MRS X5,CTR_EL0
 
     let ThreadCpuState::A64(a64) = state else {
         unreachable!()
     };
     assert_eq!(a64.read_x(x(3)), 0x1234_5678_9abc_def0);
     assert_eq!(a64.read_x(x(4)), 0x14, "DC ZVA is prohibited at EL0");
-    assert_eq!(a64.pc(), 8);
+    assert_eq!(a64.read_x(x(5)), 0x0004_0004);
+    assert_eq!(a64.pc(), 12);
 }
 
 #[test]
@@ -417,6 +419,24 @@ fn a64_architectural_timer_registers_use_the_runtime_snapshot() {
     };
     assert_eq!(a64.read_x(x(1)), 19_200_000);
     assert_eq!(a64.read_x(x(2)), 0x1234_5678_9abc_def0);
+}
+
+#[test]
+fn a64_cache_maintenance_is_a_coherent_memory_no_op() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(8), 0x1234_5000);
+
+    execute_one(&profile, &mut state, 0xd50b_7e28_u32.into()).unwrap(); // DC CIVAC,X8
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(8)), 0x1234_5000);
+    assert_eq!(a64.pc(), 4);
 }
 
 #[test]
@@ -986,6 +1006,47 @@ fn a64_simd_bitwise_executes_observed_libnx_orr_encoding() {
 }
 
 #[test]
+fn a64_simd_shift_right_narrow_executes_observed_libnx_encoding() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let source_lanes = [
+        0x0010_u16, 0x0123, 0x0ff0, 0x1234, 0x8000, 0xabcd, 0xfff0, 0x000f,
+    ];
+    let source = source_lanes
+        .into_iter()
+        .enumerate()
+        .fold(0_u128, |value, (lane, element)| {
+            value | (u128::from(element) << (lane * 16))
+        });
+    let expected = source_lanes
+        .into_iter()
+        .enumerate()
+        .fold(0_u64, |value, (lane, element)| {
+            value | (u64::from((element >> 4) as u8) << (lane * 8))
+        });
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(0, source));
+    execute_one(&profile, &mut state, 0x0f0c_8400_u32.into()).unwrap(); // SHRN V0.8B,V0.8H,#4
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(0), Some(u128::from(expected)));
+
+    assert!(a64.set_vector(0, u128::from(0x8877_6655_4433_2211_u64)));
+    assert!(a64.set_vector(1, source));
+    execute_one(&profile, &mut state, 0x4f0c_8420_u32.into()).unwrap(); // SHRN2 V0.16B,V1.8H,#4
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a64.vector(0),
+        Some((u128::from(expected) << 64) | 0x8877_6655_4433_2211_u128)
+    );
+}
+
+#[test]
 fn a64_simd_pairwise_integer_family_reduces_adjacent_lanes_from_each_source() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
@@ -1051,6 +1112,26 @@ fn a64_simd_pairwise_integer_family_reduces_adjacent_lanes_from_each_source() {
             "encoding={encoding:#010x}"
         );
     }
+}
+
+#[test]
+fn a64_simd_elementwise_min_max_handles_signed_lanes_and_register_aliasing() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    let first = u128::from(10_u32) | (u128::from((-20_i32) as u32) << 32);
+    let second = u128::from(5_u32) | (u128::from((-30_i32) as u32) << 32);
+    assert!(a64.set_vector(30, first));
+    assert!(a64.set_vector(31, second));
+
+    execute_one(&profile, &mut state, 0x0ebf_6fdf_u32.into()).unwrap(); // SMIN V31.2S,V30.2S,V31.2S
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(31), Some(second));
 }
 
 #[test]

@@ -93,6 +93,16 @@ pub(super) fn execute(
             );
             None
         }
+        Instruction::IntegerMinMax(_) => {
+            integer_min_max(
+                state,
+                fields,
+                fields
+                    .pairwise_operation
+                    .expect("normalized SIMD minimum/maximum operation"),
+            );
+            None
+        }
         Instruction::PermuteTwoSource(_) => {
             permute_two_source(
                 state,
@@ -101,6 +111,10 @@ pub(super) fn execute(
                     .permute_operation
                     .expect("normalized SIMD two-source permute operation"),
             );
+            None
+        }
+        Instruction::ShiftRightNarrow(_) => {
+            shift_right_narrow(state, fields);
             None
         }
         Instruction::MemoryUnsigned(_)
@@ -652,6 +666,53 @@ fn integer_pairwise(
     assert!(state.set_vector(fields.rd, result));
 }
 
+fn integer_min_max(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    operation: PairwiseOperation,
+) {
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_bits = 8_u8 << fields.opc;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized SIMD first source register");
+    let rhs = state
+        .vector(fields.rm)
+        .expect("normalized SIMD second source register");
+    let mut result = 0_u128;
+
+    for shift in (0..vector_bits).step_by(usize::from(lane_bits)) {
+        let lhs_lane = (lhs >> shift) & lane_mask;
+        let rhs_lane = (rhs >> shift) & lane_mask;
+        let selected = match operation {
+            PairwiseOperation::SignedMaximum => {
+                if sign_extend(lhs_lane as u64, lane_bits)
+                    >= sign_extend(rhs_lane as u64, lane_bits)
+                {
+                    lhs_lane
+                } else {
+                    rhs_lane
+                }
+            }
+            PairwiseOperation::SignedMinimum => {
+                if sign_extend(lhs_lane as u64, lane_bits)
+                    <= sign_extend(rhs_lane as u64, lane_bits)
+                {
+                    lhs_lane
+                } else {
+                    rhs_lane
+                }
+            }
+            PairwiseOperation::UnsignedMaximum => lhs_lane.max(rhs_lane),
+            PairwiseOperation::UnsignedMinimum => lhs_lane.min(rhs_lane),
+            PairwiseOperation::Add => unreachable!("ADD is not a minimum/maximum operation"),
+        };
+        result |= selected << shift;
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
 // UZP1/2, TRN1/2, and ZIP1/2 select lanes from both source vectors before
 // writing the destination, which also permits either source to alias Vd.
 // Arm ARM DDI 0602 (2025-12):
@@ -711,6 +772,39 @@ fn permute_two_source(
         let lane = (source >> (source_lane * lane_bits)) & lane_mask;
         result |= lane << (destination_lane * lane_bits);
     }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// SHRN writes eight, four, or two narrowed lanes into one 64-bit half.
+// SHRN clears the upper half while SHRN2 preserves the lower half and replaces
+// the upper half. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHRN--SHRN2--Shift-right-narrow--immediate--
+fn shift_right_narrow(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
+    let bits = fields.helper_token.helper_abi_value();
+    let immediate_high = (bits >> 19) & 0xf;
+    let immediate_low = (bits >> 16) & 7;
+    let destination_lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+    let source_lane_bits = destination_lane_bits * 2;
+    let immediate = (immediate_high << 3) | immediate_low;
+    let shift = source_lane_bits - immediate;
+    let lane_count = 128 / source_lane_bits;
+    let destination_mask = (1_u128 << destination_lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized SHRN source register");
+    let mut narrowed = 0_u128;
+    for lane in 0..lane_count {
+        let value = source >> (lane * source_lane_bits);
+        narrowed |= ((value >> shift) & destination_mask) << (lane * destination_lane_bits);
+    }
+    let result = if fields.vector_128 {
+        let previous = state
+            .vector(fields.rd)
+            .expect("normalized SHRN2 destination register");
+        (previous & u128::from(u64::MAX)) | (narrowed << 64)
+    } else {
+        narrowed
+    };
     assert!(state.set_vector(fields.rd, result));
 }
 

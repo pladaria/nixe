@@ -6,11 +6,12 @@ use std::time::Instant;
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{InitialOperationMode, TimeMode};
-use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment};
+use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment, VideoSystem};
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess, VirtualClock, VirtualClockMode,
 };
+use nixe_video::FrameMailbox;
 
 use crate::logging::LogLevel;
 
@@ -131,6 +132,11 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
     );
+    let mailbox = FrameMailbox::default();
+    let video_system = VideoSystem::new(mailbox.clone());
+    let mut window = nixe_video_winit::WindowFrontend::new(mailbox, Arc::clone(&interrupted))
+        .map_err(|error| error.to_string())?;
+    window.pump().map_err(|error| error.to_string())?;
     let execution_started = Instant::now();
     let execution = execute(
         &mut process,
@@ -138,6 +144,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         &interrupted,
         initial_operation_mode,
         time_environment,
+        video_system,
+        &mut window,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -189,14 +197,24 @@ fn execute(
     interrupted: &AtomicBool,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
+    video_system: VideoSystem,
+    window: &mut nixe_video_winit::WindowFrontend,
 ) -> Result<ExecutionSummary, String> {
-    let mut dispatcher = HorizonSvcDispatcher::new(initial_operation_mode, time_environment);
+    let mut dispatcher = HorizonSvcDispatcher::new_with_video(
+        initial_operation_mode,
+        time_environment,
+        video_system,
+    );
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let mut next_progress = EXECUTION_PROGRESS_INTERVAL;
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
     loop {
+        if !window.pump().map_err(|error| error.to_string())? {
+            return Err("video window event loop stopped unexpectedly".to_owned());
+        }
+        dispatcher.advance_video(execution_started.elapsed());
         if interrupted.load(Ordering::SeqCst) {
             log::info!("Ctrl+C received; stopping the guest process cleanly");
             if !process.terminate() {
@@ -257,9 +275,12 @@ fn execute(
                         return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
                     }
                     ExceptionHandlingResult::Suspended => {
-                        return Err(format!(
-                            "title suspended without a scheduler after {instructions} instructions: {report}"
-                        ));
+                        if !process.resume() {
+                            return Err(format!(
+                                "title suspended but could not be resumed for event polling after {instructions} instructions: {report}"
+                            ));
+                        }
+                        std::thread::yield_now();
                     }
                     ExceptionHandlingResult::Fault(error) => {
                         return Err(format!(

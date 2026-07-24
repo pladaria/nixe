@@ -25,7 +25,7 @@ pub(super) fn execute(
         Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
         Instruction::WriteRegister(_) => execute_msr(state, fields),
         Instruction::Barrier(_) => execute_barrier(fields),
-        Instruction::System(_) => false,
+        Instruction::System(_) => execute_system(fields),
     };
     if !outcome {
         return Err(super::super::unsupported(decoded));
@@ -64,6 +64,11 @@ fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Op
         0xd53b_4200 => u64::from(state.nzcv().bits()),
         0xd53b_4400 => u64::from(state.fpcr()),
         0xd53b_4420 => u64::from(state.fpsr()),
+        // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
+        // Switch 1's Cortex-A57 exposes 64-byte instruction and data lines,
+        // hence log2(64 / 4) = 4 in both fields. Register definition:
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
+        0xd53b_0020 => (4_u64 << 16) | 4,
         0xd53b_d040 => state.tpidr_el0(),
         0xd53b_d060 => state.tpidrro_el0(),
         // CNTFRQ_EL0 and CNTVCT_EL0 are runtime-owned architectural timer
@@ -129,6 +134,21 @@ fn execute_barrier(fields: Operands) -> bool {
         6 if fields.barrier_option == 15 => true,
         _ => false,
     }
+}
+
+fn execute_system(fields: Operands) -> bool {
+    // The reference memory interface is coherent and has no separate guest
+    // cache state. Architecturally valid maintenance operations therefore
+    // complete without changing memory, while unknown SYS encodings remain
+    // explicit unsupported semantics.
+    matches!(
+        fields.system_key,
+        0xd508_7500 // IC IALLU
+            | 0xd50b_7520 // IC IVAU
+            | 0xd508_7620 // DC IVAC
+            | 0xd50b_7b20 // DC CVAU
+            | 0xd50b_7e20 // DC CIVAC
+    )
 }
 
 fn valid_barrier_option(option: u8) -> bool {
