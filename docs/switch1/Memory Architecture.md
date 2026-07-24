@@ -709,7 +709,10 @@ The primary source files are:
 
 | Responsibility | Source |
 | -------------- | ------ |
-| Portable traits, values, faults, and deterministic backend | [`crates/cpu/src/memory.rs`](../../crates/cpu/src/memory.rs) |
+| Public memory-module facade and re-exports | [`crates/cpu/src/memory/mod.rs`](../../crates/cpu/src/memory/mod.rs) |
+| Portable traits, values, and faults | [`crates/cpu/src/memory/contracts.rs`](../../crates/cpu/src/memory/contracts.rs) |
+| Small implementation helpers shared by both backends | [`crates/cpu/src/memory/common.rs`](../../crates/cpu/src/memory/common.rs) |
+| Deterministic reference backend | [`crates/cpu/src/memory/synthetic.rs`](../../crates/cpu/src/memory/synthetic.rs) |
 | Production storage and hot paths | [`crates/cpu/src/memory/execution.rs`](../../crates/cpu/src/memory/execution.rs) |
 | Module installation transaction | [`crates/runtime/src/module_memory.rs`](../../crates/runtime/src/module_memory.rs) |
 | Address-space regions and initial process mappings | [`crates/runtime/src/process_builder.rs`](../../crates/runtime/src/process_builder.rs) |
@@ -718,13 +721,19 @@ The primary source files are:
 For a first code review, read them in this order:
 
 ```text
-memory.rs: public contracts and shared semantic types
+memory/mod.rs: public facade and re-exports
         │
         ▼
-execution.rs: storage invariants and page resolution
+memory/contracts.rs: public contracts and shared semantic types
         │
         ▼
-execution.rs: fetch, read, write, and management operations
+memory/synthetic.rs: deterministic reference implementation
+        │
+        ▼
+memory/execution.rs: storage invariants and page resolution
+        │
+        ▼
+memory/execution.rs: fetch, read, write, and management operations
         │
         ▼
 module_memory.rs: atomic executable installation
@@ -737,9 +746,9 @@ svc_dispatch.rs: Horizon-visible validation and state numbers
 ```
 
 This order separates what callers may rely on from how production storage
-implements it. The differential tests at the end of `memory.rs`, together
-with the representation-specific tests in `memory/execution.rs`, form an
-executable specification for the deterministic and production backends.
+implements it. The differential tests in `memory/synthetic.rs`, together with
+the representation-specific tests in `memory/execution.rs`, form an executable
+specification for the deterministic and production backends.
 
 ### Portable identity types
 
