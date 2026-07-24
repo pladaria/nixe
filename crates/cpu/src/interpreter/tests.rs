@@ -31,6 +31,17 @@ fn source(
 }
 
 #[test]
+fn normal_interpretation_does_not_extract_generic_operands() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+
+    crate::decode::table::reset_operand_extraction_count();
+    execute_one(&profile, &mut state, 0xd503_201f_u32.into()).unwrap();
+
+    assert_eq!(crate::decode::table::operand_extraction_count(), 0);
+}
+
+#[test]
 fn interpreter_only_t32_movs_executes_once_and_resumes_at_next_pc() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A32(Box::new(crate::state::A32State::t32()));

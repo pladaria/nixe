@@ -20,7 +20,7 @@ pub use ipc::{
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
-pub use nvdrv::{NvDrvSession, NvMapAllocation};
+pub use nvdrv::{NvDrvSession, NvMapAllocation, UnsupportedNvDrvOperation};
 pub use object::{
     AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource, HidSession,
     HostDirectoryFileSystem, HostFile, IpcSession, OperationMode, PerformanceManagerSession,

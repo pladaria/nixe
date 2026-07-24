@@ -66,8 +66,7 @@ cargo install cargo-fuzz
 cargo fuzz-all
 ```
 
-The aggregate alias runs 10,000 iterations for each target. See [fuzz/README.md](fuzz/README.md) for
-target-specific commands and configuration.
+See [fuzz/README.md](fuzz/README.md) for target-specific commands and configuration.
 
 ## Contributing
 

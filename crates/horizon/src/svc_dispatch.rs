@@ -155,11 +155,15 @@ pub enum HorizonSvcFault {
         immediate: u32,
         reason: &'static str,
     },
+    UnsupportedNvDrv {
+        immediate: u32,
+        operation: crate::nvdrv::UnsupportedNvDrvOperation,
+    },
 }
 
 impl HorizonSvcFault {
     /// Returns the stable Horizon result exposed for a recoverable runtime
-    /// rejection, or `None` when the exception-routing contract itself failed.
+    /// rejection, or `None` when dispatch must stop on a host-side fault.
     #[must_use]
     pub const fn guest_result(&self) -> Option<HorizonKernelResult> {
         match self {
@@ -187,6 +191,7 @@ impl HorizonSvcFault {
                 MemoryMappingErrorReason::ResourceExhausted => HorizonKernelResult::RESOURCE_LIMIT,
             }),
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
+            Self::UnsupportedNvDrv { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -238,6 +243,13 @@ impl Display for HorizonSvcFault {
                     "Horizon SVC {immediate:#x} rejected malformed IPC: {reason}"
                 )
             }
+            Self::UnsupportedNvDrv {
+                immediate,
+                operation,
+            } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} reached unsupported emulator semantics: {operation}"
+            ),
         }
     }
 }
@@ -1039,6 +1051,12 @@ fn reject_ipc(
         IpcWireError::ResourceExhausted => {
             result(context, HorizonKernelResult::OUT_OF_RESOURCE);
             resume()
+        }
+        IpcWireError::UnsupportedNvDrv(operation) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
+                immediate,
+                operation,
+            })
         }
     }
 }
@@ -2461,5 +2479,23 @@ mod tests {
         );
         assert_eq!(handles.len(), 1);
         assert!(handles.get(existing).unwrap().is::<ThreadObject>());
+    }
+
+    #[test]
+    fn unsupported_nvdrv_semantics_have_no_guest_result() {
+        let fault = HorizonSvcFault::UnsupportedNvDrv {
+            immediate: 0x21,
+            operation: crate::nvdrv::UnsupportedNvDrvOperation::Ioctl {
+                device: "/dev/nvhost-ctrl-gpu",
+                request: 0xc018_4706,
+            },
+        };
+
+        assert_eq!(fault.guest_result(), None);
+        assert_eq!(
+            fault.to_string(),
+            "Horizon SVC 0x21 reached unsupported emulator semantics: nvdrv ioctl is not \
+             implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706"
+        );
     }
 }

@@ -45,6 +45,7 @@ pub(crate) enum IpcWireError {
     GuestMemory(DataAccessFault),
     Malformed(&'static str),
     ResourceExhausted,
+    UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
 }
 
 impl From<MessageError> for IpcWireError {
@@ -1709,7 +1710,10 @@ fn dispatch_nvdrv(
             )?;
             let (fd, error) = match session.open(&path) {
                 Ok(fd) => (fd, crate::nvdrv::NV_SUCCESS),
-                Err(error) => (0, error),
+                Err(crate::nvdrv::NvDrvCallError::GuestResult(error)) => (0, error),
+                Err(crate::nvdrv::NvDrvCallError::Unsupported(operation)) => {
+                    return Err(IpcWireError::UnsupportedNvDrv(operation));
+                }
             };
             let mut data = Vec::with_capacity(8);
             data.extend_from_slice(&fd.to_le_bytes());
@@ -1739,8 +1743,9 @@ fn dispatch_nvdrv(
                 GuestVirtualAddress::new(input_descriptor.address),
                 &mut input,
             )?;
-            let (output, error) = session.ioctl(fd, ioctl, &input);
-            log::debug!("nvdrv ioctl fd={fd} request={ioctl:#010x} result={error:#x}");
+            let (output, error) = session
+                .ioctl(fd, ioctl, &input)
+                .map_err(IpcWireError::UnsupportedNvDrv)?;
             write_descriptor_bytes(process, output_descriptor, &output)?;
             Ok((
                 encode_response(
@@ -1786,37 +1791,14 @@ fn dispatch_nvdrv(
                 None,
             ))
         }
-        4 => {
-            let Some(_fd) = request_u32(request.data, 0) else {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            };
-            let (_writable, readable) = EventObject::create_pair();
-            let handle = process
-                .handles_mut()
-                .insert(readable)
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
-            let error = crate::nvdrv::NV_SUCCESS;
-            Ok((
-                CmifResponse {
-                    token: request.token,
-                    result: HorizonIpcResult::SUCCESS.raw(),
-                    data: &error.to_le_bytes(),
-                    pid: None,
-                    copy_handles: &[handle],
-                    move_handles: &[],
-                    send_statics: &[],
-                    is_domain: false,
-                    domain_objects: &[],
-                }
-                .encode()?,
-                Some(handle),
-            ))
-        }
-        8 => Ok((
-            encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
-            None,
+        // Commands 4 (QueryEvent) and 8 (SetClientPID) require event
+        // signaling and client-identity semantics respectively. Returning an
+        // inert event or accepting identity without applying it would hide
+        // missing emulator behavior. The pinned client ABI is documented at:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c
+        command_id => Err(IpcWireError::UnsupportedNvDrv(
+            crate::nvdrv::UnsupportedNvDrvOperation::ServiceCommand { command_id },
         )),
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
     }
 }
 

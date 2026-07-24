@@ -682,6 +682,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lazy_operands_preserve_direct_branch_targets_for_all_execution_states() {
+        let profile = GuestCpuProfile::switch_1();
+        let cases = [
+            (ExecutionState::A64, 0x1400_0002_u32.into(), 0x1008),
+            (ExecutionState::A32, 0xeaff_ffff_u32.into(), 0x1004),
+            (
+                ExecutionState::T32,
+                InstructionEncoding::from_u16(0xe7ff),
+                0x1002,
+            ),
+        ];
+
+        for (state, encoding, expected_pc) in cases {
+            let location = start(profile, 0x1000, state);
+            let decoded = match crate::decode::decode(&profile, location, encoding) {
+                DecodeResult::Decoded(decoded) => decoded,
+                result => panic!("expected decoded branch, got {result:?}"),
+            };
+            assert_eq!(
+                direct_branch_target(&decoded).unwrap(),
+                ControlTarget::Direct {
+                    pc: GuestVirtualAddress::new(expected_pc),
+                    execution_state: state,
+                }
+            );
+        }
+    }
+
     fn terminator_family(terminator: &Terminator) -> &'static str {
         match terminator {
             Terminator::Direct { .. } => "direct",

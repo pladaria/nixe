@@ -32,3 +32,6 @@ Thumbs.db
 /keys/
 /cache/
 /storage/
+
+# Debug
+/perf.*

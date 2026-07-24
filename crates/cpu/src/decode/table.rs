@@ -210,11 +210,11 @@ impl DecodedOperands {
     }
 }
 
-/// Pattern identity and validated typed operands.
+/// Pattern identity and raw bits used to extract typed operands on demand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedOpcode {
     pattern: &'static InstructionPattern,
-    operands: DecodedOperands,
+    bits: u32,
 }
 
 impl DecodedOpcode {
@@ -224,8 +224,16 @@ impl DecodedOpcode {
     }
 
     #[must_use]
+    #[cfg(not(test))]
     pub const fn operands(&self) -> DecodedOperands {
-        self.operands
+        extract_operands(self.pattern, self.bits)
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub fn operands(&self) -> DecodedOperands {
+        OPERAND_EXTRACTION_COUNT.with(|count| count.set(count.get() + 1));
+        extract_operands(self.pattern, self.bits)
     }
 
     #[must_use]
@@ -240,7 +248,7 @@ impl DecodedOpcode {
 
     pub(crate) fn fmt_disassembly(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.pattern.name)?;
-        for (index, (id, value)) in self.operands.iter().enumerate() {
+        for (index, (id, value)) in self.operands().iter().enumerate() {
             f.write_str(if index == 0 { " " } else { ", " })?;
             match value {
                 OperandValue::Unsigned(value) => write!(f, "{}=#{value}", id.name())?,
@@ -391,14 +399,8 @@ impl DecoderTable {
                     rejection,
                 };
             }
-            let decoded = DecodedInstruction::new(
-                location,
-                encoding,
-                DecodedOpcode {
-                    pattern,
-                    operands: extract_operands(pattern, bits),
-                },
-            );
+            let decoded =
+                DecodedInstruction::new(location, encoding, DecodedOpcode { pattern, bits });
             return match pattern.registration.decoder {
                 DecodeSupport::Ready => DecodeResult::Decoded(decoded),
                 DecodeSupport::RecognizedUnimplemented => {
@@ -434,11 +436,13 @@ impl DecoderTable {
     }
 }
 
-fn extract_operands(pattern: &InstructionPattern, bits: u32) -> DecodedOperands {
+const fn extract_operands(pattern: &InstructionPattern, bits: u32) -> DecodedOperands {
     let mut result = DecodedOperands::EMPTY;
-    for field in pattern.operands {
+    let mut field_index = 0;
+    while field_index < pattern.operands.len() {
+        let field = pattern.operands[field_index];
         let mask = low_mask(field.width);
-        let raw = u64::from((bits >> field.lsb) & mask);
+        let raw = ((bits >> field.lsb) & mask) as u64;
         let value = match field.kind {
             OperandKind::Unsigned => OperandValue::Unsigned(raw),
             OperandKind::Register(class) => OperandValue::Register {
@@ -453,8 +457,26 @@ fn extract_operands(pattern: &InstructionPattern, bits: u32) -> DecodedOperands 
         };
         result.values[result.len()] = Some((field.id, value));
         result.len += 1;
+        field_index += 1;
     }
     result
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OPERAND_EXTRACTION_COUNT: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_operand_extraction_count() {
+    OPERAND_EXTRACTION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn operand_extraction_count() -> usize {
+    OPERAND_EXTRACTION_COUNT.with(core::cell::Cell::get)
 }
 
 fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> {
@@ -611,6 +633,8 @@ const fn low_mask(width: u8) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use core::mem::size_of;
+
     use super::*;
     use crate::{address::GuestVirtualAddress, profile::CapabilityStatus};
 
@@ -678,6 +702,63 @@ mod tests {
             panic!("expected decoded")
         };
         assert_eq!(decoded.instruction.pattern().name, "narrow");
+    }
+
+    #[test]
+    fn decoding_keeps_generic_operand_extraction_lazy() {
+        static FIELDS: [OperandField; 2] = [
+            OperandField {
+                id: OperandId::Destination,
+                lsb: 0,
+                width: 5,
+                kind: OperandKind::Register(RegisterClass::A64General),
+            },
+            OperandField {
+                id: OperandId::Immediate,
+                lsb: 5,
+                width: 7,
+                kind: OperandKind::SignedScaled { scale: 2 },
+            },
+        ];
+        static PATTERNS: [InstructionPattern; 1] = [InstructionPattern {
+            operands: &FIELDS,
+            ..pattern("lazy-operands", 0xff00_0000, 0x1200_0000, 1)
+        }];
+        let table = DecoderTable::compile(&PATTERNS).unwrap();
+        let profile = GuestCpuProfile::switch_1();
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0),
+            ExecutionState::A64,
+            profile.id(),
+        );
+
+        reset_operand_extraction_count();
+        let DecodeResult::Decoded(decoded) =
+            table.decode(&profile, location, 0x1200_0fe3_u32.into())
+        else {
+            panic!("expected decoded")
+        };
+        assert_eq!(operand_extraction_count(), 0);
+
+        let operands = decoded.instruction.operands();
+        assert_eq!(operand_extraction_count(), 1);
+        assert_eq!(
+            operands.get(OperandId::Destination),
+            Some(OperandValue::Register {
+                class: RegisterClass::A64General,
+                index: 3,
+            })
+        );
+        assert_eq!(
+            operands.get(OperandId::Immediate),
+            Some(OperandValue::Signed(-4))
+        );
+    }
+
+    #[test]
+    fn decoded_results_do_not_embed_fixed_operand_storage() {
+        assert!(size_of::<DecodedOpcode>() <= 2 * size_of::<usize>());
+        assert!(size_of::<DecodeResult>() < size_of::<DecodedOperands>());
     }
 
     #[test]
