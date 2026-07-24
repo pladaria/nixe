@@ -134,14 +134,17 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     );
     let mailbox = FrameMailbox::default();
     let video_system = VideoSystem::new(mailbox.clone());
-    let mut window = nixe_video_winit::WindowFrontend::new(mailbox, Arc::clone(&interrupted))
-        .map_err(|error| error.to_string())?;
+    let window_close_requested = Arc::new(AtomicBool::new(false));
+    let mut window =
+        nixe_video_winit::WindowFrontend::new(mailbox, Arc::clone(&window_close_requested))
+            .map_err(|error| error.to_string())?;
     window.pump().map_err(|error| error.to_string())?;
     let execution_started = Instant::now();
     let execution = execute(
         &mut process,
         instruction_trace,
         &interrupted,
+        &window_close_requested,
         initial_operation_mode,
         time_environment,
         video_system,
@@ -195,6 +198,7 @@ fn execute(
     process: &mut RunnableProcess,
     print_trace: bool,
     interrupted: &AtomicBool,
+    window_close_requested: &AtomicBool,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
@@ -211,10 +215,18 @@ fn execute(
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
     loop {
-        if !window.pump().map_err(|error| error.to_string())? {
-            return Err("video window event loop stopped unexpectedly".to_owned());
-        }
+        let window_running = window.pump().map_err(|error| error.to_string())?;
         dispatcher.advance_video(execution_started.elapsed());
+        if window_close_requested.load(Ordering::Acquire) {
+            log::info!("video window closed; stopping the guest process cleanly");
+            if !process.terminate() {
+                return Err(
+                    "video window closed, but the guest process could not be terminated cleanly"
+                        .to_owned(),
+                );
+            }
+            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+        }
         if interrupted.load(Ordering::SeqCst) {
             log::info!("Ctrl+C received; stopping the guest process cleanly");
             if !process.terminate() {
@@ -224,6 +236,9 @@ fn execute(
                 );
             }
             return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+        }
+        if !window_running {
+            return Err("video window event loop stopped unexpectedly".to_owned());
         }
         let report = process
             .run_reference(if print_trace {
@@ -314,10 +329,16 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
                 ))
             }
         }
-        ProcessExitCause::HostRequested => Err(format!(
-            "guest execution was interrupted by the host after a clean shutdown (code {:#x})",
-            exit.exit_code
-        )),
+        ProcessExitCause::HostRequested => {
+            if exit.exit_code == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "guest execution was interrupted by the host with non-zero code {:#x}",
+                    exit.exit_code
+                ))
+            }
+        }
         ProcessExitCause::GuestBreak { reason, info, size } => Err(format!(
             "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}, code={:#x}",
             exit.exit_code
@@ -401,10 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_host_interrupts_and_missing_exit_records() {
-        let interrupted =
-            classify_exit(Some(process_exit(ProcessExitCause::HostRequested, 0))).unwrap_err();
-        assert!(interrupted.contains("interrupted by the host"));
+    fn accepts_clean_host_termination_and_rejects_other_host_exit_codes() {
+        assert_eq!(
+            classify_exit(Some(process_exit(ProcessExitCause::HostRequested, 0))),
+            Ok(())
+        );
+        assert!(classify_exit(Some(process_exit(ProcessExitCause::HostRequested, 7))).is_err());
         assert!(classify_exit(None).is_err());
     }
 
