@@ -5,7 +5,8 @@ use std::fmt::{Display, Formatter};
 
 use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::memory::{
-    MemoryPermissions as CpuPermissions, SyntheticInstallStage, SyntheticMemory, SyntheticRamPage,
+    ExecutionMemory, MemoryPermissions as CpuPermissions, SyntheticInstallStage, SyntheticMemory,
+    SyntheticRamPage,
 };
 use nixe_loader_executable::{MemoryPermissions as LoaderPermissions, PreparedModule};
 
@@ -269,6 +270,37 @@ fn module_error(
 }
 
 impl ModuleMemoryBackend for SyntheticMemory {
+    fn page_size(&self) -> usize {
+        nixe_cpu::memory::SYNTHETIC_PAGE_SIZE
+    }
+
+    fn install_pages_atomic(
+        &mut self,
+        address_space: AddressSpaceId,
+        pages: &[PageRequest<'_>],
+    ) -> Result<(), BackendInstallError> {
+        let requests = pages
+            .iter()
+            .map(|page| SyntheticRamPage {
+                virtual_address: page.address,
+                bytes: page.bytes,
+                permissions: page.permissions,
+            })
+            .collect::<Vec<_>>();
+        self.install_ram_pages_atomic(address_space, &requests)
+            .map_err(|error| {
+                let stage = match error.stage {
+                    SyntheticInstallStage::Preflight => InstallStage::Preflight,
+                    SyntheticInstallStage::Allocation => InstallStage::Allocation,
+                    SyntheticInstallStage::Initialization => InstallStage::Initialization,
+                    SyntheticInstallStage::Publication => InstallStage::Publication,
+                };
+                BackendInstallError::new(stage, error.address, error.reason)
+            })
+    }
+}
+
+impl ModuleMemoryBackend for ExecutionMemory {
     fn page_size(&self) -> usize {
         nixe_cpu::memory::SYNTHETIC_PAGE_SIZE
     }

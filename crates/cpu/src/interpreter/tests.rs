@@ -1,3 +1,5 @@
+use core::cell::Cell;
+
 use crate::{
     address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     coverage::CoverageId,
@@ -15,9 +17,9 @@ use crate::{
 };
 
 use super::{
-    ArchitecturalTimerSnapshot, InstructionSupport, InterpreterContext, InterpreterError,
-    InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one, execute_one_with_context,
-    instruction_support,
+    ArchitecturalTimer, ArchitecturalTimerSnapshot, InstructionSupport, InterpreterContext,
+    InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one,
+    execute_one_with_context, instruction_support,
 };
 
 fn source(
@@ -419,6 +421,36 @@ fn a64_architectural_timer_registers_use_the_runtime_snapshot() {
     };
     assert_eq!(a64.read_x(x(1)), 19_200_000);
     assert_eq!(a64.read_x(x(2)), 0x1234_5678_9abc_def0);
+}
+
+#[test]
+fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
+    struct CountingTimer {
+        samples: Cell<u32>,
+    }
+
+    impl ArchitecturalTimer for CountingTimer {
+        fn snapshot(&self) -> ArchitecturalTimerSnapshot {
+            self.samples.set(self.samples.get() + 1);
+            ArchitecturalTimerSnapshot {
+                counter: 42,
+                frequency: 19_200_000,
+            }
+        }
+    }
+
+    let profile = GuestCpuProfile::switch_1();
+    let timer = CountingTimer {
+        samples: Cell::new(0),
+    };
+    let context = InterpreterContext::new(ProcessCpuContext::new(profile, AddressSpaceId::new(0)))
+        .with_architectural_timer_provider(&timer);
+    let mut state = ThreadCpuState::A64(Box::default());
+
+    execute_one_with_context(context, &mut state, 0xd503_201f_u32.into()).unwrap(); // NOP
+    assert_eq!(timer.samples.get(), 0);
+    execute_one_with_context(context, &mut state, 0xd53b_e020_u32.into()).unwrap(); // MRS X0,CNTVCT_EL0
+    assert_eq!(timer.samples.get(), 1);
 }
 
 #[test]

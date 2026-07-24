@@ -14,7 +14,7 @@ use nixe_cpu::interpreter::{
     execute_one_with_context,
 };
 use nixe_cpu::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
-use nixe_cpu::memory::{InstructionMemory, SyntheticMemory};
+use nixe_cpu::memory::{ExecutionMemory, InstructionMemory};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu::vcpu::VcpuExecutionState;
@@ -394,12 +394,19 @@ impl Display for ProcessExecutionError {
 
 impl Error for ProcessExecutionError {}
 
-fn architectural_timer(clock: &VirtualClock, frequency: u64) -> ArchitecturalTimerSnapshot {
-    let elapsed_nanos = clock.elapsed().as_nanos();
-    let ticks = elapsed_nanos.saturating_mul(u128::from(frequency)) / 1_000_000_000;
-    ArchitecturalTimerSnapshot {
-        counter: u64::try_from(ticks).unwrap_or(u64::MAX),
-        frequency,
+struct RuntimeArchitecturalTimer<'a> {
+    clock: &'a VirtualClock,
+    frequency: u64,
+}
+
+impl nixe_cpu::interpreter::ArchitecturalTimer for RuntimeArchitecturalTimer<'_> {
+    fn snapshot(&self) -> ArchitecturalTimerSnapshot {
+        let elapsed_nanos = self.clock.elapsed().as_nanos();
+        let ticks = elapsed_nanos.saturating_mul(u128::from(self.frequency)) / 1_000_000_000;
+        ArchitecturalTimerSnapshot {
+            counter: u64::try_from(ticks).unwrap_or(u64::MAX),
+            frequency: self.frequency,
+        }
     }
 }
 
@@ -489,7 +496,7 @@ impl ProcessExecutionControl {
 pub(crate) fn run_reference(
     control: &mut ProcessExecutionControl,
     cpu: ProcessCpuContext,
-    memory: &SyntheticMemory,
+    memory: &ExecutionMemory,
     state: &mut ThreadCpuState,
     instruction_budget: u64,
     loader_return: Option<GuestVirtualAddress>,
@@ -560,13 +567,14 @@ pub(crate) fn run_reference(
             }
         };
         let source = current_location(cpu, state);
+        let architectural_timer = RuntimeArchitecturalTimer {
+            clock: &control.virtual_clock,
+            frequency: control.architectural_timer_frequency,
+        };
         let context = InterpreterContext::new(cpu)
             .with_memory(memory)
             .with_exclusive_monitor(control.vcpu.exclusive_monitor_cell())
-            .with_architectural_timer(architectural_timer(
-                &control.virtual_clock,
-                control.architectural_timer_frequency,
-            ));
+            .with_architectural_timer_provider(&architectural_timer);
         let outcome = match execute_one_with_context(context, state, encoding) {
             Ok(outcome) => outcome,
             Err(InterpreterError::UnsupportedInstruction {

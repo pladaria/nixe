@@ -792,9 +792,18 @@ impl Default for SyntheticMemoryInner {
 ///
 /// Its APIs expose copies, identities, and callbacks only; no raw mutable host
 /// pointer crosses the CPU/memory boundary.
-#[derive(Default)]
 pub struct SyntheticMemory {
     inner: RefCell<SyntheticMemoryInner>,
+    fault_injection_enabled: bool,
+}
+
+impl Default for SyntheticMemory {
+    fn default() -> Self {
+        Self {
+            inner: RefCell::default(),
+            fault_injection_enabled: true,
+        }
+    }
 }
 
 impl SyntheticMemory {
@@ -802,6 +811,13 @@ impl SyntheticMemory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn for_execution() -> Self {
+        Self {
+            inner: RefCell::default(),
+            fault_injection_enabled: false,
+        }
     }
 
     /// Atomically creates, initializes, and publishes ordinary RAM pages.
@@ -1133,6 +1149,62 @@ impl SyntheticMemory {
             ));
         }
         let inner = self.inner.borrow();
+        let end_offset = page_offset(address) + N;
+        if end_offset <= SYNTHETIC_PAGE_SIZE {
+            if self.fault_injection_enabled
+                && !inner.instruction_faults.is_empty()
+                && let Some((fault_address, reason)) = (0..N).find_map(|index| {
+                    let current = address.checked_add(index as u64)?;
+                    inner
+                        .instruction_faults
+                        .get(&(address_space, current))
+                        .map(|reason| (current, reason))
+                })
+            {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    fault_address,
+                    InstructionFetchFaultReason::Memory(reason.clone()),
+                ));
+            }
+            let mapping = mapping_at(&inner, address_space, address).ok_or_else(|| {
+                InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Unmapped,
+                )
+            })?;
+            if !mapping.permissions.contains(MemoryPermissions::EXECUTE) {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::ExecutePermissionDenied,
+                ));
+            }
+            let Some(PhysicalPage::Ram {
+                bytes: contents,
+                generation,
+            }) = inner.pages.get(&mapping.physical_page)
+            else {
+                return Err(InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Memory("executable mapping is not RAM".into()),
+                ));
+            };
+            let mut bytes = [0; N];
+            if let Some(contents) = contents {
+                bytes.copy_from_slice(&contents[page_offset(address)..end_offset]);
+            }
+            return Ok((
+                bytes,
+                CodeDependencies::one(CodePageDependency {
+                    page: mapping.physical_page,
+                    generation: CodeGeneration::new(*generation),
+                }),
+            ));
+        }
+
         let mut bytes = [0; N];
         let mut dependencies: Option<CodeDependencies> = None;
         for (index, destination) in bytes.iter_mut().enumerate() {
@@ -1143,7 +1215,9 @@ impl SyntheticMemory {
                     InstructionFetchFaultReason::AddressOverflow,
                 ));
             };
-            if let Some(reason) = inner.instruction_faults.get(&(address_space, current)) {
+            if self.fault_injection_enabled
+                && let Some(reason) = inner.instruction_faults.get(&(address_space, current))
+            {
                 return Err(InstructionFetchFault::new(
                     address_space,
                     current,
@@ -1284,11 +1358,14 @@ impl CpuMemory for SyntheticMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<DataReadResult, DataAccessFault> {
-        validate_data_access(self, address_space, address, access, DataAccessKind::Read)?;
         let mut inner = self.inner.borrow_mut();
-        if let Some(reason) = inner
-            .data_faults
-            .get(&(address_space, address, DataAccessKind::Read))
+        let resolved =
+            resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+        if self.fault_injection_enabled
+            && let Some(reason) =
+                inner
+                    .data_faults
+                    .get(&(address_space, address, DataAccessKind::Read))
         {
             return Err(DataAccessFault::new(
                 address_space,
@@ -1297,70 +1374,92 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::Injected(reason.clone()),
             ));
         }
-        let mapping = mapping_at(&inner, address_space, address).expect("validated mapping");
-        match inner
-            .pages
-            .get_mut(&mapping.physical_page)
-            .expect("mapping references a page")
-        {
-            PhysicalPage::Mmio(handler) => {
-                if page_offset(address) + access.size.bytes() > SYNTHETIC_PAGE_SIZE {
-                    return Err(DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Read,
-                        DataAccessFaultReason::MixedRegions,
-                    ));
-                }
-                let value =
-                    handler
-                        .read(page_offset(address) as u64, access)
-                        .map_err(|reason| {
-                            DataAccessFault::new(
-                                address_space,
-                                address,
-                                DataAccessKind::Read,
-                                DataAccessFaultReason::Device(reason),
-                            )
-                        })?;
-                if value.size() != access.size {
-                    return Err(DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Read,
-                        DataAccessFaultReason::ValueSizeMismatch,
-                    ));
-                }
-                Ok(DataReadResult {
-                    value,
-                    region: MemoryRegionKind::Device,
-                })
+        if resolved.region == MemoryRegionKind::Device {
+            if resolved.second.is_some() {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::MixedRegions,
+                ));
             }
-            PhysicalPage::Ram { .. } => {
-                let mut bytes = [0_u8; 16];
-                for (index, byte) in bytes[..access.size.bytes()].iter_mut().enumerate() {
-                    let current = address.checked_add(index as u64).expect("validated range");
-                    let mapping =
-                        mapping_at(&inner, address_space, current).expect("validated mapping");
+            let PhysicalPage::Mmio(handler) = inner
+                .pages
+                .get_mut(&resolved.first.physical_page)
+                .expect("resolved device page exists")
+            else {
+                unreachable!()
+            };
+            let value = handler
+                .read(page_offset(address) as u64, access)
+                .map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Read,
+                        DataAccessFaultReason::Device(reason),
+                    )
+                })?;
+            if value.size() != access.size {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::ValueSizeMismatch,
+                ));
+            }
+            return Ok(DataReadResult {
+                value,
+                region: MemoryRegionKind::Device,
+            });
+        }
+
+        let byte_count = access.size.bytes();
+        let mut bytes = [0_u8; 16];
+        match resolved.second {
+            None => {
+                let PhysicalPage::Ram {
+                    bytes: contents, ..
+                } = inner
+                    .pages
+                    .get(&resolved.first.physical_page)
+                    .expect("resolved RAM page exists")
+                else {
+                    unreachable!()
+                };
+                if let Some(contents) = contents {
+                    let offset = page_offset(address);
+                    bytes[..byte_count].copy_from_slice(&contents[offset..offset + byte_count]);
+                }
+            }
+            Some(second) => {
+                let mappings = [resolved.first, second];
+                let mut copied = 0;
+                for (mapping, count, offset) in [
+                    (mappings[0], resolved.first_bytes, page_offset(address)),
+                    (mappings[1], byte_count - resolved.first_bytes, 0),
+                ] {
                     let PhysicalPage::Ram {
                         bytes: contents, ..
                     } = inner
                         .pages
                         .get(&mapping.physical_page)
-                        .expect("validated RAM region")
+                        .expect("resolved RAM page exists")
                     else {
                         unreachable!()
                     };
-                    *byte = contents
-                        .as_ref()
-                        .map_or(0, |contents| contents[page_offset(current)]);
+                    if let Some(contents) = contents {
+                        bytes[copied..copied + count]
+                            .copy_from_slice(&contents[offset..offset + count]);
+                    }
+                    copied += count;
                 }
-                Ok(DataReadResult {
-                    value: MemoryValue::from_le_slice(access.size, &bytes[..access.size.bytes()]),
-                    region: MemoryRegionKind::Ram,
-                })
             }
         }
+        Ok(DataReadResult {
+            value: MemoryValue::from_le_slice(access.size, &bytes[..byte_count]),
+            region: MemoryRegionKind::Ram,
+        })
     }
 
     fn write(
@@ -1378,12 +1477,19 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::ValueSizeMismatch,
             ));
         }
-        validate_data_access(self, address_space, address, access, DataAccessKind::Write)?;
         let mut inner = self.inner.borrow_mut();
-        if let Some(reason) =
-            inner
-                .data_faults
-                .get(&(address_space, address, DataAccessKind::Write))
+        let resolved = resolve_data_access(
+            &inner,
+            address_space,
+            address,
+            access,
+            DataAccessKind::Write,
+        )?;
+        if self.fault_injection_enabled
+            && let Some(reason) =
+                inner
+                    .data_faults
+                    .get(&(address_space, address, DataAccessKind::Write))
         {
             return Err(DataAccessFault::new(
                 address_space,
@@ -1392,12 +1498,8 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::Injected(reason.clone()),
             ));
         }
-        let mapping = mapping_at(&inner, address_space, address).expect("validated mapping");
-        if matches!(
-            inner.pages.get(&mapping.physical_page),
-            Some(PhysicalPage::Mmio(_))
-        ) {
-            if page_offset(address) + access.size.bytes() > SYNTHETIC_PAGE_SIZE {
+        if resolved.region == MemoryRegionKind::Device {
+            if resolved.second.is_some() {
                 return Err(DataAccessFault::new(
                     address_space,
                     address,
@@ -1407,8 +1509,8 @@ impl CpuMemory for SyntheticMemory {
             }
             let PhysicalPage::Mmio(handler) = inner
                 .pages
-                .get_mut(&mapping.physical_page)
-                .expect("validated MMIO page")
+                .get_mut(&resolved.first.physical_page)
+                .expect("resolved device page exists")
             else {
                 unreachable!()
             };
@@ -1426,32 +1528,63 @@ impl CpuMemory for SyntheticMemory {
                 region: MemoryRegionKind::Device,
             });
         }
+        let byte_count = access.size.bytes();
         let mut bytes = [0_u8; 16];
-        value.copy_le_bytes(&mut bytes[..access.size.bytes()]);
-        let mut touched_pages = Vec::with_capacity(2);
-        for (index, byte) in bytes[..access.size.bytes()].iter().copied().enumerate() {
-            let current = address.checked_add(index as u64).expect("validated range");
-            let mapping = mapping_at(&inner, address_space, current).expect("validated mapping");
-            let PhysicalPage::Ram {
-                bytes: contents, ..
-            } = inner
-                .pages
-                .get_mut(&mapping.physical_page)
-                .expect("validated RAM region")
-            else {
-                unreachable!()
-            };
-            let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
-            contents[page_offset(current)] = byte;
-            if !touched_pages.contains(&mapping.physical_page) {
-                touched_pages.push(mapping.physical_page);
+        value.copy_le_bytes(&mut bytes[..byte_count]);
+        match resolved.second {
+            None => {
+                let PhysicalPage::Ram {
+                    bytes: contents,
+                    generation,
+                } = inner
+                    .pages
+                    .get_mut(&resolved.first.physical_page)
+                    .expect("resolved RAM page exists")
+                else {
+                    unreachable!()
+                };
+                let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+                let offset = page_offset(address);
+                contents[offset..offset + byte_count].copy_from_slice(&bytes[..byte_count]);
+                *generation = generation.wrapping_add(1);
             }
-        }
-        for page in touched_pages {
-            let Some(PhysicalPage::Ram { generation, .. }) = inner.pages.get_mut(&page) else {
-                unreachable!()
-            };
-            *generation = generation.wrapping_add(1);
+            Some(second) => {
+                let mappings = [resolved.first, second];
+                let mut copied = 0;
+                for (mapping, count, offset) in [
+                    (mappings[0], resolved.first_bytes, page_offset(address)),
+                    (mappings[1], byte_count - resolved.first_bytes, 0),
+                ] {
+                    let PhysicalPage::Ram {
+                        bytes: contents, ..
+                    } = inner
+                        .pages
+                        .get_mut(&mapping.physical_page)
+                        .expect("resolved RAM page exists")
+                    else {
+                        unreachable!()
+                    };
+                    let contents =
+                        contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+                    contents[offset..offset + count]
+                        .copy_from_slice(&bytes[copied..copied + count]);
+                    copied += count;
+                }
+                for page in [
+                    Some(mappings[0].physical_page),
+                    (mappings[1].physical_page != mappings[0].physical_page)
+                        .then_some(mappings[1].physical_page),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let Some(PhysicalPage::Ram { generation, .. }) = inner.pages.get_mut(&page)
+                    else {
+                        unreachable!()
+                    };
+                    *generation = generation.wrapping_add(1);
+                }
+            }
         }
         Ok(DataWriteResult {
             region: MemoryRegionKind::Ram,
@@ -1498,11 +1631,16 @@ impl CpuMemory for SyntheticMemory {
         value: MemoryValue,
         reservation: crate::vcpu::ExclusiveReservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault> {
-        validate_data_access(self, address_space, address, access, DataAccessKind::Write)?;
         let matches = {
             let inner = self.inner.borrow();
-            let mapping = mapping_at(&inner, address_space, address).expect("store was validated");
-            let generation = match inner.pages.get(&mapping.physical_page) {
+            let resolved = resolve_data_access(
+                &inner,
+                address_space,
+                address,
+                access,
+                DataAccessKind::Write,
+            )?;
+            let generation = match inner.pages.get(&resolved.first.physical_page) {
                 Some(PhysicalPage::Ram { generation, .. }) => *generation,
                 _ => {
                     return Err(DataAccessFault::new(
@@ -1513,7 +1651,7 @@ impl CpuMemory for SyntheticMemory {
                     ));
                 }
             };
-            reservation.page == mapping.physical_page
+            reservation.page == resolved.first.physical_page
                 && usize::from(reservation.byte_offset) == page_offset(address)
                 && usize::from(reservation.access_size) == access.size.bytes()
                 && reservation.generation == CodeGeneration::new(generation)
@@ -1833,6 +1971,204 @@ impl ProcessMemory for SyntheticMemory {
     }
 }
 
+/// Process-memory backend used by normal guest execution.
+///
+/// It shares the reference backend's mapping and fault semantics while
+/// permanently removing deterministic fault-injection lookups from hot paths.
+/// Keeping the shared core makes conformance changes apply to both backends;
+/// [`SyntheticMemory`] remains the test-facing backend and differential oracle.
+pub struct ExecutionMemory {
+    memory: SyntheticMemory,
+}
+
+impl Default for ExecutionMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionMemory {
+    /// Creates an empty production process address space.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            memory: SyntheticMemory::for_execution(),
+        }
+    }
+
+    /// Atomically installs initialized RAM pages without test fault injection.
+    pub fn install_ram_pages_atomic(
+        &mut self,
+        address_space: AddressSpaceId,
+        requests: &[SyntheticRamPage<'_>],
+    ) -> Result<(), SyntheticInstallError> {
+        self.memory
+            .install_ram_pages_atomic(address_space, requests)
+    }
+
+    /// Returns the observable mapping state used by runtime diagnostics.
+    #[must_use]
+    pub fn mapping_info(
+        &self,
+        address_space: AddressSpaceId,
+        virtual_address: GuestVirtualAddress,
+    ) -> Option<SyntheticMappingInfo> {
+        self.memory.mapping_info(address_space, virtual_address)
+    }
+
+    /// Updates the runtime-owned purpose of a complete mapped range.
+    pub fn set_mapping_purpose(
+        &mut self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        purpose: MemoryMappingPurpose,
+    ) -> bool {
+        self.memory
+            .set_mapping_purpose(address_space, start, size, purpose)
+    }
+
+    /// Returns the number of physical pages owned by this address space.
+    #[must_use]
+    pub fn physical_page_count(&self) -> usize {
+        self.memory.physical_page_count()
+    }
+
+    /// Publishes an alias mapping for an existing physical page.
+    pub fn map_page(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_address: GuestVirtualAddress,
+        physical_page: GuestPhysicalPageId,
+        permissions: MemoryPermissions,
+    ) -> bool {
+        self.memory
+            .map_page(address_space, virtual_address, physical_page, permissions)
+    }
+}
+
+impl InstructionMemory for ExecutionMemory {
+    fn code_page_span(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<CodePageSpan, InstructionFetchFault> {
+        self.memory.code_page_span(address_space, address)
+    }
+
+    fn fetch16(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<FetchedCode<u16>, InstructionFetchFault> {
+        self.memory.fetch16(address_space, address)
+    }
+
+    fn fetch32(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
+        self.memory.fetch32(address_space, address)
+    }
+}
+
+impl CpuMemory for ExecutionMemory {
+    fn read(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<DataReadResult, DataAccessFault> {
+        self.memory.read(address_space, address, access)
+    }
+
+    fn write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+    ) -> Result<DataWriteResult, DataAccessFault> {
+        self.memory.write(address_space, address, access, value)
+    }
+
+    fn query_memory(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        end_exclusive: GuestVirtualAddress,
+    ) -> Option<MemoryQueryResult> {
+        self.memory
+            .query_memory(address_space, address, end_exclusive)
+    }
+
+    fn load_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault> {
+        self.memory.load_exclusive(address_space, address, access)
+    }
+
+    fn store_exclusive(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        value: MemoryValue,
+        reservation: crate::vcpu::ExclusiveReservation,
+    ) -> Result<(DataWriteResult, bool), DataAccessFault> {
+        self.memory
+            .store_exclusive(address_space, address, access, value, reservation)
+    }
+}
+
+impl ProcessMemory for ExecutionMemory {
+    fn resize_zeroed_mapping(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        old_size: u64,
+        new_size: u64,
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+    ) -> Result<(), MemoryMappingError> {
+        self.memory.resize_zeroed_mapping(
+            address_space,
+            start,
+            old_size,
+            new_size,
+            permissions,
+            purpose,
+        )
+    }
+
+    fn set_permissions(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryProtectionError> {
+        self.memory
+            .set_permissions(address_space, start, size, permissions)
+    }
+
+    fn set_attributes(
+        &self,
+        address_space: AddressSpaceId,
+        start: GuestVirtualAddress,
+        size: u64,
+        mask: MemoryAttributes,
+        value: MemoryAttributes,
+    ) -> Result<(), MemoryProtectionError> {
+        self.memory
+            .set_attributes(address_space, start, size, mask, value)
+    }
+}
+
 fn synthetic_mapping_state(
     inner: &SyntheticMemoryInner,
     address_space: AddressSpaceId,
@@ -1871,13 +2207,21 @@ fn page_offset(address: GuestVirtualAddress) -> usize {
     address.get() as usize % SYNTHETIC_PAGE_SIZE
 }
 
-fn validate_data_access(
-    memory: &SyntheticMemory,
+#[derive(Clone, Copy)]
+struct ResolvedDataAccess {
+    first: Mapping,
+    second: Option<Mapping>,
+    first_bytes: usize,
+    region: MemoryRegionKind,
+}
+
+fn resolve_data_access(
+    inner: &SyntheticMemoryInner,
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     access: MemoryAccess,
     kind: DataAccessKind,
-) -> Result<(), DataAccessFault> {
+) -> Result<ResolvedDataAccess, DataAccessFault> {
     let required_alignment = access.alignment.bytes(access.size);
     if !address.is_aligned_to(u64::from(required_alignment)) {
         return Err(DataAccessFault::new(
@@ -1887,18 +2231,27 @@ fn validate_data_access(
             DataAccessFaultReason::Misaligned { required_alignment },
         ));
     }
-    let inner = memory.inner.borrow();
-    let mut region = None;
-    for index in 0..access.size.bytes() {
-        let Some(current) = address.checked_add(index as u64) else {
-            return Err(DataAccessFault::new(
-                address_space,
-                address,
-                kind,
-                DataAccessFaultReason::AddressOverflow,
-            ));
-        };
-        let mapping = mapping_at(&inner, address_space, current).ok_or_else(|| {
+    let byte_count = access.size.bytes();
+    if address.checked_add((byte_count - 1) as u64).is_none() {
+        return Err(DataAccessFault::new(
+            address_space,
+            address,
+            kind,
+            DataAccessFaultReason::AddressOverflow,
+        ));
+    }
+    let first_bytes = (SYNTHETIC_PAGE_SIZE - page_offset(address)).min(byte_count);
+    let second_address = (first_bytes < byte_count).then_some(
+        address
+            .checked_add(first_bytes as u64)
+            .expect("validated access end contains its second page"),
+    );
+    let required = match kind {
+        DataAccessKind::Read => MemoryPermissions::READ,
+        DataAccessKind::Write => MemoryPermissions::WRITE,
+    };
+    let resolve = |current| {
+        let mapping = mapping_at(inner, address_space, current).ok_or_else(|| {
             DataAccessFault::new(
                 address_space,
                 current,
@@ -1906,18 +2259,19 @@ fn validate_data_access(
                 DataAccessFaultReason::Unmapped,
             )
         })?;
-        let required = match kind {
-            DataAccessKind::Read => MemoryPermissions::READ,
-            DataAccessKind::Write => MemoryPermissions::WRITE,
-        };
         if !mapping.permissions.contains(required) {
-            let reason = match kind {
+            let permission_fault = match kind {
                 DataAccessKind::Read => DataAccessFaultReason::ReadPermissionDenied,
                 DataAccessKind::Write => DataAccessFaultReason::WritePermissionDenied,
             };
-            return Err(DataAccessFault::new(address_space, current, kind, reason));
+            return Err(DataAccessFault::new(
+                address_space,
+                current,
+                kind,
+                permission_fault,
+            ));
         }
-        let current_region = match inner.pages.get(&mapping.physical_page) {
+        let region = match inner.pages.get(&mapping.physical_page) {
             Some(PhysicalPage::Ram { .. }) => MemoryRegionKind::Ram,
             Some(PhysicalPage::Mmio(_)) => MemoryRegionKind::Device,
             None => {
@@ -1929,17 +2283,29 @@ fn validate_data_access(
                 ));
             }
         };
-        if region.is_some_and(|first| first != current_region) {
+        Ok((mapping, region))
+    };
+    let (first, region) = resolve(address)?;
+    let second = if let Some(second_address) = second_address {
+        let (second, second_region) = resolve(second_address)?;
+        if region != second_region {
             return Err(DataAccessFault::new(
                 address_space,
-                current,
+                second_address,
                 kind,
                 DataAccessFaultReason::MixedRegions,
             ));
         }
-        region = Some(current_region);
-    }
-    Ok(())
+        Some(second)
+    } else {
+        None
+    };
+    Ok(ResolvedDataAccess {
+        first,
+        second,
+        first_bytes,
+        region,
+    })
 }
 
 #[cfg(test)]
@@ -1995,6 +2361,21 @@ mod tests {
                 page: PAGE_1,
                 generation: CodeGeneration::new(1)
             }]
+        );
+    }
+
+    #[test]
+    fn in_page_fetch_fast_path_preserves_precise_injected_faults() {
+        let mut memory = code_memory();
+        let fault_address = CODE.checked_add(2).unwrap();
+        memory.inject_instruction_fault(SPACE, fault_address, "middle-byte fault");
+
+        let fault = memory.fetch32(SPACE, CODE).unwrap_err();
+
+        assert_eq!(fault.address, fault_address);
+        assert_eq!(
+            fault.reason,
+            InstructionFetchFaultReason::Memory("middle-byte fault".into())
         );
     }
 
