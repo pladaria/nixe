@@ -4,7 +4,7 @@
 //! boundary. Window-system and host-GPU crates consume them without becoming
 //! dependencies of Horizon or the emulated runtime.
 
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -121,19 +121,46 @@ struct MailboxState {
 /// Publishing replaces an unconsumed older image. Presentation never applies
 /// back-pressure to the guest display clock merely because the host window is
 /// temporarily occluded or slow.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct FrameMailbox {
     state: Arc<Mutex<MailboxState>>,
+    notifier: Arc<dyn FrameNotifier>,
+}
+
+impl Debug for FrameMailbox {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FrameMailbox")
+            .field("statistics", &self.statistics())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for FrameMailbox {
+    fn default() -> Self {
+        Self::with_notifier(Arc::new(NoopFrameNotifier))
+    }
 }
 
 impl FrameMailbox {
+    #[must_use]
+    pub fn with_notifier(notifier: Arc<dyn FrameNotifier>) -> Self {
+        Self {
+            state: Arc::default(),
+            notifier,
+        }
+    }
+
     pub fn publish(&self, frame: Arc<Frame>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.published = state.published.saturating_add(1);
-        state.latest = Some(frame);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.published = state.published.saturating_add(1);
+            state.latest = Some(frame);
+        }
+        self.notifier.frame_available();
     }
 
     /// Takes the newest frame, if one has not already been consumed.
@@ -161,6 +188,20 @@ impl FrameMailbox {
             pending: state.latest.is_some(),
         }
     }
+}
+
+/// Host-specific wakeup invoked after a frame has been published.
+///
+/// Implementations must return promptly and must not consume the mailbox.
+pub trait FrameNotifier: Send + Sync {
+    fn frame_available(&self);
+}
+
+#[derive(Debug)]
+struct NoopFrameNotifier;
+
+impl FrameNotifier for NoopFrameNotifier {
+    fn frame_available(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -272,7 +313,18 @@ impl HeadlessFrameSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct CountingNotifier(AtomicU64);
+
+    impl FrameNotifier for CountingNotifier {
+        fn frame_available(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn frame_rejects_incomplete_storage() {
@@ -301,6 +353,18 @@ mod tests {
                 pending: false,
             }
         );
+    }
+
+    #[test]
+    fn mailbox_notifies_after_every_publication() {
+        let notifier = Arc::new(CountingNotifier::default());
+        let mailbox = FrameMailbox::with_notifier(notifier.clone());
+
+        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 1, vec![1]).unwrap()));
+        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 2, vec![2]).unwrap()));
+
+        assert_eq!(notifier.0.load(Ordering::Relaxed), 2);
+        assert_eq!(mailbox.take_latest().unwrap().sequence(), 2);
     }
 
     #[test]

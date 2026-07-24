@@ -3,9 +3,8 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
-use nixe_video::{Frame, FrameMailbox};
+use nixe_video::{Frame, FrameMailbox, FrameNotifier};
 use wgpu::{
     Backends, BindGroup, BindGroupLayout, Color, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor,
@@ -22,43 +21,107 @@ use wgpu::{
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-/// Main-thread frontend pumped cooperatively between bounded emulation slices.
+#[derive(Clone, Copy, Debug)]
+enum FrontendEvent {
+    FrameAvailable,
+    StopRequested,
+    WorkerFinished,
+}
+
+/// Thread-safe control channel into the main-thread window event loop.
+#[derive(Clone, Debug)]
+pub struct FrontendControl {
+    proxy: EventLoopProxy<FrontendEvent>,
+}
+
+impl FrontendControl {
+    /// Wakes the event loop after an external stop request such as Ctrl+C.
+    pub fn stop_requested(&self) {
+        let _ = self.proxy.send_event(FrontendEvent::StopRequested);
+    }
+
+    /// Reports that guest execution and process teardown have completed.
+    pub fn worker_finished(&self) {
+        let _ = self.proxy.send_event(FrontendEvent::WorkerFinished);
+    }
+}
+
+#[derive(Debug)]
+struct EventLoopFrameNotifier {
+    proxy: EventLoopProxy<FrontendEvent>,
+    pending: Arc<AtomicBool>,
+}
+
+impl FrameNotifier for EventLoopFrameNotifier {
+    fn frame_available(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel)
+            && self
+                .proxy
+                .send_event(FrontendEvent::FrameAvailable)
+                .is_err()
+        {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Main-thread owner of the native window and Vulkan presentation state.
 pub struct WindowFrontend {
-    event_loop: EventLoop<()>,
+    event_loop: EventLoop<FrontendEvent>,
     application: PresenterApplication,
+    control: FrontendControl,
 }
 
 impl WindowFrontend {
-    pub fn new(
-        mailbox: FrameMailbox,
-        stop_requested: Arc<AtomicBool>,
-    ) -> Result<Self, WindowError> {
-        let event_loop = EventLoop::new().map_err(WindowError::event_loop)?;
+    pub fn new(stop_requested: Arc<AtomicBool>) -> Result<Self, WindowError> {
+        let event_loop = EventLoop::<FrontendEvent>::with_user_event()
+            .build()
+            .map_err(WindowError::event_loop)?;
         event_loop.set_control_flow(ControlFlow::Wait);
+        let proxy = event_loop.create_proxy();
+        let frame_wakeup_pending = Arc::new(AtomicBool::new(false));
+        let mailbox = FrameMailbox::with_notifier(Arc::new(EventLoopFrameNotifier {
+            proxy: proxy.clone(),
+            pending: Arc::clone(&frame_wakeup_pending),
+        }));
         Ok(Self {
             event_loop,
             application: PresenterApplication {
                 mailbox,
                 stop_requested,
+                frame_wakeup_pending,
                 presenter: None,
                 failure: None,
             },
+            control: FrontendControl { proxy },
         })
     }
 
-    /// Dispatches pending native events without blocking guest execution.
-    pub fn pump(&mut self) -> Result<bool, WindowError> {
-        let status = self
-            .event_loop
-            .pump_app_events(Some(Duration::ZERO), &mut self.application);
-        if let Some(error) = self.application.failure.take() {
+    #[must_use]
+    pub fn mailbox(&self) -> FrameMailbox {
+        self.application.mailbox.clone()
+    }
+
+    #[must_use]
+    pub fn control(&self) -> FrontendControl {
+        self.control.clone()
+    }
+
+    /// Runs native event dispatch and Vulkan presentation on the calling thread.
+    pub fn run(self) -> Result<(), WindowError> {
+        let Self {
+            event_loop,
+            mut application,
+            control: _,
+        } = self;
+        let event_result = event_loop.run_app(&mut application);
+        if let Some(error) = application.failure.take() {
             return Err(error);
         }
-        Ok(matches!(status, PumpStatus::Continue))
+        event_result.map_err(WindowError::event_loop)
     }
 }
 
@@ -385,6 +448,7 @@ impl Presenter {
 struct PresenterApplication {
     mailbox: FrameMailbox,
     stop_requested: Arc<AtomicBool>,
+    frame_wakeup_pending: Arc<AtomicBool>,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
 }
@@ -401,9 +465,9 @@ impl PresenterApplication {
     }
 }
 
-impl ApplicationHandler for PresenterApplication {
+impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.presenter.is_some() {
+        if self.presenter.is_some() || self.failure.is_some() {
             return;
         }
         let attributes = WindowAttributes::default()
@@ -417,18 +481,35 @@ impl ApplicationHandler for PresenterApplication {
                     .map_err(WindowError::window)?,
             );
             self.presenter = Some(Presenter::new(window)?);
+            if self.mailbox.statistics().pending
+                && let Some(presenter) = &self.presenter
+            {
+                presenter.window.request_redraw();
+            }
             Ok(())
         })();
         if let Err(error) = result {
             self.failure = Some(error);
             self.stop_requested.store(true, Ordering::Release);
-            event_loop.exit();
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FrontendEvent) {
+        match event {
+            FrontendEvent::FrameAvailable => {
+                self.frame_wakeup_pending.store(false, Ordering::Release);
+                if let Some(presenter) = &self.presenter {
+                    presenter.window.request_redraw();
+                }
+            }
+            FrontendEvent::StopRequested => {}
+            FrontendEvent::WorkerFinished => event_loop.exit(),
         }
     }
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -442,7 +523,7 @@ impl ApplicationHandler for PresenterApplication {
         match event {
             WindowEvent::CloseRequested => {
                 self.stop_requested.store(true, Ordering::Release);
-                event_loop.exit();
+                self.presenter = None;
             }
             WindowEvent::Resized(size) => {
                 if let Some(presenter) = &mut self.presenter {
@@ -454,7 +535,7 @@ impl ApplicationHandler for PresenterApplication {
                 if let Err(error) = self.redraw() {
                     self.failure = Some(error);
                     self.stop_requested.store(true, Ordering::Release);
-                    event_loop.exit();
+                    self.presenter = None;
                 }
             }
             _ => {}
@@ -462,14 +543,7 @@ impl ApplicationHandler for PresenterApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.mailbox.statistics().pending
-            && let Some(presenter) = &self.presenter
-        {
-            presenter.window.request_redraw();
-        }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(8),
-        ));
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
