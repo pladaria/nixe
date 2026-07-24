@@ -143,8 +143,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let execution = execute(
         &mut process,
         instruction_trace,
-        &interrupted,
-        &window_close_requested,
+        HostStopSignals {
+            ctrl_c: &interrupted,
+            window_closed: &window_close_requested,
+        },
         initial_operation_mode,
         time_environment,
         video_system,
@@ -194,11 +196,16 @@ struct ExecutionSummary {
     rejected_svc_kinds: usize,
 }
 
+#[derive(Clone, Copy)]
+struct HostStopSignals<'a> {
+    ctrl_c: &'a AtomicBool,
+    window_closed: &'a AtomicBool,
+}
+
 fn execute(
     process: &mut RunnableProcess,
     print_trace: bool,
-    interrupted: &AtomicBool,
-    window_close_requested: &AtomicBool,
+    stop_signals: HostStopSignals<'_>,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
@@ -217,7 +224,7 @@ fn execute(
     loop {
         let window_running = window.pump().map_err(|error| error.to_string())?;
         dispatcher.advance_video(execution_started.elapsed());
-        if window_close_requested.load(Ordering::Acquire) {
+        if stop_signals.window_closed.load(Ordering::Acquire) {
             log::info!("video window closed; stopping the guest process cleanly");
             if !process.terminate() {
                 return Err(
@@ -227,7 +234,7 @@ fn execute(
             }
             return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
         }
-        if interrupted.load(Ordering::SeqCst) {
+        if stop_signals.ctrl_c.load(Ordering::SeqCst) {
             log::info!("Ctrl+C received; stopping the guest process cleanly");
             if !process.terminate() {
                 return Err(

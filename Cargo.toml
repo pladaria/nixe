@@ -24,15 +24,16 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 aes = "0.8.4"
+bytemuck = "1.22"
 chrono = "0.4.41"
 chrono-tz = "0.10.4"
 ctrlc = "3.4"
 getrandom = "0.4"
 lz4_flex = "0.11"
 log = "0.4"
+pollster = "0.4"
 ruzstd-zbic = { path = "crates/vendor/ruzstd-zbic" }
 sanitize-filename = "0.6"
-softbuffer = "0.4"
 sdl3 = { version = "=0.18.4", features = [
     "build-from-source",
     "build-from-source-unix-console",
@@ -51,6 +52,11 @@ nixe-loader-title = { path = "crates/loader/title" }
 nixe-runtime = { path = "crates/runtime" }
 nixe-video = { path = "crates/video" }
 nixe-video-winit = { path = "crates/video-winit" }
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "vulkan",
+    "wgsl",
+] }
 winit = "0.30"
 toml = "0.8"
 zstd = { version = "0.13", default-features = false }
