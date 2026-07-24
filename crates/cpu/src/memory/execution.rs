@@ -16,6 +16,7 @@ use crate::{
     vcpu::ExclusiveReservation,
 };
 
+use super::common::{install_error, page_offset};
 use super::{
     CodeDependencies, CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault,
     DataAccessFaultReason, DataAccessKind, DataReadResult, DataWriteResult, FetchedCode,
@@ -23,7 +24,7 @@ use super::{
     MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
     MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
     SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo,
-    SyntheticMmio, SyntheticRamPage, install_error, page_offset,
+    SyntheticMmio, SyntheticRamPage,
 };
 
 const PAGE_SHIFT: u32 = SYNTHETIC_PAGE_SIZE.trailing_zeros();
