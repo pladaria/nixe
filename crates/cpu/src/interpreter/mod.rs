@@ -85,7 +85,7 @@ pub struct InterpreterContext<'a> {
     process: ProcessCpuContext,
     memory: Option<&'a dyn CpuMemory>,
     exclusive_monitor: Option<&'a RefCell<crate::vcpu::ExclusiveMonitorState>>,
-    architectural_timer: Option<ArchitecturalTimerSnapshot>,
+    architectural_timer: Option<ArchitecturalTimerSource<'a>>,
 }
 
 /// One immutable architectural-timer observation supplied by the runtime.
@@ -93,6 +93,21 @@ pub struct InterpreterContext<'a> {
 pub struct ArchitecturalTimerSnapshot {
     pub counter: u64,
     pub frequency: u64,
+}
+
+/// Runtime provider for architectural timer observations.
+///
+/// The interpreter requests a snapshot only when an instruction actually
+/// reads an architectural timer register. This keeps host clock access out of
+/// the common instruction path.
+pub trait ArchitecturalTimer {
+    fn snapshot(&self) -> ArchitecturalTimerSnapshot;
+}
+
+#[derive(Clone, Copy)]
+enum ArchitecturalTimerSource<'a> {
+    Snapshot(ArchitecturalTimerSnapshot),
+    Provider(&'a dyn ArchitecturalTimer),
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -126,13 +141,25 @@ impl<'a> InterpreterContext<'a> {
         mut self,
         architectural_timer: ArchitecturalTimerSnapshot,
     ) -> Self {
-        self.architectural_timer = Some(architectural_timer);
+        self.architectural_timer = Some(ArchitecturalTimerSource::Snapshot(architectural_timer));
         self
     }
 
     #[must_use]
-    pub const fn architectural_timer(self) -> Option<ArchitecturalTimerSnapshot> {
-        self.architectural_timer
+    pub const fn with_architectural_timer_provider(
+        mut self,
+        architectural_timer: &'a dyn ArchitecturalTimer,
+    ) -> Self {
+        self.architectural_timer = Some(ArchitecturalTimerSource::Provider(architectural_timer));
+        self
+    }
+
+    #[must_use]
+    pub fn architectural_timer(self) -> Option<ArchitecturalTimerSnapshot> {
+        match self.architectural_timer? {
+            ArchitecturalTimerSource::Snapshot(snapshot) => Some(snapshot),
+            ArchitecturalTimerSource::Provider(provider) => Some(provider.snapshot()),
+        }
     }
 
     #[must_use]

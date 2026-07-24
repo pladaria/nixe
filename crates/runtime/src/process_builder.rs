@@ -9,7 +9,7 @@ use nixe_cpu::ir::block::IrBlock;
 use nixe_cpu::ir::print::{IrPrintOptions, print_block};
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::memory::{
-    MemoryMappingPurpose, MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory, SyntheticRamPage,
+    ExecutionMemory, MemoryMappingPurpose, MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticRamPage,
 };
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
@@ -322,7 +322,7 @@ pub struct RunnableProcess {
     random_entropy: [u64; 4],
     heap_size: u64,
     initial_memory_size: u64,
-    memory: SyntheticMemory,
+    memory: ExecutionMemory,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
     main_thread: MainThread,
@@ -359,7 +359,7 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub const fn memory(&self) -> &SyntheticMemory {
+    pub const fn memory(&self) -> &ExecutionMemory {
         &self.memory
     }
 
@@ -903,7 +903,7 @@ impl ProcessBuilder {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
         })?;
 
-        let mut memory = SyntheticMemory::new();
+        let mut memory = ExecutionMemory::new();
         for module in &modules {
             install_prepared_module(&mut memory, self.config.address_space_id, module)
                 .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
@@ -1176,7 +1176,7 @@ fn prepare_modules(
 }
 
 fn install_zero_pages(
-    memory: &mut SyntheticMemory,
+    memory: &mut ExecutionMemory,
     address_space: AddressSpaceId,
     start: GuestVirtualAddress,
     size: u64,
@@ -1203,7 +1203,7 @@ fn install_zero_pages(
 }
 
 fn install_homebrew_context(
-    memory: &mut SyntheticMemory,
+    memory: &mut ExecutionMemory,
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     main_thread_handle: u32,
@@ -1226,7 +1226,7 @@ fn install_homebrew_context(
 }
 
 fn install_homebrew_loader_return(
-    memory: &mut SyntheticMemory,
+    memory: &mut ExecutionMemory,
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {
