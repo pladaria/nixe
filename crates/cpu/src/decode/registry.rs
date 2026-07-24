@@ -37,7 +37,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0048..=0x0000_004b
                     | 0x0000_004e..=0x0000_0058
                     | 0x0000_0059..=0x0000_005d
-                    | 0x0000_0060..=0x0000_0064
+                    | 0x0000_0060..=0x0000_0069
             ) =>
         {
             IMPLEMENTED
@@ -91,7 +91,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                 | 0x0000_0010..=0x0000_001d
                 | 0x0000_0022..=0x0000_002a
                 | 0x0000_004c..=0x0000_004d
-                | 0x0000_0060..=0x0000_0064
+                | 0x0000_0060..=0x0000_0065
         )
     {
         interpreter = ENCODING_DEPENDENT;
@@ -263,6 +263,15 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         }
         0x0000_0062 | 0x0000_0063 => validate_a64_simd_single_structure(bits),
         0x0000_0064 => validate_a64_simd_permute_two_source(bits),
+        0x0000_0065 => {
+            let immediate_high = (bits >> 19) & 0xf;
+            if immediate_high == 0 {
+                AllocationStatus::Reserved("SIMD narrow shift has no element-size bit")
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
+        0x0000_0066..=0x0000_0069 => validate_a64_simd_min_max_pairwise(bits),
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
             let size = (bits >> 30) as u8;
             let opc = ((bits >> 22) & 3) as u8;

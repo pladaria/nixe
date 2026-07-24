@@ -195,6 +195,40 @@ impl ReadableEventObject {
     }
 }
 
+/// Guest-owned memory range exported through a Horizon transfer-memory handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferMemoryObject {
+    address: u64,
+    size: u64,
+    permissions: MemoryPermissions,
+}
+
+impl TransferMemoryObject {
+    #[must_use]
+    pub const fn new(address: u64, size: u64, permissions: MemoryPermissions) -> Self {
+        Self {
+            address,
+            size,
+            permissions,
+        }
+    }
+
+    #[must_use]
+    pub const fn address(self) -> u64 {
+        self.address
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub const fn permissions(self) -> MemoryPermissions {
+        self.permissions
+    }
+}
+
 /// Endpoint role of one process-local session pair.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionEndpoint {

@@ -12,6 +12,7 @@ nixe-cpu.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-runtime.workspace = true
+nixe-video.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
