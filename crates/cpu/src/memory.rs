@@ -1,4 +1,4 @@
-//! Portable CPU memory contracts and a synthetic implementation for tests.
+//! Portable CPU memory contracts and deterministic/production implementations.
 //!
 //! Frontends fetch from the final process address space through these traits.
 //! They never consume loader images, file storage, or mutable host pointers.
@@ -14,7 +14,7 @@ use crate::{
     error::{InstructionFetchFault, InstructionFetchFaultReason},
 };
 
-/// Page size used by [`SyntheticMemory`].
+/// Page size used by the synthetic and production memory backends.
 pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
 
 /// Stage of an atomic synthetic RAM installation.
@@ -792,18 +792,9 @@ impl Default for SyntheticMemoryInner {
 ///
 /// Its APIs expose copies, identities, and callbacks only; no raw mutable host
 /// pointer crosses the CPU/memory boundary.
+#[derive(Default)]
 pub struct SyntheticMemory {
     inner: RefCell<SyntheticMemoryInner>,
-    fault_injection_enabled: bool,
-}
-
-impl Default for SyntheticMemory {
-    fn default() -> Self {
-        Self {
-            inner: RefCell::default(),
-            fault_injection_enabled: true,
-        }
-    }
 }
 
 impl SyntheticMemory {
@@ -811,13 +802,6 @@ impl SyntheticMemory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn for_execution() -> Self {
-        Self {
-            inner: RefCell::default(),
-            fault_injection_enabled: false,
-        }
     }
 
     /// Atomically creates, initializes, and publishes ordinary RAM pages.
@@ -1151,8 +1135,7 @@ impl SyntheticMemory {
         let inner = self.inner.borrow();
         let end_offset = page_offset(address) + N;
         if end_offset <= SYNTHETIC_PAGE_SIZE {
-            if self.fault_injection_enabled
-                && !inner.instruction_faults.is_empty()
+            if !inner.instruction_faults.is_empty()
                 && let Some((fault_address, reason)) = (0..N).find_map(|index| {
                     let current = address.checked_add(index as u64)?;
                     inner
@@ -1215,9 +1198,7 @@ impl SyntheticMemory {
                     InstructionFetchFaultReason::AddressOverflow,
                 ));
             };
-            if self.fault_injection_enabled
-                && let Some(reason) = inner.instruction_faults.get(&(address_space, current))
-            {
+            if let Some(reason) = inner.instruction_faults.get(&(address_space, current)) {
                 return Err(InstructionFetchFault::new(
                     address_space,
                     current,
@@ -1361,11 +1342,9 @@ impl CpuMemory for SyntheticMemory {
         let mut inner = self.inner.borrow_mut();
         let resolved =
             resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
-        if self.fault_injection_enabled
-            && let Some(reason) =
-                inner
-                    .data_faults
-                    .get(&(address_space, address, DataAccessKind::Read))
+        if let Some(reason) = inner
+            .data_faults
+            .get(&(address_space, address, DataAccessKind::Read))
         {
             return Err(DataAccessFault::new(
                 address_space,
@@ -1485,11 +1464,10 @@ impl CpuMemory for SyntheticMemory {
             access,
             DataAccessKind::Write,
         )?;
-        if self.fault_injection_enabled
-            && let Some(reason) =
-                inner
-                    .data_faults
-                    .get(&(address_space, address, DataAccessKind::Write))
+        if let Some(reason) =
+            inner
+                .data_faults
+                .get(&(address_space, address, DataAccessKind::Write))
         {
             return Err(DataAccessFault::new(
                 address_space,
@@ -1971,203 +1949,9 @@ impl ProcessMemory for SyntheticMemory {
     }
 }
 
-/// Process-memory backend used by normal guest execution.
-///
-/// It shares the reference backend's mapping and fault semantics while
-/// permanently removing deterministic fault-injection lookups from hot paths.
-/// Keeping the shared core makes conformance changes apply to both backends;
-/// [`SyntheticMemory`] remains the test-facing backend and differential oracle.
-pub struct ExecutionMemory {
-    memory: SyntheticMemory,
-}
+mod execution;
 
-impl Default for ExecutionMemory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ExecutionMemory {
-    /// Creates an empty production process address space.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            memory: SyntheticMemory::for_execution(),
-        }
-    }
-
-    /// Atomically installs initialized RAM pages without test fault injection.
-    pub fn install_ram_pages_atomic(
-        &mut self,
-        address_space: AddressSpaceId,
-        requests: &[SyntheticRamPage<'_>],
-    ) -> Result<(), SyntheticInstallError> {
-        self.memory
-            .install_ram_pages_atomic(address_space, requests)
-    }
-
-    /// Returns the observable mapping state used by runtime diagnostics.
-    #[must_use]
-    pub fn mapping_info(
-        &self,
-        address_space: AddressSpaceId,
-        virtual_address: GuestVirtualAddress,
-    ) -> Option<SyntheticMappingInfo> {
-        self.memory.mapping_info(address_space, virtual_address)
-    }
-
-    /// Updates the runtime-owned purpose of a complete mapped range.
-    pub fn set_mapping_purpose(
-        &mut self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        size: u64,
-        purpose: MemoryMappingPurpose,
-    ) -> bool {
-        self.memory
-            .set_mapping_purpose(address_space, start, size, purpose)
-    }
-
-    /// Returns the number of physical pages owned by this address space.
-    #[must_use]
-    pub fn physical_page_count(&self) -> usize {
-        self.memory.physical_page_count()
-    }
-
-    /// Publishes an alias mapping for an existing physical page.
-    pub fn map_page(
-        &mut self,
-        address_space: AddressSpaceId,
-        virtual_address: GuestVirtualAddress,
-        physical_page: GuestPhysicalPageId,
-        permissions: MemoryPermissions,
-    ) -> bool {
-        self.memory
-            .map_page(address_space, virtual_address, physical_page, permissions)
-    }
-}
-
-impl InstructionMemory for ExecutionMemory {
-    fn code_page_span(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<CodePageSpan, InstructionFetchFault> {
-        self.memory.code_page_span(address_space, address)
-    }
-
-    fn fetch16(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u16>, InstructionFetchFault> {
-        self.memory.fetch16(address_space, address)
-    }
-
-    fn fetch32(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        self.memory.fetch32(address_space, address)
-    }
-}
-
-impl CpuMemory for ExecutionMemory {
-    fn read(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-    ) -> Result<DataReadResult, DataAccessFault> {
-        self.memory.read(address_space, address, access)
-    }
-
-    fn write(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        value: MemoryValue,
-    ) -> Result<DataWriteResult, DataAccessFault> {
-        self.memory.write(address_space, address, access, value)
-    }
-
-    fn query_memory(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        end_exclusive: GuestVirtualAddress,
-    ) -> Option<MemoryQueryResult> {
-        self.memory
-            .query_memory(address_space, address, end_exclusive)
-    }
-
-    fn load_exclusive(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault> {
-        self.memory.load_exclusive(address_space, address, access)
-    }
-
-    fn store_exclusive(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        value: MemoryValue,
-        reservation: crate::vcpu::ExclusiveReservation,
-    ) -> Result<(DataWriteResult, bool), DataAccessFault> {
-        self.memory
-            .store_exclusive(address_space, address, access, value, reservation)
-    }
-}
-
-impl ProcessMemory for ExecutionMemory {
-    fn resize_zeroed_mapping(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        old_size: u64,
-        new_size: u64,
-        permissions: MemoryPermissions,
-        purpose: MemoryMappingPurpose,
-    ) -> Result<(), MemoryMappingError> {
-        self.memory.resize_zeroed_mapping(
-            address_space,
-            start,
-            old_size,
-            new_size,
-            permissions,
-            purpose,
-        )
-    }
-
-    fn set_permissions(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        size: u64,
-        permissions: MemoryPermissions,
-    ) -> Result<(), MemoryProtectionError> {
-        self.memory
-            .set_permissions(address_space, start, size, permissions)
-    }
-
-    fn set_attributes(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        size: u64,
-        mask: MemoryAttributes,
-        value: MemoryAttributes,
-    ) -> Result<(), MemoryProtectionError> {
-        self.memory
-            .set_attributes(address_space, start, size, mask, value)
-    }
-}
+pub use execution::ExecutionMemory;
 
 fn synthetic_mapping_state(
     inner: &SyntheticMemoryInner,
@@ -2831,6 +2615,375 @@ mod tests {
                 .unwrap()
                 .value,
             MemoryValue::U32(0x1122_3344),
+        );
+    }
+
+    fn paired_ram_memory() -> (SyntheticMemory, ExecutionMemory) {
+        let mut synthetic = SyntheticMemory::new();
+        let mut execution = ExecutionMemory::new();
+        for page in [PAGE_1, PAGE_2] {
+            assert!(synthetic.add_ram_page(page));
+            assert!(execution.add_ram_page(page));
+        }
+        let first = [0x1f, 0x20, 0x03, 0xd5];
+        let second = [0x00, 0xf0, 0x01, 0xf8];
+        assert!(synthetic.initialize_ram(PAGE_1, 0, &first));
+        assert!(execution.initialize_ram(PAGE_1, 0, &first));
+        assert!(synthetic.initialize_ram(PAGE_1, SYNTHETIC_PAGE_SIZE - 2, &second[..2]));
+        assert!(execution.initialize_ram(PAGE_1, SYNTHETIC_PAGE_SIZE - 2, &second[..2]));
+        assert!(synthetic.initialize_ram(PAGE_2, 0, &second[2..]));
+        assert!(execution.initialize_ram(PAGE_2, 0, &second[2..]));
+        for memory in [
+            &mut synthetic as &mut dyn DifferentialMemorySetup,
+            &mut execution,
+        ] {
+            assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
+            assert!(memory.map_page(
+                SPACE,
+                GuestVirtualAddress::new(0x2000),
+                PAGE_2,
+                MemoryPermissions::READ_EXECUTE
+            ));
+            assert!(memory.map_page(SPACE, ALIAS, PAGE_1, MemoryPermissions::READ_WRITE));
+        }
+        (synthetic, execution)
+    }
+
+    trait DifferentialMemorySetup {
+        fn map_page(
+            &mut self,
+            address_space: AddressSpaceId,
+            address: GuestVirtualAddress,
+            page: GuestPhysicalPageId,
+            permissions: MemoryPermissions,
+        ) -> bool;
+    }
+
+    impl DifferentialMemorySetup for SyntheticMemory {
+        fn map_page(
+            &mut self,
+            address_space: AddressSpaceId,
+            address: GuestVirtualAddress,
+            page: GuestPhysicalPageId,
+            permissions: MemoryPermissions,
+        ) -> bool {
+            Self::map_page(self, address_space, address, page, permissions)
+        }
+    }
+
+    impl DifferentialMemorySetup for ExecutionMemory {
+        fn map_page(
+            &mut self,
+            address_space: AddressSpaceId,
+            address: GuestVirtualAddress,
+            page: GuestPhysicalPageId,
+            permissions: MemoryPermissions,
+        ) -> bool {
+            Self::map_page(self, address_space, address, page, permissions)
+        }
+    }
+
+    #[test]
+    fn production_and_synthetic_ram_paths_are_observably_equivalent() {
+        let (mut synthetic, mut execution) = paired_ram_memory();
+
+        assert_eq!(
+            synthetic.fetch32(SPACE, CODE),
+            execution.fetch32(SPACE, CODE)
+        );
+        assert_eq!(
+            synthetic.mapping_info(SPACE, ALIAS),
+            execution.mapping_info(SPACE, ALIAS)
+        );
+        let thumb_address = GuestVirtualAddress::new(0x1ffe);
+        assert_eq!(
+            synthetic.fetch_t32_32(SPACE, thumb_address),
+            execution.fetch_t32_32(SPACE, thumb_address)
+        );
+        for address in [
+            CODE.checked_add(2).unwrap(),
+            GuestVirtualAddress::new(0x9000),
+            ALIAS,
+        ] {
+            assert_eq!(
+                synthetic.fetch32(SPACE, address),
+                execution.fetch32(SPACE, address)
+            );
+        }
+
+        let unaligned_word = MemoryAccess::new(
+            MemoryAccessSize::Word,
+            MemoryAlignment::Unaligned,
+            MemoryOrdering::Relaxed,
+            MemoryAccessClass::Normal,
+        );
+        let cross_page = GuestVirtualAddress::new(0x1ffe);
+        let data_space = AddressSpaceId::new(8);
+        for memory in [
+            &mut synthetic as &mut dyn DifferentialMemorySetup,
+            &mut execution,
+        ] {
+            assert!(memory.map_page(data_space, CODE, PAGE_1, MemoryPermissions::READ_WRITE));
+            assert!(memory.map_page(
+                data_space,
+                GuestVirtualAddress::new(0x2000),
+                PAGE_2,
+                MemoryPermissions::READ
+            ));
+        }
+        assert_eq!(
+            synthetic.read(data_space, cross_page, unaligned_word),
+            execution.read(data_space, cross_page, unaligned_word)
+        );
+        let synthetic_fault = synthetic
+            .write(
+                data_space,
+                cross_page,
+                unaligned_word,
+                MemoryValue::U32(0x1122_3344),
+            )
+            .unwrap_err();
+        let execution_fault = execution
+            .write(
+                data_space,
+                cross_page,
+                unaligned_word,
+                MemoryValue::U32(0x1122_3344),
+            )
+            .unwrap_err();
+        assert_eq!(synthetic_fault, execution_fault);
+        assert_eq!(execution_fault.address, GuestVirtualAddress::new(0x2000));
+        assert_eq!(
+            execution_fault.reason,
+            DataAccessFaultReason::WritePermissionDenied
+        );
+        assert_eq!(
+            synthetic.read(data_space, cross_page, unaligned_word),
+            execution.read(data_space, cross_page, unaligned_word),
+            "a cross-page store fault must not commit its first bytes"
+        );
+
+        assert_eq!(
+            synthetic.write(
+                SPACE,
+                ALIAS,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0xaabb_ccdd)
+            ),
+            execution.write(
+                SPACE,
+                ALIAS,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0xaabb_ccdd)
+            )
+        );
+
+        let before_synthetic = synthetic.fetch32(SPACE, CODE).unwrap();
+        let before_execution = execution.fetch32(SPACE, CODE).unwrap();
+        let write = MemoryAccess::normal(MemoryAccessSize::Word);
+        assert_eq!(
+            synthetic.write(SPACE, ALIAS, write, MemoryValue::U32(0x5566_7788)),
+            execution.write(SPACE, ALIAS, write, MemoryValue::U32(0x5566_7788))
+        );
+        let after_synthetic = synthetic.fetch32(SPACE, CODE).unwrap();
+        let after_execution = execution.fetch32(SPACE, CODE).unwrap();
+        assert_eq!(before_synthetic, before_execution);
+        assert_eq!(after_synthetic, after_execution);
+        assert_ne!(
+            before_execution.dependencies, after_execution.dependencies,
+            "a write through a non-executable alias must invalidate fetched code"
+        );
+    }
+
+    #[test]
+    fn production_and_synthetic_mapping_management_and_exclusives_match() {
+        let mut synthetic = SyntheticMemory::new();
+        let mut execution = ExecutionMemory::new();
+        let base = GuestVirtualAddress::new(0x40_0000);
+        let size = (SYNTHETIC_PAGE_SIZE * 3) as u64;
+        for memory in [
+            &synthetic as &dyn ProcessMemory,
+            &execution as &dyn ProcessMemory,
+        ] {
+            memory
+                .resize_zeroed_mapping(
+                    SPACE,
+                    base,
+                    0,
+                    size,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+        }
+        assert!(synthetic.set_mapping_purpose(SPACE, base, size, MemoryMappingPurpose::Heap));
+        assert!(execution.set_mapping_purpose(SPACE, base, size, MemoryMappingPurpose::Heap));
+        assert_eq!(
+            synthetic.query_memory(SPACE, base, GuestVirtualAddress::new(0x80_0000)),
+            execution.query_memory(SPACE, base, GuestVirtualAddress::new(0x80_0000))
+        );
+        assert_eq!(
+            synthetic.read(SPACE, base, MemoryAccess::normal(MemoryAccessSize::Word)),
+            execution.read(SPACE, base, MemoryAccess::normal(MemoryAccessSize::Word))
+        );
+
+        let access = MemoryAccess::normal(MemoryAccessSize::Word);
+        let (synthetic_value, synthetic_reservation) =
+            synthetic.load_exclusive(SPACE, base, access).unwrap();
+        let (execution_value, execution_reservation) =
+            execution.load_exclusive(SPACE, base, access).unwrap();
+        assert_eq!(synthetic_value, execution_value);
+        assert_eq!(synthetic_reservation, execution_reservation);
+        assert_eq!(
+            synthetic.store_exclusive(
+                SPACE,
+                base,
+                access,
+                MemoryValue::U32(0x1234_5678),
+                synthetic_reservation,
+            ),
+            execution.store_exclusive(
+                SPACE,
+                base,
+                access,
+                MemoryValue::U32(0x1234_5678),
+                execution_reservation,
+            )
+        );
+
+        assert_eq!(
+            synthetic.resize_zeroed_mapping(
+                SPACE,
+                base,
+                size,
+                SYNTHETIC_PAGE_SIZE as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            ),
+            execution.resize_zeroed_mapping(
+                SPACE,
+                base,
+                size,
+                SYNTHETIC_PAGE_SIZE as u64,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+        );
+        assert_eq!(synthetic.physical_page_count(), 1);
+        assert_eq!(
+            synthetic.physical_page_count(),
+            execution.physical_page_count()
+        );
+
+        for memory in [
+            &synthetic as &dyn ProcessMemory,
+            &execution as &dyn ProcessMemory,
+        ] {
+            memory
+                .set_attributes(
+                    SPACE,
+                    base,
+                    SYNTHETIC_PAGE_SIZE as u64,
+                    MemoryAttributes::UNCACHED,
+                    MemoryAttributes::UNCACHED,
+                )
+                .unwrap();
+            memory
+                .set_permissions(
+                    SPACE,
+                    base,
+                    SYNTHETIC_PAGE_SIZE as u64,
+                    MemoryPermissions::READ,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            synthetic.query_memory(SPACE, base, GuestVirtualAddress::new(0x80_0000)),
+            execution.query_memory(SPACE, base, GuestVirtualAddress::new(0x80_0000))
+        );
+    }
+
+    #[test]
+    fn production_and_synthetic_atomic_install_fail_without_partial_publication() {
+        let bytes = [0x5a; SYNTHETIC_PAGE_SIZE];
+        let request = SyntheticRamPage {
+            virtual_address: CODE,
+            bytes: &bytes,
+            permissions: MemoryPermissions::READ_EXECUTE,
+        };
+        let mut synthetic = SyntheticMemory::new();
+        let mut execution = ExecutionMemory::new();
+
+        let synthetic_error = synthetic
+            .install_ram_pages_atomic(SPACE, &[request, request])
+            .unwrap_err();
+        let execution_error = execution
+            .install_ram_pages_atomic(SPACE, &[request, request])
+            .unwrap_err();
+        assert_eq!(synthetic_error, execution_error);
+        assert_eq!(synthetic.physical_page_count(), 0);
+        assert_eq!(execution.physical_page_count(), 0);
+        assert!(synthetic.mapping_info(SPACE, CODE).is_none());
+        assert!(execution.mapping_info(SPACE, CODE).is_none());
+
+        synthetic
+            .install_ram_pages_atomic(SPACE, &[request])
+            .unwrap();
+        execution
+            .install_ram_pages_atomic(SPACE, &[request])
+            .unwrap();
+        assert_eq!(
+            synthetic.fetch32(SPACE, CODE),
+            execution.fetch32(SPACE, CODE)
+        );
+        assert_eq!(
+            synthetic.install_ram_pages_atomic(SPACE, &[request]),
+            execution.install_ram_pages_atomic(SPACE, &[request])
+        );
+        assert_eq!(synthetic.physical_page_count(), 1);
+        assert_eq!(execution.physical_page_count(), 1);
+    }
+
+    #[test]
+    fn production_and_synthetic_mmio_callbacks_match() {
+        let page = GuestPhysicalPageId::new(99);
+        let address = GuestVirtualAddress::new(0x90_0000);
+        let synthetic_events = Arc::new(Mutex::new(Vec::new()));
+        let execution_events = Arc::new(Mutex::new(Vec::new()));
+        let mut synthetic = SyntheticMemory::new();
+        let mut execution = ExecutionMemory::new();
+        assert!(synthetic.add_mmio_page(
+            page,
+            RecordingMmio {
+                events: Arc::clone(&synthetic_events)
+            }
+        ));
+        assert!(execution.add_mmio_page(
+            page,
+            RecordingMmio {
+                events: Arc::clone(&execution_events)
+            }
+        ));
+        assert!(synthetic.map_page(SPACE, address, page, MemoryPermissions::READ_WRITE));
+        assert!(execution.map_page(SPACE, address, page, MemoryPermissions::READ_WRITE));
+        let access = MemoryAccess::new(
+            MemoryAccessSize::Word,
+            MemoryAlignment::Natural,
+            MemoryOrdering::AcquireRelease,
+            MemoryAccessClass::Volatile,
+        );
+
+        assert_eq!(
+            synthetic.read(SPACE, address, access),
+            execution.read(SPACE, address, access)
+        );
+        assert_eq!(
+            synthetic.write(SPACE, address, access, MemoryValue::U32(7)),
+            execution.write(SPACE, address, access, MemoryValue::U32(7))
+        );
+        assert_eq!(
+            *synthetic_events.lock().unwrap(),
+            *execution_events.lock().unwrap()
         );
     }
 }

@@ -575,7 +575,8 @@ pub(crate) fn run_reference(
             .with_memory(memory)
             .with_exclusive_monitor(control.vcpu.exclusive_monitor_cell())
             .with_architectural_timer_provider(&architectural_timer);
-        let outcome = match execute_one_with_context(context, state, encoding) {
+        let execution_result = execute_one_with_context(context, state, encoding);
+        let outcome = match execution_result {
             Ok(outcome) => outcome,
             Err(InterpreterError::UnsupportedInstruction {
                 source,

@@ -19,6 +19,9 @@ documentation, commits, etc.
 ## Contribution Principles
 
 - Prefer correctness and clear behavior over premature optimization.
+- If an emulated service or component lacks required semantics, stop the emulator with a typed host-side error.
+  Never hide missing implementation with a guest-visible error or fabricated data; guest-visible failures are valid
+  only when they faithfully model the emulated system.
 - Add tests for new behavior whenever practical.
 - When an implementation relies on external references, record those references in nearby code comments and link
   to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.

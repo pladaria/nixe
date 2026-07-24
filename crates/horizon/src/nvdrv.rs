@@ -1,6 +1,7 @@
 //! Minimal `nvdrv` and `/dev/nvmap` state for CPU-produced display buffers.
 
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
@@ -9,17 +10,70 @@ const IOCTL_NVMAP_ALLOC: u32 = 0xc020_0104;
 const IOCTL_NVMAP_FREE: u32 = 0xc018_0105;
 const IOCTL_NVMAP_PARAM: u32 = 0xc00c_0109;
 const IOCTL_NVMAP_GET_ID: u32 = 0xc008_010e;
+const IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE: u32 = 0x8004_4701;
+const IOCTL_CTRL_GPU_ZCULL_GET_INFO: u32 = 0x8028_4702;
+const IOCTL_CTRL_GPU_GET_CHARACTERISTICS: u32 = 0xc0b0_4705;
 
 pub(crate) const NV_SUCCESS: u32 = 0;
-pub(crate) const NV_NOT_IMPLEMENTED: u32 = 1;
 pub(crate) const NV_NOT_INITIALIZED: u32 = 3;
 pub(crate) const NV_BAD_PARAMETER: u32 = 4;
 pub(crate) const NV_INVALID_STATE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeviceKind {
-    NvMap,
-    NvHostCtrl,
+    Map,
+    HostCtrl,
+    HostCtrlGpu,
+}
+
+impl DeviceKind {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Map => "/dev/nvmap",
+            Self::HostCtrl => "/dev/nvhost-ctrl",
+            Self::HostCtrlGpu => "/dev/nvhost-ctrl-gpu",
+        }
+    }
+}
+
+/// An `nvdrv` operation for which Nixe cannot yet provide faithful semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnsupportedNvDrvOperation {
+    OpenDevice { path: Box<[u8]> },
+    ServiceCommand { command_id: u32 },
+    Ioctl { device: &'static str, request: u32 },
+}
+
+impl Display for UnsupportedNvDrvOperation {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenDevice { path } => write!(
+                formatter,
+                "nvdrv device open is not implemented: path={:?}",
+                String::from_utf8_lossy(path)
+            ),
+            Self::ServiceCommand { command_id } => write!(
+                formatter,
+                "nvdrv service command is not implemented: command={command_id}"
+            ),
+            Self::Ioctl { device, request } => write!(
+                formatter,
+                "nvdrv ioctl is not implemented: device={device} request={request:#010x}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NvDrvCallError {
+    GuestResult(u32),
+    Unsupported(UnsupportedNvDrvOperation),
+}
+
+impl From<u32> for NvDrvCallError {
+    fn from(result: u32) -> Self {
+        Self::GuestResult(result)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,21 +131,32 @@ impl NvDrvSession {
             .initialized = true;
     }
 
-    pub(crate) fn open(&self, path: &[u8]) -> Result<u32, u32> {
+    pub(crate) fn open(&self, path: &[u8]) -> Result<u32, NvDrvCallError> {
         let kind = match path {
-            b"/dev/nvmap" => DeviceKind::NvMap,
-            b"/dev/nvhost-ctrl" => DeviceKind::NvHostCtrl,
-            _ => return Err(NV_NOT_IMPLEMENTED),
+            b"/dev/nvmap" => DeviceKind::Map,
+            b"/dev/nvhost-ctrl" => DeviceKind::HostCtrl,
+            // Device path used by libnx's GPU-characteristics and Z-cull
+            // wrappers:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c
+            b"/dev/nvhost-ctrl-gpu" => DeviceKind::HostCtrlGpu,
+            _ => {
+                return Err(NvDrvCallError::Unsupported(
+                    UnsupportedNvDrvOperation::OpenDevice { path: path.into() },
+                ));
+            }
         };
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.initialized {
-            return Err(NV_NOT_INITIALIZED);
+            return Err(NvDrvCallError::GuestResult(NV_NOT_INITIALIZED));
         }
         let fd = state.next_fd;
-        state.next_fd = state.next_fd.checked_add(1).ok_or(NV_INVALID_STATE)?;
+        state.next_fd = state
+            .next_fd
+            .checked_add(1)
+            .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
         state.devices.insert(fd, kind);
         Ok(fd)
     }
@@ -111,17 +176,31 @@ impl NvDrvSession {
         }
     }
 
-    pub(crate) fn ioctl(&self, fd: u32, request: u32, input: &[u8]) -> (Vec<u8>, u32) {
+    pub(crate) fn ioctl(
+        &self,
+        fd: u32,
+        request: u32,
+        input: &[u8],
+    ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.devices.get(&fd) != Some(&DeviceKind::NvMap) {
-            return (input.to_vec(), NV_NOT_IMPLEMENTED);
-        }
-        match ioctl_nvmap(&mut state, request, input) {
-            Ok(output) => (output, NV_SUCCESS),
-            Err(error) => (input.to_vec(), error),
+        let result = match state.devices.get(&fd).copied() {
+            Some(DeviceKind::Map) => ioctl_nvmap(&mut state, request, input),
+            Some(DeviceKind::HostCtrlGpu) => ioctl_nvhost_ctrl_gpu(request, input),
+            Some(device) => Err(NvDrvCallError::Unsupported(
+                UnsupportedNvDrvOperation::Ioctl {
+                    device: device.path(),
+                    request,
+                },
+            )),
+            None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
+        };
+        match result {
+            Ok(output) => Ok((output, NV_SUCCESS)),
+            Err(NvDrvCallError::GuestResult(error)) => Ok((input.to_vec(), error)),
+            Err(NvDrvCallError::Unsupported(operation)) => Err(operation),
         }
     }
 
@@ -137,12 +216,86 @@ impl NvDrvSession {
     }
 }
 
-fn ioctl_nvmap(state: &mut NvDrvState, request: u32, input: &[u8]) -> Result<Vec<u8>, u32> {
+fn ioctl_nvhost_ctrl_gpu(request: u32, input: &[u8]) -> Result<Vec<u8>, NvDrvCallError> {
+    match request {
+        IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE => {
+            let mut output = sized_output(input, 4);
+            // GM20B exposes one Z-cull context unit. The ABI wrapper and exact
+            // four-byte result layout are pinned here:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c#L6-L21
+            write_u32(&mut output, 0, 1)?;
+            Ok(output)
+        }
+        IOCTL_CTRL_GPU_ZCULL_GET_INFO => {
+            let mut output = sized_output(input, 40);
+            // Exact Tegra X1 Z-cull geometry:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/ioctl.h#L47-L58
+            for (index, value) in [0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10]
+                .into_iter()
+                .enumerate()
+            {
+                write_u32(&mut output, index * 4, value)?;
+            }
+            Ok(output)
+        }
+        IOCTL_CTRL_GPU_GET_CHARACTERISTICS => {
+            // Exact GM20B/Tegra X1 field layout and hardware values:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/ioctl.h#L71-L106
+            const CHARACTERISTICS_SIZE: usize = 0xa0;
+            const REQUEST_SIZE: usize = 0x10 + CHARACTERISTICS_SIZE;
+            if input.len() < REQUEST_SIZE {
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+            }
+            let mut output = sized_output(input, REQUEST_SIZE);
+            write_u64(&mut output, 0, CHARACTERISTICS_SIZE as u64)?;
+            let mut offset = 0x10;
+            for value in [0x120, 0xb, 0xa1, 1] {
+                write_u32(&mut output, offset, value)?;
+                offset += 4;
+            }
+            for value in [0x4_0000_u64, 0] {
+                write_u64(&mut output, offset, value)?;
+                offset += 8;
+            }
+            for value in [
+                2, 0x20, 0x2_0000, 0x2_0000, 0x1b, 0x3_0000, 1, 0x503, 0x503, 0x80, 0x28, 0,
+            ] {
+                write_u32(&mut output, offset, value)?;
+                offset += 4;
+            }
+            write_u64(&mut output, offset, 0x55)?;
+            offset += 8;
+            for value in [
+                0x902d, 0xb197, 0xb1c0, 0xb06f, 0xa140, 0xb0b5, 1, 0, 2, 1, 0, 1, 0x2_1d70, 0,
+            ] {
+                write_u32(&mut output, offset, value)?;
+                offset += 4;
+            }
+            write_u64(&mut output, offset, 0x62_30_32_6d_67)?;
+            offset += 8;
+            write_u64(&mut output, offset, 0)?;
+            debug_assert_eq!(offset + 8, REQUEST_SIZE);
+            Ok(output)
+        }
+        _ => Err(NvDrvCallError::Unsupported(
+            UnsupportedNvDrvOperation::Ioctl {
+                device: DeviceKind::HostCtrlGpu.path(),
+                request,
+            },
+        )),
+    }
+}
+
+fn ioctl_nvmap(
+    state: &mut NvDrvState,
+    request: u32,
+    input: &[u8],
+) -> Result<Vec<u8>, NvDrvCallError> {
     match request {
         IOCTL_NVMAP_CREATE => {
             let size = input_u32(input, 0)?;
             if size == 0 {
-                return Err(NV_BAD_PARAMETER);
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
             let handle = state.next_handle;
             state.next_handle = state.next_handle.checked_add(1).ok_or(NV_INVALID_STATE)?;
@@ -183,11 +336,11 @@ fn ioctl_nvmap(state: &mut NvDrvState, request: u32, input: &[u8]) -> Result<Vec
             let kind = *input.get(16).ok_or(NV_BAD_PARAMETER)?;
             let address = input_u64(input, 24)?;
             if address == 0 || alignment < 0x1000 || !alignment.is_power_of_two() {
-                return Err(NV_BAD_PARAMETER);
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
             let allocation = state.allocations.get_mut(&handle).ok_or(NV_BAD_PARAMETER)?;
             if allocation.cpu_address.is_some() {
-                return Err(NV_INVALID_STATE);
+                return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
             }
             allocation.flags = flags;
             allocation.alignment = alignment;
@@ -213,7 +366,7 @@ fn ioctl_nvmap(state: &mut NvDrvState, request: u32, input: &[u8]) -> Result<Vec
                 2 => allocation.alignment,
                 4 => 0,
                 5 => u32::from(allocation.kind),
-                _ => return Err(NV_BAD_PARAMETER),
+                _ => return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
             };
             let mut output = sized_output(input, 12);
             output[8..12].copy_from_slice(&value.to_le_bytes());
@@ -226,7 +379,12 @@ fn ioctl_nvmap(state: &mut NvDrvState, request: u32, input: &[u8]) -> Result<Vec
             output[0..4].copy_from_slice(&allocation.id.to_le_bytes());
             Ok(output)
         }
-        _ => Err(NV_NOT_IMPLEMENTED),
+        _ => Err(NvDrvCallError::Unsupported(
+            UnsupportedNvDrvOperation::Ioctl {
+                device: DeviceKind::Map.path(),
+                request,
+            },
+        )),
     }
 }
 
@@ -257,6 +415,22 @@ fn input_u64(input: &[u8], offset: usize) -> Result<u64, u32> {
     ))
 }
 
+fn write_u32(output: &mut [u8], offset: usize, value: u32) -> Result<(), u32> {
+    output
+        .get_mut(offset..offset + 4)
+        .ok_or(NV_BAD_PARAMETER)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
+    output
+        .get_mut(offset..offset + 8)
+        .ok_or(NV_BAD_PARAMETER)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,7 +440,9 @@ mod tests {
         let session = NvDrvSession::new();
         session.initialize();
         let fd = session.open(b"/dev/nvmap").unwrap();
-        let (created, error) = session.ioctl(fd, IOCTL_NVMAP_CREATE, &0x2000_u32.to_le_bytes());
+        let (created, error) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &0x2000_u32.to_le_bytes())
+            .unwrap();
         assert_eq!(error, NV_SUCCESS);
         let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
         let mut allocate = vec![0_u8; 32];
@@ -275,7 +451,7 @@ mod tests {
         allocate[16] = 0xfe;
         allocate[24..32].copy_from_slice(&0x1234_5000_u64.to_le_bytes());
         assert_eq!(
-            session.ioctl(fd, IOCTL_NVMAP_ALLOC, &allocate).1,
+            session.ioctl(fd, IOCTL_NVMAP_ALLOC, &allocate).unwrap().1,
             NV_SUCCESS
         );
         let id = session
@@ -289,6 +465,74 @@ mod tests {
         assert_eq!(
             session.allocation_by_id(id).unwrap().cpu_address,
             Some(0x1234_5000)
+        );
+    }
+
+    #[test]
+    fn ctrl_gpu_reports_documented_tegra_x1_characteristics() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let mut input = vec![0_u8; 0xb0];
+        input[0..8].copy_from_slice(&0xa0_u64.to_le_bytes());
+        input[8..16].copy_from_slice(&1_u64.to_le_bytes());
+
+        let (output, error) = session
+            .ioctl(fd, IOCTL_CTRL_GPU_GET_CHARACTERISTICS, &input)
+            .unwrap();
+
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(input_u64(&output, 0), Ok(0xa0));
+        assert_eq!(input_u32(&output, 0x10), Ok(0x120));
+        assert_eq!(input_u32(&output, 0x14), Ok(0xb));
+        assert_eq!(input_u32(&output, 0x18), Ok(0xa1));
+        assert_eq!(input_u64(&output, 0x20), Ok(0x4_0000));
+        assert_eq!(input_u32(&output, 0x50), Ok(0x503));
+        assert_eq!(input_u32(&output, 0x68), Ok(0x902d));
+        assert_eq!(input_u32(&output, 0x98), Ok(0x2_1d70));
+        assert_eq!(input_u64(&output, 0xa0), Ok(0x62_30_32_6d_67));
+
+        let (context_size, error) = session
+            .ioctl(fd, IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE, &[])
+            .unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(input_u32(&context_size, 0), Ok(1));
+
+        let (zcull, error) = session
+            .ioctl(fd, IOCTL_CTRL_GPU_ZCULL_GET_INFO, &[])
+            .unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(input_u32(&zcull, 0), Ok(0x20));
+        assert_eq!(input_u32(&zcull, 8), Ok(0x400));
+        assert_eq!(input_u32(&zcull, 36), Ok(0x10));
+    }
+
+    #[test]
+    fn missing_emulator_semantics_are_distinct_from_driver_results() {
+        let session = NvDrvSession::new();
+        session.initialize();
+
+        assert_eq!(
+            session.open(b"/dev/not-emulated"),
+            Err(NvDrvCallError::Unsupported(
+                UnsupportedNvDrvOperation::OpenDevice {
+                    path: Box::from(&b"/dev/not-emulated"[..]),
+                }
+            ))
+        );
+
+        assert_eq!(
+            session.ioctl(0xffff, IOCTL_NVMAP_CREATE, &[]),
+            Ok((Vec::new(), NV_BAD_PARAMETER))
+        );
+
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        assert_eq!(
+            session.ioctl(fd, 0xc018_4706, &[0; 24]),
+            Err(UnsupportedNvDrvOperation::Ioctl {
+                device: "/dev/nvhost-ctrl-gpu",
+                request: 0xc018_4706,
+            })
         );
     }
 }
