@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Instant;
 
 use nixe_cli::library::{Library, LibraryTitleSource};
@@ -9,9 +10,10 @@ use nixe_config::{InitialOperationMode, TimeMode};
 use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment, VideoSystem};
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExit, ProcessExitCause, RunnableProcess, VirtualClock, VirtualClockMode,
+    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessTeardownReport, RunnableProcess,
+    VirtualClock, VirtualClockMode,
 };
-use nixe_video::FrameMailbox;
+use nixe_video_winit::{FrontendControl, WindowFrontend};
 
 use crate::logging::LogLevel;
 
@@ -27,7 +29,11 @@ pub struct Arguments {
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
-    let interrupted = install_interrupt_handler()?;
+    let frontend_stop_requested = Arc::new(AtomicBool::new(false));
+    let frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
+        .map_err(|error| error.to_string())?;
+    let frontend_control = frontend.control();
+    let interrupted = install_interrupt_handler(frontend_control.clone())?;
     let config = load_config(arguments.config_path, arguments.log_level_override)?;
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
@@ -107,7 +113,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     };
     let virtual_clock = VirtualClock::new(clock_mode);
     let process_started = Instant::now();
-    let mut process = ProcessBuilder::new()
+    let process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
@@ -132,40 +138,100 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
     );
-    let mailbox = FrameMailbox::default();
-    let video_system = VideoSystem::new(mailbox.clone());
-    let window_close_requested = Arc::new(AtomicBool::new(false));
-    let mut window =
-        nixe_video_winit::WindowFrontend::new(mailbox, Arc::clone(&window_close_requested))
-            .map_err(|error| error.to_string())?;
-    window.pump().map_err(|error| error.to_string())?;
+    let video_system = VideoSystem::new(frontend.mailbox());
+    let worker_frontend_stop = Arc::clone(&frontend_stop_requested);
+    let worker_interrupted = Arc::clone(&interrupted);
+    let worker_control = frontend_control.clone();
+    let worker = thread::Builder::new()
+        .name("nixe-guest".to_owned())
+        .spawn(move || {
+            let _completion = WorkerCompletion(worker_control);
+            execute_worker(
+                process,
+                instruction_trace,
+                HostStopSignals {
+                    ctrl_c: worker_interrupted,
+                    frontend: worker_frontend_stop,
+                },
+                initial_operation_mode,
+                time_environment,
+                video_system,
+            )
+        })
+        .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
+
+    let frontend_result = frontend.run().map_err(|error| error.to_string());
+    if frontend_result.is_err() {
+        frontend_stop_requested.store(true, Ordering::Release);
+    }
+    let worker_result = worker
+        .join()
+        .map_err(|_| "guest execution worker panicked".to_owned())?;
+    let execution_result = finish_execution(worker_result);
+    frontend_result.and(execution_result)
+}
+
+fn install_interrupt_handler(control: FrontendControl) -> Result<Arc<AtomicBool>, String> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal_flag = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || {
+        signal_flag.store(true, Ordering::SeqCst);
+        control.stop_requested();
+    })
+    .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
+    Ok(interrupted)
+}
+
+struct WorkerCompletion(FrontendControl);
+
+impl Drop for WorkerCompletion {
+    fn drop(&mut self) {
+        self.0.worker_finished();
+    }
+}
+
+struct WorkerResult {
+    execution: Result<ExecutionSummary, String>,
+    teardown: ProcessTeardownReport,
+}
+
+fn execute_worker(
+    mut process: RunnableProcess,
+    instruction_trace: bool,
+    stop_signals: HostStopSignals,
+    initial_operation_mode: OperationMode,
+    time_environment: TimeEnvironment,
+    video_system: VideoSystem,
+) -> WorkerResult {
     let execution_started = Instant::now();
     let execution = execute(
         &mut process,
         instruction_trace,
-        HostStopSignals {
-            ctrl_c: &interrupted,
-            window_closed: &window_close_requested,
-        },
+        &stop_signals,
         initial_operation_mode,
         time_environment,
         video_system,
-        &mut window,
     );
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
     );
-    let teardown = process.teardown();
-    let summary = match execution {
+    WorkerResult {
+        execution,
+        teardown: process.teardown(),
+    }
+}
+
+fn finish_execution(result: WorkerResult) -> Result<(), String> {
+    let summary = match result.execution {
         Ok(summary) => summary,
         Err(error) => {
             log::info!("process resources released after failure: {error}");
             return Err(error);
         }
     };
-    let exit_code = teardown.exit.map_or(0, |exit| exit.exit_code);
-    let exit_cause = teardown.exit.map_or_else(
+    let exit_code = result.teardown.exit.map_or(0, |exit| exit.exit_code);
+    let exit_cause = result.teardown.exit.map_or_else(
         || "without an exit record".to_owned(),
         |exit| format!("{:?}", exit.cause),
     );
@@ -177,17 +243,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         exit_cause,
         exit_code
     );
-    classify_exit(teardown.exit)
-}
-
-fn install_interrupt_handler() -> Result<Arc<AtomicBool>, String> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let signal_flag = Arc::clone(&interrupted);
-    ctrlc::set_handler(move || {
-        signal_flag.store(true, Ordering::SeqCst);
-    })
-    .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
-    Ok(interrupted)
+    classify_exit(result.teardown.exit)
 }
 
 struct ExecutionSummary {
@@ -196,20 +252,18 @@ struct ExecutionSummary {
     rejected_svc_kinds: usize,
 }
 
-#[derive(Clone, Copy)]
-struct HostStopSignals<'a> {
-    ctrl_c: &'a AtomicBool,
-    window_closed: &'a AtomicBool,
+struct HostStopSignals {
+    ctrl_c: Arc<AtomicBool>,
+    frontend: Arc<AtomicBool>,
 }
 
 fn execute(
     process: &mut RunnableProcess,
     print_trace: bool,
-    stop_signals: HostStopSignals<'_>,
+    stop_signals: &HostStopSignals,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
-    window: &mut nixe_video_winit::WindowFrontend,
 ) -> Result<ExecutionSummary, String> {
     let mut dispatcher = HorizonSvcDispatcher::new_with_video(
         initial_operation_mode,
@@ -222,9 +276,8 @@ fn execute(
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
     loop {
-        let window_running = window.pump().map_err(|error| error.to_string())?;
         dispatcher.advance_video(execution_started.elapsed());
-        if stop_signals.window_closed.load(Ordering::Acquire) {
+        if stop_signals.frontend.load(Ordering::Acquire) {
             log::info!("video window closed; stopping the guest process cleanly");
             if !process.terminate() {
                 return Err(
@@ -243,9 +296,6 @@ fn execute(
                 );
             }
             return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
-        }
-        if !window_running {
-            return Err("video window event loop stopped unexpectedly".to_owned());
         }
         let report = process
             .run_reference(if print_trace {
@@ -406,6 +456,13 @@ fn execution_stop_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runnable_process_can_be_owned_by_the_guest_worker() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<RunnableProcess>();
+    }
 
     fn process_exit(cause: ProcessExitCause, exit_code: u64) -> ProcessExit {
         ProcessExit {

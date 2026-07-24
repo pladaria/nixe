@@ -737,7 +737,7 @@ impl MemoryPermissions {
 }
 
 /// Callback interface used by synthetic MMIO pages.
-pub trait SyntheticMmio {
+pub trait SyntheticMmio: Send {
     /// Reads a value at a page-relative byte offset.
     fn read(&mut self, offset: u64, access: MemoryAccess) -> Result<MemoryValue, Box<str>>;
 
@@ -1944,7 +1944,7 @@ fn validate_data_access(
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -2243,13 +2243,14 @@ mod tests {
     }
 
     struct RecordingMmio {
-        events: Rc<RefCell<Vec<MmioEvent>>>,
+        events: Arc<Mutex<Vec<MmioEvent>>>,
     }
 
     impl SyntheticMmio for RecordingMmio {
         fn read(&mut self, offset: u64, access: MemoryAccess) -> Result<MemoryValue, Box<str>> {
             self.events
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(MmioEvent::Read(offset, access));
             Ok(MemoryValue::U32(0xaabb_ccdd))
         }
@@ -2261,7 +2262,8 @@ mod tests {
             value: MemoryValue,
         ) -> Result<(), Box<str>> {
             self.events
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push(MmioEvent::Write(offset, access, value));
             Ok(())
         }
@@ -2271,12 +2273,12 @@ mod tests {
     fn mmio_results_and_callbacks_remain_observable() {
         let device_page = GuestPhysicalPageId::new(99);
         let device_address = GuestVirtualAddress::new(0x9000);
-        let events = Rc::new(RefCell::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         let mut memory = SyntheticMemory::new();
         assert!(memory.add_mmio_page(
             device_page,
             RecordingMmio {
-                events: Rc::clone(&events)
+                events: Arc::clone(&events)
             }
         ));
         assert!(memory.map_page(
@@ -2306,7 +2308,7 @@ mod tests {
         );
         assert_eq!(write.region, MemoryRegionKind::Device);
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             vec![
                 MmioEvent::Read(0, access),
                 MmioEvent::Write(0, access, MemoryValue::U32(5))
