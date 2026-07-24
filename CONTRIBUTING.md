@@ -13,7 +13,7 @@ supported platforms.
 
 ## Language
 
-English is the required language for all project content, including: Source code, source code comments,
+English is the required language for all project content, including: source code, source code comments,
 documentation, commits, etc.
 
 ## Contribution Principles
@@ -22,6 +22,8 @@ documentation, commits, etc.
 - Add tests for new behavior whenever practical.
 - When an implementation relies on external references, record those references in nearby code comments and link
   to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.
+- When implementing CPU instructions for the interpreter or JIT, consult the official Arm documentation and add
+  a nearby comment linking to the relevant page.
 - Keep platform-independent code separate from console-specific behavior.
 - Share code between platforms only when the abstraction is supported by verified technical knowledge.
 - Do not include copyrighted games, firmware, cryptographic keys, leaked material, or other content that

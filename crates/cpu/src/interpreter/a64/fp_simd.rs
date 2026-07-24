@@ -2,7 +2,9 @@ use crate::{
     address::GuestVirtualAddress,
     decode::{
         DecodedOpcode,
-        a64::fp_simd::{BitwiseOperation, Instruction, IntegerComparison, PairwiseOperation},
+        a64::fp_simd::{
+            BitwiseOperation, Instruction, IntegerComparison, PairwiseOperation, PermuteOperation,
+        },
     },
     location::DecodedInstruction,
     memory::{
@@ -88,6 +90,16 @@ pub(super) fn execute(
                 fields
                     .pairwise_operation
                     .expect("normalized SIMD pairwise operation"),
+            );
+            None
+        }
+        Instruction::PermuteTwoSource(_) => {
+            permute_two_source(
+                state,
+                fields,
+                fields
+                    .permute_operation
+                    .expect("normalized SIMD two-source permute operation"),
             );
             None
         }
@@ -190,6 +202,18 @@ pub(super) fn execute(
                 ),
             ))
         }
+        Instruction::MemorySingleStructure(_) | Instruction::MemorySingleStructurePostIndex(_) => {
+            let Some(memory) = context.memory() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            Some(vector_single_structure(
+                memory,
+                context.process().address_space_id(),
+                state,
+                fields,
+                matches!(instruction, Instruction::MemorySingleStructurePostIndex(_)),
+            ))
+        }
         _ => return Err(super::super::unsupported(decoded)),
     };
     if let Some(Err(fault)) = result {
@@ -289,6 +313,82 @@ fn vector_multiple_structures(
         super::write(state, fields.rn, 64, true, base.wrapping_add(offset));
     }
     Ok(())
+}
+
+// LD1/ST1 transfer one element between memory and one vector lane. Loads
+// preserve every other lane, and post-index writeback occurs only after a
+// successful memory access. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--single-structure---Load-one-single-element-structure-to-one-lane-of-one-register-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--single-structure---Store-one-single-element-structure-from-one-lane-of-one-register-
+fn vector_single_structure(
+    memory: &dyn CpuMemory,
+    address_space: crate::address::AddressSpaceId,
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    post_index: bool,
+) -> MemoryStep {
+    let (size, lane) = single_structure_shape(fields);
+    let base = read(state, fields.rn, 64, true);
+    let address = GuestVirtualAddress::new(base);
+    if fields.load {
+        let value = read_vector(memory, address_space, address, size)?;
+        insert_lane(state, fields.rd, lane, size.bytes() as u32 * 8, value);
+    } else {
+        let vector = state
+            .vector(fields.rd)
+            .expect("normalized single-structure source register");
+        let lane_bits = size.bytes() as u32 * 8;
+        let lane_mask = (1_u128 << lane_bits) - 1;
+        let value = (vector >> (u32::from(lane) * lane_bits)) & lane_mask;
+        write_lane(memory, address_space, address, size, value)?;
+    }
+    if post_index {
+        let offset = if fields.rm == 31 {
+            size.bytes() as u64
+        } else {
+            read(state, fields.rm, 64, false)
+        };
+        super::write(state, fields.rn, 64, true, base.wrapping_add(offset));
+    }
+    Ok(())
+}
+
+fn single_structure_shape(fields: crate::decode::a64::fp_simd::Operands) -> (MemoryAccessSize, u8) {
+    let opcode = fields.structure_opcode >> 1;
+    let s = fields.structure_opcode & 1;
+    let q = u8::from(fields.vector_128);
+    match opcode {
+        0 => (
+            MemoryAccessSize::Byte,
+            (q << 3) | (s << 2) | fields.element_size,
+        ),
+        2 => (
+            MemoryAccessSize::Halfword,
+            (q << 2) | (s << 1) | (fields.element_size >> 1),
+        ),
+        4 if fields.element_size == 0 => (MemoryAccessSize::Word, (q << 1) | s),
+        4 => (MemoryAccessSize::Doubleword, q),
+        _ => unreachable!("allocation validation rejects other single-structure opcodes"),
+    }
+}
+
+fn write_lane(
+    memory: &dyn CpuMemory,
+    address_space: crate::address::AddressSpaceId,
+    address: GuestVirtualAddress,
+    size: MemoryAccessSize,
+    value: u128,
+) -> MemoryStep {
+    let value = match size {
+        MemoryAccessSize::Byte => MemoryValue::U8(value as u8),
+        MemoryAccessSize::Halfword => MemoryValue::U16(value as u16),
+        MemoryAccessSize::Word => MemoryValue::U32(value as u32),
+        MemoryAccessSize::Doubleword => MemoryValue::U64(value as u64),
+        MemoryAccessSize::Quadword => unreachable!("single-structure lanes are at most 64 bits"),
+    };
+    memory
+        .write(address_space, address, vector_access(size), value)
+        .map(|_| ())
 }
 
 fn duplicate_general(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
@@ -548,6 +648,68 @@ fn integer_pairwise(
             let destination_lane = source_index as u32 * (lanes_per_source / 2) + pair;
             result |= reduced << (destination_lane * u32::from(lane_bits));
         }
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// UZP1/2, TRN1/2, and ZIP1/2 select lanes from both source vectors before
+// writing the destination, which also permits either source to alias Vd.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP1--vector---Zip-vectors--primary--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP2--vector---Zip-vectors--secondary--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/TRN1--Transpose-vectors--primary--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/TRN2--Transpose-vectors--secondary--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP1--Unzip-vectors--primary--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP2--Unzip-vectors--secondary--
+fn permute_two_source(
+    state: &mut A64State,
+    fields: crate::decode::a64::fp_simd::Operands,
+    operation: PermuteOperation,
+) {
+    let vector_bits = if fields.vector_128 { 128_u32 } else { 64 };
+    let lane_bits = 8_u32 << fields.opc;
+    let lane_count = vector_bits / lane_bits;
+    let half = lane_count / 2;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let first = state
+        .vector(fields.rn)
+        .expect("normalized SIMD first source register");
+    let second = state
+        .vector(fields.rm)
+        .expect("normalized SIMD second source register");
+    let mut result = 0_u128;
+
+    for destination_lane in 0..lane_count {
+        let (source, source_lane) = match operation {
+            PermuteOperation::UnzipPrimary | PermuteOperation::UnzipSecondary => {
+                let odd = u32::from(matches!(operation, PermuteOperation::UnzipSecondary));
+                if destination_lane < half {
+                    (first, destination_lane * 2 + odd)
+                } else {
+                    (second, (destination_lane - half) * 2 + odd)
+                }
+            }
+            PermuteOperation::TransposePrimary | PermuteOperation::TransposeSecondary => {
+                let odd = u32::from(matches!(operation, PermuteOperation::TransposeSecondary));
+                let source = if destination_lane & 1 == 0 {
+                    first
+                } else {
+                    second
+                };
+                (source, (destination_lane / 2) * 2 + odd)
+            }
+            PermuteOperation::ZipPrimary | PermuteOperation::ZipSecondary => {
+                let upper = u32::from(matches!(operation, PermuteOperation::ZipSecondary));
+                let source = if destination_lane & 1 == 0 {
+                    first
+                } else {
+                    second
+                };
+                (source, destination_lane / 2 + upper * half)
+            }
+        };
+        let lane = (source >> (source_lane * lane_bits)) & lane_mask;
+        result |= lane << (destination_lane * lane_bits);
     }
     assert!(state.set_vector(fields.rd, result));
 }
