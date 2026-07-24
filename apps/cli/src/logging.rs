@@ -72,6 +72,7 @@ struct NixeLogger;
 impl Log for NixeLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= log::max_level()
+            && (metadata.target().starts_with("nixe") || metadata.level() <= Level::Warn)
     }
 
     fn log(&self, record: &Record<'_>) {
