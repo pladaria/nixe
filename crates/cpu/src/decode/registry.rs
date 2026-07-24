@@ -37,7 +37,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0048..=0x0000_004b
                     | 0x0000_004e..=0x0000_0058
                     | 0x0000_0059..=0x0000_005d
-                    | 0x0000_0060..=0x0000_0061
+                    | 0x0000_0060..=0x0000_0064
             ) =>
         {
             IMPLEMENTED
@@ -91,7 +91,7 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                 | 0x0000_0010..=0x0000_001d
                 | 0x0000_0022..=0x0000_002a
                 | 0x0000_004c..=0x0000_004d
-                | 0x0000_0060..=0x0000_0061
+                | 0x0000_0060..=0x0000_0064
         )
     {
         interpreter = ENCODING_DEPENDENT;
@@ -239,6 +239,9 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0038 if is_a64_simd_integer_compare_zero(bits) => {
             validate_a64_simd_integer_compare(bits)
         }
+        0x0000_0038 if bits & 0xbf20_8c00 == 0x0e00_0800 => {
+            validate_a64_simd_permute_two_source(bits)
+        }
         0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
         0x0000_004b => validate_a64_umov(bits),
         0x0000_0060 | 0x0000_0061 => validate_a64_simd_insert(id, bits),
@@ -258,6 +261,8 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
                 )
             }
         }
+        0x0000_0062 | 0x0000_0063 => validate_a64_simd_single_structure(bits),
+        0x0000_0064 => validate_a64_simd_permute_two_source(bits),
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
             let size = (bits >> 30) as u8;
             let opc = ((bits >> 22) & 3) as u8;
@@ -372,6 +377,33 @@ fn validate_a64_simd_insert(id: u32, bits: u32) -> AllocationStatus {
     AllocationStatus::Allocated
 }
 
+fn validate_a64_simd_single_structure(bits: u32) -> AllocationStatus {
+    let opcode = (bits >> 13) & 7;
+    let s = bits & (1 << 12) != 0;
+    let size = (bits >> 10) & 3;
+    match opcode {
+        0 => AllocationStatus::Allocated,
+        2 if size & 1 == 0 => AllocationStatus::Allocated,
+        4 if size == 0 || (size == 1 && !s) => AllocationStatus::Allocated,
+        2 => AllocationStatus::Reserved("16-bit single-structure lane requires size<0> == 0"),
+        4 => AllocationStatus::Reserved("invalid 32-bit or 64-bit single-structure lane index"),
+        _ => AllocationStatus::Unallocated(
+            "opcode does not select an LD1 or ST1 single-structure lane transfer",
+        ),
+    }
+}
+
+fn validate_a64_simd_permute_two_source(bits: u32) -> AllocationStatus {
+    let operation = (bits >> 12) & 7;
+    if !matches!(operation, 1 | 2 | 3 | 5 | 6 | 7) {
+        AllocationStatus::Unallocated("unallocated Advanced SIMD two-source permute operation")
+    } else if (bits >> 22) & 3 == 3 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit SIMD vector cannot contain two 64-bit lanes")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
 #[must_use]
 pub fn validate_a32(id: SemanticId, bits: u32) -> AllocationStatus {
     if bits >> 28 != 0xf || matches!(id.get(), 0x0001_0006 | 0x0001_0031..=0x0001_0033) {
@@ -436,6 +468,7 @@ mod tests {
             0x6ee2_a420, // UMAXP has no 64-bit lane form
             0x0ee1_3420, // SIMD compare with a reserved one-lane 64-bit arrangement
             0x0ee0_8820, // SIMD zero compare with a reserved one-lane 64-bit arrangement
+            0x0ec2_3820, // ZIP1 with a reserved one-lane 64-bit arrangement
             0x4c40_1020, // unallocated SIMD multiple-structures opcode
         ];
         for bits in cases {

@@ -26,6 +26,9 @@ pub(super) fn lift(
         | FpSimdInstruction::InsertGeneral(_)
         | FpSimdInstruction::MemoryMultipleStructures(_)
         | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+        | FpSimdInstruction::MemorySingleStructure(_)
+        | FpSimdInstruction::MemorySingleStructurePostIndex(_)
+        | FpSimdInstruction::PermuteTwoSource(_)
         | FpSimdInstruction::IntegerCompare(_)
         | FpSimdInstruction::IntegerPairwise(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)

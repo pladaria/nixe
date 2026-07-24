@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0061 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0064 => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -224,10 +224,13 @@ mod tests {
             (0x3c40_0400, "fp-simd-load-store-post-index"),
             (0x9c00_0000, "fp-simd-load-literal"),
             (0x4c40_a020, "simd-load-store-multiple-structures"),
+            (0x0d40_183d, "simd-load-store-single-structure"),
             (
                 0x4cdf_a041,
                 "simd-load-store-multiple-structures-post-index",
             ),
+            (0x0ddf_1e30, "simd-load-store-single-structure-post-index"),
+            (0x4e1d_3bde, "simd-permute-two-source"),
         ];
         for (bits, expected) in cases {
             assert_eq!(

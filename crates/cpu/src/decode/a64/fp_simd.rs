@@ -325,6 +325,22 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 Advanced SIMD two-source permutes, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP1--vector---Zip-vectors--primary--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP2--vector---Zip-vectors--secondary--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/TRN1--Transpose-vectors--primary--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/TRN2--Transpose-vectors--secondary--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP1--Unzip-vectors--primary--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UZP2--Unzip-vectors--secondary--
+    pattern(
+        "simd-permute-two-source",
+        0xbf20_8c00,
+        0x0e00_0800,
+        0x0000_0064,
+        161,
+        &[],
+        SIMD,
+    ),
     // Arm A64 Advanced SIMD load/store multiple structures allocation and
     // operation, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--multiple-structures---Load-multiple-single-element-structures-to-one--two--three--or-four-registers-
@@ -344,6 +360,28 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0c80_0000,
         0x0000_004d,
         136,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 LD1/ST1 single-structure lane transfers, including immediate
+    // and register post-index forms, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--single-structure---Load-one-single-element-structure-to-one-lane-of-one-register-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--single-structure---Store-one-single-element-structure-from-one-lane-of-one-register-
+    pattern(
+        "simd-load-store-single-structure",
+        0xbfbf_0000,
+        0x0d00_0000,
+        0x0000_0062,
+        158,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-load-store-single-structure-post-index",
+        0xbfa0_0000,
+        0x0d80_0000,
+        0x0000_0063,
+        157,
         &[],
         SIMD,
     ),
@@ -488,9 +526,11 @@ pub struct Operands {
     pub bitwise_operation: Option<BitwiseOperation>,
     pub integer_comparison: Option<IntegerComparison>,
     pub pairwise_operation: Option<PairwiseOperation>,
+    pub permute_operation: Option<PermuteOperation>,
     pub compare_with_zero: bool,
     pub operation_bit: bool,
     pub immediate_4: u8,
+    pub element_size: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,6 +564,16 @@ pub enum PairwiseOperation {
     SignedMinimum,
     UnsignedMaximum,
     UnsignedMinimum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermuteOperation {
+    UnzipPrimary,
+    UnzipSecondary,
+    TransposePrimary,
+    TransposeSecondary,
+    ZipPrimary,
+    ZipSecondary,
 }
 
 macro_rules! instructions {
@@ -567,6 +617,9 @@ instructions!(
     MemoryLiteral,
     MemoryMultipleStructures,
     MemoryMultipleStructuresPostIndex,
+    MemorySingleStructure,
+    MemorySingleStructurePostIndex,
+    PermuteTwoSource,
     IntegerCompare,
     IntegerPairwise,
 );
@@ -601,9 +654,14 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         }),
         integer_comparison: integer_comparison(semantic_id),
         pairwise_operation: pairwise_operation(semantic_id),
+        permute_operation: (semantic_id == 0x0000_0064).then(|| {
+            permute_operation(bits)
+                .expect("allocation validation rejects invalid SIMD two-source permutes")
+        }),
         compare_with_zero: matches!(semantic_id, 0x0000_0054..=0x0000_0058),
         operation_bit: bits & (1 << 29) != 0,
         immediate_4: ((bits >> 11) & 0xf) as u8,
+        element_size: ((bits >> 10) & 3) as u8,
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -632,9 +690,24 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0043 => Instruction::MemoryLiteral(operands),
         0x0000_004c => Instruction::MemoryMultipleStructures(operands),
         0x0000_004d => Instruction::MemoryMultipleStructuresPostIndex(operands),
+        0x0000_0062 => Instruction::MemorySingleStructure(operands),
+        0x0000_0063 => Instruction::MemorySingleStructurePostIndex(operands),
+        0x0000_0064 => Instruction::PermuteTwoSource(operands),
         0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
         0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
+    }
+}
+
+fn permute_operation(bits: u32) -> Option<PermuteOperation> {
+    match (bits >> 12) & 7 {
+        1 => Some(PermuteOperation::UnzipPrimary),
+        2 => Some(PermuteOperation::TransposePrimary),
+        3 => Some(PermuteOperation::ZipPrimary),
+        5 => Some(PermuteOperation::UnzipSecondary),
+        6 => Some(PermuteOperation::TransposeSecondary),
+        7 => Some(PermuteOperation::ZipSecondary),
+        _ => None,
     }
 }
 
