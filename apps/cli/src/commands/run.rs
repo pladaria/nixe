@@ -57,7 +57,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     );
     let title = library
         .find(&arguments.identifier)
-        .ok_or_else(|| format!("unknown title ID: {}", arguments.identifier))?;
+        .ok_or_else(|| format!("unknown title ID or name: {}", arguments.identifier))?;
     log::info!("selected {}: {}", title.identifier, title.name);
 
     let plan_started = Instant::now();

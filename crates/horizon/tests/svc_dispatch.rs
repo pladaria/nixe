@@ -15,7 +15,7 @@ use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonProcess,
     HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
-    OperationMode,
+    OperationMode, UnsupportedServiceOperation,
 };
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -1834,6 +1834,116 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .mapping_info(process.cpu_context().address_space_id(), mapping_address)
             .is_none()
     );
+}
+
+#[test]
+fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
+    let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21), svc(0x21)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..40].copy_from_slice(b"missing\0");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedService {
+            immediate: 0x21,
+            operation: UnsupportedServiceOperation::Connect {
+                name: Box::from(&b"missing"[..]),
+            },
+        })
+    );
+}
+
+#[test]
+fn account_application_info_binds_the_calling_process() {
+    let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21), svc(0x21), svc(0x21)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..40].copy_from_slice(b"acc:u0\0\0");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let account_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(
+        process
+            .handles()
+            .get_as::<nixe_horizon::AccountSession>(account_handle)
+            .is_some()
+    );
+
+    let mut initialize = [0_u8; 0x100];
+    put_u32(&mut initialize, 0, 4);
+    put_u32(&mut initialize, 4, 10 | (1 << 31));
+    put_u32(&mut initialize, 8, 1);
+    put_u32(&mut initialize, 32, 0x4943_4653);
+    put_u32(&mut initialize, 40, 100);
+    write_guest_bytes(&process, tls, &initialize);
+    state(&mut process).write_w(x(0), account_handle);
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 }
 
 #[test]

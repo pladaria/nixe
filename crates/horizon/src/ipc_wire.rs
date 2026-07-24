@@ -20,13 +20,14 @@ use crate::ipc_message::{
 };
 use crate::object::AppletObject;
 use crate::{
-    AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HorizonIpcResult,
-    HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
-    IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
-    NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory,
-    ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
-    SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
-    TimeZoneServiceSession, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
+    AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession,
+    HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
+    IpcResultCode, IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
+    MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession,
+    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession,
+    SystemClockKind, SystemClockSession, SystemSettingsSession, TimeEnvironment,
+    TimeServiceSession, TimeZoneServiceSession, ViObjectKind, ViServiceKind, ViSession,
+    VideoSystem,
 };
 
 pub(crate) const NAMED_PORT_NAME_SIZE: usize = 12;
@@ -45,7 +46,39 @@ pub(crate) enum IpcWireError {
     GuestMemory(DataAccessFault),
     Malformed(&'static str),
     ResourceExhausted,
+    UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
+}
+
+/// A Horizon service operation for which Nixe lacks faithful semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnsupportedServiceOperation {
+    Connect {
+        name: Box<[u8]>,
+    },
+    Command {
+        service: &'static str,
+        command_id: u32,
+    },
+}
+
+impl std::fmt::Display for UnsupportedServiceOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect { name } => write!(
+                formatter,
+                "Horizon service is not implemented: name={:?}",
+                String::from_utf8_lossy(name)
+            ),
+            Self::Command {
+                service,
+                command_id,
+            } => write!(
+                formatter,
+                "Horizon service command is not implemented: service={service} command={command_id}"
+            ),
+        }
+    }
 }
 
 impl From<MessageError> for IpcWireError {
@@ -136,6 +169,7 @@ pub(crate) fn send_sync_request_from_buffer(
         .get_as::<PerformanceSession>(handle)
         .cloned();
     let applet = process.handles().get_as::<AppletSession>(handle).cloned();
+    let account = process.handles().get_as::<AccountSession>(handle).cloned();
     let hid = process.handles().get_as::<HidSession>(handle).cloned();
     let hid_applet_resource = process
         .handles()
@@ -172,6 +206,7 @@ pub(crate) fn send_sync_request_from_buffer(
         && performance_manager.is_none()
         && performance.is_none()
         && applet.is_none()
+        && account.is_none()
         && hid.is_none()
         && hid_applet_resource.is_none()
         && time.is_none()
@@ -374,6 +409,8 @@ pub(crate) fn send_sync_request_from_buffer(
         dispatch_performance_session(&session, request)?
     } else if let Some(applet) = applet {
         dispatch_applet(process, &applet, request, &hipc, video_system)?
+    } else if let Some(account) = account {
+        dispatch_account(process, &account, request, &hipc)?
     } else if let Some(hid) = hid {
         dispatch_hid(process, &hid, request, &hipc)?
     } else if let Some(resource) = hid_applet_resource {
@@ -491,6 +528,31 @@ fn dispatch_service_manager(
                     time_environment,
                 );
             }
+            // libnx opens acc:u0 for application account sessions. Retain the
+            // real session identity here; commands remain fail-fast until
+            // their account semantics are implemented:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L25-L30
+            if name == b"acc:u0" {
+                if !process.mounts().allows_service(name) {
+                    return Ok((
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SM_NOT_ALLOWED,
+                            &[],
+                            None,
+                        )?,
+                        None,
+                    ));
+                }
+                let handle = process
+                    .handles_mut()
+                    .insert(AccountSession::new())
+                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                return Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+                    Some(handle),
+                ));
+            }
             if let Some(kind) = ViServiceKind::from_name(name) {
                 if !process.mounts().allows_service(name) {
                     return Ok((
@@ -537,23 +599,19 @@ fn dispatch_service_manager(
                 ));
             }
             let Some(service) = IpcService::from_name(name) else {
-                let encoded_name: [u8; 8] = encoded_name
-                    .try_into()
-                    .expect("service name length was checked");
-                if manager.first_unavailable_request(encoded_name) {
-                    log::warn!(
-                        "guest requested unavailable Horizon service via sm: {:?}",
-                        String::from_utf8_lossy(name)
-                    );
-                }
-                return Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_NOT_REGISTERED,
-                        &[],
+                if !process.mounts().allows_service(name) {
+                    return Ok((
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SM_NOT_ALLOWED,
+                            &[],
+                            None,
+                        )?,
                         None,
-                    )?,
-                    None,
+                    ));
+                }
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::Connect { name: name.into() },
                 ));
             };
             let (mounts, handles) = process.mounts_and_handles_mut();
@@ -602,6 +660,44 @@ fn dispatch_service_manager(
                 None,
             )?,
             None,
+        )),
+    }
+}
+
+fn dispatch_account(
+    process: &ExceptionProcessContext<'_>,
+    session: &AccountSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        // InitializeApplicationInfo is command 100 before Horizon 6.0.0 and
+        // command 140 afterward. libnx sends the caller PID descriptor and a
+        // zero u64 placeholder:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L61-L67
+        100 | 140 => {
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0) != Some(0)
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            session.initialize_application_info(process.process_id());
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+        command_id => Err(IpcWireError::UnsupportedService(
+            UnsupportedServiceOperation::Command {
+                service: "acc:u0",
+                command_id,
+            },
         )),
     }
 }
@@ -1791,11 +1887,32 @@ fn dispatch_nvdrv(
                 None,
             ))
         }
-        // Commands 4 (QueryEvent) and 8 (SetClientPID) require event
-        // signaling and client-identity semantics respectively. Returning an
-        // inert event or accepting identity without applying it would hide
-        // missing emulator behavior. The pinned client ABI is documented at:
-        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c
+        8 => {
+            // INvDrvServices::SetAruid carries the caller PID descriptor and
+            // an AppletResourceUserId. Associate both with the shared nvdrv
+            // session so cloned service handles observe the same identity:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c#L104-L106
+            let Some(applet_resource_user_id) = request_u64(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if hipc.pid.is_none()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            session.set_aruid(process.process_id(), applet_resource_user_id);
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
+                None,
+            ))
+        }
+        // QueryEvent requires event signaling tied to syncpoint progress.
+        // Returning an inert event would hide missing emulator behavior.
         command_id => Err(IpcWireError::UnsupportedNvDrv(
             crate::nvdrv::UnsupportedNvDrvOperation::ServiceCommand { command_id },
         )),

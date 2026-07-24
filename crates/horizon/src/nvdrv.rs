@@ -90,11 +90,18 @@ pub struct NvMapAllocation {
 #[derive(Debug)]
 struct NvDrvState {
     initialized: bool,
+    client_identity: Option<NvDrvClientIdentity>,
     next_fd: u32,
     next_handle: u32,
     next_id: u32,
     devices: BTreeMap<u32, DeviceKind>,
     allocations: BTreeMap<u32, NvMapAllocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NvDrvClientIdentity {
+    process_id: u64,
+    applet_resource_user_id: u64,
 }
 
 /// One cloneable `nvdrv` service connection sharing file descriptors and maps.
@@ -115,6 +122,7 @@ impl NvDrvSession {
         Self {
             state: Arc::new(Mutex::new(NvDrvState {
                 initialized: false,
+                client_identity: None,
                 next_fd: 1,
                 next_handle: 1,
                 next_id: 1,
@@ -129,6 +137,16 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .initialized = true;
+    }
+
+    pub(crate) fn set_aruid(&self, process_id: u64, applet_resource_user_id: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .client_identity = Some(NvDrvClientIdentity {
+            process_id,
+            applet_resource_user_id,
+        });
     }
 
     pub(crate) fn open(&self, path: &[u8]) -> Result<u32, NvDrvCallError> {
@@ -532,6 +550,22 @@ mod tests {
             Err(UnsupportedNvDrvOperation::Ioctl {
                 device: "/dev/nvhost-ctrl-gpu",
                 request: 0xc018_4706,
+            })
+        );
+    }
+
+    #[test]
+    fn cloned_sessions_share_the_bound_applet_resource_identity() {
+        let session = NvDrvSession::new();
+        let clone = session.clone();
+
+        session.set_aruid(7, 0x1234);
+
+        assert_eq!(
+            clone.state.lock().unwrap().client_identity,
+            Some(NvDrvClientIdentity {
+                process_id: 7,
+                applet_resource_user_id: 0x1234,
             })
         );
     }

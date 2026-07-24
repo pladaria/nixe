@@ -111,11 +111,12 @@ impl Library {
         &self.titles
     }
 
-    /// Finds the title accepted by a future `run <title_id>` invocation.
-    pub fn find(&self, identifier: &str) -> Option<&LibraryTitle> {
+    /// Finds a title by identifier first, then by its displayed name.
+    pub fn find(&self, candidate: &str) -> Option<&LibraryTitle> {
         self.titles
             .iter()
-            .find(|title| title.identifier.matches(identifier))
+            .find(|title| title.identifier.matches(candidate))
+            .or_else(|| self.titles.iter().find(|title| title.name == candidate))
     }
 }
 
@@ -290,6 +291,21 @@ fn format_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn test_library(titles: Vec<LibraryTitle>) -> Library {
+        Library {
+            titles,
+            keys: NcaKeySet::from_text("", None).unwrap(),
+        }
+    }
+
+    fn homebrew(identifier: &str, name: &str) -> LibraryTitle {
+        LibraryTitle {
+            identifier: LibraryTitleId::Homebrew(identifier.to_owned()),
+            name: name.to_owned(),
+            source: LibraryTitleSource::Homebrew(PathBuf::from(format!("{name}.nro"))),
+        }
+    }
+
     #[test]
     fn uses_the_module_id_as_the_homebrew_identifier() {
         let module_id = std::array::from_fn(|index| u8::try_from(index).unwrap());
@@ -304,6 +320,30 @@ mod tests {
         let identifier = LibraryTitleId::Homebrew("A1B2C3".to_owned());
         assert!(identifier.matches("nro:a1b2c3"));
         assert!(!identifier.matches("a1b2c3"));
+    }
+
+    #[test]
+    fn finds_titles_by_identifier_before_falling_back_to_name() {
+        let library = test_library(vec![
+            homebrew("FIRST", "nro:SECOND"),
+            homebrew("SECOND", "Friendly Name"),
+        ]);
+
+        assert_eq!(
+            library.find("nro:SECOND").unwrap().name,
+            "Friendly Name",
+            "an identifier match must win over an earlier name match"
+        );
+        assert_eq!(library.find("nro:first").unwrap().name, "nro:SECOND");
+        assert_eq!(
+            library
+                .find("Friendly Name")
+                .unwrap()
+                .identifier
+                .to_string(),
+            "nro:SECOND"
+        );
+        assert!(library.find("friendly name").is_none());
     }
 
     #[test]

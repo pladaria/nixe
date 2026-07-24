@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -360,4 +361,59 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
             "missing completed SVC {immediate:#x}; coverage={coverage:?}"
         );
     }
+}
+
+#[test]
+fn libnx_hello_world_publishes_a_software_frame() {
+    let path = asset("graphics/printing/hello-world/hello-world.nro");
+    let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let mailbox = dispatcher.video_system().mailbox();
+    let mut executed = 0_u64;
+    let mut elapsed = Duration::ZERO;
+
+    while mailbox.statistics().published == 0 {
+        elapsed += Duration::from_millis(1);
+        dispatcher.advance_video(elapsed);
+        let report = process.run_reference(4_096).unwrap();
+        executed += report.instructions_executed;
+        assert!(
+            executed <= 20_000_000,
+            "hello-world did not publish a frame within its acceptance bound; layers={} \
+             mailbox={:?} coverage={:?}",
+            dispatcher.video_system().active_layer_count(),
+            mailbox.statistics(),
+            dispatcher.coverage(),
+        );
+        match &report.stop {
+            ExecutionStop::BudgetExhausted
+            | ExecutionStop::Safepoint
+            | ExecutionStop::PendingEvent { .. } => {}
+            ExecutionStop::Scheduled { .. } => {
+                assert!(process.resume(), "scheduled hello-world did not resume");
+            }
+            ExecutionStop::SupervisorCall { .. } => {
+                match process
+                    .route_supervisor_call(&report.stop, &mut dispatcher)
+                    .unwrap()
+                {
+                    ExceptionHandlingResult::Resumed => {}
+                    ExceptionHandlingResult::Suspended => {
+                        assert!(process.resume(), "suspended hello-world did not resume");
+                    }
+                    outcome => panic!(
+                        "hello-world SVC failed before publishing a frame: {outcome:?}; {report}"
+                    ),
+                }
+            }
+            stop => panic!("hello-world stopped before publishing a frame: {stop}; {report}"),
+        }
+    }
+
+    let frame = mailbox
+        .take_latest()
+        .expect("published frame must be present");
+    assert_eq!((frame.width(), frame.height()), (1280, 720));
+    assert_eq!(frame.pixels().len(), 1280 * 720);
 }

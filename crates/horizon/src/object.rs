@@ -1,6 +1,6 @@
 //! Horizon-owned objects retained in the generic runtime handle table.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
@@ -18,14 +18,12 @@ use crate::IpcService;
 #[derive(Clone, Debug)]
 pub struct ServiceManagerSession {
     registered: Arc<AtomicBool>,
-    reported_unavailable: Arc<Mutex<BTreeSet<[u8; 8]>>>,
 }
 
 impl ServiceManagerSession {
     pub(crate) fn new() -> Self {
         Self {
             registered: Arc::new(AtomicBool::new(false)),
-            reported_unavailable: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -36,17 +34,44 @@ impl ServiceManagerSession {
     pub(crate) fn is_registered(&self) -> bool {
         self.registered.load(Ordering::Acquire)
     }
+}
 
-    pub(crate) fn first_unavailable_request(&self, name: [u8; 8]) -> bool {
-        const MAX_REPORTED_SERVICES: usize = 64;
-        let mut reported = self
-            .reported_unavailable
+/// Client session connected to Horizon's `acc:u0` account service.
+#[derive(Clone, Debug, Default)]
+pub struct AccountSession {
+    state: Arc<Mutex<AccountState>>,
+}
+
+impl AccountSession {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn initialize_application_info(&self, process_id: u64) {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reported.len() >= MAX_REPORTED_SERVICES {
-            return false;
-        }
-        reported.insert(name)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .application_process_id = Some(process_id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AccountState {
+    application_process_id: Option<u64>,
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_sessions_share_initialized_application_identity() {
+        let session = AccountSession::new();
+        let clone = session.clone();
+
+        session.initialize_application_info(42);
+
+        assert_eq!(clone.state.lock().unwrap().application_process_id, Some(42));
     }
 }
 

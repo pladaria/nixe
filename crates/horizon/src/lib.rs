@@ -20,13 +20,15 @@ pub use ipc::{
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
+pub use ipc_wire::UnsupportedServiceOperation;
 pub use nvdrv::{NvDrvSession, NvMapAllocation, UnsupportedNvDrvOperation};
 pub use object::{
-    AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource, HidSession,
-    HostDirectoryFileSystem, HostFile, IpcSession, OperationMode, PerformanceManagerSession,
-    PerformanceSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession,
-    SteadyClockSession, SystemClockKind, SystemClockSession, SystemSettingsSession,
-    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
+    AccountSession, AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource,
+    HidSession, HostDirectoryFileSystem, HostFile, IpcSession, OperationMode,
+    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
+    ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession, SystemClockKind,
+    SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
+    TimeZoneServiceSession,
 };
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,
