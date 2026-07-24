@@ -119,8 +119,10 @@ fn parse_arguments(
         }
         [] => Err("a command is required".to_owned()),
         [command, ..] if command == "list" => Err("list does not accept arguments".to_owned()),
-        [command] if command == "run" => Err("run requires a title ID".to_owned()),
-        [command, ..] if command == "run" => Err("run accepts exactly one title ID".to_owned()),
+        [command] if command == "run" => Err("run requires a title ID or name".to_owned()),
+        [command, ..] if command == "run" => {
+            Err("run accepts exactly one title ID or name".to_owned())
+        }
         [command, ..] => Err(format!("unknown command: {}", command.to_string_lossy())),
     }
 }
@@ -130,7 +132,7 @@ fn print_usage(program: &OsStr) {
         "Usage: {} [--config <file>] [--log-level <level>] <command>\n\n\
          Commands:\n  \
            list        List configured titles as title ID and localized name\n  \
-           run <id>    Run a title\n\n\
+           run <id|name>  Run a title\n\n\
          Log levels:\n  \
            error, warn, info, debug, trace\n  \
            --log-level overrides diagnostics.log_level from nixe.toml\n  \

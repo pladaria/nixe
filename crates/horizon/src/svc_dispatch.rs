@@ -159,6 +159,10 @@ pub enum HorizonSvcFault {
         immediate: u32,
         operation: crate::nvdrv::UnsupportedNvDrvOperation,
     },
+    UnsupportedService {
+        immediate: u32,
+        operation: crate::ipc_wire::UnsupportedServiceOperation,
+    },
 }
 
 impl HorizonSvcFault {
@@ -191,7 +195,7 @@ impl HorizonSvcFault {
                 MemoryMappingErrorReason::ResourceExhausted => HorizonKernelResult::RESOURCE_LIMIT,
             }),
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
-            Self::UnsupportedNvDrv { .. } => None,
+            Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -244,6 +248,13 @@ impl Display for HorizonSvcFault {
                 )
             }
             Self::UnsupportedNvDrv {
+                immediate,
+                operation,
+            } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} reached unsupported emulator semantics: {operation}"
+            ),
+            Self::UnsupportedService {
                 immediate,
                 operation,
             } => write!(
@@ -1054,6 +1065,12 @@ fn reject_ipc(
         }
         IpcWireError::UnsupportedNvDrv(operation) => {
             ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
+                immediate,
+                operation,
+            })
+        }
+        IpcWireError::UnsupportedService(operation) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedService {
                 immediate,
                 operation,
             })
