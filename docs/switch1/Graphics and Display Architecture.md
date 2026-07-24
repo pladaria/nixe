@@ -92,10 +92,11 @@ The graphics path contains several layers with different responsibilities:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The top four layers execute partly inside the title and partly in Horizon
-services. The last layer is real hardware on the console. Nixe must reproduce
-the guest-visible contracts of all relevant upper layers, but it does not need
-to reproduce electrical LCD or HDMI signals.
+The upper layers execute inside the title, Horizon services, or both,
+depending on their responsibility. The last layer is real hardware on the
+console. Nixe must reproduce the guest-visible contracts of all relevant
+upper layers, but it does not need to reproduce electrical LCD or HDMI
+signals.
 
 ### Library calls are not SVCs
 
@@ -482,14 +483,15 @@ separate:
              ▼                                   ▼
 ┌──────────────────────────┐         ┌────────────────────────┐
 │ Accelerated host backend │         │ Headless/test backend  │
-│ Vulkan or another API    │         │ validation and capture │
+│ wgpu host-GPU execution  │         │ validation and capture │
 └──────────────────────────┘         └────────────────────────┘
 ```
 
-The final host API should be selected when requirements are understood; this
-document does not prescribe Vulkan as a permanent choice. The important
-boundary is that Horizon services do not call SDL or a host GPU API directly,
-and that the Maxwell decoder does not own window-system behavior.
+Nixe uses `wgpu` as the host graphics abstraction and currently enables only
+its Vulkan backend. Other `wgpu` backends may be enabled later without making
+Vulkan part of the guest-visible contract. The important boundary is that
+Horizon services do not call `winit`, `wgpu`, or a native host GPU API
+directly, and that the Maxwell decoder does not own window-system behavior.
 
 Shaders require their own translation path:
 
@@ -537,8 +539,8 @@ overlays, applets, screenshots, and multiple layers do not require replacing
 the architecture later.
 
 The compositor output should flow into a host-independent presentation
-interface. An SDL window can be one consumer, while tests can use a headless
-consumer that hashes or captures frames.
+interface. The current `winit` and `wgpu` presenter is one consumer, while
+tests can use a headless consumer that hashes or captures frames.
 
 ## VSync, fences, and buffer availability
 
@@ -623,7 +625,10 @@ different scope from serving a normal application's `nvdrv` IPC.
 ## Proposed implementation stages
 
 The following ordering allows incremental progress without making the
-software-framebuffer path a dead-end.
+software-framebuffer path a dead-end. These stages describe the intended
+completeness of each subsystem; the current implementation status is recorded
+separately below because Nixe may implement a useful subset of several stages
+before completing all behavior in any one of them.
 
 ### Stage 1: VI object model
 
@@ -728,7 +733,8 @@ long-term incompatibilities:
    CPU-readable.
 5. Do not copy full buffers merely to simplify handle or slot ownership unless
    the copy is an explicit backend operation.
-6. Do not put SDL, Vulkan, or another host API inside Horizon service objects.
+6. Do not put `winit`, `wgpu`, Vulkan, or another host API inside Horizon
+   service objects.
 7. Do not identify guest graphics libraries by fixed program counters when a
    stable driver or hardware boundary exists.
 8. Do not interpret unknown GPU methods or shader instructions as no-ops.
@@ -740,3 +746,162 @@ The last rule is the central design constraint. The hello-world framebuffer
 is the smallest producer that reaches the display pipeline; it should exercise
 the same ownership and presentation architecture that a later 3D render
 target will use.
+
+## Current status and future direction
+
+This section records the implemented baseline and the constraints that should
+guide subsequent graphics work. It is intentionally narrower than the staged
+plan above: accepting one homebrew path does not imply complete VI, Binder,
+`nvdrv`, synchronization, or compositor compatibility.
+
+### Implemented software presentation path
+
+Nixe can currently run the libnx software-console path far enough to display
+the redistributable hello-world homebrew:
+
+```text
+guest RGB565 software framebuffer
+        │
+        ├── nvmap-backed guest memory
+        ├── block-linear NvGraphicBuffer metadata
+        └── Binder QueueBuffer
+                    │
+                    ▼
+decode block-linear RGB565 on the host CPU
+                    │
+                    ▼
+publish the newest host-ready XRGB8888 Frame
+                    │
+                    ▼
+upload into a persistent wgpu texture
+                    │
+                    ▼
+render through Vulkan into a winit window
+```
+
+The supported image path is deliberately limited to the block-linear RGB565
+layout emitted by the tested libnx software framebuffer. Other formats,
+multi-plane images, transformations, crops, GPU-produced images, and complete
+fence behavior remain future work. VI objects, Binder slots, buffer
+availability, minimal `nvmap` operations, and virtual VSync exist to the
+extent required by this path, but should not yet be described as complete
+implementations of their respective stages.
+
+The presenter owns one persistent `Bgra8UnormSrgb` GPU texture. It recreates
+that texture only when the dimensions of the submitted guest frame change.
+Each software frame is currently decoded on the CPU and uploaded in full with
+`wgpu::Queue::write_texture`. This is an appropriate correctness-first
+baseline for 1280 by 720 at 60 Hz. Staging-buffer rings, partial uploads, or
+GPU conversion should be considered only after measurements show a relevant
+bottleneck.
+
+### Threading, wakeups, and shutdown
+
+`winit` and `wgpu` remain on the main thread. `RunnableProcess`, Horizon
+dispatch, and guest execution run on a dedicated worker thread. Publishing a
+frame wakes the main event loop through an `EventLoopProxy`; presentation is
+therefore not scheduled by an arbitrary guest instruction count. The
+latest-frame mailbox replaces stale unconsumed frames, and presentation
+wakeups are coalesced so that presentation cannot apply unbounded
+back-pressure to guest execution.
+
+The host event loop uses a waiting control flow rather than periodic polling.
+Window resizing immediately reconfigures the surface and redraws the existing
+texture, so resize responsiveness does not depend on the interpreter slice
+size. Closing the window and pressing Ctrl+C both request a clean
+host-initiated guest termination. The main thread waits for the worker to
+finish process teardown before returning the final classified result.
+
+Guest VI VSync remains independent of host presentation. The current virtual
+display clock runs at 60 Hz, while the Vulkan surface uses FIFO presentation
+for host VSync. Host refresh rate, occlusion, or window resizing must not
+silently redefine guest-visible display timing.
+
+### Resolution model today
+
+The current implementation has three distinct image sizes:
+
+1. The emulated default display reports a fixed 1280 by 720 resolution.
+2. The submitted `NvGraphicBuffer` supplies the actual guest frame width and
+   height.
+3. The host window and swapchain have an independently resizable extent.
+
+The first size influences what libnx and the application normally allocate,
+but the submitted graphic-buffer metadata is authoritative for decoding and
+texture creation. A title may submit a different resolution on a later frame.
+Nixe then recreates only the persistent frame texture and presents the new
+image in the existing window.
+
+Presentation preserves the submitted frame's aspect ratio. The image is
+scaled to the largest fitting viewport and centered, with black bars where
+the window and frame aspect ratios differ. Host window resizing never
+pretends that the guest entered or left its dock.
+
+The configured initial operation mode is reported as either handheld or
+console mode through Horizon applet state. It does not currently change the
+fixed 1280 by 720 display resolution. Future mode-transition work must update
+the appropriate guest-visible capabilities and notifications without
+assuming that existing buffers change dimensions automatically.
+
+### Near-term software-path improvements
+
+The software path should remain simple until profiling identifies a concrete
+cost, but it needs better observability and broader protocol coverage. Useful
+next steps include:
+
+- measure CPU decode, texture upload, redraw, and presentation time;
+- count produced, replaced, uploaded, presented, and skipped frames;
+- characterize frame pacing, queue depth, and end-to-end latency;
+- complete the required BufferQueue ownership, blocking, and fence behavior;
+- support additional verified graphic-buffer formats, layouts, crops, and
+  transforms;
+- define configurable display capabilities and handheld or docked resolution
+  policies;
+- specify guest VSync behavior during pause, fast-forward, and deterministic
+  execution; and
+- evaluate reusable staging buffers or GPU format conversion only when
+  measurements justify their added complexity.
+
+### Future 3D resolution scaling
+
+The 3D implementation must not assume that guest and host image dimensions
+are identical. At minimum, it should keep the following concepts separate:
+
+- guest-visible display mode and capabilities;
+- dimensions of a submitted guest buffer;
+- logical dimensions of a guest render target;
+- physical dimensions of its host-GPU representation;
+- compositor output dimensions; and
+- host window or swapchain dimensions.
+
+Internal resolution scaling should rasterize directly into a larger host
+render target. For example, a logical 1280 by 720 guest render target at a
+three-times scale should use a 3840 by 2160 host representation. Enlarging the
+already completed 1280 by 720 image would only upscale pixels and would not
+produce additional geometric detail.
+
+Graphics resources should therefore carry explicit logical and physical
+extents, conceptually `guest_extent` and `host_extent`, together with their
+coherence state. Viewports, scissors, color and depth targets, clears,
+resolves, copies, and blits must apply the scale consistently. When a guest
+render target is sampled later, its higher-resolution host representation
+should remain on the GPU whenever possible rather than being reduced to guest
+resolution and uploaded again.
+
+Correct internal scaling also requires policies for:
+
+- CPU reads or writes of GPU-produced images;
+- guest-memory aliasing between images and buffers;
+- render-target use as a later texture;
+- copies between scaled and unscaled resources;
+- shaders that use absolute pixel coordinates or encoded dimensions;
+- post-processing, temporal effects, and history buffers;
+- UI and other content intended for exact pixel placement; and
+- synchronization between guest backing memory and host-GPU resources.
+
+The final high-resolution image should flow directly into composition and
+presentation. Nixe should reduce it to guest resolution only where a
+guest-visible operation requires that representation. Preserving these
+boundaries from the first Maxwell render-target implementation will make
+two-, three-, and four-times internal scaling possible without redesigning
+the graphics architecture.

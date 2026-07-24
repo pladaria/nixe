@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{InitialOperationMode, TimeMode};
@@ -273,6 +273,8 @@ fn execute(
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let mut next_progress = EXECUTION_PROGRESS_INTERVAL;
+    let mut last_progress_instructions = 0_u64;
+    let mut last_progress_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
     loop {
@@ -306,10 +308,15 @@ fn execute(
             .map_err(|error| error.to_string())?;
         instructions = instructions.saturating_add(report.instructions_executed);
         if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
+            let elapsed = execution_started.elapsed();
+            let interval_instructions = instructions.saturating_sub(last_progress_instructions);
+            let interval_elapsed = elapsed.saturating_sub(last_progress_elapsed);
+            let interval_ips = instructions_per_second(interval_instructions, interval_elapsed);
             log::debug!(
-                "guest execution progress: instructions={instructions}, elapsed={:?}",
-                execution_started.elapsed()
+                "guest execution progress: instructions={instructions}, elapsed={elapsed:?}, interval_ips={interval_ips:.0}"
             );
+            last_progress_instructions = instructions;
+            last_progress_elapsed = elapsed;
             next_progress = next_progress.saturating_add(EXECUTION_PROGRESS_INTERVAL);
         }
         if print_trace {
@@ -366,6 +373,14 @@ fn execute(
             }
             stop => return Err(execution_stop_error(stop, instructions, &report)),
         }
+    }
+}
+
+fn instructions_per_second(instructions: u64, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        instructions as f64 / elapsed.as_secs_f64()
     }
 }
 
@@ -462,6 +477,15 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<RunnableProcess>();
+    }
+
+    #[test]
+    fn computes_instruction_rate_for_the_progress_interval() {
+        assert_eq!(
+            instructions_per_second(20_000_000, Duration::from_millis(2_500)),
+            8_000_000.0
+        );
+        assert_eq!(instructions_per_second(1, Duration::ZERO), 0.0);
     }
 
     fn process_exit(cause: ProcessExitCause, exit_code: u64) -> ProcessExit {
