@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 sdl3.workspace = true
+# SDL is only an input backend; video is provided by winit/wgpu.
+sdl3-sys.workspace = true
+serde.workspace = true

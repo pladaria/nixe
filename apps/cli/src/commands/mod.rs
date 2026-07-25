@@ -4,6 +4,7 @@ use nixe_config::NixeConfig;
 
 use crate::logging::{self, LogLevel};
 
+pub mod input;
 pub mod list;
 pub mod run;
 

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 enum Command {
+    Input,
     List(commands::list::Arguments),
     Run(commands::run::Arguments),
 }
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
     }
 
     let result = match invocation.command {
+        Command::Input => commands::input::run(),
         Command::List(arguments) => commands::list::run(arguments),
         Command::Run(arguments) => commands::run::run(arguments),
     };
@@ -96,6 +98,10 @@ fn parse_arguments(
     }
 
     match positionals.as_slice() {
+        [command] if command == "input" => Ok(Some(Invocation {
+            command: Command::Input,
+            log_level: log_level.unwrap_or_default(),
+        })),
         [command] if command == "list" => Ok(Some(Invocation {
             command: Command::List(commands::list::Arguments {
                 config_path,
@@ -118,6 +124,7 @@ fn parse_arguments(
             }))
         }
         [] => Err("a command is required".to_owned()),
+        [command, ..] if command == "input" => Err("input does not accept arguments".to_owned()),
         [command, ..] if command == "list" => Err("list does not accept arguments".to_owned()),
         [command] if command == "run" => Err("run requires a title ID or name".to_owned()),
         [command, ..] if command == "run" => {
@@ -131,7 +138,8 @@ fn print_usage(program: &OsStr) {
     eprintln!(
         "Usage: {} [--config <file>] [--log-level <level>] <command>\n\n\
          Commands:\n  \
-           list        List configured titles as title ID and localized name\n  \
+           input           Display live state from the first connected gamepad\n  \
+           list            List configured titles as title ID and localized name\n  \
            run <id|name>  Run a title\n\n\
          Log levels:\n  \
            error, warn, info, debug, trace\n  \
@@ -163,6 +171,13 @@ mod tests {
         };
         assert_eq!(arguments.config_path, None);
         assert_eq!(arguments.log_level_override, None);
+        assert_eq!(invocation.log_level, logging::LogLevel::Info);
+    }
+
+    #[test]
+    fn parses_input_without_configuration() {
+        let invocation = parse_arguments(arguments(&["input"])).unwrap().unwrap();
+        assert!(matches!(invocation.command, Command::Input));
         assert_eq!(invocation.log_level, logging::LogLevel::Info);
     }
 
@@ -206,6 +221,7 @@ mod tests {
             let invocation = parse_arguments(arguments(values)).unwrap().unwrap();
             assert_eq!(invocation.log_level, logging::LogLevel::Trace);
             match invocation.command {
+                Command::Input => panic!("expected list or run command"),
                 Command::List(arguments) => {
                     assert_eq!(arguments.log_level_override, Some(logging::LogLevel::Trace));
                 }

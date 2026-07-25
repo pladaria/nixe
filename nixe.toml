@@ -43,3 +43,34 @@ report_detail = "detailed"
 # runtime retains at most 64 entries. Detailed mode includes bounded
 # disassembly; sanitized mode retains only sequence, guest location and bits.
 instruction_trace = false
+
+# Use `cargo cli input` to get your controller's SDL gamepad information
+[input.profiles.switch-pro]
+device = "Nintendo Switch Pro Controller"
+type = "switch-pro"
+
+# Emulated Switch buttons mapped to SDL gamepad identifiers.
+a = "east"
+b = "south"
+x = "north"
+y = "west"
+plus = "start"
+minus = "back"
+home = "guide"
+capture = "misc1"
+l = "leftshoulder"
+r = "rightshoulder"
+leftstick = "leftstick"
+rightstick = "rightstick"
+dpup = "dpup"
+dpdown = "dpdown"
+dpleft = "dpleft"
+dpright = "dpright"
+zl = "lefttrigger"
+zr = "righttrigger"
+leftx = "leftx"
+lefty = "lefty"
+rightx = "rightx"
+righty = "righty"
+gyroscope = "gyroscope"
+accelerometer = "accelerometer"

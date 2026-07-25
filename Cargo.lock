@@ -953,6 +953,7 @@ dependencies = [
  "log",
  "nixe-config",
  "nixe-horizon",
+ "nixe-input",
  "nixe-loader-content",
  "nixe-loader-executable",
  "nixe-loader-storage",
@@ -968,6 +969,7 @@ name = "nixe-config"
 version = "0.1.0"
 dependencies = [
  "chrono-tz",
+ "nixe-input",
  "nixe-loader-title",
  "serde",
  "toml",
@@ -998,6 +1000,8 @@ name = "nixe-input"
 version = "0.1.0"
 dependencies = [
  "sdl3",
+ "sdl3-sys",
+ "serde",
 ]
 
 [[package]]
