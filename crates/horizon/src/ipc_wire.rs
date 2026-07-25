@@ -7,12 +7,8 @@
 use chrono::{Datelike, Offset, Timelike};
 use chrono_tz::OffsetComponents;
 use nixe_cpu::address::GuestVirtualAddress;
-use nixe_cpu::memory::{
-    DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
-};
-use nixe_runtime::{
-    EventObject, ExceptionProcessContext, HandleObject, SharedMemoryObject, TransferMemoryObject,
-};
+use nixe_cpu::memory::{DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryValue};
+use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
 
 use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
@@ -20,7 +16,7 @@ use crate::ipc_message::{
 };
 use crate::object::AppletObject;
 use crate::{
-    AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession,
+    AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HidSystem,
     HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
     IpcResultCode, IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
     MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession,
@@ -39,7 +35,6 @@ const PERFORMANCE_MODE_NORMAL: u32 = 0;
 const FS_MAX_PATH: usize = 0x301;
 const FS_DIRECTORY_ENTRY_SIZE: usize = 0x310;
 const FS_DIRECTORY_ENTRY_FILE: u8 = 1;
-const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IpcWireError {
@@ -123,13 +118,19 @@ pub(crate) fn connect_to_named_port(
     Ok(NamedPortResult::NameOutOfRange)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostSystems<'a> {
+    pub video: &'a VideoSystem,
+    pub hid: &'a HidSystem,
+}
+
 pub(crate) fn send_sync_request(
     process: &mut ExceptionProcessContext<'_>,
     tls: GuestVirtualAddress,
     handle: u32,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
-    video_system: &VideoSystem,
+    host_systems: HostSystems<'_>,
 ) -> Result<SyncRequestResult, IpcWireError> {
     send_sync_request_from_buffer(
         process,
@@ -138,7 +139,7 @@ pub(crate) fn send_sync_request(
         handle,
         initial_operation_mode,
         time_environment,
-        video_system,
+        host_systems,
     )
 }
 
@@ -149,7 +150,7 @@ pub(crate) fn send_sync_request_from_buffer(
     handle: u32,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
-    video_system: &VideoSystem,
+    host_systems: HostSystems<'_>,
 ) -> Result<SyncRequestResult, IpcWireError> {
     let manager = process
         .handles()
@@ -399,7 +400,7 @@ pub(crate) fn send_sync_request_from_buffer(
             hipc.pid.is_some(),
             initial_operation_mode,
             time_environment,
-            video_system,
+            host_systems,
         )?
     } else if settings.is_some() {
         dispatch_system_settings(process, request, &hipc.receive_statics)?
@@ -408,7 +409,7 @@ pub(crate) fn send_sync_request_from_buffer(
     } else if let Some(session) = performance {
         dispatch_performance_session(&session, request)?
     } else if let Some(applet) = applet {
-        dispatch_applet(process, &applet, request, &hipc, video_system)?
+        dispatch_applet(process, &applet, request, &hipc, host_systems.video)?
     } else if let Some(account) = account {
         dispatch_account(process, &account, request, &hipc)?
     } else if let Some(hid) = hid {
@@ -456,7 +457,7 @@ fn dispatch_service_manager(
     sent_pid: bool,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
-    video_system: &VideoSystem,
+    host_systems: HostSystems<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     match request.command_id {
         0 => {
@@ -526,6 +527,7 @@ fn dispatch_service_manager(
                     name,
                     initial_operation_mode,
                     time_environment,
+                    host_systems.hid,
                 );
             }
             // libnx opens acc:u0 for application account sessions. Retain the
@@ -569,7 +571,7 @@ fn dispatch_service_manager(
                     .handles_mut()
                     .insert(ViSession::new(
                         ViObjectKind::Root(kind),
-                        video_system.clone(),
+                        host_systems.video.clone(),
                     ))
                     .map_err(|_| IpcWireError::ResourceExhausted)?;
                 return Ok((
@@ -591,7 +593,7 @@ fn dispatch_service_manager(
                 }
                 let handle = process
                     .handles_mut()
-                    .insert(video_system.nvdrv())
+                    .insert(host_systems.video.nvdrv())
                     .map_err(|_| IpcWireError::ResourceExhausted)?;
                 return Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
@@ -708,6 +710,7 @@ fn connect_system_service(
     name: &[u8],
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
+    hid_system: &HidSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     if !process.mounts().allows_service(name) {
         return Ok((
@@ -723,14 +726,9 @@ fn connect_system_service(
         b"appletOE" => process
             .handles_mut()
             .insert(AppletSession::new(initial_operation_mode)),
-        b"hid" => {
-            let shared_memory = SharedMemoryObject::zeroed_with_remote_permissions(
-                HID_SHARED_MEMORY_SIZE,
-                MemoryPermissions::READ,
-            )
-            .map_err(|_| IpcWireError::ResourceExhausted)?;
-            process.handles_mut().insert(HidSession::new(shared_memory))
-        }
+        b"hid" => process
+            .handles_mut()
+            .insert(HidSession::new(hid_system.shared_memory())),
         b"time:u" => time_environment
             .create_service()
             .and_then(|session| process.handles_mut().insert(session)),
@@ -2105,10 +2103,12 @@ fn dispatch_hid(
             log::debug!("hid created IAppletResource handle {handle:#x}");
             semantic_success(request.token, false, &[], &[], &[], Some(handle))
         }
-        // These commands only configure which Npad records HID should publish.
-        // The shared memory currently remains in its valid disconnected/zeroed
-        // state, so acknowledging them is sufficient until host input lands.
+        // These commands configure Npad publication or start/stop its full-key
+        // six-axis sensor. Player one is published as FullKey by HidSystem.
         // ABI: libnx hid.c at dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb.
+        66 | 67 if hipc.pid.is_some() && request.data.len() >= 16 => {
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
         100 if hipc.pid.is_some() && request.data.len() >= 16 => {
             semantic_success(request.token, false, &[], &[], &[], None)
         }
@@ -2124,7 +2124,12 @@ fn dispatch_hid(
         103 if hipc.pid.is_some() && request.data.len() >= 8 => {
             semantic_success(request.token, false, &[], &[], &[], None)
         }
-        100 | 102 | 103 => cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER),
+        109 if hipc.pid.is_some() && request.data.len() >= 16 => {
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        66 | 67 | 100 | 102 | 103 | 109 => {
+            cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER)
+        }
         _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
     }
 }

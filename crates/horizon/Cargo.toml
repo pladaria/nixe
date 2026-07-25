@@ -9,6 +9,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 log.workspace = true
 nixe-cpu.workspace = true
+nixe-input.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-runtime.workspace = true

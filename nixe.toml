@@ -48,8 +48,7 @@ instruction_trace = false
 [input.profiles.switch-pro]
 device = "Nintendo Switch Pro Controller"
 type = "switch-pro"
-
-# Emulated Switch buttons mapped to SDL gamepad identifiers.
+# button mapping for the SDL gamepad
 a = "east"
 b = "south"
 x = "north"
