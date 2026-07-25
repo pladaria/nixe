@@ -4,13 +4,15 @@ use std::fmt;
 
 use sdl3::{
     GamepadSubsystem, Sdl,
-    gamepad::{Axis, Button as SdlButton, Gamepad, GamepadType},
+    gamepad::{Axis, Button as SdlButton, ButtonLabel as SdlButtonLabel, Gamepad, GamepadType},
     joystick::JoystickId,
+    sensor::SensorType,
 };
 
 use crate::{
-    Button, ButtonSet, ControllerId, ControllerKind, ControllerState, DPadState, HostInputBackend,
-    InputSnapshot, TriggerState,
+    Button, ButtonLabel, ButtonSet, ControllerId, ControllerKind, ControllerState, DPadState,
+    FaceButtonLabels, HostInputBackend, InputSnapshot, MotionState, MotionVector, StickState,
+    TriggerState,
 };
 
 // SDL's position-based button and trigger conventions are defined here:
@@ -108,6 +110,7 @@ impl SdlInputBackend {
                 .gamepad_subsystem
                 .open(joystick_id)
                 .map_err(|error| SdlInputError::new("controller open", error))?;
+            enable_available_sensors(&gamepad);
             let controller_id = ControllerId::new(self.next_controller_id);
             self.next_controller_id = self.next_controller_id.checked_add(1).ok_or_else(|| {
                 SdlInputError::new(
@@ -138,22 +141,26 @@ impl HostInputBackend for SdlInputBackend {
 
 fn controller_state(open: &OpenGamepad) -> ControllerState {
     let gamepad = &open.gamepad;
-    let (buttons, dpad, triggers) =
+    let (buttons, dpad, left_stick, right_stick, triggers) =
         map_controls(|button| gamepad.button(button), |axis| gamepad.axis(axis));
     ControllerState {
         id: open.controller_id,
         name: open.name.clone(),
         kind: controller_kind(gamepad.r#type()),
         buttons,
+        button_labels: face_button_labels(gamepad),
         dpad,
+        left_stick,
+        right_stick,
         triggers,
+        motion: motion_state(gamepad),
     }
 }
 
 fn map_controls(
     button: impl Fn(SdlButton) -> bool,
     axis: impl Fn(Axis) -> i16,
-) -> (ButtonSet, DPadState, TriggerState) {
+) -> (ButtonSet, DPadState, StickState, StickState, TriggerState) {
     let mut buttons = ButtonSet::default();
     for (source, destination) in [
         (SdlButton::South, Button::South),
@@ -167,7 +174,21 @@ fn map_controls(
         (SdlButton::RightStick, Button::RightStick),
         (SdlButton::LeftShoulder, Button::LeftShoulder),
         (SdlButton::RightShoulder, Button::RightShoulder),
+        (SdlButton::DPadUp, Button::DPadUp),
+        (SdlButton::DPadDown, Button::DPadDown),
+        (SdlButton::DPadLeft, Button::DPadLeft),
+        (SdlButton::DPadRight, Button::DPadRight),
         (SdlButton::Misc1, Button::Miscellaneous),
+        (SdlButton::Misc2, Button::Miscellaneous2),
+        (SdlButton::Misc3, Button::Miscellaneous3),
+        (SdlButton::Misc4, Button::Miscellaneous4),
+        (SdlButton::Misc5, Button::Miscellaneous5),
+        (SdlButton::Misc6, Button::Miscellaneous6),
+        (SdlButton::LeftPaddle1, Button::LeftPaddle1),
+        (SdlButton::RightPaddle1, Button::RightPaddle1),
+        (SdlButton::LeftPaddle2, Button::LeftPaddle2),
+        (SdlButton::RightPaddle2, Button::RightPaddle2),
+        (SdlButton::Touchpad, Button::Touchpad),
     ] {
         buttons.set(destination, button(source));
     }
@@ -179,11 +200,84 @@ fn map_controls(
             left: button(SdlButton::DPadLeft),
             right: button(SdlButton::DPadRight),
         },
+        StickState {
+            x: axis(Axis::LeftX),
+            y: axis(Axis::LeftY),
+        },
+        StickState {
+            x: axis(Axis::RightX),
+            y: axis(Axis::RightY),
+        },
         TriggerState {
             left: normalize_trigger(axis(Axis::TriggerLeft)),
             right: normalize_trigger(axis(Axis::TriggerRight)),
         },
     )
+}
+
+fn face_button_labels(gamepad: &Gamepad) -> FaceButtonLabels {
+    FaceButtonLabels {
+        south: button_label(gamepad.button_label_for_gamepad_type(SdlButton::South)),
+        east: button_label(gamepad.button_label_for_gamepad_type(SdlButton::East)),
+        west: button_label(gamepad.button_label_for_gamepad_type(SdlButton::West)),
+        north: button_label(gamepad.button_label_for_gamepad_type(SdlButton::North)),
+    }
+}
+
+fn button_label(value: SdlButtonLabel) -> ButtonLabel {
+    match value {
+        SdlButtonLabel::Unknown => ButtonLabel::Unknown,
+        SdlButtonLabel::A => ButtonLabel::A,
+        SdlButtonLabel::B => ButtonLabel::B,
+        SdlButtonLabel::X => ButtonLabel::X,
+        SdlButtonLabel::Y => ButtonLabel::Y,
+        SdlButtonLabel::Cross => ButtonLabel::Cross,
+        SdlButtonLabel::Circle => ButtonLabel::Circle,
+        SdlButtonLabel::Square => ButtonLabel::Square,
+        SdlButtonLabel::Triangle => ButtonLabel::Triangle,
+    }
+}
+
+const SENSOR_TYPES: [SensorType; 6] = [
+    SensorType::Gyroscope,
+    SensorType::Accelerometer,
+    SensorType::GyroscopeLeft,
+    SensorType::GyroscopeRight,
+    SensorType::AccelerometerLeft,
+    SensorType::AccelerometerRight,
+];
+
+fn enable_available_sensors(gamepad: &Gamepad) {
+    for sensor_type in SENSOR_TYPES {
+        // The gamepad is open and remains alive for this entire query.
+        if unsafe { gamepad.has_sensor(sensor_type) } {
+            let _ = gamepad.sensor_set_enabled(sensor_type, true);
+        }
+    }
+}
+
+fn motion_state(gamepad: &Gamepad) -> MotionState {
+    MotionState {
+        gyroscope: read_sensor(gamepad, SensorType::Gyroscope),
+        accelerometer: read_sensor(gamepad, SensorType::Accelerometer),
+        left_gyroscope: read_sensor(gamepad, SensorType::GyroscopeLeft),
+        right_gyroscope: read_sensor(gamepad, SensorType::GyroscopeRight),
+        left_accelerometer: read_sensor(gamepad, SensorType::AccelerometerLeft),
+        right_accelerometer: read_sensor(gamepad, SensorType::AccelerometerRight),
+    }
+}
+
+fn read_sensor(gamepad: &Gamepad, sensor_type: SensorType) -> Option<MotionVector> {
+    if !gamepad.sensor_enabled(sensor_type) {
+        return None;
+    }
+    let mut data = [0.0; 3];
+    gamepad.sensor_get_data(sensor_type, &mut data).ok()?;
+    Some(MotionVector {
+        x: data[0],
+        y: data[1],
+        z: data[2],
+    })
 }
 
 fn normalize_trigger(value: i16) -> u16 {
@@ -222,7 +316,7 @@ mod tests {
 
     #[test]
     fn sdl_controls_map_to_the_backend_independent_model() {
-        let (buttons, dpad, triggers) = map_controls(
+        let (buttons, dpad, left_stick, right_stick, triggers) = map_controls(
             |button| {
                 matches!(
                     button,
@@ -235,9 +329,12 @@ mod tests {
                 )
             },
             |axis| match axis {
+                Axis::LeftX => -12_345,
+                Axis::LeftY => 23_456,
+                Axis::RightX => 10,
+                Axis::RightY => -20,
                 Axis::TriggerLeft => 8_192,
                 Axis::TriggerRight => i16::MAX,
-                _ => 0,
             },
         );
 
@@ -256,6 +353,14 @@ mod tests {
                 right: true,
             }
         );
+        assert_eq!(
+            left_stick,
+            StickState {
+                x: -12_345,
+                y: 23_456
+            }
+        );
+        assert_eq!(right_stick, StickState { x: 10, y: -20 });
         assert_eq!(triggers.left, 16_384);
         assert_eq!(triggers.right, u16::MAX);
     }

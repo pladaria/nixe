@@ -1,11 +1,13 @@
 //! Shared configuration for Nixe applications.
 
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nixe_input::{Axis, Button, ControllerKind, InputSnapshot, MotionSensor};
 use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
 
@@ -28,6 +30,8 @@ pub struct NixeConfig {
     pub system: SystemConfig,
     /// Cross-cutting diagnostic preferences consumed by application runtimes.
     pub diagnostics: DiagnosticsConfig,
+    /// Host gamepad identification and emulated-controller mappings.
+    pub input: InputConfig,
     source_path: PathBuf,
 }
 
@@ -50,6 +54,7 @@ impl NixeConfig {
             });
         }
         validate_time_config(path, &raw.system.time)?;
+        validate_input_config(path, &raw.input)?;
 
         let source_path = absolute_path(path).map_err(|source| ConfigError::Io {
             path: path.to_owned(),
@@ -88,6 +93,7 @@ impl NixeConfig {
                 report_detail: raw.diagnostics.report_detail,
                 instruction_trace: raw.diagnostics.instruction_trace,
             },
+            input: raw.input,
             source_path,
         })
     }
@@ -219,6 +225,77 @@ pub struct DiagnosticsConfig {
     pub instruction_trace: bool,
 }
 
+/// Named mappings from host gamepads to the emulated controller.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputConfig {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, GamepadProfile>,
+}
+
+impl InputConfig {
+    /// Finds the unique profile matching an SDL device name and controller type.
+    #[must_use]
+    pub fn matching_profile(
+        &self,
+        device: &str,
+        controller_type: ControllerKind,
+    ) -> Option<(&str, &GamepadProfile)> {
+        self.profiles
+            .iter()
+            .find(|(_, profile)| {
+                profile.device == device && profile.controller_type == controller_type
+            })
+            .map(|(name, profile)| (name.as_str(), profile))
+    }
+
+    /// Matches only the first attached controller, never a later controller.
+    #[must_use]
+    pub fn matching_first_controller(
+        &self,
+        snapshot: &InputSnapshot,
+    ) -> Option<(&str, &GamepadProfile)> {
+        let controller = snapshot.controllers.first()?;
+        self.matching_profile(&controller.name, controller.kind)
+    }
+}
+
+/// Flat mapping whose values are canonical identifiers printed by `nixe input`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GamepadProfile {
+    pub device: String,
+    #[serde(rename = "type")]
+    pub controller_type: ControllerKind,
+
+    pub a: Option<Button>,
+    pub b: Option<Button>,
+    pub x: Option<Button>,
+    pub y: Option<Button>,
+    pub plus: Option<Button>,
+    pub minus: Option<Button>,
+    pub home: Option<Button>,
+    pub capture: Option<Button>,
+    pub l: Option<Button>,
+    pub r: Option<Button>,
+    pub leftstick: Option<Button>,
+    pub rightstick: Option<Button>,
+    pub dpup: Option<Button>,
+    pub dpdown: Option<Button>,
+    pub dpleft: Option<Button>,
+    pub dpright: Option<Button>,
+
+    pub zl: Option<Axis>,
+    pub zr: Option<Axis>,
+    pub leftx: Option<Axis>,
+    pub lefty: Option<Axis>,
+    pub rightx: Option<Axis>,
+    pub righty: Option<Axis>,
+
+    pub gyroscope: Option<MotionSensor>,
+    pub accelerometer: Option<MotionSensor>,
+}
+
 /// Errors produced while locating or loading shared configuration.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -236,6 +313,8 @@ pub enum ConfigError {
     UnsupportedVersion { path: PathBuf, version: u32 },
     /// Virtual-time settings are internally inconsistent or not representable.
     InvalidTime { path: PathBuf, reason: String },
+    /// Input profiles contain ambiguous device selectors.
+    InvalidInput { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -265,6 +344,11 @@ impl Display for ConfigError {
                 "configuration {} has invalid system.time settings: {reason}",
                 path.display()
             ),
+            Self::InvalidInput { path, reason } => write!(
+                formatter,
+                "configuration {} has invalid input settings: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -274,7 +358,9 @@ impl Error for ConfigError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::UnsupportedVersion { .. } | Self::InvalidTime { .. } => None,
+            Self::UnsupportedVersion { .. }
+            | Self::InvalidTime { .. }
+            | Self::InvalidInput { .. } => None,
         }
     }
 }
@@ -289,6 +375,8 @@ struct RawConfig {
     system: RawSystemConfig,
     #[serde(default)]
     diagnostics: RawDiagnosticsConfig,
+    #[serde(default)]
+    input: InputConfig,
 }
 
 #[derive(Deserialize)]
@@ -414,6 +502,24 @@ fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigE
     }
 }
 
+fn validate_input_config(path: &Path, input: &InputConfig) -> Result<(), ConfigError> {
+    let mut selectors = HashMap::new();
+    for (name, profile) in &input.profiles {
+        let selector = (profile.device.as_str(), profile.controller_type);
+        if let Some(previous) = selectors.insert(selector, name) {
+            return Err(ConfigError::InvalidInput {
+                path: path.to_owned(),
+                reason: format!(
+                    "profiles `{previous}` and `{name}` both match device {:?} with type {}",
+                    profile.device,
+                    profile.controller_type.identifier()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn deserialize_languages<'de, D>(deserializer: D) -> Result<Vec<NacpLanguage>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -477,6 +583,11 @@ fn user_config_path() -> Option<PathBuf> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nixe_input::{
+        ButtonSet, ControllerId, ControllerState, DPadState, FaceButtonLabels, MotionState,
+        StickState, TriggerState,
+    };
+
     use super::*;
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -501,6 +612,21 @@ mod tests {
     impl Drop for TemporaryConfig {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn controller(name: &str, kind: ControllerKind) -> ControllerState {
+        ControllerState {
+            id: ControllerId::new(1),
+            name: name.to_owned(),
+            kind,
+            buttons: ButtonSet::default(),
+            button_labels: FaceButtonLabels::default(),
+            dpad: DPadState::default(),
+            left_stick: StickState::default(),
+            right_stick: StickState::default(),
+            triggers: TriggerState::default(),
+            motion: MotionState::default(),
         }
     }
 
@@ -547,6 +673,7 @@ mod tests {
         );
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert!(!config.diagnostics.instruction_trace);
+        assert!(config.input.profiles.is_empty());
     }
 
     #[test]
@@ -602,6 +729,115 @@ mod tests {
         );
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Trace);
         assert!(config.diagnostics.instruction_trace);
+    }
+
+    #[test]
+    fn loads_and_matches_a_typed_gamepad_profile() {
+        let file = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [input.profiles.switch-pro]
+                device = "Nintendo Switch Pro Controller"
+                type = "switch-pro"
+                a = "east"
+                plus = "start"
+                zl = "lefttrigger"
+                leftx = "leftx"
+                gyroscope = "gyroscope"
+            "#,
+        );
+
+        let config = NixeConfig::load(&file.path).unwrap();
+        let (name, profile) = config
+            .input
+            .matching_profile("Nintendo Switch Pro Controller", ControllerKind::SwitchPro)
+            .unwrap();
+
+        assert_eq!(name, "switch-pro");
+        assert_eq!(profile.a, Some(Button::East));
+        assert_eq!(profile.plus, Some(Button::Start));
+        assert_eq!(profile.zl, Some(Axis::LeftTrigger));
+        assert_eq!(profile.leftx, Some(Axis::LeftX));
+        assert_eq!(profile.gyroscope, Some(MotionSensor::Gyroscope));
+        assert!(
+            config
+                .input
+                .matching_profile("Another controller", ControllerKind::SwitchPro)
+                .is_none()
+        );
+
+        let snapshot = InputSnapshot {
+            controllers: vec![
+                controller("Another controller", ControllerKind::Standard),
+                controller("Nintendo Switch Pro Controller", ControllerKind::SwitchPro),
+            ],
+        };
+        assert!(config.input.matching_first_controller(&snapshot).is_none());
+
+        let snapshot = InputSnapshot {
+            controllers: vec![controller(
+                "Nintendo Switch Pro Controller",
+                ControllerKind::SwitchPro,
+            )],
+        };
+        assert_eq!(
+            config
+                .input
+                .matching_first_controller(&snapshot)
+                .map(|(name, _)| name),
+            Some("switch-pro")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_profile_identifiers_and_duplicate_selectors() {
+        let invalid_identifier = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [input.profiles.invalid]
+                device = "Controller"
+                type = "switch-pro"
+                a = "right"
+            "#,
+        );
+        assert!(matches!(
+            NixeConfig::load(&invalid_identifier.path),
+            Err(ConfigError::Parse { .. })
+        ));
+
+        let duplicate = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [input.profiles.one]
+                device = "Controller"
+                type = "standard"
+                [input.profiles.two]
+                device = "Controller"
+                type = "standard"
+            "#,
+        );
+        assert!(matches!(
+            NixeConfig::load(&duplicate.path),
+            Err(ConfigError::InvalidInput { .. })
+        ));
     }
 
     #[test]

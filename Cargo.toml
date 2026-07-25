@@ -37,7 +37,9 @@ sanitize-filename = "0.6"
 sdl3 = { version = "=0.18.4", features = [
     "build-from-source",
     "build-from-source-unix-console",
+    "hidapi",
 ] }
+sdl3-sys = { version = "=0.6.7", features = ["no-sdl-video"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
 tempfile = "3.27"

@@ -10,6 +10,7 @@ log.workspace = true
 sha2.workspace = true
 nixe-config.workspace = true
 nixe-horizon.workspace = true
+nixe-input.workspace = true
 nixe-loader-content.workspace = true
 nixe-loader-executable.workspace = true
 nixe-loader-storage.workspace = true
