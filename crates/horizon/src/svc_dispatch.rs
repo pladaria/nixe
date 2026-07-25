@@ -297,6 +297,7 @@ pub struct HorizonSvcDispatcher {
     initial_operation_mode: crate::OperationMode,
     time_environment: crate::TimeEnvironment,
     video_system: crate::VideoSystem,
+    hid_system: crate::HidSystem,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), Instant>,
@@ -340,6 +341,7 @@ impl HorizonSvcDispatcher {
             initial_operation_mode,
             time_environment,
             video_system,
+            hid_system: crate::HidSystem::new(),
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
@@ -354,6 +356,17 @@ impl HorizonSvcDispatcher {
     /// Advances the guest display clock and signals VI VSync when due.
     pub fn advance_video(&self, elapsed: Duration) -> u64 {
         self.video_system.advance(elapsed)
+    }
+
+    /// Publishes the latest player-one controller state to Horizon HID.
+    pub fn advance_input(
+        &mut self,
+        process: &nixe_runtime::RunnableProcess,
+        state: Option<&nixe_input::EmulatedControllerState>,
+        delta: Duration,
+    ) -> Result<(), nixe_runtime::HandleError> {
+        self.hid_system.publish(state, delta)?;
+        self.hid_system.synchronize(process.memory())
     }
 
     #[must_use]
@@ -443,8 +456,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             }
             0x11 => event_signal(context),
             0x12 => event_clear(context),
-            0x13 => map_shared_memory(context),
-            0x14 => unmap_shared_memory(context),
+            0x13 => map_shared_memory(context, &mut self.hid_system),
+            0x14 => unmap_shared_memory(context, &mut self.hid_system),
             0x15 => create_transfer_memory(context),
             0x16 => close_handle(context),
             0x17 => reset_signal(context),
@@ -456,12 +469,14 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
                 self.initial_operation_mode,
                 &self.time_environment,
                 &self.video_system,
+                &self.hid_system,
             ),
             0x22 => send_sync_request_with_user_buffer(
                 context,
                 self.initial_operation_mode,
                 &self.time_environment,
                 &self.video_system,
+                &self.hid_system,
             ),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
@@ -638,6 +653,7 @@ fn send_sync_request(
     initial_operation_mode: crate::OperationMode,
     time_environment: &crate::TimeEnvironment,
     video_system: &crate::VideoSystem,
+    hid_system: &crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let tls = match context.thread().state() {
@@ -650,7 +666,10 @@ fn send_sync_request(
         handle,
         initial_operation_mode,
         time_environment,
-        video_system,
+        crate::ipc_wire::HostSystems {
+            video: video_system,
+            hid: hid_system,
+        },
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -668,6 +687,7 @@ fn send_sync_request_with_user_buffer(
     initial_operation_mode: crate::OperationMode,
     time_environment: &crate::TimeEnvironment,
     video_system: &crate::VideoSystem,
+    hid_system: &crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let address = read_register(context.thread().state(), 0);
     let size = read_register(context.thread().state(), 1);
@@ -702,7 +722,10 @@ fn send_sync_request_with_user_buffer(
         handle,
         initial_operation_mode,
         time_environment,
-        video_system,
+        crate::ipc_wire::HostSystems {
+            video: video_system,
+            hid: hid_system,
+        },
     ) {
         Ok(SyncRequestResult::Success) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -1213,6 +1236,7 @@ fn set_memory_permission(
 
 fn map_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
+    hid_system: &mut crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -1345,6 +1369,9 @@ fn map_shared_memory(
             log::debug!(
                 "mapped temporary shared memory handle {handle:#x} at {start} ({size:#x} bytes)"
             );
+            if hid_system.owns(&shared_memory) {
+                hid_system.register_mapping(context.process().cpu().address_space_id(), start);
+            }
             result(context, HorizonKernelResult::SUCCESS);
             resume()
         }
@@ -1411,6 +1438,7 @@ fn create_transfer_memory(
 
 fn unmap_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
+    hid_system: &mut crate::HidSystem,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -1457,6 +1485,9 @@ fn unmap_shared_memory(
         MemoryMappingPurpose::SharedMemory,
     ) {
         Ok(()) => {
+            if hid_system.owns(&shared_memory) {
+                hid_system.unregister_mapping(context.process().cpu().address_space_id(), start);
+            }
             log::debug!(
                 "unmapped temporary shared memory handle {handle:#x} from {start} ({size:#x} bytes)"
             );

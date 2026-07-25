@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{InitialOperationMode, TimeMode};
 use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment, VideoSystem};
+use nixe_input::{
+    ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
+};
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, ProcessTeardownReport, RunnableProcess,
@@ -21,6 +24,7 @@ use super::load_config;
 
 const EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
 const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub struct Arguments {
     pub config_path: Option<PathBuf>,
@@ -139,6 +143,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         config.system.time.timezone
     );
     let video_system = VideoSystem::new(frontend.mailbox());
+    let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     let worker_frontend_stop = Arc::clone(&frontend_stop_requested);
     let worker_interrupted = Arc::clone(&interrupted);
     let worker_control = frontend_control.clone();
@@ -156,6 +161,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 initial_operation_mode,
                 time_environment,
                 video_system,
+                gamepad_profiles,
             )
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
@@ -202,16 +208,23 @@ fn execute_worker(
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
+    gamepad_profiles: GamepadProfiles,
 ) -> WorkerResult {
     let execution_started = Instant::now();
-    let execution = execute(
-        &mut process,
-        instruction_trace,
-        &stop_signals,
-        initial_operation_mode,
-        time_environment,
-        video_system,
-    );
+    let execution = SdlInputBackend::new()
+        .map_err(|error| error.to_string())
+        .and_then(|backend| {
+            let mut input = InputManager::with_profiles(backend, gamepad_profiles);
+            execute(
+                &mut process,
+                instruction_trace,
+                &stop_signals,
+                initial_operation_mode,
+                time_environment,
+                video_system,
+                &mut input,
+            )
+        });
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
@@ -264,6 +277,7 @@ fn execute(
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
+    input: &mut InputManager<SdlInputBackend>,
 ) -> Result<ExecutionSummary, String> {
     let mut dispatcher = HorizonSvcDispatcher::new_with_video(
         initial_operation_mode,
@@ -277,8 +291,29 @@ fn execute(
     let mut last_progress_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
     let mut last_trace_sequence = None;
+    let mut next_input_poll = Duration::ZERO;
+    let mut last_input_poll = Duration::ZERO;
+    let mut active_input = None;
+    let mut input_observed = false;
     loop {
-        dispatcher.advance_video(execution_started.elapsed());
+        let elapsed = execution_started.elapsed();
+        dispatcher.advance_video(elapsed);
+        if elapsed >= next_input_poll {
+            let profiled = input
+                .read_profiled_input()
+                .map_err(|error| error.to_string())?;
+            report_input_change(&mut active_input, &profiled, input_observed);
+            input_observed = true;
+            dispatcher
+                .advance_input(
+                    process,
+                    profiled.as_ref().map(|controller| &controller.state),
+                    elapsed.saturating_sub(last_input_poll),
+                )
+                .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;
+            last_input_poll = elapsed;
+            next_input_poll = elapsed.saturating_add(INPUT_POLL_INTERVAL);
+        }
         if stop_signals.frontend.load(Ordering::Acquire) {
             log::info!("video window closed; stopping the guest process cleanly");
             if !process.terminate() {
@@ -374,6 +409,40 @@ fn execute(
             stop => return Err(execution_stop_error(stop, instructions, &report)),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveInput {
+    controller_id: ControllerId,
+    device: String,
+    profile_name: String,
+}
+
+fn report_input_change(
+    active: &mut Option<ActiveInput>,
+    current: &Option<ProfiledControllerState>,
+    previously_observed: bool,
+) {
+    let next = current.as_ref().map(|controller| ActiveInput {
+        controller_id: controller.controller_id,
+        device: controller.device.clone(),
+        profile_name: controller.profile_name.clone(),
+    });
+    if *active == next && previously_observed {
+        return;
+    }
+    match &next {
+        Some(controller) => log::info!(
+            "using input profile `{}` for {}",
+            controller.profile_name,
+            controller.device
+        ),
+        None if previously_observed && active.is_some() => {
+            log::info!("mapped gamepad disconnected; player one is now disconnected");
+        }
+        None => log::debug!("no matching first-gamepad input profile; player one is disconnected"),
+    }
+    *active = next;
 }
 
 fn instructions_per_second(instructions: u64, elapsed: Duration) -> f64 {

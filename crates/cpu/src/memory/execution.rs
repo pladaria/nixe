@@ -490,6 +490,62 @@ impl ExecutionMemory {
         true
     }
 
+    /// Overwrites mapped RAM from a trusted host producer, ignoring guest
+    /// write permissions while retaining mapping and region validation.
+    ///
+    /// This is used for kernel-owned shared-memory producers whose guest view
+    /// is intentionally read-only.
+    pub fn overwrite_mapped_ram(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+    ) -> bool {
+        let Some(end) = address.get().checked_add(bytes.len() as u64) else {
+            return false;
+        };
+        let mut inner = self.inner.borrow_mut();
+        let mut cursor = address.get();
+        while cursor < end {
+            let virtual_address = GuestVirtualAddress::new(cursor);
+            let Some(mapping) = inner.mapping_at(address_space, virtual_address) else {
+                return false;
+            };
+            if !matches!(
+                inner.page(mapping.physical_slot),
+                Some(ExecutionPhysicalPage::Ram { .. })
+            ) {
+                return false;
+            }
+            let remaining_in_page = SYNTHETIC_PAGE_SIZE - page_offset(virtual_address);
+            cursor = cursor.saturating_add(remaining_in_page.min((end - cursor) as usize) as u64);
+        }
+
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let virtual_address =
+                GuestVirtualAddress::new(address.get().saturating_add(copied as u64));
+            let mapping = inner
+                .mapping_at(address_space, virtual_address)
+                .expect("host overwrite range was validated");
+            let offset = page_offset(virtual_address);
+            let count = (SYNTHETIC_PAGE_SIZE - offset).min(bytes.len() - copied);
+            let Some(ExecutionPhysicalPage::Ram {
+                bytes: contents,
+                generation,
+            }) = inner.page_mut(mapping.physical_slot)
+            else {
+                unreachable!("host overwrite RAM range was validated")
+            };
+            contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]))
+                [offset..offset + count]
+                .copy_from_slice(&bytes[copied..copied + count]);
+            *generation = generation.wrapping_add(1);
+            copied += count;
+        }
+        true
+    }
+
     /// Publishes an alias mapping for an existing physical page.
     pub fn map_page(
         &mut self,

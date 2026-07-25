@@ -1,12 +1,17 @@
 //! Host input abstractions and platform backends.
 
 mod model;
+mod profile;
 pub mod sdl;
 
 pub use model::{
     Axis, Button, ButtonLabel, ButtonSet, ControllerId, ControllerKind, ControllerState, DPadState,
     FaceButtonLabels, IdentifierError, InputSnapshot, MotionSensor, MotionState, MotionVector,
     StickState, TriggerState,
+};
+pub use profile::{
+    EmulatedButtonState, EmulatedControllerState, GamepadProfile, GamepadProfiles,
+    ProfiledControllerState,
 };
 
 /// Produces complete snapshots of the currently connected host controllers.
@@ -25,12 +30,21 @@ pub trait HostInputBackend {
 /// remains stable until it disconnects.
 pub struct InputManager<B> {
     backend: B,
+    profiles: GamepadProfiles,
 }
 
 impl<B> InputManager<B> {
     #[must_use]
     pub const fn new(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            profiles: GamepadProfiles::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_profiles(backend: B, profiles: GamepadProfiles) -> Self {
+        Self { backend, profiles }
     }
 
     #[must_use]
@@ -52,6 +66,15 @@ impl<B: HostInputBackend> InputManager<B> {
     /// Reads the current state of the first attached controller.
     pub fn read_input(&mut self) -> Result<Option<ControllerState>, B::Error> {
         Ok(self.backend.poll()?.controllers.into_iter().next())
+    }
+
+    /// Reads and maps the first attached controller through an exact profile.
+    ///
+    /// A missing controller or profile match is exposed as a disconnected
+    /// emulated controller.
+    pub fn read_profiled_input(&mut self) -> Result<Option<ProfiledControllerState>, B::Error> {
+        let snapshot = self.backend.poll()?;
+        Ok(self.profiles.map_first_controller(&snapshot.controllers))
     }
 }
 

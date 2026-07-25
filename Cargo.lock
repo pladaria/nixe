@@ -987,6 +987,7 @@ dependencies = [
  "chrono-tz",
  "log",
  "nixe-cpu",
+ "nixe-input",
  "nixe-loader-storage",
  "nixe-loader-title",
  "nixe-runtime",

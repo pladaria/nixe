@@ -7,9 +7,11 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nixe_input::{Axis, Button, ControllerKind, InputSnapshot, MotionSensor};
+use nixe_input::{ControllerKind, InputSnapshot};
 use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
+
+pub use nixe_input::GamepadProfile;
 
 /// Configuration file name used during automatic discovery.
 pub const CONFIG_FILE_NAME: &str = "nixe.toml";
@@ -258,42 +260,6 @@ impl InputConfig {
         let controller = snapshot.controllers.first()?;
         self.matching_profile(&controller.name, controller.kind)
     }
-}
-
-/// Flat mapping whose values are canonical identifiers printed by `nixe input`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GamepadProfile {
-    pub device: String,
-    #[serde(rename = "type")]
-    pub controller_type: ControllerKind,
-
-    pub a: Option<Button>,
-    pub b: Option<Button>,
-    pub x: Option<Button>,
-    pub y: Option<Button>,
-    pub plus: Option<Button>,
-    pub minus: Option<Button>,
-    pub home: Option<Button>,
-    pub capture: Option<Button>,
-    pub l: Option<Button>,
-    pub r: Option<Button>,
-    pub leftstick: Option<Button>,
-    pub rightstick: Option<Button>,
-    pub dpup: Option<Button>,
-    pub dpdown: Option<Button>,
-    pub dpleft: Option<Button>,
-    pub dpright: Option<Button>,
-
-    pub zl: Option<Axis>,
-    pub zr: Option<Axis>,
-    pub leftx: Option<Axis>,
-    pub lefty: Option<Axis>,
-    pub rightx: Option<Axis>,
-    pub righty: Option<Axis>,
-
-    pub gyroscope: Option<MotionSensor>,
-    pub accelerometer: Option<MotionSensor>,
 }
 
 /// Errors produced while locating or loading shared configuration.
@@ -584,8 +550,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use nixe_input::{
-        ButtonSet, ControllerId, ControllerState, DPadState, FaceButtonLabels, MotionState,
-        StickState, TriggerState,
+        Axis, Button, ButtonSet, ControllerId, ControllerState, DPadState, FaceButtonLabels,
+        MotionSensor, MotionState, StickState, TriggerState,
     };
 
     use super::*;

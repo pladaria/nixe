@@ -2,6 +2,7 @@
 mod support;
 
 use std::fs;
+use std::time::Duration;
 
 use nixe_cpu::address::AddressSpaceId;
 use nixe_cpu::location::ExecutionState;
@@ -17,6 +18,7 @@ use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
     OperationMode, UnsupportedServiceOperation,
 };
+use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
     Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExecutionError,
@@ -1818,6 +1820,37 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .unwrap()
             .purpose,
         MemoryMappingPurpose::SharedMemory
+    );
+
+    let controller = EmulatedControllerState {
+        buttons: EmulatedButtonState {
+            a: true,
+            plus: true,
+            ..EmulatedButtonState::default()
+        },
+        ..EmulatedControllerState::default()
+    };
+    dispatcher
+        .advance_input(&process, Some(&controller), Duration::from_millis(5))
+        .unwrap();
+    assert_eq!(
+        read_guest_u32(&process, mapping_address.checked_add(0x9a00).unwrap()),
+        1
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            read_guest_bytes(&process, mapping_address.checked_add(0x9a58).unwrap(), 8)
+                .try_into()
+                .unwrap()
+        ),
+        1 | 1 << 10
+    );
+    dispatcher
+        .advance_input(&process, None, Duration::from_millis(5))
+        .unwrap();
+    assert_eq!(
+        read_guest_u32(&process, mapping_address.checked_add(0x9a00).unwrap()),
+        0
     );
 
     state(&mut process).write_w(x(0), shared_memory_handle);
