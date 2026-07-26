@@ -1838,7 +1838,13 @@ fn dispatch_nvdrv(
                 &mut input,
             )?;
             let (output, error) = session
-                .ioctl(fd, ioctl, &input)
+                .ioctl_with_memory(
+                    fd,
+                    ioctl,
+                    &input,
+                    process.cpu().address_space_id(),
+                    process.canonical_memory(),
+                )
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             write_descriptor_bytes(process, output_descriptor, &output)?;
             Ok((

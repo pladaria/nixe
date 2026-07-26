@@ -23,6 +23,7 @@ fn runtime_owns_the_cpu_and_executable_loader_dependency_direction() {
 
     assert!(dependencies.contains(&"nixe-cpu"));
     assert!(dependencies.contains(&"nixe-loader-executable"));
+    assert!(dependencies.contains(&"nixe-memory"));
 }
 
 fn dependency_names(manifest: &str) -> Vec<&str> {

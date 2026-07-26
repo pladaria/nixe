@@ -254,6 +254,7 @@ mod tests {
             vec![CodePageDependency {
                 page: GuestPhysicalPageId::new(5),
                 generation: CodeGeneration::new(9),
+                mapping_generation: crate::address::MappingGeneration::new(1),
             }],
             vec![
                 InstructionSource::new(
@@ -262,6 +263,7 @@ mod tests {
                     CodeDependencies::one(CodePageDependency {
                         page: GuestPhysicalPageId::new(5),
                         generation: CodeGeneration::new(9),
+                        mapping_generation: crate::address::MappingGeneration::new(1),
                     }),
                 ),
                 InstructionSource::new(
@@ -270,6 +272,7 @@ mod tests {
                     CodeDependencies::one(CodePageDependency {
                         page: GuestPhysicalPageId::new(5),
                         generation: CodeGeneration::new(9),
+                        mapping_generation: crate::address::MappingGeneration::new(1),
                     }),
                 ),
             ],

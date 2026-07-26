@@ -1,8 +1,7 @@
 [package]
-name = "nixe-cpu"
+name = "nixe-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nixe-memory.workspace = true

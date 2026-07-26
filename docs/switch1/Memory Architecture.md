@@ -709,6 +709,11 @@ The primary source files are:
 
 | Responsibility | Source |
 | -------------- | ------ |
+| Device-neutral identities and generations | [`crates/memory/src/lib.rs`](../../crates/memory/src/lib.rs) |
+| Device-neutral permissions and access declarations | [`crates/memory/src/access.rs`](../../crates/memory/src/access.rs) |
+| CPU/device visibility contracts | [`crates/memory/src/visibility.rs`](../../crates/memory/src/visibility.rs) |
+| Retained canonical RAM and allocations | [`crates/memory/src/backing.rs`](../../crates/memory/src/backing.rs) |
+| Checked pointer-free backing ranges | [`crates/memory/src/range.rs`](../../crates/memory/src/range.rs) |
 | Public memory-module facade and re-exports | [`crates/cpu/src/memory/mod.rs`](../../crates/cpu/src/memory/mod.rs) |
 | Portable traits, values, and faults | [`crates/cpu/src/memory/contracts.rs`](../../crates/cpu/src/memory/contracts.rs) |
 | Small implementation helpers shared by both backends | [`crates/cpu/src/memory/common.rs`](../../crates/cpu/src/memory/common.rs) |
@@ -752,15 +757,151 @@ specification for the deterministic and production backends.
 
 ### Portable identity types
 
-Nixe uses domain-specific integer wrappers:
+The device-neutral `nixe-memory` crate owns domain-specific integer wrappers:
 
 - `GuestVirtualAddress`: an address in a guest virtual space;
 - `AddressSpaceId`: the identity of that virtual space;
-- `GuestPhysicalPageId`: stable backing identity shared by aliases; and
-- `CodeGeneration`: a version of physical page content.
+- `GuestPhysicalPageId`: a store-local physical page shared by aliases;
+- `BackingStoreId` and `CanonicalPageId`: an unambiguous cross-device page
+  identity;
+- `ContentGeneration`: a version of physical page bytes; and
+- `MappingGeneration`: a version of one virtual mapping and its access
+  metadata.
 
 They are deliberately not host pointers. Checked arithmetic is the default for
-guest addresses.
+guest addresses. `nixe-cpu::address` remains a compatibility facade for
+existing CPU callers; `CodeGeneration` is an alias for `ContentGeneration`.
+
+### Retained canonical ranges
+
+Production RAM bytes and their content generation live in
+`CanonicalBackingPage`. Clones retain a page independently of CPU virtual
+mappings, sparse page-table slots, and the `ExecutionMemory` which created it.
+Removing the final CPU alias releases process ownership, but an `nvmap`
+allocation or in-flight device range which already retained the page remains
+valid until that reference is dropped.
+
+`CanonicalRangeTranslator` is the temporary production CPU adapter into the
+neutral contract. A complete translation validates the requested CPU virtual
+range before returning ordered `CanonicalBackingSegment` values. Each segment
+contains:
+
+- `CanonicalPageId`;
+- page-relative byte offset and size;
+- the exact CPU mapping permissions;
+- the observed content generation; and
+- the observed mapping generation.
+
+The range contains no CPU virtual address as backing identity, physical-slot
+index, borrowed byte slice, raw pointer, or host graphics object. Translation
+fails at the first unmapped, permission-incompatible, MMIO, overflowing, or
+internally inconsistent byte. Its result retains canonical storage rather than
+retaining a process or CPU mapping.
+
+`NVMAP_IOC_ALLOC` now uses this adapter before publishing allocation state.
+The CPU address remains only the guest ABI view origin needed by the existing
+software-framebuffer path; the retained canonical range is the allocation's
+cross-device identity and lifetime anchor. A failed translation does not
+partially initialize the `nvmap` allocation and is a typed emulator-side stop,
+not a fabricated NVIDIA driver result.
+
+Runtime shared-memory objects now also own `CanonicalAllocation` storage and
+can expose a retained neutral range. Transfer-memory handles retain the
+validated canonical range denoted by their creation request instead of
+retaining only a CPU virtual address. The current Horizon shared-memory mapping
+path still copies object storage into process pages; replacing that known
+coherency limitation with direct canonical aliases is separate kernel mapping
+work. The object no longer needs a second architectural storage model in order
+to reach that future path.
+
+### Non-CPU access and visibility
+
+`DeviceAccessDeclaration` describes a read, write, or read/write operation
+without naming Maxwell, a host graphics API, or a backend resource. Every
+declaration identifies the non-CPU consumer and records two distinct ordering
+concepts:
+
+- `device_visible_at` is the point before which canonical inputs and
+  unaffected bytes must be available to the device; and
+- `cpu_visible_at` is required for a write and is the point after which the
+  device's output may be reconciled into canonical CPU-visible storage.
+
+`DeviceVisibilityPoint` is an opaque value ordered by the device owner. It does
+not itself claim guest-fence, host-queue, or presentation completion. Later
+submission and synchronization layers must connect those separate events.
+
+Every `CanonicalBackingPage` owns one visibility authority shared by all CPU
+aliases and retained ranges:
+
+```text
+Clean
+  │
+  ├── CPU write ────────────────────────────────► CpuNewer
+  │                                                │
+  │                          make device visible ──┘
+  │
+  └── completed declared device write ──────────► GpuNewer
+                                                   │
+                              CPU read or write ───┘
+                                   make CPU visible
+
+incompatible unsynchronized owners ─────────────► Conflicting
+failed or malformed transition ─────────────────► Invalid
+```
+
+The first implementation deliberately tracks complete canonical pages. A
+logical range may start or end inside a page, but its transition includes the
+whole page so overlapping aliases cannot silently retain different ownership.
+Dirty byte ranges, image subresources, and version vectors are later
+optimizations, not changes to this contract.
+
+`VisibilityCoordinator` is the only boundary which performs host residency and
+visibility work. Before device access it receives complete canonical bytes.
+Before CPU access to `GpuNewer` storage it waits or performs the required host
+operations and returns one complete newest page. A discrete backend can
+implement these methods with staging uploads and downloads; coherent
+unified-memory storage can make data movement a no-op while still enforcing
+ordering and lifetime. The interface contains no `wgpu`, Vulkan, Metal,
+Direct3D, queue, command-buffer, or host-pointer type.
+
+Production instruction fetches, CPU reads, and CPU writes call canonical page
+accessors. `Clean` and `CpuNewer` take the ordinary path. `GpuNewer` invokes the
+coordinator before returning or modifying bytes, advances the content
+generation when device output becomes canonical, and only then continues the
+CPU operation. Consequently host API work remains outside interpreter and
+future generated-code semantics. Coordinator failure, incorrect writeback
+size, generation exhaustion, a concurrent transition, or conflicting owners
+is a typed emulator-side memory failure; stale bytes are never returned.
+
+A CPU read copies bytes while holding the same page-state lock under which it
+checks visibility authority. If a device publishes newer ownership after the
+slow path returns but before the read reacquires that lock, the read retries
+the transition instead of exposing the previous canonical contents.
+
+### Canonical-memory acceptance evidence
+
+The T2 acceptance matrix is intentionally layered rather than concentrated in
+one end-to-end test:
+
+| Contract | Permanent evidence |
+| -------- | ------------------ |
+| CPU aliases share identity and bytes | `data_aliases_share_one_physical_page_identity_and_contents` and `mapping_and_content_generations_change_independently_in_both_backends` in `crates/cpu/src/memory/synthetic.rs` |
+| Checked page crossings and exact permissions | `canonical_translation_retains_checked_page_spanning_segments` in `crates/cpu/src/memory/execution.rs` |
+| Remaps do not masquerade as byte writes | `mapping_and_content_generations_change_independently_in_both_backends` |
+| Content and mapping generations never wrap | `generation_domains_are_distinct_and_never_wrap`, `exhausted_generations_fail_without_publishing_bytes_or_mapping_changes`, and `exhausted_device_writeback_generation_invalidates_without_downloading` |
+| Concurrent CPU/device observations cannot accept stale state | `concurrent_cpu_write_rejects_an_in_flight_device_snapshot` |
+| CPU unmap, allocation release, and process-memory teardown retain live device ranges | `retained_ranges_outlive_their_allocation_owner` and `retained_translation_survives_cpu_unmap_and_memory_teardown` |
+| Neutral GPU code accesses validated canonical ranges without CPU context | `gpu_contract_accesses_a_page_spanning_range_without_cpu_context` in `crates/gpu/tests/canonical_memory_contract.rs` |
+| Dependency direction excludes CPU internals and host APIs | the `dependency_boundaries` tests in `nixe-memory`, `nixe-cpu`, `nixe-gpu`, `nixe-runtime`, and `nixe-horizon` |
+| Interpreter behavior remains equivalent | `directed_sequences_compare_state_vectors_memory_pc_flags_and_exceptions`, `bounded_generated_a64_sequences_match_the_reference_evaluator`, and the CPU unit suite |
+| Existing software-framebuffer behavior remains accepted | `libnx_hello_world_publishes_a_software_frame` in `crates/horizon/tests/homebrew_acceptance.rs` |
+
+The GPU acceptance test starts from a `CanonicalAllocation`, obtains a
+page-spanning `CanonicalBackingRange`, and performs a declared device access
+using only `nixe-memory` contracts. It has no `ExceptionProcessContext`, CPU
+virtual address, borrowed host slice, or raw pointer. The `nixe-gpu`
+dependency-boundary test prevents adding CPU, runtime, Horizon, Maxwell, video,
+window-system, or concrete host-backend dependencies to make that test pass.
 
 ### InstructionMemory
 
@@ -773,8 +914,8 @@ It provides:
 - 32-bit T32 assembly from two halfword fetches.
 
 Every fetch returns canonical little-endian instruction bits plus
-`CodeDependencies`. A dependency contains the physical page ID and generation
-observed while reading.
+`CodeDependencies`. A dependency contains the physical page ID, content
+generation, and mapping generation observed while reading.
 
 For a T32 instruction crossing a page:
 
@@ -827,7 +968,7 @@ page-relative byte offset
 access size
         │
         ▼
-physical page generation
+content generation
 ```
 
 An intervening write through any alias changes the generation and causes a
@@ -948,6 +1089,7 @@ Each production virtual-page entry records:
 
 - physical page ID;
 - physical slot index;
+- mapping generation;
 - permissions;
 - mapping purpose; and
 - attributes.
@@ -977,8 +1119,11 @@ A physical slot contains either:
 ```text
 RAM
         │
-        ├── optional 4096-byte allocation
-        └── content generation
+        └── retained CanonicalBackingPage
+                │
+                ├── stable CanonicalPageId
+                ├── optional 4096-byte allocation
+                └── typed content generation
 
 or
 
@@ -986,6 +1131,9 @@ MMIO
         │
         └── device callback object
 ```
+
+The physical slot is only the production CPU lookup strategy. Removing or
+reusing it cannot invalidate a retained canonical page.
 
 `None` RAM bytes represent a lazily materialized all-zero page. Reads return
 zero without allocating. The first write allocates the 4 KiB backing and then
@@ -1030,7 +1178,7 @@ require RAM backing
 read four little-endian bytes
         │
         ▼
-return bits + physical ID + generation
+return bits + physical ID + content and mapping generations
 ```
 
 Aligned 2-byte and 4-byte fetches cannot cross a 4 KiB page because both widths
@@ -1092,12 +1240,12 @@ materialize zero page if necessary
 write little-endian bytes
         │
         ▼
-advance physical generation
+advance content generation
 ```
 
-The generation advances for every successful RAM write, whether or not any
-alias is executable. This conservative rule makes code invalidation and
-exclusive reservations simple and correct.
+The content generation advances for every successful RAM write, whether or not
+any alias is executable. It never wraps: exhaustion produces a typed memory
+failure before bytes are committed.
 
 ### Cross-page data accesses
 
@@ -1124,7 +1272,7 @@ validate second page
             copy second fragment
                 │
                 ▼
-            advance each distinct physical generation once
+            advance each distinct content generation once
 ```
 
 An access cannot span RAM and MMIO. Device accesses spanning pages remain on a
@@ -1138,27 +1286,27 @@ Fetched or translated code depends on physical pages, not virtual addresses:
 translated block
         │
         ▼
-CodeDependency(page P, generation G)
+CodeDependency(page P, content generation C, mapping generation M)
         │
         ▼
 write through any alias of P
         │
         ▼
-generation becomes G + 1
+content generation becomes C + 1
         │
         ▼
 old dependency no longer matches
 ```
 
-Changing whether a mapping is executable also advances the affected RAM page
-generation. This prevents a block compiled under an old executable view from
-remaining valid across permission transitions.
+Changing mapping permissions or attributes advances the affected mapping
+generation without changing the content generation. Code dependencies retain
+both values, so a block compiled under an old executable view becomes stale
+without falsely recording a byte write.
 
 The translator already attaches these dependencies to IR blocks. The current
 reference executor does not yet maintain a native-code cache, so no JIT block
-is being evicted today. A future cache must validate both the physical
-dependencies and the virtual mapping from the block's guest location; a page
-generation alone cannot detect every unmap/remap transition.
+is being evicted today. A future cache must validate both generations and the
+virtual mapping from the block's guest location.
 
 ### Atomic page installation
 
@@ -1361,9 +1509,11 @@ emulated architectural TLB.
 The access descriptor retains ordering and access class, and exclusive
 reservations use physical identity and generation. The current process model
 executes one guest thread/vCPU at a time, although that execution may run on a
-host worker thread. It does not yet reproduce the complete multicore Arm
-memory model, cache hierarchy, device coherence, or all cache-maintenance
-effects.
+host worker thread. Canonical backing now records conservative CPU/device
+visibility authority and can invoke an injected reconciliation slow path, but
+no GPU backend is connected yet. Nixe does not reproduce the complete
+multicore Arm memory model, cache hierarchy, device coherence, or all
+cache-maintenance effects.
 
 ## Planned dynamic-recompiler memory path
 
@@ -1457,7 +1607,8 @@ A native block cache needs two related checks:
 guest block location + address-space identity
         │
         ├── current virtual mapping still resolves to the expected page
-        └── every CodeDependency still has the expected generation
+        └── every CodeDependency still has the expected content and mapping
+            generations
 ```
 
 Writes through any alias must remain visible to every other alias. A direct

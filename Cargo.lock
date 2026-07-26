@@ -978,10 +978,16 @@ dependencies = [
 [[package]]
 name = "nixe-cpu"
 version = "0.1.0"
+dependencies = [
+ "nixe-memory",
+]
 
 [[package]]
 name = "nixe-gpu"
 version = "0.1.0"
+dependencies = [
+ "nixe-memory",
+]
 
 [[package]]
 name = "nixe-gpu-maxwell"
@@ -1003,6 +1009,7 @@ dependencies = [
  "nixe-input",
  "nixe-loader-storage",
  "nixe-loader-title",
+ "nixe-memory",
  "nixe-runtime",
  "nixe-video",
  "sha2",
@@ -1059,6 +1066,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixe-memory"
+version = "0.1.0"
+
+[[package]]
 name = "nixe-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1070,6 +1081,7 @@ dependencies = [
  "nixe-loader-executable",
  "nixe-loader-storage",
  "nixe-loader-title",
+ "nixe-memory",
  "sha2",
  "tempfile",
 ]

@@ -10,8 +10,17 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+use nixe_memory::{
+    BackingStoreId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
+    CanonicalPageId, CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason,
+    CanonicalRangeTranslator,
+};
+
 use crate::{
-    address::{AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
+    address::{
+        AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress,
+        MappingGeneration,
+    },
     error::{InstructionFetchFault, InstructionFetchFaultReason},
     vcpu::ExclusiveReservation,
 };
@@ -37,6 +46,7 @@ const _: () = assert!(SYNTHETIC_PAGE_SIZE.is_power_of_two());
 struct ExecutionMapping {
     physical_page: GuestPhysicalPageId,
     physical_slot: usize,
+    mapping_generation: MappingGeneration,
     permissions: MemoryPermissions,
     purpose: MemoryMappingPurpose,
     attributes: MemoryAttributes,
@@ -123,10 +133,7 @@ impl ExecutionPageTable {
 }
 
 enum ExecutionPhysicalPage {
-    Ram {
-        bytes: Option<Box<[u8; SYNTHETIC_PAGE_SIZE]>>,
-        generation: u64,
-    },
+    Ram(CanonicalBackingPage),
     Mmio(Box<dyn SyntheticMmio>),
 }
 
@@ -139,10 +146,29 @@ struct ExecutionMemoryInner {
     physical_slots: Vec<Option<ExecutionPhysicalPage>>,
     free_physical_slots: Vec<usize>,
     slots_by_id: BTreeMap<GuestPhysicalPageId, usize>,
+    backing_store_id: Option<BackingStoreId>,
     next_page_id: u64,
+    next_mapping_generation: Option<MappingGeneration>,
 }
 
 impl ExecutionMemoryInner {
+    fn backing_store_id(&mut self) -> Option<BackingStoreId> {
+        if self.backing_store_id.is_none() {
+            self.backing_store_id = BackingStoreId::allocate().ok();
+        }
+        self.backing_store_id
+    }
+
+    fn canonical_page_id(&mut self, page: GuestPhysicalPageId) -> Option<CanonicalPageId> {
+        Some(CanonicalPageId::new(self.backing_store_id()?, page))
+    }
+
+    fn take_mapping_generation(&mut self) -> Option<MappingGeneration> {
+        let generation = self.next_mapping_generation?;
+        self.next_mapping_generation = generation.next().ok();
+        Some(generation)
+    }
+
     fn page(&self, slot: usize) -> Option<&ExecutionPhysicalPage> {
         self.physical_slots.get(slot)?.as_ref()
     }
@@ -201,7 +227,7 @@ impl ExecutionMemoryInner {
     )> {
         let mapping = self.mappings.get(address_space, virtual_page)?;
         let region = match self.page(mapping.physical_slot)? {
-            ExecutionPhysicalPage::Ram { .. } => MemoryRegionKind::Ram,
+            ExecutionPhysicalPage::Ram(_) => MemoryRegionKind::Ram,
             ExecutionPhysicalPage::Mmio(_) => MemoryRegionKind::Device,
         };
         Some((
@@ -239,6 +265,7 @@ impl ExecutionMemory {
     pub fn new() -> Self {
         let inner = ExecutionMemoryInner {
             next_page_id: 1,
+            next_mapping_generation: Some(MappingGeneration::new(1)),
             ..ExecutionMemoryInner::default()
         };
         Self {
@@ -301,7 +328,17 @@ impl ExecutionMemory {
             }
             virtual_pages.push(virtual_page);
         }
+        if requests.is_empty() {
+            return Ok(());
+        }
 
+        let backing_store_id = inner.backing_store_id().ok_or_else(|| {
+            install_error(
+                SyntheticInstallStage::Allocation,
+                requests.first().map(|request| request.virtual_address),
+                "canonical backing-store identities are exhausted",
+            )
+        })?;
         let mut next_page_id = inner.next_page_id;
         let mut pending = Vec::new();
         pending.try_reserve_exact(requests.len()).map_err(|_| {
@@ -332,16 +369,23 @@ impl ExecutionMemory {
                     "physical-page identities are exhausted",
                 )
             })?;
-            let mut contents = Box::new([0; SYNTHETIC_PAGE_SIZE]);
-            contents.copy_from_slice(request.bytes);
+            let backing = CanonicalBackingPage::initialized(
+                CanonicalPageId::new(backing_store_id, physical_page),
+                request.bytes,
+                ContentGeneration::new(1),
+            )
+            .map_err(|error| {
+                install_error(
+                    SyntheticInstallStage::Allocation,
+                    Some(request.virtual_address),
+                    error.to_string(),
+                )
+            })?;
             pending.push((
                 virtual_pages[index],
                 physical_page,
                 request.permissions,
-                ExecutionPhysicalPage::Ram {
-                    bytes: Some(contents),
-                    generation: 1,
-                },
+                ExecutionPhysicalPage::Ram(backing),
             ));
         }
 
@@ -358,6 +402,17 @@ impl ExecutionMemory {
                     "host resources are exhausted",
                 )
             })?;
+        let mapping_generation = if pending.is_empty() {
+            MappingGeneration::INITIAL
+        } else {
+            inner.take_mapping_generation().ok_or_else(|| {
+                install_error(
+                    SyntheticInstallStage::Allocation,
+                    requests.first().map(|request| request.virtual_address),
+                    "mapping generations are exhausted",
+                )
+            })?
+        };
         for (virtual_page, physical_page, permissions, page) in pending {
             let slot = inner
                 .push_page(physical_page, page)
@@ -368,6 +423,7 @@ impl ExecutionMemory {
                 ExecutionMapping {
                     physical_page,
                     physical_slot: slot,
+                    mapping_generation,
                     permissions,
                     purpose: MemoryMappingPurpose::Normal,
                     attributes: MemoryAttributes::NONE,
@@ -391,6 +447,7 @@ impl ExecutionMemory {
             .mapping_at(address_space, virtual_address)
             .map(|mapping| SyntheticMappingInfo {
                 physical_page: mapping.physical_page,
+                mapping_generation: mapping.mapping_generation,
                 permissions: mapping.permissions,
                 attributes: mapping.attributes,
                 purpose: mapping.purpose,
@@ -418,12 +475,16 @@ impl ExecutionMemory {
         if !(first_page..end_page).all(|page| inner.mappings.get(address_space, page).is_some()) {
             return false;
         }
+        let Some(mapping_generation) = inner.take_mapping_generation() else {
+            return false;
+        };
         for page in first_page..end_page {
-            inner
+            let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
-                .expect("range was preflighted")
-                .purpose = purpose;
+                .expect("range was preflighted");
+            mapping.purpose = purpose;
+            mapping.mapping_generation = mapping_generation;
         }
         true
     }
@@ -436,15 +497,19 @@ impl ExecutionMemory {
 
     /// Creates a zero-filled RAM page for explicit runtime or differential setup.
     pub fn add_ram_page(&mut self, page: GuestPhysicalPageId) -> bool {
-        self.inner
-            .get_mut()
-            .push_page(
-                page,
-                ExecutionPhysicalPage::Ram {
-                    bytes: Some(Box::new([0; SYNTHETIC_PAGE_SIZE])),
-                    generation: 0,
-                },
-            )
+        let inner = self.inner.get_mut();
+        let Some(identity) = inner.canonical_page_id(page) else {
+            return false;
+        };
+        let Ok(backing) = CanonicalBackingPage::initialized(
+            identity,
+            &[0; SYNTHETIC_PAGE_SIZE],
+            ContentGeneration::INITIAL,
+        ) else {
+            return false;
+        };
+        inner
+            .push_page(page, ExecutionPhysicalPage::Ram(backing))
             .is_some()
     }
 
@@ -471,23 +536,25 @@ impl ExecutionMemory {
         let Some(&slot) = inner.slots_by_id.get(&page) else {
             return false;
         };
-        let Some(ExecutionPhysicalPage::Ram {
-            bytes: contents,
-            generation,
-        }) = inner.page_mut(slot)
-        else {
+        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(slot) else {
             return false;
         };
         let Some(end) = offset.checked_add(bytes.len()) else {
             return false;
         };
-        let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
-        let Some(destination) = contents.get_mut(offset..end) else {
+        if end > SYNTHETIC_PAGE_SIZE {
+            return false;
+        }
+        if backing.prepare_write().is_err() {
+            return false;
+        }
+        let generation = backing.content_generation();
+        let Ok(next_generation) = generation.next() else {
             return false;
         };
-        destination.copy_from_slice(bytes);
-        *generation = generation.wrapping_add(1);
-        true
+        backing
+            .write_preflighted(offset, bytes, generation, next_generation)
+            .is_ok()
     }
 
     /// Overwrites mapped RAM from a trusted host producer, ignoring guest
@@ -504,24 +571,36 @@ impl ExecutionMemory {
         let Some(end) = address.get().checked_add(bytes.len() as u64) else {
             return false;
         };
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow();
         let mut cursor = address.get();
+        let mut pending_generations = BTreeMap::new();
         while cursor < end {
             let virtual_address = GuestVirtualAddress::new(cursor);
             let Some(mapping) = inner.mapping_at(address_space, virtual_address) else {
                 return false;
             };
-            if !matches!(
-                inner.page(mapping.physical_slot),
-                Some(ExecutionPhysicalPage::Ram { .. })
-            ) {
+            let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
+            else {
                 return false;
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                pending_generations.entry(mapping.physical_slot)
+            {
+                if backing.prepare_write().is_err() {
+                    return false;
+                }
+                let current = backing.content_generation();
+                let Ok(next) = current.next() else {
+                    return false;
+                };
+                entry.insert((current, next));
             }
             let remaining_in_page = SYNTHETIC_PAGE_SIZE - page_offset(virtual_address);
             cursor = cursor.saturating_add(remaining_in_page.min((end - cursor) as usize) as u64);
         }
 
         let mut copied = 0;
+        let mut written_slots = BTreeSet::new();
         while copied < bytes.len() {
             let virtual_address =
                 GuestVirtualAddress::new(address.get().saturating_add(copied as u64));
@@ -530,17 +609,19 @@ impl ExecutionMemory {
                 .expect("host overwrite range was validated");
             let offset = page_offset(virtual_address);
             let count = (SYNTHETIC_PAGE_SIZE - offset).min(bytes.len() - copied);
-            let Some(ExecutionPhysicalPage::Ram {
-                bytes: contents,
-                generation,
-            }) = inner.page_mut(mapping.physical_slot)
+            let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
             else {
                 unreachable!("host overwrite RAM range was validated")
             };
-            contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]))
-                [offset..offset + count]
-                .copy_from_slice(&bytes[copied..copied + count]);
-            *generation = generation.wrapping_add(1);
+            let (expected, next) = pending_generations[&mapping.physical_slot];
+            let result = if written_slots.insert(mapping.physical_slot) {
+                backing.write_preflighted(offset, &bytes[copied..copied + count], expected, next)
+            } else {
+                backing.write_fragment_preflighted(offset, &bytes[copied..copied + count], next)
+            };
+            if result.is_err() {
+                return false;
+            }
             copied += count;
         }
         true
@@ -561,20 +642,27 @@ impl ExecutionMemory {
         let Some(&physical_slot) = inner.slots_by_id.get(&physical_page) else {
             return false;
         };
-        inner
-            .mappings
-            .insert(
-                address_space,
-                virtual_address.get() >> PAGE_SHIFT,
-                ExecutionMapping {
-                    physical_page,
-                    physical_slot,
-                    permissions,
-                    purpose: MemoryMappingPurpose::Normal,
-                    attributes: MemoryAttributes::NONE,
-                },
-            )
-            .is_none()
+        let virtual_page = virtual_address.get() >> PAGE_SHIFT;
+        if inner.mappings.get(address_space, virtual_page).is_some() {
+            return false;
+        }
+        let Some(mapping_generation) = inner.take_mapping_generation() else {
+            return false;
+        };
+        let previous = inner.mappings.insert(
+            address_space,
+            virtual_page,
+            ExecutionMapping {
+                physical_page,
+                physical_slot,
+                mapping_generation,
+                permissions,
+                purpose: MemoryMappingPurpose::Normal,
+                attributes: MemoryAttributes::NONE,
+            },
+        );
+        debug_assert!(previous.is_none());
+        true
     }
 
     fn fetch<const N: usize>(
@@ -613,11 +701,7 @@ impl ExecutionMemory {
                 InstructionFetchFaultReason::ExecutePermissionDenied,
             ));
         }
-        let Some(ExecutionPhysicalPage::Ram {
-            bytes: contents,
-            generation,
-        }) = inner.page(mapping.physical_slot)
-        else {
+        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
             return Err(InstructionFetchFault::new(
                 address_space,
                 address,
@@ -625,14 +709,21 @@ impl ExecutionMemory {
             ));
         };
         let mut bytes = [0; N];
-        if let Some(contents) = contents {
-            bytes.copy_from_slice(&contents[page_offset(address)..end_offset]);
-        }
+        backing
+            .read(page_offset(address), &mut bytes)
+            .map_err(|reason| {
+                InstructionFetchFault::new(
+                    address_space,
+                    address,
+                    InstructionFetchFaultReason::Memory(reason.to_string().into()),
+                )
+            })?;
         Ok((
             bytes,
             CodeDependencies::one(CodePageDependency {
                 page: mapping.physical_page,
-                generation: CodeGeneration::new(*generation),
+                generation: backing.content_generation(),
+                mapping_generation: mapping.mapping_generation,
             }),
         ))
     }
@@ -686,6 +777,121 @@ impl InstructionMemory for ExecutionMemory {
         Ok(FetchedCode {
             bits: u32::from_le_bytes(bytes),
             dependencies,
+        })
+    }
+}
+
+impl CanonicalRangeTranslator for ExecutionMemory {
+    fn translate_canonical_range(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        size: u64,
+        required_permissions: MemoryPermissions,
+    ) -> Result<CanonicalBackingRange, CanonicalRangeTranslationError> {
+        let failure = |address, reason| CanonicalRangeTranslationError {
+            address_space,
+            address,
+            reason,
+        };
+        if size == 0 {
+            return Err(failure(
+                address,
+                CanonicalRangeTranslationErrorReason::Empty,
+            ));
+        }
+        if address.checked_add(size - 1).is_none() {
+            return Err(failure(
+                address,
+                CanonicalRangeTranslationErrorReason::AddressOverflow,
+            ));
+        }
+
+        let page_size = SYNTHETIC_PAGE_SIZE as u64;
+        let covered_bytes = (page_offset(address) as u64)
+            .checked_add(size)
+            .ok_or_else(|| {
+                failure(
+                    address,
+                    CanonicalRangeTranslationErrorReason::AddressOverflow,
+                )
+            })?;
+        let segment_capacity =
+            usize::try_from(covered_bytes.div_ceil(page_size)).map_err(|_| {
+                failure(
+                    address,
+                    CanonicalRangeTranslationErrorReason::ResourceExhausted,
+                )
+            })?;
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(segment_capacity).map_err(|_| {
+            failure(
+                address,
+                CanonicalRangeTranslationErrorReason::ResourceExhausted,
+            )
+        })?;
+
+        let inner = self.inner.borrow();
+        let mut cursor = address;
+        let mut remaining = size;
+        while remaining != 0 {
+            let mapping = inner
+                .mapping_at(address_space, cursor)
+                .ok_or_else(|| failure(cursor, CanonicalRangeTranslationErrorReason::Unmapped))?;
+            if !mapping.permissions.contains(required_permissions) {
+                return Err(failure(
+                    cursor,
+                    CanonicalRangeTranslationErrorReason::PermissionDenied,
+                ));
+            }
+            let backing = match inner.page(mapping.physical_slot) {
+                Some(ExecutionPhysicalPage::Ram(backing)) => backing.clone(),
+                Some(ExecutionPhysicalPage::Mmio(_)) => {
+                    return Err(failure(
+                        cursor,
+                        CanonicalRangeTranslationErrorReason::DeviceMemory,
+                    ));
+                }
+                None => {
+                    return Err(failure(
+                        cursor,
+                        CanonicalRangeTranslationErrorReason::InconsistentBacking,
+                    ));
+                }
+            };
+            let offset = page_offset(cursor) as u64;
+            let count = remaining.min(page_size - offset);
+            let generation = backing.content_generation();
+            let segment = CanonicalBackingSegment::new(
+                backing,
+                offset,
+                count,
+                mapping.permissions,
+                generation,
+                mapping.mapping_generation,
+            )
+            .map_err(|_| {
+                failure(
+                    cursor,
+                    CanonicalRangeTranslationErrorReason::InconsistentBacking,
+                )
+            })?;
+            segments.push(segment);
+            remaining -= count;
+            if remaining != 0 {
+                cursor = cursor.checked_add(count).ok_or_else(|| {
+                    failure(
+                        cursor,
+                        CanonicalRangeTranslationErrorReason::AddressOverflow,
+                    )
+                })?;
+            }
+        }
+        CanonicalBackingRange::new(segments).map_err(|_| {
+            failure(
+                address,
+                CanonicalRangeTranslationErrorReason::InconsistentBacking,
+            )
         })
     }
 }
@@ -755,7 +961,7 @@ fn resolve_data_access(
             ));
         }
         let region = match inner.page(mapping.physical_slot) {
-            Some(ExecutionPhysicalPage::Ram { .. }) => MemoryRegionKind::Ram,
+            Some(ExecutionPhysicalPage::Ram(_)) => MemoryRegionKind::Ram,
             Some(ExecutionPhysicalPage::Mmio(_)) => MemoryRegionKind::Device,
             None => {
                 return Err(DataAccessFault::new(
@@ -844,18 +1050,22 @@ impl CpuMemory for ExecutionMemory {
         let mut bytes = [0_u8; 16];
         match resolved.second {
             None => {
-                let ExecutionPhysicalPage::Ram {
-                    bytes: contents, ..
-                } = inner
+                let ExecutionPhysicalPage::Ram(backing) = inner
                     .page(resolved.first.physical_slot)
                     .expect("resolved RAM page exists")
                 else {
                     unreachable!()
                 };
-                if let Some(contents) = contents {
-                    let offset = page_offset(address);
-                    bytes[..byte_count].copy_from_slice(&contents[offset..offset + byte_count]);
-                }
+                backing
+                    .read(page_offset(address), &mut bytes[..byte_count])
+                    .map_err(|reason| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Read,
+                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                        )
+                    })?;
             }
             Some(second) => {
                 let mappings = [resolved.first, second];
@@ -864,18 +1074,22 @@ impl CpuMemory for ExecutionMemory {
                     (mappings[0], resolved.first_bytes, page_offset(address)),
                     (mappings[1], byte_count - resolved.first_bytes, 0),
                 ] {
-                    let ExecutionPhysicalPage::Ram {
-                        bytes: contents, ..
-                    } = inner
+                    let ExecutionPhysicalPage::Ram(backing) = inner
                         .page(mapping.physical_slot)
                         .expect("resolved RAM page exists")
                     else {
                         unreachable!()
                     };
-                    if let Some(contents) = contents {
-                        bytes[copied..copied + count]
-                            .copy_from_slice(&contents[offset..offset + count]);
-                    }
+                    backing
+                        .read(offset, &mut bytes[copied..copied + count])
+                        .map_err(|reason| {
+                            DataAccessFault::new(
+                                address_space,
+                                address,
+                                DataAccessKind::Read,
+                                DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                            )
+                        })?;
                     copied += count;
                 }
             }
@@ -944,54 +1158,129 @@ impl CpuMemory for ExecutionMemory {
         value.copy_le_bytes(&mut bytes[..byte_count]);
         match resolved.second {
             None => {
-                let ExecutionPhysicalPage::Ram {
-                    bytes: contents,
-                    generation,
-                } = inner
-                    .page_mut(resolved.first.physical_slot)
+                let ExecutionPhysicalPage::Ram(backing) = inner
+                    .page(resolved.first.physical_slot)
                     .expect("resolved RAM page exists")
                 else {
                     unreachable!()
                 };
-                let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+                backing.prepare_write().map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?;
+                let generation = backing.content_generation();
+                let next_generation = generation.next().map_err(|_| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::ContentGenerationExhausted,
+                    )
+                })?;
                 let offset = page_offset(address);
-                contents[offset..offset + byte_count].copy_from_slice(&bytes[..byte_count]);
-                *generation = generation.wrapping_add(1);
+                backing
+                    .write_preflighted(offset, &bytes[..byte_count], generation, next_generation)
+                    .map_err(|reason| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Write,
+                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                        )
+                    })?;
             }
             Some(second) => {
                 let mappings = [resolved.first, second];
+                let backing = |slot| match inner.page(slot) {
+                    Some(ExecutionPhysicalPage::Ram(backing)) => backing,
+                    _ => unreachable!("resolved RAM page exists"),
+                };
+                let first_backing = backing(mappings[0].physical_slot);
+                first_backing.prepare_write().map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?;
+                let first_generation = first_backing.content_generation();
+                let next_first = first_generation.next().map_err(|_| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::ContentGenerationExhausted,
+                    )
+                })?;
+                let distinct_pages = mappings[1].physical_slot != mappings[0].physical_slot;
+                let (second_generation, next_second) = if distinct_pages {
+                    let second_backing = backing(mappings[1].physical_slot);
+                    second_backing.prepare_write().map_err(|reason| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Write,
+                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                        )
+                    })?;
+                    let generation = second_backing.content_generation();
+                    let next = generation.next().map_err(|_| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Write,
+                            DataAccessFaultReason::ContentGenerationExhausted,
+                        )
+                    })?;
+                    (Some(generation), Some(next))
+                } else {
+                    (None, None)
+                };
                 let mut copied = 0;
-                for (mapping, count, offset) in [
+                for (index, (mapping, count, offset)) in [
                     (mappings[0], resolved.first_bytes, page_offset(address)),
                     (mappings[1], byte_count - resolved.first_bytes, 0),
-                ] {
-                    let ExecutionPhysicalPage::Ram {
-                        bytes: contents, ..
-                    } = inner
-                        .page_mut(mapping.physical_slot)
-                        .expect("resolved RAM page exists")
-                    else {
-                        unreachable!()
-                    };
-                    let contents =
-                        contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
-                    contents[offset..offset + count]
-                        .copy_from_slice(&bytes[copied..copied + count]);
-                    copied += count;
-                }
-                for slot in [
-                    Some(mappings[0].physical_slot),
-                    (mappings[1].physical_slot != mappings[0].physical_slot)
-                        .then_some(mappings[1].physical_slot),
                 ]
                 .into_iter()
-                .flatten()
+                .enumerate()
                 {
-                    let Some(ExecutionPhysicalPage::Ram { generation, .. }) = inner.page_mut(slot)
-                    else {
-                        unreachable!()
+                    let page = backing(mapping.physical_slot);
+                    let result = if index == 0 {
+                        page.write_preflighted(
+                            offset,
+                            &bytes[copied..copied + count],
+                            first_generation,
+                            next_first,
+                        )
+                    } else if let (Some(generation), Some(next)) = (second_generation, next_second)
+                    {
+                        page.write_preflighted(
+                            offset,
+                            &bytes[copied..copied + count],
+                            generation,
+                            next,
+                        )
+                    } else {
+                        page.write_fragment_preflighted(
+                            offset,
+                            &bytes[copied..copied + count],
+                            next_first,
+                        )
                     };
-                    *generation = generation.wrapping_add(1);
+                    result.map_err(|reason| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Write,
+                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                        )
+                    })?;
+                    copied += count;
                 }
             }
         }
@@ -1073,7 +1362,7 @@ impl CpuMemory for ExecutionMemory {
         let mapping = inner
             .mapping_at(address_space, address)
             .expect("load was validated");
-        let ExecutionPhysicalPage::Ram { generation, .. } = inner
+        let ExecutionPhysicalPage::Ram(backing) = inner
             .page(mapping.physical_slot)
             .expect("mapping references a page")
         else {
@@ -1090,7 +1379,7 @@ impl CpuMemory for ExecutionMemory {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                generation: CodeGeneration::new(*generation),
+                generation: backing.content_generation(),
             },
         ))
     }
@@ -1113,7 +1402,17 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessKind::Write,
             )?;
             let generation = match inner.page(resolved.first.physical_slot) {
-                Some(ExecutionPhysicalPage::Ram { generation, .. }) => *generation,
+                Some(ExecutionPhysicalPage::Ram(backing)) => {
+                    backing.prepare_cpu_access().map_err(|reason| {
+                        DataAccessFault::new(
+                            address_space,
+                            address,
+                            DataAccessKind::Write,
+                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                        )
+                    })?;
+                    backing.content_generation()
+                }
                 _ => {
                     return Err(DataAccessFault::new(
                         address_space,
@@ -1126,7 +1425,7 @@ impl CpuMemory for ExecutionMemory {
             reservation.page == resolved.first.physical_page
                 && usize::from(reservation.byte_offset) == page_offset(address)
                 && usize::from(reservation.access_size) == access.size.bytes()
-                && reservation.generation == CodeGeneration::new(generation)
+                && reservation.generation == generation
         };
         if !matches {
             return Ok((
@@ -1219,6 +1518,9 @@ impl ProcessMemory for ExecutionMemory {
             }
             return Ok(());
         }
+        if new_end_page == old_end_page {
+            return Ok(());
+        }
 
         let additional_pages = new_end_page - old_end_page;
         let capacity = usize::try_from(additional_pages)
@@ -1232,6 +1534,9 @@ impl ProcessMemory for ExecutionMemory {
             .physical_slots
             .try_reserve(additional_slots)
             .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+        let backing_store_id = inner
+            .backing_store_id()
+            .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
         let mut next_page_id = inner.next_page_id;
         for page in old_end_page..new_end_page {
             while inner
@@ -1246,17 +1551,24 @@ impl ProcessMemory for ExecutionMemory {
             next_page_id = next_page_id
                 .checked_add(1)
                 .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
-            pending.push((page, physical_page));
+            let backing = CanonicalBackingPage::zeroed(
+                CanonicalPageId::new(backing_store_id, physical_page),
+                SYNTHETIC_PAGE_SIZE,
+                ContentGeneration::new(1),
+            )
+            .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+            pending.push((page, physical_page, backing));
         }
-        for (page, physical_page) in pending {
+        let mapping_generation = if pending.is_empty() {
+            MappingGeneration::INITIAL
+        } else {
+            inner
+                .take_mapping_generation()
+                .ok_or_else(|| error(start, MemoryMappingErrorReason::GenerationExhausted))?
+        };
+        for (page, physical_page, backing) in pending {
             let slot = inner
-                .push_page(
-                    physical_page,
-                    ExecutionPhysicalPage::Ram {
-                        bytes: None,
-                        generation: 1,
-                    },
-                )
+                .push_page(physical_page, ExecutionPhysicalPage::Ram(backing))
                 .expect("allocated physical identity is unique");
             let previous = inner.mappings.insert(
                 address_space,
@@ -1264,6 +1576,7 @@ impl ProcessMemory for ExecutionMemory {
                 ExecutionMapping {
                     physical_page,
                     physical_slot: slot,
+                    mapping_generation,
                     permissions,
                     purpose,
                     attributes: MemoryAttributes::NONE,
@@ -1324,23 +1637,25 @@ impl ProcessMemory for ExecutionMemory {
                 ));
             }
         }
-        let mut changed_executable_slots = BTreeSet::new();
+        let changed = (first_page..end_page).any(|page| {
+            inner
+                .mappings
+                .get(address_space, page)
+                .is_some_and(|mapping| mapping.permissions != permissions)
+        });
+        if !changed {
+            return Ok(());
+        }
+        let mapping_generation = inner
+            .take_mapping_generation()
+            .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in first_page..end_page {
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
                 .expect("protection range was preflighted");
-            if mapping.permissions.contains(MemoryPermissions::EXECUTE)
-                != permissions.contains(MemoryPermissions::EXECUTE)
-            {
-                changed_executable_slots.insert(mapping.physical_slot);
-            }
             mapping.permissions = permissions;
-        }
-        for slot in changed_executable_slots {
-            if let Some(ExecutionPhysicalPage::Ram { generation, .. }) = inner.page_mut(slot) {
-                *generation = generation.wrapping_add(1);
-            }
+            mapping.mapping_generation = mapping_generation;
         }
         Ok(())
     }
@@ -1381,6 +1696,20 @@ impl ProcessMemory for ExecutionMemory {
                 ));
             }
         }
+        let changed = (first_page..end_page).any(|page| {
+            let mapping = inner
+                .mappings
+                .get(address_space, page)
+                .expect("attribute range was preflighted");
+            let bits = (mapping.attributes.bits() & !mask.bits()) | value.bits();
+            mapping.attributes.bits() != bits
+        });
+        if !changed {
+            return Ok(());
+        }
+        let mapping_generation = inner
+            .take_mapping_generation()
+            .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in first_page..end_page {
             let mapping = inner
                 .mappings
@@ -1389,6 +1718,7 @@ impl ProcessMemory for ExecutionMemory {
             let bits = (mapping.attributes.bits() & !mask.bits()) | value.bits();
             mapping.attributes = MemoryAttributes::from_bits(bits)
                 .expect("existing, masked, and replacement attributes are bounded");
+            mapping.mapping_generation = mapping_generation;
         }
         Ok(())
     }
@@ -1397,6 +1727,293 @@ impl ProcessMemory for ExecutionMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use nixe_memory::{
+        CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
+        DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
+        VisibilityState,
+    };
+
+    struct DeviceWriteback {
+        bytes: Box<[u8]>,
+    }
+
+    impl VisibilityCoordinator for DeviceWriteback {
+        fn make_device_visible(
+            &self,
+            _request: DeviceVisibilityRequest,
+            _canonical_bytes: &[u8],
+        ) -> Result<(), VisibilityCoordinatorError> {
+            Ok(())
+        }
+
+        fn make_cpu_visible(
+            &self,
+            _request: CpuVisibilityRequest,
+        ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[test]
+    fn canonical_translation_retains_checked_page_spanning_segments() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(7);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                GuestVirtualAddress::new(0x1000),
+                0,
+                0x3000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+
+        let range = memory
+            .translate_canonical_range(
+                space,
+                GuestVirtualAddress::new(0x1800),
+                0x1800,
+                MemoryPermissions::WRITE,
+            )
+            .unwrap();
+        assert_eq!(range.size(), 0x1800);
+        assert_eq!(range.segments().len(), 2);
+        assert_eq!(range.segments()[0].offset(), 0x800);
+        assert_eq!(range.segments()[0].size(), 0x800);
+        assert_eq!(range.segments()[1].offset(), 0);
+        assert_eq!(range.segments()[1].size(), 0x1000);
+        assert_eq!(
+            range.segments()[0].permissions(),
+            MemoryPermissions::READ_WRITE
+        );
+        assert_ne!(range.segments()[0].page(), range.segments()[1].page());
+        assert_eq!(
+            range.segments()[0].page().store(),
+            range.segments()[1].page().store()
+        );
+
+        memory
+            .set_permissions(
+                space,
+                GuestVirtualAddress::new(0x2000),
+                0x1000,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        assert_eq!(
+            memory
+                .translate_canonical_range(
+                    space,
+                    GuestVirtualAddress::new(0x1800),
+                    0x1800,
+                    MemoryPermissions::WRITE,
+                )
+                .unwrap_err(),
+            CanonicalRangeTranslationError {
+                address_space: space,
+                address: GuestVirtualAddress::new(0x2000),
+                reason: CanonicalRangeTranslationErrorReason::PermissionDenied,
+            }
+        );
+    }
+
+    #[test]
+    fn retained_translation_survives_cpu_unmap_and_memory_teardown() {
+        let space = AddressSpaceId::new(9);
+        let retained = {
+            let memory = ExecutionMemory::new();
+            memory
+                .resize_zeroed_mapping(
+                    space,
+                    GuestVirtualAddress::new(0x4000),
+                    0,
+                    0x1000,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+            memory
+                .write(
+                    space,
+                    GuestVirtualAddress::new(0x4007),
+                    MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+                    MemoryValue::U8(0x5a),
+                )
+                .unwrap();
+            let retained = memory
+                .translate_canonical_range(
+                    space,
+                    GuestVirtualAddress::new(0x4000),
+                    0x1000,
+                    MemoryPermissions::READ,
+                )
+                .unwrap();
+            memory
+                .resize_zeroed_mapping(
+                    space,
+                    GuestVirtualAddress::new(0x4000),
+                    0x1000,
+                    0,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+            assert_eq!(memory.physical_page_count(), 0);
+            retained
+        };
+
+        assert_eq!(retained.size(), 0x1000);
+        assert!(retained.segments()[0].content_is_current());
+        assert_eq!(
+            retained.segments()[0].content_generation(),
+            ContentGeneration::new(2)
+        );
+    }
+
+    #[test]
+    fn cpu_read_reconciles_gpu_newer_backing_through_neutral_slow_path() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(10);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                GuestVirtualAddress::new(0x8000),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let retained = memory
+            .translate_canonical_range(
+                space,
+                GuestVirtualAddress::new(0x8000),
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        let mut bytes = vec![0; 0x1000];
+        bytes[9] = 0xa5;
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+            bytes: bytes.into_boxed_slice(),
+        });
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(4),
+            DeviceVisibilityPoint::new(11),
+            DeviceVisibilityPoint::new(12),
+        )
+        .unwrap();
+        retained
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        retained
+            .complete_device_write(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        assert!(matches!(
+            retained.segments()[0].visibility_state(),
+            VisibilityState::GpuNewer { .. }
+        ));
+
+        let result = memory
+            .read(
+                space,
+                GuestVirtualAddress::new(0x8009),
+                MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+            )
+            .unwrap();
+        assert_eq!(result.value, MemoryValue::U8(0xa5));
+        assert_eq!(
+            retained.segments()[0].visibility_state(),
+            VisibilityState::Clean
+        );
+
+        let second_write = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(4),
+            DeviceVisibilityPoint::new(13),
+            DeviceVisibilityPoint::new(14),
+        )
+        .unwrap();
+        retained
+            .prepare_device_access(second_write, Arc::clone(&coordinator))
+            .unwrap();
+        retained
+            .complete_device_write(second_write, coordinator)
+            .unwrap();
+        memory
+            .write(
+                space,
+                GuestVirtualAddress::new(0x8009),
+                MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+                MemoryValue::U8(0x33),
+            )
+            .unwrap();
+        assert_eq!(
+            retained.segments()[0].visibility_state(),
+            VisibilityState::CpuNewer
+        );
+        assert_eq!(
+            memory
+                .read(
+                    space,
+                    GuestVirtualAddress::new(0x8009),
+                    MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U8(0x33)
+        );
+    }
+
+    #[test]
+    fn gpu_write_invalidates_a_cpu_exclusive_reservation_before_store() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(11);
+        let address = GuestVirtualAddress::new(0x9000);
+        let access = MemoryAccess::normal(crate::memory::MemoryAccessSize::Byte);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                address,
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        let (_, reservation) = memory.load_exclusive(space, address, access).unwrap();
+        let retained = memory
+            .translate_canonical_range(space, address, 0x1000, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut bytes = vec![0; 0x1000];
+        bytes[0] = 0x5a;
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+            bytes: bytes.into_boxed_slice(),
+        });
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(5),
+            DeviceVisibilityPoint::new(20),
+            DeviceVisibilityPoint::new(21),
+        )
+        .unwrap();
+        retained
+            .prepare_device_access(declaration, Arc::clone(&coordinator))
+            .unwrap();
+        retained
+            .complete_device_write(declaration, coordinator)
+            .unwrap();
+
+        let (_, stored) = memory
+            .store_exclusive(space, address, access, MemoryValue::U8(0xff), reservation)
+            .unwrap();
+        assert!(!stored);
+        assert_eq!(
+            memory.read(space, address, access).unwrap().value,
+            MemoryValue::U8(0x5a)
+        );
+    }
 
     #[test]
     fn sparse_page_table_allocates_only_populated_leaves() {

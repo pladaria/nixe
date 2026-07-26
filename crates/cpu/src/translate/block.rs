@@ -1327,6 +1327,7 @@ mod tests {
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(1),
             generation: CodeGeneration::new(2),
+            mapping_generation: crate::address::MappingGeneration::new(1),
         };
         let return_address = GuestVirtualAddress::new(0x1004);
         let target = ControlTarget::Direct {

@@ -78,8 +78,8 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
     for dependency in &block.metadata.code_dependencies {
         writeln!(
             output,
-            "  dependency {} {}",
-            dependency.page, dependency.generation
+            "  dependency {} {} {}",
+            dependency.page, dependency.generation, dependency.mapping_generation
         )
         .expect("writing to a String cannot fail");
     }
@@ -177,6 +177,7 @@ mod tests {
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(2),
             generation: CodeGeneration::new(3),
+            mapping_generation: crate::address::MappingGeneration::new(1),
         };
         IrBlock::new(
             BlockMetadata::new(
@@ -217,7 +218,8 @@ mod tests {
         let expected = concat!(
             "block 0x0000000000001000 A64 profile=0x0000000000000001 bytes=4 instructions=1\n",
             "  source pc=0x0000000000001000 state=A64 ; raw=0xd503201f ; guest=\"nop\"\n",
-            "  dependency page=0x0000000000000002 generation=0x0000000000000003\n",
+            "  dependency page=0x0000000000000002 generation=0x0000000000000003 \
+             mapping-generation=1\n",
             "  end-reason explicit-terminator\n",
             "  %0:i64 = op0 Constant(I64(7)) effects=OperationEffects { side_effects: EffectSet(0), may_fault: false } source=0x0000000000001000\n",
             "  terminator Direct { target: Direct { pc: GuestVirtualAddress(4100), execution_state: A64 } }\n",

@@ -258,10 +258,10 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
     if metadata
         .code_dependencies
         .iter()
-        .any(|dependency| !unique.insert(dependency.page))
+        .any(|dependency| !unique.insert((dependency.page, dependency.mapping_generation)))
     {
         return Err(VerificationError::metadata(
-            "block code_dependencies contain a duplicate physical page",
+            "block code_dependencies contain a duplicate physical mapping",
         ));
     }
     Ok(())
@@ -1318,6 +1318,7 @@ mod tests {
         CodePageDependency {
             page: GuestPhysicalPageId::new(2),
             generation: CodeGeneration::new(4),
+            mapping_generation: crate::address::MappingGeneration::new(1),
         }
     }
 

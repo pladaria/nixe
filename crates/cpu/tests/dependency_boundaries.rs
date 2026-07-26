@@ -3,7 +3,7 @@ use std::path::Path;
 
 // Keep this allowlist explicit. Adding an entry is an architectural review of
 // the CPU crate's ownership boundary, not merely a manifest edit.
-const APPROVED_DEPENDENCIES: &[&str] = &[];
+const APPROVED_DEPENDENCIES: &[&str] = &["nixe-memory"];
 
 #[test]
 fn manifest_contains_only_architecturally_approved_dependencies() {
@@ -38,7 +38,8 @@ fn dependency_names(manifest: &str) -> Vec<&str> {
             && !line.starts_with('#')
             && let Some((name, _)) = line.split_once('=')
         {
-            dependencies.push(name.trim().trim_matches(['\'', '"']));
+            let name = name.trim().trim_matches(['\'', '"']);
+            dependencies.push(name.strip_suffix(".workspace").unwrap_or(name));
         }
     }
 

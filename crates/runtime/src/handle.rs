@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use nixe_cpu::memory::MemoryPermissions;
+use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, GuestVirtualAddress};
 
 const FIRST_HANDLE: u32 = 1;
 const LAST_HANDLE: u32 = 0x7fff_ffff;
@@ -196,36 +197,49 @@ impl ReadableEventObject {
 }
 
 /// Guest-owned memory range exported through a Horizon transfer-memory handle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferMemoryObject {
-    address: u64,
+    address: GuestVirtualAddress,
     size: u64,
     permissions: MemoryPermissions,
+    backing: CanonicalBackingRange,
 }
 
 impl TransferMemoryObject {
     #[must_use]
-    pub const fn new(address: u64, size: u64, permissions: MemoryPermissions) -> Self {
+    pub const fn new(
+        address: GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+        backing: CanonicalBackingRange,
+    ) -> Self {
         Self {
             address,
             size,
             permissions,
+            backing,
         }
     }
 
     #[must_use]
-    pub const fn address(self) -> u64 {
+    pub const fn address(&self) -> GuestVirtualAddress {
         self.address
     }
 
     #[must_use]
-    pub const fn size(self) -> u64 {
+    pub const fn size(&self) -> u64 {
         self.size
     }
 
     #[must_use]
-    pub const fn permissions(self) -> MemoryPermissions {
+    pub const fn permissions(&self) -> MemoryPermissions {
         self.permissions
+    }
+
+    /// Returns the retained canonical bytes denoted by the handle.
+    #[must_use]
+    pub const fn backing(&self) -> &CanonicalBackingRange {
+        &self.backing
     }
 }
 
@@ -770,10 +784,10 @@ pub enum PortError {
     NoPendingSession,
 }
 
-/// Minimal shared-memory identity and backing used until kernel memory objects exist.
+/// Shared-memory identity backed by device-neutral canonical storage.
 #[derive(Clone, Debug)]
 pub struct SharedMemoryObject {
-    bytes: Arc<Mutex<Box<[u8]>>>,
+    backing: CanonicalAllocation,
     size: usize,
     remote_permissions: MemoryPermissions,
 }
@@ -790,13 +804,10 @@ impl SharedMemoryObject {
         if size > MAX_SHARED_MEMORY_BYTES {
             return Err(HandleError::ObjectTooLarge(size));
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| HandleError::AllocationFailed)?;
-        bytes.resize(size, 0);
+        let backing =
+            CanonicalAllocation::zeroed(size, 4096).map_err(|_| HandleError::AllocationFailed)?;
         Ok(Self {
-            bytes: Arc::new(Mutex::new(bytes.into_boxed_slice())),
+            backing,
             size,
             remote_permissions,
         })
@@ -815,35 +826,34 @@ impl SharedMemoryObject {
     /// Reports whether two objects refer to the same temporary backing.
     #[must_use]
     pub fn same_backing(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.bytes, &other.bytes)
+        self.backing.same_backing(&other.backing)
     }
 
-    /// Copies bytes into the temporary backing shared by every duplicate handle.
+    /// Returns a retained canonical route for future CPU/device mappings.
+    pub fn backing_range(&self) -> Result<CanonicalBackingRange, HandleError> {
+        self.backing
+            .backing_range(self.remote_permissions)
+            .map_err(|_| HandleError::BackingAccess)
+    }
+
+    /// Copies bytes into canonical backing shared by every duplicate handle.
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), HandleError> {
-        let end = offset
-            .checked_add(bytes.len())
-            .filter(|end| *end <= self.size)
-            .ok_or(HandleError::InvalidRange)?;
-        self.bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[offset..end]
-            .copy_from_slice(bytes);
-        Ok(())
+        self.backing
+            .write(offset, bytes)
+            .map_err(|error| match error {
+                nixe_memory::CanonicalAllocationError::InvalidRange => HandleError::InvalidRange,
+                _ => HandleError::BackingAccess,
+            })
     }
 
-    /// Copies bytes out of the temporary shared backing.
+    /// Copies bytes out of canonical shared backing.
     pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), HandleError> {
-        let end = offset
-            .checked_add(output.len())
-            .filter(|end| *end <= self.size)
-            .ok_or(HandleError::InvalidRange)?;
-        output.copy_from_slice(
-            &self
-                .bytes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)[offset..end],
-        );
-        Ok(())
+        self.backing
+            .read(offset, output)
+            .map_err(|error| match error {
+                nixe_memory::CanonicalAllocationError::InvalidRange => HandleError::InvalidRange,
+                _ => HandleError::BackingAccess,
+            })
     }
 }
 
@@ -855,6 +865,7 @@ pub enum HandleError {
     InvalidHandle(u32),
     ObjectTooLarge(usize),
     InvalidRange,
+    BackingAccess,
 }
 
 impl Display for HandleError {
@@ -868,6 +879,9 @@ impl Display for HandleError {
                 "runtime object size {size:#x} exceeds its safety limit"
             ),
             Self::InvalidRange => formatter.write_str("object byte range is outside its backing"),
+            Self::BackingAccess => {
+                formatter.write_str("canonical object backing could not complete the access")
+            }
         }
     }
 }
@@ -1058,6 +1072,10 @@ mod tests {
         let duplicate = memory.clone();
         assert_eq!(memory.size(), 0x1000);
         assert!(memory.same_backing(&duplicate));
+        let range = memory.backing_range().unwrap();
+        assert_eq!(range.size(), 0x1000);
+        memory.write(3, &[0x5a]).unwrap();
+        assert!(!range.segments()[0].content_is_current());
         assert!(matches!(
             SharedMemoryObject::zeroed(MAX_SHARED_MEMORY_BYTES + 1),
             Err(HandleError::ObjectTooLarge(_))

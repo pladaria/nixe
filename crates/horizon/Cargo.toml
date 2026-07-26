@@ -14,6 +14,7 @@ nixe-gpu-maxwell.workspace = true
 nixe-input.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
+nixe-memory.workspace = true
 nixe-runtime.workspace = true
 nixe-video.workspace = true
 

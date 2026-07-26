@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{
-    DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingError,
-    MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
-    MemoryProtectionErrorReason, MemoryRegionKind, MemoryValue,
+    DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAttributes,
+    MemoryMappingError, MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions,
+    MemoryProtectionError, MemoryProtectionErrorReason, MemoryRegionKind, MemoryValue,
 };
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_memory::CanonicalRangeTranslationError;
 use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -151,6 +152,10 @@ pub enum HorizonSvcFault {
     MemoryMapping {
         fault: MemoryMappingError,
     },
+    CanonicalMemory {
+        immediate: u32,
+        fault: CanonicalRangeTranslationError,
+    },
     MalformedIpc {
         immediate: u32,
         reason: &'static str,
@@ -173,27 +178,40 @@ impl HorizonSvcFault {
         match self {
             Self::Unknown(_) => Some(HorizonKernelResult::NOT_SUPPORTED),
             Self::UnsupportedSemantics { .. } => Some(HorizonKernelResult::NOT_IMPLEMENTED),
-            Self::GuestMemory { .. } => Some(HorizonKernelResult::INVALID_POINTER),
+            Self::GuestMemory { fault, .. } => match fault.reason {
+                DataAccessFaultReason::ContentGenerationExhausted
+                | DataAccessFaultReason::HostBacking(_) => None,
+                _ => Some(HorizonKernelResult::INVALID_POINTER),
+            },
             Self::InvalidMemoryPermission { .. }
             | Self::InvalidMemoryAttribute { .. }
             | Self::InvalidMemoryState { .. } => Some(HorizonKernelResult::INVALID_STATE),
-            Self::MemoryProtection { fault } => Some(match fault.reason {
+            Self::MemoryProtection { fault } => match fault.reason {
                 MemoryProtectionErrorReason::InvalidRange
-                | MemoryProtectionErrorReason::Unmapped => HorizonKernelResult::INVALID_ADDRESS,
-                MemoryProtectionErrorReason::WritableExecutable => {
-                    HorizonKernelResult::INVALID_STATE
+                | MemoryProtectionErrorReason::Unmapped => {
+                    Some(HorizonKernelResult::INVALID_ADDRESS)
                 }
-                MemoryProtectionErrorReason::PermissionLocked => HorizonKernelResult::INVALID_STATE,
-            }),
-            Self::MemoryMapping { fault } => Some(match fault.reason {
+                MemoryProtectionErrorReason::WritableExecutable
+                | MemoryProtectionErrorReason::PermissionLocked => {
+                    Some(HorizonKernelResult::INVALID_STATE)
+                }
+                MemoryProtectionErrorReason::GenerationExhausted => None,
+            },
+            Self::MemoryMapping { fault } => match fault.reason {
                 MemoryMappingErrorReason::InvalidRange
                 | MemoryMappingErrorReason::AlreadyMapped
                 | MemoryMappingErrorReason::MappingStateMismatch => {
-                    HorizonKernelResult::INVALID_ADDRESS
+                    Some(HorizonKernelResult::INVALID_ADDRESS)
                 }
-                MemoryMappingErrorReason::WritableExecutable => HorizonKernelResult::INVALID_STATE,
-                MemoryMappingErrorReason::ResourceExhausted => HorizonKernelResult::RESOURCE_LIMIT,
-            }),
+                MemoryMappingErrorReason::WritableExecutable => {
+                    Some(HorizonKernelResult::INVALID_STATE)
+                }
+                MemoryMappingErrorReason::ResourceExhausted => {
+                    Some(HorizonKernelResult::RESOURCE_LIMIT)
+                }
+                MemoryMappingErrorReason::GenerationExhausted => None,
+            },
+            Self::CanonicalMemory { .. } => None,
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -241,6 +259,10 @@ impl Display for HorizonSvcFault {
             Self::MemoryMapping { fault } => {
                 write!(formatter, "Horizon memory mapping failed: {fault:?}")
             }
+            Self::CanonicalMemory { immediate, fault } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} cannot retain canonical memory: {fault}"
+            ),
             Self::MalformedIpc { immediate, reason } => {
                 write!(
                     formatter,
@@ -1422,10 +1444,30 @@ fn create_transfer_memory(
         result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
         return resume();
     }
+    let backing = match context
+        .process()
+        .canonical_memory()
+        .translate_canonical_range(
+            context.process().cpu().address_space_id(),
+            start,
+            size,
+            MemoryPermissions::NONE,
+        ) {
+        Ok(backing) => backing,
+        Err(fault) => {
+            return reject(
+                context,
+                HorizonSvcFault::CanonicalMemory {
+                    immediate: 0x15,
+                    fault,
+                },
+            );
+        }
+    };
     match context
         .process_mut()
         .handles_mut()
-        .insert(TransferMemoryObject::new(address, size, permissions))
+        .insert(TransferMemoryObject::new(start, size, permissions, backing))
     {
         Ok(handle) => {
             result(context, HorizonKernelResult::SUCCESS);
@@ -2545,5 +2587,69 @@ mod tests {
             "Horizon SVC 0x21 reached unsupported emulator semantics: graphics-gap=ioctl nvdrv \
              ioctl is not implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706"
         );
+    }
+
+    #[test]
+    fn emulator_generation_exhaustion_is_never_fabricated_as_a_guest_result() {
+        let address_space = nixe_cpu::address::AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let faults = [
+            HorizonSvcFault::GuestMemory {
+                immediate: 0x21,
+                fault: DataAccessFault::new(
+                    address_space,
+                    address,
+                    nixe_cpu::memory::DataAccessKind::Write,
+                    DataAccessFaultReason::ContentGenerationExhausted,
+                ),
+            },
+            HorizonSvcFault::MemoryProtection {
+                fault: MemoryProtectionError {
+                    address_space,
+                    address,
+                    reason: MemoryProtectionErrorReason::GenerationExhausted,
+                },
+            },
+            HorizonSvcFault::MemoryMapping {
+                fault: MemoryMappingError {
+                    address_space,
+                    address,
+                    reason: MemoryMappingErrorReason::GenerationExhausted,
+                },
+            },
+        ];
+
+        for fault in faults {
+            assert_eq!(fault.guest_result(), None);
+        }
+    }
+
+    #[test]
+    fn canonical_backing_failures_are_never_fabricated_as_guest_results() {
+        let address_space = nixe_cpu::address::AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let faults = [
+            HorizonSvcFault::GuestMemory {
+                immediate: 0x21,
+                fault: DataAccessFault::new(
+                    address_space,
+                    address,
+                    nixe_cpu::memory::DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking("allocation failed".into()),
+                ),
+            },
+            HorizonSvcFault::CanonicalMemory {
+                immediate: 0x15,
+                fault: CanonicalRangeTranslationError {
+                    address_space,
+                    address,
+                    reason: nixe_memory::CanonicalRangeTranslationErrorReason::ResourceExhausted,
+                },
+            },
+        ];
+
+        for fault in faults {
+            assert_eq!(fault.guest_result(), None);
+        }
     }
 }
