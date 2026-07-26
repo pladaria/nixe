@@ -16,6 +16,7 @@ use nixe_runtime::{
     ProcessBuilder, ProcessExit, ProcessExitCause, ProcessTeardownReport, RunnableProcess,
     VirtualClock, VirtualClockMode,
 };
+use nixe_video::FrameMailbox;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
 
 use crate::logging::LogLevel;
@@ -30,15 +31,29 @@ pub struct Arguments {
     pub config_path: Option<PathBuf>,
     pub log_level_override: Option<LogLevel>,
     pub identifier: String,
+    pub headless: bool,
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
+    let Arguments {
+        config_path,
+        log_level_override,
+        identifier,
+        headless,
+    } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
-        .map_err(|error| error.to_string())?;
-    let frontend_control = frontend.control();
+    let (frontend, frontend_control, mailbox) = if headless {
+        log::info!("headless presentation enabled; no host window will be created");
+        (None, None, FrameMailbox::default())
+    } else {
+        let frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
+            .map_err(|error| error.to_string())?;
+        let control = frontend.control();
+        let mailbox = frontend.mailbox();
+        (Some(frontend), Some(control), mailbox)
+    };
     let interrupted = install_interrupt_handler(frontend_control.clone())?;
-    let config = load_config(arguments.config_path, arguments.log_level_override)?;
+    let config = load_config(config_path, log_level_override)?;
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
         format!(
@@ -60,8 +75,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         scan_started.elapsed()
     );
     let title = library
-        .find(&arguments.identifier)
-        .ok_or_else(|| format!("unknown title ID or name: {}", arguments.identifier))?;
+        .find(&identifier)
+        .ok_or_else(|| format!("unknown title ID or name: {identifier}"))?;
     log::info!("selected {}: {}", title.identifier, title.name);
 
     let plan_started = Instant::now();
@@ -142,11 +157,28 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
     );
-    let video_system = VideoSystem::new(frontend.mailbox());
+    let video_system = VideoSystem::new(mailbox);
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
+
+    let Some(frontend) = frontend else {
+        return finish_execution(execute_worker(
+            process,
+            instruction_trace,
+            HostStopSignals {
+                ctrl_c: interrupted,
+                frontend: frontend_stop_requested,
+            },
+            initial_operation_mode,
+            time_environment,
+            video_system,
+            gamepad_profiles,
+        ));
+    };
+
     let worker_frontend_stop = Arc::clone(&frontend_stop_requested);
     let worker_interrupted = Arc::clone(&interrupted);
-    let worker_control = frontend_control.clone();
+    let worker_control =
+        frontend_control.expect("window frontend construction provides its control channel");
     let worker = thread::Builder::new()
         .name("nixe-guest".to_owned())
         .spawn(move || {
@@ -177,12 +209,14 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     frontend_result.and(execution_result)
 }
 
-fn install_interrupt_handler(control: FrontendControl) -> Result<Arc<AtomicBool>, String> {
+fn install_interrupt_handler(control: Option<FrontendControl>) -> Result<Arc<AtomicBool>, String> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&interrupted);
     ctrlc::set_handler(move || {
         signal_flag.store(true, Ordering::SeqCst);
-        control.stop_requested();
+        if let Some(control) = &control {
+            control.stop_requested();
+        }
     })
     .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
     Ok(interrupted)

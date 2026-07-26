@@ -7,5 +7,6 @@ mod diagnostics;
 
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId, GpuVirtualAddress,
-    GraphicsAllocationId, GraphicsGapKind, MappingGeneration, SyncpointValue,
+    GraphicsAllocationId, GraphicsGapKind, SyncpointValue,
 };
+pub use nixe_memory::MappingGeneration;

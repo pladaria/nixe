@@ -72,7 +72,6 @@ macro_rules! hex_diagnostic_id {
 hex_diagnostic_id!(CpuVirtualAddress, "cpu-va", u64, 16);
 hex_diagnostic_id!(GpuVirtualAddress, "gpu-va", u64, 16);
 hex_diagnostic_id!(GraphicsAllocationId, "allocation", u64, 16);
-decimal_diagnostic_id!(MappingGeneration, "mapping-generation", u64);
 decimal_diagnostic_id!(GpuChannelId, "channel", u32);
 decimal_diagnostic_id!(GpfifoEntryIndex, "gpfifo-entry", u32);
 hex_diagnostic_id!(GpuClassId, "class", u32, 8);
@@ -128,7 +127,10 @@ mod tests {
             GraphicsAllocationId(0x42).to_string(),
             "allocation=0x0000000000000042"
         );
-        assert_eq!(MappingGeneration(17).to_string(), "mapping-generation=17");
+        assert_eq!(
+            crate::MappingGeneration::new(17).to_string(),
+            "mapping-generation=17"
+        );
         assert_eq!(GpuChannelId(3).to_string(), "channel=3");
         assert_eq!(GpfifoEntryIndex(9).to_string(), "gpfifo-entry=9");
         assert_eq!(GpuClassId(0xb197).to_string(), "class=0x0000b197");

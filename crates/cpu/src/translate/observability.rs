@@ -1,7 +1,9 @@
 //! Opt-in deterministic reports for one frontend translation block.
 
 use crate::{
-    address::{AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
+    address::{
+        AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    },
     error::{
         FrontendError, FrontendInternalError, InstructionFetchFault, InstructionFetchFaultReason,
     },
@@ -337,6 +339,7 @@ fn dependency(address: GuestVirtualAddress) -> CodePageDependency {
     CodePageDependency {
         page: GuestPhysicalPageId::new(address.get() / SYNTHETIC_PAGE_SIZE as u64),
         generation: CodeGeneration::new(1),
+        mapping_generation: MappingGeneration::new(1),
     }
 }
 
@@ -403,9 +406,10 @@ mod tests {
                 "source pc=0x0000000000001004 state=A64 ; raw=0xd4000001 ; guest=\"svc\""
             )
         );
-        assert!(
-            output.contains("dependency page=0x0000000000000001 generation=0x0000000000000001")
-        );
+        assert!(output.contains(
+            "dependency page=0x0000000000000001 generation=0x0000000000000001 \
+                 mapping-generation=1"
+        ));
         assert!(!output.contains("0x7f"));
 
         let post = print_ir_dump(

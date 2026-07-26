@@ -3,9 +3,13 @@
 use std::fmt::{Display, Formatter};
 
 use crate::{
-    address::{AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
+    address::{
+        AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    },
     error::{InstructionFetchFault, InstructionFetchFaultReason},
 };
+
+pub use nixe_memory::MemoryPermissions;
 
 /// Page size used by the synthetic and production memory backends.
 pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
@@ -62,6 +66,8 @@ impl std::error::Error for SyntheticInstallError {}
 pub struct SyntheticMappingInfo {
     /// Runtime-owned physical-page identity.
     pub physical_page: GuestPhysicalPageId,
+    /// Version of this virtual mapping and its access metadata.
+    pub mapping_generation: MappingGeneration,
     /// Exact guest-visible mapping permissions.
     pub permissions: MemoryPermissions,
     /// Runtime-visible mapping attributes.
@@ -77,6 +83,8 @@ pub struct CodePageDependency {
     pub page: GuestPhysicalPageId,
     /// Monotonic content generation observed during the fetch.
     pub generation: CodeGeneration,
+    /// Generation of the virtual mapping used for the fetch.
+    pub mapping_generation: MappingGeneration,
 }
 
 /// The one or two physical pages on which fetched instruction bytes depend.
@@ -541,6 +549,10 @@ pub enum DataAccessFaultReason {
     ValueSizeMismatch,
     /// An access cannot span distinct RAM/device regions.
     MixedRegions,
+    /// The backing content version cannot advance without observable reuse.
+    ContentGenerationExhausted,
+    /// Canonical host backing could not complete an emulator-side operation.
+    HostBacking(Box<str>),
     /// Device handler rejected the operation.
     Device(Box<str>),
     /// Synthetic fault requested by a test.
@@ -672,6 +684,7 @@ pub enum MemoryMappingErrorReason {
     MappingStateMismatch,
     WritableExecutable,
     ResourceExhausted,
+    GenerationExhausted,
 }
 
 /// Pointer-free reason a runtime mapping resize was rejected.
@@ -688,6 +701,7 @@ pub enum MemoryProtectionErrorReason {
     Unmapped,
     WritableExecutable,
     PermissionLocked,
+    GenerationExhausted,
 }
 
 /// Pointer-free reason a runtime mapping-protection operation was rejected.
@@ -696,37 +710,6 @@ pub struct MemoryProtectionError {
     pub address_space: AddressSpaceId,
     pub address: GuestVirtualAddress,
     pub reason: MemoryProtectionErrorReason,
-}
-
-/// Read, write, and execute permissions on a synthetic virtual mapping.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct MemoryPermissions(u8);
-
-impl MemoryPermissions {
-    /// No access.
-    pub const NONE: Self = Self(0);
-    /// Read-only data.
-    pub const READ: Self = Self(1 << 0);
-    /// Write-only data.
-    pub const WRITE: Self = Self(1 << 1);
-    /// Instruction execution.
-    pub const EXECUTE: Self = Self(1 << 2);
-    /// Read/write data.
-    pub const READ_WRITE: Self = Self(Self::READ.0 | Self::WRITE.0);
-    /// Readable executable code.
-    pub const READ_EXECUTE: Self = Self(Self::READ.0 | Self::EXECUTE.0);
-    /// Writable executable memory, useful for coherency tests.
-    pub const READ_WRITE_EXECUTE: Self = Self(Self::READ.0 | Self::WRITE.0 | Self::EXECUTE.0);
-
-    pub const fn contains(self, permission: Self) -> bool {
-        self.0 & permission.0 == permission.0
-    }
-
-    /// Returns the portable read/write/execute bit representation.
-    #[must_use]
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
 }
 
 /// Callback interface used by synthetic MMIO pages.

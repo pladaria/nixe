@@ -10,6 +10,7 @@ use nixe_cpu::{
     location::{ExecutionState, LocationDescriptor},
 };
 use nixe_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
+use nixe_memory::CanonicalRangeTranslator;
 
 use crate::{
     HandleTable, ProcessExecutionStatus, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
@@ -162,6 +163,7 @@ pub struct ExceptionProcessContext<'a> {
     heap_size: &'a mut u64,
     initial_memory_size: u64,
     memory: &'a dyn ProcessMemory,
+    canonical_memory: &'a dyn CanonicalRangeTranslator,
     mounts: &'a ProcessMountNamespace,
     handles: &'a mut HandleTable,
 }
@@ -181,6 +183,7 @@ impl<'a> ExceptionProcessContext<'a> {
         metadata: ExceptionProcessMetadata,
         heap_size: &'a mut u64,
         memory: &'a dyn ProcessMemory,
+        canonical_memory: &'a dyn CanonicalRangeTranslator,
         mounts: &'a ProcessMountNamespace,
         handles: &'a mut HandleTable,
     ) -> Self {
@@ -193,6 +196,7 @@ impl<'a> ExceptionProcessContext<'a> {
             heap_size,
             initial_memory_size: metadata.initial_memory_size,
             memory,
+            canonical_memory,
             mounts,
             handles,
         }
@@ -254,6 +258,12 @@ impl<'a> ExceptionProcessContext<'a> {
     #[must_use]
     pub const fn memory(&self) -> &dyn ProcessMemory {
         self.memory
+    }
+
+    /// Returns pointer-free translation into retained canonical backing.
+    #[must_use]
+    pub const fn canonical_memory(&self) -> &dyn CanonicalRangeTranslator {
+        self.canonical_memory
     }
 
     /// Returns the current process filesystem namespace.

@@ -6,6 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use nixe_gpu::GraphicsGapKind;
 use nixe_gpu_maxwell::{MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE};
+use nixe_memory::{
+    AddressSpaceId, CanonicalBackingRange, CanonicalRangeTranslationError,
+    CanonicalRangeTranslator, GuestVirtualAddress, MemoryPermissions,
+};
 
 pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
@@ -43,9 +47,21 @@ impl DeviceKind {
 /// An `nvdrv` operation for which Nixe cannot yet provide faithful semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnsupportedNvDrvOperation {
-    OpenDevice { path: Box<[u8]> },
-    ServiceCommand { command_id: u32 },
-    Ioctl { device: &'static str, request: u32 },
+    OpenDevice {
+        path: Box<[u8]>,
+    },
+    ServiceCommand {
+        command_id: u32,
+    },
+    Ioctl {
+        device: &'static str,
+        request: u32,
+    },
+    CanonicalMemory {
+        device: &'static str,
+        request: u32,
+        fault: CanonicalRangeTranslationError,
+    },
 }
 
 impl UnsupportedNvDrvOperation {
@@ -55,7 +71,7 @@ impl UnsupportedNvDrvOperation {
         match self {
             Self::OpenDevice { .. } => GraphicsGapKind::DeviceOpen,
             Self::ServiceCommand { .. } => GraphicsGapKind::ServiceCommand,
-            Self::Ioctl { .. } => GraphicsGapKind::Ioctl,
+            Self::Ioctl { .. } | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
         }
     }
 }
@@ -75,6 +91,15 @@ impl Display for UnsupportedNvDrvOperation {
             Self::Ioctl { device, request } => write!(
                 formatter,
                 "nvdrv ioctl is not implemented: device={device} request={request:#010x}"
+            ),
+            Self::CanonicalMemory {
+                device,
+                request,
+                fault,
+            } => write!(
+                formatter,
+                "nvdrv ioctl cannot establish canonical backing: device={device} \
+                 request={request:#010x} fault=[{fault}]"
             ),
         }
     }
@@ -119,6 +144,7 @@ pub struct NvMapAllocation {
     pub alignment: u32,
     pub kind: u8,
     pub cpu_address: Option<u64>,
+    pub backing: Option<CanonicalBackingRange>,
     pub flags: u32,
 }
 
@@ -237,18 +263,40 @@ impl NvDrvSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn ioctl(
         &self,
         fd: u32,
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
+        self.ioctl_inner(fd, request, input, None)
+    }
+
+    pub(crate) fn ioctl_with_memory(
+        &self,
+        fd: u32,
+        request: u32,
+        input: &[u8],
+        address_space: AddressSpaceId,
+        translator: &dyn CanonicalRangeTranslator,
+    ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
+        self.ioctl_inner(fd, request, input, Some((address_space, translator)))
+    }
+
+    fn ioctl_inner(
+        &self,
+        fd: u32,
+        request: u32,
+        input: &[u8],
+        canonical_memory: Option<(AddressSpaceId, &dyn CanonicalRangeTranslator)>,
+    ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = match state.devices.get(&fd).copied() {
-            Some(DeviceKind::Map) => ioctl_nvmap(&mut state, request, input),
+            Some(DeviceKind::Map) => ioctl_nvmap(&mut state, request, input, canonical_memory),
             Some(DeviceKind::HostCtrlGpu) => {
                 ioctl_nvhost_ctrl_gpu(state.gpu_profile, request, input)
             }
@@ -469,6 +517,7 @@ fn ioctl_nvmap(
     state: &mut NvDrvState,
     request: u32,
     input: &[u8],
+    canonical_memory: Option<(AddressSpaceId, &dyn CanonicalRangeTranslator)>,
 ) -> Result<Vec<u8>, NvDrvCallError> {
     match request {
         IOCTL_NVMAP_CREATE => {
@@ -489,6 +538,7 @@ fn ioctl_nvmap(
                     alignment: 0,
                     kind: 0,
                     cpu_address: None,
+                    backing: None,
                     flags: 0,
                 },
             );
@@ -521,10 +571,33 @@ fn ioctl_nvmap(
             if allocation.cpu_address.is_some() {
                 return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
             }
+            let Some((address_space, translator)) = canonical_memory else {
+                return Err(NvDrvCallError::Unsupported(
+                    UnsupportedNvDrvOperation::Ioctl {
+                        device: DeviceKind::Map.path(),
+                        request,
+                    },
+                ));
+            };
+            let backing = translator
+                .translate_canonical_range(
+                    address_space,
+                    GuestVirtualAddress::new(address),
+                    u64::from(allocation.size),
+                    MemoryPermissions::NONE,
+                )
+                .map_err(|fault| {
+                    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::CanonicalMemory {
+                        device: DeviceKind::Map.path(),
+                        request,
+                        fault,
+                    })
+                })?;
             allocation.flags = flags;
             allocation.alignment = alignment;
             allocation.kind = kind;
             allocation.cpu_address = Some(address);
+            allocation.backing = Some(backing);
             Ok(sized_output(input, 32))
         }
         IOCTL_NVMAP_FREE => {
@@ -612,11 +685,25 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
 
 #[cfg(test)]
 mod tests {
+    use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
+
     use super::*;
 
     #[test]
     fn nvmap_allocation_retains_guest_address_identity() {
         let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(1);
+        memory
+            .resize_zeroed_mapping(
+                address_space,
+                GuestVirtualAddress::new(0x1234_5000),
+                0,
+                0x2000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
         session.initialize();
         let fd = session.open(b"/dev/nvmap").unwrap();
         let (created, error) = session
@@ -630,7 +717,10 @@ mod tests {
         allocate[16] = 0xfe;
         allocate[24..32].copy_from_slice(&0x1234_5000_u64.to_le_bytes());
         assert_eq!(
-            session.ioctl(fd, IOCTL_NVMAP_ALLOC, &allocate).unwrap().1,
+            session
+                .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, address_space, &memory,)
+                .unwrap()
+                .1,
             NV_SUCCESS
         );
         let id = session
@@ -641,10 +731,51 @@ mod tests {
             .get(&handle)
             .unwrap()
             .id;
-        assert_eq!(
-            session.allocation_by_id(id).unwrap().cpu_address,
-            Some(0x1234_5000)
-        );
+        let allocation = session.allocation_by_id(id).unwrap();
+        assert_eq!(allocation.cpu_address, Some(0x1234_5000));
+        let backing = allocation.backing.unwrap();
+        assert_eq!(backing.size(), 0x2000);
+        assert_eq!(backing.segments().len(), 2);
+    }
+
+    #[test]
+    fn nvmap_translation_failure_does_not_publish_partial_allocation_state() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(2);
+        session.initialize();
+        let fd = session.open(b"/dev/nvmap").unwrap();
+        let (created, _) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &0x1000_u32.to_le_bytes())
+            .unwrap();
+        let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
+        let mut allocate = vec![0_u8; 32];
+        allocate[0..4].copy_from_slice(&handle.to_le_bytes());
+        allocate[8..12].copy_from_slice(&0x55_u32.to_le_bytes());
+        allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        allocate[16] = 0xfe;
+        allocate[24..32].copy_from_slice(&0x9000_u64.to_le_bytes());
+
+        let error = session
+            .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, address_space, &memory)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UnsupportedNvDrvOperation::CanonicalMemory {
+                fault: CanonicalRangeTranslationError {
+                    reason: nixe_memory::CanonicalRangeTranslationErrorReason::Unmapped,
+                    ..
+                },
+                ..
+            }
+        ));
+        let state = session.state.lock().unwrap();
+        let allocation = state.allocations.get(&handle).unwrap();
+        assert_eq!(allocation.flags, 0);
+        assert_eq!(allocation.alignment, 0);
+        assert_eq!(allocation.kind, 0);
+        assert_eq!(allocation.cpu_address, None);
+        assert_eq!(allocation.backing, None);
     }
 
     #[test]

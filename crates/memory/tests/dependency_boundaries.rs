@@ -2,29 +2,16 @@ use std::fs;
 use std::path::Path;
 
 #[test]
-fn neutral_gpu_contract_has_no_console_or_host_backend_dependencies() {
+fn neutral_memory_contract_has_no_platform_or_execution_dependencies() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents =
-        fs::read_to_string(manifest.join("Cargo.toml")).expect("GPU manifest must be readable");
+        fs::read_to_string(manifest.join("Cargo.toml")).expect("memory manifest must be readable");
     let dependencies = dependency_names(&contents);
 
-    assert!(dependencies.contains(&"nixe-memory"));
-
-    for prohibited in [
-        "nixe-cpu",
-        "nixe-runtime",
-        "nixe-horizon",
-        "nixe-gpu-maxwell",
-        "nixe-video",
-        "nixe-video-winit",
-        "wgpu",
-        "winit",
-    ] {
-        assert!(
-            !dependencies.contains(&prohibited),
-            "neutral GPU crate must not depend on {prohibited}"
-        );
-    }
+    assert!(
+        dependencies.is_empty(),
+        "neutral memory crate must remain dependency-free, found {dependencies:?}"
+    );
 }
 
 fn dependency_names(manifest: &str) -> Vec<&str> {

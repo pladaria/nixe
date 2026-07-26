@@ -184,6 +184,7 @@ mod tests {
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(7),
             generation: CodeGeneration::new(3),
+            mapping_generation: crate::address::MappingGeneration::new(1),
         };
         BlockMetadata::new(
             location(),

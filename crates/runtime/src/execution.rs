@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::decode::{DecodeResult, decode, disassemble};
 use nixe_cpu::error::InstructionFetchFault;
 use nixe_cpu::error::{ProfileDisabledInstruction, UnallocatedEncoding};
@@ -19,6 +18,7 @@ use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu::vcpu::VcpuExecutionState;
 use nixe_cpu::{coverage::CoverageId, memory::DataAccessFault};
+use nixe_memory::GuestVirtualAddress;
 
 use crate::{
     DiagnosticsPolicy, ExceptionDispatchRequest, ExceptionTerminationScope, ReportDetail,
@@ -714,7 +714,7 @@ pub(crate) fn current_location(
         ),
     };
     LocationDescriptor::new(
-        nixe_cpu::address::GuestVirtualAddress::new(pc),
+        GuestVirtualAddress::new(pc),
         execution_state,
         cpu.profile().id(),
     )
@@ -764,7 +764,7 @@ fn fetch_current(
             state.execution_state(),
         ),
     };
-    let address = nixe_cpu::address::GuestVirtualAddress::new(pc);
+    let address = GuestVirtualAddress::new(pc);
     let address_space = cpu.address_space_id();
     match execution_state {
         ExecutionState::A64 | ExecutionState::A32 => memory

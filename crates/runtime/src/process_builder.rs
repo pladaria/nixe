@@ -4,7 +4,6 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::ir::block::IrBlock;
 use nixe_cpu::ir::print::{IrPrintOptions, print_block};
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
@@ -19,6 +18,7 @@ use nixe_cpu::translate::{
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::exception_dispatch::ExceptionProcessMetadata;
 use crate::{
@@ -532,6 +532,7 @@ impl RunnableProcess {
                 initial_memory_size: self.initial_memory_size,
             },
             &mut self.heap_size,
+            &self.memory,
             &self.memory,
             &self.mounts,
             &mut self.handles,

@@ -13,6 +13,7 @@ nixe-loader-executable.workspace = true
 nixe-loader-content.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
+nixe-memory.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

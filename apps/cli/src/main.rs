@@ -60,6 +60,7 @@ fn parse_arguments(
 ) -> Result<Option<Invocation>, String> {
     let mut config_path = None;
     let mut log_level = None;
+    let mut headless = false;
     let mut positionals = Vec::new();
     let mut arguments = arguments;
 
@@ -91,6 +92,13 @@ fn parse_arguments(
             log_level = Some(value.parse::<logging::LogLevel>()?);
             continue;
         }
+        if argument == "--headless" {
+            if headless {
+                return Err("--headless may only be specified once".to_owned());
+            }
+            headless = true;
+            continue;
+        }
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
         }
@@ -98,17 +106,27 @@ fn parse_arguments(
     }
 
     match positionals.as_slice() {
-        [command] if command == "input" => Ok(Some(Invocation {
-            command: Command::Input,
-            log_level: log_level.unwrap_or_default(),
-        })),
-        [command] if command == "list" => Ok(Some(Invocation {
-            command: Command::List(commands::list::Arguments {
-                config_path,
-                log_level_override: log_level,
-            }),
-            log_level: log_level.unwrap_or_default(),
-        })),
+        [command] if command == "input" => {
+            if headless {
+                return Err("--headless is only valid with run".to_owned());
+            }
+            Ok(Some(Invocation {
+                command: Command::Input,
+                log_level: log_level.unwrap_or_default(),
+            }))
+        }
+        [command] if command == "list" => {
+            if headless {
+                return Err("--headless is only valid with run".to_owned());
+            }
+            Ok(Some(Invocation {
+                command: Command::List(commands::list::Arguments {
+                    config_path,
+                    log_level_override: log_level,
+                }),
+                log_level: log_level.unwrap_or_default(),
+            }))
+        }
         [command, identifier] if command == "run" => {
             let identifier = identifier
                 .to_str()
@@ -119,6 +137,7 @@ fn parse_arguments(
                     config_path,
                     log_level_override: log_level,
                     identifier,
+                    headless,
                 }),
                 log_level: log_level.unwrap_or_default(),
             }))
@@ -140,7 +159,9 @@ fn print_usage(program: &OsStr) {
          Commands:\n  \
            input           Display live state from the first connected gamepad\n  \
            list            List configured titles as title ID and localized name\n  \
-           run <id|name>  Run a title\n\n\
+           run <id|name>   Run a title\n\n\
+         Run options:\n  \
+           --headless      Run without creating a host window\n\n\
          Log levels:\n  \
            error, warn, info, debug, trace\n  \
            --log-level overrides diagnostics.log_level from nixe.toml\n  \
@@ -207,7 +228,24 @@ mod tests {
             assert_eq!(arguments.config_path, None);
             assert_eq!(arguments.log_level_override, None);
             assert_eq!(arguments.identifier, identifier);
+            assert!(!arguments.headless);
             assert_eq!(invocation.log_level, logging::LogLevel::Info);
+        }
+    }
+
+    #[test]
+    fn parses_headless_before_or_after_run_identifier() {
+        for values in [
+            &["--headless", "run", "hello-world"][..],
+            &["run", "--headless", "hello-world"][..],
+            &["run", "hello-world", "--headless"][..],
+        ] {
+            let invocation = parse_arguments(arguments(values)).unwrap().unwrap();
+            let Command::Run(arguments) = invocation.command else {
+                panic!("expected run command");
+            };
+            assert_eq!(arguments.identifier, "hello-world");
+            assert!(arguments.headless);
         }
     }
 
@@ -258,6 +296,9 @@ mod tests {
             &["list", "--trace"][..],
             &["--log-level", "verbose", "list"][..],
             &["--log-level", "debug", "--log-level", "trace", "list"][..],
+            &["list", "--headless"][..],
+            &["input", "--headless"][..],
+            &["run", "--headless", "--headless", "hello-world"][..],
             &["--unknown", "list"][..],
             &["--config", "list"][..],
         ] {

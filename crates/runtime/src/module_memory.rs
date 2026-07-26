@@ -3,12 +3,12 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::memory::{
     ExecutionMemory, MemoryPermissions as CpuPermissions, SyntheticInstallStage, SyntheticMemory,
     SyntheticRamPage,
 };
 use nixe_loader_executable::{MemoryPermissions as LoaderPermissions, PreparedModule};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 /// Stage of a module-memory installation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
