@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    AddressSpaceId, CanonicalBackingPage, CanonicalPageId, ContentGeneration,
+    AddressSpaceId, CanonicalBackingPage, CanonicalPageError, CanonicalPageId, ContentGeneration,
     DeviceAccessDeclaration, GuestVirtualAddress, MappingGeneration, MemoryPermissions,
     VisibilityCoordinator, VisibilityError, VisibilityState,
 };
@@ -138,6 +138,66 @@ impl CanonicalBackingRange {
         &self.segments
     }
 
+    /// Copies a checked logical subrange from retained canonical storage.
+    ///
+    /// Reads walk canonical page segments directly. A CPU virtual address is
+    /// neither required nor reconstructed, so aliases and unmapped-but-retained
+    /// storage preserve the same byte identity.
+    pub fn read(&self, offset: u64, output: &mut [u8]) -> Result<(), CanonicalRangeAccessError> {
+        let output_size =
+            u64::try_from(output.len()).map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
+        let end = offset
+            .checked_add(output_size)
+            .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
+        if end > self.size {
+            return Err(CanonicalRangeAccessError::OutOfBounds {
+                offset,
+                size: output_size,
+                range_size: self.size,
+            });
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+
+        let mut logical_start = 0_u64;
+        let mut copied = 0_usize;
+        for segment in &self.segments {
+            let logical_end = logical_start
+                .checked_add(segment.size)
+                .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
+            let read_start = offset.max(logical_start);
+            let read_end = end.min(logical_end);
+            if read_start < read_end {
+                let within_segment = read_start - logical_start;
+                let page_offset = segment
+                    .offset
+                    .checked_add(within_segment)
+                    .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
+                let copy_size = usize::try_from(read_end - read_start)
+                    .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
+                let page_offset = usize::try_from(page_offset)
+                    .map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
+                let copied_end = copied
+                    .checked_add(copy_size)
+                    .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
+                segment
+                    .backing
+                    .read(page_offset, &mut output[copied..copied_end])
+                    .map_err(CanonicalRangeAccessError::Backing)?;
+                copied = copied_end;
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        if copied != output.len() {
+            return Err(CanonicalRangeAccessError::IncompleteRange);
+        }
+        Ok(())
+    }
+
     /// Establishes device visibility before executing a declared access.
     ///
     /// The initial implementation transitions complete canonical pages even
@@ -222,6 +282,42 @@ impl Display for CanonicalRangeError {
 
 impl std::error::Error for CanonicalRangeError {}
 
+/// Failure while accessing a retained canonical backing range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalRangeAccessError {
+    RangeOverflow,
+    OutOfBounds {
+        offset: u64,
+        size: u64,
+        range_size: u64,
+    },
+    IncompleteRange,
+    Backing(CanonicalPageError),
+}
+
+impl Display for CanonicalRangeAccessError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RangeOverflow => formatter.write_str("canonical range access overflows"),
+            Self::OutOfBounds {
+                offset,
+                size,
+                range_size,
+            } => write!(
+                formatter,
+                "canonical range access offset={offset:#x} size={size:#x} exceeds \
+                 range-size={range_size:#x}"
+            ),
+            Self::IncompleteRange => {
+                formatter.write_str("canonical range segments do not cover the requested bytes")
+            }
+            Self::Backing(error) => write!(formatter, "canonical backing access failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalRangeAccessError {}
+
 /// Why a CPU virtual range could not be translated to canonical RAM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalRangeTranslationErrorReason {
@@ -304,6 +400,56 @@ mod tests {
                 MappingGeneration::new(1),
             ),
             Err(CanonicalRangeError::StaleContentGeneration)
+        );
+    }
+
+    #[test]
+    fn retained_range_reads_checked_subranges_across_pages() {
+        let store = BackingStoreId::allocate().unwrap();
+        let first = CanonicalBackingPage::initialized(
+            CanonicalPageId::new(store, GuestPhysicalPageId::new(1)),
+            &[0x10, 0x11, 0x12, 0x13],
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let second = CanonicalBackingPage::initialized(
+            CanonicalPageId::new(store, GuestPhysicalPageId::new(2)),
+            &[0x20, 0x21, 0x22, 0x23],
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let range = CanonicalBackingRange::new(vec![
+            CanonicalBackingSegment::new(
+                first,
+                1,
+                3,
+                MemoryPermissions::READ,
+                ContentGeneration::INITIAL,
+                MappingGeneration::new(1),
+            )
+            .unwrap(),
+            CanonicalBackingSegment::new(
+                second,
+                0,
+                3,
+                MemoryPermissions::READ,
+                ContentGeneration::INITIAL,
+                MappingGeneration::new(2),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let mut bytes = [0_u8; 4];
+        range.read(1, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x12, 0x13, 0x20, 0x21]);
+        assert_eq!(
+            range.read(5, &mut [0_u8; 2]),
+            Err(CanonicalRangeAccessError::OutOfBounds {
+                offset: 5,
+                size: 2,
+                range_size: 6,
+            })
         );
     }
 }

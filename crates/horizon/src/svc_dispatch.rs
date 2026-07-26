@@ -18,7 +18,7 @@ use nixe_cpu::memory::{
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_memory::CanonicalRangeTranslationError;
+use nixe_memory::{CanonicalRangeAccessError, CanonicalRangeTranslationError};
 use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -156,6 +156,10 @@ pub enum HorizonSvcFault {
         immediate: u32,
         fault: CanonicalRangeTranslationError,
     },
+    CanonicalBacking {
+        immediate: u32,
+        fault: CanonicalRangeAccessError,
+    },
     MalformedIpc {
         immediate: u32,
         reason: &'static str,
@@ -211,7 +215,7 @@ impl HorizonSvcFault {
                 }
                 MemoryMappingErrorReason::GenerationExhausted => None,
             },
-            Self::CanonicalMemory { .. } => None,
+            Self::CanonicalMemory { .. } | Self::CanonicalBacking { .. } => None,
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -262,6 +266,10 @@ impl Display for HorizonSvcFault {
             Self::CanonicalMemory { immediate, fault } => write!(
                 formatter,
                 "Horizon SVC {immediate:#x} cannot retain canonical memory: {fault}"
+            ),
+            Self::CanonicalBacking { immediate, fault } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} cannot access retained canonical backing: {fault}"
             ),
             Self::MalformedIpc { immediate, reason } => {
                 write!(
@@ -1108,6 +1116,10 @@ fn reject_ipc(
             result(context, HorizonKernelResult::OUT_OF_RESOURCE);
             resume()
         }
+        IpcWireError::CanonicalBacking(fault) => reject(
+            context,
+            HorizonSvcFault::CanonicalBacking { immediate, fault },
+        ),
         IpcWireError::UnsupportedNvDrv(operation) => {
             ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
                 immediate,
@@ -2576,8 +2588,13 @@ mod tests {
         let fault = HorizonSvcFault::UnsupportedNvDrv {
             immediate: 0x21,
             operation: crate::nvdrv::UnsupportedNvDrvOperation::Ioctl {
-                device: "/dev/nvhost-ctrl-gpu",
-                request: 0xc018_4706,
+                context: crate::nvdrv::NvDrvErrorContext::new(
+                    crate::nvdrv::NvDrvDeviceKind::HostControlGpu,
+                    0xc018_4706,
+                    crate::nvdrv::NvDrvFileDescriptor::new(3),
+                    None,
+                    crate::nvdrv::NvDrvValidationReason::UnsupportedOperation,
+                ),
             },
         };
 
@@ -2585,7 +2602,8 @@ mod tests {
         assert_eq!(
             fault.to_string(),
             "Horizon SVC 0x21 reached unsupported emulator semantics: graphics-gap=ioctl nvdrv \
-             ioctl is not implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706"
+             ioctl is not implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706 \
+             fd=nvfd:0x00000003 reason=unsupported-operation"
         );
     }
 

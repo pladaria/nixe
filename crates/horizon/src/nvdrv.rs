@@ -1,15 +1,30 @@
-//! Minimal `nvdrv` and `/dev/nvmap` state for CPU-produced display buffers.
+//! Semantic `nvdrv` service, device, ioctl, and `nvmap` state.
 
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter, Write};
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::GraphicsGapKind;
 use nixe_gpu_maxwell::{MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE};
-use nixe_memory::{
-    AddressSpaceId, CanonicalBackingRange, CanonicalRangeTranslationError,
-    CanonicalRangeTranslator, GuestVirtualAddress, MemoryPermissions,
+use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
+
+mod device;
+mod diagnostics;
+mod ioctl;
+mod nvmap;
+mod service;
+mod session;
+
+pub use device::{
+    NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
+    NvDrvFileDescriptor, NvDrvPermissionProfile, NvDrvSessionId,
 };
+use diagnostics::NvDrvCallError;
+pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
+pub use nvmap::{
+    NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
+    NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
+};
+use nvmap::{NvMapObjects, NvMapOwner, NvMapStateError};
+pub(crate) use service::{NvDrvService, NvDrvServiceError};
 
 pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
@@ -27,136 +42,15 @@ pub(crate) const NV_NOT_INITIALIZED: u32 = 3;
 pub(crate) const NV_BAD_PARAMETER: u32 = 4;
 pub(crate) const NV_INVALID_STATE: u32 = 8;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeviceKind {
-    Map,
-    HostCtrl,
-    HostCtrlGpu,
-}
-
-impl DeviceKind {
-    const fn path(self) -> &'static str {
-        match self {
-            Self::Map => "/dev/nvmap",
-            Self::HostCtrl => "/dev/nvhost-ctrl",
-            Self::HostCtrlGpu => "/dev/nvhost-ctrl-gpu",
-        }
-    }
-}
-
-/// An `nvdrv` operation for which Nixe cannot yet provide faithful semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UnsupportedNvDrvOperation {
-    OpenDevice {
-        path: Box<[u8]>,
-    },
-    ServiceCommand {
-        command_id: u32,
-    },
-    Ioctl {
-        device: &'static str,
-        request: u32,
-    },
-    CanonicalMemory {
-        device: &'static str,
-        request: u32,
-        fault: CanonicalRangeTranslationError,
-    },
-}
-
-impl UnsupportedNvDrvOperation {
-    /// Classifies the first missing graphics semantic layer.
-    #[must_use]
-    pub const fn gap_kind(&self) -> GraphicsGapKind {
-        match self {
-            Self::OpenDevice { .. } => GraphicsGapKind::DeviceOpen,
-            Self::ServiceCommand { .. } => GraphicsGapKind::ServiceCommand,
-            Self::Ioctl { .. } | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
-        }
-    }
-}
-
-impl Display for UnsupportedNvDrvOperation {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "graphics-gap={} ", self.gap_kind())?;
-        match self {
-            Self::OpenDevice { path } => {
-                formatter.write_str("nvdrv device open is not implemented: path=")?;
-                write_bounded_guest_bytes(formatter, path)
-            }
-            Self::ServiceCommand { command_id } => write!(
-                formatter,
-                "nvdrv service command is not implemented: command={command_id}"
-            ),
-            Self::Ioctl { device, request } => write!(
-                formatter,
-                "nvdrv ioctl is not implemented: device={device} request={request:#010x}"
-            ),
-            Self::CanonicalMemory {
-                device,
-                request,
-                fault,
-            } => write!(
-                formatter,
-                "nvdrv ioctl cannot establish canonical backing: device={device} \
-                 request={request:#010x} fault=[{fault}]"
-            ),
-        }
-    }
-}
-
-const MAX_DIAGNOSTIC_GUEST_BYTES: usize = 96;
-
-fn write_bounded_guest_bytes(formatter: &mut Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
-    formatter.write_str("\"")?;
-    for byte in bytes.iter().take(MAX_DIAGNOSTIC_GUEST_BYTES) {
-        for escaped in std::ascii::escape_default(*byte) {
-            formatter.write_char(escaped as char)?;
-        }
-    }
-    if bytes.len() > MAX_DIAGNOSTIC_GUEST_BYTES {
-        write!(
-            formatter,
-            "...<{} bytes omitted>",
-            bytes.len() - MAX_DIAGNOSTIC_GUEST_BYTES
-        )?;
-    }
-    formatter.write_str("\"")
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NvDrvCallError {
-    GuestResult(u32),
-    Unsupported(UnsupportedNvDrvOperation),
-}
-
-impl From<u32> for NvDrvCallError {
-    fn from(result: u32) -> Self {
-        Self::GuestResult(result)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NvMapAllocation {
-    pub handle: u32,
-    pub id: u32,
-    pub size: u32,
-    pub alignment: u32,
-    pub kind: u8,
-    pub cpu_address: Option<u64>,
-    pub backing: Option<CanonicalBackingRange>,
-    pub flags: u32,
-}
-
 #[derive(Debug)]
-struct NvDrvState {
+struct NvDrvClientState {
     initialized: bool,
     client_identity: Option<NvDrvClientIdentity>,
+    next_session_id: u64,
+    permission: NvDrvPermissionProfile,
     next_fd: u32,
-    next_handle: u32,
-    next_id: u32,
-    devices: BTreeMap<u32, DeviceKind>,
-    allocations: BTreeMap<u32, NvMapAllocation>,
+    devices: BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
+    nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
 }
 
@@ -172,10 +66,16 @@ struct NvDrvClientIdentity {
     applet_resource_user_id: u64,
 }
 
-/// One cloneable `nvdrv` service connection sharing file descriptors and maps.
+/// One `nvdrv` service connection into a shared NVIDIA client.
+///
+/// Rust clones preserve the same connection identity so transient host-side
+/// references do not create guest state. CMIF session cloning uses
+/// [`NvDrvSession::clone_connection`] to allocate a distinct connection that
+/// retains this client's initialization, descriptor, and allocation tables.
 #[derive(Clone, Debug)]
 pub struct NvDrvSession {
-    state: Arc<Mutex<NvDrvState>>,
+    connection_id: NvDrvSessionId,
+    state: Arc<Mutex<NvDrvClientState>>,
 }
 
 impl Default for NvDrvSession {
@@ -188,14 +88,15 @@ impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(NvDrvState {
+            connection_id: NvDrvSessionId::ROOT,
+            state: Arc::new(Mutex::new(NvDrvClientState {
                 initialized: false,
                 client_identity: None,
+                next_session_id: NvDrvSessionId::ROOT.raw() + 1,
+                permission: NvDrvPermissionProfile::Application,
                 next_fd: 1,
-                next_handle: 1,
-                next_id: 1,
                 devices: BTreeMap::new(),
-                allocations: BTreeMap::new(),
+                nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
             })),
         }
@@ -218,14 +119,18 @@ impl NvDrvSession {
         });
     }
 
-    pub(crate) fn open(&self, path: &[u8]) -> Result<u32, NvDrvCallError> {
+    pub(crate) fn open(
+        &self,
+        path: &[u8],
+        process_id: u64,
+    ) -> Result<NvDrvFileDescriptor, NvDrvCallError> {
         let kind = match path {
-            b"/dev/nvmap" => DeviceKind::Map,
-            b"/dev/nvhost-ctrl" => DeviceKind::HostCtrl,
+            b"/dev/nvmap" => NvDrvDeviceKind::NvMap,
+            b"/dev/nvhost-ctrl" => NvDrvDeviceKind::HostControl,
             // Device path used by libnx's GPU-characteristics and Z-cull
             // wrappers:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c
-            b"/dev/nvhost-ctrl-gpu" => DeviceKind::HostCtrlGpu,
+            b"/dev/nvhost-ctrl-gpu" => NvDrvDeviceKind::HostControlGpu,
             _ => {
                 return Err(NvDrvCallError::Unsupported(
                     UnsupportedNvDrvOperation::OpenDevice { path: path.into() },
@@ -239,16 +144,24 @@ impl NvDrvSession {
         if !state.initialized {
             return Err(NvDrvCallError::GuestResult(NV_NOT_INITIALIZED));
         }
-        let fd = state.next_fd;
+        if state
+            .client_identity
+            .is_some_and(|identity| identity.process_id != process_id)
+        {
+            return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+        }
+        let fd = NvDrvFileDescriptor::new(state.next_fd);
         state.next_fd = state
             .next_fd
             .checked_add(1)
             .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
-        state.devices.insert(fd, kind);
+        let owner = NvDrvDescriptorOwner::new(self.connection_id, process_id);
+        let descriptor = NvDrvDeviceDescriptor::open(fd, kind, owner, state.permission);
+        state.devices.insert(fd, descriptor);
         Ok(fd)
     }
 
-    pub(crate) fn close(&self, fd: u32) -> u32 {
+    pub(crate) fn close(&self, fd: NvDrvFileDescriptor) -> u32 {
         if self
             .state
             .lock()
@@ -266,7 +179,7 @@ impl NvDrvSession {
     #[cfg(test)]
     pub(crate) fn ioctl(
         &self,
-        fd: u32,
+        fd: NvDrvFileDescriptor,
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
@@ -275,35 +188,59 @@ impl NvDrvSession {
 
     pub(crate) fn ioctl_with_memory(
         &self,
-        fd: u32,
+        fd: NvDrvFileDescriptor,
         request: u32,
         input: &[u8],
+        process_id: u64,
         address_space: AddressSpaceId,
         translator: &dyn CanonicalRangeTranslator,
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        self.ioctl_inner(fd, request, input, Some((address_space, translator)))
+        self.ioctl_inner(
+            fd,
+            request,
+            input,
+            Some((process_id, address_space, translator)),
+        )
     }
 
     fn ioctl_inner(
         &self,
-        fd: u32,
+        fd: NvDrvFileDescriptor,
         request: u32,
         input: &[u8],
-        canonical_memory: Option<(AddressSpaceId, &dyn CanonicalRangeTranslator)>,
+        canonical_memory: Option<(u64, AddressSpaceId, &dyn CanonicalRangeTranslator)>,
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = match state.devices.get(&fd).copied() {
-            Some(DeviceKind::Map) => ioctl_nvmap(&mut state, request, input, canonical_memory),
-            Some(DeviceKind::HostCtrlGpu) => {
-                ioctl_nvhost_ctrl_gpu(state.gpu_profile, request, input)
+            Some(descriptor)
+                if canonical_memory.is_some_and(|(process_id, _, _)| {
+                    descriptor.owner().process_id() != process_id
+                }) =>
+            {
+                Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
             }
-            Some(device) => Err(NvDrvCallError::Unsupported(
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::NvMap => ioctl_nvmap(
+                &mut state,
+                descriptor,
+                request,
+                input,
+                canonical_memory.map(|(_, address_space, translator)| (address_space, translator)),
+            ),
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
+                ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
+            }
+            Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::Ioctl {
-                    device: device.path(),
-                    request,
+                    context: NvDrvErrorContext::new(
+                        descriptor.kind(),
+                        request,
+                        descriptor.fd(),
+                        None,
+                        NvDrvValidationReason::UnsupportedOperation,
+                    ),
                 },
             )),
             None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
@@ -316,14 +253,21 @@ impl NvDrvSession {
     }
 
     #[must_use]
-    pub fn allocation_by_id(&self, id: u32) -> Option<NvMapAllocation> {
+    pub fn nvmap_object(&self, handle: NvMapHandle) -> Option<NvMapObject> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allocations
-            .values()
-            .find(|allocation| allocation.id == id)
-            .cloned()
+            .nvmap
+            .object_snapshot_by_handle(handle)
+    }
+
+    #[must_use]
+    pub fn nvmap_object_by_id(&self, id: NvMapExportedId) -> Option<NvMapObject> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvmap
+            .object_by_exported_id(id)
     }
 
     pub(crate) fn teardown(&self) -> NvDrvTeardownReport {
@@ -333,10 +277,9 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let report = NvDrvTeardownReport {
             device_fds_released: state.devices.len(),
-            allocations_released: state.allocations.len(),
+            allocations_released: state.nvmap.clear(),
         };
         state.devices.clear();
-        state.allocations.clear();
         state.initialized = false;
         state.client_identity = None;
         report
@@ -345,6 +288,7 @@ impl NvDrvSession {
 
 fn ioctl_nvhost_ctrl_gpu(
     profile: MaxwellGpuProfile,
+    descriptor: NvDrvDeviceDescriptor,
     request: u32,
     input: &[u8],
 ) -> Result<Vec<u8>, NvDrvCallError> {
@@ -498,8 +442,13 @@ fn ioctl_nvhost_ctrl_gpu(
         }
         _ => Err(NvDrvCallError::Unsupported(
             UnsupportedNvDrvOperation::Ioctl {
-                device: DeviceKind::HostCtrlGpu.path(),
-                request,
+                context: NvDrvErrorContext::new(
+                    descriptor.kind(),
+                    request,
+                    descriptor.fd(),
+                    None,
+                    NvDrvValidationReason::UnsupportedOperation,
+                ),
             },
         )),
     }
@@ -514,130 +463,161 @@ fn require_input_size(input: &[u8], expected: usize) -> Result<(), NvDrvCallErro
 }
 
 fn ioctl_nvmap(
-    state: &mut NvDrvState,
+    state: &mut NvDrvClientState,
+    descriptor: NvDrvDeviceDescriptor,
     request: u32,
     input: &[u8],
     canonical_memory: Option<(AddressSpaceId, &dyn CanonicalRangeTranslator)>,
 ) -> Result<Vec<u8>, NvDrvCallError> {
+    // Exact Switch nvmap ioctl layouts and the create/import/free/ID behavior:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvmap.c
+    // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvmap
     match request {
         IOCTL_NVMAP_CREATE => {
+            require_input_size(input, 8)?;
             let size = input_u32(input, 0)?;
-            if size == 0 {
-                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
-            }
-            let handle = state.next_handle;
-            state.next_handle = state.next_handle.checked_add(1).ok_or(NV_INVALID_STATE)?;
-            let id = state.next_id;
-            state.next_id = state.next_id.checked_add(1).ok_or(NV_INVALID_STATE)?;
-            state.allocations.insert(
-                handle,
-                NvMapAllocation {
-                    handle,
-                    id,
-                    size,
-                    alignment: 0,
-                    kind: 0,
-                    cpu_address: None,
-                    backing: None,
-                    flags: 0,
-                },
-            );
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let handle = state
+                .nvmap
+                .create(owner, size)
+                .map_err(nvmap_driver_result)?;
             let mut output = sized_output(input, 8);
-            output[4..8].copy_from_slice(&handle.to_le_bytes());
+            output[4..8].copy_from_slice(&handle.raw().to_le_bytes());
             Ok(output)
         }
         IOCTL_NVMAP_FROM_ID => {
-            let id = input_u32(input, 0)?;
-            let handle = state
-                .allocations
-                .values()
-                .find(|allocation| allocation.id == id)
-                .map(|allocation| allocation.handle)
-                .ok_or(NV_BAD_PARAMETER)?;
+            require_input_size(input, 8)?;
+            let id = NvMapExportedId::new(input_u32(input, 0)?);
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let handle = state.nvmap.import(owner, id).map_err(nvmap_driver_result)?;
             let mut output = sized_output(input, 8);
-            output[4..8].copy_from_slice(&handle.to_le_bytes());
+            output[4..8].copy_from_slice(&handle.raw().to_le_bytes());
             Ok(output)
         }
         IOCTL_NVMAP_ALLOC => {
-            let handle = input_u32(input, 0)?;
+            require_input_size(input, 32)?;
+            let handle = NvMapHandle::new(input_u32(input, 0)?);
+            let heap_mask = input_u32(input, 4)?;
             let flags = input_u32(input, 8)?;
             let alignment = input_u32(input, 12)?;
             let kind = *input.get(16).ok_or(NV_BAD_PARAMETER)?;
             let address = input_u64(input, 24)?;
-            if address == 0 || alignment < 0x1000 || !alignment.is_power_of_two() {
+            let allocation = NvMapAllocationMetadata::new(heap_mask, flags, alignment, kind);
+            if address == 0 {
                 return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
-            let allocation = state.allocations.get_mut(&handle).ok_or(NV_BAD_PARAMETER)?;
-            if allocation.cpu_address.is_some() {
-                return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
-            }
+            allocation.validate().map_err(nvmap_driver_result)?;
+            let address = GuestVirtualAddress::new(address);
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let size = state
+                .nvmap
+                .allocation_size(owner, handle)
+                .map_err(nvmap_driver_result)?;
             let Some((address_space, translator)) = canonical_memory else {
                 return Err(NvDrvCallError::Unsupported(
                     UnsupportedNvDrvOperation::Ioctl {
-                        device: DeviceKind::Map.path(),
-                        request,
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request,
+                            descriptor.fd(),
+                            Some(handle),
+                            NvDrvValidationReason::UnsupportedOperation,
+                        ),
                     },
                 ));
             };
             let backing = translator
                 .translate_canonical_range(
                     address_space,
-                    GuestVirtualAddress::new(address),
-                    u64::from(allocation.size),
-                    MemoryPermissions::NONE,
+                    address,
+                    u64::from(size),
+                    allocation.required_permissions(),
                 )
                 .map_err(|fault| {
                     NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::CanonicalMemory {
-                        device: DeviceKind::Map.path(),
-                        request,
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request,
+                            descriptor.fd(),
+                            Some(handle),
+                            NvDrvValidationReason::CanonicalBackingUnavailable,
+                        ),
                         fault,
                     })
                 })?;
-            allocation.flags = flags;
-            allocation.alignment = alignment;
-            allocation.kind = kind;
-            allocation.cpu_address = Some(address);
-            allocation.backing = Some(backing);
+            state
+                .nvmap
+                .allocate(
+                    owner,
+                    handle,
+                    allocation,
+                    NvMapCpuMapping::new(address_space, address),
+                    backing,
+                )
+                .map_err(nvmap_driver_result)?;
             Ok(sized_output(input, 32))
         }
         IOCTL_NVMAP_FREE => {
-            let handle = input_u32(input, 0)?;
-            let allocation = state.allocations.remove(&handle).ok_or(NV_BAD_PARAMETER)?;
+            require_input_size(input, 24)?;
+            let handle = NvMapHandle::new(input_u32(input, 0)?);
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let freed = state
+                .nvmap
+                .free(owner, handle)
+                .map_err(nvmap_driver_result)?;
             let mut output = sized_output(input, 24);
-            output[8..16].copy_from_slice(&0_u64.to_le_bytes());
-            output[16..20].copy_from_slice(&allocation.size.to_le_bytes());
-            output[20..24].copy_from_slice(&0_u32.to_le_bytes());
+            output[8..16].copy_from_slice(&freed.address.to_le_bytes());
+            output[16..20].copy_from_slice(&freed.size.to_le_bytes());
+            output[20..24].copy_from_slice(&freed.flags.to_le_bytes());
             Ok(output)
         }
         IOCTL_NVMAP_PARAM => {
-            let handle = input_u32(input, 0)?;
+            require_input_size(input, 12)?;
+            let handle = NvMapHandle::new(input_u32(input, 0)?);
             let parameter = input_u32(input, 4)?;
-            let allocation = state.allocations.get(&handle).ok_or(NV_BAD_PARAMETER)?;
-            let value = match parameter {
-                1 => allocation.size,
-                2 => allocation.alignment,
-                4 => 0,
-                5 => u32::from(allocation.kind),
-                _ => return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
-            };
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let value = state
+                .nvmap
+                .parameter(owner, handle, parameter)
+                .map_err(nvmap_driver_result)?;
             let mut output = sized_output(input, 12);
             output[8..12].copy_from_slice(&value.to_le_bytes());
             Ok(output)
         }
         IOCTL_NVMAP_GET_ID => {
-            let handle = input_u32(input, 4)?;
-            let allocation = state.allocations.get(&handle).ok_or(NV_BAD_PARAMETER)?;
+            require_input_size(input, 8)?;
+            let handle = NvMapHandle::new(input_u32(input, 4)?);
+            let owner = NvMapOwner::new(descriptor.owner().process_id());
+            let id = state
+                .nvmap
+                .exported_id(owner, handle)
+                .map_err(nvmap_driver_result)?;
             let mut output = sized_output(input, 8);
-            output[0..4].copy_from_slice(&allocation.id.to_le_bytes());
+            output[0..4].copy_from_slice(&id.raw().to_le_bytes());
             Ok(output)
         }
         _ => Err(NvDrvCallError::Unsupported(
             UnsupportedNvDrvOperation::Ioctl {
-                device: DeviceKind::Map.path(),
-                request,
+                context: NvDrvErrorContext::new(
+                    descriptor.kind(),
+                    request,
+                    descriptor.fd(),
+                    input_u32(input, 0).ok().map(NvMapHandle::new),
+                    NvDrvValidationReason::UnsupportedOperation,
+                ),
             },
         )),
     }
+}
+
+fn nvmap_driver_result(error: NvMapStateError) -> NvDrvCallError {
+    NvDrvCallError::GuestResult(match error {
+        NvMapStateError::BadParameter => NV_BAD_PARAMETER,
+        NvMapStateError::InvalidState
+        | NvMapStateError::AlreadyAllocated
+        | NvMapStateError::InvalidBacking
+        | NvMapStateError::InvalidOwner => NV_INVALID_STATE,
+    })
 }
 
 fn sized_output(input: &[u8], size: usize) -> Vec<u8> {
@@ -686,8 +666,39 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
 #[cfg(test)]
 mod tests {
     use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
+    use nixe_gpu::GraphicsGapKind;
+    use nixe_memory::{CanonicalRangeTranslationError, MemoryPermissions};
 
     use super::*;
+
+    fn nvmap_create_input(size: u32) -> [u8; 8] {
+        let mut input = [0_u8; 8];
+        input[..4].copy_from_slice(&size.to_le_bytes());
+        input
+    }
+
+    fn nvmap_from_id_input(id: NvMapExportedId) -> [u8; 8] {
+        let mut input = [0_u8; 8];
+        input[..4].copy_from_slice(&id.raw().to_le_bytes());
+        input
+    }
+
+    fn nvmap_allocate_input(
+        handle: NvMapHandle,
+        flags: u32,
+        alignment: u32,
+        kind: u8,
+        address: GuestVirtualAddress,
+    ) -> [u8; 32] {
+        let mut input = [0_u8; 32];
+        input[..4].copy_from_slice(&handle.raw().to_le_bytes());
+        input[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
+        input[8..12].copy_from_slice(&flags.to_le_bytes());
+        input[12..16].copy_from_slice(&alignment.to_le_bytes());
+        input[16] = kind;
+        input[24..32].copy_from_slice(&address.get().to_le_bytes());
+        input
+    }
 
     #[test]
     fn nvmap_allocation_retains_guest_address_identity() {
@@ -705,35 +716,39 @@ mod tests {
             )
             .unwrap();
         session.initialize();
-        let fd = session.open(b"/dev/nvmap").unwrap();
+        let fd = session.open(b"/dev/nvmap", 1).unwrap();
         let (created, error) = session
-            .ioctl(fd, IOCTL_NVMAP_CREATE, &0x2000_u32.to_le_bytes())
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x2000))
             .unwrap();
         assert_eq!(error, NV_SUCCESS);
         let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
         let mut allocate = vec![0_u8; 32];
         allocate[0..4].copy_from_slice(&handle.to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
         allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
         allocate[16] = 0xfe;
         allocate[24..32].copy_from_slice(&0x1234_5000_u64.to_le_bytes());
         assert_eq!(
             session
-                .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, address_space, &memory,)
+                .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, 1, address_space, &memory)
                 .unwrap()
                 .1,
             NV_SUCCESS
         );
-        let id = session
-            .state
-            .lock()
-            .unwrap()
-            .allocations
-            .get(&handle)
-            .unwrap()
-            .id;
-        let allocation = session.allocation_by_id(id).unwrap();
-        assert_eq!(allocation.cpu_address, Some(0x1234_5000));
-        let backing = allocation.backing.unwrap();
+        let mut get_id = [0_u8; 8];
+        get_id[4..8].copy_from_slice(&handle.to_le_bytes());
+        let (get_id, error) = session.ioctl(fd, IOCTL_NVMAP_GET_ID, &get_id).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let id = NvMapExportedId::new(u32::from_le_bytes(get_id[0..4].try_into().unwrap()));
+        let object = session.nvmap_object_by_id(id).unwrap();
+        assert_eq!(
+            object.cpu_mapping(),
+            Some(NvMapCpuMapping::new(
+                address_space,
+                GuestVirtualAddress::new(0x1234_5000)
+            ))
+        );
+        let backing = object.backing().unwrap();
         assert_eq!(backing.size(), 0x2000);
         assert_eq!(backing.segments().len(), 2);
     }
@@ -744,20 +759,20 @@ mod tests {
         let memory = ExecutionMemory::new();
         let address_space = AddressSpaceId::new(2);
         session.initialize();
-        let fd = session.open(b"/dev/nvmap").unwrap();
+        let fd = session.open(b"/dev/nvmap", 2).unwrap();
         let (created, _) = session
-            .ioctl(fd, IOCTL_NVMAP_CREATE, &0x1000_u32.to_le_bytes())
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
             .unwrap();
         let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
         let mut allocate = vec![0_u8; 32];
         allocate[0..4].copy_from_slice(&handle.to_le_bytes());
-        allocate[8..12].copy_from_slice(&0x55_u32.to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
         allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
         allocate[16] = 0xfe;
         allocate[24..32].copy_from_slice(&0x9000_u64.to_le_bytes());
 
         let error = session
-            .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, address_space, &memory)
+            .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, 2, address_space, &memory)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -770,19 +785,513 @@ mod tests {
             }
         ));
         let state = session.state.lock().unwrap();
-        let allocation = state.allocations.get(&handle).unwrap();
-        assert_eq!(allocation.flags, 0);
-        assert_eq!(allocation.alignment, 0);
-        assert_eq!(allocation.kind, 0);
-        assert_eq!(allocation.cpu_address, None);
-        assert_eq!(allocation.backing, None);
+        let object = state
+            .nvmap
+            .object_by_handle(NvMapHandle::new(handle))
+            .unwrap();
+        assert_eq!(object.allocation_metadata(), None);
+        assert_eq!(object.cpu_mapping(), None);
+        assert_eq!(object.backing(), None);
+    }
+
+    #[test]
+    fn nvmap_handles_ids_and_views_have_independent_lifetimes() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(3);
+        memory
+            .resize_zeroed_mapping(
+                address_space,
+                GuestVirtualAddress::new(0x4000),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        session.initialize();
+        let fd = session.open(b"/dev/nvmap", 3).unwrap();
+
+        let (created, error) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
+            .unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let first_handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
+        let mut allocate = vec![0_u8; 32];
+        allocate[0..4].copy_from_slice(&first_handle.raw().to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
+        allocate[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        allocate[16] = 0xfe;
+        allocate[24..32].copy_from_slice(&0x4000_u64.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, 3, address_space, &memory)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let mut get_id = [0_u8; 8];
+        get_id[4..8].copy_from_slice(&first_handle.raw().to_le_bytes());
+        let (first_id, error) = session.ioctl(fd, IOCTL_NVMAP_GET_ID, &get_id).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let exported_id =
+            NvMapExportedId::new(u32::from_le_bytes(first_id[0..4].try_into().unwrap()));
+        let (same_id, error) = session.ioctl(fd, IOCTL_NVMAP_GET_ID, &get_id).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(&same_id[0..4], &first_id[0..4]);
+
+        let (imported, error) = session
+            .ioctl(fd, IOCTL_NVMAP_FROM_ID, &nvmap_from_id_input(exported_id))
+            .unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let second_handle =
+            NvMapHandle::new(u32::from_le_bytes(imported[4..8].try_into().unwrap()));
+        assert_ne!(first_handle, second_handle);
+        let retained_object = session.nvmap_object_by_id(exported_id).unwrap();
+        assert_eq!(
+            session.nvmap_object(first_handle).unwrap().id(),
+            retained_object.id()
+        );
+        assert_eq!(
+            session.nvmap_object(second_handle).unwrap().id(),
+            retained_object.id()
+        );
+        {
+            let state = session.state.lock().unwrap();
+            assert_eq!(
+                state.nvmap.handle_references(first_handle),
+                Ok(2),
+                "both handles must retain one semantic object"
+            );
+            assert_eq!(
+                state.nvmap.object_by_handle(first_handle).unwrap().id(),
+                state.nvmap.object_by_handle(second_handle).unwrap().id()
+            );
+        }
+
+        let mut free_first = [0_u8; 24];
+        free_first[0..4].copy_from_slice(&first_handle.raw().to_le_bytes());
+        let (free_first, error) = session.ioctl(fd, IOCTL_NVMAP_FREE, &free_first).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(u64::from_le_bytes(free_first[8..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(free_first[20..24].try_into().unwrap()),
+            0
+        );
+        assert!(session.nvmap_object_by_id(exported_id).is_some());
+
+        let mut free_second = [0_u8; 24];
+        free_second[0..4].copy_from_slice(&second_handle.raw().to_le_bytes());
+        let (free_second, error) = session.ioctl(fd, IOCTL_NVMAP_FREE, &free_second).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(
+            u64::from_le_bytes(free_second[8..16].try_into().unwrap()),
+            0x4000
+        );
+        assert_eq!(
+            u32::from_le_bytes(free_second[16..20].try_into().unwrap()),
+            0x1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(free_second[20..24].try_into().unwrap()),
+            1,
+            "the final free must report an uncached allocation"
+        );
+        assert_eq!(session.nvmap_object_by_id(exported_id), None);
+        assert_eq!(
+            session.ioctl(fd, IOCTL_NVMAP_FROM_ID, &nvmap_from_id_input(exported_id)),
+            Ok((nvmap_from_id_input(exported_id).to_vec(), NV_BAD_PARAMETER))
+        );
+
+        let view = retained_object
+            .image_view(NvMapImageViewMetadata::new(
+                16,
+                8,
+                4,
+                0xfe,
+                3,
+                0,
+                vec![NvMapPlaneMetadata::new(0x100, 0x200, 64)],
+            ))
+            .unwrap();
+        assert_eq!(view.object_id(), retained_object.id());
+        assert_eq!(view.metadata().planes()[0].pitch(), 64);
+        assert_eq!(view.read_plane(0).unwrap(), vec![0_u8; 0x200]);
+        let allocation = retained_object.allocation_metadata().unwrap();
+        assert_eq!(allocation.heap_mask(), 0x4000_0000);
+        assert_eq!(allocation.flags(), 3);
+        assert_eq!(allocation.alignment(), 0x1000);
+        assert_eq!(allocation.kind(), 0xfe);
+    }
+
+    #[test]
+    fn nvmap_validates_wire_fields_permissions_coverage_and_duplicate_allocation() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(4);
+        memory
+            .resize_zeroed_mapping(
+                address_space,
+                GuestVirtualAddress::new(0x8000),
+                0,
+                0x1000,
+                MemoryPermissions::READ,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        memory
+            .resize_zeroed_mapping(
+                address_space,
+                GuestVirtualAddress::new(0xa000),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        session.initialize();
+        let fd = session.open(b"/dev/nvmap", 4).unwrap();
+
+        for size in [0, 7, 9] {
+            let input = vec![0_u8; size];
+            assert_eq!(
+                session.ioctl(fd, IOCTL_NVMAP_CREATE, &input),
+                Ok((input, NV_BAD_PARAMETER))
+            );
+        }
+        assert_eq!(
+            session.ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0)),
+            Ok((nvmap_create_input(0).to_vec(), NV_BAD_PARAMETER))
+        );
+
+        let (created, _) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
+            .unwrap();
+        let handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
+        let mut valid =
+            nvmap_allocate_input(handle, 0, 0x1000, 0xfe, GuestVirtualAddress::new(0x8000));
+        valid[4..8].fill(0);
+
+        for invalid in [
+            {
+                let mut input = valid;
+                input[4..8].copy_from_slice(&1_u32.to_le_bytes());
+                input
+            },
+            {
+                let mut input = valid;
+                input[8..12].copy_from_slice(&4_u32.to_le_bytes());
+                input
+            },
+            {
+                let mut input = valid;
+                input[12..16].copy_from_slice(&0x800_u32.to_le_bytes());
+                input
+            },
+            {
+                let mut input = valid;
+                input[12..16].copy_from_slice(&0x1800_u32.to_le_bytes());
+                input
+            },
+            {
+                let mut input = valid;
+                input[16] = 0xff;
+                input
+            },
+            {
+                let mut input = valid;
+                input[24..32].fill(0);
+                input
+            },
+        ] {
+            assert_eq!(
+                session.ioctl_with_memory(
+                    fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &invalid,
+                    4,
+                    address_space,
+                    &memory,
+                ),
+                Ok((invalid.to_vec(), NV_BAD_PARAMETER))
+            );
+        }
+        for size in [0, 31, 33] {
+            let input = vec![0_u8; size];
+            assert_eq!(
+                session
+                    .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &input, 4, address_space, &memory,),
+                Ok((input, NV_BAD_PARAMETER))
+            );
+        }
+
+        let read_write =
+            nvmap_allocate_input(handle, 1, 0x1000, 0xfe, GuestVirtualAddress::new(0x8000));
+        assert!(matches!(
+            session.ioctl_with_memory(
+                fd,
+                IOCTL_NVMAP_ALLOC,
+                &read_write,
+                4,
+                address_space,
+                &memory,
+            ),
+            Err(UnsupportedNvDrvOperation::CanonicalMemory {
+                fault: CanonicalRangeTranslationError {
+                    reason: nixe_memory::CanonicalRangeTranslationErrorReason::PermissionDenied,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            session
+                .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &valid, 4, address_space, &memory)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        assert_eq!(
+            session
+                .nvmap_object(handle)
+                .unwrap()
+                .allocation_metadata()
+                .unwrap()
+                .heap_mask(),
+            0x4000_0000,
+            "a zero heap request must resolve to the system heap"
+        );
+        assert_eq!(
+            session.ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &valid, 4, address_space, &memory,),
+            Ok((valid.to_vec(), NV_INVALID_STATE))
+        );
+
+        let (large_created, _) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x2000))
+            .unwrap();
+        let large_handle =
+            NvMapHandle::new(u32::from_le_bytes(large_created[4..8].try_into().unwrap()));
+        let incomplete = nvmap_allocate_input(
+            large_handle,
+            0,
+            0x1000,
+            0xfe,
+            GuestVirtualAddress::new(0xa000),
+        );
+        assert!(matches!(
+            session.ioctl_with_memory(
+                fd,
+                IOCTL_NVMAP_ALLOC,
+                &incomplete,
+                4,
+                address_space,
+                &memory,
+            ),
+            Err(UnsupportedNvDrvOperation::CanonicalMemory {
+                fault: CanonicalRangeTranslationError {
+                    reason: nixe_memory::CanonicalRangeTranslationErrorReason::Unmapped,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        for (request, expected, handle_offset) in [
+            (IOCTL_NVMAP_FROM_ID, 8, 0),
+            (IOCTL_NVMAP_FREE, 24, 0),
+            (IOCTL_NVMAP_PARAM, 12, 0),
+            (IOCTL_NVMAP_GET_ID, 8, 4),
+        ] {
+            for size in [expected - 1, expected + 1] {
+                let mut input = vec![0_u8; size];
+                if size >= handle_offset + 4 {
+                    input[handle_offset..handle_offset + 4]
+                        .copy_from_slice(&handle.raw().to_le_bytes());
+                }
+                assert_eq!(
+                    session.ioctl(fd, request, &input),
+                    Ok((input, NV_BAD_PARAMETER))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloned_sessions_aliases_imports_ownership_and_teardown_are_coherent() {
+        let session = NvDrvSession::new();
+        let clone = session.clone_connection().unwrap();
+        let mut memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(5);
+        memory
+            .resize_zeroed_mapping(
+                address_space,
+                GuestVirtualAddress::new(0x10_0000),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        let first_backing = memory
+            .translate_canonical_range(
+                address_space,
+                GuestVirtualAddress::new(0x10_0000),
+                0x1000,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        assert!(memory.map_page(
+            address_space,
+            GuestVirtualAddress::new(0x20_0000),
+            first_backing.segments()[0].page().page(),
+            MemoryPermissions::READ_WRITE,
+        ));
+
+        session.set_aruid(5, 0x55);
+        session.initialize();
+        let original_fd = session.open(b"/dev/nvmap", 5).unwrap();
+        let cloned_fd = clone.open(b"/dev/nvmap", 5).unwrap();
+        assert_eq!(
+            clone.open(b"/dev/nvmap", 6),
+            Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
+        );
+
+        let (first_created, _) = clone
+            .ioctl(original_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
+            .unwrap();
+        let first_handle =
+            NvMapHandle::new(u32::from_le_bytes(first_created[4..8].try_into().unwrap()));
+        let first_allocate = nvmap_allocate_input(
+            first_handle,
+            1,
+            0x1000,
+            0xfe,
+            GuestVirtualAddress::new(0x10_0000),
+        );
+        assert_eq!(
+            session
+                .ioctl_with_memory(
+                    cloned_fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &first_allocate,
+                    5,
+                    address_space,
+                    &memory,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let (second_created, _) = session
+            .ioctl(cloned_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
+            .unwrap();
+        let second_handle =
+            NvMapHandle::new(u32::from_le_bytes(second_created[4..8].try_into().unwrap()));
+        let second_allocate = nvmap_allocate_input(
+            second_handle,
+            1,
+            0x1000,
+            0xfe,
+            GuestVirtualAddress::new(0x20_0000),
+        );
+        assert_eq!(
+            clone
+                .ioctl_with_memory(
+                    original_fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &second_allocate,
+                    5,
+                    address_space,
+                    &memory,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        let first_object = session.nvmap_object(first_handle).unwrap();
+        let second_object = session.nvmap_object(second_handle).unwrap();
+        assert_ne!(first_object.id(), second_object.id());
+        assert_eq!(
+            first_object.backing().unwrap().segments()[0].page(),
+            second_object.backing().unwrap().segments()[0].page(),
+            "CPU aliases must converge on one canonical backing identity"
+        );
+
+        let mut get_id = [0_u8; 8];
+        get_id[4..8].copy_from_slice(&first_handle.raw().to_le_bytes());
+        let (id_output, error) = clone.ioctl(cloned_fd, IOCTL_NVMAP_GET_ID, &get_id).unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let exported_id =
+            NvMapExportedId::new(u32::from_le_bytes(id_output[..4].try_into().unwrap()));
+        let (imported, error) = session
+            .ioctl(
+                original_fd,
+                IOCTL_NVMAP_FROM_ID,
+                &nvmap_from_id_input(exported_id),
+            )
+            .unwrap();
+        assert_eq!(error, NV_SUCCESS);
+        let imported_handle =
+            NvMapHandle::new(u32::from_le_bytes(imported[4..8].try_into().unwrap()));
+        assert_eq!(
+            session.nvmap_object(imported_handle).unwrap().id(),
+            first_object.id()
+        );
+        let mut foreign_caller_param = [0_u8; 12];
+        foreign_caller_param[..4].copy_from_slice(&first_handle.raw().to_le_bytes());
+        foreign_caller_param[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            clone.ioctl_with_memory(
+                original_fd,
+                IOCTL_NVMAP_PARAM,
+                &foreign_caller_param,
+                6,
+                address_space,
+                &memory,
+            ),
+            Ok((foreign_caller_param.to_vec(), NV_BAD_PARAMETER))
+        );
+
+        let foreign = NvDrvSession::new();
+        foreign.set_aruid(6, 0x66);
+        foreign.initialize();
+        let foreign_fd = foreign.open(b"/dev/nvmap", 6).unwrap();
+        assert_eq!(
+            foreign.ioctl(
+                foreign_fd,
+                IOCTL_NVMAP_FROM_ID,
+                &nvmap_from_id_input(exported_id),
+            ),
+            Ok((nvmap_from_id_input(exported_id).to_vec(), NV_BAD_PARAMETER))
+        );
+        let mut foreign_param = [0_u8; 12];
+        foreign_param[..4].copy_from_slice(&first_handle.raw().to_le_bytes());
+        foreign_param[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            foreign.ioctl(foreign_fd, IOCTL_NVMAP_PARAM, &foreign_param),
+            Ok((foreign_param.to_vec(), NV_BAD_PARAMETER))
+        );
+
+        let retained = first_object.clone();
+        assert_eq!(
+            clone.teardown(),
+            NvDrvTeardownReport {
+                device_fds_released: 2,
+                allocations_released: 2,
+            }
+        );
+        assert_eq!(session.nvmap_object(first_handle), None);
+        assert_eq!(retained.backing().unwrap().size(), 0x1000);
     }
 
     #[test]
     fn ctrl_gpu_discovery_ioctls_encode_exact_switch_1_bytes() {
         let session = NvDrvSession::new();
         session.initialize();
-        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut input = vec![0_u8; 0xb0];
         input[0..8].copy_from_slice(&0xa0_u64.to_le_bytes());
         input[8..16].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
@@ -852,7 +1361,7 @@ mod tests {
     fn ctrl_gpu_discovery_rejects_malformed_sizes_and_invalid_arguments() {
         let session = NvDrvSession::new();
         session.initialize();
-        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
 
         for (request, input) in [
             (IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE, vec![0]),
@@ -904,7 +1413,7 @@ mod tests {
         session.initialize();
 
         assert_eq!(
-            session.open(b"/dev/not-emulated"),
+            session.open(b"/dev/not-emulated", 1),
             Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::OpenDevice {
                     path: Box::from(&b"/dev/not-emulated"[..]),
@@ -913,34 +1422,45 @@ mod tests {
         );
 
         assert_eq!(
-            session.ioctl(0xffff, IOCTL_NVMAP_CREATE, &[]),
+            session.ioctl(NvDrvFileDescriptor::new(0xffff), IOCTL_NVMAP_CREATE, &[]),
             Ok((Vec::new(), NV_BAD_PARAMETER))
         );
 
-        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let unknown_request = 0xc008_4707;
         assert_eq!(
             session.ioctl(fd, unknown_request, &[0; 8]),
             Err(UnsupportedNvDrvOperation::Ioctl {
-                device: "/dev/nvhost-ctrl-gpu",
-                request: unknown_request,
+                context: NvDrvErrorContext::new(
+                    NvDrvDeviceKind::HostControlGpu,
+                    unknown_request,
+                    fd,
+                    None,
+                    NvDrvValidationReason::UnsupportedOperation,
+                ),
             })
         );
         let operation = UnsupportedNvDrvOperation::Ioctl {
-            device: "/dev/nvhost-ctrl-gpu",
-            request: unknown_request,
+            context: NvDrvErrorContext::new(
+                NvDrvDeviceKind::HostControlGpu,
+                unknown_request,
+                fd,
+                None,
+                NvDrvValidationReason::UnsupportedOperation,
+            ),
         };
         assert_eq!(operation.gap_kind(), GraphicsGapKind::Ioctl);
         assert_eq!(
             operation.to_string(),
             "graphics-gap=ioctl nvdrv ioctl is not implemented: \
-             device=/dev/nvhost-ctrl-gpu request=0xc0084707"
+             device=/dev/nvhost-ctrl-gpu request=0xc0084707 \
+             fd=nvfd:0x00000001 reason=unsupported-operation"
         );
     }
 
     #[test]
     fn guest_supplied_paths_are_bounded_and_escaped_in_diagnostics() {
-        let mut path = vec![b'a'; MAX_DIAGNOSTIC_GUEST_BYTES + 20];
+        let mut path = vec![b'a'; 96 + 20];
         path[0] = b'\n';
         let diagnostic = UnsupportedNvDrvOperation::OpenDevice { path: path.into() }.to_string();
 
@@ -955,10 +1475,10 @@ mod tests {
     fn teardown_releases_nvdrv_state_and_is_idempotent() {
         let session = NvDrvSession::new();
         session.initialize();
-        let map_fd = session.open(b"/dev/nvmap").unwrap();
-        let _gpu_fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let map_fd = session.open(b"/dev/nvmap", 1).unwrap();
+        let _gpu_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         session
-            .ioctl(map_fd, IOCTL_NVMAP_CREATE, &0x2000_u32.to_le_bytes())
+            .ioctl(map_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x2000))
             .unwrap();
 
         assert_eq!(
@@ -970,24 +1490,125 @@ mod tests {
         );
         assert_eq!(session.teardown(), NvDrvTeardownReport::default());
         assert_eq!(
-            session.open(b"/dev/nvmap"),
+            session.open(b"/dev/nvmap", 1),
             Err(NvDrvCallError::GuestResult(NV_NOT_INITIALIZED))
         );
     }
 
     #[test]
-    fn cloned_sessions_share_the_bound_applet_resource_identity() {
+    fn host_clone_preserves_connection_without_allocating_guest_state() {
         let session = NvDrvSession::new();
         let clone = session.clone();
 
-        session.set_aruid(7, 0x1234);
+        assert_eq!(clone.connection_id(), session.connection_id());
+        assert_eq!(
+            session.state.lock().unwrap().next_session_id,
+            NvDrvSessionId::ROOT.raw() + 1
+        );
+    }
 
+    #[test]
+    fn cloned_connections_share_client_identity_and_descriptor_table() {
+        let session = NvDrvSession::new();
+        let clone = session.clone_connection().unwrap();
+
+        assert_ne!(clone.connection_id(), session.connection_id());
+        session.set_aruid(7, 0x1234);
         assert_eq!(
             clone.state.lock().unwrap().client_identity,
             Some(NvDrvClientIdentity {
                 process_id: 7,
                 applet_resource_user_id: 0x1234,
             })
+        );
+
+        session.initialize();
+        let original_fd = session.open(b"/dev/nvmap", 7).unwrap();
+        let original_descriptor = clone.device_descriptor(original_fd).unwrap();
+        assert_eq!(
+            original_descriptor.owner().session(),
+            session.connection_id()
+        );
+        assert_eq!(clone.close(original_fd), NV_SUCCESS);
+        assert_eq!(session.close(original_fd), NV_BAD_PARAMETER);
+
+        let cloned_fd = clone.open(b"/dev/nvhost-ctrl-gpu", 7).unwrap();
+        let cloned_descriptor = session.device_descriptor(cloned_fd).unwrap();
+        assert_eq!(cloned_descriptor.owner().session(), clone.connection_id());
+        assert_eq!(session.close(cloned_fd), NV_SUCCESS);
+        assert_eq!(clone.device_descriptor(cloned_fd), None);
+    }
+
+    #[test]
+    fn teardown_from_one_connection_invalidates_the_shared_client() {
+        let session = NvDrvSession::new();
+        let clone = session.clone_connection().unwrap();
+        session.initialize();
+        let _fd = clone.open(b"/dev/nvmap", 11).unwrap();
+
+        assert_eq!(
+            clone.teardown(),
+            NvDrvTeardownReport {
+                device_fds_released: 1,
+                allocations_released: 0,
+            }
+        );
+        assert_eq!(
+            session.open(b"/dev/nvmap", 11),
+            Err(NvDrvCallError::GuestResult(NV_NOT_INITIALIZED))
+        );
+        assert_eq!(session.teardown(), NvDrvTeardownReport::default());
+    }
+
+    #[test]
+    fn opened_descriptor_records_typed_owner_permission_and_lifecycle() {
+        let session = NvDrvSession::new();
+        session.set_aruid(42, 0x1234);
+        session.initialize();
+
+        let fd = session.open(b"/dev/nvmap", 42).unwrap();
+        let descriptor = session.device_descriptor(fd).unwrap();
+
+        assert_eq!(descriptor.fd(), fd);
+        assert_eq!(descriptor.kind(), NvDrvDeviceKind::NvMap);
+        assert_eq!(descriptor.owner().session(), session.connection_id());
+        assert_eq!(descriptor.owner().process_id(), 42);
+        assert_eq!(descriptor.permission(), NvDrvPermissionProfile::Application);
+        assert_eq!(descriptor.lifecycle(), NvDrvDescriptorLifecycle::Open);
+        assert_eq!(session.close(fd), NV_SUCCESS);
+        assert_eq!(session.device_descriptor(fd), None);
+    }
+
+    #[test]
+    fn canonical_memory_failure_carries_fd_allocation_and_validation_reason() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let address_space = AddressSpaceId::new(9);
+        session.initialize();
+        let fd = session.open(b"/dev/nvmap", 9).unwrap();
+        let (created, _) = session
+            .ioctl(fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x1000))
+            .unwrap();
+        let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
+        let mut allocate = vec![0_u8; 32];
+        allocate[0..4].copy_from_slice(&handle.to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
+        allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        allocate[24..32].copy_from_slice(&0x9000_u64.to_le_bytes());
+
+        let error = session
+            .ioctl_with_memory(fd, IOCTL_NVMAP_ALLOC, &allocate, 9, address_space, &memory)
+            .unwrap_err();
+        let UnsupportedNvDrvOperation::CanonicalMemory { context, .. } = error else {
+            panic!("translation failure must preserve canonical-memory context");
+        };
+        assert_eq!(context.device(), NvDrvDeviceKind::NvMap);
+        assert_eq!(context.request(), IOCTL_NVMAP_ALLOC);
+        assert_eq!(context.fd(), fd);
+        assert_eq!(context.allocation(), Some(NvMapHandle::new(handle)));
+        assert_eq!(
+            context.reason(),
+            NvDrvValidationReason::CanonicalBackingUnavailable
         );
     }
 }
