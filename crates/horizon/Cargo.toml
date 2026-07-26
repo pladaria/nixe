@@ -10,6 +10,7 @@ chrono-tz.workspace = true
 log.workspace = true
 nixe-cpu.workspace = true
 nixe-gpu.workspace = true
+nixe-gpu-maxwell.workspace = true
 nixe-input.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
