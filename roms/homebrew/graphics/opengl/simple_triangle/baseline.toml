@@ -1,0 +1,70 @@
+schema_version = 1
+milestone = "switch-examples graphics/opengl/simple_triangle"
+
+[source]
+repository = "https://github.com/switchbrew/switch-examples"
+revision = "669786898205b7beb25ff1731e72982e6d0397d3"
+main = "graphics/opengl/simple_triangle/source/main.cpp"
+makefile = "graphics/opengl/simple_triangle/Makefile"
+
+[build]
+rules = "libnx/switch_rules"
+architecture = "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
+cxx_flags = "-g -Wall -O2 -ffunction-sections -fno-rtti -fno-exceptions"
+libraries = ["glad", "EGL", "glapi", "drm_nouveau", "nx"]
+toolchain_identity = "not encoded in the retained NRO; a replacement build must record devkitA64 and every portlib package version"
+
+[artifact]
+path = "simple_triangle.nro"
+sha256 = "2cc37d295d297d680009013507f511a42859aac7963abb3cc5a7645becd107c1"
+size = 5871813
+repository_introduction_revision = "819ac58a3ed6302f8e003c84f0fa0b768f0c0018"
+policy = "This manifest identifies the existing redistributable corpus artifact; do not add a newly built NRO for this milestone."
+
+[libnx]
+repository = "https://github.com/switchbrew/libnx"
+revision = "dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb"
+service_wrapper = "nx/source/services/nv.c"
+ioctl_header = "nx/include/switch/nvidia/ioctl.h"
+nvhost_ctrl_gpu_wrapper = "nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c"
+
+[service_table]
+reference = "https://switchbrew.org/w/index.php?title=NV_services&oldid=14790"
+implemented_initialization_commands = [0, 1, 2, 3, 8]
+
+[[ioctl]]
+name = "NVGPU_GPU_IOCTL_ZCULL_GET_CTX_SIZE"
+device = "/dev/nvhost-ctrl-gpu"
+request = "0x80044701"
+wire_size = 4
+direction = "out"
+
+[[ioctl]]
+name = "NVGPU_GPU_IOCTL_ZCULL_GET_INFO"
+device = "/dev/nvhost-ctrl-gpu"
+request = "0x80284702"
+wire_size = 40
+direction = "out"
+
+[[ioctl]]
+name = "NVGPU_GPU_IOCTL_GET_CHARACTERISTICS"
+device = "/dev/nvhost-ctrl-gpu"
+request = "0xc0b04705"
+wire_size = 176
+direction = "inout"
+
+[[ioctl]]
+name = "NVGPU_GPU_IOCTL_GET_TPC_MASKS"
+device = "/dev/nvhost-ctrl-gpu"
+request = "0xc0184706"
+wire_size = 24
+direction = "inout"
+baseline_status = "first unsupported graphics semantic boundary"
+
+[baseline]
+graphics_gap = "ioctl"
+device = "/dev/nvhost-ctrl-gpu"
+request = "0xc0184706"
+host_pointers_allowed = false
+process_owned_host_backend_resources = 0
+host_presenter_teardown = "FrontendEvent::WorkerFinished drops Presenter before event-loop exit"

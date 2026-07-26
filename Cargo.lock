@@ -980,6 +980,10 @@ name = "nixe-cpu"
 version = "0.1.0"
 
 [[package]]
+name = "nixe-gpu"
+version = "0.1.0"
+
+[[package]]
 name = "nixe-horizon"
 version = "0.1.0"
 dependencies = [
@@ -987,6 +991,7 @@ dependencies = [
  "chrono-tz",
  "log",
  "nixe-cpu",
+ "nixe-gpu",
  "nixe-input",
  "nixe-loader-storage",
  "nixe-loader-title",
@@ -994,6 +999,7 @@ dependencies = [
  "nixe-video",
  "sha2",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

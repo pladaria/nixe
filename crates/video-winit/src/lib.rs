@@ -503,7 +503,13 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 }
             }
             FrontendEvent::StopRequested => {}
-            FrontendEvent::WorkerFinished => event_loop.exit(),
+            FrontendEvent::WorkerFinished => {
+                // Drop the surface, device, queue and all presentation
+                // resources before leaving the event loop. This event is sent
+                // only after guest-process and guest-graphics teardown.
+                self.presenter = None;
+                event_loop.exit();
+            }
         }
     }
 

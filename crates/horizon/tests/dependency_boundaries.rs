@@ -13,6 +13,7 @@ fn horizon_layers_on_runtime_without_a_reverse_dependency() {
     let runtime_dependencies = dependency_names(&runtime_contents);
 
     assert!(horizon_dependencies.contains(&"nixe-runtime"));
+    assert!(horizon_dependencies.contains(&"nixe-gpu"));
     assert!(!runtime_dependencies.contains(&"nixe-horizon"));
 }
 

@@ -199,6 +199,7 @@ impl Drop for WorkerCompletion {
 struct WorkerResult {
     execution: Result<ExecutionSummary, String>,
     teardown: ProcessTeardownReport,
+    graphics_teardown: nixe_horizon::GraphicsTeardownReport,
 }
 
 fn execute_worker(
@@ -211,6 +212,7 @@ fn execute_worker(
     gamepad_profiles: GamepadProfiles,
 ) -> WorkerResult {
     let execution_started = Instant::now();
+    let execution_video = video_system.clone();
     let execution = SdlInputBackend::new()
         .map_err(|error| error.to_string())
         .and_then(|backend| {
@@ -221,7 +223,7 @@ fn execute_worker(
                 &stop_signals,
                 initial_operation_mode,
                 time_environment,
-                video_system,
+                execution_video,
                 &mut input,
             )
         });
@@ -232,10 +234,21 @@ fn execute_worker(
     WorkerResult {
         execution,
         teardown: process.teardown(),
+        graphics_teardown: video_system.teardown(),
     }
 }
 
 fn finish_execution(result: WorkerResult) -> Result<(), String> {
+    log::debug!(
+        "graphics resources released: handles={}, layers={}, queues={}, pending_frames={}, \
+         nvdrv_fds={}, nvmap_allocations={}",
+        result.teardown.handles_released,
+        result.graphics_teardown.layers_released,
+        result.graphics_teardown.queues_released,
+        result.graphics_teardown.pending_frames_released,
+        result.graphics_teardown.device_fds_released,
+        result.graphics_teardown.allocations_released,
+    );
     let summary = match result.execution {
         Ok(summary) => summary,
         Err(error) => {

@@ -102,6 +102,16 @@ pub struct VideoSystem {
     state: Arc<Mutex<VideoState>>,
 }
 
+/// Resources released when one emulated process graphics system is torn down.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct GraphicsTeardownReport {
+    pub layers_released: usize,
+    pub queues_released: usize,
+    pub pending_frames_released: usize,
+    pub device_fds_released: usize,
+    pub allocations_released: usize,
+}
+
 impl Default for VideoSystem {
     fn default() -> Self {
         Self::new(FrameMailbox::default())
@@ -147,6 +157,31 @@ impl VideoSystem {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .layers
             .len()
+    }
+
+    /// Deterministically releases process-owned display and driver resources.
+    ///
+    /// Host presentation resources are owned by `nixe-video-winit`, not this
+    /// guest graphics system. The frontend releases those resources when its
+    /// worker-finished event is handled.
+    #[must_use]
+    pub fn teardown(&self) -> GraphicsTeardownReport {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nvdrv = state.nvdrv.teardown();
+        let report = GraphicsTeardownReport {
+            layers_released: state.layers.len(),
+            queues_released: state.queues.len(),
+            pending_frames_released: state.pending_frames.len(),
+            device_fds_released: nvdrv.device_fds_released,
+            allocations_released: nvdrv.allocations_released,
+        };
+        state.layers.clear();
+        state.queues.clear();
+        state.pending_frames.clear();
+        report
     }
 
     pub(crate) fn nvdrv(&self) -> NvDrvSession {
@@ -742,6 +777,46 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.binder_id, second.binder_id);
         assert_eq!(video.layer(first.id), Some(first));
+    }
+
+    #[test]
+    fn graphics_teardown_releases_layers_queues_and_nvdrv_state() {
+        let video = VideoSystem::default();
+        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
+        let nvdrv = video.nvdrv();
+        nvdrv.initialize();
+        let map_fd = nvdrv.open(b"/dev/nvmap").unwrap();
+        let _gpu_fd = nvdrv.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        nvdrv
+            .ioctl(
+                map_fd,
+                super::super::nvdrv::IOCTL_NVMAP_CREATE,
+                &0x1000_u32.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            nvdrv.ioctl(_gpu_fd, 0xc018_4706, &[0; 24]),
+            Err(super::super::nvdrv::UnsupportedNvDrvOperation::Ioctl {
+                device: "/dev/nvhost-ctrl-gpu",
+                request: 0xc018_4706,
+            })
+        ));
+
+        assert_eq!(video.active_layer_count(), 1);
+        assert!(video.binder_event(layer.binder_id).is_some());
+        assert_eq!(
+            video.teardown(),
+            GraphicsTeardownReport {
+                layers_released: 1,
+                queues_released: 1,
+                pending_frames_released: 0,
+                device_fds_released: 2,
+                allocations_released: 1,
+            }
+        );
+        assert_eq!(video.active_layer_count(), 0);
+        assert!(video.binder_event(layer.binder_id).is_none());
+        assert_eq!(video.teardown(), GraphicsTeardownReport::default());
     }
 
     #[test]

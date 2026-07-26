@@ -2542,8 +2542,8 @@ mod tests {
         assert_eq!(fault.guest_result(), None);
         assert_eq!(
             fault.to_string(),
-            "Horizon SVC 0x21 reached unsupported emulator semantics: nvdrv ioctl is not \
-             implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706"
+            "Horizon SVC 0x21 reached unsupported emulator semantics: graphics-gap=ioctl nvdrv \
+             ioctl is not implemented: device=/dev/nvhost-ctrl-gpu request=0xc0184706"
         );
     }
 }
