@@ -289,6 +289,7 @@ impl MaxwellVirtualAddressCapabilities {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellMemoryCapabilities {
     onboard_video_memory_bytes: u64,
+    small_page_size: GpuPageSize,
     big_page_size: GpuPageSize,
     compression_page_size: GpuPageSize,
     available_big_page_sizes: GpuPageSizeMask,
@@ -298,6 +299,11 @@ impl MaxwellMemoryCapabilities {
     #[must_use]
     pub const fn onboard_video_memory_bytes(self) -> u64 {
         self.onboard_video_memory_bytes
+    }
+
+    #[must_use]
+    pub const fn small_page_size(self) -> GpuPageSize {
+        self.small_page_size
     }
 
     #[must_use]
@@ -598,6 +604,12 @@ impl MaxwellGpuProfile {
         }
 
         let memory = self.memory;
+        let small_page_size = memory.small_page_size.raw();
+        if !is_nonzero_power_of_two(small_page_size) {
+            return Err(MaxwellProfileValidationError::InvalidSmallPageSize {
+                bytes: small_page_size,
+            });
+        }
         let big_page_size = memory.big_page_size.raw();
         if !is_nonzero_power_of_two(big_page_size) {
             return Err(MaxwellProfileValidationError::InvalidBigPageSize {
@@ -706,6 +718,9 @@ pub enum MaxwellProfileValidationError {
         bits: u8,
         virtual_address_bits: u8,
     },
+    InvalidSmallPageSize {
+        bytes: u32,
+    },
     InvalidBigPageSize {
         bytes: u32,
     },
@@ -780,6 +795,7 @@ pub const SWITCH_1_GM20B_PROFILE: MaxwellGpuProfile = MaxwellGpuProfile {
     },
     memory: MaxwellMemoryCapabilities {
         onboard_video_memory_bytes: 0,
+        small_page_size: GpuPageSize::from_raw(0x1_000),
         big_page_size: GpuPageSize::from_raw(0x2_0000),
         compression_page_size: GpuPageSize::from_raw(0x2_0000),
         available_big_page_sizes: GpuPageSizeMask::from_raw(0x3_0000),
@@ -860,6 +876,7 @@ mod tests {
         },
         memory: MaxwellMemoryCapabilities {
             onboard_video_memory_bytes: 0,
+            small_page_size: GpuPageSize::from_raw(0x1_000),
             big_page_size: GpuPageSize::from_raw(0x1_000),
             compression_page_size: GpuPageSize::from_raw(0x2_000),
             available_big_page_sizes: GpuPageSizeMask::from_raw(0x3_000),

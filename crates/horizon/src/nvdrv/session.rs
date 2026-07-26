@@ -1,3 +1,5 @@
+use nixe_gpu_maxwell::MaxwellGpuAddressSpace;
+
 use super::{NvDrvDeviceDescriptor, NvDrvFileDescriptor, NvDrvSession, NvDrvSessionId};
 
 impl NvDrvSession {
@@ -36,5 +38,16 @@ impl NvDrvSession {
             .devices
             .get(&fd)
             .copied()
+    }
+
+    /// Returns the profile-bound address space owned by an as-gpu descriptor.
+    #[must_use]
+    pub fn gpu_address_space(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellGpuAddressSpace> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .gpu_address_spaces
+            .get(&fd)
+            .cloned()
     }
 }

@@ -2,13 +2,13 @@ use std::fs;
 use std::path::Path;
 
 #[test]
-fn maxwell_frontend_depends_only_on_neutral_gpu_contracts() {
+fn maxwell_frontend_depends_only_on_neutral_gpu_and_memory_contracts() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents =
         fs::read_to_string(manifest.join("Cargo.toml")).expect("Maxwell manifest must be readable");
     let dependencies = dependency_names(&contents);
 
-    assert_eq!(dependencies, ["nixe-gpu"]);
+    assert_eq!(dependencies, ["nixe-gpu", "nixe-memory"]);
     for prohibited in [
         "nixe-horizon",
         "nixe-video",

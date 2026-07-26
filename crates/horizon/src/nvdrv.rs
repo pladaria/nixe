@@ -3,12 +3,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu_maxwell::{MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE};
+use nixe_gpu_maxwell::{
+    MaxwellAddressSpaceId, MaxwellGpuAddressSpace, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
+};
 use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
 
 mod device;
 mod diagnostics;
 mod ioctl;
+mod nvhost_as_gpu;
 mod nvmap;
 mod service;
 mod session;
@@ -19,6 +22,7 @@ pub use device::{
 };
 use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
+use nvhost_as_gpu::ioctl_nvhost_as_gpu;
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
     NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
@@ -38,9 +42,13 @@ const IOCTL_CTRL_GPU_GET_CHARACTERISTICS: u32 = 0xc0b0_4705;
 const IOCTL_CTRL_GPU_GET_TPC_MASKS: u32 = 0xc018_4706;
 
 pub(crate) const NV_SUCCESS: u32 = 0;
+pub(crate) const NV_NOT_SUPPORTED: u32 = 2;
 pub(crate) const NV_NOT_INITIALIZED: u32 = 3;
 pub(crate) const NV_BAD_PARAMETER: u32 = 4;
+pub(crate) const NV_INSUFFICIENT_MEMORY: u32 = 6;
 pub(crate) const NV_INVALID_STATE: u32 = 8;
+pub(crate) const NV_BAD_VALUE: u32 = 0xb;
+pub(crate) const NV_OVERFLOW: u32 = 0x11;
 
 #[derive(Debug)]
 struct NvDrvClientState {
@@ -50,6 +58,8 @@ struct NvDrvClientState {
     permission: NvDrvPermissionProfile,
     next_fd: u32,
     devices: BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
+    next_gpu_address_space_id: u64,
+    gpu_address_spaces: BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>,
     nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
 }
@@ -96,6 +106,8 @@ impl NvDrvSession {
                 permission: NvDrvPermissionProfile::Application,
                 next_fd: 1,
                 devices: BTreeMap::new(),
+                next_gpu_address_space_id: 1,
+                gpu_address_spaces: BTreeMap::new(),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
             })),
@@ -131,6 +143,10 @@ impl NvDrvSession {
             // wrappers:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c
             b"/dev/nvhost-ctrl-gpu" => NvDrvDeviceKind::HostControlGpu,
+            // Each descriptor opened to this device owns a distinct GPU
+            // address space:
+            // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvhost-as-gpu
+            b"/dev/nvhost-as-gpu" => NvDrvDeviceKind::HostAddressSpaceGpu,
             _ => {
                 return Err(NvDrvCallError::Unsupported(
                     UnsupportedNvDrvOperation::OpenDevice { path: path.into() },
@@ -150,26 +166,41 @@ impl NvDrvSession {
         {
             return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
         }
-        let fd = NvDrvFileDescriptor::new(state.next_fd);
-        state.next_fd = state
+        let next_fd = state
             .next_fd
             .checked_add(1)
             .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
+        let next_gpu_address_space_id = if kind == NvDrvDeviceKind::HostAddressSpaceGpu {
+            Some(
+                state
+                    .next_gpu_address_space_id
+                    .checked_add(1)
+                    .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?,
+            )
+        } else {
+            None
+        };
+        let fd = NvDrvFileDescriptor::new(state.next_fd);
         let owner = NvDrvDescriptorOwner::new(self.connection_id, process_id);
         let descriptor = NvDrvDeviceDescriptor::open(fd, kind, owner, state.permission);
+        state.next_fd = next_fd;
         state.devices.insert(fd, descriptor);
+        if let Some(next_gpu_address_space_id) = next_gpu_address_space_id {
+            let address_space_id = MaxwellAddressSpaceId::new(state.next_gpu_address_space_id);
+            state.next_gpu_address_space_id = next_gpu_address_space_id;
+            let address_space = MaxwellGpuAddressSpace::new(address_space_id, state.gpu_profile);
+            state.gpu_address_spaces.insert(fd, address_space);
+        }
         Ok(fd)
     }
 
     pub(crate) fn close(&self, fd: NvDrvFileDescriptor) -> u32 {
-        if self
+        let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .devices
-            .remove(&fd)
-            .is_some()
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.devices.remove(&fd).is_some() {
+            state.gpu_address_spaces.remove(&fd);
             NV_SUCCESS
         } else {
             NV_BAD_PARAMETER
@@ -232,6 +263,25 @@ impl NvDrvSession {
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
                 ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
             }
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostAddressSpaceGpu => {
+                let NvDrvClientState {
+                    gpu_address_spaces,
+                    nvmap,
+                    ..
+                } = &mut *state;
+                let Some(address_space) = gpu_address_spaces.get_mut(&fd) else {
+                    return Err(UnsupportedNvDrvOperation::Ioctl {
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request,
+                            descriptor.fd(),
+                            None,
+                            NvDrvValidationReason::AddressSpaceUnavailable,
+                        ),
+                    });
+                };
+                ioctl_nvhost_as_gpu(address_space, nvmap, descriptor, request, input)
+            }
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::Ioctl {
                     context: NvDrvErrorContext::new(
@@ -280,6 +330,7 @@ impl NvDrvSession {
             allocations_released: state.nvmap.clear(),
         };
         state.devices.clear();
+        state.gpu_address_spaces.clear();
         state.initialized = false;
         state.client_identity = None;
         report
@@ -1537,6 +1588,557 @@ mod tests {
         assert_eq!(cloned_descriptor.owner().session(), clone.connection_id());
         assert_eq!(session.close(cloned_fd), NV_SUCCESS);
         assert_eq!(clone.device_descriptor(cloned_fd), None);
+    }
+
+    #[test]
+    fn as_gpu_descriptors_own_distinct_profile_bound_address_spaces() {
+        let session = NvDrvSession::new();
+        let clone = session.clone_connection().unwrap();
+        session.initialize();
+
+        let first_fd = session.open(b"/dev/nvhost-as-gpu", 7).unwrap();
+        let second_fd = clone.open(b"/dev/nvhost-as-gpu", 7).unwrap();
+        let first_descriptor = session.device_descriptor(first_fd).unwrap();
+        let first_address_space = clone.gpu_address_space(first_fd).unwrap();
+        let second_address_space = session.gpu_address_space(second_fd).unwrap();
+
+        assert_eq!(
+            first_descriptor.kind(),
+            NvDrvDeviceKind::HostAddressSpaceGpu
+        );
+        assert_eq!(first_descriptor.owner().session(), session.connection_id());
+        assert_ne!(first_address_space.id(), second_address_space.id());
+        assert_eq!(
+            first_address_space.profile_id(),
+            SWITCH_1_GM20B_PROFILE.id()
+        );
+        assert_eq!(
+            second_address_space.profile_id(),
+            SWITCH_1_GM20B_PROFILE.id()
+        );
+
+        assert_eq!(clone.close(first_fd), NV_SUCCESS);
+        assert_eq!(session.gpu_address_space(first_fd), None);
+        assert_eq!(session.device_descriptor(first_fd), None);
+        assert_eq!(
+            session.gpu_address_space(second_fd),
+            Some(second_address_space)
+        );
+
+        assert_eq!(
+            session.teardown(),
+            NvDrvTeardownReport {
+                device_fds_released: 1,
+                allocations_released: 0,
+            }
+        );
+        assert_eq!(clone.gpu_address_space(second_fd), None);
+    }
+
+    #[test]
+    fn as_gpu_ioctls_remain_fatal_until_their_semantics_exist() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+        // NVHOST_AS_GPU_IOCTL_BIND_CHANNEL from the pinned libnx wrapper:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-as-gpu.c#L7-L17
+        let request = 0x4004_4101;
+
+        assert_eq!(
+            session.ioctl(fd, request, &[0; 4]),
+            Err(UnsupportedNvDrvOperation::Ioctl {
+                context: NvDrvErrorContext::new(
+                    NvDrvDeviceKind::HostAddressSpaceGpu,
+                    request,
+                    fd,
+                    None,
+                    NvDrvValidationReason::UnsupportedOperation,
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn as_gpu_initialization_and_region_query_encode_exact_switch_bytes() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+        let mut initialize = [0_u8; 40];
+        initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        initialize[8..12].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, &initialize)
+                .unwrap(),
+            (initialize.to_vec(), NV_SUCCESS)
+        );
+
+        let mut query = [0_u8; 64];
+        query[0..8].copy_from_slice(&0x1234_5678_u64.to_le_bytes());
+        query[8..12].copy_from_slice(&48_u32.to_le_bytes());
+        let (output, result) = session
+            .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_GET_VA_REGIONS, &query)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        let mut expected = query;
+        expected[16..24].copy_from_slice(&0x0800_0000_u64.to_le_bytes());
+        expected[24..28].copy_from_slice(&0x1000_u32.to_le_bytes());
+        expected[32..40].copy_from_slice(&0x3f_8000_u64.to_le_bytes());
+        expected[40..48].copy_from_slice(&0x4_0000_0000_u64.to_le_bytes());
+        expected[48..52].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        expected[56..64].copy_from_slice(&0xe_0000_u64.to_le_bytes());
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn as_gpu_reservations_allocate_and_free_exact_ranges() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+        let mut initialize = [0_u8; 40];
+        initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        initialize[8..12].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, &initialize)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let mut allocate = [0_u8; 24];
+        allocate[0..4].copy_from_slice(&3_u32.to_le_bytes());
+        allocate[4..8].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        allocate[16..24].copy_from_slice(&0x2_0000_u64.to_le_bytes());
+        let (allocated, result) = session
+            .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_SPACE, &allocate)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(
+            u64::from_le_bytes(allocated[16..24].try_into().unwrap()),
+            0x4_0000_0000
+        );
+
+        let mut overlap = [0_u8; 24];
+        overlap[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        overlap[4..8].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        overlap[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        overlap[16..24].copy_from_slice(&0x4_0000_0000_u64.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_SPACE, &overlap)
+                .unwrap(),
+            (overlap.to_vec(), NV_BAD_VALUE)
+        );
+
+        let mut free = [0_u8; 16];
+        free[0..8].copy_from_slice(&0x4_0000_0000_u64.to_le_bytes());
+        free[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        free[12..16].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_FREE_SPACE, &free)
+                .unwrap(),
+            (free.to_vec(), NV_BAD_VALUE)
+        );
+        assert_eq!(
+            session.gpu_address_space(fd).unwrap().reservation_count(),
+            1
+        );
+
+        free[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_FREE_SPACE, &free)
+                .unwrap(),
+            (free.to_vec(), NV_SUCCESS)
+        );
+        assert_eq!(
+            session.gpu_address_space(fd).unwrap().reservation_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn as_gpu_maps_aliases_and_unmaps_retained_nvmap_backing() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let cpu_address_space = AddressSpaceId::new(12);
+        let cpu_address = GuestVirtualAddress::new(0x20_0000);
+        memory
+            .resize_zeroed_mapping(
+                cpu_address_space,
+                cpu_address,
+                0,
+                0x20_000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        session.initialize();
+        let nvmap_fd = session.open(b"/dev/nvmap", 12).unwrap();
+        let as_gpu_fd = session.open(b"/dev/nvhost-as-gpu", 12).unwrap();
+
+        let (created, result) = session
+            .ioctl(nvmap_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x20_000))
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        let handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
+        let allocation = nvmap_allocate_input(handle, 1, 0x20_000, 0, cpu_address);
+        assert_eq!(
+            session
+                .ioctl_with_memory(
+                    nvmap_fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &allocation,
+                    12,
+                    cpu_address_space,
+                    &memory,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let mut initialize = [0_u8; 40];
+        initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        initialize[8..12].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX,
+                    &initialize,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let mut map = [0_u8; 40];
+        map[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.raw().to_le_bytes());
+        let (first_output, result) = session
+            .ioctl(as_gpu_fd, nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX, &map)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes(first_output[12..16].try_into().unwrap()),
+            0
+        );
+        let first_offset = u64::from_le_bytes(first_output[32..40].try_into().unwrap());
+        assert_eq!(first_offset, 0x4_0000_0000);
+
+        let (second_output, result) = session
+            .ioctl(as_gpu_fd, nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX, &map)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        let second_offset = u64::from_le_bytes(second_output[32..40].try_into().unwrap());
+        assert_eq!(second_offset, first_offset + 0x2_0000);
+        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
+        let first_address = address_space.address(first_offset).unwrap();
+        let second_address = address_space.address(second_offset).unwrap();
+        let retained = address_space.mapping(first_address).unwrap();
+        let alias = address_space.mapping(second_address).unwrap();
+        assert_eq!(retained.page_size(), 0x2_0000);
+        assert_eq!(retained.allocation(), alias.allocation());
+        assert_eq!(
+            retained.backing().segments()[0].page(),
+            alias.backing().segments()[0].page()
+        );
+
+        let foreign_nvmap_fd = session.open(b"/dev/nvmap", 99).unwrap();
+        let (foreign_created, _) = session
+            .ioctl(
+                foreign_nvmap_fd,
+                IOCTL_NVMAP_CREATE,
+                &nvmap_create_input(0x20_000),
+            )
+            .unwrap();
+        let foreign_handle = NvMapHandle::new(u32::from_le_bytes(
+            foreign_created[4..8].try_into().unwrap(),
+        ));
+        let foreign_allocation = nvmap_allocate_input(foreign_handle, 1, 0x20_000, 0, cpu_address);
+        assert_eq!(
+            session
+                .ioctl_with_memory(
+                    foreign_nvmap_fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &foreign_allocation,
+                    99,
+                    cpu_address_space,
+                    &memory,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        let mut foreign_map = map;
+        foreign_map[8..12].copy_from_slice(&foreign_handle.raw().to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX,
+                    &foreign_map,
+                )
+                .unwrap(),
+            (foreign_map.to_vec(), NV_INVALID_STATE)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            2
+        );
+
+        let (unallocated_created, _) = session
+            .ioctl(nvmap_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x20_000))
+            .unwrap();
+        let unallocated_handle = NvMapHandle::new(u32::from_le_bytes(
+            unallocated_created[4..8].try_into().unwrap(),
+        ));
+        let mut unallocated_map = map;
+        unallocated_map[8..12].copy_from_slice(&unallocated_handle.raw().to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX,
+                    &unallocated_map,
+                )
+                .unwrap(),
+            (unallocated_map.to_vec(), NV_BAD_VALUE)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            2
+        );
+
+        let mut free_nvmap = [0_u8; 24];
+        free_nvmap[..4].copy_from_slice(&handle.raw().to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(nvmap_fd, IOCTL_NVMAP_FREE, &free_nvmap)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        assert!(session.nvmap_object(handle).is_none());
+
+        let mut unmap = [0_u8; 8];
+        unmap.copy_from_slice(&first_offset.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(as_gpu_fd, nvhost_as_gpu::IOCTL_AS_GPU_UNMAP_BUFFER, &unmap,)
+                .unwrap(),
+            (unmap.to_vec(), NV_SUCCESS)
+        );
+        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
+        assert!(!address_space.retained_mapping_is_current(&retained));
+        assert!(address_space.retained_mapping_is_current(&alias));
+        let mut bytes = [0; 2];
+        retained.backing().read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0]);
+    }
+
+    #[test]
+    fn as_gpu_sparse_remap_is_owned_and_atomic() {
+        let session = NvDrvSession::new();
+        let memory = ExecutionMemory::new();
+        let cpu_address_space = AddressSpaceId::new(13);
+        let cpu_address = GuestVirtualAddress::new(0x40_0000);
+        memory
+            .resize_zeroed_mapping(
+                cpu_address_space,
+                cpu_address,
+                0,
+                0x40_000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        session.initialize();
+        let nvmap_fd = session.open(b"/dev/nvmap", 13).unwrap();
+        let as_gpu_fd = session.open(b"/dev/nvhost-as-gpu", 13).unwrap();
+        let (created, _) = session
+            .ioctl(nvmap_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x40_000))
+            .unwrap();
+        let handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
+        let allocation = nvmap_allocate_input(handle, 1, 0x20_000, 0, cpu_address);
+        assert_eq!(
+            session
+                .ioctl_with_memory(
+                    nvmap_fd,
+                    IOCTL_NVMAP_ALLOC,
+                    &allocation,
+                    13,
+                    cpu_address_space,
+                    &memory,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        let mut initialize = [0_u8; 40];
+        initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        initialize[8..12].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX,
+                    &initialize,
+                )
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        let mut reserve = [0_u8; 24];
+        reserve[0..4].copy_from_slice(&4_u32.to_le_bytes());
+        reserve[4..8].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        reserve[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        reserve[16..24].copy_from_slice(&0x4_0000_0000_u64.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(as_gpu_fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_SPACE, &reserve,)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let mut entries = [0_u8; 40];
+        entries[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        entries[4..8].copy_from_slice(&handle.raw().to_le_bytes());
+        entries[12..16].copy_from_slice(&0x20_000_u32.to_le_bytes());
+        entries[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        entries[20 + 4..20 + 8].copy_from_slice(&handle.raw().to_le_bytes());
+        entries[20 + 12..20 + 16].copy_from_slice(&0x28_000_u32.to_le_bytes());
+        entries[20 + 16..20 + 20].copy_from_slice(&1_u32.to_le_bytes());
+        let remap_two = 0xc028_4114;
+        assert_eq!(
+            session.ioctl(as_gpu_fd, remap_two, &entries).unwrap(),
+            (entries.to_vec(), NV_BAD_VALUE)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            0
+        );
+
+        let entry = &entries[..20];
+        let remap_one = 0xc014_4114;
+        assert_eq!(
+            session.ioctl(as_gpu_fd, remap_one, entry).unwrap(),
+            (entry.to_vec(), NV_SUCCESS)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            1
+        );
+        let mut hole = entry.to_vec();
+        hole[4..8].fill(0);
+        assert_eq!(
+            session.ioctl(as_gpu_fd, remap_one, &hole).unwrap(),
+            (hole, NV_SUCCESS)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn as_gpu_rejects_malformed_or_invalid_operations_without_partial_state() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+
+        for (request, size) in [
+            (nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS, 16),
+            (nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, 40),
+            (nvhost_as_gpu::IOCTL_AS_GPU_GET_VA_REGIONS, 64),
+            (nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_SPACE, 24),
+            (nvhost_as_gpu::IOCTL_AS_GPU_FREE_SPACE, 16),
+            (nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX, 40),
+            (nvhost_as_gpu::IOCTL_AS_GPU_UNMAP_BUFFER, 8),
+        ] {
+            for malformed_size in [size - 1, size + 1] {
+                let malformed = vec![0_u8; malformed_size];
+                assert_eq!(
+                    session.ioctl(fd, request, &malformed).unwrap(),
+                    (malformed, NV_BAD_PARAMETER)
+                );
+            }
+        }
+        assert_eq!(
+            session.ioctl(fd, 0xc014_4114, &[0; 19]).unwrap(),
+            (vec![0; 19], NV_BAD_PARAMETER)
+        );
+        assert_eq!(
+            session.ioctl(fd, 0xc000_4114, &[]).unwrap(),
+            (Vec::new(), NV_BAD_PARAMETER)
+        );
+
+        let query = [0_u8; 64];
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_GET_VA_REGIONS, &query)
+                .unwrap(),
+            (query.to_vec(), NV_BAD_VALUE)
+        );
+        let allocate = [0_u8; 24];
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_SPACE, &allocate)
+                .unwrap(),
+            (allocate.to_vec(), NV_BAD_VALUE)
+        );
+
+        let mut invalid_initialize = [0_u8; 40];
+        invalid_initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        invalid_initialize[8..12].copy_from_slice(&0x4000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX,
+                    &invalid_initialize
+                )
+                .unwrap(),
+            (invalid_initialize.to_vec(), NV_BAD_VALUE)
+        );
+        assert!(!session.gpu_address_space(fd).unwrap().initialized());
+
+        let mut initialize = [0_u8; 40];
+        initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        initialize[8..12].copy_from_slice(&0x2_0000_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, &initialize)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        assert_eq!(
+            session
+                .ioctl(fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, &initialize)
+                .unwrap(),
+            (initialize.to_vec(), NV_INVALID_STATE)
+        );
     }
 
     #[test]

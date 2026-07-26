@@ -705,6 +705,14 @@ impl NvMapObjects {
         self.object_by_handle(handle).ok().cloned()
     }
 
+    pub(super) fn object_snapshot_by_owned_handle(
+        &self,
+        owner: NvMapOwner,
+        handle: NvMapHandle,
+    ) -> Result<NvMapObject, NvMapStateError> {
+        self.object_by_owned_handle(owner, handle).cloned()
+    }
+
     pub(super) fn object_by_handle(
         &self,
         handle: NvMapHandle,

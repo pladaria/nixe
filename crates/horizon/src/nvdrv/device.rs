@@ -42,6 +42,7 @@ pub enum NvDrvDeviceKind {
     NvMap,
     HostControl,
     HostControlGpu,
+    HostAddressSpaceGpu,
 }
 
 impl NvDrvDeviceKind {
@@ -50,6 +51,7 @@ impl NvDrvDeviceKind {
             Self::NvMap => "/dev/nvmap",
             Self::HostControl => "/dev/nvhost-ctrl",
             Self::HostControlGpu => "/dev/nvhost-ctrl-gpu",
+            Self::HostAddressSpaceGpu => "/dev/nvhost-as-gpu",
         }
     }
 }
