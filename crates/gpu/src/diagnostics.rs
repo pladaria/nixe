@@ -70,7 +70,6 @@ macro_rules! hex_diagnostic_id {
 }
 
 hex_diagnostic_id!(CpuVirtualAddress, "cpu-va", u64, 16);
-hex_diagnostic_id!(GpuVirtualAddress, "gpu-va", u64, 16);
 hex_diagnostic_id!(GraphicsAllocationId, "allocation", u64, 16);
 decimal_diagnostic_id!(GpuChannelId, "channel", u32);
 decimal_diagnostic_id!(GpfifoEntryIndex, "gpfifo-entry", u32);
@@ -120,7 +119,9 @@ mod tests {
             "cpu-va=0x0000000012345678"
         );
         assert_eq!(
-            GpuVirtualAddress(0xabcdef).to_string(),
+            crate::GpuVirtualAddress::try_new(0xabcdef, 40)
+                .unwrap()
+                .to_string(),
             "gpu-va=0x0000000000abcdef"
         );
         assert_eq!(

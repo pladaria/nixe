@@ -13,6 +13,9 @@ const MAX_DIAGNOSTIC_GUEST_BYTES: usize = 96;
 pub enum NvDrvValidationReason {
     UnsupportedOperation,
     CanonicalBackingUnavailable,
+    AddressSpaceUnavailable,
+    AddressSpaceGenerationExhausted,
+    AddressSpaceIdentityExhausted,
 }
 
 impl Display for NvDrvValidationReason {
@@ -20,6 +23,9 @@ impl Display for NvDrvValidationReason {
         formatter.write_str(match self {
             Self::UnsupportedOperation => "unsupported-operation",
             Self::CanonicalBackingUnavailable => "canonical-backing-unavailable",
+            Self::AddressSpaceUnavailable => "address-space-unavailable",
+            Self::AddressSpaceGenerationExhausted => "address-space-generation-exhausted",
+            Self::AddressSpaceIdentityExhausted => "address-space-identity-exhausted",
         })
     }
 }
