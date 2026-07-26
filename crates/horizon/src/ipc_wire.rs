@@ -8,12 +8,14 @@ use chrono::{Datelike, Offset, Timelike};
 use chrono_tz::OffsetComponents;
 use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::memory::{DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryValue};
+use nixe_memory::CanonicalRangeAccessError;
 use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
 
 use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
     HipcRequest, MessageError, ReceiveStatics, SendStaticDescriptor,
 };
+use crate::nvdrv::{NvDrvFileDescriptor, NvDrvService, NvDrvServiceError};
 use crate::object::AppletObject;
 use crate::{
     AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HidSystem,
@@ -41,6 +43,7 @@ pub(crate) enum IpcWireError {
     GuestMemory(DataAccessFault),
     Malformed(&'static str),
     ResourceExhausted,
+    CanonicalBacking(CanonicalRangeAccessError),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
 }
@@ -354,9 +357,16 @@ pub(crate) fn send_sync_request_from_buffer(
         if matches!(request.command_id, 2 | 4)
             && let Some(nvdrv) = &nvdrv
         {
+            // CMIF cloning creates another service connection into the same
+            // nvdrv client. The connections share initialization, descriptors,
+            // allocations, and close effects, but retain distinct identities
+            // for descriptor ownership.
+            let cloned_session = nvdrv
+                .clone_connection()
+                .ok_or(IpcWireError::ResourceExhausted)?;
             let cloned_handle = process
                 .handles_mut()
-                .insert(nvdrv.clone())
+                .insert(cloned_session)
                 .map_err(|_| IpcWireError::ResourceExhausted)?;
             let response = encode_response(
                 request.token,
@@ -1712,30 +1722,26 @@ fn dispatch_binder_relay(
             );
             write_descriptor_bytes(process, output, &transaction.reply)?;
             if let Some((slot, buffer)) = transaction.queued {
-                let allocation = video.nvdrv().allocation_by_id(buffer.nvmap_id).ok_or(
-                    IpcWireError::Malformed("queued graphic buffer references an unknown nvmap ID"),
-                )?;
-                let cpu_address = allocation.cpu_address.ok_or(IpcWireError::Malformed(
-                    "queued nvmap allocation has no CPU backing address",
-                ))?;
+                let object = video
+                    .nvdrv()
+                    .nvmap_object_by_id(crate::NvMapExportedId::new(buffer.nvmap_id))
+                    .ok_or(IpcWireError::Malformed(
+                        "queued graphic buffer references an unknown nvmap ID",
+                    ))?;
                 if buffer.plane_size == 0
                     || buffer.plane_size > u64::from(buffer.total_size)
                     || u64::from(buffer.offset)
                         .checked_add(buffer.plane_size)
-                        .is_none_or(|end| end > u64::from(allocation.size))
+                        .is_none_or(|end| end > u64::from(object.size()))
                 {
                     return Err(IpcWireError::Malformed(
                         "queued graphic-buffer plane exceeds its nvmap allocation",
                     ));
                 }
-                let plane_size = usize::try_from(buffer.plane_size).map_err(|_| {
-                    IpcWireError::Malformed("queued graphic-buffer plane is too large")
-                })?;
-                let address = cpu_address.checked_add(u64::from(buffer.offset)).ok_or(
-                    IpcWireError::Malformed("queued graphic-buffer address overflows"),
-                )?;
-                let mut bytes = vec![0_u8; plane_size];
-                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+                let view = object
+                    .image_view(buffer.nvmap_view_metadata())
+                    .map_err(map_nvmap_view_error)?;
+                let bytes = view.read_plane(0).map_err(map_nvmap_view_error)?;
                 video
                     .queue_software_frame(binder_id, slot, &buffer, &bytes)
                     .map_err(|error| IpcWireError::Malformed(error.0))?;
@@ -1782,12 +1788,35 @@ fn dispatch_binder_relay(
     }
 }
 
+fn map_nvmap_view_error(error: crate::NvMapViewError) -> IpcWireError {
+    match error {
+        crate::NvMapViewError::ResourceExhausted => IpcWireError::ResourceExhausted,
+        crate::NvMapViewError::Backing(error) => IpcWireError::CanonicalBacking(error),
+        crate::NvMapViewError::UnallocatedObject => {
+            IpcWireError::Malformed("queued nvmap object has no canonical backing")
+        }
+        crate::NvMapViewError::MissingPlanes => {
+            IpcWireError::Malformed("queued graphic buffer has no planes")
+        }
+        crate::NvMapViewError::UnknownPlane => {
+            IpcWireError::Malformed("queued graphic-buffer plane does not exist")
+        }
+        crate::NvMapViewError::PlaneOutsideObject => {
+            IpcWireError::Malformed("queued graphic-buffer plane exceeds its nvmap object")
+        }
+        crate::NvMapViewError::RangeOverflow => {
+            IpcWireError::Malformed("queued graphic-buffer plane range overflows")
+        }
+    }
+}
+
 fn dispatch_nvdrv(
     process: &mut ExceptionProcessContext<'_>,
     session: &NvDrvSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let service = NvDrvService::new(session);
     match request.command_id {
         0 => {
             let descriptor = one_send_buffer(hipc)?;
@@ -1802,10 +1831,10 @@ fn dispatch_nvdrv(
                 GuestVirtualAddress::new(descriptor.address),
                 &mut path,
             )?;
-            let (fd, error) = match session.open(&path) {
-                Ok(fd) => (fd, crate::nvdrv::NV_SUCCESS),
-                Err(crate::nvdrv::NvDrvCallError::GuestResult(error)) => (0, error),
-                Err(crate::nvdrv::NvDrvCallError::Unsupported(operation)) => {
+            let (fd, error) = match service.open(&path, process.process_id()) {
+                Ok(fd) => (fd.raw(), crate::nvdrv::NV_SUCCESS),
+                Err(NvDrvServiceError::DriverResult(error)) => (0, error),
+                Err(NvDrvServiceError::Unsupported(operation)) => {
                     return Err(IpcWireError::UnsupportedNvDrv(operation));
                 }
             };
@@ -1837,21 +1866,22 @@ fn dispatch_nvdrv(
                 GuestVirtualAddress::new(input_descriptor.address),
                 &mut input,
             )?;
-            let (output, error) = session
-                .ioctl_with_memory(
-                    fd,
+            let response = service
+                .ioctl(
+                    NvDrvFileDescriptor::new(fd),
                     ioctl,
                     &input,
+                    process.process_id(),
                     process.cpu().address_space_id(),
                     process.canonical_memory(),
                 )
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
-            write_descriptor_bytes(process, output_descriptor, &output)?;
+            write_descriptor_bytes(process, output_descriptor, &response.output)?;
             Ok((
                 encode_response(
                     request.token,
                     HorizonIpcResult::SUCCESS,
-                    &error.to_le_bytes(),
+                    &response.driver_result.to_le_bytes(),
                     None,
                 )?,
                 None,
@@ -1861,7 +1891,7 @@ fn dispatch_nvdrv(
             let Some(fd) = request_u32(request.data, 0) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
-            let error = session.close(fd);
+            let error = service.close(NvDrvFileDescriptor::new(fd));
             Ok((
                 encode_response(
                     request.token,
@@ -1885,7 +1915,7 @@ fn dispatch_nvdrv(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            session.initialize();
+            service.initialize();
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
                 None,
@@ -1909,7 +1939,7 @@ fn dispatch_nvdrv(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            session.set_aruid(process.process_id(), applet_resource_user_id);
+            service.set_aruid(process.process_id(), applet_resource_user_id);
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
                 None,

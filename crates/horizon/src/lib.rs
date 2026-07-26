@@ -23,7 +23,13 @@ pub use ipc::{
 };
 pub use ipc_result::HorizonIpcResult;
 pub use ipc_wire::UnsupportedServiceOperation;
-pub use nvdrv::{NvDrvSession, NvMapAllocation, UnsupportedNvDrvOperation};
+pub use nvdrv::{
+    NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
+    NvDrvErrorContext, NvDrvFileDescriptor, NvDrvPermissionProfile, NvDrvSession, NvDrvSessionId,
+    NvDrvValidationReason, NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle,
+    NvMapImageView, NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata,
+    NvMapViewError, UnsupportedNvDrvOperation,
+};
 pub use object::{
     AccountSession, AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource,
     HidSession, HostDirectoryFileSystem, HostFile, IpcSession, OperationMode,

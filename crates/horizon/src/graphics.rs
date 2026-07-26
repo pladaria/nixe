@@ -7,8 +7,8 @@ use std::time::Duration;
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, Frame, FrameMailbox};
 
-use crate::NvDrvSession;
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
+use crate::{NvDrvSession, NvMapImageViewMetadata, NvMapPlaneMetadata};
 
 const DEFAULT_DISPLAY_ID: u64 = 1;
 const DEFAULT_WIDTH: u32 = 1280;
@@ -389,6 +389,24 @@ pub(crate) struct GraphicBuffer {
     pub(crate) kind: u32,
     pub(crate) block_height_log2: u32,
     pub(crate) plane_size: u64,
+}
+
+impl GraphicBuffer {
+    pub(crate) fn nvmap_view_metadata(&self) -> NvMapImageViewMetadata {
+        NvMapImageViewMetadata::new(
+            self.width,
+            self.height,
+            self.format,
+            self.kind,
+            self.layout,
+            self.block_height_log2,
+            vec![NvMapPlaneMetadata::new(
+                u64::from(self.offset),
+                self.plane_size,
+                self.pitch,
+            )],
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -785,14 +803,12 @@ mod tests {
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
         nvdrv.initialize();
-        let map_fd = nvdrv.open(b"/dev/nvmap").unwrap();
-        let _gpu_fd = nvdrv.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let map_fd = nvdrv.open(b"/dev/nvmap", 1).unwrap();
+        let _gpu_fd = nvdrv.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
+        let mut create = [0_u8; 8];
+        create[..4].copy_from_slice(&0x1000_u32.to_le_bytes());
         nvdrv
-            .ioctl(
-                map_fd,
-                super::super::nvdrv::IOCTL_NVMAP_CREATE,
-                &0x1000_u32.to_le_bytes(),
-            )
+            .ioctl(map_fd, super::super::nvdrv::IOCTL_NVMAP_CREATE, &create)
             .unwrap();
         let mut tpc_masks = [0_u8; 24];
         tpc_masks[0..4].copy_from_slice(&8_u32.to_le_bytes());

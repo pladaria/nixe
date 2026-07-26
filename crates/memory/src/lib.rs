@@ -20,7 +20,7 @@ pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalPageError,
 };
 pub use range::{
-    CanonicalBackingRange, CanonicalBackingSegment, CanonicalRangeError,
+    CanonicalBackingRange, CanonicalBackingSegment, CanonicalRangeAccessError, CanonicalRangeError,
     CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
 };
 pub use visibility::{
