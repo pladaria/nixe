@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter, Write};
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu::GraphicsGapKind;
+use nixe_gpu_maxwell::{MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE};
 
 pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
@@ -15,6 +16,7 @@ const IOCTL_NVMAP_GET_ID: u32 = 0xc008_010e;
 const IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE: u32 = 0x8004_4701;
 const IOCTL_CTRL_GPU_ZCULL_GET_INFO: u32 = 0x8028_4702;
 const IOCTL_CTRL_GPU_GET_CHARACTERISTICS: u32 = 0xc0b0_4705;
+const IOCTL_CTRL_GPU_GET_TPC_MASKS: u32 = 0xc018_4706;
 
 pub(crate) const NV_SUCCESS: u32 = 0;
 pub(crate) const NV_NOT_INITIALIZED: u32 = 3;
@@ -129,6 +131,7 @@ struct NvDrvState {
     next_id: u32,
     devices: BTreeMap<u32, DeviceKind>,
     allocations: BTreeMap<u32, NvMapAllocation>,
+    gpu_profile: MaxwellGpuProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -167,6 +170,7 @@ impl NvDrvSession {
                 next_id: 1,
                 devices: BTreeMap::new(),
                 allocations: BTreeMap::new(),
+                gpu_profile: SWITCH_1_GM20B_PROFILE,
             })),
         }
     }
@@ -245,7 +249,9 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = match state.devices.get(&fd).copied() {
             Some(DeviceKind::Map) => ioctl_nvmap(&mut state, request, input),
-            Some(DeviceKind::HostCtrlGpu) => ioctl_nvhost_ctrl_gpu(request, input),
+            Some(DeviceKind::HostCtrlGpu) => {
+                ioctl_nvhost_ctrl_gpu(state.gpu_profile, request, input)
+            }
             Some(device) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::Ioctl {
                     device: device.path(),
@@ -289,65 +295,157 @@ impl NvDrvSession {
     }
 }
 
-fn ioctl_nvhost_ctrl_gpu(request: u32, input: &[u8]) -> Result<Vec<u8>, NvDrvCallError> {
+fn ioctl_nvhost_ctrl_gpu(
+    profile: MaxwellGpuProfile,
+    request: u32,
+    input: &[u8],
+) -> Result<Vec<u8>, NvDrvCallError> {
+    debug_assert_eq!(profile.validate(), Ok(()));
     match request {
         IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE => {
+            require_input_size(input, 0)?;
             let mut output = sized_output(input, 4);
-            // GM20B exposes one Z-cull context unit. The ABI wrapper and exact
-            // four-byte result layout are pinned here:
+            // The exact four-byte result layout is pinned here:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c#L6-L21
-            write_u32(&mut output, 0, 1)?;
+            write_u32(&mut output, 0, profile.z_cull().context_size())?;
             Ok(output)
         }
         IOCTL_CTRL_GPU_ZCULL_GET_INFO => {
+            require_input_size(input, 0)?;
             let mut output = sized_output(input, 40);
-            // Exact Tegra X1 Z-cull geometry:
+            // Exact Switch 1 inline ABI:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/ioctl.h#L47-L58
-            for (index, value) in [0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10]
-                .into_iter()
-                .enumerate()
+            let z_cull = profile.z_cull();
+            for (index, value) in [
+                z_cull.width_align_pixels(),
+                z_cull.height_align_pixels(),
+                z_cull.pixel_squares_by_aliquots(),
+                z_cull.aliquot_total(),
+                z_cull.region_byte_multiplier(),
+                z_cull.region_header_size(),
+                z_cull.subregion_header_size(),
+                z_cull.subregion_width_align_pixels(),
+                z_cull.subregion_height_align_pixels(),
+                z_cull.subregion_count(),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 write_u32(&mut output, index * 4, value)?;
             }
             Ok(output)
         }
         IOCTL_CTRL_GPU_GET_CHARACTERISTICS => {
-            // Exact GM20B/Tegra X1 field layout and hardware values:
+            // Exact Switch 1 field layout:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/ioctl.h#L71-L106
             const CHARACTERISTICS_SIZE: usize = 0xa0;
             const REQUEST_SIZE: usize = 0x10 + CHARACTERISTICS_SIZE;
-            if input.len() < REQUEST_SIZE {
+            require_input_size(input, REQUEST_SIZE)?;
+            if input_u64(input, 0)? == 0 || input_u64(input, 8)? == 0 {
                 return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
             let mut output = sized_output(input, REQUEST_SIZE);
             write_u64(&mut output, 0, CHARACTERISTICS_SIZE as u64)?;
+            let chipset = profile.chipset();
+            let topology = profile.topology();
+            let memory = profile.memory();
+            let cache = profile.cache();
+            let shader = profile.shader();
+            let classes = profile.classes();
             let mut offset = 0x10;
-            for value in [0x120, 0xb, 0xa1, 1] {
+            for value in [
+                chipset.architecture().raw(),
+                chipset.implementation().raw(),
+                chipset.revision().raw(),
+                topology.gpc_count(),
+            ] {
                 write_u32(&mut output, offset, value)?;
                 offset += 4;
             }
-            for value in [0x4_0000_u64, 0] {
+            for value in [cache.l2_cache_bytes(), memory.onboard_video_memory_bytes()] {
                 write_u64(&mut output, offset, value)?;
                 offset += 8;
             }
             for value in [
-                2, 0x20, 0x2_0000, 0x2_0000, 0x1b, 0x3_0000, 1, 0x503, 0x503, 0x80, 0x28, 0,
+                topology.tpc_per_gpc(),
+                profile.interconnect().bus_type().raw(),
+                memory.big_page_size().raw(),
+                memory.compression_page_size().raw(),
+                u32::from(profile.virtual_address().pde_coverage_bits().bits()),
+                memory.available_big_page_sizes().raw(),
+                topology.gpc_enable_mask(),
+                shader.sm_version().raw(),
+                shader.spa_version().raw(),
+                shader.warp_count(),
+                u32::from(profile.virtual_address().address_bits().bits()),
+                0,
             ] {
                 write_u32(&mut output, offset, value)?;
                 offset += 4;
             }
-            write_u64(&mut output, offset, 0x55)?;
+            write_u64(&mut output, offset, profile.feature_flags().raw())?;
             offset += 8;
             for value in [
-                0x902d, 0xb197, 0xb1c0, 0xb06f, 0xa140, 0xb0b5, 1, 0, 2, 1, 0, 1, 0x2_1d70, 0,
+                classes.two_d().0,
+                classes.three_d().0,
+                classes.compute().0,
+                classes.gpfifo().0,
+                classes.inline_to_memory().0,
+                classes.dma_copy().0,
+                topology.maximum_fbp_count(),
+                topology.fbp_enable_mask(),
+                topology.maximum_ltc_per_fbp(),
+                topology.maximum_lts_per_ltc(),
+                topology.maximum_texture_units_per_tpc(),
+                topology.maximum_gpc_count(),
+                cache.rop_l2_enable_masks()[0],
+                cache.rop_l2_enable_masks()[1],
             ] {
                 write_u32(&mut output, offset, value)?;
                 offset += 4;
             }
-            write_u64(&mut output, offset, 0x62_30_32_6d_67)?;
+            write_u64(
+                &mut output,
+                offset,
+                u64::from_le_bytes(*chipset.chip_name().as_bytes()),
+            )?;
             offset += 8;
-            write_u64(&mut output, offset, 0)?;
+            write_u64(
+                &mut output,
+                offset,
+                cache.compression_bit_store_base().unwrap_or(0),
+            )?;
             debug_assert_eq!(offset + 8, REQUEST_SIZE);
+            Ok(output)
+        }
+        IOCTL_CTRL_GPU_GET_TPC_MASKS => {
+            // Switch 1 returns the masks inline in the final eight bytes:
+            // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#NVGPU_GPU_IOCTL_GET_TPC_MASKS
+            //
+            // The libnx wrapper fixes the request at 24 bytes and requires a
+            // non-null caller buffer:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c#L81-L102
+            const REQUEST_SIZE: usize = 24;
+            const INLINE_MASK_SIZE: usize = 8;
+            require_input_size(input, REQUEST_SIZE)?;
+            let caller_size =
+                usize::try_from(input_u32(input, 0)?).map_err(|_| NV_BAD_PARAMETER)?;
+            let caller_address = input_u64(input, 8)?;
+            let masks = profile.topology().tpc_enable_masks();
+            let required_size = masks
+                .len()
+                .checked_mul(size_of::<u32>())
+                .ok_or(NV_BAD_PARAMETER)?;
+            if caller_address == 0 || caller_size < required_size || caller_size > INLINE_MASK_SIZE
+            {
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+            }
+
+            let mut output = sized_output(input, REQUEST_SIZE);
+            write_u64(&mut output, 16, 0)?;
+            for (index, mask) in masks.iter().copied().enumerate() {
+                write_u32(&mut output, 16 + index * size_of::<u32>(), mask)?;
+            }
             Ok(output)
         }
         _ => Err(NvDrvCallError::Unsupported(
@@ -356,6 +454,14 @@ fn ioctl_nvhost_ctrl_gpu(request: u32, input: &[u8]) -> Result<Vec<u8>, NvDrvCal
                 request,
             },
         )),
+    }
+}
+
+fn require_input_size(input: &[u8], expected: usize) -> Result<(), NvDrvCallError> {
+    if input.len() == expected {
+        Ok(())
+    } else {
+        Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
     }
 }
 
@@ -542,42 +648,123 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_gpu_reports_documented_tegra_x1_characteristics() {
+    fn ctrl_gpu_discovery_ioctls_encode_exact_switch_1_bytes() {
         let session = NvDrvSession::new();
         session.initialize();
         let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
         let mut input = vec![0_u8; 0xb0];
         input[0..8].copy_from_slice(&0xa0_u64.to_le_bytes());
-        input[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        input[8..16].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
 
         let (output, error) = session
             .ioctl(fd, IOCTL_CTRL_GPU_GET_CHARACTERISTICS, &input)
             .unwrap();
 
+        let mut expected = Vec::with_capacity(0xb0);
+        expected.extend_from_slice(&0xa0_u64.to_le_bytes());
+        expected.extend_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
+        for value in [0x120_u32, 0xb, 0xa1, 1] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0x4_0000_u64, 0] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [
+            2_u32, 0x20, 0x2_0000, 0x2_0000, 0x1b, 0x3_0000, 1, 0x503, 0x503, 0x80, 0x28, 0,
+        ] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(&0x55_u64.to_le_bytes());
+        for value in [
+            0x902d_u32, 0xb197, 0xb1c0, 0xb06f, 0xa140, 0xb0b5, 1, 0, 2, 1, 0, 1, 0x2_1d70, 0,
+        ] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(b"gm20b\0\0\0");
+        expected.extend_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(expected.len(), 0xb0);
         assert_eq!(error, NV_SUCCESS);
-        assert_eq!(input_u64(&output, 0), Ok(0xa0));
-        assert_eq!(input_u32(&output, 0x10), Ok(0x120));
-        assert_eq!(input_u32(&output, 0x14), Ok(0xb));
-        assert_eq!(input_u32(&output, 0x18), Ok(0xa1));
-        assert_eq!(input_u64(&output, 0x20), Ok(0x4_0000));
-        assert_eq!(input_u32(&output, 0x50), Ok(0x503));
-        assert_eq!(input_u32(&output, 0x68), Ok(0x902d));
-        assert_eq!(input_u32(&output, 0x98), Ok(0x2_1d70));
-        assert_eq!(input_u64(&output, 0xa0), Ok(0x62_30_32_6d_67));
+        assert_eq!(output, expected);
 
         let (context_size, error) = session
             .ioctl(fd, IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE, &[])
             .unwrap();
         assert_eq!(error, NV_SUCCESS);
-        assert_eq!(input_u32(&context_size, 0), Ok(1));
+        assert_eq!(context_size, 1_u32.to_le_bytes());
 
         let (zcull, error) = session
             .ioctl(fd, IOCTL_CTRL_GPU_ZCULL_GET_INFO, &[])
             .unwrap();
+        let expected_zcull: Vec<u8> = [
+            0x20_u32, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
         assert_eq!(error, NV_SUCCESS);
-        assert_eq!(input_u32(&zcull, 0), Ok(0x20));
-        assert_eq!(input_u32(&zcull, 8), Ok(0x400));
-        assert_eq!(input_u32(&zcull, 36), Ok(0x10));
+        assert_eq!(zcull, expected_zcull);
+
+        let mut tpc_input = [0xa5_u8; 24];
+        tpc_input[0..4].copy_from_slice(&8_u32.to_le_bytes());
+        tpc_input[8..16].copy_from_slice(&0x8877_6655_4433_2211_u64.to_le_bytes());
+        let (tpc_output, error) = session
+            .ioctl(fd, IOCTL_CTRL_GPU_GET_TPC_MASKS, &tpc_input)
+            .unwrap();
+        let mut expected_tpc = tpc_input;
+        expected_tpc[16..20].copy_from_slice(&0b11_u32.to_le_bytes());
+        expected_tpc[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(error, NV_SUCCESS);
+        assert_eq!(tpc_output, expected_tpc);
+    }
+
+    #[test]
+    fn ctrl_gpu_discovery_rejects_malformed_sizes_and_invalid_arguments() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+
+        for (request, input) in [
+            (IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE, vec![0]),
+            (IOCTL_CTRL_GPU_ZCULL_GET_INFO, vec![0]),
+            (IOCTL_CTRL_GPU_GET_CHARACTERISTICS, vec![0; 0xaf]),
+            (IOCTL_CTRL_GPU_GET_CHARACTERISTICS, vec![0; 0xb1]),
+            (IOCTL_CTRL_GPU_GET_TPC_MASKS, vec![0; 23]),
+            (IOCTL_CTRL_GPU_GET_TPC_MASKS, vec![0; 25]),
+        ] {
+            assert_eq!(
+                session.ioctl(fd, request, &input),
+                Ok((input, NV_BAD_PARAMETER))
+            );
+        }
+
+        let mut characteristics = vec![0_u8; 0xb0];
+        characteristics[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            session.ioctl(fd, IOCTL_CTRL_GPU_GET_CHARACTERISTICS, &characteristics),
+            Ok((characteristics.clone(), NV_BAD_PARAMETER))
+        );
+        characteristics[0..8].copy_from_slice(&0xa0_u64.to_le_bytes());
+        characteristics[8..16].fill(0);
+        assert_eq!(
+            session.ioctl(fd, IOCTL_CTRL_GPU_GET_CHARACTERISTICS, &characteristics),
+            Ok((characteristics.clone(), NV_BAD_PARAMETER))
+        );
+
+        for caller_size in [0_u32, 3, 9] {
+            let mut input = vec![0_u8; 24];
+            input[0..4].copy_from_slice(&caller_size.to_le_bytes());
+            input[8..16].copy_from_slice(&1_u64.to_le_bytes());
+            assert_eq!(
+                session.ioctl(fd, IOCTL_CTRL_GPU_GET_TPC_MASKS, &input),
+                Ok((input, NV_BAD_PARAMETER))
+            );
+        }
+        let mut input = vec![0_u8; 24];
+        input[0..4].copy_from_slice(&8_u32.to_le_bytes());
+        assert_eq!(
+            session.ioctl(fd, IOCTL_CTRL_GPU_GET_TPC_MASKS, &input),
+            Ok((input, NV_BAD_PARAMETER))
+        );
     }
 
     #[test]
@@ -600,22 +787,23 @@ mod tests {
         );
 
         let fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        let unknown_request = 0xc008_4707;
         assert_eq!(
-            session.ioctl(fd, 0xc018_4706, &[0; 24]),
+            session.ioctl(fd, unknown_request, &[0; 8]),
             Err(UnsupportedNvDrvOperation::Ioctl {
                 device: "/dev/nvhost-ctrl-gpu",
-                request: 0xc018_4706,
+                request: unknown_request,
             })
         );
         let operation = UnsupportedNvDrvOperation::Ioctl {
             device: "/dev/nvhost-ctrl-gpu",
-            request: 0xc018_4706,
+            request: unknown_request,
         };
         assert_eq!(operation.gap_kind(), GraphicsGapKind::Ioctl);
         assert_eq!(
             operation.to_string(),
             "graphics-gap=ioctl nvdrv ioctl is not implemented: \
-             device=/dev/nvhost-ctrl-gpu request=0xc0184706"
+             device=/dev/nvhost-ctrl-gpu request=0xc0084707"
         );
     }
 

@@ -984,6 +984,13 @@ name = "nixe-gpu"
 version = "0.1.0"
 
 [[package]]
+name = "nixe-gpu-maxwell"
+version = "0.1.0"
+dependencies = [
+ "nixe-gpu",
+]
+
+[[package]]
 name = "nixe-horizon"
 version = "0.1.0"
 dependencies = [
@@ -992,6 +999,7 @@ dependencies = [
  "log",
  "nixe-cpu",
  "nixe-gpu",
+ "nixe-gpu-maxwell",
  "nixe-input",
  "nixe-loader-storage",
  "nixe-loader-title",

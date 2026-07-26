@@ -794,13 +794,13 @@ mod tests {
                 &0x1000_u32.to_le_bytes(),
             )
             .unwrap();
-        assert!(matches!(
-            nvdrv.ioctl(_gpu_fd, 0xc018_4706, &[0; 24]),
-            Err(super::super::nvdrv::UnsupportedNvDrvOperation::Ioctl {
-                device: "/dev/nvhost-ctrl-gpu",
-                request: 0xc018_4706,
-            })
-        ));
+        let mut tpc_masks = [0_u8; 24];
+        tpc_masks[0..4].copy_from_slice(&8_u32.to_le_bytes());
+        tpc_masks[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            nvdrv.ioctl(_gpu_fd, 0xc018_4706, &tpc_masks).unwrap().1,
+            super::super::nvdrv::NV_SUCCESS
+        );
 
         assert_eq!(video.active_layer_count(), 1);
         assert!(video.binder_event(layer.binder_id).is_some());
