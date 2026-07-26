@@ -1,10 +1,12 @@
 //! Minimal `nvdrv` and `/dev/nvmap` state for CPU-produced display buffers.
 
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Display, Formatter, Write};
 use std::sync::{Arc, Mutex};
 
-const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
+use nixe_gpu::GraphicsGapKind;
+
+pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
 const IOCTL_NVMAP_ALLOC: u32 = 0xc020_0104;
 const IOCTL_NVMAP_FREE: u32 = 0xc018_0105;
@@ -44,14 +46,26 @@ pub enum UnsupportedNvDrvOperation {
     Ioctl { device: &'static str, request: u32 },
 }
 
+impl UnsupportedNvDrvOperation {
+    /// Classifies the first missing graphics semantic layer.
+    #[must_use]
+    pub const fn gap_kind(&self) -> GraphicsGapKind {
+        match self {
+            Self::OpenDevice { .. } => GraphicsGapKind::DeviceOpen,
+            Self::ServiceCommand { .. } => GraphicsGapKind::ServiceCommand,
+            Self::Ioctl { .. } => GraphicsGapKind::Ioctl,
+        }
+    }
+}
+
 impl Display for UnsupportedNvDrvOperation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "graphics-gap={} ", self.gap_kind())?;
         match self {
-            Self::OpenDevice { path } => write!(
-                formatter,
-                "nvdrv device open is not implemented: path={:?}",
-                String::from_utf8_lossy(path)
-            ),
+            Self::OpenDevice { path } => {
+                formatter.write_str("nvdrv device open is not implemented: path=")?;
+                write_bounded_guest_bytes(formatter, path)
+            }
             Self::ServiceCommand { command_id } => write!(
                 formatter,
                 "nvdrv service command is not implemented: command={command_id}"
@@ -62,6 +76,25 @@ impl Display for UnsupportedNvDrvOperation {
             ),
         }
     }
+}
+
+const MAX_DIAGNOSTIC_GUEST_BYTES: usize = 96;
+
+fn write_bounded_guest_bytes(formatter: &mut Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    formatter.write_str("\"")?;
+    for byte in bytes.iter().take(MAX_DIAGNOSTIC_GUEST_BYTES) {
+        for escaped in std::ascii::escape_default(*byte) {
+            formatter.write_char(escaped as char)?;
+        }
+    }
+    if bytes.len() > MAX_DIAGNOSTIC_GUEST_BYTES {
+        write!(
+            formatter,
+            "...<{} bytes omitted>",
+            bytes.len() - MAX_DIAGNOSTIC_GUEST_BYTES
+        )?;
+    }
+    formatter.write_str("\"")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +129,12 @@ struct NvDrvState {
     next_id: u32,
     devices: BTreeMap<u32, DeviceKind>,
     allocations: BTreeMap<u32, NvMapAllocation>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) struct NvDrvTeardownReport {
+    pub device_fds_released: usize,
+    pub allocations_released: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +270,22 @@ impl NvDrvSession {
             .values()
             .find(|allocation| allocation.id == id)
             .cloned()
+    }
+
+    pub(crate) fn teardown(&self) -> NvDrvTeardownReport {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let report = NvDrvTeardownReport {
+            device_fds_released: state.devices.len(),
+            allocations_released: state.allocations.len(),
+        };
+        state.devices.clear();
+        state.allocations.clear();
+        state.initialized = false;
+        state.client_identity = None;
+        report
     }
 }
 
@@ -551,6 +606,53 @@ mod tests {
                 device: "/dev/nvhost-ctrl-gpu",
                 request: 0xc018_4706,
             })
+        );
+        let operation = UnsupportedNvDrvOperation::Ioctl {
+            device: "/dev/nvhost-ctrl-gpu",
+            request: 0xc018_4706,
+        };
+        assert_eq!(operation.gap_kind(), GraphicsGapKind::Ioctl);
+        assert_eq!(
+            operation.to_string(),
+            "graphics-gap=ioctl nvdrv ioctl is not implemented: \
+             device=/dev/nvhost-ctrl-gpu request=0xc0184706"
+        );
+    }
+
+    #[test]
+    fn guest_supplied_paths_are_bounded_and_escaped_in_diagnostics() {
+        let mut path = vec![b'a'; MAX_DIAGNOSTIC_GUEST_BYTES + 20];
+        path[0] = b'\n';
+        let diagnostic = UnsupportedNvDrvOperation::OpenDevice { path: path.into() }.to_string();
+
+        assert!(diagnostic.starts_with(
+            "graphics-gap=device-open nvdrv device open is not implemented: path=\"\\n"
+        ));
+        assert!(diagnostic.ends_with("...<20 bytes omitted>\""));
+        assert!(diagnostic.len() < 256);
+    }
+
+    #[test]
+    fn teardown_releases_nvdrv_state_and_is_idempotent() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let map_fd = session.open(b"/dev/nvmap").unwrap();
+        let _gpu_fd = session.open(b"/dev/nvhost-ctrl-gpu").unwrap();
+        session
+            .ioctl(map_fd, IOCTL_NVMAP_CREATE, &0x2000_u32.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(
+            session.teardown(),
+            NvDrvTeardownReport {
+                device_fds_released: 2,
+                allocations_released: 1,
+            }
+        );
+        assert_eq!(session.teardown(), NvDrvTeardownReport::default());
+        assert_eq!(
+            session.open(b"/dev/nvmap"),
+            Err(NvDrvCallError::GuestResult(NV_NOT_INITIALIZED))
         );
     }
 

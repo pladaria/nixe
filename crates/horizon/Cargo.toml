@@ -9,6 +9,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 log.workspace = true
 nixe-cpu.workspace = true
+nixe-gpu.workspace = true
 nixe-input.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
@@ -18,3 +19,4 @@ nixe-video.workspace = true
 [dev-dependencies]
 sha2.workspace = true
 tempfile.workspace = true
+toml.workspace = true

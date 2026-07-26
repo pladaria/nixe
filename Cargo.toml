@@ -3,6 +3,7 @@ members = [
     "apps/cli",
     "crates/config",
     "crates/cpu",
+    "crates/gpu",
     "crates/horizon",
     "crates/input",
     "crates/loader/content",
@@ -45,6 +46,7 @@ sha2 = "0.10.9"
 tempfile = "3.27"
 nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
+nixe-gpu = { path = "crates/gpu" }
 nixe-horizon = { path = "crates/horizon" }
 nixe-input = { path = "crates/input" }
 nixe-loader-content = { path = "crates/loader/content" }
