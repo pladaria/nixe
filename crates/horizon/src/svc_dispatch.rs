@@ -164,6 +164,10 @@ pub enum HorizonSvcFault {
         immediate: u32,
         reason: &'static str,
     },
+    InternalIpc {
+        immediate: u32,
+        reason: &'static str,
+    },
     UnsupportedNvDrv {
         immediate: u32,
         operation: crate::nvdrv::UnsupportedNvDrvOperation,
@@ -180,8 +184,7 @@ impl HorizonSvcFault {
     #[must_use]
     pub const fn guest_result(&self) -> Option<HorizonKernelResult> {
         match self {
-            Self::Unknown(_) => Some(HorizonKernelResult::NOT_SUPPORTED),
-            Self::UnsupportedSemantics { .. } => Some(HorizonKernelResult::NOT_IMPLEMENTED),
+            Self::Unknown(_) | Self::UnsupportedSemantics { .. } => None,
             Self::GuestMemory { fault, .. } => match fault.reason {
                 DataAccessFaultReason::ContentGenerationExhausted
                 | DataAccessFaultReason::HostBacking(_) => None,
@@ -215,7 +218,9 @@ impl HorizonSvcFault {
                 }
                 MemoryMappingErrorReason::GenerationExhausted => None,
             },
-            Self::CanonicalMemory { .. } | Self::CanonicalBacking { .. } => None,
+            Self::CanonicalMemory { .. }
+            | Self::CanonicalBacking { .. }
+            | Self::InternalIpc { .. } => None,
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -277,6 +282,10 @@ impl Display for HorizonSvcFault {
                     "Horizon SVC {immediate:#x} rejected malformed IPC: {reason}"
                 )
             }
+            Self::InternalIpc { immediate, reason } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} reached invalid emulator IPC state: {reason}"
+            ),
             Self::UnsupportedNvDrv {
                 immediate,
                 operation,
@@ -469,7 +478,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 self.unknown_calls = self.unknown_calls.saturating_add(1);
-                return reject(context, HorizonSvcFault::Unknown(error));
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Unknown(error));
             }
         };
 
@@ -521,15 +530,12 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x70 => create_port(context),
             0x71 => self.manage_named_port(context),
             0x72 => connect_to_port(context),
-            _ => reject(
-                context,
-                HorizonSvcFault::UnsupportedSemantics {
-                    immediate,
-                    documented_name: descriptor
-                        .unambiguous_name()
-                        .unwrap_or("version-dependent SVC"),
-                },
-            ),
+            _ => ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
+                immediate,
+                documented_name: descriptor
+                    .unambiguous_name()
+                    .unwrap_or("version-dependent SVC"),
+            }),
         };
         self.observe(immediate, &outcome);
         outcome
@@ -1112,6 +1118,9 @@ fn reject_ipc(
         IpcWireError::Malformed(reason) => {
             reject(context, HorizonSvcFault::MalformedIpc { immediate, reason })
         }
+        IpcWireError::Internal(reason) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc { immediate, reason })
+        }
         IpcWireError::ResourceExhausted => {
             result(context, HorizonKernelResult::OUT_OF_RESOURCE);
             resume()
@@ -1182,13 +1191,10 @@ fn get_info(
         7 => context.process().used_memory_size(),
         28 => 0,
         _ => {
-            return reject(
-                context,
-                HorizonSvcFault::UnsupportedSemantics {
-                    immediate: 0x29,
-                    documented_name: "GetInfo",
-                },
-            );
+            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
+                immediate: 0x29,
+                documented_name: "GetInfo",
+            });
         }
     };
     result(context, HorizonKernelResult::SUCCESS);
@@ -2581,6 +2587,26 @@ mod tests {
         );
         assert_eq!(handles.len(), 1);
         assert!(handles.get(existing).unwrap().is::<ThreadObject>());
+    }
+
+    #[test]
+    fn unsupported_horizon_semantics_have_no_guest_result() {
+        let fault = HorizonSvcFault::UnsupportedSemantics {
+            immediate: 0x23,
+            documented_name: "WaitForAddress",
+        };
+
+        assert_eq!(fault.guest_result(), None);
+    }
+
+    #[test]
+    fn invalid_emulator_ipc_state_has_no_guest_result() {
+        let fault = HorizonSvcFault::InternalIpc {
+            immediate: 0x21,
+            reason: "synthetic internal invariant",
+        };
+
+        assert_eq!(fault.guest_result(), None);
     }
 
     #[test]

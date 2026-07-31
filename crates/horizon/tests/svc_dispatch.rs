@@ -70,7 +70,7 @@ fn put_receive_buffer(bytes: &mut [u8], offset: usize, address: u64, size: u64) 
 }
 
 fn synthetic_nro(instructions: &[u32]) -> Vec<u8> {
-    assert!(instructions.len() <= 16);
+    assert!(instructions.len() <= 32);
     let mut bytes = vec![0; 0x2800];
     put_u32(&mut bytes, 0, 0x1400_0020); // Branch over the NRO header.
     for (index, instruction) in instructions.iter().copied().enumerate() {
@@ -681,6 +681,33 @@ fn malformed_wire_messages_are_rejected_with_bounded_diagnostics() {
             HorizonKernelResult::INVALID_STATE.raw()
         );
     }
+}
+
+#[test]
+fn unimplemented_command_on_a_known_service_is_fatal() {
+    let (_directory, mut process) = fixture_process(&[svc(0x21)]);
+    let handle = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let tls = process.main_thread().tls_base;
+    let mut message = [0_u8; 0x100];
+    put_u32(&mut message, 0, 4);
+    put_u32(&mut message, 4, 8);
+    put_u32(&mut message, 16, 0x4943_4653);
+    put_u32(&mut message, 24, 999);
+    write_guest_bytes(&process, tls, &message);
+    state(&mut process).write_w(x(0), handle);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedService {
+            immediate: 0x21,
+            operation: UnsupportedServiceOperation::Command {
+                service: "fsp-srv",
+                command_id: 999,
+            },
+        })
+    );
+    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
 }
 
 #[test]
@@ -1493,41 +1520,34 @@ fn named_port_registration_connection_acceptance_and_removal_share_one_port() {
 }
 
 #[test]
-fn unsupported_and_unknown_calls_are_structured_and_bounded_in_coverage() {
+fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
     let (_directory, mut process) = fixture_process(&[svc(0x23)]);
     let mut dispatcher = HorizonSvcDispatcher::default();
-    let rejected_source = state(&mut process).pc();
+    let source = state(&mut process).pc();
     let result = dispatch_next(&mut process, &mut dispatcher);
     assert!(matches!(
         result,
-        ExceptionHandlingResult::Rejected(HorizonSvcFault::UnsupportedSemantics {
+        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedSemantics {
             immediate: 0x23,
             ..
         })
     ));
-    assert_eq!(
-        state(&mut process).read_w(x(0)),
-        HorizonKernelResult::NOT_IMPLEMENTED.raw()
-    );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
-    assert_eq!(state(&mut process).pc(), rejected_source + 4);
+    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+    assert_eq!(state(&mut process).pc(), source);
     assert_eq!(
         dispatcher.coverage()[0].support,
         HorizonSvcSupport::Unsupported
     );
-    assert_eq!(dispatcher.coverage()[0].rejected, 1);
+    assert_eq!(dispatcher.coverage()[0].rejected, 0);
     assert_eq!(dispatcher.coverage()[0].resumed, 0);
+    assert_eq!(dispatcher.coverage()[0].faulted, 1);
 
     let (_directory, mut process) = fixture_process(&[svc(0xff)]);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Rejected(HorizonSvcFault::Unknown(_))
+        ExceptionHandlingResult::Fault(HorizonSvcFault::Unknown(_))
     ));
-    assert_eq!(
-        state(&mut process).read_w(x(0)),
-        HorizonKernelResult::NOT_SUPPORTED.raw()
-    );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
+    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
     assert_eq!(dispatcher.unknown_calls(), 1);
     assert_eq!(dispatcher.coverage().len(), 1);
 }
@@ -1536,6 +1556,9 @@ fn unsupported_and_unknown_calls_are_structured_and_bounded_in_coverage() {
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let (_directory, mut process) = fixture_process(&[
         svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
         svc(0x21),
         svc(0x21),
         svc(0x21),
@@ -1759,6 +1782,51 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .get_as::<nixe_horizon::HidSession>(hid_handle)
             .is_some()
     );
+
+    // Configure the same FullKey/Player-1 Npad publication contract that
+    // libnx establishes before consuming HID shared memory.
+    let mut activate_npad = [0_u8; 0x100];
+    put_u32(&mut activate_npad, 0, 4);
+    put_u32(&mut activate_npad, 4, 10 | (1 << 31));
+    put_u32(&mut activate_npad, 8, 1);
+    put_u32(&mut activate_npad, 32, 0x4943_4653);
+    put_u32(&mut activate_npad, 40, 103);
+    write_guest_bytes(&process, tls, &activate_npad);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut set_style = activate_npad;
+    put_u32(&mut set_style, 4, 11 | (1 << 31));
+    put_u32(&mut set_style, 40, 100);
+    put_u32(&mut set_style, 48, 1);
+    write_guest_bytes(&process, tls, &set_style);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let id_address = tls.checked_add(0xf0).unwrap();
+    let mut set_ids = [0_u8; 0x100];
+    put_u32(&mut set_ids, 0, 4 | (1 << 16));
+    put_u32(&mut set_ids, 4, 10 | (1 << 31));
+    put_u32(&mut set_ids, 8, 1);
+    put_send_static(&mut set_ids, 20, id_address.get(), 4);
+    put_u32(&mut set_ids, 32, 0x4943_4653);
+    put_u32(&mut set_ids, 40, 102);
+    put_u32(&mut set_ids, 0xf0, 0);
+    write_guest_bytes(&process, tls, &set_ids);
+    state(&mut process).write_w(x(0), hid_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 
     let mut create_resource = [0_u8; 0x100];
     put_u32(&mut create_resource, 0, 4);

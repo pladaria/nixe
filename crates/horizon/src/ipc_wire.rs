@@ -42,6 +42,7 @@ const FS_DIRECTORY_ENTRY_FILE: u8 = 1;
 pub(crate) enum IpcWireError {
     GuestMemory(DataAccessFault),
     Malformed(&'static str),
+    Internal(&'static str),
     ResourceExhausted,
     CanonicalBacking(CanonicalRangeAccessError),
     UnsupportedService(UnsupportedServiceOperation),
@@ -57,6 +58,11 @@ pub enum UnsupportedServiceOperation {
     Command {
         service: &'static str,
         command_id: u32,
+    },
+    CommandVariant {
+        service: &'static str,
+        command_id: u32,
+        detail: &'static str,
     },
 }
 
@@ -75,13 +81,40 @@ impl std::fmt::Display for UnsupportedServiceOperation {
                 formatter,
                 "Horizon service command is not implemented: service={service} command={command_id}"
             ),
+            Self::CommandVariant {
+                service,
+                command_id,
+                detail,
+            } => write!(
+                formatter,
+                "Horizon service command variant is not implemented: service={service} command={command_id} detail={detail}"
+            ),
         }
+    }
+}
+
+fn unsupported_service_command<T>(
+    service: &'static str,
+    command_id: u32,
+) -> Result<T, IpcWireError> {
+    Err(IpcWireError::UnsupportedService(
+        UnsupportedServiceOperation::Command {
+            service,
+            command_id,
+        },
+    ))
+}
+
+const fn semantic_service_name(service: IpcService) -> &'static str {
+    match service {
+        IpcService::FileSystem => "fsp-srv",
+        IpcService::AddOnContent => "aoc:u",
     }
 }
 
 impl From<MessageError> for IpcWireError {
     fn from(error: MessageError) -> Self {
-        Self::Malformed(error.0)
+        Self::Internal(error.0)
     }
 }
 
@@ -235,10 +268,20 @@ pub(crate) fn send_sync_request_from_buffer(
         .map_err(|_| IpcWireError::ResourceExhausted)?;
     buffer.resize(size, 0);
     read_bytes(process, address, &mut buffer)?;
-    let hipc = HipcRequest::decode(&buffer)?;
+    let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
     let is_domain = applet.as_ref().is_some_and(AppletSession::is_domain)
         || service.as_ref().is_some_and(IpcSession::is_domain);
-    let request = CmifRequest::decode(&hipc, is_domain)?;
+    let request = CmifRequest::decode(&hipc, is_domain).map_err(|error| {
+        if error.0 == "unsupported HIPC command type for CMIF" {
+            IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
+                service: "CMIF transport",
+                command_id: u32::from(hipc.command_type),
+                detail: error.0,
+            })
+        } else {
+            IpcWireError::Malformed(error.0)
+        }
+    })?;
     log::debug!(
         "SendSyncRequest handle={handle:#x} type={} command={} send_pid={} descriptors={}/{}/{}/{} handles={}/{}",
         request.command_type,
@@ -386,18 +429,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 &0_u16.to_le_bytes(),
                 None,
             ),
-            0 | 1 | 2 | 4 => encode_response(
-                request.token,
-                HorizonIpcResult::CMIF_NOT_SUPPORTED,
-                &[],
-                None,
-            ),
-            _ => encode_response(
-                request.token,
-                HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
-                &[],
-                None,
-            ),
+            command_id => return unsupported_service_command("CMIF control", command_id),
         }?;
         write_bytes(process, address, &response)?;
         return Ok(SyncRequestResult::Success);
@@ -423,7 +455,7 @@ pub(crate) fn send_sync_request_from_buffer(
     } else if let Some(account) = account {
         dispatch_account(process, &account, request, &hipc)?
     } else if let Some(hid) = hid {
-        dispatch_hid(process, &hid, request, &hipc)?
+        dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
     } else if let Some(resource) = hid_applet_resource {
         dispatch_hid_applet_resource(process, &resource, request)?
     } else if let Some(time) = time {
@@ -664,15 +696,7 @@ fn dispatch_service_manager(
                 )),
             }
         }
-        _ => Ok((
-            encode_response(
-                request.token,
-                HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
-                &[],
-                None,
-            )?,
-            None,
-        )),
+        command_id => unsupported_service_command("sm:", command_id),
     }
 }
 
@@ -790,11 +814,9 @@ fn dispatch_semantic_service(
             input_objects,
         }) => {
             if !input_objects.is_empty() {
-                return semantic_error(
-                    request.token,
-                    session.service(),
-                    Some(session),
-                    HorizonIpcResult::CMIF_NOT_SUPPORTED,
+                return unsupported_service_command(
+                    semantic_service_name(session.service()),
+                    request.command_id,
                 );
             }
             if *object_id == 1 {
@@ -824,11 +846,9 @@ fn dispatch_semantic_service(
         Target::Object(object) => decode_object_request(process, object, &request, hipc)?,
     };
     let Some(semantic_request) = semantic_request else {
-        return semantic_error(
-            request.token,
-            session.service(),
-            Some(session),
-            HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
+        return unsupported_service_command(
+            semantic_service_name(session.service()),
+            request.command_id,
         );
     };
 
@@ -845,6 +865,17 @@ fn dispatch_semantic_service(
     };
     let response = match semantic_result {
         Ok(response) => response,
+        Err(error) if error == IpcResultCode::INVALID_COMMAND => {
+            return unsupported_service_command(
+                semantic_service_name(session.service()),
+                request.command_id,
+            );
+        }
+        Err(error) if error == IpcResultCode::INTERNAL_STATE => {
+            return Err(IpcWireError::Internal(
+                "semantic service entered an invalid internal state",
+            ));
+        }
         Err(error) => {
             return semantic_error(
                 request.token,
@@ -871,12 +902,7 @@ fn dispatch_plain_semantic_object(
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(semantic_request) = decode_object_request(process, object, &request, hipc)? else {
-        return semantic_error(
-            request.token,
-            IpcService::FileSystem,
-            None,
-            HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID,
-        );
+        return unsupported_service_command(semantic_object_name(object), request.command_id);
     };
     let result = {
         let (mounts, handles) = process.mounts_and_handles_mut();
@@ -891,12 +917,34 @@ fn dispatch_plain_semantic_object(
             hipc,
             response,
         ),
+        Err(error) if error == IpcResultCode::INVALID_COMMAND => {
+            unsupported_service_command(semantic_object_name(object), request.command_id)
+        }
+        Err(error) if error == IpcResultCode::INTERNAL_STATE => Err(IpcWireError::Internal(
+            "semantic object entered an invalid internal state",
+        )),
         Err(error) => semantic_error(
             request.token,
             IpcService::FileSystem,
             None,
             HorizonIpcResult::from_semantic(IpcService::FileSystem, error),
         ),
+    }
+}
+
+fn semantic_object_name(object: &HandleObject) -> &'static str {
+    if object.is::<ReadOnlyFileSystem>() {
+        "IFileSystem(read-only)"
+    } else if object.is::<HostDirectoryFileSystem>() {
+        "IFileSystem(sd-card)"
+    } else if object.is::<ReadOnlyFile>() {
+        "IFile(read-only)"
+    } else if object.is::<HostFile>() {
+        "IFile(sd-card)"
+    } else if object.is::<ReadOnlyDirectory>() {
+        "IDirectory"
+    } else {
+        "semantic IPC object"
     }
 }
 
@@ -1126,7 +1174,7 @@ fn encode_semantic_response(
                 let object = process
                     .handles_mut()
                     .close(handle)
-                    .map_err(|_| IpcWireError::Malformed("semantic child handle disappeared"))?;
+                    .map_err(|_| IpcWireError::Internal("semantic child handle disappeared"))?;
                 let Some(object_id) =
                     domain_session.and_then(|session| session.insert_object(object))
                 else {
@@ -1327,6 +1375,118 @@ fn one_send_buffer(hipc: &HipcRequest<'_>) -> Result<BufferDescriptor, IpcWireEr
     }
 }
 
+const NV_IOCTL_WRITE: u32 = 1 << 30;
+const NV_IOCTL_READ: u32 = 1 << 31;
+const NV_IOCTL_SIZE_MASK: u32 = 0x3fff;
+
+// nvIoctl derives the two buffer presences and their common size directly
+// from these Linux-style request fields before issuing CMIF command 1:
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c#L137-L170
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NvIoctlBuffers {
+    input: Option<BufferDescriptor>,
+    output: Option<BufferDescriptor>,
+}
+
+fn nv_ioctl_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
+    nv_ioctl_buffer_descriptors(
+        &hipc.send_statics,
+        &hipc.send_buffers,
+        &hipc.receive_buffers,
+        &hipc.receive_statics,
+        request,
+    )
+}
+
+fn nv_ioctl_buffer_descriptors(
+    send_statics: &[SendStaticDescriptor],
+    send_buffers: &[BufferDescriptor],
+    receive_buffers: &[BufferDescriptor],
+    receive_statics: &ReceiveStatics,
+    request: u32,
+) -> Result<NvIoctlBuffers, IpcWireError> {
+    let [input] = send_buffers else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires exactly one input auto-select buffer",
+        ));
+    };
+    let [output] = receive_buffers else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires exactly one output auto-select buffer",
+        ));
+    };
+    let [input_pointer] = send_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires exactly one input auto-select pointer",
+        ));
+    };
+    let ReceiveStatics::Entries(output_pointers) = receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires one output auto-select pointer",
+        ));
+    };
+    let [output_pointer] = output_pointers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires exactly one output auto-select pointer",
+        ));
+    };
+
+    // Nixe reports a zero CMIF pointer-buffer size, so libnx selects the
+    // map-alias side of each HipcAutoSelect pair and emits null pointer-side
+    // placeholders. Keep this transport contract pinned to the implementation
+    // used by the target homebrew:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L157-L177
+    if input_pointer.address != 0
+        || input_pointer.size != 0
+        || output_pointer.address != 0
+        || output_pointer.size != 0
+    {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl auto-select pointer placeholders are not null",
+        ));
+    }
+
+    let encoded_size = u64::from((request >> 16) & NV_IOCTL_SIZE_MASK);
+    let select = |descriptor: BufferDescriptor,
+                  present: bool,
+                  present_error: &'static str,
+                  absent_error: &'static str|
+     -> Result<Option<BufferDescriptor>, IpcWireError> {
+        if descriptor.mode == BufferMode::Invalid {
+            return Err(IpcWireError::Malformed(present_error));
+        }
+        if present {
+            if descriptor.size != encoded_size || (encoded_size != 0 && descriptor.address == 0) {
+                return Err(IpcWireError::Malformed(present_error));
+            }
+            Ok(Some(descriptor))
+        } else if descriptor.address == 0
+            && descriptor.size == 0
+            && descriptor.mode == BufferMode::Normal
+        {
+            Ok(None)
+        } else {
+            Err(IpcWireError::Malformed(absent_error))
+        }
+    };
+
+    Ok(NvIoctlBuffers {
+        input: select(
+            *input,
+            request & NV_IOCTL_WRITE != 0,
+            "nvdrv ioctl input buffer does not match its encoded direction and size",
+            "nvdrv ioctl without input carries a non-null input placeholder",
+        )?,
+        output: select(
+            *output,
+            request & NV_IOCTL_READ != 0,
+            "nvdrv ioctl output buffer does not match its encoded direction and size",
+            "nvdrv ioctl without output carries a non-null output placeholder",
+        )?,
+    })
+}
+
 fn write_descriptor_bytes(
     process: &ExceptionProcessContext<'_>,
     descriptor: BufferDescriptor,
@@ -1373,7 +1533,7 @@ fn dispatch_system_settings(
                 None,
             ))
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("set:sys", command_id),
     }
 }
 
@@ -1407,7 +1567,7 @@ fn dispatch_performance_manager(
                 None,
             ))
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("apm", command_id),
     }
 }
 
@@ -1456,7 +1616,7 @@ fn dispatch_performance_session(
                 None,
             ))
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("IPerformanceSession", command_id),
     }
 }
 
@@ -1470,7 +1630,10 @@ fn dispatch_vi(
     match session.kind() {
         ViObjectKind::Root(kind) => {
             if request.command_id != kind.required_root_command() {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+                return unsupported_service_command(
+                    vi_object_name(session.kind()),
+                    request.command_id,
+                );
             }
             vi_child(
                 process,
@@ -1614,7 +1777,7 @@ fn dispatch_vi(
                     Some(handle),
                 ))
             }
-            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            command_id => unsupported_service_command("IApplicationDisplayService", command_id),
         },
         ViObjectKind::SystemDisplay => match request.command_id {
             1203 => {
@@ -1632,11 +1795,58 @@ fn dispatch_vi(
                     None,
                 ))
             }
-            2201 | 2203 | 2205 => Ok((
-                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
-                None,
-            )),
-            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            // ABI layouts follow pinned libnx vi.c:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/vi.c#L411-L446
+            2201 => {
+                let (Some(x), Some(y), Some(layer_id)) = (
+                    request_f32(request.data, 0),
+                    request_f32(request.data, 4),
+                    request_u64(request.data, 8),
+                ) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result =
+                    if x.is_finite() && y.is_finite() && video.set_layer_position(layer_id, x, y) {
+                        HorizonIpcResult::SUCCESS
+                    } else {
+                        HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                    };
+                cmif_error(request.token, result)
+            }
+            2203 => {
+                let (Some(layer_id), Some(width), Some(height)) = (
+                    request_u64(request.data, 0),
+                    request_i64(request.data, 8),
+                    request_i64(request.data, 16),
+                ) else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = match (u32::try_from(width), u32::try_from(height)) {
+                    (Ok(width), Ok(height))
+                        if width != 0
+                            && height != 0
+                            && video.set_layer_size(layer_id, width, height) =>
+                    {
+                        HorizonIpcResult::SUCCESS
+                    }
+                    _ => HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                };
+                cmif_error(request.token, result)
+            }
+            2205 => {
+                let (Some(layer_id), Some(z)) =
+                    (request_u64(request.data, 0), request_i64(request.data, 8))
+                else {
+                    return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let result = if video.set_layer_z(layer_id, z) {
+                    HorizonIpcResult::SUCCESS
+                } else {
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION
+                };
+                cmif_error(request.token, result)
+            }
+            command_id => unsupported_service_command("ISystemDisplayService", command_id),
         },
         ViObjectKind::ManagerDisplay => match request.command_id {
             2010 | 2012 => {
@@ -1679,9 +1889,21 @@ fn dispatch_vi(
                 };
                 cmif_error(request.token, result)
             }
-            _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            command_id => unsupported_service_command("IManagerDisplayService", command_id),
         },
         ViObjectKind::BinderRelay => dispatch_binder_relay(process, video, request, hipc),
+    }
+}
+
+const fn vi_object_name(kind: ViObjectKind) -> &'static str {
+    match kind {
+        ViObjectKind::Root(ViServiceKind::Application) => "vi:u",
+        ViObjectKind::Root(ViServiceKind::System) => "vi:s",
+        ViObjectKind::Root(ViServiceKind::Manager) => "vi:m",
+        ViObjectKind::ApplicationDisplay => "IApplicationDisplayService",
+        ViObjectKind::BinderRelay => "IHOSBinderDriver",
+        ViObjectKind::SystemDisplay => "ISystemDisplayService",
+        ViObjectKind::ManagerDisplay => "IManagerDisplayService",
     }
 }
 
@@ -1709,9 +1931,23 @@ fn dispatch_binder_relay(
                 GuestVirtualAddress::new(input.address),
                 &mut encoded,
             )?;
-            let transaction = video
-                .transact_binder(binder_id, code, &encoded)
-                .map_err(|error| IpcWireError::Malformed(error.0))?;
+            let transaction =
+                video
+                    .transact_binder(binder_id, code, &encoded)
+                    .map_err(|error| match error {
+                        crate::parcel::ParcelError::Malformed(reason) => {
+                            IpcWireError::Malformed(reason)
+                        }
+                        crate::parcel::ParcelError::Unsupported(detail) => {
+                            IpcWireError::UnsupportedService(
+                                UnsupportedServiceOperation::CommandVariant {
+                                    service: "IGraphicBufferProducer",
+                                    command_id: code,
+                                    detail,
+                                },
+                            )
+                        }
+                    })?;
             log::debug!(
                 "Binder producer {binder_id} completed transaction {code:#x}{}",
                 if transaction.queued.is_some() {
@@ -1744,7 +1980,20 @@ fn dispatch_binder_relay(
                 let bytes = view.read_plane(0).map_err(map_nvmap_view_error)?;
                 video
                     .queue_software_frame(binder_id, slot, &buffer, &bytes)
-                    .map_err(|error| IpcWireError::Malformed(error.0))?;
+                    .map_err(|error| match error {
+                        crate::graphics::FramebufferError::Malformed(reason) => {
+                            IpcWireError::Malformed(reason)
+                        }
+                        crate::graphics::FramebufferError::Unsupported(detail) => {
+                            IpcWireError::UnsupportedService(
+                                UnsupportedServiceOperation::CommandVariant {
+                                    service: "IGraphicBufferProducer",
+                                    command_id: code,
+                                    detail,
+                                },
+                            )
+                        }
+                    })?;
             }
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
@@ -1752,7 +2001,16 @@ fn dispatch_binder_relay(
             ))
         }
         1 => {
-            if request.data.len() < 12 || video.binder_event(binder_id).is_none() {
+            // IHOSBinderDriver::AdjustRefcount uses three signed 32-bit values;
+            // reference type 0 is weak and 1 is strong:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/binder.c#L115-L126
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/display/binder.h#L33-L50
+            let (Some(add_value), Some(reference_type)) =
+                (request_i32(request.data, 4), request_i32(request.data, 8))
+            else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if !video.adjust_binder_refcount(binder_id, add_value, reference_type) {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
             Ok((
@@ -1784,7 +2042,7 @@ fn dispatch_binder_relay(
                 Some(handle),
             ))
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("IHOSBinderDriver", command_id),
     }
 }
 
@@ -1853,19 +2111,23 @@ fn dispatch_nvdrv(
             let Some(ioctl) = request_u32(request.data, 4) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
-            let input_descriptor = one_send_buffer(hipc)?;
-            let output_descriptor = one_receive_buffer(hipc)?;
-            let input_size = usize::try_from(input_descriptor.size)
+            let buffers = nv_ioctl_buffers(hipc, ioctl)?;
+            let input_size = buffers
+                .input
+                .map(|descriptor| descriptor.size)
+                .map_or(Ok(0), usize::try_from)
                 .map_err(|_| IpcWireError::Malformed("nvdrv ioctl input is too large"))?;
             if input_size > 0x1000 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut input = vec![0_u8; input_size];
-            read_bytes(
-                process,
-                GuestVirtualAddress::new(input_descriptor.address),
-                &mut input,
-            )?;
+            if let Some(input_descriptor) = buffers.input {
+                read_bytes(
+                    process,
+                    GuestVirtualAddress::new(input_descriptor.address),
+                    &mut input,
+                )?;
+            }
             let response = service
                 .ioctl(
                     NvDrvFileDescriptor::new(fd),
@@ -1876,7 +2138,9 @@ fn dispatch_nvdrv(
                     process.canonical_memory(),
                 )
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
-            write_descriptor_bytes(process, output_descriptor, &response.output)?;
+            if let Some(output_descriptor) = buffers.output {
+                write_descriptor_bytes(process, output_descriptor, &response.output)?;
+            }
             Ok((
                 encode_response(
                     request.token,
@@ -2003,16 +2267,7 @@ fn dispatch_applet(
         }
     };
     if !input_objects.is_empty() {
-        return Ok((
-            encode_domain_response(
-                request.token,
-                HorizonIpcResult::CMIF_NOT_SUPPORTED,
-                &[],
-                &[],
-                &[],
-            )?,
-            None,
-        ));
+        return unsupported_service_command("appletOE", request.command_id);
     }
     let Some(object) = session.object(object_id) else {
         return Ok((
@@ -2030,7 +2285,7 @@ fn dispatch_applet(
     match object {
         AppletObject::Root => {
             if request.command_id != 0 {
-                return applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+                return unsupported_service_command(applet_object_name(object), request.command_id);
             }
             if hipc.pid.is_none()
                 || hipc.copy_handles.as_slice() != [crate::CURRENT_PROCESS_HANDLE]
@@ -2056,7 +2311,10 @@ fn dispatch_applet(
                 20 => AppletObject::ApplicationFunctions,
                 1000 => AppletObject::DebugFunctions,
                 _ => {
-                    return applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+                    return unsupported_service_command(
+                        applet_object_name(object),
+                        request.command_id,
+                    );
                 }
             };
             applet_child(session, request.token, child, applet_object_name(child))
@@ -2085,7 +2343,7 @@ fn dispatch_applet(
             5 => applet_data(request.token, &[session.operation_mode().as_raw()]),
             6 => applet_data(request.token, &PERFORMANCE_MODE_NORMAL.to_le_bytes()),
             9 => applet_data(request.token, &[1]), // Application is in focus.
-            _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            command_id => unsupported_service_command("ICommonStateGetter", command_id),
         },
         AppletObject::SelfController => match request.command_id {
             40 => {
@@ -2097,23 +2355,50 @@ fn dispatch_applet(
                 };
                 applet_data(request.token, &layer.id.to_le_bytes())
             }
-            11..=13 => applet_data(request.token, &[]),
-            _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            // These state-mutating command layouts follow pinned libnx:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1113-L1125
+            11 => {
+                let Some(enabled) = request.data.first() else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                session.set_operation_mode_changed_notification(*enabled != 0);
+                applet_data(request.token, &[])
+            }
+            12 => {
+                let Some(enabled) = request.data.first() else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                session.set_performance_mode_changed_notification(*enabled != 0);
+                applet_data(request.token, &[])
+            }
+            13 => {
+                let Some(mode) = request.data.get(..3) else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                session.set_focus_handling_mode([mode[0] != 0, mode[1] != 0, mode[2] != 0]);
+                applet_data(request.token, &[])
+            }
+            command_id => unsupported_service_command("ISelfController", command_id),
         },
         AppletObject::WindowController => match request.command_id {
             1 => applet_data(request.token, &process.process_id().to_le_bytes()),
-            10 => applet_data(request.token, &[]),
-            _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            // AcquireForegroundRights has no input/output payload:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1271-L1279
+            10 => {
+                session.acquire_foreground_rights();
+                applet_data(request.token, &[])
+            }
+            command_id => unsupported_service_command("IWindowController", command_id),
         },
         AppletObject::ApplicationFunctions => match request.command_id {
             40 => applet_data(request.token, &[1]),
-            _ => applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+            command_id => unsupported_service_command("IApplicationFunctions", command_id),
         },
         AppletObject::LibraryAppletCreator
         | AppletObject::AudioController
         | AppletObject::DisplayController
         | AppletObject::DebugFunctions => {
-            applet_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID)
+            unsupported_service_command(applet_object_name(object), request.command_id)
         }
     }
 }
@@ -2121,6 +2406,7 @@ fn dispatch_applet(
 fn dispatch_hid(
     process: &mut ExceptionProcessContext<'_>,
     session: &HidSession,
+    hid_system: &HidSystem,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -2143,9 +2429,13 @@ fn dispatch_hid(
         // six-axis sensor. Player one is published as FullKey by HidSystem.
         // ABI: libnx hid.c at dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb.
         66 | 67 if hipc.pid.is_some() && request.data.len() >= 16 => {
+            let handle = request_u32(request.data, 0).expect("validated HID handle payload");
+            hid_system.set_six_axis_sensor_active(handle, request.command_id == 66);
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         100 if hipc.pid.is_some() && request.data.len() >= 16 => {
+            let style_set = request_u32(request.data, 0).expect("validated HID style payload");
+            hid_system.set_supported_npad_style_set(style_set);
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         102 if hipc.pid.is_some()
@@ -2155,18 +2445,53 @@ fn dispatch_hid(
                 ([_], []) | ([], [_])
             ) =>
         {
+            let (address, size) = match (hipc.send_statics.as_slice(), hipc.send_buffers.as_slice())
+            {
+                ([descriptor], []) => (descriptor.address, usize::from(descriptor.size)),
+                ([], [descriptor]) if descriptor.mode != BufferMode::Invalid => (
+                    descriptor.address,
+                    usize::try_from(descriptor.size)
+                        .map_err(|_| IpcWireError::Malformed("HID Npad ID buffer is too large"))?,
+                ),
+                _ => unreachable!("validated HID Npad ID descriptor"),
+            };
+            if size == 0 || !size.is_multiple_of(4) || size > 10 * 4 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let mut encoded_ids = vec![0; size];
+            read_bytes(process, GuestVirtualAddress::new(address), &mut encoded_ids)?;
+            let ids = encoded_ids
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+            if !hid_system.set_supported_npad_ids(ids) {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         103 if hipc.pid.is_some() && request.data.len() >= 8 => {
+            hid_system.activate_npad();
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         109 if hipc.pid.is_some() && request.data.len() >= 16 => {
-            semantic_success(request.token, false, &[], &[], &[], None)
+            let revision = request_u32(request.data, 0).expect("validated HID revision payload");
+            Err(IpcWireError::UnsupportedService(
+                UnsupportedServiceOperation::CommandVariant {
+                    service: "hid",
+                    command_id: 109,
+                    detail: match revision {
+                        1 => "Npad shared-memory revision 1",
+                        2 => "Npad shared-memory revision 2",
+                        3 => "Npad shared-memory revision 3",
+                        5 => "Npad shared-memory revision 5",
+                        _ => "unknown Npad shared-memory revision",
+                    },
+                },
+            ))
         }
         66 | 67 | 100 | 102 | 103 | 109 => {
             cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER)
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("hid", command_id),
     }
 }
 
@@ -2179,7 +2504,7 @@ fn dispatch_hid_applet_resource(
     // object as a copied handle; libnx maps it read-only immediately:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L47-L65
     if request.command_id != 0 {
-        return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID);
+        return unsupported_service_command("IAppletResource", request.command_id);
     }
     let handle = process
         .handles_mut()
@@ -2217,7 +2542,7 @@ fn dispatch_time(
             log::debug!("time:u returned shared-memory handle {handle:#x}");
             return semantic_success(request.token, false, &[], &[handle], &[], None);
         }
-        _ => return cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => return unsupported_service_command("time:u", command_id),
     };
     let handle = process
         .handles_mut()
@@ -2257,7 +2582,7 @@ fn dispatch_system_clock(
                 .map_err(|_| IpcWireError::ResourceExhausted)?;
             semantic_success(request.token, false, &[], &[], &[], None)
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("ISystemClock", command_id),
     }
 }
 
@@ -2274,7 +2599,7 @@ fn dispatch_steady_clock(
             semantic_success(request.token, false, &data, &[], &[], None)
         }
         200 => semantic_success(request.token, false, &0_i64.to_le_bytes(), &[], &[], None),
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("ISteadyClock", command_id),
     }
 }
 
@@ -2306,7 +2631,7 @@ fn dispatch_timezone(
             };
             semantic_success(request.token, false, &data, &[], &[], None)
         }
-        _ => cmif_error(request.token, HorizonIpcResult::CMIF_UNKNOWN_COMMAND_ID),
+        command_id => unsupported_service_command("ITimeZoneService", command_id),
     }
 }
 
@@ -2392,10 +2717,28 @@ fn request_u32(data: &[u8], offset: usize) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
+fn request_i32(data: &[u8], offset: usize) -> Option<i32> {
+    data.get(offset..offset + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i32::from_le_bytes)
+}
+
 fn request_u64(data: &[u8], offset: usize) -> Option<u64> {
     data.get(offset..offset + 8)
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes)
+}
+
+fn request_i64(data: &[u8], offset: usize) -> Option<i64> {
+    data.get(offset..offset + 8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i64::from_le_bytes)
+}
+
+fn request_f32(data: &[u8], offset: usize) -> Option<f32> {
+    data.get(offset..offset + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(f32::from_le_bytes)
 }
 
 fn emulated_firmware_version() -> [u8; FIRMWARE_VERSION_SIZE] {
@@ -2604,6 +2947,93 @@ fn add(address: GuestVirtualAddress, offset: usize) -> Result<GuestVirtualAddres
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc_message::ReceiveStaticDescriptor;
+
+    fn nv_ioctl_descriptors(
+        input: BufferDescriptor,
+        output: BufferDescriptor,
+        request: u32,
+    ) -> Result<NvIoctlBuffers, IpcWireError> {
+        nv_ioctl_buffer_descriptors(
+            &[SendStaticDescriptor {
+                address: 0,
+                size: 0,
+                index: 0,
+            }],
+            &[input],
+            &[output],
+            &ReceiveStatics::Entries(vec![ReceiveStaticDescriptor {
+                address: 0,
+                size: 0,
+            }]),
+            request,
+        )
+    }
+
+    fn buffer(address: u64, size: u64) -> BufferDescriptor {
+        BufferDescriptor {
+            address,
+            size,
+            mode: BufferMode::Normal,
+        }
+    }
+
+    #[test]
+    fn write_only_nv_ioctl_accepts_libnx_null_output_placeholder() {
+        assert_eq!(
+            nv_ioctl_descriptors(buffer(0x1000, 40), buffer(0, 0), 0x4028_4109),
+            Ok(NvIoctlBuffers {
+                input: Some(buffer(0x1000, 40)),
+                output: None,
+            })
+        );
+    }
+
+    #[test]
+    fn nv_ioctl_direction_does_not_hide_a_non_null_placeholder() {
+        assert_eq!(
+            nv_ioctl_descriptors(buffer(0x1000, 40), buffer(0x2000, 40), 0x4028_4109),
+            Err(IpcWireError::Malformed(
+                "nvdrv ioctl without output carries a non-null output placeholder"
+            ))
+        );
+    }
+
+    #[test]
+    fn unimplemented_service_command_is_a_typed_host_fault() {
+        assert_eq!(
+            unsupported_service_command::<()>("IExample", 77),
+            Err(IpcWireError::UnsupportedService(
+                UnsupportedServiceOperation::Command {
+                    service: "IExample",
+                    command_id: 77,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn unimplemented_command_variants_are_typed_host_faults() {
+        let operation = UnsupportedServiceOperation::CommandVariant {
+            service: "IGraphicBufferProducer",
+            command_id: 99,
+            detail: "unsupported transaction",
+        };
+        assert_eq!(
+            operation.to_string(),
+            "Horizon service command variant is not implemented: service=IGraphicBufferProducer command=99 detail=unsupported transaction"
+        );
+    }
+
+    #[test]
+    fn wire_dispatch_has_no_generic_unsupported_guest_fallback() {
+        let source = include_str!("ipc_wire.rs");
+        let unknown_command = ["HorizonIpcResult::", "CMIF_UNKNOWN_COMMAND_ID"].concat();
+        let not_supported = ["HorizonIpcResult::", "CMIF_NOT_SUPPORTED"].concat();
+
+        assert!(!source.contains(&unknown_command));
+        assert!(!source.contains(&not_supported));
+    }
 
     #[test]
     fn service_names_require_canonical_zero_padding() {

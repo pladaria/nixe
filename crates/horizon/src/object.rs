@@ -543,6 +543,10 @@ struct AppletDomain {
     next_object_id: u32,
     objects: BTreeMap<u32, AppletObject>,
     operation_mode: OperationMode,
+    operation_mode_changed_notification: bool,
+    performance_mode_changed_notification: bool,
+    focus_handling_mode: [bool; 3],
+    foreground_rights_acquired: bool,
 }
 
 /// Client session connected to Horizon's `appletOE` service.
@@ -565,6 +569,10 @@ impl AppletSession {
                 next_object_id: APPLET_ROOT_OBJECT_ID + 1,
                 objects,
                 operation_mode,
+                operation_mode_changed_notification: false,
+                performance_mode_changed_notification: false,
+                focus_handling_mode: [false; 3],
+                foreground_rights_acquired: false,
             })),
         }
     }
@@ -625,6 +633,60 @@ impl AppletSession {
         }
         domain.objects.remove(&object_id).is_some()
     }
+
+    pub(crate) fn set_operation_mode_changed_notification(&self, enabled: bool) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if domain.operation_mode_changed_notification != enabled {
+            domain.operation_mode_changed_notification = enabled;
+        }
+    }
+
+    pub(crate) fn set_performance_mode_changed_notification(&self, enabled: bool) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if domain.performance_mode_changed_notification != enabled {
+            domain.performance_mode_changed_notification = enabled;
+        }
+    }
+
+    pub(crate) fn set_focus_handling_mode(&self, mode: [bool; 3]) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if domain.focus_handling_mode != mode {
+            domain.focus_handling_mode = mode;
+        }
+    }
+
+    pub(crate) fn acquire_foreground_rights(&self) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !domain.foreground_rights_acquired {
+            domain.foreground_rights_acquired = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn requested_runtime_policy(&self) -> (bool, bool, [bool; 3], bool) {
+        let domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            domain.operation_mode_changed_notification,
+            domain.performance_mode_changed_notification,
+            domain.focus_handling_mode,
+            domain.foreground_rights_acquired,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +723,21 @@ mod applet_tests {
             session
                 .insert_object(AppletObject::CommonStateGetter)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn applet_runtime_policy_is_retained_in_the_shared_domain() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        cloned.set_operation_mode_changed_notification(true);
+        cloned.set_performance_mode_changed_notification(true);
+        cloned.set_focus_handling_mode([true, false, true]);
+        cloned.acquire_foreground_rights();
+
+        assert_eq!(
+            session.requested_runtime_policy(),
+            (true, true, [true, false, true], true)
         );
     }
 }

@@ -427,9 +427,7 @@ fn execute(
                     ExceptionHandlingResult::Rejected(error) => {
                         let diagnostic = error.to_string();
                         if rejected.insert(diagnostic.clone()) {
-                            log::warn!(
-                                "guest requested an unavailable or incomplete Horizon service: {diagnostic}"
-                            );
+                            log::debug!("guest operation returned a Horizon error: {diagnostic}");
                         }
                     }
                     ExceptionHandlingResult::Terminated { .. } => {
