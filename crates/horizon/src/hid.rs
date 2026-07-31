@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use nixe_cpu::{
@@ -38,6 +40,15 @@ pub struct HidSystem {
     capture_tail: u64,
     connected: bool,
     guest_mapping: Option<(AddressSpaceId, GuestVirtualAddress)>,
+    configuration: Mutex<HidConfiguration>,
+}
+
+#[derive(Debug, Default)]
+struct HidConfiguration {
+    npad_active: bool,
+    supported_style_set: u32,
+    supported_ids: BTreeSet<u32>,
+    active_six_axis_handles: BTreeSet<u32>,
 }
 
 impl Default for HidSystem {
@@ -63,6 +74,7 @@ impl HidSystem {
             capture_tail: LIFO_CAPACITY - 1,
             connected: false,
             guest_mapping: None,
+            configuration: Mutex::new(HidConfiguration::default()),
         }
     }
 
@@ -90,6 +102,45 @@ impl HidSystem {
     ) {
         if self.guest_mapping == Some((address_space, address)) {
             self.guest_mapping = None;
+        }
+    }
+
+    pub(crate) fn activate_npad(&self) {
+        let mut configuration = self
+            .configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        configuration.npad_active = true;
+    }
+
+    pub(crate) fn set_supported_npad_style_set(&self, style_set: u32) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .supported_style_set = style_set;
+    }
+
+    pub(crate) fn set_supported_npad_ids(&self, ids: impl IntoIterator<Item = u32>) -> bool {
+        let ids = ids.into_iter().collect::<BTreeSet<_>>();
+        if ids.iter().any(|id| !matches!(*id, 0..=7 | 0x10 | 0x20)) {
+            return false;
+        }
+        self.configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .supported_ids = ids;
+        true
+    }
+
+    pub(crate) fn set_six_axis_sensor_active(&self, handle: u32, active: bool) {
+        let mut configuration = self
+            .configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active {
+            configuration.active_six_axis_handles.insert(handle);
+        } else {
+            configuration.active_six_axis_handles.remove(&handle);
         }
     }
 
@@ -123,7 +174,22 @@ impl HidSystem {
         state: Option<&EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), HandleError> {
-        let Some(state) = state else {
+        let (publish_player_one, publish_six_axis) = {
+            let configuration = self
+                .configuration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                configuration.npad_active
+                    && configuration.supported_style_set & NPAD_STYLE_FULL_KEY != 0
+                    && configuration.supported_ids.contains(&0),
+                // FullKey, Player 1, device index 2. The packed handle layout
+                // is pinned in the public libnx HidSixAxisSensorHandle ABI:
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L1412-L1421
+                configuration.active_six_axis_handles.contains(&0x0002_0003),
+            )
+        };
+        let Some(state) = state.filter(|_| publish_player_one) else {
             if self.connected {
                 self.sampling_number = self.sampling_number.saturating_add(1);
                 self.shared_memory
@@ -165,37 +231,39 @@ impl HidSystem {
             &common,
         )?;
 
-        self.six_axis_tail = next_tail(self.six_axis_tail);
-        let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];
-        put_u64(&mut sensor, 0, self.sampling_number);
-        put_u64(
-            &mut sensor,
-            8,
-            u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX),
-        );
-        put_u64(&mut sensor, 16, self.sampling_number);
-        if let Some(acceleration) = state.accelerometer {
-            put_f32(&mut sensor, 24, acceleration.x / STANDARD_GRAVITY);
-            put_f32(&mut sensor, 28, acceleration.y / STANDARD_GRAVITY);
-            put_f32(&mut sensor, 32, acceleration.z / STANDARD_GRAVITY);
+        if publish_six_axis {
+            self.six_axis_tail = next_tail(self.six_axis_tail);
+            let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];
+            put_u64(&mut sensor, 0, self.sampling_number);
+            put_u64(
+                &mut sensor,
+                8,
+                u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX),
+            );
+            put_u64(&mut sensor, 16, self.sampling_number);
+            if let Some(acceleration) = state.accelerometer {
+                put_f32(&mut sensor, 24, acceleration.x / STANDARD_GRAVITY);
+                put_f32(&mut sensor, 28, acceleration.y / STANDARD_GRAVITY);
+                put_f32(&mut sensor, 32, acceleration.z / STANDARD_GRAVITY);
+            }
+            if let Some(gyroscope) = state.gyroscope {
+                put_f32(&mut sensor, 36, gyroscope.x);
+                put_f32(&mut sensor, 40, gyroscope.y);
+                put_f32(&mut sensor, 44, gyroscope.z);
+            }
+            for offset in [60, 76, 92] {
+                put_f32(&mut sensor, offset, 1.0);
+            }
+            if state.gyroscope.is_some() || state.accelerometer.is_some() {
+                put_u32(&mut sensor, 96, SIX_AXIS_ATTRIBUTE_CONNECTED);
+            }
+            self.publish_lifo_entry(
+                NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET,
+                self.six_axis_tail,
+                SIX_AXIS_ENTRY_SIZE,
+                &sensor,
+            )?;
         }
-        if let Some(gyroscope) = state.gyroscope {
-            put_f32(&mut sensor, 36, gyroscope.x);
-            put_f32(&mut sensor, 40, gyroscope.y);
-            put_f32(&mut sensor, 44, gyroscope.z);
-        }
-        for offset in [60, 76, 92] {
-            put_f32(&mut sensor, offset, 1.0);
-        }
-        if state.gyroscope.is_some() || state.accelerometer.is_some() {
-            put_u32(&mut sensor, 96, SIX_AXIS_ATTRIBUTE_CONNECTED);
-        }
-        self.publish_lifo_entry(
-            NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET,
-            self.six_axis_tail,
-            SIX_AXIS_ENTRY_SIZE,
-            &sensor,
-        )?;
 
         self.publish_system_button(HOME_BUTTON_LIFO_OFFSET, state.buttons.home, true)?;
         self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, state.buttons.capture, false)
@@ -316,9 +384,19 @@ mod tests {
         u64::from_le_bytes(bytes)
     }
 
+    fn configure_player_one(hid: &HidSystem, six_axis: bool) {
+        hid.activate_npad();
+        hid.set_supported_npad_style_set(NPAD_STYLE_FULL_KEY);
+        assert!(hid.set_supported_npad_ids([0]));
+        if six_axis {
+            hid.set_six_axis_sensor_active(0x0002_0003, true);
+        }
+    }
+
     #[test]
     fn publishes_player_one_full_key_state_and_disconnects_it() {
         let mut hid = HidSystem::new();
+        configure_player_one(&hid, false);
         let memory = hid.shared_memory();
         let state = EmulatedControllerState {
             buttons: EmulatedButtonState {
@@ -351,6 +429,7 @@ mod tests {
     #[test]
     fn publishes_motion_and_system_buttons() {
         let mut hid = HidSystem::new();
+        configure_player_one(&hid, true);
         let memory = hid.shared_memory();
         let state = EmulatedControllerState {
             buttons: EmulatedButtonState {
@@ -378,5 +457,30 @@ mod tests {
         assert_eq!(read_u32(&memory, six_axis_entry + 36), 1.0_f32.to_bits());
         assert_eq!(read_u64(&memory, HOME_BUTTON_LIFO_OFFSET + 0x20 + 16), 1);
         assert_eq!(read_u64(&memory, CAPTURE_BUTTON_LIFO_OFFSET + 0x20 + 16), 1);
+    }
+
+    #[test]
+    fn configuration_gates_npad_and_six_axis_publication() {
+        let mut hid = HidSystem::new();
+        let memory = hid.shared_memory();
+        let state = EmulatedControllerState::default();
+
+        hid.publish(Some(&state), Duration::from_millis(5)).unwrap();
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), 0);
+
+        configure_player_one(&hid, false);
+        hid.publish(Some(&state), Duration::from_millis(5)).unwrap();
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), NPAD_STYLE_FULL_KEY);
+        assert_eq!(
+            read_u64(&memory, NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET + 24),
+            0
+        );
+
+        hid.set_six_axis_sensor_active(0x0002_0003, true);
+        hid.publish(Some(&state), Duration::from_millis(5)).unwrap();
+        assert_eq!(
+            read_u64(&memory, NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET + 24),
+            1
+        );
     }
 }

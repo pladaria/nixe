@@ -72,7 +72,7 @@ impl ViSession {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LayerState {
     pub(crate) id: u64,
     pub(crate) binder_id: i32,
@@ -80,6 +80,9 @@ pub(crate) struct LayerState {
     pub(crate) height: u32,
     pub(crate) visible: bool,
     pub(crate) scaling_mode: u32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) z: i64,
 }
 
 #[derive(Debug)]
@@ -228,6 +231,9 @@ impl VideoSystem {
             height: DEFAULT_HEIGHT,
             visible: true,
             scaling_mode: 0,
+            x: 0.0,
+            y: 0.0,
+            z: 0,
         };
         state.layers.insert(id, layer.clone());
         state.queues.insert(binder_id, BufferQueue::new());
@@ -267,6 +273,44 @@ impl VideoSystem {
         true
     }
 
+    pub(crate) fn set_layer_position(&self, layer_id: u64, x: f32, y: f32) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(layer) = state.layers.get_mut(&layer_id) else {
+            return false;
+        };
+        layer.x = x;
+        layer.y = y;
+        true
+    }
+
+    pub(crate) fn set_layer_size(&self, layer_id: u64, width: u32, height: u32) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(layer) = state.layers.get_mut(&layer_id) else {
+            return false;
+        };
+        layer.width = width;
+        layer.height = height;
+        true
+    }
+
+    pub(crate) fn set_layer_z(&self, layer_id: u64, z: i64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(layer) = state.layers.get_mut(&layer_id) else {
+            return false;
+        };
+        layer.z = z;
+        true
+    }
+
     pub(crate) fn vsync_event(&self, display_id: u64) -> Option<ReadableEventObject> {
         Self::display_resolution(display_id)?;
         Some(
@@ -287,6 +331,22 @@ impl VideoSystem {
             .map(|queue| queue.available_readable.clone())
     }
 
+    pub(crate) fn adjust_binder_refcount(
+        &self,
+        binder_id: i32,
+        add_value: i32,
+        reference_type: i32,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .queues
+            .get_mut(&binder_id)
+            .is_some_and(|queue| queue.adjust_refcount(add_value, reference_type))
+    }
+
     pub(crate) fn transact_binder(
         &self,
         binder_id: i32,
@@ -300,7 +360,7 @@ impl VideoSystem {
         let queue = state
             .queues
             .get_mut(&binder_id)
-            .ok_or(ParcelError("unknown Binder producer object"))?;
+            .ok_or(ParcelError::Malformed("unknown Binder producer object"))?;
         queue.transact(code, encoded)
     }
 
@@ -319,7 +379,7 @@ impl VideoSystem {
         let sequence = state.next_frame_sequence;
         state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
         let frame = Frame::new_xrgb8888(buffer.width, buffer.height, sequence, pixels)
-            .map_err(|_| FramebufferError("decoded frame dimensions are invalid"))?;
+            .map_err(|_| FramebufferError::Malformed("decoded frame dimensions are invalid"))?;
         state.pending_frames.push_back(PendingFrame {
             binder_id,
             slot,
@@ -418,6 +478,8 @@ struct BufferSlot {
 #[derive(Debug)]
 struct BufferQueue {
     connected: bool,
+    weak_references: i64,
+    strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
     available_writable: WritableEventObject,
     available_readable: ReadableEventObject,
@@ -437,17 +499,38 @@ struct PendingFrame {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FramebufferError(pub(crate) &'static str);
+pub(crate) enum FramebufferError {
+    Malformed(&'static str),
+    Unsupported(&'static str),
+}
 
 impl BufferQueue {
     fn new() -> Self {
         let (available_writable, available_readable) = EventObject::create_pair();
         Self {
             connected: false,
+            weak_references: 0,
+            strong_references: 0,
             slots: BTreeMap::new(),
             available_writable,
             available_readable,
         }
+    }
+
+    fn adjust_refcount(&mut self, add_value: i32, reference_type: i32) -> bool {
+        let references = match reference_type {
+            0 => &mut self.weak_references,
+            1 => &mut self.strong_references,
+            _ => return false,
+        };
+        let Some(updated) = references.checked_add(i64::from(add_value)) else {
+            return false;
+        };
+        if updated < 0 {
+            return false;
+        }
+        *references = updated;
+        true
     }
 
     fn transact(&mut self, code: u32, encoded: &[u8]) -> Result<BinderTransaction, ParcelError> {
@@ -502,10 +585,14 @@ impl BufferQueue {
                 let slot_index = reader.read_i32()?;
                 let _input = reader.read_flattened()?;
                 let Some(slot) = self.slots.get_mut(&slot_index) else {
-                    return Err(ParcelError("QueueBuffer references an unknown slot"));
+                    return Err(ParcelError::Malformed(
+                        "QueueBuffer references an unknown slot",
+                    ));
                 };
                 if slot.ownership != SlotOwnership::Dequeued {
-                    return Err(ParcelError("QueueBuffer slot is not producer-owned"));
+                    return Err(ParcelError::Malformed(
+                        "QueueBuffer slot is not producer-owned",
+                    ));
                 }
                 slot.ownership = SlotOwnership::Queued;
                 queued = Some((slot_index, slot.buffer.clone()));
@@ -516,10 +603,14 @@ impl BufferQueue {
                 let slot_index = reader.read_i32()?;
                 let _fence = reader.read_flattened()?;
                 let Some(slot) = self.slots.get_mut(&slot_index) else {
-                    return Err(ParcelError("CancelBuffer references an unknown slot"));
+                    return Err(ParcelError::Malformed(
+                        "CancelBuffer references an unknown slot",
+                    ));
                 };
                 if slot.ownership != SlotOwnership::Dequeued {
-                    return Err(ParcelError("CancelBuffer slot is not producer-owned"));
+                    return Err(ParcelError::Malformed(
+                        "CancelBuffer slot is not producer-owned",
+                    ));
                 }
                 slot.ownership = SlotOwnership::Free;
                 self.available_writable.signal();
@@ -556,7 +647,9 @@ impl BufferQueue {
             14 => {
                 let slot_index = reader.read_i32()?;
                 if !(0..MAX_BUFFER_SLOTS).contains(&slot_index) {
-                    return Err(ParcelError("preallocated buffer slot is out of range"));
+                    return Err(ParcelError::Malformed(
+                        "preallocated buffer slot is out of range",
+                    ));
                 }
                 let has_buffer = reader.read_i32()?;
                 if has_buffer == 0 {
@@ -565,7 +658,9 @@ impl BufferQueue {
                     let flattened = reader.read_flattened()?;
                     let buffer = parse_graphic_buffer(flattened)?;
                     if self.slots.contains_key(&slot_index) {
-                        return Err(ParcelError("preallocated buffer slot already exists"));
+                        return Err(ParcelError::Malformed(
+                            "preallocated buffer slot already exists",
+                        ));
                     }
                     self.slots.insert(
                         slot_index,
@@ -575,12 +670,14 @@ impl BufferQueue {
                         },
                     );
                 } else {
-                    return Err(ParcelError("preallocated buffer presence flag is invalid"));
+                    return Err(ParcelError::Malformed(
+                        "preallocated buffer presence flag is invalid",
+                    ));
                 }
                 self.update_availability();
             }
             _ => {
-                return Err(ParcelError(
+                return Err(ParcelError::Unsupported(
                     "unsupported IGraphicBufferProducer transaction",
                 ));
             }
@@ -637,36 +734,44 @@ fn parse_graphic_buffer(bytes: &[u8]) -> Result<GraphicBuffer, ParcelError> {
     const PREFIX_WORDS: usize = 10;
     const REQUIRED_INTS: usize = 29;
     if bytes.len() < PREFIX_WORDS * 4 {
-        return Err(ParcelError("flattened graphic buffer is truncated"));
+        return Err(ParcelError::Malformed(
+            "flattened graphic buffer is truncated",
+        ));
     }
     let word = |index: usize| -> Result<u32, ParcelError> {
         let offset = index
             .checked_mul(4)
-            .ok_or(ParcelError("graphic buffer offset overflows"))?;
+            .ok_or(ParcelError::Malformed("graphic buffer offset overflows"))?;
         Ok(u32::from_le_bytes(
             bytes
                 .get(offset..offset + 4)
-                .ok_or(ParcelError("graphic buffer is truncated"))?
+                .ok_or(ParcelError::Malformed("graphic buffer is truncated"))?
                 .try_into()
                 .unwrap(),
         ))
     };
     if word(0)? != 0x4742_4652 || word(8)? != 0 {
-        return Err(ParcelError("flattened graphic buffer header is invalid"));
+        return Err(ParcelError::Malformed(
+            "flattened graphic buffer header is invalid",
+        ));
     }
     let num_ints = usize::try_from(word(9)?)
-        .map_err(|_| ParcelError("graphic buffer integer count overflows"))?;
+        .map_err(|_| ParcelError::Malformed("graphic buffer integer count overflows"))?;
     if num_ints < REQUIRED_INTS
         || PREFIX_WORDS
             .checked_add(num_ints)
             .and_then(|words| words.checked_mul(4))
             .is_none_or(|size| size > bytes.len())
     {
-        return Err(ParcelError("graphic buffer integer payload is truncated"));
+        return Err(ParcelError::Malformed(
+            "graphic buffer integer payload is truncated",
+        ));
     }
     let int = |index: usize| word(PREFIX_WORDS + index);
     if int(3)? != 0xdaff_caff || int(11)? != 1 {
-        return Err(ParcelError("NvGraphicBuffer metadata is unsupported"));
+        return Err(ParcelError::Unsupported(
+            "NvGraphicBuffer metadata is unsupported",
+        ));
     }
     let color_format = u64::from(int(15)?) | (u64::from(int(16)?) << 32);
     let plane_size = u64::from(int(27)?) | (u64::from(int(28)?) << 32);
@@ -701,7 +806,7 @@ fn decode_rgb565_block_linear(
         || buffer.kind != NV_KIND_GENERIC_16BX2
         || buffer.color_format != NV_COLOR_FORMAT_R5G6B5
     {
-        return Err(FramebufferError(
+        return Err(FramebufferError::Unsupported(
             "queued image is not supported block-linear RGB565",
         ));
     }
@@ -714,7 +819,9 @@ fn decode_rgb565_block_linear(
         || buffer.pitch < buffer.width.saturating_mul(2)
         || !buffer.pitch.is_multiple_of(64)
     {
-        return Err(FramebufferError("queued RGB565 dimensions are invalid"));
+        return Err(FramebufferError::Malformed(
+            "queued RGB565 dimensions are invalid",
+        ));
     }
     let pixel_count = usize::try_from(buffer.width)
         .ok()
@@ -723,7 +830,9 @@ fn decode_rgb565_block_linear(
                 .ok()
                 .and_then(|height| width.checked_mul(height))
         })
-        .ok_or(FramebufferError("queued RGB565 dimensions overflow"))?;
+        .ok_or(FramebufferError::Malformed(
+            "queued RGB565 dimensions overflow",
+        ))?;
     let mut pixels = vec![0_u32; pixel_count];
     let width_in_gobs = u64::from(buffer.pitch / 64);
     let block_height_gobs = 1_u64 << buffer.block_height_log2;
@@ -739,11 +848,11 @@ fn decode_rgb565_block_linear(
                 + (y % 2) * 16
                 + byte_x % 16;
             let address = usize::try_from(address)
-                .map_err(|_| FramebufferError("RGB565 swizzle address overflows"))?;
+                .map_err(|_| FramebufferError::Malformed("RGB565 swizzle address overflows"))?;
             let packed = u16::from_le_bytes(
                 bytes
                     .get(address..address + 2)
-                    .ok_or(FramebufferError("RGB565 backing is truncated"))?
+                    .ok_or(FramebufferError::Malformed("RGB565 backing is truncated"))?
                     .try_into()
                     .unwrap(),
             );
@@ -758,7 +867,7 @@ fn decode_rgb565_block_linear(
                         .and_then(|width| y.checked_mul(width))
                 })
                 .and_then(|row| usize::try_from(x).ok().and_then(|x| row.checked_add(x)))
-                .ok_or(FramebufferError("RGB565 output index overflows"))?;
+                .ok_or(FramebufferError::Malformed("RGB565 output index overflows"))?;
             pixels[output_index] = (red << 16) | (green << 8) | blue;
         }
     }
@@ -795,6 +904,25 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.binder_id, second.binder_id);
         assert_eq!(video.layer(first.id), Some(first));
+    }
+
+    #[test]
+    fn layer_geometry_and_binder_references_are_retained() {
+        let video = VideoSystem::default();
+        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
+
+        assert!(video.set_layer_position(layer.id, 12.5, -4.0));
+        assert!(video.set_layer_size(layer.id, 640, 360));
+        assert!(video.set_layer_z(layer.id, -3));
+        let updated = video.layer(layer.id).unwrap();
+        assert_eq!((updated.x, updated.y), (12.5, -4.0));
+        assert_eq!((updated.width, updated.height, updated.z), (640, 360, -3));
+
+        assert!(video.adjust_binder_refcount(layer.binder_id, 1, 0));
+        assert!(video.adjust_binder_refcount(layer.binder_id, 1, 1));
+        assert!(video.adjust_binder_refcount(layer.binder_id, -1, 1));
+        assert!(!video.adjust_binder_refcount(layer.binder_id, -1, 1));
+        assert!(!video.adjust_binder_refcount(layer.binder_id, 1, 2));
     }
 
     #[test]
@@ -880,5 +1008,28 @@ mod tests {
             &decoded[usize::try_from(width).unwrap()..][..4],
             &[0x00ff00, 0x0000ff, 0xffffff, 0xff0000]
         );
+    }
+
+    #[test]
+    fn unsupported_framebuffer_formats_are_not_guest_malformed_data() {
+        let buffer = GraphicBuffer {
+            nvmap_id: 1,
+            width: 1,
+            height: 1,
+            stride_pixels: 1,
+            format: 1,
+            total_size: 4,
+            color_format: 0,
+            layout: 1,
+            pitch: 4,
+            offset: 0,
+            kind: 0,
+            block_height_log2: 0,
+            plane_size: 4,
+        };
+        assert!(matches!(
+            decode_rgb565_block_linear(&buffer, &[0; 4]),
+            Err(FramebufferError::Unsupported(_))
+        ));
     }
 }

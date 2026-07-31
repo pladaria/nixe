@@ -6,11 +6,22 @@ const HEADER_SIZE: usize = 16;
 const MAX_PARCEL_BYTES: usize = 0x4000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ParcelError(pub(crate) &'static str);
+pub(crate) enum ParcelError {
+    Malformed(&'static str),
+    Unsupported(&'static str),
+}
+
+impl ParcelError {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Malformed(reason) | Self::Unsupported(reason) => reason,
+        }
+    }
+}
 
 impl Display for ParcelError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
+        formatter.write_str(self.reason())
     }
 }
 
@@ -23,30 +34,32 @@ pub(crate) struct ParcelReader<'a> {
 impl<'a> ParcelReader<'a> {
     pub(crate) fn decode(encoded: &'a [u8]) -> Result<Self, ParcelError> {
         if encoded.len() < HEADER_SIZE || encoded.len() > MAX_PARCEL_BYTES {
-            return Err(ParcelError("Parcel has an invalid total size"));
+            return Err(ParcelError::Malformed("Parcel has an invalid total size"));
         }
         let payload_size = usize::try_from(read_u32(encoded, 0)?)
-            .map_err(|_| ParcelError("Parcel payload size overflows"))?;
+            .map_err(|_| ParcelError::Malformed("Parcel payload size overflows"))?;
         let payload_offset = usize::try_from(read_u32(encoded, 4)?)
-            .map_err(|_| ParcelError("Parcel payload offset overflows"))?;
+            .map_err(|_| ParcelError::Malformed("Parcel payload offset overflows"))?;
         let objects_size = usize::try_from(read_u32(encoded, 8)?)
-            .map_err(|_| ParcelError("Parcel objects size overflows"))?;
+            .map_err(|_| ParcelError::Malformed("Parcel objects size overflows"))?;
         let objects_offset = usize::try_from(read_u32(encoded, 12)?)
-            .map_err(|_| ParcelError("Parcel objects offset overflows"))?;
+            .map_err(|_| ParcelError::Malformed("Parcel objects offset overflows"))?;
         let payload_end = payload_offset
             .checked_add(payload_size)
-            .ok_or(ParcelError("Parcel payload range overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel payload range overflows"))?;
         let objects_end = objects_offset
             .checked_add(objects_size)
-            .ok_or(ParcelError("Parcel object range overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel object range overflows"))?;
         if payload_offset < HEADER_SIZE
             || payload_end > encoded.len()
             || objects_end > encoded.len()
         {
-            return Err(ParcelError("Parcel range exceeds its buffer"));
+            return Err(ParcelError::Malformed("Parcel range exceeds its buffer"));
         }
         if objects_size != 0 {
-            return Err(ParcelError("Parcel Binder objects are not supported"));
+            return Err(ParcelError::Unsupported(
+                "Parcel Binder objects are not supported",
+            ));
         }
         Ok(Self {
             payload: &encoded[payload_offset..payload_end],
@@ -66,26 +79,35 @@ impl<'a> ParcelReader<'a> {
         let size = self.read_i32()?;
         let fd_count = self.read_i32()?;
         if size < 0 || fd_count != 0 {
-            return Err(ParcelError("flattened Parcel object header is invalid"));
+            return Err(ParcelError::Malformed(
+                "flattened Parcel object header is invalid",
+            ));
         }
-        self.read_exact(usize::try_from(size).map_err(|_| ParcelError("flattened size overflows"))?)
+        self.read_exact(
+            usize::try_from(size)
+                .map_err(|_| ParcelError::Malformed("flattened size overflows"))?,
+        )
     }
 
     /// Validates and consumes libnx's strict UTF-16 Binder interface token.
     pub(crate) fn read_interface_token(&mut self, expected: &str) -> Result<(), ParcelError> {
         if self.read_u32()? != 0x100 {
-            return Err(ParcelError("Binder interface token policy is invalid"));
+            return Err(ParcelError::Malformed(
+                "Binder interface token policy is invalid",
+            ));
         }
         let length = self.read_i32()?;
         if length < 0 {
-            return Err(ParcelError("Binder interface token length is negative"));
+            return Err(ParcelError::Malformed(
+                "Binder interface token length is negative",
+            ));
         }
-        let length =
-            usize::try_from(length).map_err(|_| ParcelError("interface length overflows"))?;
+        let length = usize::try_from(length)
+            .map_err(|_| ParcelError::Malformed("interface length overflows"))?;
         let encoded_bytes = length
             .checked_add(1)
             .and_then(|length| length.checked_mul(2))
-            .ok_or(ParcelError("interface token size overflows"))?;
+            .ok_or(ParcelError::Malformed("interface token size overflows"))?;
         let encoded = self.read_exact(encoded_bytes)?;
         if encoded
             .chunks_exact(2)
@@ -94,7 +116,9 @@ impl<'a> ParcelReader<'a> {
             .ne(expected.encode_utf16())
             || encoded.get(length * 2..length * 2 + 2) != Some(&[0, 0])
         {
-            return Err(ParcelError("Binder interface token does not match"));
+            return Err(ParcelError::Malformed(
+                "Binder interface token does not match",
+            ));
         }
         Ok(())
     }
@@ -103,21 +127,21 @@ impl<'a> ParcelReader<'a> {
         let aligned = size
             .checked_add(3)
             .map(|size| size & !3)
-            .ok_or(ParcelError("Parcel read size overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel read size overflows"))?;
         let end = self
             .position
             .checked_add(aligned)
-            .ok_or(ParcelError("Parcel cursor overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel cursor overflows"))?;
         let data_end = self
             .position
             .checked_add(size)
-            .ok_or(ParcelError("Parcel cursor overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel cursor overflows"))?;
         let data = self
             .payload
             .get(self.position..data_end)
-            .ok_or(ParcelError("Parcel payload is truncated"))?;
+            .ok_or(ParcelError::Malformed("Parcel payload is truncated"))?;
         if end > self.payload.len() {
-            return Err(ParcelError("Parcel alignment exceeds payload"));
+            return Err(ParcelError::Malformed("Parcel alignment exceeds payload"));
         }
         self.position = end;
         Ok(data)
@@ -140,7 +164,7 @@ impl ParcelWriter {
 
     pub(crate) fn write_flattened(&mut self, value: &[u8]) -> Result<(), ParcelError> {
         let size = i32::try_from(value.len())
-            .map_err(|_| ParcelError("flattened Parcel object is too large"))?;
+            .map_err(|_| ParcelError::Malformed("flattened Parcel object is too large"))?;
         self.write_i32(size);
         self.write_i32(0);
         self.payload.extend_from_slice(value);
@@ -150,12 +174,12 @@ impl ParcelWriter {
 
     pub(crate) fn finish(self) -> Result<Vec<u8>, ParcelError> {
         let payload_size = u32::try_from(self.payload.len())
-            .map_err(|_| ParcelError("Parcel response size overflows"))?;
+            .map_err(|_| ParcelError::Malformed("Parcel response size overflows"))?;
         let total = HEADER_SIZE
             .checked_add(self.payload.len())
-            .ok_or(ParcelError("Parcel response size overflows"))?;
-        let total_u32 =
-            u32::try_from(total).map_err(|_| ParcelError("Parcel response size overflows"))?;
+            .ok_or(ParcelError::Malformed("Parcel response size overflows"))?;
+        let total_u32 = u32::try_from(total)
+            .map_err(|_| ParcelError::Malformed("Parcel response size overflows"))?;
         let mut encoded = Vec::with_capacity(total);
         encoded.extend_from_slice(&payload_size.to_le_bytes());
         encoded.extend_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
@@ -170,7 +194,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ParcelError> {
     Ok(u32::from_le_bytes(
         bytes
             .get(offset..offset + 4)
-            .ok_or(ParcelError("Parcel header is truncated"))?
+            .ok_or(ParcelError::Malformed("Parcel header is truncated"))?
             .try_into()
             .unwrap(),
     ))
@@ -208,5 +232,17 @@ mod tests {
         let mut reader = ParcelReader::decode(&encoded).unwrap();
         assert_eq!(reader.read_flattened().unwrap(), &[1, 2, 3]);
         assert_eq!(reader.read_u32().unwrap(), 7);
+    }
+
+    #[test]
+    fn binder_objects_are_an_unsupported_variant_not_malformed_guest_data() {
+        let mut encoded = vec![0_u8; HEADER_SIZE + 4];
+        encoded[4..8].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+        encoded[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        encoded[12..16].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+        assert!(matches!(
+            ParcelReader::decode(&encoded),
+            Err(ParcelError::Unsupported(_))
+        ));
     }
 }
