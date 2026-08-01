@@ -9,7 +9,7 @@ use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 
-use crate::{GpuProfileId, MaxwellAddressSpaceId, MaxwellGpuProfile};
+use crate::{GpuProfileId, MaxwellAddressSpaceId, MaxwellGpuProfile, MaxwellPushbufferSubchannel};
 
 /// Stable identity of one Maxwell channel lifetime.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -202,6 +202,7 @@ pub struct MaxwellChannelFrontendState {
     object_context: Option<MaxwellObjectContext>,
     error_notifier_enabled: bool,
     z_cull_binding: Option<MaxwellZCullBinding>,
+    subchannel_bindings: [Option<GpuClassId>; 8],
 }
 
 impl MaxwellChannelFrontendState {
@@ -228,6 +229,28 @@ impl MaxwellChannelFrontendState {
     #[must_use]
     pub const fn z_cull_binding(self) -> Option<MaxwellZCullBinding> {
         self.z_cull_binding
+    }
+
+    /// Returns the engine class currently selected for one pushbuffer
+    /// subchannel. The binding contains no engine state or backend object.
+    #[must_use]
+    pub const fn subchannel_binding(
+        self,
+        subchannel: MaxwellPushbufferSubchannel,
+    ) -> Option<GpuClassId> {
+        self.subchannel_bindings[subchannel.get() as usize]
+    }
+
+    pub(crate) fn bind_subchannel(
+        &mut self,
+        subchannel: MaxwellPushbufferSubchannel,
+        class: GpuClassId,
+    ) -> Option<GpuClassId> {
+        self.subchannel_bindings[subchannel.get() as usize].replace(class)
+    }
+
+    pub(crate) fn reset_subchannel_bindings(&mut self) {
+        self.subchannel_bindings = [None; 8];
     }
 }
 
@@ -267,6 +290,7 @@ impl MaxwellGpuChannel {
                 object_context: None,
                 error_notifier_enabled: false,
                 z_cull_binding: None,
+                subchannel_bindings: [None; 8],
             },
             priority: MaxwellChannelPriority::Medium,
             timeslice: MaxwellChannelTimeslice::DriverDefault,
@@ -313,6 +337,16 @@ impl MaxwellGpuChannel {
     #[must_use]
     pub const fn frontend(&self) -> MaxwellChannelFrontendState {
         self.frontend
+    }
+
+    pub(crate) fn replace_frontend(&mut self, frontend: MaxwellChannelFrontendState) {
+        self.frontend = frontend;
+    }
+
+    /// Resets frontend class selection at a verified channel-reset boundary.
+    /// Closing a channel normally drops the complete object instead.
+    pub fn reset_subchannel_bindings(&mut self) {
+        self.frontend.reset_subchannel_bindings();
     }
 
     #[must_use]
@@ -557,6 +591,23 @@ mod tests {
         assert_eq!(channel.owner().process_id(), 9);
         assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
         assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+    }
+
+    #[test]
+    fn frontend_subchannel_bindings_replace_and_reset_without_backend_state() {
+        let subchannel = MaxwellPushbufferSubchannel::try_new(0).unwrap();
+        let first = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let replacement = SWITCH_1_GM20B_PROFILE.classes().compute();
+        let mut frontend = MaxwellChannelFrontendState::default();
+
+        assert_eq!(frontend.bind_subchannel(subchannel, first), None);
+        assert_eq!(
+            frontend.bind_subchannel(subchannel, replacement),
+            Some(first)
+        );
+        assert_eq!(frontend.subchannel_binding(subchannel), Some(replacement));
+        frontend.reset_subchannel_bindings();
+        assert_eq!(frontend.subchannel_binding(subchannel), None);
     }
 
     #[test]

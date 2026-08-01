@@ -4,9 +4,12 @@
 //! on host-independent GPU contracts and never on Horizon or a host backend.
 
 mod address_space;
+mod capture;
 mod channel;
+mod engines;
 mod gpfifo;
 mod profile;
+mod pushbuffer;
 mod scheduler;
 
 pub use address_space::{
@@ -16,11 +19,22 @@ pub use address_space::{
     MaxwellMappingDump, MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange,
     MaxwellSparseMapping, MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
 };
+pub use capture::{
+    MAXWELL_FRONTEND_CAPTURE_WORDS, MaxwellFrontendCapture, MaxwellFrontendCaptureError,
+    MaxwellFrontendFailure, MaxwellFrontendReplay, capture_maxwell_frontend_dispatch,
+    replay_maxwell_frontend_capture,
+};
 pub use channel::{
     MaxwellChannelError, MaxwellChannelFrontendState, MaxwellChannelId, MaxwellChannelOwner,
     MaxwellChannelPriority, MaxwellChannelSchedulingPolicy, MaxwellChannelTimeout,
     MaxwellChannelTimeslice, MaxwellGpuChannel, MaxwellMemoryManagerId, MaxwellObjectContext,
     MaxwellZCullBinding, MaxwellZCullMode,
+};
+pub use engines::{
+    MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodDispatch,
+    MaxwellEngineMethodEffect, MaxwellEngineMethodMetadata, MaxwellEnginePacketDispatch,
+    commit_maxwell_engine_packet, dispatch_maxwell_engine_packet,
+    dispatch_maxwell_engine_pushbuffer, preflight_maxwell_engine_packet,
 };
 pub use gpfifo::{
     MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,
@@ -38,6 +52,18 @@ pub use profile::{
     MaxwellInterconnectCapabilities, MaxwellMemoryCapabilities, MaxwellProfileValidationError,
     MaxwellShaderCapabilities, MaxwellTopology, MaxwellVirtualAddressCapabilities,
     MaxwellZCullCapabilities, SWITCH_1_GM20B_PROFILE, ShaderVersion,
+};
+pub use pushbuffer::dispatch::{
+    MAXWELL_SET_OBJECT_METHOD, MaxwellMethodDispatch, MaxwellMethodDispatchError,
+    MaxwellMethodDispatchKind, MaxwellMethodSource, MaxwellPacketDispatch,
+    MaxwellSetObjectTransition, commit_maxwell_packet, dispatch_maxwell_packet,
+    dispatch_maxwell_pushbuffer, preflight_maxwell_packet,
+};
+pub use pushbuffer::packet::{
+    MaxwellDecodedMethod, MaxwellDecodedMethodPacket, MaxwellDecodedPacket,
+    MaxwellDecodedPushbuffer, MaxwellMethodPacketMode, MaxwellPushbufferControl,
+    MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel, MaxwellPushbufferWord,
+    decode_maxwell_pushbuffer, decode_maxwell_submission,
 };
 pub use scheduler::{
     MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary, MaxwellScheduleError,

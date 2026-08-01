@@ -1,0 +1,803 @@
+//! Maxwell subchannel binding and source-preserving method dispatch.
+//!
+//! This layer consumes only fully decoded T7 packets. It owns frontend class
+//! selection but no engine method tables, mappings, Horizon ABI, or backend
+//! objects. Engine-specific interpretation begins at the next dispatch layer.
+
+use std::fmt::{Display, Formatter};
+
+use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
+
+use crate::{
+    MaxwellChannelFrontendState, MaxwellChannelId, MaxwellDecodedMethod,
+    MaxwellDecodedMethodPacket, MaxwellDecodedPacket, MaxwellDecodedPushbuffer,
+    MaxwellGpfifoSourceLocation, MaxwellGpuChannel, MaxwellGpuProfile, MaxwellPushbufferControl,
+    MaxwellPushbufferSubchannel,
+};
+
+/// Byte address of the PBDMA SetObject host method.
+pub const MAXWELL_SET_OBJECT_METHOD: GpuMethodId = GpuMethodId(0);
+
+const HOST_METHOD_LIMIT: u32 = 0x100;
+const SET_OBJECT_CLASS_MASK: u32 = 0xffff;
+const SET_OBJECT_ENGINE_SHIFT: u32 = 16;
+const SET_OBJECT_ENGINE_MASK: u32 = 0x1f;
+const SET_OBJECT_DEFINED_MASK: u32 =
+    SET_OBJECT_CLASS_MASK | (SET_OBJECT_ENGINE_MASK << SET_OBJECT_ENGINE_SHIFT);
+
+/// Complete pointer-free source of one expanded Maxwell method write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellMethodSource {
+    channel: MaxwellChannelId,
+    submission: FrontendSubmissionId,
+    location: MaxwellGpfifoSourceLocation,
+    subchannel: MaxwellPushbufferSubchannel,
+    method: GpuMethodId,
+    argument: u32,
+}
+
+impl MaxwellMethodSource {
+    #[must_use]
+    pub const fn channel(self) -> MaxwellChannelId {
+        self.channel
+    }
+
+    #[must_use]
+    pub const fn submission(self) -> FrontendSubmissionId {
+        self.submission
+    }
+
+    #[must_use]
+    pub const fn location(self) -> MaxwellGpfifoSourceLocation {
+        self.location
+    }
+
+    #[must_use]
+    pub const fn subchannel(self) -> MaxwellPushbufferSubchannel {
+        self.subchannel
+    }
+
+    #[must_use]
+    pub const fn method(self) -> GpuMethodId {
+        self.method
+    }
+
+    #[must_use]
+    pub const fn argument(self) -> u32 {
+        self.argument
+    }
+}
+
+impl Display for MaxwellMethodSource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} {} argument={:#010x}",
+            self.location, self.subchannel, self.method, self.argument
+        )
+    }
+}
+
+/// Effect of a verified SetObject write on the selected subchannel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellSetObjectTransition {
+    Bound,
+    VerifiedExisting,
+    Replaced { previous: GpuClassId },
+}
+
+/// Semantic kind of a source-preserving method record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellMethodDispatchKind {
+    SetObject(MaxwellSetObjectTransition),
+    ClassMethod,
+}
+
+/// One method after a valid subchannel class has been established.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellMethodDispatch {
+    source: MaxwellMethodSource,
+    class: GpuClassId,
+    kind: MaxwellMethodDispatchKind,
+}
+
+impl MaxwellMethodDispatch {
+    #[must_use]
+    pub const fn source(self) -> MaxwellMethodSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn class(self) -> GpuClassId {
+        self.class
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> MaxwellMethodDispatchKind {
+        self.kind
+    }
+}
+
+impl Display for MaxwellMethodDispatch {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} kind={:?}",
+            self.source, self.class, self.kind
+        )
+    }
+}
+
+/// Complete result of one atomically preflighted packet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxwellPacketDispatch {
+    channel: MaxwellChannelId,
+    frontend_before: MaxwellChannelFrontendState,
+    frontend_after: MaxwellChannelFrontendState,
+    methods: Box<[MaxwellMethodDispatch]>,
+}
+
+impl MaxwellPacketDispatch {
+    #[must_use]
+    pub fn methods(&self) -> &[MaxwellMethodDispatch] {
+        &self.methods
+    }
+
+    #[must_use]
+    pub const fn channel(&self) -> MaxwellChannelId {
+        self.channel
+    }
+
+    #[must_use]
+    pub const fn frontend_before(&self) -> MaxwellChannelFrontendState {
+        self.frontend_before
+    }
+
+    #[must_use]
+    pub const fn frontend_after(&self) -> MaxwellChannelFrontendState {
+        self.frontend_after
+    }
+}
+
+/// Failure at the class-binding boundary, before engine method execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaxwellMethodDispatchError {
+    SourceIdentityMismatch {
+        source: MaxwellGpfifoSourceLocation,
+        channel: MaxwellChannelId,
+        submission: FrontendSubmissionId,
+    },
+    FrontendStateChanged {
+        channel: MaxwellChannelId,
+    },
+    MissingPacketSubchannel {
+        source: MaxwellGpfifoSourceLocation,
+    },
+    InvalidSetObjectValue {
+        source: MaxwellMethodSource,
+    },
+    UnsupportedSetObjectEngine {
+        source: MaxwellMethodSource,
+        engine: u8,
+    },
+    UnsupportedClassForSubchannel {
+        source: MaxwellMethodSource,
+        class: GpuClassId,
+        expected: Option<GpuClassId>,
+    },
+    UnsupportedHostMethod {
+        source: MaxwellMethodSource,
+    },
+    UnboundSubchannel {
+        source: MaxwellMethodSource,
+    },
+    UnsupportedControl {
+        source: MaxwellGpfifoSourceLocation,
+        operation: MaxwellPushbufferControl,
+    },
+    ResourceExhausted,
+}
+
+impl Display for MaxwellMethodDispatchError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceIdentityMismatch {
+                source,
+                channel,
+                submission,
+            } => write!(
+                formatter,
+                "Maxwell method source belongs to another dispatch: expected=[{channel} {submission}] actual=[{source}]"
+            ),
+            Self::FrontendStateChanged { channel } => write!(
+                formatter,
+                "Maxwell channel frontend changed after packet preflight: {channel}"
+            ),
+            Self::MissingPacketSubchannel { source } => {
+                write!(
+                    formatter,
+                    "non-empty method packet has no subchannel: {source}"
+                )
+            }
+            Self::InvalidSetObjectValue { source } => write!(
+                formatter,
+                "SetObject argument sets reserved bits outside ClassId[15:0] and EngineId[20:16]: {source}"
+            ),
+            Self::UnsupportedSetObjectEngine { source, engine } => write!(
+                formatter,
+                "SetObject engine is not available in the Switch 1 profile: {source} engine-id={engine}"
+            ),
+            Self::UnsupportedClassForSubchannel {
+                source,
+                class,
+                expected,
+            } => {
+                write!(
+                    formatter,
+                    "SetObject class is unsupported by the selected Switch 1 engine: {source} requested-{class}"
+                )?;
+                match expected {
+                    Some(expected) => write!(formatter, " expected-{expected}"),
+                    None => formatter.write_str(" subchannel-has-no-hardware-engine"),
+                }
+            }
+            Self::UnsupportedHostMethod { source } => {
+                write!(
+                    formatter,
+                    "Maxwell host method semantics are unavailable: {source}"
+                )
+            }
+            Self::UnboundSubchannel { source } => {
+                write!(
+                    formatter,
+                    "Maxwell method targets an unbound subchannel: {source} class=unbound"
+                )
+            }
+            Self::UnsupportedControl { source, operation } => write!(
+                formatter,
+                "Maxwell pushbuffer control semantics are unavailable: {source} operation={operation:?}"
+            ),
+            Self::ResourceExhausted => {
+                formatter.write_str("Maxwell method dispatch exhausted host resources")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MaxwellMethodDispatchError {}
+
+/// Preflights one complete decoded packet without mutating channel state.
+///
+/// Method writes are evaluated against a private copy of the channel frontend.
+/// T7-C can validate every resulting class method before calling
+/// [`commit_maxwell_packet`], keeping binding and future class state atomic.
+pub fn preflight_maxwell_packet(
+    channel: &MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    packet: &MaxwellDecodedPacket,
+) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
+    match packet {
+        MaxwellDecodedPacket::Methods(packet) => {
+            dispatch_method_packet(channel, submission, packet)
+        }
+        MaxwellDecodedPacket::Control { operation, source } => {
+            validate_source_identity(channel.id(), submission, *source)?;
+            match operation {
+                MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment => {
+                    Ok(MaxwellPacketDispatch {
+                        channel: channel.id(),
+                        frontend_before: channel.frontend(),
+                        frontend_after: channel.frontend(),
+                        methods: Box::new([]),
+                    })
+                }
+                MaxwellPushbufferControl::SetSubdeviceMask(_)
+                | MaxwellPushbufferControl::StoreSubdeviceMask(_)
+                | MaxwellPushbufferControl::UseSubdeviceMask => {
+                    Err(MaxwellMethodDispatchError::UnsupportedControl {
+                        source: *source,
+                        operation: *operation,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Commits a previously preflighted packet if no intervening frontend state
+/// change occurred. Engine handlers must finish their own preflight first.
+pub fn commit_maxwell_packet(
+    channel: &mut MaxwellGpuChannel,
+    dispatch: &MaxwellPacketDispatch,
+) -> Result<(), MaxwellMethodDispatchError> {
+    if channel.id() != dispatch.channel || channel.frontend() != dispatch.frontend_before {
+        return Err(MaxwellMethodDispatchError::FrontendStateChanged {
+            channel: channel.id(),
+        });
+    }
+    channel.replace_frontend(dispatch.frontend_after);
+    Ok(())
+}
+
+/// Preflights and commits the class-binding portion of one packet.
+///
+/// T7-C and later layers should use the explicit preflight/commit pair so
+/// engine-specific validation occurs before any frontend state is committed.
+pub fn dispatch_maxwell_packet(
+    channel: &mut MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    packet: &MaxwellDecodedPacket,
+) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
+    let dispatch = preflight_maxwell_packet(channel, submission, packet)?;
+    commit_maxwell_packet(channel, &dispatch)?;
+    Ok(dispatch)
+}
+
+/// Dispatches decoded packets in stream order while preserving per-packet
+/// atomicity. A failing packet cannot mutate bindings or expose its prefix;
+/// bindings committed by earlier complete packets remain frontend state.
+pub fn dispatch_maxwell_pushbuffer(
+    channel: &mut MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    pushbuffer: &MaxwellDecodedPushbuffer,
+) -> Result<Box<[MaxwellPacketDispatch]>, MaxwellMethodDispatchError> {
+    let mut packets = Vec::new();
+    packets
+        .try_reserve_exact(pushbuffer.packets().len())
+        .map_err(|_| MaxwellMethodDispatchError::ResourceExhausted)?;
+    for packet in pushbuffer.packets() {
+        packets.push(dispatch_maxwell_packet(channel, submission, packet)?);
+    }
+    Ok(packets.into_boxed_slice())
+}
+
+fn dispatch_method_packet(
+    channel: &MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    packet: &MaxwellDecodedMethodPacket,
+) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
+    validate_source_identity(channel.id(), submission, packet.header())?;
+    if packet.methods().is_empty() {
+        return Ok(MaxwellPacketDispatch {
+            channel: channel.id(),
+            frontend_before: channel.frontend(),
+            frontend_after: channel.frontend(),
+            methods: Box::new([]),
+        });
+    }
+    let subchannel =
+        packet
+            .subchannel()
+            .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel {
+                source: packet.header(),
+            })?;
+    let frontend_before = channel.frontend();
+    let mut frontend_after = frontend_before;
+    let mut methods = Vec::new();
+    methods
+        .try_reserve_exact(packet.methods().len())
+        .map_err(|_| MaxwellMethodDispatchError::ResourceExhausted)?;
+
+    for method in packet.methods() {
+        methods.push(preflight_method(
+            channel.id(),
+            channel.profile(),
+            submission,
+            subchannel,
+            *method,
+            &mut frontend_after,
+        )?);
+    }
+
+    Ok(MaxwellPacketDispatch {
+        channel: channel.id(),
+        frontend_before,
+        frontend_after,
+        methods: methods.into_boxed_slice(),
+    })
+}
+
+fn preflight_method(
+    channel: MaxwellChannelId,
+    profile: MaxwellGpuProfile,
+    submission: FrontendSubmissionId,
+    subchannel: MaxwellPushbufferSubchannel,
+    method: MaxwellDecodedMethod,
+    frontend: &mut MaxwellChannelFrontendState,
+) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
+    let source = MaxwellMethodSource {
+        channel,
+        submission,
+        location: method.argument_source(),
+        subchannel,
+        method: method.method(),
+        argument: method.argument(),
+    };
+    validate_source_identity(channel, submission, source.location)?;
+    if method.method() == MAXWELL_SET_OBJECT_METHOD {
+        return preflight_set_object(profile, source, frontend);
+    }
+    if method.method().0 < HOST_METHOD_LIMIT {
+        return Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source });
+    }
+    let class = frontend
+        .subchannel_binding(subchannel)
+        .ok_or(MaxwellMethodDispatchError::UnboundSubchannel { source })?;
+    Ok(MaxwellMethodDispatch {
+        source,
+        class,
+        kind: MaxwellMethodDispatchKind::ClassMethod,
+    })
+}
+
+fn validate_source_identity(
+    channel: MaxwellChannelId,
+    submission: FrontendSubmissionId,
+    source: MaxwellGpfifoSourceLocation,
+) -> Result<(), MaxwellMethodDispatchError> {
+    if source.channel != channel || source.frontend != submission {
+        return Err(MaxwellMethodDispatchError::SourceIdentityMismatch {
+            source,
+            channel,
+            submission,
+        });
+    }
+    Ok(())
+}
+
+fn preflight_set_object(
+    profile: MaxwellGpuProfile,
+    source: MaxwellMethodSource,
+    frontend: &mut MaxwellChannelFrontendState,
+) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
+    // NVIDIA defines SetObject as NV_UDMA_OBJECT at byte method 0. It verifies
+    // the class supported by the fixed engine selected by the graphics-runlist
+    // subchannel; it does not select a host class and class zero is not a reset
+    // command:
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/manuals/volta/gv100/dev_pbdma.ref.txt#L3146-L3187
+    // The fixed graphics subchannel mapping is documented in the paired RAM
+    // reference at the same pinned revision:
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/manuals/volta/gv100/dev_ram.ref.txt#L948-L975
+    // Switch 1's public class table records the GM20B extension carrying
+    // ClassId[15:0] and EngineId[20:16]. The advertised profile contains one
+    // instance of each graphics engine, so only engine zero is currently
+    // meaningful:
+    // https://switchbrew.org/w/index.php?title=GPU_Classes&oldid=12790
+    if source.argument & !SET_OBJECT_DEFINED_MASK != 0 {
+        return Err(MaxwellMethodDispatchError::InvalidSetObjectValue { source });
+    }
+    let engine = ((source.argument >> SET_OBJECT_ENGINE_SHIFT) & SET_OBJECT_ENGINE_MASK) as u8;
+    if engine != 0 {
+        return Err(MaxwellMethodDispatchError::UnsupportedSetObjectEngine { source, engine });
+    }
+    let class = GpuClassId(source.argument & SET_OBJECT_CLASS_MASK);
+    let expected = graphics_subchannel_class(profile, source.subchannel);
+    if expected != Some(class) {
+        return Err(MaxwellMethodDispatchError::UnsupportedClassForSubchannel {
+            source,
+            class,
+            expected,
+        });
+    }
+    let transition = match frontend.bind_subchannel(source.subchannel, class) {
+        None => MaxwellSetObjectTransition::Bound,
+        Some(previous) if previous == class => MaxwellSetObjectTransition::VerifiedExisting,
+        Some(previous) => MaxwellSetObjectTransition::Replaced { previous },
+    };
+    Ok(MaxwellMethodDispatch {
+        source,
+        class,
+        kind: MaxwellMethodDispatchKind::SetObject(transition),
+    })
+}
+
+const fn graphics_subchannel_class(
+    profile: MaxwellGpuProfile,
+    subchannel: MaxwellPushbufferSubchannel,
+) -> Option<GpuClassId> {
+    let classes = profile.classes();
+    match subchannel.get() {
+        0 => Some(classes.three_d()),
+        1 => Some(classes.compute()),
+        2 => Some(classes.inline_to_memory()),
+        3 => Some(classes.two_d()),
+        4 => Some(classes.dma_copy()),
+        5..=7 => None,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nixe_gpu::{GpuVirtualAddress, MappingGeneration};
+
+    use super::*;
+    use crate::{
+        MaxwellChannelOwner, MaxwellGpfifoSourceLocation, MaxwellMappingId, MaxwellPushbufferWord,
+        SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
+    };
+
+    fn channel() -> MaxwellGpuChannel {
+        MaxwellGpuChannel::new(
+            MaxwellChannelId::new(7),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        )
+    }
+
+    fn location(word: u64) -> MaxwellGpfifoSourceLocation {
+        MaxwellGpfifoSourceLocation {
+            channel: MaxwellChannelId::new(7),
+            frontend: FrontendSubmissionId::new(11),
+            entry_index: 2,
+            pushbuffer: GpuVirtualAddress::try_new(0x8000, 40).unwrap(),
+            word_offset: word,
+            mapping: MaxwellMappingId::new(3),
+            generation: MappingGeneration::new(5),
+        }
+    }
+
+    fn word(value: u32, offset: u64) -> MaxwellPushbufferWord {
+        MaxwellPushbufferWord::new(value, location(offset))
+    }
+
+    const fn header(opcode: u32, method: u32, subchannel: u32, count: u32) -> u32 {
+        opcode << 29 | count << 16 | subchannel << 13 | method
+    }
+
+    fn decode(words: &[MaxwellPushbufferWord]) -> MaxwellDecodedPushbuffer {
+        decode_maxwell_pushbuffer(words.iter().copied().map(Ok)).unwrap()
+    }
+
+    #[test]
+    fn set_object_binds_and_revalidates_the_expected_engine_class() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[
+            word(header(1, 0, 0, 1), 0),
+            word(class.0, 1),
+            word(header(1, 0, 0, 1), 2),
+            word(class.0, 3),
+        ]);
+        let mut channel = channel();
+        let dispatched =
+            dispatch_maxwell_pushbuffer(&mut channel, FrontendSubmissionId::new(11), &decoded)
+                .unwrap();
+
+        assert_eq!(dispatched.len(), 2);
+        assert_eq!(
+            dispatched[0].methods()[0].kind(),
+            MaxwellMethodDispatchKind::SetObject(MaxwellSetObjectTransition::Bound)
+        );
+        assert_eq!(
+            dispatched[1].methods()[0].kind(),
+            MaxwellMethodDispatchKind::SetObject(MaxwellSetObjectTransition::VerifiedExisting)
+        );
+        assert_eq!(
+            channel
+                .frontend()
+                .subchannel_binding(MaxwellPushbufferSubchannel::try_new(0).unwrap()),
+            Some(class)
+        );
+    }
+
+    #[test]
+    fn explicit_preflight_defers_commit_and_detects_intervening_state() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let subchannel = MaxwellPushbufferSubchannel::try_new(0).unwrap();
+        let decoded = decode(&[word(header(1, 0, 0, 1), 0), word(class.0, 1)]);
+        let mut channel = channel();
+
+        let prepared = preflight_maxwell_packet(
+            &channel,
+            FrontendSubmissionId::new(11),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        assert_eq!(channel.frontend().subchannel_binding(subchannel), None);
+        commit_maxwell_packet(&mut channel, &prepared).unwrap();
+        assert_eq!(
+            channel.frontend().subchannel_binding(subchannel),
+            Some(class)
+        );
+
+        let prepared = preflight_maxwell_packet(
+            &channel,
+            FrontendSubmissionId::new(11),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        channel.reset_subchannel_bindings();
+        assert_eq!(
+            commit_maxwell_packet(&mut channel, &prepared),
+            Err(MaxwellMethodDispatchError::FrontendStateChanged {
+                channel: MaxwellChannelId::new(7)
+            })
+        );
+        assert_eq!(channel.frontend().subchannel_binding(subchannel), None);
+    }
+
+    #[test]
+    fn class_methods_preserve_complete_source_provenance() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[
+            word(header(1, 0, 0, 1), 0),
+            word(class.0, 1),
+            word(header(1, 0x100, 0, 1), 2),
+            word(0x1234_5678, 3),
+        ]);
+        let mut channel = channel();
+        let dispatched =
+            dispatch_maxwell_pushbuffer(&mut channel, FrontendSubmissionId::new(11), &decoded)
+                .unwrap();
+        let method = dispatched[1].methods()[0];
+
+        assert_eq!(method.class(), class);
+        assert_eq!(method.kind(), MaxwellMethodDispatchKind::ClassMethod);
+        assert_eq!(method.source().channel(), MaxwellChannelId::new(7));
+        assert_eq!(method.source().submission(), FrontendSubmissionId::new(11));
+        assert_eq!(method.source().location(), location(3));
+        assert_eq!(method.source().subchannel().get(), 0);
+        assert_eq!(method.source().method(), GpuMethodId(0x400));
+        assert_eq!(method.source().argument(), 0x1234_5678);
+        assert!(method.to_string().contains("mapping-generation=5"));
+    }
+
+    #[test]
+    fn ordinary_method_on_unbound_subchannel_is_rejected_without_state_change() {
+        let decoded = decode(&[word(header(1, 0x100, 2, 1), 0), word(9, 1)]);
+        let mut channel = channel();
+        let before = channel.frontend();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::UnboundSubchannel { source })
+                if source.location() == location(1)
+                    && source.subchannel().get() == 2
+                    && source.method() == GpuMethodId(0x400)
+        ));
+        assert_eq!(channel.frontend(), before);
+    }
+
+    #[test]
+    fn retained_source_identity_cannot_be_relabelled_for_another_submission() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[word(header(1, 0, 0, 1), 0), word(class.0, 1)]);
+        let mut channel = channel();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(12),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::SourceIdentityMismatch {
+                source,
+                submission,
+                ..
+            }) if source == location(0) && submission == FrontendSubmissionId::new(12)
+        ));
+        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+    }
+
+    #[test]
+    fn later_invalid_set_object_makes_the_whole_packet_atomic() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[
+            word(header(3, 0, 0, 2), 0),
+            word(class.0, 1),
+            word(class.0 | 0x0020_0000, 2),
+        ]);
+        let mut channel = channel();
+        let before = channel.frontend();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::InvalidSetObjectValue { source })
+                if source.location() == location(2)
+        ));
+        assert_eq!(channel.frontend(), before);
+    }
+
+    #[test]
+    fn wrong_engine_class_and_software_subchannels_are_typed_failures() {
+        let compute = SWITCH_1_GM20B_PROFILE.classes().compute();
+        for (subchannel, expected) in [
+            (0, Some(SWITCH_1_GM20B_PROFILE.classes().three_d())),
+            (5, None),
+        ] {
+            let decoded = decode(&[word(header(1, 0, subchannel, 1), 0), word(compute.0, 1)]);
+            let mut channel = channel();
+            assert!(matches!(
+                dispatch_maxwell_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(11),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellMethodDispatchError::UnsupportedClassForSubchannel {
+                    class,
+                    expected: actual,
+                    ..
+                }) if class == compute && actual == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn nonzero_set_object_engine_is_not_silently_discarded() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[
+            word(header(1, 0, 0, 1), 0),
+            word(class.0 | (1 << SET_OBJECT_ENGINE_SHIFT), 1),
+        ]);
+        let mut channel = channel();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::UnsupportedSetObjectEngine { engine: 1, .. })
+        ));
+        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+    }
+
+    #[test]
+    fn channel_reset_clears_bindings_without_fabricating_set_object_zero() {
+        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
+        let decoded = decode(&[word(header(1, 0, 0, 1), 0), word(class.0, 1)]);
+        let mut channel = channel();
+        dispatch_maxwell_pushbuffer(&mut channel, FrontendSubmissionId::new(11), &decoded).unwrap();
+        channel.reset_subchannel_bindings();
+        assert_eq!(
+            channel
+                .frontend()
+                .subchannel_binding(MaxwellPushbufferSubchannel::try_new(0).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_host_and_subdevice_controls_remain_fatal_boundaries() {
+        let host = decode(&[word(header(4, 2, 0, 7), 0)]);
+        let control = decode(&[word(1 << 16, 0)]);
+        let mut channel = channel();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &host.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source })
+                if source.method() == GpuMethodId(8)
+        ));
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &control.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::UnsupportedControl { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_count_packet_and_verified_controls_have_no_binding_effect() {
+        let decoded = decode(&[
+            word(header(1, 0xfff, 7, 0), 0),
+            word(0, 1),
+            word(7 << 29, 2),
+        ]);
+        let mut channel = channel();
+        let dispatched =
+            dispatch_maxwell_pushbuffer(&mut channel, FrontendSubmissionId::new(11), &decoded)
+                .unwrap();
+        assert_eq!(dispatched.len(), 3);
+        assert!(dispatched.iter().all(|packet| packet.methods().is_empty()));
+        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+    }
+}
