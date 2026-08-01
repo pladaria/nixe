@@ -176,7 +176,8 @@ impl BackendResourceCreateInfo {
         }
     }
 
-    fn capability_requirements(
+    /// Capabilities required before this complete resource can be created.
+    pub fn capability_requirements(
         &self,
     ) -> Result<CapabilityRequirements, BackendResourceValidationError> {
         Ok(match self {

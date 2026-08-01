@@ -138,6 +138,52 @@ impl CanonicalBackingRange {
         &self.segments
     }
 
+    /// Captures a checked logical subrange with current content generations.
+    ///
+    /// The returned range retains the same canonical pages and permissions,
+    /// but snapshots each touched page's content generation at this boundary.
+    /// This is useful when a long-lived mapping is interpreted as a resource:
+    /// content writes do not invalidate the mapping, while the derived view
+    /// still needs an exact version key for later invalidation.
+    pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalRangeError::RangeOverflow)?;
+        if size == 0 || end > self.size {
+            return Err(CanonicalRangeError::InvalidSubrange);
+        }
+
+        let mut logical_start = 0_u64;
+        let mut captured = Vec::new();
+        for segment in &self.segments {
+            let logical_end = logical_start
+                .checked_add(segment.size)
+                .ok_or(CanonicalRangeError::RangeOverflow)?;
+            let capture_start = offset.max(logical_start);
+            let capture_end = end.min(logical_end);
+            if capture_start < capture_end {
+                let within_segment = capture_start - logical_start;
+                let page_offset = segment
+                    .offset
+                    .checked_add(within_segment)
+                    .ok_or(CanonicalRangeError::SegmentOverflow)?;
+                captured.push(CanonicalBackingSegment::new(
+                    segment.backing.clone(),
+                    page_offset,
+                    capture_end - capture_start,
+                    segment.permissions,
+                    segment.backing.content_generation(),
+                    segment.mapping_generation,
+                )?);
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        Self::new(captured)
+    }
+
     /// Copies a checked logical subrange from retained canonical storage.
     ///
     /// Reads walk canonical page segments directly. A CPU virtual address is
@@ -260,6 +306,7 @@ impl CanonicalBackingRange {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalRangeError {
     Empty,
+    InvalidSubrange,
     SegmentOverflow,
     InvalidSegmentBounds,
     StaleContentGeneration,
@@ -270,6 +317,7 @@ impl Display for CanonicalRangeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Empty => "canonical backing range is empty",
+            Self::InvalidSubrange => "canonical backing subrange is empty or out of bounds",
             Self::SegmentOverflow => "canonical segment end overflows",
             Self::InvalidSegmentBounds => "canonical segment is outside its retained page",
             Self::StaleContentGeneration => {
@@ -450,6 +498,89 @@ mod tests {
                 size: 2,
                 range_size: 6,
             })
+        );
+    }
+
+    #[test]
+    fn snapshot_subrange_retains_exact_bytes_and_current_content_generations() {
+        let store = BackingStoreId::allocate().unwrap();
+        let first = CanonicalBackingPage::zeroed(
+            CanonicalPageId::new(store, GuestPhysicalPageId::new(1)),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let second = CanonicalBackingPage::zeroed(
+            CanonicalPageId::new(store, GuestPhysicalPageId::new(2)),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let range = CanonicalBackingRange::new(vec![
+            CanonicalBackingSegment::new(
+                first.clone(),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                ContentGeneration::INITIAL,
+                MappingGeneration::new(1),
+            )
+            .unwrap(),
+            CanonicalBackingSegment::new(
+                second.clone(),
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                ContentGeneration::INITIAL,
+                MappingGeneration::new(2),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        first.prepare_write().unwrap();
+        first
+            .write_preflighted(
+                0xff0,
+                &[0x5a; 0x10],
+                ContentGeneration::INITIAL,
+                ContentGeneration::new(1),
+            )
+            .unwrap();
+        second.prepare_write().unwrap();
+        second
+            .write_preflighted(
+                0,
+                &[0xa5; 0x10],
+                ContentGeneration::INITIAL,
+                ContentGeneration::new(1),
+            )
+            .unwrap();
+        let snapshot = range.snapshot_subrange(0xff0, 0x20).unwrap();
+
+        assert_eq!(snapshot.size(), 0x20);
+        assert_eq!(snapshot.segments().len(), 2);
+        assert_eq!(snapshot.segments()[0].offset(), 0xff0);
+        assert_eq!(
+            snapshot.segments()[0].content_generation(),
+            first.content_generation()
+        );
+        assert_eq!(
+            snapshot.segments()[1].content_generation(),
+            second.content_generation()
+        );
+        let mut bytes = [0; 0x20];
+        snapshot.read(0, &mut bytes).unwrap();
+        assert_eq!(&bytes[..0x10], &[0x5a; 0x10]);
+        assert_eq!(&bytes[0x10..], &[0xa5; 0x10]);
+
+        assert_eq!(
+            range.snapshot_subrange(0, 0),
+            Err(CanonicalRangeError::InvalidSubrange)
+        );
+        assert_eq!(
+            range.snapshot_subrange(0x1ff0, 0x20),
+            Err(CanonicalRangeError::InvalidSubrange)
         );
     }
 }

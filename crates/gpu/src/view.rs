@@ -150,7 +150,7 @@ impl ImageMemoryLayout {
 }
 
 /// One plane, mip level, and contiguous array-layer range.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ImageSubresourceRange {
     pub plane: u8,
     pub mip_level: u8,

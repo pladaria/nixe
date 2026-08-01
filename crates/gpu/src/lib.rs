@@ -54,9 +54,9 @@ pub use resource::{
     AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableDescription,
     DescriptorTableId, FilterMode, ImageDescription, ImageDimension, ImageExtent, ImageFormat,
     ImageId, ImageKind, PipelineDescription, PipelineId, PipelineKind, QueryKind,
-    QueryPoolDescription, QueryPoolId, RenderPassDescription, RenderPassId,
-    ResourceDescriptionError, SampleCount, SamplerDescription, SamplerId, ShaderDescription,
-    ShaderId, ShaderStage,
+    QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription, RenderPassDescription,
+    RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription, SamplerId,
+    ShaderDescription, ShaderId, ShaderStage,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, HostCompletion,

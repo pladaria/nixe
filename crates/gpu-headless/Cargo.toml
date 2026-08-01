@@ -8,4 +8,5 @@ license.workspace = true
 nixe-gpu.workspace = true
 
 [dev-dependencies]
+nixe-gpu-maxwell.workspace = true
 nixe-memory.workspace = true

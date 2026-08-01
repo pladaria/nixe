@@ -1,0 +1,71 @@
+//! Typed `MAXWELL_B` render-enable state.
+
+use crate::MaxwellMethodSource;
+
+use super::MaxwellThreeDRegister;
+
+/// Render-enable mode programmed through `MAXWELL_B::SET_RENDER_ENABLE_C`.
+///
+/// This type is intentionally distinct from the identically encoded Fermi 2D
+/// register: class state and future execution rules remain engine-owned.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDRenderEnableMode {
+    Disabled = 0,
+    Enabled = 1,
+    Conditional = 2,
+    RenderIfEqual = 3,
+    RenderIfNotEqual = 4,
+}
+
+impl MaxwellThreeDRenderEnableMode {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            2 => Some(Self::Conditional),
+            3 => Some(Self::RenderIfEqual),
+            4 => Some(Self::RenderIfNotEqual),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// One validated 3D render-enable transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellThreeDRenderEnableStateWrite {
+    Mode {
+        value: MaxwellThreeDRenderEnableMode,
+        source: MaxwellMethodSource,
+    },
+}
+
+/// Persistent render-enable configuration on one `MAXWELL_B` channel.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDRenderEnableState {
+    mode: MaxwellThreeDRegister<MaxwellThreeDRenderEnableMode>,
+}
+
+impl MaxwellThreeDRenderEnableState {
+    #[must_use]
+    pub const fn mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRenderEnableMode> {
+        &self.mode
+    }
+
+    pub(in crate::engines) fn execution_mode(&self) -> Option<MaxwellThreeDRenderEnableMode> {
+        self.mode.value().copied()
+    }
+
+    pub(super) fn apply(&mut self, write: MaxwellThreeDRenderEnableStateWrite) {
+        match write {
+            MaxwellThreeDRenderEnableStateWrite::Mode { value, source } => {
+                self.mode = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+        }
+    }
+}

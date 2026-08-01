@@ -414,14 +414,7 @@ impl RenderPassOperation {
         description: RenderPassDescription,
         attachments: Vec<RenderAttachment>,
     ) -> Result<Self, CommandDescriptionError> {
-        let color_count = attachments
-            .iter()
-            .filter(|attachment| attachment.kind == ImageKind::Color)
-            .count();
-        let depth_count = attachments.len().saturating_sub(color_count);
-        if color_count != usize::from(description.color_attachments)
-            || depth_count != usize::from(description.depth_stencil)
-        {
+        if attachments.len() != description.attachments().len() {
             return Err(CommandDescriptionError::AttachmentCountMismatch);
         }
         for (index, attachment) in attachments.iter().enumerate() {
@@ -432,6 +425,17 @@ impl RenderPassOperation {
             {
                 return Err(CommandDescriptionError::DuplicateAttachment);
             }
+        }
+        if attachments
+            .iter()
+            .zip(description.attachments())
+            .any(|(attachment, expected)| {
+                attachment.kind != expected.kind
+                    || attachment.format != expected.format
+                    || attachment.samples != expected.samples
+            })
+        {
+            return Err(CommandDescriptionError::AttachmentDescriptionMismatch);
         }
         Ok(Self::Begin {
             render_pass,
@@ -696,6 +700,7 @@ pub enum CommandDescriptionError {
     EmptyBarrier,
     AttachmentKindMismatch,
     AttachmentCountMismatch,
+    AttachmentDescriptionMismatch,
     DuplicateAttachment,
     EmptySubmission,
     SelfDependency,
@@ -721,9 +726,10 @@ impl Display for CommandDescriptionError {
             Self::AttachmentKindMismatch => {
                 formatter.write_str("render attachment kind and format disagree")
             }
-            Self::AttachmentCountMismatch => {
-                formatter.write_str("render attachments do not match the render-pass description")
-            }
+            Self::AttachmentCountMismatch => formatter
+                .write_str("render attachment count does not match the render-pass description"),
+            Self::AttachmentDescriptionMismatch => formatter
+                .write_str("render attachment shape does not match the render-pass description"),
             Self::DuplicateAttachment => {
                 formatter.write_str("render pass names one image subresource more than once")
             }
@@ -1008,10 +1014,12 @@ mod tests {
         };
         let pass = RenderPassOperation::begin(
             RenderPassId::new(1),
-            RenderPassDescription {
-                color_attachments: 1,
-                depth_stencil: false,
-            },
+            RenderPassDescription::new(vec![crate::RenderPassAttachmentDescription {
+                kind: ImageKind::Color,
+                format: ImageFormat::Rgba8Unorm,
+                samples: SampleCount::One,
+            }])
+            .unwrap(),
             vec![color],
         )
         .unwrap();
@@ -1034,13 +1042,29 @@ mod tests {
         assert_eq!(
             RenderPassOperation::begin(
                 RenderPassId::new(1),
-                RenderPassDescription {
-                    color_attachments: 1,
-                    depth_stencil: false,
-                },
+                RenderPassDescription::new(vec![crate::RenderPassAttachmentDescription {
+                    kind: ImageKind::Color,
+                    format: ImageFormat::Rgba8Unorm,
+                    samples: SampleCount::One,
+                }])
+                .unwrap(),
                 vec![invalid]
             ),
             Err(CommandDescriptionError::AttachmentKindMismatch)
+        );
+
+        assert_eq!(
+            RenderPassOperation::begin(
+                RenderPassId::new(1),
+                RenderPassDescription::new(vec![crate::RenderPassAttachmentDescription {
+                    kind: ImageKind::Color,
+                    format: ImageFormat::Bgra8Unorm,
+                    samples: SampleCount::One,
+                }])
+                .unwrap(),
+                vec![color]
+            ),
+            Err(CommandDescriptionError::AttachmentDescriptionMismatch)
         );
     }
 

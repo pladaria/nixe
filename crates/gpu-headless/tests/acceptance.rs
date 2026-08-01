@@ -387,14 +387,11 @@ fn operation_ordering_rejection_does_not_leave_partial_render_pass_state() {
         capabilities(BackendFeatures::RENDER_PASS, &[]),
     );
     let render_pass = RenderPassId::new(1);
-    let description = RenderPassDescription {
-        color_attachments: 0,
-        depth_stencil: false,
-    };
+    let description = RenderPassDescription::new(vec![]).unwrap();
     backend
         .create_resource(BackendResourceCreateInfo::RenderPass {
             id: render_pass,
-            description,
+            description: description.clone(),
         })
         .unwrap();
 
