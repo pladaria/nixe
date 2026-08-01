@@ -11,9 +11,10 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
 
 use crate::{
-    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy, MaxwellGpfifoCapture,
-    MaxwellGpfifoSourceError, MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace,
-    MaxwellGpuChannel, MaxwellValidatedGpfifoSubmission,
+    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
+    MaxwellFrontendCapture, MaxwellFrontendReplay, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
+    MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+    MaxwellValidatedGpfifoSubmission,
 };
 
 /// Global acceptance order assigned by one deterministic scheduler.
@@ -175,27 +176,55 @@ pub enum MaxwellFrontendDispatchBoundary {
     EmptySubmission {
         dispatch: Box<MaxwellFrontendDispatch>,
     },
+    /// T7 decoded and dispatched the retained command stream and stopped at
+    /// its precise semantic boundary. The scheduled work remains owned here,
+    /// so its completion reservation cannot be published accidentally.
+    Frontend {
+        dispatch: Box<MaxwellFrontendDispatch>,
+        capture: Box<MaxwellFrontendCapture>,
+        replay: Box<MaxwellFrontendReplay>,
+    },
 }
 
 impl MaxwellFrontendDispatchBoundary {
     #[must_use]
     pub const fn dispatch(&self) -> &MaxwellFrontendDispatch {
         match self {
-            Self::FirstPacket { dispatch, .. } | Self::EmptySubmission { dispatch } => dispatch,
+            Self::FirstPacket { dispatch, .. }
+            | Self::EmptySubmission { dispatch }
+            | Self::Frontend { dispatch, .. } => dispatch,
         }
     }
 
     #[must_use]
-    pub const fn first_packet(&self) -> Option<MaxwellGpfifoSourceLocation> {
+    pub fn first_packet(&self) -> Option<MaxwellGpfifoSourceLocation> {
         match self {
             Self::FirstPacket { location, .. } => Some(*location),
             Self::EmptySubmission { .. } => None,
+            Self::Frontend { capture, .. } => capture.words().first().map(|word| word.location()),
+        }
+    }
+
+    #[must_use]
+    pub const fn frontend_capture(&self) -> Option<&MaxwellFrontendCapture> {
+        match self {
+            Self::Frontend { capture, .. } => Some(capture),
+            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn frontend_replay(&self) -> Option<&MaxwellFrontendReplay> {
+        match self {
+            Self::Frontend { replay, .. } => Some(replay),
+            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
         }
     }
 }
 
 impl Display for MaxwellFrontendDispatchBoundary {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let includes_capture = matches!(self, Self::Frontend { .. });
         let scheduled = self.dispatch().scheduled();
         write!(
             formatter,
@@ -218,8 +247,21 @@ impl Display for MaxwellFrontendDispatchBoundary {
             Self::EmptySubmission { .. } => {
                 formatter.write_str("empty-submission completion semantics are unavailable")
             }
+            Self::Frontend {
+                capture, replay, ..
+            } => write!(
+                formatter,
+                "frontend-packets={} first-fatal=[{}] frontend-capture=[{}]",
+                replay.packets().len(),
+                replay.failure(),
+                capture
+            ),
         }?;
-        write!(formatter, " capture=[{}]", self.dispatch().capture())
+        if includes_capture {
+            Ok(())
+        } else {
+            write!(formatter, " capture=[{}]", self.dispatch().capture())
+        }
     }
 }
 

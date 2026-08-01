@@ -331,6 +331,54 @@ impl MaxwellValidatedGpfifoSubmission {
             })
     }
 
+    /// Resolves the exact retained source location of one command word.
+    pub fn word_location(
+        &self,
+        entry_index: u32,
+        word_offset: u64,
+    ) -> Result<MaxwellGpfifoSourceLocation, MaxwellGpfifoSourceError> {
+        let pushbuffer = self
+            .pushbuffers
+            .get(entry_index as usize)
+            .ok_or(MaxwellGpfifoSourceError::UnknownEntry { entry_index })?;
+        if word_offset >= u64::from(pushbuffer.entry.word_count()) {
+            return Err(MaxwellGpfifoSourceError::UnknownWord {
+                entry_index,
+                word_offset,
+                word_count: pushbuffer.entry.word_count(),
+            });
+        }
+        let byte_offset = word_offset
+            .checked_mul(4)
+            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
+        let address = pushbuffer
+            .entry
+            .address()
+            .get()
+            .checked_add(byte_offset)
+            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
+        let segment = pushbuffer
+            .source
+            .segments()
+            .iter()
+            .find(|segment| {
+                let start = segment.gpu_offset().get();
+                start
+                    .checked_add(segment.size())
+                    .is_some_and(|end| address >= start && address < end)
+            })
+            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
+        source_location(
+            self.channel,
+            self.frontend,
+            entry_index,
+            pushbuffer.entry.address(),
+            segment.mapping(),
+            GpuVirtualAddress::try_new(address, 64)
+                .map_err(|_| MaxwellGpfifoSourceError::ArithmeticOverflow)?,
+        )
+    }
+
     /// Builds a pointer-free, hard-bounded summary for host diagnostics.
     #[must_use]
     pub fn capture(&self) -> MaxwellGpfifoCapture {
@@ -502,6 +550,11 @@ pub enum MaxwellGpfifoSourceError {
     UnknownEntry {
         entry_index: u32,
     },
+    UnknownWord {
+        entry_index: u32,
+        word_offset: u64,
+        word_count: u32,
+    },
     Resolution {
         channel: MaxwellChannelId,
         frontend: FrontendSubmissionId,
@@ -535,6 +588,14 @@ impl Display for MaxwellGpfifoSourceError {
             Self::UnknownEntry { entry_index } => write!(
                 formatter,
                 "unknown retained GPFIFO entry: entry={entry_index}"
+            ),
+            Self::UnknownWord {
+                entry_index,
+                word_offset,
+                word_count,
+            } => write!(
+                formatter,
+                "unknown retained GPFIFO word: entry={entry_index} word-offset={word_offset} word-count={word_count}"
             ),
             Self::Resolution {
                 channel,

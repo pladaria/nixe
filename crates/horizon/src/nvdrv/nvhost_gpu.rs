@@ -8,10 +8,10 @@ use nixe_gpu::{
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
-    MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace,
-    MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission, MaxwellMemoryManagerId,
-    MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode, decode_gpfifo_submission,
-    resolve_gpfifo_submission,
+    MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
+    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
+    capture_maxwell_frontend_dispatch, decode_gpfifo_submission, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -406,7 +406,7 @@ fn decode_legacy_submit_gpfifo(
 }
 
 fn submit_gpfifo(
-    channel: &MaxwellGpuChannel,
+    channel: &mut MaxwellGpuChannel,
     scheduler: &mut MaxwellScheduler,
     next_frontend_submission: &mut u64,
     resources: NvHostGpuIoctlResources<'_>,
@@ -515,11 +515,15 @@ fn submit_gpfifo(
         .dispatch_next(dependency_reached, dispatch_address_space)
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let boundary = dispatch
-        .unsupported_boundary()
-        .map_err(|error| gpfifo_memory_error(descriptor, request, error))?;
-    // T7 owns packet decoding. The reservation remains embedded in this fatal
-    // boundary and is neither backend-complete nor guest-visible.
+    let (capture, replay) =
+        capture_maxwell_frontend_dispatch(&dispatch, channel, dispatch_address_space);
+    let boundary = MaxwellFrontendDispatchBoundary::Frontend {
+        dispatch: Box::new(dispatch),
+        capture: Box::new(capture),
+        replay: Box::new(replay),
+    };
+    // The reservation remains embedded in this fatal boundary and is neither
+    // backend-complete nor guest-visible. T8 and later own neutral execution.
     Err(NvDrvCallError::Unsupported(
         UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
             context: NvDrvErrorContext::new(
@@ -575,23 +579,6 @@ fn scheduling_error(
             descriptor.fd(),
             None,
             NvDrvValidationReason::GpfifoSchedulingUnavailable,
-        ),
-        error: Box::new(error),
-    })
-}
-
-fn gpfifo_memory_error(
-    descriptor: NvDrvDeviceDescriptor,
-    request: u32,
-    error: nixe_gpu_maxwell::MaxwellGpfifoSourceError,
-) -> NvDrvCallError {
-    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::GpfifoMemory {
-        context: NvDrvErrorContext::new(
-            descriptor.kind(),
-            request,
-            descriptor.fd(),
-            None,
-            NvDrvValidationReason::GpfifoMemoryResolutionFailed,
         ),
         error: Box::new(error),
     })

@@ -212,7 +212,7 @@ impl Display for UnsupportedNvDrvOperation {
             ),
             Self::ScheduledGpfifoSubmission { context, boundary } => write!(
                 formatter,
-                "validated GPFIFO work reached the unsupported Maxwell packet boundary: device={} request={:#010x} fd={} reason={} dispatch=[{}]",
+                "validated GPFIFO work reached the first unsupported Maxwell frontend boundary: device={} request={:#010x} fd={} reason={} dispatch=[{}]",
                 context.device().path(),
                 context.request(),
                 context.fd(),
