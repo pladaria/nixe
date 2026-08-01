@@ -456,11 +456,73 @@ impl DescriptorTableDescription {
     }
 }
 
-/// Immutable render-pass attachment shape.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Immutable compatibility shape of one ordered render-pass attachment.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RenderPassAttachmentDescription {
+    pub kind: ImageKind,
+    pub format: ImageFormat,
+    pub samples: SampleCount,
+}
+
+/// Immutable ordered render-pass compatibility description.
+///
+/// Color attachment position is semantically relevant to fragment output
+/// routing, so the description retains every attachment rather than merely
+/// a count. Resource identities remain dynamic begin-operation data.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderPassDescription {
-    pub color_attachments: u8,
-    pub depth_stencil: bool,
+    attachments: Box<[RenderPassAttachmentDescription]>,
+}
+
+impl RenderPassDescription {
+    pub fn new(
+        attachments: Vec<RenderPassAttachmentDescription>,
+    ) -> Result<Self, ResourceDescriptionError> {
+        let mut depth_stencil = false;
+        let mut seen_depth_stencil = false;
+        for attachment in &attachments {
+            match attachment.kind {
+                ImageKind::Color if !seen_depth_stencil => {}
+                ImageKind::Color => {
+                    return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
+                }
+                ImageKind::DepthStencil if !depth_stencil => {
+                    depth_stencil = true;
+                    seen_depth_stencil = true;
+                }
+                ImageKind::DepthStencil => {
+                    return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
+                }
+            }
+            if attachment.format.is_depth_stencil() != (attachment.kind == ImageKind::DepthStencil)
+            {
+                return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
+            }
+        }
+        Ok(Self {
+            attachments: attachments.into_boxed_slice(),
+        })
+    }
+
+    #[must_use]
+    pub fn attachments(&self) -> &[RenderPassAttachmentDescription] {
+        &self.attachments
+    }
+
+    #[must_use]
+    pub fn color_attachment_count(&self) -> usize {
+        self.attachments
+            .iter()
+            .filter(|attachment| attachment.kind == ImageKind::Color)
+            .count()
+    }
+
+    #[must_use]
+    pub fn has_depth_stencil(&self) -> bool {
+        self.attachments
+            .last()
+            .is_some_and(|attachment| attachment.kind == ImageKind::DepthStencil)
+    }
 }
 
 /// Type of values stored by a query pool.
@@ -509,6 +571,7 @@ pub enum ResourceDescriptionError {
     InvalidLodRange,
     InvalidAnisotropy,
     EmptyDescriptorTable,
+    InvalidRenderPassAttachments,
     EmptyQueryPool,
 }
 
@@ -542,6 +605,9 @@ impl Display for ResourceDescriptionError {
                 formatter.write_str("sampler anisotropy is non-finite or less than one")
             }
             Self::EmptyDescriptorTable => formatter.write_str("descriptor table has no bindings"),
+            Self::InvalidRenderPassAttachments => {
+                formatter.write_str("render pass attachment sequence is invalid")
+            }
             Self::EmptyQueryPool => formatter.write_str("query pool has no queries"),
         }
     }

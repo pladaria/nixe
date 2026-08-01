@@ -9,7 +9,10 @@ use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 
-use crate::{GpuProfileId, MaxwellAddressSpaceId, MaxwellGpuProfile, MaxwellPushbufferSubchannel};
+use crate::{
+    GpuProfileId, MaxwellAddressSpaceId, MaxwellGpuProfile, MaxwellPushbufferSubchannel,
+    MaxwellThreeDState, MaxwellTwoDState,
+};
 
 /// Stable identity of one Maxwell channel lifetime.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -264,6 +267,8 @@ pub struct MaxwellGpuChannel {
     address_space: Option<MaxwellAddressSpaceId>,
     syncpoint: Option<GuestSyncpointId>,
     frontend: MaxwellChannelFrontendState,
+    two_d: MaxwellTwoDState,
+    three_d: MaxwellThreeDState,
     priority: MaxwellChannelPriority,
     timeslice: MaxwellChannelTimeslice,
     timeout: MaxwellChannelTimeout,
@@ -272,7 +277,7 @@ pub struct MaxwellGpuChannel {
 
 impl MaxwellGpuChannel {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         id: MaxwellChannelId,
         owner: MaxwellChannelOwner,
         profile: MaxwellGpuProfile,
@@ -292,6 +297,8 @@ impl MaxwellGpuChannel {
                 z_cull_binding: None,
                 subchannel_bindings: [None; 8],
             },
+            two_d: MaxwellTwoDState::new(),
+            three_d: MaxwellThreeDState::new(),
             priority: MaxwellChannelPriority::Medium,
             timeslice: MaxwellChannelTimeslice::DriverDefault,
             timeout: MaxwellChannelTimeout::DriverDefault,
@@ -341,6 +348,26 @@ impl MaxwellGpuChannel {
 
     pub(crate) fn replace_frontend(&mut self, frontend: MaxwellChannelFrontendState) {
         self.frontend = frontend;
+    }
+
+    /// Returns an immutable snapshot of channel-owned `FERMI_TWOD_A` state.
+    #[must_use]
+    pub const fn two_d(&self) -> &MaxwellTwoDState {
+        &self.two_d
+    }
+
+    pub(crate) fn replace_two_d(&mut self, two_d: MaxwellTwoDState) {
+        self.two_d = two_d;
+    }
+
+    /// Returns an immutable snapshot of channel-owned `MAXWELL_B` state.
+    #[must_use]
+    pub const fn three_d(&self) -> &MaxwellThreeDState {
+        &self.three_d
+    }
+
+    pub(crate) fn replace_three_d(&mut self, three_d: MaxwellThreeDState) {
+        self.three_d = three_d;
     }
 
     /// Resets frontend class selection at a verified channel-reset boundary.
@@ -591,6 +618,14 @@ mod tests {
         assert_eq!(channel.owner().process_id(), 9);
         assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
         assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+        assert_eq!(
+            channel.three_d().raster().point_size().origin(),
+            crate::MaxwellThreeDRegisterOrigin::Unset
+        );
+        assert_eq!(
+            channel.three_d().viewport().z_clip_range().origin(),
+            crate::MaxwellThreeDRegisterOrigin::Unset
+        );
     }
 
     #[test]

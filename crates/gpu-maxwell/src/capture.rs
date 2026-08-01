@@ -12,7 +12,8 @@ use crate::{
     GpuProfileId, MaxwellChannelFrontendState, MaxwellChannelId, MaxwellDecodedPushbuffer,
     MaxwellEngineDispatchError, MaxwellEnginePacketDispatch, MaxwellFrontendDispatch,
     MaxwellGpfifoCapture, MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellPushbufferDecodeError,
-    MaxwellPushbufferWord, decode_maxwell_pushbuffer, dispatch_maxwell_engine_packet,
+    MaxwellPushbufferWord, MaxwellThreeDState, decode_maxwell_pushbuffer,
+    dispatch_maxwell_engine_packet,
 };
 
 /// Maximum command words retained in an in-memory failure capture.
@@ -24,6 +25,7 @@ pub struct MaxwellFrontendCapture {
     profile: GpuProfileId,
     channel: MaxwellChannelId,
     initial_frontend: MaxwellChannelFrontendState,
+    initial_three_d: MaxwellThreeDState,
     submission: MaxwellGpfifoCapture,
     total_words: usize,
     words: Box<[MaxwellPushbufferWord]>,
@@ -44,6 +46,11 @@ impl MaxwellFrontendCapture {
     #[must_use]
     pub const fn initial_frontend(&self) -> MaxwellChannelFrontendState {
         self.initial_frontend
+    }
+
+    #[must_use]
+    pub const fn initial_three_d(&self) -> &MaxwellThreeDState {
+        &self.initial_three_d
     }
 
     #[must_use]
@@ -160,6 +167,9 @@ pub enum MaxwellFrontendCaptureError {
     FrontendStateMismatch {
         channel: MaxwellChannelId,
     },
+    EngineStateMismatch {
+        channel: MaxwellChannelId,
+    },
     TruncatedCapture {
         total_words: usize,
         retained_words: usize,
@@ -183,6 +193,12 @@ impl Display for MaxwellFrontendCaptureError {
                 write!(
                     formatter,
                     "capture initial frontend state mismatch: {channel}"
+                )
+            }
+            Self::EngineStateMismatch { channel } => {
+                write!(
+                    formatter,
+                    "capture initial Maxwell engine state mismatch: {channel}"
                 )
             }
             Self::TruncatedCapture {
@@ -211,6 +227,7 @@ pub fn capture_maxwell_frontend_dispatch(
     address_space: &MaxwellGpuAddressSpace,
 ) -> (MaxwellFrontendCapture, MaxwellFrontendReplay) {
     let initial_frontend = channel.frontend();
+    let initial_three_d = channel.three_d().clone();
     let submission = dispatch.scheduled().submission();
     let mut recording = RecordingWords::new(SubmissionWords::new(submission, address_space));
     let decoded = decode_maxwell_pushbuffer(&mut recording);
@@ -219,6 +236,7 @@ pub fn capture_maxwell_frontend_dispatch(
         channel.profile_id(),
         channel.id(),
         initial_frontend,
+        initial_three_d,
         dispatch.capture(),
         source_complete,
     );
@@ -251,6 +269,11 @@ pub fn replay_maxwell_frontend_capture(
     }
     if channel.frontend() != capture.initial_frontend {
         return Err(MaxwellFrontendCaptureError::FrontendStateMismatch {
+            channel: channel.id(),
+        });
+    }
+    if channel.three_d() != &capture.initial_three_d {
+        return Err(MaxwellFrontendCaptureError::EngineStateMismatch {
             channel: channel.id(),
         });
     }
@@ -330,6 +353,7 @@ impl<I> RecordingWords<I> {
         profile: GpuProfileId,
         channel: MaxwellChannelId,
         initial_frontend: MaxwellChannelFrontendState,
+        initial_three_d: MaxwellThreeDState,
         submission: MaxwellGpfifoCapture,
         source_complete: bool,
     ) -> MaxwellFrontendCapture {
@@ -337,6 +361,7 @@ impl<I> RecordingWords<I> {
             profile,
             channel,
             initial_frontend,
+            initial_three_d,
             submission,
             total_words: self.total_words,
             words: self.words.into_boxed_slice(),
@@ -542,7 +567,7 @@ mod tests {
         assert_eq!(channel.frontend(), initial.frontend());
 
         channel.reset_subchannel_bindings();
-        let mut mismatched = initial;
+        let mut mismatched = initial.clone();
         let bind = crate::decode_maxwell_pushbuffer([
             Ok(MaxwellPushbufferWord::new(
                 method_header(1, 0, 0, 1),
@@ -563,6 +588,37 @@ mod tests {
         assert!(matches!(
             replay_maxwell_frontend_capture(&capture, &mut mismatched),
             Err(MaxwellFrontendCaptureError::FrontendStateMismatch { .. })
+        ));
+
+        let mut engine_mismatched = initial;
+        crate::dispatch_maxwell_engine_packet(
+            &mut engine_mismatched,
+            capture.submission().frontend(),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        let point_size = crate::decode_maxwell_pushbuffer([
+            Ok(MaxwellPushbufferWord::new(
+                method_header(1, 0x1518 / 4, 0, 1),
+                capture.words()[0].location(),
+            )),
+            Ok(MaxwellPushbufferWord::new(
+                0x3f80_0000,
+                capture.words()[1].location(),
+            )),
+        ])
+        .unwrap();
+        crate::dispatch_maxwell_engine_packet(
+            &mut engine_mismatched,
+            capture.submission().frontend(),
+            &point_size.packets()[0],
+        )
+        .unwrap();
+        engine_mismatched.reset_subchannel_bindings();
+        assert_eq!(engine_mismatched.frontend(), capture.initial_frontend());
+        assert!(matches!(
+            replay_maxwell_frontend_capture(&capture, &mut engine_mismatched),
+            Err(MaxwellFrontendCaptureError::EngineStateMismatch { .. })
         ));
     }
 

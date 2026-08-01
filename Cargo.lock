@@ -994,6 +994,7 @@ name = "nixe-gpu-headless"
 version = "0.1.0"
 dependencies = [
  "nixe-gpu",
+ "nixe-gpu-maxwell",
  "nixe-memory",
 ]
 
