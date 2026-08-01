@@ -1,6 +1,10 @@
 use std::fmt::{Display, Formatter, Write};
 
 use nixe_gpu::GraphicsGapKind;
+use nixe_gpu_maxwell::{
+    MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError, MaxwellScheduleError,
+    MaxwellUnsupportedGpfifoSubmission,
+};
 use nixe_memory::CanonicalRangeTranslationError;
 
 use super::device::{NvDrvDeviceKind, NvDrvFileDescriptor};
@@ -19,6 +23,9 @@ pub enum NvDrvValidationReason {
     DeviceStateUnavailable,
     TimelineIdentityExhausted,
     TimelineOrderingUnavailable,
+    GpfifoMemoryResolutionFailed,
+    GpfifoSchedulingUnavailable,
+    MaxwellPacketSemanticsUnavailable,
 }
 
 impl Display for NvDrvValidationReason {
@@ -32,6 +39,9 @@ impl Display for NvDrvValidationReason {
             Self::DeviceStateUnavailable => "device-state-unavailable",
             Self::TimelineIdentityExhausted => "timeline-identity-exhausted",
             Self::TimelineOrderingUnavailable => "timeline-ordering-unavailable",
+            Self::GpfifoMemoryResolutionFailed => "gpfifo-memory-resolution-failed",
+            Self::GpfifoSchedulingUnavailable => "gpfifo-scheduling-unavailable",
+            Self::MaxwellPacketSemanticsUnavailable => "maxwell-packet-semantics-unavailable",
         })
     }
 }
@@ -101,6 +111,22 @@ pub enum UnsupportedNvDrvOperation {
     Ioctl {
         context: NvDrvErrorContext,
     },
+    GpfifoSubmission {
+        context: NvDrvErrorContext,
+        error: MaxwellUnsupportedGpfifoSubmission,
+    },
+    GpfifoMemory {
+        context: NvDrvErrorContext,
+        error: Box<MaxwellGpfifoSourceError>,
+    },
+    GpfifoScheduling {
+        context: NvDrvErrorContext,
+        error: Box<MaxwellScheduleError>,
+    },
+    ScheduledGpfifoSubmission {
+        context: NvDrvErrorContext,
+        boundary: Box<MaxwellFrontendDispatchBoundary>,
+    },
     CanonicalMemory {
         context: NvDrvErrorContext,
         fault: CanonicalRangeTranslationError,
@@ -116,7 +142,12 @@ impl UnsupportedNvDrvOperation {
             Self::ServiceCommand { .. } | Self::QueryEvent { .. } => {
                 GraphicsGapKind::ServiceCommand
             }
-            Self::Ioctl { .. } | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
+            Self::Ioctl { .. }
+            | Self::GpfifoSubmission { .. }
+            | Self::GpfifoMemory { .. }
+            | Self::GpfifoScheduling { .. }
+            | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
+            Self::ScheduledGpfifoSubmission { .. } => GraphicsGapKind::GpuPacket,
         }
     }
 }
@@ -151,6 +182,42 @@ impl Display for UnsupportedNvDrvOperation {
                 context.request(),
                 context.fd(),
                 context.reason()
+            ),
+            Self::GpfifoSubmission { context, error } => write!(
+                formatter,
+                "nvdrv GPFIFO submission mode is not implemented: device={} request={:#010x} fd={} reason={} detail=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                error
+            ),
+            Self::GpfifoMemory { context, error } => write!(
+                formatter,
+                "nvdrv GPFIFO command memory is invalid or unavailable: device={} request={:#010x} fd={} reason={} detail=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                error
+            ),
+            Self::GpfifoScheduling { context, error } => write!(
+                formatter,
+                "nvdrv GPFIFO scheduling failed: device={} request={:#010x} fd={} reason={} detail=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                error
+            ),
+            Self::ScheduledGpfifoSubmission { context, boundary } => write!(
+                formatter,
+                "validated GPFIFO work reached the unsupported Maxwell packet boundary: device={} request={:#010x} fd={} reason={} dispatch=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                boundary
             ),
             Self::CanonicalMemory { context, fault } => {
                 write!(

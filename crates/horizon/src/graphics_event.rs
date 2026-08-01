@@ -11,6 +11,7 @@ pub enum GraphicsEventSource {
     ViVsync { display_id: u64 },
     BufferQueueAvailability { binder_id: i32 },
     GpuSyncpoint { event_slot: u8 },
+    GpuChannelError { channel_id: u64 },
     AcquireFence,
     ReleaseFence,
 }

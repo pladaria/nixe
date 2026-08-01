@@ -1403,6 +1403,7 @@ const NV_IOCTL_SIZE_MASK: u32 = 0x3fff;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NvIoctlBuffers {
     input: Option<BufferDescriptor>,
+    additional_input: Option<BufferDescriptor>,
     output: Option<BufferDescriptor>,
 }
 
@@ -1495,12 +1496,87 @@ fn nv_ioctl_buffer_descriptors(
             "nvdrv ioctl input buffer does not match its encoded direction and size",
             "nvdrv ioctl without input carries a non-null input placeholder",
         )?,
+        additional_input: None,
         output: select(
             *output,
             request & NV_IOCTL_READ != 0,
             "nvdrv ioctl output buffer does not match its encoded direction and size",
             "nvdrv ioctl without output carries a non-null output placeholder",
         )?,
+    })
+}
+
+fn nv_ioctl2_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
+    nv_ioctl2_buffer_descriptors(
+        &hipc.send_statics,
+        &hipc.send_buffers,
+        &hipc.receive_buffers,
+        &hipc.receive_statics,
+        request,
+    )
+}
+
+fn nv_ioctl2_buffer_descriptors(
+    send_statics: &[SendStaticDescriptor],
+    send_buffers: &[BufferDescriptor],
+    receive_buffers: &[BufferDescriptor],
+    receive_statics: &ReceiveStatics,
+    request: u32,
+) -> Result<NvIoctlBuffers, IpcWireError> {
+    let [input, additional_input] = send_buffers else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires exactly two input auto-select buffers",
+        ));
+    };
+    let [output] = receive_buffers else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires exactly one output auto-select buffer",
+        ));
+    };
+    let [input_pointer, additional_input_pointer] = send_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires exactly two input auto-select pointers",
+        ));
+    };
+    let ReceiveStatics::Entries(output_pointers) = receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires one output auto-select pointer",
+        ));
+    };
+    let [output_pointer] = output_pointers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires exactly one output auto-select pointer",
+        ));
+    };
+    if [input_pointer, additional_input_pointer]
+        .into_iter()
+        .any(|pointer| pointer.address != 0 || pointer.size != 0)
+        || output_pointer.address != 0
+        || output_pointer.size != 0
+    {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 auto-select pointer placeholders are not null",
+        ));
+    }
+    if additional_input.mode == BufferMode::Invalid
+        || (additional_input.size != 0 && additional_input.address == 0)
+    {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 additional input buffer is invalid",
+        ));
+    }
+
+    let ordinary = nv_ioctl_buffer_descriptors(
+        &[*input_pointer],
+        &[*input],
+        &[*output],
+        &ReceiveStatics::Entries(vec![*output_pointer]),
+        request,
+    )?;
+    Ok(NvIoctlBuffers {
+        input: ordinary.input,
+        additional_input: Some(*additional_input),
+        output: ordinary.output,
     })
 }
 
@@ -2122,14 +2198,21 @@ fn dispatch_nvdrv(
                 None,
             ))
         }
-        1 => {
+        1 | 11 => {
             let Some(fd) = request_u32(request.data, 0) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
             let Some(ioctl) = request_u32(request.data, 4) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
-            let buffers = nv_ioctl_buffers(hipc, ioctl)?;
+            let buffers = if request.command_id == 11 {
+                // libnx `nvIoctl2` uses command 11 and carries the GPFIFO
+                // descriptor array in a second input auto-select buffer:
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nv.c#L172-L208
+                nv_ioctl2_buffers(hipc, ioctl)?
+            } else {
+                nv_ioctl_buffers(hipc, ioctl)?
+            };
             let input_size = buffers
                 .input
                 .map(|descriptor| descriptor.size)
@@ -2146,11 +2229,28 @@ fn dispatch_nvdrv(
                     &mut input,
                 )?;
             }
+            let additional_input_size = buffers
+                .additional_input
+                .map(|descriptor| descriptor.size)
+                .map_or(Ok(0), usize::try_from)
+                .map_err(|_| IpcWireError::Malformed("nvdrv Ioctl2 input is too large"))?;
+            if additional_input_size > 0x1_0000 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let mut additional_input = vec![0_u8; additional_input_size];
+            if let Some(input_descriptor) = buffers.additional_input {
+                read_bytes(
+                    process,
+                    GuestVirtualAddress::new(input_descriptor.address),
+                    &mut additional_input,
+                )?;
+            }
             let response = service
                 .ioctl(crate::nvdrv::NvDrvIoctlRequest {
                     fd: NvDrvFileDescriptor::new(fd),
                     request: ioctl,
                     input: &input,
+                    additional_input: &additional_input,
                     process_id: process.process_id(),
                     address_space: process.cpu().address_space_id(),
                     translator: process.canonical_memory(),
@@ -3050,6 +3150,35 @@ mod tests {
         )
     }
 
+    fn nv_ioctl2_descriptors(
+        input: BufferDescriptor,
+        additional_input: BufferDescriptor,
+        output: BufferDescriptor,
+        request: u32,
+    ) -> Result<NvIoctlBuffers, IpcWireError> {
+        nv_ioctl2_buffer_descriptors(
+            &[
+                SendStaticDescriptor {
+                    address: 0,
+                    size: 0,
+                    index: 0,
+                },
+                SendStaticDescriptor {
+                    address: 0,
+                    size: 0,
+                    index: 1,
+                },
+            ],
+            &[input, additional_input],
+            &[output],
+            &ReceiveStatics::Entries(vec![ReceiveStaticDescriptor {
+                address: 0,
+                size: 0,
+            }]),
+            request,
+        )
+    }
+
     fn buffer(address: u64, size: u64) -> BufferDescriptor {
         BufferDescriptor {
             address,
@@ -3064,6 +3193,7 @@ mod tests {
             nv_ioctl_descriptors(buffer(0x1000, 40), buffer(0, 0), 0x4028_4109),
             Ok(NvIoctlBuffers {
                 input: Some(buffer(0x1000, 40)),
+                additional_input: None,
                 output: None,
             })
         );
@@ -3075,6 +3205,34 @@ mod tests {
             nv_ioctl_descriptors(buffer(0x1000, 40), buffer(0x2000, 40), 0x4028_4109),
             Err(IpcWireError::Malformed(
                 "nvdrv ioctl without output carries a non-null output placeholder"
+            ))
+        );
+    }
+
+    #[test]
+    fn nv_ioctl2_retains_the_independently_sized_additional_input() {
+        assert_eq!(
+            nv_ioctl2_descriptors(
+                buffer(0x1000, 24),
+                buffer(0x2000, 0x40),
+                buffer(0x3000, 24),
+                0xc018_481b,
+            ),
+            Ok(NvIoctlBuffers {
+                input: Some(buffer(0x1000, 24)),
+                additional_input: Some(buffer(0x2000, 0x40)),
+                output: Some(buffer(0x3000, 24)),
+            })
+        );
+        assert_eq!(
+            nv_ioctl2_descriptors(
+                buffer(0x1000, 24),
+                buffer(0, 8),
+                buffer(0x3000, 24),
+                0xc018_481b,
+            ),
+            Err(IpcWireError::Malformed(
+                "nvdrv Ioctl2 additional input buffer is invalid"
             ))
         );
     }
