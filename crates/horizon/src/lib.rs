@@ -4,6 +4,7 @@
 //! layered on its process, mount, and extensible handle primitives.
 
 mod graphics;
+mod graphics_event;
 mod hid;
 mod ipc;
 mod ipc_message;
@@ -16,6 +17,7 @@ mod svc;
 mod svc_dispatch;
 
 pub use graphics::{GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem};
+pub use graphics_event::GraphicsEventSource;
 pub use hid::HidSystem;
 pub use ipc::{
     AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,

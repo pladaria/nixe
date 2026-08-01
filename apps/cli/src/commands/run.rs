@@ -434,12 +434,16 @@ fn execute(
                         return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
                     }
                     ExceptionHandlingResult::Suspended => {
+                        let thread_id = process.main_thread().object().thread_id();
+                        let waited = dispatcher.wait_for_thread_wakeup(thread_id);
                         if !process.resume() {
                             return Err(format!(
-                                "title suspended but could not be resumed for event polling after {instructions} instructions: {report}"
+                                "title suspended but could not be resumed after its scheduler wakeup at {instructions} instructions: {report}"
                             ));
                         }
-                        std::thread::yield_now();
+                        if !waited {
+                            std::thread::yield_now();
+                        }
                     }
                     ExceptionHandlingResult::Fault(error) => {
                         return Err(format!(

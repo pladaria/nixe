@@ -1,7 +1,5 @@
-use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator};
-
 use super::diagnostics::NvDrvCallError;
-use super::ioctl::{NvDrvIoctlRequest, NvDrvIoctlResponse};
+use super::ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use super::{NvDrvFileDescriptor, NvDrvSession, UnsupportedNvDrvOperation};
 
 /// Semantic NVIDIA service failure before Horizon response encoding.
@@ -43,37 +41,22 @@ impl<'a> NvDrvService<'a> {
 
     pub(crate) fn ioctl(
         &self,
-        fd: NvDrvFileDescriptor,
-        request: u32,
-        input: &[u8],
-        process_id: u64,
-        address_space: AddressSpaceId,
-        translator: &dyn CanonicalRangeTranslator,
-    ) -> Result<NvDrvIoctlResponse, UnsupportedNvDrvOperation> {
-        let request = NvDrvIoctlRequest {
-            fd,
-            request,
-            input,
-            process_id,
-            address_space,
-            translator,
-        };
-        let (output, driver_result) = self.session.ioctl_with_memory(
-            request.fd,
-            request.request,
-            request.input,
-            request.process_id,
-            request.address_space,
-            request.translator,
-        )?;
-        Ok(NvDrvIoctlResponse {
-            output,
-            driver_result,
-        })
+        request: NvDrvIoctlRequest<'_>,
+    ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
+        self.session.ioctl_outcome(request)
     }
 
     pub(crate) fn close(&self, fd: NvDrvFileDescriptor) -> u32 {
         self.session.close(fd)
+    }
+
+    pub(crate) fn query_event(
+        &self,
+        fd: NvDrvFileDescriptor,
+        event_id: u32,
+        process_id: u64,
+    ) -> Result<(Option<nixe_runtime::ReadableEventObject>, u32), UnsupportedNvDrvOperation> {
+        self.session.query_event(fd, event_id, process_id)
     }
 
     pub(crate) fn initialize(&self) {

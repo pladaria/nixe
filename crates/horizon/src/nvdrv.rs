@@ -12,6 +12,8 @@ mod device;
 mod diagnostics;
 mod ioctl;
 mod nvhost_as_gpu;
+mod nvhost_ctrl;
+pub(crate) use nvhost_ctrl::PendingNvHostCtrlWait;
 mod nvmap;
 mod service;
 mod session;
@@ -22,7 +24,10 @@ pub use device::{
 };
 use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
+use ioctl::NvDrvIoctlResponse;
+pub(crate) use ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::ioctl_nvhost_as_gpu;
+use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
     NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
@@ -45,6 +50,7 @@ pub(crate) const NV_SUCCESS: u32 = 0;
 pub(crate) const NV_NOT_SUPPORTED: u32 = 2;
 pub(crate) const NV_NOT_INITIALIZED: u32 = 3;
 pub(crate) const NV_BAD_PARAMETER: u32 = 4;
+pub(crate) const NV_TIMEOUT: u32 = 5;
 pub(crate) const NV_INSUFFICIENT_MEMORY: u32 = 6;
 pub(crate) const NV_INVALID_STATE: u32 = 8;
 pub(crate) const NV_BAD_VALUE: u32 = 0xb;
@@ -60,6 +66,7 @@ struct NvDrvClientState {
     devices: BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
     next_gpu_address_space_id: u64,
     gpu_address_spaces: BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>,
+    nvhost_control: NvHostControl,
     nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
 }
@@ -108,6 +115,7 @@ impl NvDrvSession {
                 devices: BTreeMap::new(),
                 next_gpu_address_space_id: 1,
                 gpu_address_spaces: BTreeMap::new(),
+                nvhost_control: NvHostControl::default(),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
             })),
@@ -185,6 +193,9 @@ impl NvDrvSession {
         let descriptor = NvDrvDeviceDescriptor::open(fd, kind, owner, state.permission);
         state.next_fd = next_fd;
         state.devices.insert(fd, descriptor);
+        if kind == NvDrvDeviceKind::HostControl {
+            state.nvhost_control.open(fd);
+        }
         if let Some(next_gpu_address_space_id) = next_gpu_address_space_id {
             let address_space_id = MaxwellAddressSpaceId::new(state.next_gpu_address_space_id);
             state.next_gpu_address_space_id = next_gpu_address_space_id;
@@ -201,6 +212,7 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.devices.remove(&fd).is_some() {
             state.gpu_address_spaces.remove(&fd);
+            state.nvhost_control.close(fd);
             NV_SUCCESS
         } else {
             NV_BAD_PARAMETER
@@ -214,9 +226,26 @@ impl NvDrvSession {
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        self.ioctl_inner(fd, request, input, None)
+        match self.ioctl_inner(fd, request, input, None, 1)? {
+            NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+                panic!("scheduler waits must use the semantic outcome test helper")
+            }
+        }
     }
 
+    #[cfg(test)]
+    fn ioctl_without_memory_outcome(
+        &self,
+        fd: NvDrvFileDescriptor,
+        request: u32,
+        input: &[u8],
+        thread_id: u64,
+    ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
+        self.ioctl_inner(fd, request, input, None, thread_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn ioctl_with_memory(
         &self,
         fd: NvDrvFileDescriptor,
@@ -226,11 +255,36 @@ impl NvDrvSession {
         address_space: AddressSpaceId,
         translator: &dyn CanonicalRangeTranslator,
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        self.ioctl_inner(
+        match self.ioctl_outcome(NvDrvIoctlRequest {
             fd,
             request,
             input,
-            Some((process_id, address_space, translator)),
+            process_id,
+            address_space,
+            translator,
+            thread_id: 1,
+        })? {
+            NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+                panic!("scheduler waits must use the semantic outcome test helper")
+            }
+        }
+    }
+
+    pub(crate) fn ioctl_outcome(
+        &self,
+        request: NvDrvIoctlRequest<'_>,
+    ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
+        self.ioctl_inner(
+            request.fd,
+            request.request,
+            request.input,
+            Some((
+                request.process_id,
+                request.address_space,
+                request.translator,
+            )),
+            request.thread_id,
         )
     }
 
@@ -240,7 +294,8 @@ impl NvDrvSession {
         request: u32,
         input: &[u8],
         canonical_memory: Option<(u64, AddressSpaceId, &dyn CanonicalRangeTranslator)>,
-    ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
+        thread_id: u64,
+    ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
         let mut state = self
             .state
             .lock()
@@ -259,9 +314,22 @@ impl NvDrvSession {
                 request,
                 input,
                 canonical_memory.map(|(_, address_space, translator)| (address_space, translator)),
-            ),
+            )
+            .map(NvHostCtrlIoctlOutcome::Complete),
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControl => {
+                state.nvhost_control.ioctl_for_waiter(
+                    descriptor,
+                    request,
+                    input,
+                    nvhost_ctrl::NvHostCtrlWaiterId::new(
+                        descriptor.owner().process_id(),
+                        thread_id,
+                    ),
+                )
+            }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
                 ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
+                    .map(NvHostCtrlIoctlOutcome::Complete)
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostAddressSpaceGpu => {
                 let NvDrvClientState {
@@ -281,6 +349,7 @@ impl NvDrvSession {
                     });
                 };
                 ioctl_nvhost_as_gpu(address_space, nvmap, descriptor, request, input)
+                    .map(NvHostCtrlIoctlOutcome::Complete)
             }
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::Ioctl {
@@ -296,8 +365,62 @@ impl NvDrvSession {
             None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
         };
         match result {
-            Ok(output) => Ok((output, NV_SUCCESS)),
-            Err(NvDrvCallError::GuestResult(error)) => Ok((input.to_vec(), error)),
+            Ok(NvHostCtrlIoctlOutcome::Complete(output)) => {
+                Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    output,
+                    driver_result: NV_SUCCESS,
+                }))
+            }
+            Ok(NvHostCtrlIoctlOutcome::DriverResult {
+                output,
+                driver_result,
+            }) => Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                output,
+                driver_result,
+            })),
+            Ok(NvHostCtrlIoctlOutcome::Pending(wait)) => {
+                Ok(NvDrvIoctlOutcome::PendingSyncpointWait(wait))
+            }
+            Err(NvDrvCallError::GuestResult(error)) => {
+                Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    output: input.to_vec(),
+                    driver_result: error,
+                }))
+            }
+            Err(NvDrvCallError::Unsupported(operation)) => Err(operation),
+        }
+    }
+
+    pub(crate) fn query_event(
+        &self,
+        fd: NvDrvFileDescriptor,
+        event_id: u32,
+        process_id: u64,
+    ) -> Result<(Option<nixe_runtime::ReadableEventObject>, u32), UnsupportedNvDrvOperation> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match state.devices.get(&fd).copied() {
+            Some(descriptor) if descriptor.owner().process_id() != process_id => {
+                Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
+            }
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControl => state
+                .nvhost_control
+                .query_event(descriptor, event_id)
+                .map(Some),
+            Some(descriptor) => Err(NvDrvCallError::Unsupported(
+                UnsupportedNvDrvOperation::QueryEvent {
+                    device: descriptor.kind(),
+                    fd: descriptor.fd(),
+                    event_id,
+                },
+            )),
+            None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
+        };
+        match result {
+            Ok(event) => Ok((event, NV_SUCCESS)),
+            Err(NvDrvCallError::GuestResult(error)) => Ok((None, error)),
             Err(NvDrvCallError::Unsupported(operation)) => Err(operation),
         }
     }
@@ -331,6 +454,7 @@ impl NvDrvSession {
         };
         state.devices.clear();
         state.gpu_address_spaces.clear();
+        state.nvhost_control.clear();
         state.initialized = false;
         state.client_identity = None;
         report
@@ -2179,6 +2303,41 @@ mod tests {
         assert_eq!(descriptor.lifecycle(), NvDrvDescriptorLifecycle::Open);
         assert_eq!(session.close(fd), NV_SUCCESS);
         assert_eq!(session.device_descriptor(fd), None);
+    }
+
+    #[test]
+    fn host_control_events_follow_descriptor_lifetime_and_waits_do_not_complete_early() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let fd = session.open(b"/dev/nvhost-ctrl", 17).unwrap();
+
+        let slot = 3_u32.to_le_bytes();
+        assert_eq!(
+            session.ioctl(fd, 0xc004_001f, &slot),
+            Ok((slot.to_vec(), NV_SUCCESS))
+        );
+        let (event, result) = session.query_event(fd, (1 << 28) | 3, 17).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert!(!event.unwrap().is_signalled());
+
+        let mut wait = Vec::new();
+        wait.extend_from_slice(&5_u32.to_le_bytes());
+        wait.extend_from_slice(&9_u32.to_le_bytes());
+        wait.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            session.ioctl_without_memory_outcome(fd, 0xc00c_0016, &wait, 4),
+            Ok(NvDrvIoctlOutcome::PendingSyncpointWait(wait))
+                if wait.target() == nixe_gpu::GuestTimelinePoint::new(
+                nixe_gpu::GuestSyncpointId::new(5),
+                nixe_gpu::GuestSyncpointValue::new(9),
+            ) && wait.timeout_microseconds() == -1 && wait.event_slot().is_none()
+        ));
+
+        assert_eq!(session.close(fd), NV_SUCCESS);
+        assert!(matches!(
+            session.query_event(fd, (1 << 28) | 3, 17),
+            Ok((None, NV_BAD_PARAMETER))
+        ));
     }
 
     #[test]

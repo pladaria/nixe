@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use nixe_cpu::memory::MemoryPermissions;
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, GuestVirtualAddress};
@@ -118,7 +119,21 @@ impl ThreadObject {
 /// A minimal event object with state shared by duplicated handles.
 #[derive(Clone, Debug)]
 pub struct EventObject {
-    signalled: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<EventState>,
+}
+
+#[derive(Debug)]
+struct EventState {
+    signalled: std::sync::atomic::AtomicBool,
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+/// Host scheduling result from sleeping on one runtime event.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EventWaitOutcome {
+    Signalled,
+    TimedOut,
 }
 
 impl Default for EventObject {
@@ -131,7 +146,11 @@ impl EventObject {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            state: Arc::new(EventState {
+                signalled: std::sync::atomic::AtomicBool::new(false),
+                generation: Mutex::new(0),
+                changed: Condvar::new(),
+            }),
         }
     }
 
@@ -148,17 +167,67 @@ impl EventObject {
 
     #[must_use]
     pub fn is_signalled(&self) -> bool {
-        self.signalled.load(std::sync::atomic::Ordering::Acquire)
+        self.state
+            .signalled
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn signal(&self) {
-        self.signalled
+        self.state
+            .signalled
             .store(true, std::sync::atomic::Ordering::Release);
+        let mut generation = self
+            .state
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        self.state.changed.notify_all();
     }
 
     pub fn clear(&self) {
-        self.signalled
+        self.state
+            .signalled
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn wait_until(&self, deadline: Option<Instant>) -> EventWaitOutcome {
+        if self.is_signalled() {
+            return EventWaitOutcome::Signalled;
+        }
+        let mut generation = self
+            .state
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = *generation;
+        loop {
+            if self.is_signalled() || *generation != observed {
+                return EventWaitOutcome::Signalled;
+            }
+            generation = match deadline {
+                None => self
+                    .state
+                    .changed
+                    .wait(generation)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return EventWaitOutcome::TimedOut;
+                    }
+                    let (next, timeout) = self
+                        .state
+                        .changed
+                        .wait_timeout(generation, deadline.saturating_duration_since(now))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if timeout.timed_out() && Instant::now() >= deadline {
+                        return EventWaitOutcome::TimedOut;
+                    }
+                    next
+                }
+            };
+        }
     }
 }
 
@@ -193,6 +262,14 @@ impl ReadableEventObject {
 
     pub fn clear(&self) {
         self.0.clear();
+    }
+
+    /// Sleeps until this event is signalled or the relative timeout expires.
+    /// `None` represents an infinite wait.
+    #[must_use]
+    pub fn wait(&self, timeout: Option<Duration>) -> EventWaitOutcome {
+        let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
+        self.0.wait_until(deadline)
     }
 }
 
@@ -1042,6 +1119,20 @@ mod tests {
             source.close(first),
             Err(HandleError::InvalidHandle(handle)) if handle == first
         ));
+    }
+
+    #[test]
+    fn readable_event_sleeps_for_signal_or_deadline_without_polling() {
+        let (writable, readable) = EventObject::create_pair();
+        let signaler = std::thread::spawn(move || writable.signal());
+        assert_eq!(readable.wait(None), EventWaitOutcome::Signalled);
+        signaler.join().unwrap();
+
+        readable.clear();
+        assert_eq!(
+            readable.wait(Some(Duration::from_millis(1))),
+            EventWaitOutcome::TimedOut
+        );
     }
 
     #[test]

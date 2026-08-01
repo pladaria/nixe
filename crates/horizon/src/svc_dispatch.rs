@@ -340,6 +340,13 @@ pub struct HorizonSvcDispatcher {
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), Instant>,
+    pending_wakes: BTreeMap<u64, PendingThreadWake>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingThreadWake {
+    event: ReadableEventObject,
+    deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -384,6 +391,7 @@ impl HorizonSvcDispatcher {
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
+            pending_wakes: BTreeMap::new(),
         }
     }
 
@@ -429,6 +437,21 @@ impl HorizonSvcDispatcher {
     #[must_use]
     pub const fn unknown_calls(&self) -> u64 {
         self.unknown_calls
+    }
+
+    /// Sleeps the host scheduler until the suspended thread's registered event
+    /// changes or its deadline expires. Returns `false` when the suspension has
+    /// no event-backed wake condition.
+    #[must_use]
+    pub fn wait_for_thread_wakeup(&self, thread_id: u64) -> bool {
+        let Some(wait) = self.pending_wakes.get(&thread_id) else {
+            return false;
+        };
+        let timeout = wait
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let _ = wait.event.wait(timeout);
+        true
     }
 
     fn observe(&mut self, immediate: u32, outcome: &ExceptionDispatchOutcome<HorizonSvcFault>) {
@@ -500,23 +523,11 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x15 => create_transfer_memory(context),
             0x16 => close_handle(context),
             0x17 => reset_signal(context),
-            0x18 => wait_synchronization(context),
+            0x18 => self.wait_synchronization(context),
             0x1f => self.connect_to_named_port(context),
             0x20 => send_sync_request_light(context),
-            0x21 => send_sync_request(
-                context,
-                self.initial_operation_mode,
-                &self.time_environment,
-                &self.video_system,
-                &self.hid_system,
-            ),
-            0x22 => send_sync_request_with_user_buffer(
-                context,
-                self.initial_operation_mode,
-                &self.time_environment,
-                &self.video_system,
-                &self.hid_system,
-            ),
+            0x21 => self.send_sync_request(context),
+            0x22 => self.send_sync_request_with_user_buffer(context),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
             0x26 => break_process(context),
@@ -684,93 +695,130 @@ impl HorizonSvcDispatcher {
     }
 }
 
-fn send_sync_request(
-    context: &mut ExceptionDispatchContext<'_>,
-    initial_operation_mode: crate::OperationMode,
-    time_environment: &crate::TimeEnvironment,
-    video_system: &crate::VideoSystem,
-    hid_system: &crate::HidSystem,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 0) as u32;
-    let tls = match context.thread().state() {
-        ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
-        ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
-    };
-    match crate::ipc_wire::send_sync_request(
-        context.process_mut(),
-        tls,
-        handle,
-        initial_operation_mode,
-        time_environment,
-        crate::ipc_wire::HostSystems {
-            video: video_system,
-            hid: hid_system,
-        },
-    ) {
-        Ok(SyncRequestResult::Success) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
+impl HorizonSvcDispatcher {
+    fn send_sync_request(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let handle = read_register(context.thread().state(), 0) as u32;
+        let tls = match context.thread().state() {
+            ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
+            ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
+        };
+        let caller_thread_id = context.thread().object().thread_id();
+        match crate::ipc_wire::send_sync_request(
+            context.process_mut(),
+            tls,
+            handle,
+            self.initial_operation_mode,
+            &self.time_environment,
+            crate::ipc_wire::HostSystems {
+                video: &self.video_system,
+                hid: &self.hid_system,
+                caller_thread_id,
+            },
+        ) {
+            Ok(SyncRequestResult::Success) => {
+                self.pending_wakes
+                    .remove(&context.thread().object().thread_id());
+                result(context, HorizonKernelResult::SUCCESS);
+                resume()
+            }
+            Ok(SyncRequestResult::InvalidHandle) => {
+                generic_sync_request(context, tls, TLS_COMMAND_BUFFER_SIZE, handle, 0x21)
+            }
+            Ok(SyncRequestResult::PendingNvDrv(wait)) => {
+                log::debug!(
+                    "suspending thread {} for nvdrv {} wait request={:#010x} target={} timeout-us={} event-slot={:?}",
+                    caller_thread_id,
+                    wait.kind().as_str(),
+                    wait.request(),
+                    wait.target(),
+                    wait.timeout_microseconds(),
+                    wait.event_slot().map(|slot| slot.get()),
+                );
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        event: wait.wake_event(),
+                        deadline: wait
+                            .remaining()
+                            .and_then(|remaining| Instant::now().checked_add(remaining)),
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+            }
+            Err(error) => reject_ipc(context, 0x21, error),
         }
-        Ok(SyncRequestResult::InvalidHandle) => {
-            generic_sync_request(context, tls, TLS_COMMAND_BUFFER_SIZE, handle, 0x21)
-        }
-        Err(error) => reject_ipc(context, 0x21, error),
     }
-}
 
-fn send_sync_request_with_user_buffer(
-    context: &mut ExceptionDispatchContext<'_>,
-    initial_operation_mode: crate::OperationMode,
-    time_environment: &crate::TimeEnvironment,
-    video_system: &crate::VideoSystem,
-    hid_system: &crate::HidSystem,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let address = read_register(context.thread().state(), 0);
-    let size = read_register(context.thread().state(), 1);
-    let handle = read_register(context.thread().state(), 2) as u32;
-    // Public ABI and validation reference:
-    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#SendSyncRequestWithUserBuffer
-    if !address.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    if !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if size == 0 {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if address.checked_add(size).is_none_or(|end| address >= end) {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-    let Ok(size) = usize::try_from(size) else {
-        result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-        return resume();
-    };
-    let address = GuestVirtualAddress::new(address);
-    match crate::ipc_wire::send_sync_request_from_buffer(
-        context.process_mut(),
-        address,
-        size,
-        handle,
-        initial_operation_mode,
-        time_environment,
-        crate::ipc_wire::HostSystems {
-            video: video_system,
-            hid: hid_system,
-        },
-    ) {
-        Ok(SyncRequestResult::Success) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
+    fn send_sync_request_with_user_buffer(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let address = read_register(context.thread().state(), 0);
+        let size = read_register(context.thread().state(), 1);
+        let handle = read_register(context.thread().state(), 2) as u32;
+        // Public ABI and validation reference:
+        // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#SendSyncRequestWithUserBuffer
+        if !address.is_multiple_of(USER_BUFFER_ALIGNMENT) {
+            result(context, HorizonKernelResult::INVALID_ADDRESS);
+            return resume();
         }
-        Ok(SyncRequestResult::InvalidHandle) => {
-            generic_sync_request(context, address, size, handle, 0x22)
+        if !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
+            result(context, HorizonKernelResult::INVALID_SIZE);
+            return resume();
         }
-        Err(error) => reject_ipc(context, 0x22, error),
+        if size == 0 {
+            result(context, HorizonKernelResult::INVALID_SIZE);
+            return resume();
+        }
+        if address.checked_add(size).is_none_or(|end| address >= end) {
+            result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+            return resume();
+        }
+        let Ok(size) = usize::try_from(size) else {
+            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
+            return resume();
+        };
+        let address = GuestVirtualAddress::new(address);
+        let caller_thread_id = context.thread().object().thread_id();
+        match crate::ipc_wire::send_sync_request_from_buffer(
+            context.process_mut(),
+            address,
+            size,
+            handle,
+            self.initial_operation_mode,
+            &self.time_environment,
+            crate::ipc_wire::HostSystems {
+                video: &self.video_system,
+                hid: &self.hid_system,
+                caller_thread_id,
+            },
+        ) {
+            Ok(SyncRequestResult::Success) => {
+                self.pending_wakes
+                    .remove(&context.thread().object().thread_id());
+                result(context, HorizonKernelResult::SUCCESS);
+                resume()
+            }
+            Ok(SyncRequestResult::InvalidHandle) => {
+                generic_sync_request(context, address, size, handle, 0x22)
+            }
+            Ok(SyncRequestResult::PendingNvDrv(wait)) => {
+                self.pending_wakes.insert(
+                    context.thread().object().thread_id(),
+                    PendingThreadWake {
+                        event: wait.wake_event(),
+                        deadline: wait
+                            .remaining()
+                            .and_then(|remaining| Instant::now().checked_add(remaining)),
+                    },
+                );
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+            }
+            Err(error) => reject_ipc(context, 0x22, error),
+        }
     }
 }
 
@@ -1139,6 +1187,12 @@ fn reject_ipc(
             ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedService {
                 immediate,
                 operation,
+            })
+        }
+        IpcWireError::PendingNvDrv(_) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc {
+                immediate,
+                reason: "pending nvdrv wait escaped the scheduler boundary",
             })
         }
     }
@@ -2314,7 +2368,12 @@ impl HorizonSvcDispatcher {
 
     fn finish_reply_wait(&mut self, thread_id: u64, immediate: u32) {
         self.reply_sent.remove(&thread_id);
+        self.finish_wait(thread_id, immediate);
+    }
+
+    fn finish_wait(&mut self, thread_id: u64, immediate: u32) {
         self.wait_deadlines.remove(&(thread_id, immediate));
+        self.pending_wakes.remove(&thread_id);
     }
 }
 
@@ -2445,58 +2504,75 @@ fn get_thread_id(
     resume()
 }
 
-fn wait_synchronization(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let pointer = read_register(context.thread().state(), 1);
-    let count = read_register(context.thread().state(), 2) as u32;
-    let timeout = read_wait_timeout(context.thread().state());
-    if count > MAX_WAIT_HANDLES {
-        result(context, HorizonKernelResult::OUT_OF_RANGE);
-        return resume();
-    }
-    let mut handles = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let Some(address) = pointer.checked_add(u64::from(index) * 4) else {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        };
-        let value = match context.process().memory().read(
-            context.process().cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            MemoryAccess::normal(MemoryAccessSize::Word),
-        ) {
-            Ok(read) => read.value,
-            Err(_) => {
-                result(context, HorizonKernelResult::INVALID_ADDRESS);
-                return resume();
-            }
-        };
-        let MemoryValue::U32(handle) = value else {
-            unreachable!("word access returns a word value")
-        };
-        handles.push(handle);
-    }
-    for (index, handle) in handles.iter().copied().enumerate() {
-        let Some(event) = context
-            .process()
-            .handles()
-            .get_as::<ReadableEventObject>(handle)
-        else {
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        };
-        if event.is_signalled() {
-            result(context, HorizonKernelResult::SUCCESS);
-            write_register(context.thread_mut().state_mut(), 1, index as u64);
+impl HorizonSvcDispatcher {
+    fn wait_synchronization(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let pointer = read_register(context.thread().state(), 1);
+        let count = read_register(context.thread().state(), 2) as u32;
+        let timeout = read_wait_timeout(context.thread().state());
+        if count > MAX_WAIT_HANDLES {
+            result(context, HorizonKernelResult::OUT_OF_RANGE);
             return resume();
         }
-    }
-    if timeout == 0 {
-        result(context, HorizonKernelResult::TIMED_OUT);
-        resume()
-    } else {
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+        let mut handles = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let Some(address) = pointer.checked_add(u64::from(index) * 4) else {
+                result(context, HorizonKernelResult::INVALID_ADDRESS);
+                return resume();
+            };
+            let value = match context.process().memory().read(
+                context.process().cpu().address_space_id(),
+                GuestVirtualAddress::new(address),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            ) {
+                Ok(read) => read.value,
+                Err(_) => {
+                    result(context, HorizonKernelResult::INVALID_ADDRESS);
+                    return resume();
+                }
+            };
+            let MemoryValue::U32(handle) = value else {
+                unreachable!("word access returns a word value")
+            };
+            handles.push(handle);
+        }
+        for (index, handle) in handles.iter().copied().enumerate() {
+            let Some(event) = context
+                .process()
+                .handles()
+                .get_as::<ReadableEventObject>(handle)
+            else {
+                result(context, HorizonKernelResult::INVALID_HANDLE);
+                return resume();
+            };
+            if event.is_signalled() {
+                self.finish_wait(context.thread().object().thread_id(), 0x18);
+                result(context, HorizonKernelResult::SUCCESS);
+                write_register(context.thread_mut().state_mut(), 1, index as u64);
+                return resume();
+            }
+        }
+        let thread_id = context.thread().object().thread_id();
+        if self.wait_expired(thread_id, 0x18, timeout) {
+            self.finish_wait(thread_id, 0x18);
+            result(context, HorizonKernelResult::TIMED_OUT);
+            resume()
+        } else {
+            if handles.len() == 1
+                && let Some(event) = context
+                    .process()
+                    .handles()
+                    .get_as::<ReadableEventObject>(handles[0])
+                    .cloned()
+            {
+                let deadline = self.wait_deadlines.get(&(thread_id, 0x18)).copied();
+                self.pending_wakes
+                    .insert(thread_id, PendingThreadWake { event, deadline });
+            }
+            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+        }
     }
 }
 
