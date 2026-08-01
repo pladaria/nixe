@@ -477,10 +477,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{GuestSyncpointId, GuestSyncpointValue, TimelineInstanceId};
+    use crate::{BackendInstanceId, GuestSyncpointId, GuestSyncpointValue, TimelineInstanceId};
 
     const OWNER: TimelineOwnerId = TimelineOwnerId::new(4);
     const POINT: DeviceVisibilityPoint = DeviceVisibilityPoint::new(12);
+    const BACKEND: BackendInstanceId = BackendInstanceId::new(5);
 
     #[derive(Default)]
     struct ManualCompletionDriver {
@@ -543,7 +544,7 @@ mod tests {
         let reservation = timeline.reserve(OWNER, 1).unwrap();
         CompletionSubmission::new(
             FrontendSubmissionId::new(frontend),
-            BackendSubmissionToken::new(backend),
+            BackendSubmissionToken::new(BACKEND, backend, 1),
             reservation,
             POINT,
             writes,
@@ -583,7 +584,7 @@ mod tests {
             VisibilityState::Clean
         );
 
-        backend.complete(BackendSubmissionToken::new(10));
+        backend.complete(BackendSubmissionToken::new(BACKEND, 10, 1));
         queue.observe_backend(&mut backend).unwrap();
         assert_eq!(
             timeline.current_point().value(),
@@ -621,7 +622,7 @@ mod tests {
             .unwrap();
         let mut backend = ManualCompletionDriver::default();
 
-        backend.complete(BackendSubmissionToken::new(11));
+        backend.complete(BackendSubmissionToken::new(BACKEND, 11, 1));
         queue.observe_backend(&mut backend).unwrap();
         assert_eq!(queue.publish_next(&mut timeline), Ok(None));
         assert_eq!(
@@ -629,7 +630,7 @@ mod tests {
             GuestSyncpointValue::new(u32::MAX - 1)
         );
 
-        backend.complete(BackendSubmissionToken::new(10));
+        backend.complete(BackendSubmissionToken::new(BACKEND, 10, 1));
         queue.observe_backend(&mut backend).unwrap();
         assert_eq!(
             queue
@@ -672,7 +673,7 @@ mod tests {
             .enqueue(submission(&mut timeline, 1, 10, vec![write]))
             .unwrap();
         let mut backend = ManualCompletionDriver::default();
-        backend.complete(BackendSubmissionToken::new(10));
+        backend.complete(BackendSubmissionToken::new(BACKEND, 10, 1));
         queue.observe_backend(&mut backend).unwrap();
 
         assert!(matches!(
@@ -701,7 +702,7 @@ mod tests {
             .enqueue(submission(&mut timeline, 2, 11, Vec::new()))
             .unwrap();
         let mut backend = ManualCompletionDriver::default();
-        backend.complete(BackendSubmissionToken::new(10));
+        backend.complete(BackendSubmissionToken::new(BACKEND, 10, 1));
         queue.observe_backend(&mut backend).unwrap();
 
         assert_eq!(queue.clear(), 2);
