@@ -1,4 +1,4 @@
-use nixe_gpu_maxwell::MaxwellGpuAddressSpace;
+use nixe_gpu_maxwell::{MaxwellGpuAddressSpace, MaxwellGpuChannel};
 
 use super::{NvDrvDeviceDescriptor, NvDrvFileDescriptor, NvDrvSession, NvDrvSessionId};
 
@@ -49,5 +49,15 @@ impl NvDrvSession {
             .gpu_address_spaces
             .get(&fd)
             .cloned()
+    }
+
+    /// Returns pointer-free Maxwell channel state for diagnostics and tests.
+    #[must_use]
+    pub fn gpu_channel(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellGpuChannel> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvhost_gpu
+            .channel(fd)
     }
 }

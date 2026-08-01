@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use nixe_gpu::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint,
-    TimelineIncrementError, TimelineInstanceId, TimelineOwnerId,
+    ReservedTimelinePoint, TimelineIncrementError, TimelineInstanceId, TimelineOwnerId,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -208,6 +208,7 @@ struct DirectWait {
 #[derive(Clone, Debug)]
 pub(super) struct NvHostControl {
     timelines: BTreeMap<GuestSyncpointId, GuestTimeline>,
+    channel_syncpoints: BTreeMap<GuestSyncpointId, u64>,
     devices: BTreeMap<NvDrvFileDescriptor, NvHostCtrlDevice>,
     direct_waits: BTreeMap<NvHostCtrlWaiterId, DirectWait>,
     next_timeline_instance: u64,
@@ -217,6 +218,7 @@ impl Default for NvHostControl {
     fn default() -> Self {
         Self {
             timelines: BTreeMap::new(),
+            channel_syncpoints: BTreeMap::new(),
             devices: BTreeMap::new(),
             direct_waits: BTreeMap::new(),
             next_timeline_instance: 1,
@@ -248,7 +250,103 @@ impl NvHostControl {
         }
         self.direct_waits.clear();
         self.timelines.clear();
+        self.channel_syncpoints.clear();
         self.devices.clear();
+    }
+
+    /// Allocates a process-owned channel syncpoint and its neutral timeline.
+    ///
+    /// Tegra210 exposes 192 syncpoints. Identity zero is retained for host1x
+    /// conventions and channel allocation uses the remaining public range.
+    pub(super) fn allocate_channel_syncpoint(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
+        let Some(id) = (1..SYNCPOINT_COUNT)
+            .map(GuestSyncpointId::new)
+            .find(|id| !self.channel_syncpoints.contains_key(id))
+        else {
+            return Err(NvDrvCallError::Unsupported(
+                UnsupportedNvDrvOperation::Ioctl {
+                    context: context(
+                        descriptor,
+                        request,
+                        NvDrvValidationReason::TimelineIdentityExhausted,
+                    ),
+                },
+            ));
+        };
+        self.ensure_timeline(descriptor, id)?;
+        self.channel_syncpoints
+            .insert(id, descriptor.owner().process_id());
+        self.timelines
+            .get(&id)
+            .map(GuestTimeline::current_point)
+            .ok_or_else(|| unsupported_device_state(descriptor, request))
+    }
+
+    pub(super) fn release_channel_syncpoint(&mut self, id: GuestSyncpointId) {
+        if self.channel_syncpoints.remove(&id).is_none() {
+            return;
+        }
+        self.timelines.remove(&id);
+        self.direct_waits.retain(|_, wait| {
+            if wait.target.syncpoint() == id {
+                wait.writable.signal();
+                false
+            } else {
+                true
+            }
+        });
+        for device in self.devices.values_mut() {
+            for event in device.events.values_mut() {
+                if event.armed.is_some_and(|target| target.syncpoint() == id) {
+                    event.armed = None;
+                    event.writable.signal();
+                }
+            }
+        }
+    }
+
+    /// Samples one typed GPFIFO dependency without advancing any timeline.
+    pub(super) fn submission_dependency_reached(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        point: GuestTimelinePoint,
+    ) -> Result<bool, NvDrvCallError> {
+        let id = parse_syncpoint(point.syncpoint().get())?;
+        Ok(self.timeline(descriptor, id)?.has_reached(point.value()))
+    }
+
+    /// Reserves channel completion without publishing guest-visible progress.
+    pub(super) fn reserve_channel_submission(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+        id: GuestSyncpointId,
+        increments: u32,
+    ) -> Result<ReservedTimelinePoint, NvDrvCallError> {
+        if self.channel_syncpoints.get(&id).copied() != Some(descriptor.owner().process_id()) {
+            return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
+        }
+        let owner = timeline_owner(descriptor);
+        self.timeline_mut(descriptor, id)?
+            .reserve(owner, increments)
+            .map_err(|_| {
+                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                    context: context(
+                        descriptor,
+                        request,
+                        NvDrvValidationReason::TimelineOrderingUnavailable,
+                    ),
+                })
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_timeline(&self, id: GuestSyncpointId) -> bool {
+        self.timelines.contains_key(&id)
     }
 
     #[cfg(test)]

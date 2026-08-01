@@ -13,6 +13,7 @@ use super::{
     UnsupportedNvDrvOperation, nvmap_driver_result,
 };
 
+pub(super) const IOCTL_AS_GPU_BIND_CHANNEL: u32 = 0x4004_4101;
 pub(super) const IOCTL_AS_GPU_ALLOC_SPACE: u32 = 0xc018_4102;
 pub(super) const IOCTL_AS_GPU_FREE_SPACE: u32 = 0xc010_4103;
 pub(super) const IOCTL_AS_GPU_UNMAP_BUFFER: u32 = 0xc008_4105;
@@ -198,6 +199,16 @@ pub(super) fn ioctl_nvhost_as_gpu(
             },
         )),
     }
+}
+
+/// Decodes the channel descriptor from the bind ioctl without performing the
+/// semantic association. The session resolves both existing objects before
+/// `MaxwellGpuChannel::bind_address_space` mutates channel state.
+pub(super) fn decode_bind_channel(
+    input: &[u8],
+) -> Result<super::NvDrvFileDescriptor, NvDrvCallError> {
+    require_size(input, 4)?;
+    Ok(super::NvDrvFileDescriptor::new(input_u32(input, 0)?))
 }
 
 fn remap(

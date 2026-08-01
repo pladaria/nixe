@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu_maxwell::{
-    MaxwellAddressSpaceId, MaxwellGpuAddressSpace, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
+    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
+    MaxwellGpuChannel, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
 };
 use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
 
@@ -14,6 +15,7 @@ mod ioctl;
 mod nvhost_as_gpu;
 mod nvhost_ctrl;
 pub(crate) use nvhost_ctrl::PendingNvHostCtrlWait;
+mod nvhost_gpu;
 mod nvmap;
 mod service;
 mod session;
@@ -26,8 +28,9 @@ use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
 use ioctl::NvDrvIoctlResponse;
 pub(crate) use ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
-use nvhost_as_gpu::ioctl_nvhost_as_gpu;
+use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
+use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources};
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
     NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
@@ -66,6 +69,8 @@ struct NvDrvClientState {
     devices: BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
     next_gpu_address_space_id: u64,
     gpu_address_spaces: BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>,
+    next_gpu_channel_id: u64,
+    nvhost_gpu: NvHostGpu,
     nvhost_control: NvHostControl,
     nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
@@ -115,6 +120,8 @@ impl NvDrvSession {
                 devices: BTreeMap::new(),
                 next_gpu_address_space_id: 1,
                 gpu_address_spaces: BTreeMap::new(),
+                next_gpu_channel_id: 1,
+                nvhost_gpu: NvHostGpu::default(),
                 nvhost_control: NvHostControl::default(),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
@@ -155,6 +162,9 @@ impl NvDrvSession {
             // address space:
             // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvhost-as-gpu
             b"/dev/nvhost-as-gpu" => NvDrvDeviceKind::HostAddressSpaceGpu,
+            // GPU channel creation path used by libnx's OpenGL frontend:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/gpu_channel.c#L11-L36
+            b"/dev/nvhost-gpu" => NvDrvDeviceKind::HostGpu,
             _ => {
                 return Err(NvDrvCallError::Unsupported(
                     UnsupportedNvDrvOperation::OpenDevice { path: path.into() },
@@ -188,6 +198,16 @@ impl NvDrvSession {
         } else {
             None
         };
+        let next_gpu_channel_id = if kind == NvDrvDeviceKind::HostGpu {
+            Some(
+                state
+                    .next_gpu_channel_id
+                    .checked_add(1)
+                    .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?,
+            )
+        } else {
+            None
+        };
         let fd = NvDrvFileDescriptor::new(state.next_fd);
         let owner = NvDrvDescriptorOwner::new(self.connection_id, process_id);
         let descriptor = NvDrvDeviceDescriptor::open(fd, kind, owner, state.permission);
@@ -202,6 +222,15 @@ impl NvDrvSession {
             let address_space = MaxwellGpuAddressSpace::new(address_space_id, state.gpu_profile);
             state.gpu_address_spaces.insert(fd, address_space);
         }
+        if let Some(next_gpu_channel_id) = next_gpu_channel_id {
+            let channel = MaxwellGpuChannel::new(
+                MaxwellChannelId::new(state.next_gpu_channel_id),
+                MaxwellChannelOwner::new(process_id),
+                state.gpu_profile,
+            );
+            state.next_gpu_channel_id = next_gpu_channel_id;
+            state.nvhost_gpu.open(fd, channel);
+        }
         Ok(fd)
     }
 
@@ -211,7 +240,12 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.devices.remove(&fd).is_some() {
-            state.gpu_address_spaces.remove(&fd);
+            if let Some(address_space) = state.gpu_address_spaces.remove(&fd) {
+                state.nvhost_gpu.unbind_address_space(address_space.id());
+            }
+            if let Some(syncpoint) = state.nvhost_gpu.close(fd) {
+                state.nvhost_control.release_channel_syncpoint(syncpoint);
+            }
             state.nvhost_control.close(fd);
             NV_SUCCESS
         } else {
@@ -226,7 +260,7 @@ impl NvDrvSession {
         request: u32,
         input: &[u8],
     ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
-        match self.ioctl_inner(fd, request, input, None, 1)? {
+        match self.ioctl_inner(fd, request, input, &[], None, 1)? {
             NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
             NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
                 panic!("scheduler waits must use the semantic outcome test helper")
@@ -242,7 +276,23 @@ impl NvDrvSession {
         input: &[u8],
         thread_id: u64,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
-        self.ioctl_inner(fd, request, input, None, thread_id)
+        self.ioctl_inner(fd, request, input, &[], None, thread_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ioctl2(
+        &self,
+        fd: NvDrvFileDescriptor,
+        request: u32,
+        input: &[u8],
+        additional_input: &[u8],
+    ) -> Result<(Vec<u8>, u32), UnsupportedNvDrvOperation> {
+        match self.ioctl_inner(fd, request, input, additional_input, None, 1)? {
+            NvDrvIoctlOutcome::Complete(response) => Ok((response.output, response.driver_result)),
+            NvDrvIoctlOutcome::PendingSyncpointWait(_) => {
+                panic!("scheduler waits must use the semantic outcome test helper")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -259,6 +309,7 @@ impl NvDrvSession {
             fd,
             request,
             input,
+            additional_input: &[],
             process_id,
             address_space,
             translator,
@@ -279,6 +330,7 @@ impl NvDrvSession {
             request.fd,
             request.request,
             request.input,
+            request.additional_input,
             Some((
                 request.process_id,
                 request.address_space,
@@ -293,6 +345,7 @@ impl NvDrvSession {
         fd: NvDrvFileDescriptor,
         request: u32,
         input: &[u8],
+        additional_input: &[u8],
         canonical_memory: Option<(u64, AddressSpaceId, &dyn CanonicalRangeTranslator)>,
         thread_id: u64,
     ) -> Result<NvDrvIoctlOutcome, UnsupportedNvDrvOperation> {
@@ -331,25 +384,94 @@ impl NvDrvSession {
                 ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
                     .map(NvHostCtrlIoctlOutcome::Complete)
             }
-            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostAddressSpaceGpu => {
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
                 let NvDrvClientState {
+                    nvhost_gpu,
+                    nvhost_control,
+                    devices,
                     gpu_address_spaces,
-                    nvmap,
                     ..
                 } = &mut *state;
-                let Some(address_space) = gpu_address_spaces.get_mut(&fd) else {
-                    return Err(UnsupportedNvDrvOperation::Ioctl {
-                        context: NvDrvErrorContext::new(
-                            descriptor.kind(),
-                            request,
-                            descriptor.fd(),
-                            None,
-                            NvDrvValidationReason::AddressSpaceUnavailable,
-                        ),
-                    });
-                };
-                ioctl_nvhost_as_gpu(address_space, nvmap, descriptor, request, input)
+                nvhost_gpu
+                    .ioctl(
+                        NvHostGpuIoctlResources {
+                            control: nvhost_control,
+                            devices,
+                            address_spaces: gpu_address_spaces,
+                        },
+                        descriptor,
+                        request,
+                        input,
+                        additional_input,
+                    )
                     .map(NvHostCtrlIoctlOutcome::Complete)
+            }
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostAddressSpaceGpu => {
+                if request == nvhost_as_gpu::IOCTL_AS_GPU_BIND_CHANNEL {
+                    let bind_result = (|| -> Result<Vec<u8>, NvDrvCallError> {
+                        let channel_fd = decode_bind_channel(input)?;
+                        let valid_channel = state.devices.get(&channel_fd).is_some_and(|channel| {
+                            channel.kind() == NvDrvDeviceKind::HostGpu
+                                && channel.owner().process_id() == descriptor.owner().process_id()
+                        });
+                        if !valid_channel {
+                            return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+                        }
+                        let address_space = state
+                            .gpu_address_spaces
+                            .get(&fd)
+                            .map(MaxwellGpuAddressSpace::id)
+                            .ok_or_else(|| {
+                                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                                    context: NvDrvErrorContext::new(
+                                        descriptor.kind(),
+                                        request,
+                                        descriptor.fd(),
+                                        None,
+                                        NvDrvValidationReason::AddressSpaceUnavailable,
+                                    ),
+                                })
+                            })?;
+                        let Some(binding) = state
+                            .nvhost_gpu
+                            .bind_address_space(channel_fd, address_space)
+                        else {
+                            return Err(NvDrvCallError::Unsupported(
+                                UnsupportedNvDrvOperation::Ioctl {
+                                    context: NvDrvErrorContext::new(
+                                        descriptor.kind(),
+                                        request,
+                                        descriptor.fd(),
+                                        None,
+                                        NvDrvValidationReason::DeviceStateUnavailable,
+                                    ),
+                                },
+                            ));
+                        };
+                        binding.map_err(|_| NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
+                        Ok(Vec::from(input))
+                    })();
+                    bind_result.map(NvHostCtrlIoctlOutcome::Complete)
+                } else {
+                    let NvDrvClientState {
+                        gpu_address_spaces,
+                        nvmap,
+                        ..
+                    } = &mut *state;
+                    let Some(address_space) = gpu_address_spaces.get_mut(&fd) else {
+                        return Err(UnsupportedNvDrvOperation::Ioctl {
+                            context: NvDrvErrorContext::new(
+                                descriptor.kind(),
+                                request,
+                                descriptor.fd(),
+                                None,
+                                NvDrvValidationReason::AddressSpaceUnavailable,
+                            ),
+                        });
+                    };
+                    ioctl_nvhost_as_gpu(address_space, nvmap, descriptor, request, input)
+                        .map(NvHostCtrlIoctlOutcome::Complete)
+                }
             }
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::Ioctl {
@@ -409,6 +531,9 @@ impl NvDrvSession {
                 .nvhost_control
                 .query_event(descriptor, event_id)
                 .map(Some),
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
+                state.nvhost_gpu.query_event(descriptor, event_id).map(Some)
+            }
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::QueryEvent {
                     device: descriptor.kind(),
@@ -454,6 +579,10 @@ impl NvDrvSession {
         };
         state.devices.clear();
         state.gpu_address_spaces.clear();
+        let channel_syncpoints = state.nvhost_gpu.clear();
+        for syncpoint in channel_syncpoints {
+            state.nvhost_control.release_channel_syncpoint(syncpoint);
+        }
         state.nvhost_control.clear();
         state.initialized = false;
         state.client_identity = None;
@@ -841,8 +970,8 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
 #[cfg(test)]
 mod tests {
     use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
-    use nixe_gpu::GraphicsGapKind;
-    use nixe_memory::{CanonicalRangeTranslationError, MemoryPermissions};
+    use nixe_gpu::{GraphicsGapKind, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint};
+    use nixe_memory::{CanonicalAllocation, CanonicalRangeTranslationError, MemoryPermissions};
 
     use super::*;
 
@@ -1760,26 +1889,601 @@ mod tests {
     }
 
     #[test]
-    fn as_gpu_ioctls_remain_fatal_until_their_semantics_exist() {
+    fn libnx_gpu_channel_creation_retains_typed_frontend_state() {
         let session = NvDrvSession::new();
         session.initialize();
-        let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
-        // NVHOST_AS_GPU_IOCTL_BIND_CHANNEL from the pinned libnx wrapper:
-        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-as-gpu.c#L7-L17
-        let request = 0x4004_4101;
+        let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
+        let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
+        let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+        let channel_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
 
         assert_eq!(
-            session.ioctl(fd, request, &[0; 4]),
-            Err(UnsupportedNvDrvOperation::Ioctl {
+            session
+                .ioctl(channel_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
+                .unwrap(),
+            (nvmap_fd.raw().to_le_bytes().to_vec(), NV_SUCCESS)
+        );
+        // NVHOST_AS_GPU_IOCTL_BIND_CHANNEL from the pinned libnx wrapper:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-as-gpu.c#L7-L17
+        assert_eq!(
+            session
+                .ioctl(as_fd, 0x4004_4101, &channel_fd.raw().to_le_bytes())
+                .unwrap(),
+            (channel_fd.raw().to_le_bytes().to_vec(), NV_SUCCESS)
+        );
+
+        let mut allocate = [0_u8; 32];
+        allocate[0..4].copy_from_slice(&0x800_u32.to_le_bytes());
+        allocate[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        let syncpoint = input_u32(&allocated, 12).unwrap();
+        assert_ne!(syncpoint, 0);
+        assert_eq!(input_u32(&allocated, 16).unwrap(), 0);
+
+        let mut object = [0_u8; 16];
+        object[0..4].copy_from_slice(&SWITCH_1_GM20B_PROFILE.classes().three_d().0.to_le_bytes());
+        let (object, result) = session.ioctl(channel_fd, 0xc010_4809, &object).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_ne!(input_u64(&object, 8).unwrap(), 0);
+
+        let z_cull = [0_u8; 16];
+        assert_eq!(
+            session.ioctl(channel_fd, 0xc010_480b, &z_cull).unwrap(),
+            (z_cull.to_vec(), NV_SUCCESS)
+        );
+        let z_cull_binding = session
+            .gpu_channel(channel_fd)
+            .unwrap()
+            .frontend()
+            .z_cull_binding()
+            .unwrap();
+        assert_eq!(z_cull_binding.address().get(), 0);
+        assert_eq!(
+            z_cull_binding.mode(),
+            nixe_gpu_maxwell::MaxwellZCullMode::Global
+        );
+        let channel_after_z_cull = session.gpu_channel(channel_fd).unwrap();
+        let mut unknown_mode = z_cull;
+        unknown_mode[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        assert!(matches!(
+            session.ioctl(channel_fd, 0xc010_480b, &unknown_mode),
+            Err(UnsupportedNvDrvOperation::Ioctl { .. })
+        ));
+        let mut invalid_separate = z_cull;
+        invalid_separate[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(channel_fd, 0xc010_480b, &invalid_separate)
+                .unwrap()
+                .1,
+            NV_BAD_VALUE
+        );
+        assert_eq!(session.gpu_channel(channel_fd), Some(channel_after_z_cull));
+
+        let (event, result) = session.query_event(channel_fd, 3, 1).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert!(!event.unwrap().is_signalled());
+
+        let mut notifier = [0_u8; 24];
+        notifier[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            session.ioctl(channel_fd, 0xc018_480c, &notifier).unwrap().1,
+            NV_SUCCESS
+        );
+        assert_eq!(
+            session
+                .ioctl(channel_fd, 0x4004_480d, &150_u32.to_le_bytes())
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        assert_eq!(
+            session
+                .ioctl(channel_fd, 0xc004_481d, &0x400_u32.to_le_bytes())
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+
+        let channel = session.gpu_channel(channel_fd).unwrap();
+        assert_eq!(channel.owner().process_id(), 1);
+        assert_eq!(
+            channel.address_space(),
+            Some(session.gpu_address_space(as_fd).unwrap().id())
+        );
+        assert_eq!(channel.syncpoint().unwrap().get(), syncpoint);
+        assert_eq!(channel.frontend().gpfifo_entries(), Some(0x800));
+        assert!(channel.frontend().gpfifo_vpr_enabled());
+        assert!(channel.frontend().object_context().is_some());
+        assert!(channel.frontend().error_notifier_enabled());
+        assert_eq!(
+            channel.priority(),
+            nixe_gpu_maxwell::MaxwellChannelPriority::High
+        );
+        assert_eq!(
+            channel.timeslice(),
+            nixe_gpu_maxwell::MaxwellChannelTimeslice::Requested(0x400)
+        );
+
+        // T6-C resolves the complete Ioctl2 command source without mutating
+        // the channel. This uninitialized address space fails before any
+        // entry is retained or command word is consumed.
+        let request = 0xc018_481b;
+        let channel_before_submission = session.gpu_channel(channel_fd).unwrap();
+        let mut submit = [0_u8; 24];
+        submit[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        submit[12..16].copy_from_slice(&(4_u32 | 2).to_le_bytes());
+        let mut entry = [0_u8; 8];
+        entry[0..4].copy_from_slice(&0x4000_u32.to_le_bytes());
+        entry[4..8].copy_from_slice(&(4_u32 << 10).to_le_bytes());
+        let Err(UnsupportedNvDrvOperation::GpfifoMemory { context, error }) =
+            session.ioctl2(channel_fd, request, &submit, &entry)
+        else {
+            panic!("unmapped GPFIFO source must return a typed host diagnostic");
+        };
+        assert_eq!(
+            context,
+            NvDrvErrorContext::new(
+                NvDrvDeviceKind::HostGpu,
+                request,
+                channel_fd,
+                None,
+                NvDrvValidationReason::GpfifoMemoryResolutionFailed,
+            )
+        );
+        assert!(matches!(
+            *error,
+            nixe_gpu_maxwell::MaxwellGpfifoSourceError::Resolution {
+                channel,
+                frontend,
+                entry_index: 0,
+                pushbuffer,
+                error: nixe_gpu_maxwell::MaxwellGpuAccessError::NotInitialized,
+                ..
+            } if channel == channel_before_submission.id()
+                && frontend == nixe_gpu::FrontendSubmissionId::new(1)
+                && pushbuffer.get() == 0x4000
+        ));
+
+        // A fully mapped source is retained, deterministically scheduled, and
+        // reaches the exact packet-consumer boundary without completion.
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        allocation.write(0, &[0x78, 0x56, 0x34, 0x12]).unwrap();
+        let mapping = {
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let address_space = state.gpu_address_spaces.get_mut(&as_fd).unwrap();
+            address_space
+                .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
+                .unwrap();
+            address_space
+                .map(nixe_gpu_maxwell::MaxwellMapRequest {
+                    allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(1),
+                    backing: allocation
+                        .backing_range(MemoryPermissions::READ_WRITE)
+                        .unwrap(),
+                    backing_offset: 0,
+                    size: 0x1000,
+                    allocation_alignment: 0x1000,
+                    page_size: 0x1000,
+                    kind: 0,
+                    cacheable: false,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    fixed_offset: None,
+                })
+                .unwrap()
+        };
+        entry[0..4].copy_from_slice(&(mapping.offset().get() as u32).to_le_bytes());
+        entry[4..8].copy_from_slice(
+            &(((mapping.offset().get() >> 32) as u32) | (1_u32 << 10)).to_le_bytes(),
+        );
+        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { context, boundary }) =
+            session.ioctl2(channel_fd, request, &submit, &entry)
+        else {
+            panic!("mapped GPFIFO source must reach the packet-consumer boundary");
+        };
+        assert_eq!(
+            context.reason(),
+            NvDrvValidationReason::MaxwellPacketSemanticsUnavailable
+        );
+        assert_eq!(
+            boundary.dispatch().scheduled().stage(),
+            nixe_gpu_maxwell::MaxwellSubmissionOrderingStage::FrontendDispatched
+        );
+        let location = boundary.first_packet().unwrap();
+        assert_eq!(location.entry_index, 0);
+        assert_eq!(location.word_offset, 0);
+        let submission = boundary.dispatch().scheduled().submission();
+        let completion = boundary.dispatch().scheduled().completion().unwrap();
+        assert_eq!(completion.point().syncpoint().get(), syncpoint);
+        assert_eq!(completion.point().value().get(), 1);
+        let mut read_syncpoint = [0_u8; 8];
+        read_syncpoint[..4].copy_from_slice(&syncpoint.to_le_bytes());
+        let (read_syncpoint, result) = session
+            .ioctl(control_fd, 0xc008_0014, &read_syncpoint)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(input_u32(&read_syncpoint, 4).unwrap(), 0);
+        let capture = submission.capture();
+        assert_eq!(capture.channel(), channel_before_submission.id());
+        assert_eq!(capture.frontend(), nixe_gpu::FrontendSubmissionId::new(1));
+        assert_eq!(
+            capture.address_space(),
+            session.gpu_address_space(as_fd).unwrap().id()
+        );
+        assert_eq!(capture.total_entries(), 1);
+        assert_eq!(capture.total_sources(), 1);
+        assert_eq!(capture.sources()[0].mapping, mapping.id());
+        assert_eq!(capture.sources()[0].generation, mapping.generation());
+
+        // The legacy normal-ioctl ABI carries the same header followed by an
+        // inline, request-sized GPFIFO array. It must converge on the exact
+        // decoder, resolver, scheduler, retention, and packet boundary used by
+        // Ioctl2 rather than introducing a second submission implementation.
+        let legacy_request = 0xc028_4808;
+        let mut legacy = [0_u8; 40];
+        legacy[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        legacy[12..16].copy_from_slice(&(4_u32 | 0x100).to_le_bytes());
+        legacy[20..24].copy_from_slice(&3_u32.to_le_bytes());
+        legacy[24..32].copy_from_slice(&entry);
+        legacy[32..40].copy_from_slice(&entry);
+        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
+            context: legacy_context,
+            boundary: legacy_boundary,
+        }) = session.ioctl(channel_fd, legacy_request, &legacy)
+        else {
+            panic!("legacy inline submission must reach the packet-consumer boundary");
+        };
+        assert_eq!(legacy_context.request(), legacy_request);
+        assert_eq!(legacy_boundary.first_packet().unwrap().entry_index, 0);
+        let legacy_submission = legacy_boundary.dispatch().scheduled().submission();
+        assert_eq!(
+            legacy_submission.frontend(),
+            nixe_gpu::FrontendSubmissionId::new(2)
+        );
+        assert_eq!(legacy_submission.capture().total_entries(), 2);
+        assert_eq!(legacy_submission.capture().total_sources(), 2);
+        assert_eq!(
+            legacy_boundary
+                .dispatch()
+                .scheduled()
+                .completion()
+                .unwrap()
+                .point()
+                .value()
+                .get(),
+            4,
+            "the command-stream increment count must extend the prior reservation by three"
+        );
+
+        // Encoded-size mismatch, truncation, trailing entries, and excessive
+        // counts are rejected before a frontend ID or scheduler state changes.
+        let pending_before_malformed = session
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvhost_gpu
+            .pending_submission_count();
+        assert_eq!(
+            session
+                .ioctl(channel_fd, legacy_request, &legacy[..39])
+                .unwrap()
+                .1,
+            NV_BAD_PARAMETER
+        );
+        let mut trailing = legacy;
+        trailing[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(channel_fd, legacy_request, &trailing)
+                .unwrap()
+                .1,
+            NV_BAD_PARAMETER
+        );
+        let truncated_request = 0xc020_4808;
+        assert_eq!(
+            session
+                .ioctl(channel_fd, truncated_request, &legacy[..32])
+                .unwrap()
+                .1,
+            NV_BAD_PARAMETER
+        );
+        let mut excessive = [0_u8; 24];
+        excessive[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(channel_fd, 0xc018_4808, &excessive)
+                .unwrap()
+                .1,
+            NV_BAD_PARAMETER
+        );
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .nvhost_gpu
+                .pending_submission_count(),
+            pending_before_malformed
+        );
+
+        let mut legacy_empty = [0_u8; 24];
+        legacy_empty[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
+            boundary: empty_legacy_boundary,
+            ..
+        }) = session.ioctl(channel_fd, 0xc018_4808, &legacy_empty)
+        else {
+            panic!("empty legacy submission must retain the explicit frontend boundary");
+        };
+        assert!(matches!(
+            *empty_legacy_boundary,
+            nixe_gpu_maxwell::MaxwellFrontendDispatchBoundary::EmptySubmission { .. }
+        ));
+        assert_eq!(
+            empty_legacy_boundary
+                .dispatch()
+                .scheduled()
+                .submission()
+                .frontend(),
+            nixe_gpu::FrontendSubmissionId::new(3),
+            "malformed legacy requests must not consume frontend identities"
+        );
+        let mut legacy_syncpoint = [0_u8; 8];
+        legacy_syncpoint[..4].copy_from_slice(&syncpoint.to_le_bytes());
+        let (legacy_syncpoint, result) = session
+            .ioctl(control_fd, 0xc008_0014, &legacy_syncpoint)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(input_u32(&legacy_syncpoint, 4).unwrap(), 0);
+        assert!(matches!(
+            session.ioctl(channel_fd, 0xc018_4807, &legacy_empty),
+            Err(UnsupportedNvDrvOperation::Ioctl { .. })
+        ));
+
+        drop(allocation);
+        {
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .gpu_address_spaces
+                .get_mut(&as_fd)
+                .unwrap()
+                .unmap(mapping.offset())
+                .unwrap();
+        }
+        let active_address_space = session.gpu_address_space(as_fd).unwrap();
+        assert!(matches!(
+            submission.validate_sources(&active_address_space),
+            Err(nixe_gpu_maxwell::MaxwellGpfifoSourceError::StaleMapping { .. })
+        ));
+        let retained_mapping = submission.pushbuffers()[0].source().segments()[0].mapping();
+        let mut retained_word = [0; 4];
+        retained_mapping
+            .backing()
+            .read(retained_mapping.backing_offset(), &mut retained_word)
+            .unwrap();
+        assert_eq!(retained_word, [0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(
+            session.gpu_channel(channel_fd),
+            Some(channel_before_submission.clone())
+        );
+
+        // A count/byte mismatch is a verified guest argument error. Neither
+        // it nor a fatal known-but-unsupported mode may retain a prefix.
+        assert_eq!(
+            session.ioctl2(channel_fd, request, &submit, &[]).unwrap().1,
+            NV_BAD_PARAMETER
+        );
+        submit[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        submit[12..16].copy_from_slice(&(4_u32 | 8).to_le_bytes());
+        assert_eq!(
+            session.ioctl2(channel_fd, request, &submit, &[]),
+            Err(UnsupportedNvDrvOperation::GpfifoSubmission {
                 context: NvDrvErrorContext::new(
-                    NvDrvDeviceKind::HostAddressSpaceGpu,
+                    NvDrvDeviceKind::HostGpu,
                     request,
-                    fd,
+                    channel_fd,
                     None,
                     NvDrvValidationReason::UnsupportedOperation,
                 ),
+                error:
+                    nixe_gpu_maxwell::MaxwellUnsupportedGpfifoSubmission::SyncFenceFileDescriptor,
             })
         );
+        assert_eq!(
+            session.gpu_channel(channel_fd),
+            Some(channel_before_submission)
+        );
+
+        assert_eq!(session.close(channel_fd), NV_SUCCESS);
+        assert_eq!(session.gpu_channel(channel_fd), None);
+
+        // Closing a channel releases its timeline identity without destroying
+        // the independently owned address space. A new channel may bind the
+        // same semantic object and deterministically reuse the free identity.
+        let replacement_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
+        session
+            .ioctl(replacement_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
+            .unwrap();
+        session
+            .ioctl(as_fd, 0x4004_4101, &replacement_fd.raw().to_le_bytes())
+            .unwrap();
+        let (replacement, result) = session
+            .ioctl(replacement_fd, 0xc020_481a, &allocate)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(input_u32(&replacement, 12).unwrap(), syncpoint);
+
+        // Conversely, closing the independently owned address space removes
+        // the live binding instead of leaving a dangling or copied object.
+        assert_eq!(session.close(as_fd), NV_SUCCESS);
+        assert_eq!(
+            session.gpu_channel(replacement_fd).unwrap().address_space(),
+            None
+        );
+    }
+
+    #[test]
+    fn gpfifo_empty_close_and_process_teardown_preserve_no_false_progress() {
+        let session = NvDrvSession::new();
+        session.initialize();
+        let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
+        let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
+        let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+        let channel_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
+        session
+            .ioctl(channel_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
+            .unwrap();
+        session
+            .ioctl(as_fd, 0x4004_4101, &channel_fd.raw().to_le_bytes())
+            .unwrap();
+        let mut allocate = [0_u8; 32];
+        allocate[0..4].copy_from_slice(&8_u32.to_le_bytes());
+        let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        let syncpoint = GuestSyncpointId::new(input_u32(&allocated, 12).unwrap());
+
+        // Even zero command entries cross a typed frontend boundary. T6 does
+        // not infer that empty work is complete or advance the channel fence.
+        let mut empty = [0_u8; 24];
+        empty[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        let Err(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
+            boundary: empty_boundary,
+            ..
+        }) = session.ioctl2(channel_fd, 0xc018_481b, &empty, &[])
+        else {
+            panic!("empty work must stop at its explicit frontend boundary");
+        };
+        assert!(matches!(
+            *empty_boundary,
+            nixe_gpu_maxwell::MaxwellFrontendDispatchBoundary::EmptySubmission { .. }
+        ));
+        assert!(empty_boundary.dispatch().scheduled().completion().is_none());
+
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        allocation.write(0, &[0x12, 0x34, 0x56, 0x78]).unwrap();
+        let mapping = {
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let address_space = state.gpu_address_spaces.get_mut(&as_fd).unwrap();
+            address_space
+                .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
+                .unwrap();
+            address_space
+                .map(nixe_gpu_maxwell::MaxwellMapRequest {
+                    allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(30),
+                    backing: allocation
+                        .backing_range(MemoryPermissions::READ_WRITE)
+                        .unwrap(),
+                    backing_offset: 0,
+                    size: 0x1000,
+                    allocation_alignment: 0x1000,
+                    page_size: 0x1000,
+                    kind: 0,
+                    cacheable: false,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    fixed_offset: None,
+                })
+                .unwrap()
+        };
+        let mut entry = [0_u8; 8];
+        entry[..4].copy_from_slice(&(mapping.offset().get() as u32).to_le_bytes());
+        entry[4..].copy_from_slice(
+            &(((mapping.offset().get() >> 32) as u32) | (1_u32 << 10)).to_le_bytes(),
+        );
+        let mut waiting = [0_u8; 24];
+        waiting[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        waiting[12..16].copy_from_slice(&(4_u32 | 1).to_le_bytes());
+        waiting[16..20].copy_from_slice(&syncpoint.get().to_le_bytes());
+        waiting[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        let Err(UnsupportedNvDrvOperation::GpfifoScheduling { error, .. }) =
+            session.ioctl2(channel_fd, 0xc018_481b, &waiting, &entry)
+        else {
+            panic!("an unreached dependency must retain queued work without dispatch");
+        };
+        assert_eq!(
+            *error,
+            nixe_gpu_maxwell::MaxwellScheduleError::PendingDependency(GuestTimelinePoint::new(
+                syncpoint,
+                GuestSyncpointValue::new(1)
+            ))
+        );
+        {
+            let state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.nvhost_gpu.pending_submission_count(), 1);
+            assert!(state.nvhost_control.has_timeline(syncpoint));
+        }
+        let mut read = [0_u8; 8];
+        read[..4].copy_from_slice(&syncpoint.get().to_le_bytes());
+        let (read, result) = session.ioctl(control_fd, 0xc008_0014, &read).unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(input_u32(&read, 4).unwrap(), 0);
+
+        assert_eq!(session.close(channel_fd), NV_SUCCESS);
+        {
+            let state = session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.nvhost_gpu.pending_submission_count(), 0);
+            assert!(!state.nvhost_control.has_timeline(syncpoint));
+        }
+
+        // Recreate pending work and exercise process-wide teardown separately
+        // from descriptor close. The same free syncpoint identity may be
+        // reused only after the old channel and queued ownership are gone.
+        let replacement_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
+        session
+            .ioctl(replacement_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
+            .unwrap();
+        session
+            .ioctl(as_fd, 0x4004_4101, &replacement_fd.raw().to_le_bytes())
+            .unwrap();
+        let (replacement, result) = session
+            .ioctl(replacement_fd, 0xc020_481a, &allocate)
+            .unwrap();
+        assert_eq!(result, NV_SUCCESS);
+        assert_eq!(input_u32(&replacement, 12).unwrap(), syncpoint.get());
+        let Err(UnsupportedNvDrvOperation::GpfifoScheduling { .. }) =
+            session.ioctl2(replacement_fd, 0xc018_481b, &waiting, &entry)
+        else {
+            panic!("replacement channel must retain its pending submission");
+        };
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .nvhost_gpu
+                .pending_submission_count(),
+            1
+        );
+
+        assert_eq!(
+            session.teardown(),
+            NvDrvTeardownReport {
+                device_fds_released: 4,
+                allocations_released: 0,
+            }
+        );
+        let state = session
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.nvhost_gpu.pending_submission_count(), 0);
+        assert!(!state.nvhost_control.has_timeline(syncpoint));
+        assert!(state.gpu_address_spaces.is_empty());
     }
 
     #[test]

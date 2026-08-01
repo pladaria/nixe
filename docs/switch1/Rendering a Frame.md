@@ -49,22 +49,22 @@ layer, queue, and synchronization rules.
 
 ## 2. Actors and responsibilities
 
-| Actor | Responsibility |
-| --- | --- |
-| Title | Builds scene data and requests draws through a guest graphics API. |
-| Guest graphics library | Allocates resources, prepares shaders, descriptors, and command streams. |
-| Horizon IPC and SVC layer | Transports requests, manages handles, mappings, events, waits, and threads. |
-| `nvdrv` | Exposes the Switch-facing NVIDIA device ABI and session semantics. |
-| `nvmap` | Gives shared allocations an NVIDIA-visible identity and lifetime. |
-| GPU address-space manager | Maps allocations into a guest GPU virtual address space. |
-| GPU channel | Owns submission state and accepts GPFIFO work. |
-| Maxwell frontend | Decodes packets, updates GPU state, resolves resources, and emits GPU operations. |
-| GPU backend | Executes validated operations using a host GPU or reference implementation. |
-| Synchronization coordinator | Relates host completion, memory visibility, guest syncpoints, and fences. |
-| Binder / BufferQueue | Transfers buffer-slot ownership between producer and compositor. |
-| VI | Owns displays, layers, scaling, visibility, stacking, and VSync events. |
-| Compositor | Selects completed layer images and produces host-ready frames. |
-| Host presenter | Uploads or copies host-ready frames to the native window. |
+| Actor                       | Responsibility                                                                    |
+| --------------------------- | --------------------------------------------------------------------------------- |
+| Title                       | Builds scene data and requests draws through a guest graphics API.                |
+| Guest graphics library      | Allocates resources, prepares shaders, descriptors, and command streams.          |
+| Horizon IPC and SVC layer   | Transports requests, manages handles, mappings, events, waits, and threads.       |
+| `nvdrv`                     | Exposes the Switch-facing NVIDIA device ABI and session semantics.                |
+| `nvmap`                     | Gives shared allocations an NVIDIA-visible identity and lifetime.                 |
+| GPU address-space manager   | Maps allocations into a guest GPU virtual address space.                          |
+| GPU channel                 | Owns submission state and accepts GPFIFO work.                                    |
+| Maxwell frontend            | Decodes packets, updates GPU state, resolves resources, and emits GPU operations. |
+| GPU backend                 | Executes validated operations using a host GPU or reference implementation.       |
+| Synchronization coordinator | Relates host completion, memory visibility, guest syncpoints, and fences.         |
+| Binder / BufferQueue        | Transfers buffer-slot ownership between producer and compositor.                  |
+| VI                          | Owns displays, layers, scaling, visibility, stacking, and VSync events.           |
+| Compositor                  | Selects completed layer images and produces host-ready frames.                    |
+| Host presenter              | Uploads or copies host-ready frames to the native window.                         |
 
 Identifiers must not cross domains implicitly. A GPU virtual address is not an
 `nvmap` handle, a syncpoint is not a host fence, and a BufferQueue slot is not a
@@ -80,7 +80,7 @@ One frame normally uses a rotating set of image slots:
       FREE ──dequeue──> DEQUEUED ──queue──> QUEUED ──acquire──> ACQUIRED
        ^                                                            |
        |                                                            |
-       └────────────────────── release ────────────────────────────┘
+       └─────────────────────── release ────────────────────────────┘
 ```
 
 The producer may write only a `DEQUEUED` slot. The compositor may read only an

@@ -8,6 +8,8 @@ pub(crate) struct NvDrvIoctlRequest<'a> {
     pub fd: NvDrvFileDescriptor,
     pub request: u32,
     pub input: &'a [u8],
+    /// Additional input buffer carried by `INvDrvServices::Ioctl2`.
+    pub additional_input: &'a [u8],
     pub process_id: u64,
     pub address_space: AddressSpaceId,
     pub translator: &'a dyn CanonicalRangeTranslator,

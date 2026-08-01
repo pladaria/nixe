@@ -43,6 +43,7 @@ pub enum NvDrvDeviceKind {
     HostControl,
     HostControlGpu,
     HostAddressSpaceGpu,
+    HostGpu,
 }
 
 impl NvDrvDeviceKind {
@@ -52,6 +53,7 @@ impl NvDrvDeviceKind {
             Self::HostControl => "/dev/nvhost-ctrl",
             Self::HostControlGpu => "/dev/nvhost-ctrl-gpu",
             Self::HostAddressSpaceGpu => "/dev/nvhost-as-gpu",
+            Self::HostGpu => "/dev/nvhost-gpu",
         }
     }
 }
