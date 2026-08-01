@@ -806,7 +806,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use nixe_gpu::{
-        BackendCompletionError, BackendCompletionSource, BackendSubmissionToken,
+        BackendCompletionError, BackendCompletionSource, BackendInstanceId, BackendSubmissionToken,
         CompletionSubmission, FrontendSubmissionId, SubmissionCompletionQueue,
     };
     use nixe_memory::DeviceVisibilityPoint;
@@ -1097,7 +1097,7 @@ mod tests {
             .unwrap()
             .reserve(owner, 1)
             .unwrap();
-        let backend = BackendSubmissionToken::new(12);
+        let backend = BackendSubmissionToken::new(BackendInstanceId::new(7), 12, 1);
         let submission = CompletionSubmission::new(
             FrontendSubmissionId::new(11),
             backend,

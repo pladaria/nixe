@@ -40,14 +40,79 @@ opaque_submission_id!(
     FrontendSubmissionId,
     "frontend-submission"
 );
-opaque_submission_id!(
-    /// Opaque token assigned when a backend accepts one neutral submission.
-    ///
-    /// The numeric representation has no guest meaning and is not a host
-    /// pointer or graphics-API object.
-    BackendSubmissionToken,
-    "backend-submission"
-);
+
+/// Identity of one initialized backend instance.
+///
+/// It is assigned by the composition root and is neither a host pointer nor a
+/// graphics-API object.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct BackendInstanceId(u64);
+
+impl BackendInstanceId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Display for BackendInstanceId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "backend-instance=0x{:016x}", self.0)
+    }
+}
+
+/// Pointer-free, backend-scoped token for one accepted neutral submission.
+///
+/// The generation changes whenever a released slot is reused. Consequently a
+/// stale token cannot name later work, even within the same backend instance.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BackendSubmissionToken {
+    instance: BackendInstanceId,
+    slot: u64,
+    generation: u32,
+}
+
+impl BackendSubmissionToken {
+    #[must_use]
+    pub const fn new(instance: BackendInstanceId, slot: u64, generation: u32) -> Self {
+        Self {
+            instance,
+            slot,
+            generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn instance(self) -> BackendInstanceId {
+        self.instance
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> u64 {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
+impl Display for BackendSubmissionToken {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend-submission[{} slot=0x{:016x} generation={}]",
+            self.instance, self.slot, self.generation
+        )
+    }
+}
 
 /// Evidence that the host backend completed one accepted submission.
 ///
@@ -115,22 +180,28 @@ mod tests {
     #[test]
     fn completion_domains_are_typed_and_pointer_free() {
         let frontend = FrontendSubmissionId::new(3);
-        let backend = BackendSubmissionToken::new(7);
+        let instance = BackendInstanceId::new(5);
+        let backend = BackendSubmissionToken::new(instance, 7, 2);
         let host = HostCompletion::new(backend);
         let visibility = VisibilityCompletion::new(DeviceVisibilityPoint::new(11));
 
         assert_eq!(frontend.get(), 3);
-        assert_eq!(backend.get(), 7);
+        assert_eq!(backend.instance(), instance);
+        assert_eq!(backend.slot(), 7);
+        assert_eq!(backend.generation(), 2);
         assert_eq!(host.submission(), backend);
         assert_eq!(visibility.point(), DeviceVisibilityPoint::new(11));
         assert_eq!(
             frontend.to_string(),
             "frontend-submission=0x0000000000000003"
         );
-        assert_eq!(backend.to_string(), "backend-submission=0x0000000000000007");
+        assert_eq!(
+            backend.to_string(),
+            "backend-submission[backend-instance=0x0000000000000005 slot=0x0000000000000007 generation=2]"
+        );
         assert_eq!(
             host.to_string(),
-            "host-completion[backend-submission=0x0000000000000007]"
+            "host-completion[backend-submission[backend-instance=0x0000000000000005 slot=0x0000000000000007 generation=2]]"
         );
         assert_eq!(
             visibility.to_string(),
