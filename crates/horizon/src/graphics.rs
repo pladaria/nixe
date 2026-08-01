@@ -8,11 +8,75 @@ use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, Frame, FrameMailbox};
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
-use crate::{NvDrvSession, NvMapImageViewMetadata, NvMapPlaneMetadata};
+use crate::{GraphicsEventSource, NvDrvSession, NvMapImageViewMetadata, NvMapPlaneMetadata};
 
 const DEFAULT_DISPLAY_ID: u64 = 1;
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
+
+/// VI refresh event, kept type-distinct from queue and GPU events even though
+/// all three currently use runtime kernel-event primitives.
+#[derive(Clone, Debug)]
+struct ViVsyncEvent {
+    source: GraphicsEventSource,
+    writable: WritableEventObject,
+    readable: ReadableEventObject,
+}
+
+impl ViVsyncEvent {
+    fn new(display_id: u64) -> Self {
+        let (writable, readable) = EventObject::create_pair();
+        Self {
+            source: GraphicsEventSource::ViVsync { display_id },
+            writable,
+            readable,
+        }
+    }
+
+    fn signal(&self) {
+        self.writable.signal();
+    }
+
+    fn readable(&self) -> ReadableEventObject {
+        debug_assert!(matches!(self.source, GraphicsEventSource::ViVsync { .. }));
+        self.readable.clone()
+    }
+}
+
+/// BufferQueue slot-availability event, never reused as a VI or GPU event.
+#[derive(Clone, Debug)]
+struct BufferQueueAvailabilityEvent {
+    source: GraphicsEventSource,
+    writable: WritableEventObject,
+    readable: ReadableEventObject,
+}
+
+impl BufferQueueAvailabilityEvent {
+    fn new(binder_id: i32) -> Self {
+        let (writable, readable) = EventObject::create_pair();
+        Self {
+            source: GraphicsEventSource::BufferQueueAvailability { binder_id },
+            writable,
+            readable,
+        }
+    }
+
+    fn signal(&self) {
+        self.writable.signal();
+    }
+
+    fn clear(&self) {
+        self.writable.clear();
+    }
+
+    fn readable(&self) -> ReadableEventObject {
+        debug_assert!(matches!(
+            self.source,
+            GraphicsEventSource::BufferQueueAvailability { .. }
+        ));
+        self.readable.clone()
+    }
+}
 
 /// Privilege of one VI root service connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -90,8 +154,7 @@ struct VideoState {
     next_layer_id: u64,
     layers: BTreeMap<u64, LayerState>,
     queues: BTreeMap<i32, BufferQueue>,
-    vsync_writable: WritableEventObject,
-    vsync_readable: ReadableEventObject,
+    vsync_event: ViVsyncEvent,
     display_clock: DisplayClock,
     mailbox: FrameMailbox,
     nvdrv: NvDrvSession,
@@ -124,14 +187,12 @@ impl Default for VideoSystem {
 impl VideoSystem {
     #[must_use]
     pub fn new(mailbox: FrameMailbox) -> Self {
-        let (vsync_writable, vsync_readable) = EventObject::create_pair();
         Self {
             state: Arc::new(Mutex::new(VideoState {
                 next_layer_id: 1,
                 layers: BTreeMap::new(),
                 queues: BTreeMap::new(),
-                vsync_writable,
-                vsync_readable,
+                vsync_event: ViVsyncEvent::new(DEFAULT_DISPLAY_ID),
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 mailbox,
@@ -236,7 +297,7 @@ impl VideoSystem {
             z: 0,
         };
         state.layers.insert(id, layer.clone());
-        state.queues.insert(binder_id, BufferQueue::new());
+        state.queues.insert(binder_id, BufferQueue::new(binder_id));
         Some(layer)
     }
 
@@ -317,8 +378,8 @@ impl VideoSystem {
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .vsync_readable
-                .clone(),
+                .vsync_event
+                .readable(),
         )
     }
 
@@ -328,7 +389,7 @@ impl VideoSystem {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queues
             .get(&binder_id)
-            .map(|queue| queue.available_readable.clone())
+            .map(|queue| queue.available_event.readable())
     }
 
     pub(crate) fn adjust_binder_refcount(
@@ -401,7 +462,7 @@ impl VideoSystem {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ticks = state.display_clock.advance(elapsed);
         if ticks.crossed != 0 {
-            state.vsync_writable.signal();
+            state.vsync_event.signal();
         }
         for _ in 0..ticks.crossed {
             let Some(pending) = state.pending_frames.pop_front() else {
@@ -481,8 +542,7 @@ struct BufferQueue {
     weak_references: i64,
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
-    available_writable: WritableEventObject,
-    available_readable: ReadableEventObject,
+    available_event: BufferQueueAvailabilityEvent,
 }
 
 #[derive(Clone, Debug)]
@@ -505,15 +565,13 @@ pub(crate) enum FramebufferError {
 }
 
 impl BufferQueue {
-    fn new() -> Self {
-        let (available_writable, available_readable) = EventObject::create_pair();
+    fn new(binder_id: i32) -> Self {
         Self {
             connected: false,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
-            available_writable,
-            available_readable,
+            available_event: BufferQueueAvailabilityEvent::new(binder_id),
         }
     }
 
@@ -573,7 +631,7 @@ impl BufferQueue {
                         .values()
                         .any(|slot| slot.ownership == SlotOwnership::Free)
                     {
-                        self.available_writable.clear();
+                        self.available_event.clear();
                     }
                 } else {
                     writer.write_i32(-1);
@@ -613,7 +671,7 @@ impl BufferQueue {
                     ));
                 }
                 slot.ownership = SlotOwnership::Free;
-                self.available_writable.signal();
+                self.available_event.signal();
             }
             9 => {
                 let _what = reader.read_i32()?;
@@ -640,7 +698,7 @@ impl BufferQueue {
                 if status == 0 {
                     self.connected = false;
                     self.slots.clear();
-                    self.available_writable.clear();
+                    self.available_event.clear();
                 }
                 writer.write_i32(status);
             }
@@ -704,9 +762,9 @@ impl BufferQueue {
             .values()
             .any(|slot| slot.ownership == SlotOwnership::Free)
         {
-            self.available_writable.signal();
+            self.available_event.signal();
         } else {
-            self.available_writable.clear();
+            self.available_event.clear();
         }
     }
 
@@ -718,7 +776,7 @@ impl BufferQueue {
             return false;
         }
         slot.ownership = SlotOwnership::Free;
-        self.available_writable.signal();
+        self.available_event.signal();
         true
     }
 }

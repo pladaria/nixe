@@ -16,6 +16,9 @@ pub enum NvDrvValidationReason {
     AddressSpaceUnavailable,
     AddressSpaceGenerationExhausted,
     AddressSpaceIdentityExhausted,
+    DeviceStateUnavailable,
+    TimelineIdentityExhausted,
+    TimelineOrderingUnavailable,
 }
 
 impl Display for NvDrvValidationReason {
@@ -26,6 +29,9 @@ impl Display for NvDrvValidationReason {
             Self::AddressSpaceUnavailable => "address-space-unavailable",
             Self::AddressSpaceGenerationExhausted => "address-space-generation-exhausted",
             Self::AddressSpaceIdentityExhausted => "address-space-identity-exhausted",
+            Self::DeviceStateUnavailable => "device-state-unavailable",
+            Self::TimelineIdentityExhausted => "timeline-identity-exhausted",
+            Self::TimelineOrderingUnavailable => "timeline-ordering-unavailable",
         })
     }
 }
@@ -87,6 +93,11 @@ pub enum UnsupportedNvDrvOperation {
     ServiceCommand {
         command_id: u32,
     },
+    QueryEvent {
+        device: NvDrvDeviceKind,
+        fd: NvDrvFileDescriptor,
+        event_id: u32,
+    },
     Ioctl {
         context: NvDrvErrorContext,
     },
@@ -102,7 +113,9 @@ impl UnsupportedNvDrvOperation {
     pub const fn gap_kind(&self) -> GraphicsGapKind {
         match self {
             Self::OpenDevice { .. } => GraphicsGapKind::DeviceOpen,
-            Self::ServiceCommand { .. } => GraphicsGapKind::ServiceCommand,
+            Self::ServiceCommand { .. } | Self::QueryEvent { .. } => {
+                GraphicsGapKind::ServiceCommand
+            }
             Self::Ioctl { .. } | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
         }
     }
@@ -119,6 +132,17 @@ impl Display for UnsupportedNvDrvOperation {
             Self::ServiceCommand { command_id } => write!(
                 formatter,
                 "nvdrv service command is not implemented: command={command_id}"
+            ),
+            Self::QueryEvent {
+                device,
+                fd,
+                event_id,
+            } => write!(
+                formatter,
+                "nvdrv QueryEvent is not implemented for device={} fd={} event-id={:#010x}",
+                device.path(),
+                fd,
+                event_id
             ),
             Self::Ioctl { context } => write!(
                 formatter,

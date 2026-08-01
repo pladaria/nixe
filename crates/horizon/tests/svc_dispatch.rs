@@ -516,6 +516,46 @@ fn unsignalled_wait_times_out_or_suspends_without_becoming_a_no_op() {
 }
 
 #[test]
+fn finite_event_wait_sleeps_until_its_deadline_then_returns_timed_out() {
+    let (_directory, mut process) = fixture_process(&[svc(0x45), svc(0x18)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let read_handle = state(&mut process).read_w(x(2));
+    let handles_address = process.main_thread().stack_bottom;
+    process
+        .memory()
+        .write(
+            process.cpu_context().address_space_id(),
+            handles_address,
+            MemoryAccess::normal(MemoryAccessSize::Word),
+            MemoryValue::U32(read_handle),
+        )
+        .unwrap();
+    state(&mut process).write_x(x(1), handles_address.get());
+    state(&mut process).write_w(x(2), 1);
+    write_wait_timeout(&mut process, 2_000_000);
+
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Suspended
+    );
+    let thread_id = process.main_thread().object().thread_id();
+    assert!(dispatcher.wait_for_thread_wakeup(thread_id));
+    assert!(process.resume());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::TIMED_OUT.raw()
+    );
+}
+
+#[test]
 fn current_id_and_session_calls_preserve_guest_domain_objects() {
     let (_directory, mut process) = fixture_process(&[svc(0x24), svc(0x25), svc(0x40)]);
     let mut dispatcher = HorizonSvcDispatcher::default();

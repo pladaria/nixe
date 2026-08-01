@@ -15,6 +15,7 @@ use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
     HipcRequest, MessageError, ReceiveStatics, SendStaticDescriptor,
 };
+use crate::nvdrv::NvDrvIoctlOutcome;
 use crate::nvdrv::{NvDrvFileDescriptor, NvDrvService, NvDrvServiceError};
 use crate::object::AppletObject;
 use crate::{
@@ -47,6 +48,8 @@ pub(crate) enum IpcWireError {
     CanonicalBacking(CanonicalRangeAccessError),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
+    /// A decoded direct nvdrv wait which must suspend at the SVC boundary.
+    PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
 }
 
 /// A Horizon service operation for which Nixe lacks faithful semantics.
@@ -158,6 +161,7 @@ pub(crate) fn connect_to_named_port(
 pub(crate) struct HostSystems<'a> {
     pub video: &'a VideoSystem,
     pub hid: &'a HidSystem,
+    pub caller_thread_id: u64,
 }
 
 pub(crate) fn send_sync_request(
@@ -469,7 +473,19 @@ pub(crate) fn send_sync_request_from_buffer(
     } else if let Some(vi) = vi {
         dispatch_vi(process, &vi, request, &hipc)?
     } else if let Some(nvdrv) = nvdrv {
-        dispatch_nvdrv(process, &nvdrv, request, &hipc)?
+        match dispatch_nvdrv(
+            process,
+            &nvdrv,
+            request,
+            &hipc,
+            host_systems.caller_thread_id,
+        ) {
+            Ok(response) => response,
+            Err(IpcWireError::PendingNvDrv(wait)) => {
+                return Ok(SyncRequestResult::PendingNvDrv(wait));
+            }
+            Err(error) => return Err(error),
+        }
     } else if let Some(service) = service {
         dispatch_semantic_service(process, &service, request, &hipc)?
     } else if let Some(object) = semantic_object {
@@ -486,10 +502,11 @@ pub(crate) fn send_sync_request_from_buffer(
     Ok(SyncRequestResult::Success)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncRequestResult {
     Success,
     InvalidHandle,
+    PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
 }
 
 fn dispatch_service_manager(
@@ -2073,6 +2090,7 @@ fn dispatch_nvdrv(
     session: &NvDrvSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    caller_thread_id: u64,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let service = NvDrvService::new(session);
     match request.command_id {
@@ -2129,15 +2147,22 @@ fn dispatch_nvdrv(
                 )?;
             }
             let response = service
-                .ioctl(
-                    NvDrvFileDescriptor::new(fd),
-                    ioctl,
-                    &input,
-                    process.process_id(),
-                    process.cpu().address_space_id(),
-                    process.canonical_memory(),
-                )
+                .ioctl(crate::nvdrv::NvDrvIoctlRequest {
+                    fd: NvDrvFileDescriptor::new(fd),
+                    request: ioctl,
+                    input: &input,
+                    process_id: process.process_id(),
+                    address_space: process.cpu().address_space_id(),
+                    translator: process.canonical_memory(),
+                    thread_id: caller_thread_id,
+                })
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
+            let response = match response {
+                NvDrvIoctlOutcome::Complete(response) => response,
+                NvDrvIoctlOutcome::PendingSyncpointWait(wait) => {
+                    return Err(IpcWireError::PendingNvDrv(wait));
+                }
+            };
             if let Some(output_descriptor) = buffers.output {
                 write_descriptor_bytes(process, output_descriptor, &response.output)?;
             }
@@ -2185,6 +2210,41 @@ fn dispatch_nvdrv(
                 None,
             ))
         }
+        4 => {
+            let Some(fd) = request_u32(request.data, 0) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            let Some(event_id) = request_u32(request.data, 4) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            if hipc.pid.is_some()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let (event, error) = service
+                .query_event(NvDrvFileDescriptor::new(fd), event_id, process.process_id())
+                .map_err(IpcWireError::UnsupportedNvDrv)?;
+            let handle = if let Some(event) = event {
+                Some(
+                    process
+                        .handles_mut()
+                        .insert(event)
+                        .map_err(|_| IpcWireError::ResourceExhausted)?,
+                )
+            } else {
+                None
+            };
+            Ok((
+                encode_nvdrv_query_event_response(request.token, error, handle)?,
+                handle,
+            ))
+        }
         8 => {
             // INvDrvServices::SetAruid carries the caller PID descriptor and
             // an AppletResourceUserId. Associate both with the shared nvdrv
@@ -2209,12 +2269,32 @@ fn dispatch_nvdrv(
                 None,
             ))
         }
-        // QueryEvent requires event signaling tied to syncpoint progress.
-        // Returning an inert event would hide missing emulator behavior.
         command_id => Err(IpcWireError::UnsupportedNvDrv(
             crate::nvdrv::UnsupportedNvDrvOperation::ServiceCommand { command_id },
         )),
     }
+}
+
+fn encode_nvdrv_query_event_response(
+    token: u32,
+    driver_result: u32,
+    copy_handle: Option<u32>,
+) -> Result<Vec<u8>, IpcWireError> {
+    let copy_handles = copy_handle.as_slice();
+    let response_data = driver_result.to_le_bytes();
+    CmifResponse {
+        token,
+        result: HorizonIpcResult::SUCCESS.raw(),
+        data: &response_data,
+        pid: None,
+        copy_handles,
+        move_handles: &[],
+        send_statics: &[],
+        is_domain: false,
+        domain_objects: &[],
+    }
+    .encode()
+    .map_err(Into::into)
 }
 
 fn vi_child(
@@ -3060,6 +3140,21 @@ mod tests {
         assert_eq!(word(24), 0);
         assert_eq!(word(28), 7);
         assert_eq!(&response[32..34], &0x100_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn nvdrv_query_event_returns_the_libnx_copy_handle_shape() {
+        let response =
+            encode_nvdrv_query_event_response(9, crate::nvdrv::NV_SUCCESS, Some(0x55)).unwrap();
+        let word = |offset| u32::from_le_bytes(response[offset..offset + 4].try_into().unwrap());
+
+        assert_eq!(word(4) >> 31, 1);
+        assert_eq!(word(8), 1 << 1);
+        assert_eq!(word(12), 0x55);
+        assert_eq!(word(16), 0x4f43_4653);
+        assert_eq!(word(24), HorizonIpcResult::SUCCESS.raw());
+        assert_eq!(word(28), 9);
+        assert_eq!(word(32), crate::nvdrv::NV_SUCCESS);
     }
 
     #[test]

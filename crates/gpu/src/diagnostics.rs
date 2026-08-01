@@ -76,19 +76,6 @@ decimal_diagnostic_id!(GpfifoEntryIndex, "gpfifo-entry", u32);
 hex_diagnostic_id!(GpuClassId, "class", u32, 8);
 hex_diagnostic_id!(GpuMethodId, "method", u32, 8);
 
-/// One guest syncpoint threshold, kept distinct from host completion values.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SyncpointValue {
-    pub id: u32,
-    pub value: u32,
-}
-
-impl Display for SyncpointValue {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "syncpoint={}:{}", self.id, self.value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,7 +124,11 @@ mod tests {
         assert_eq!(GpuClassId(0xb197).to_string(), "class=0x0000b197");
         assert_eq!(GpuMethodId(0x1234).to_string(), "method=0x00001234");
         assert_eq!(
-            SyncpointValue { id: 5, value: 42 }.to_string(),
+            crate::GuestTimelinePoint::new(
+                crate::GuestSyncpointId::new(5),
+                crate::GuestSyncpointValue::new(42),
+            )
+            .to_string(),
             "syncpoint=5:42"
         );
     }
