@@ -21,11 +21,13 @@ use nixe_gpu::{
 use crate::MaxwellMethodSource;
 
 use super::{
-    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDBegin, MaxwellThreeDColorCompressionMode,
-    MaxwellThreeDCsaaEnable, MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionValue,
-    MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableMode, MaxwellThreeDResolvedResource,
-    MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole, MaxwellThreeDShaderStage,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDZCompressionMode,
+    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDBegin, MaxwellThreeDBlendEnableCommon,
+    MaxwellThreeDColorCompressionMode, MaxwellThreeDCsaaEnable, MaxwellThreeDFixedFunctionRegister,
+    MaxwellThreeDFixedFunctionValue, MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableMode,
+    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole,
+    MaxwellThreeDShadeMode, MaxwellThreeDShaderStage, MaxwellThreeDSmTimeoutCounterBit,
+    MaxwellThreeDState, MaxwellThreeDVisibleCallLimit, MaxwellThreeDZCompressionMode,
+    MaxwellThreeDZCullStatsEnable,
 };
 
 #[derive(Clone, Debug)]
@@ -418,6 +420,37 @@ pub fn preflight_maxwell_three_d_operation(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(MaxwellThreeDFixedFunctionValue::ShadeMode(mode)) = state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
+        .value()
+    {
+        // The current neutral pipeline contract cannot attest whether shader
+        // interpolation implements Maxwell flat or smooth shading. Reject the
+        // draw before cache/backend effects instead of assuming a host default.
+        return Err(MaxwellThreeDLoweringError::UnsupportedShadeModeSemantics(
+            *mode,
+        ));
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(limit) = state
+        .shader_execution()
+        .visible_call_limit()
+        .value()
+        .copied()
+        .filter(|limit| limit.limit().is_some())
+    {
+        // The public ABI verifies the selector values but not what hardware
+        // counts as an API-visible call or where the limit is enforced. Keep
+        // active limiting ahead of cache/backend effects. `NoCheck` is the
+        // only encoding whose absence of a limiting effect is explicit.
+        return Err(MaxwellThreeDLoweringError::UnsupportedVisibleCallLimitSemantics(limit));
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) && let Some(value) = state
         .shader_execution()
         .sm_timeout_counter_bit()
@@ -436,7 +469,25 @@ pub fn preflight_maxwell_three_d_operation(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.zcull().stats_enable().value() == Some(&MaxwellThreeDZCullStatsEnable::Enabled)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedZCullStatsSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) {
+        if state
+            .vertex_input()
+            .primitive()
+            .vertex_array_restart_enabled()
+            .value()
+            == Some(&super::MaxwellThreeDVertexArrayPrimitiveRestartEnable::Enabled)
+        {
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedVertexArrayPrimitiveRestartSemantics,
+            );
+        }
         validate_line_rasterization_state(state)?;
     }
     if let MaxwellThreeDOperationTrigger::ClearSurface { source } = trigger
@@ -457,6 +508,7 @@ pub fn preflight_maxwell_three_d_operation(
         let attachments = draw_attachments
             .as_ref()
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
+        validate_draw_blending_state(state, attachments)?;
         reject_unsupported_z_compression(state, resources, trigger)?;
         reject_unsupported_color_compression(state, resources, trigger, Some(attachments))?;
     }
@@ -533,6 +585,179 @@ pub fn preflight_maxwell_three_d_operation(
         agreement,
         dirty_images: dirty_images.into_boxed_slice(),
     })
+}
+
+fn validate_draw_blending_state(
+    state: &MaxwellThreeDState,
+    attachments: &DrawAttachmentSelection,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    let active_targets = attachments.color_targets().collect::<Vec<_>>();
+    if active_targets.is_empty() {
+        return Ok(());
+    }
+
+    let per_target = match state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable)
+        .value()
+    {
+        Some(MaxwellThreeDFixedFunctionValue::Boolean(value)) => *value,
+        None => {
+            return Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_STATE_PER_TARGET",
+            });
+        }
+        Some(_) => {
+            return Err(MaxwellThreeDLoweringError::ContradictoryState {
+                reason: "blend-state selection register has the wrong typed value",
+            });
+        }
+    };
+
+    if !per_target {
+        return match state.fixed_function().blend_enable_common().value() {
+            None => Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_ENABLE_COMMON",
+            }),
+            Some(MaxwellThreeDBlendEnableCommon::Disabled) => Ok(()),
+            Some(MaxwellThreeDBlendEnableCommon::Enabled) => {
+                validate_common_blend_equation_state(state)?;
+                Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: None })
+            }
+        };
+    }
+
+    let mut enabled_target = None;
+    for target in active_targets {
+        match state.fixed_function().blend_enable()[target as usize].value() {
+            None => {
+                return Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                    target: Some(target),
+                    field: "SET_BLEND(i)",
+                });
+            }
+            Some(false) => {}
+            Some(true) => {
+                validate_per_target_blend_equation_state(state, target)?;
+                enabled_target.get_or_insert(target);
+            }
+        }
+    }
+    if let Some(target) = enabled_target {
+        return Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics {
+            target: Some(target),
+        });
+    }
+    Ok(())
+}
+
+fn validate_common_blend_equation_state(
+    state: &MaxwellThreeDState,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    let fixed = state.fixed_function();
+    let separate_alpha = require_common_blend_value(
+        fixed,
+        MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
+        "SET_BLEND_SEPARATE_FOR_ALPHA",
+    )?;
+    for (register, field) in [
+        (
+            MaxwellThreeDFixedFunctionRegister::BlendColorOp,
+            "SET_BLEND_OP_COLOR",
+        ),
+        (
+            MaxwellThreeDFixedFunctionRegister::BlendColorSource,
+            "SET_BLEND_COEFF_SOURCE_COLOR",
+        ),
+        (
+            MaxwellThreeDFixedFunctionRegister::BlendColorDestination,
+            "SET_BLEND_COEFF_DESTINATION_COLOR",
+        ),
+    ] {
+        require_common_blend_value(fixed, register, field)?;
+    }
+    if matches!(
+        separate_alpha,
+        MaxwellThreeDFixedFunctionValue::Boolean(true)
+    ) {
+        for (register, field) in [
+            (
+                MaxwellThreeDFixedFunctionRegister::BlendAlphaOp,
+                "SET_BLEND_OP_ALPHA",
+            ),
+            (
+                MaxwellThreeDFixedFunctionRegister::BlendAlphaSource,
+                "SET_BLEND_COEFF_SOURCE_ALPHA",
+            ),
+            (
+                MaxwellThreeDFixedFunctionRegister::BlendAlphaDestination,
+                "SET_BLEND_COEFF_DESTINATION_ALPHA",
+            ),
+        ] {
+            require_common_blend_value(fixed, register, field)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_common_blend_value(
+    fixed: &super::MaxwellThreeDFixedFunctionState,
+    register: MaxwellThreeDFixedFunctionRegister,
+    field: &'static str,
+) -> Result<MaxwellThreeDFixedFunctionValue, MaxwellThreeDLoweringError> {
+    fixed.register(register).value().copied().ok_or(
+        MaxwellThreeDLoweringError::IncompleteBlendState {
+            target: None,
+            field,
+        },
+    )
+}
+
+fn validate_per_target_blend_equation_state(
+    state: &MaxwellThreeDState,
+    target: u8,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    let values = &state.fixed_function().per_target_blend()[target as usize];
+    let separate_alpha =
+        values[0]
+            .value()
+            .copied()
+            .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: Some(target),
+                field: "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA",
+            })?;
+    for (index, field) in [
+        (1, "SET_BLEND_PER_TARGET_OP_COLOR"),
+        (2, "SET_BLEND_PER_TARGET_COEFF_SOURCE_COLOR"),
+        (3, "SET_BLEND_PER_TARGET_COEFF_DESTINATION_COLOR"),
+    ] {
+        values[index]
+            .value()
+            .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: Some(target),
+                field,
+            })?;
+    }
+    if matches!(
+        separate_alpha,
+        MaxwellThreeDFixedFunctionValue::Boolean(true)
+    ) {
+        for (index, field) in [
+            (4, "SET_BLEND_PER_TARGET_OP_ALPHA"),
+            (5, "SET_BLEND_PER_TARGET_COEFF_SOURCE_ALPHA"),
+            (6, "SET_BLEND_PER_TARGET_COEFF_DESTINATION_ALPHA"),
+        ] {
+            values[index]
+                .value()
+                .ok_or(MaxwellThreeDLoweringError::IncompleteBlendState {
+                    target: Some(target),
+                    field,
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_line_rasterization_state(
@@ -1233,7 +1458,8 @@ fn lower_draw(
     };
 
     let pipeline_key = PipelineKey {
-        method_dependencies: state.pipeline_dependencies(),
+        method_dependencies: state
+            .pipeline_dependencies(&attachment_selection.color_targets().collect::<Vec<_>>()),
         attachments: attachment_pipeline_key(resources, bindings, attachment_selection)?,
         resource_dependencies: shaders
             .resources
@@ -1641,8 +1867,15 @@ pub enum MaxwellThreeDLoweringError {
     TriggerStateMismatch,
     UnsupportedRenderEnableMode(MaxwellThreeDRenderEnableMode),
     UnsupportedSmTimeoutIntervalSemantics(MaxwellThreeDSmTimeoutCounterBit),
+    UnsupportedVisibleCallLimitSemantics(MaxwellThreeDVisibleCallLimit),
     UnsupportedCsaaSemantics,
+    UnsupportedZCullStatsSemantics,
     UnsupportedAliasedLineWidthSemantics,
+    UnsupportedVertexArrayPrimitiveRestartSemantics,
+    UnsupportedShadeModeSemantics(MaxwellThreeDShadeMode),
+    UnsupportedBlendSemantics {
+        target: Option<u8>,
+    },
     UnsupportedZCompressionSemantics,
     UnsupportedColorCompressionSemantics {
         target: u8,
@@ -1673,6 +1906,10 @@ pub enum MaxwellThreeDLoweringError {
     PartialDepthStencilClearUnsupported,
     ClearOutsideAttachment,
     IncompleteDraw(&'static str),
+    IncompleteBlendState {
+        target: Option<u8>,
+        field: &'static str,
+    },
     ColorTargetRouteUnprogrammed {
         slot: u8,
         target: u8,
@@ -1724,12 +1961,41 @@ impl Display for MaxwellThreeDLoweringError {
                 "MAXWELL_B SM timeout interval has no verified temporal semantics: counter-bit={}",
                 value.get()
             ),
+            Self::UnsupportedVisibleCallLimitSemantics(limit) => match limit.limit() {
+                Some(call_limit) => write!(
+                    formatter,
+                    "MAXWELL_B API-visible call limiting is not implemented: selector=0x{:x} limit={call_limit}",
+                    limit.raw()
+                ),
+                None => formatter.write_str(
+                    "MAXWELL_B API-visible call limiting reported an unsupported boundary for NO_CHECK",
+                ),
+            },
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
+            ),
+            Self::UnsupportedZCullStatsSemantics => formatter.write_str(
+                "MAXWELL_B enabled Z-cull statistics have no implemented counter accumulation, visibility, or reporting semantics",
             ),
             Self::UnsupportedAliasedLineWidthSemantics => formatter.write_str(
                 "MAXWELL_B aliased line-width selection has no represented width register or host rasterization semantics",
             ),
+            Self::UnsupportedVertexArrayPrimitiveRestartSemantics => formatter.write_str(
+                "MAXWELL_B enabled vertex-array primitive restart has no verified marker, segmentation, draw-accounting, or neutral backend semantics",
+            ),
+            Self::UnsupportedShadeModeSemantics(mode) => write!(
+                formatter,
+                "MAXWELL_B shade mode is not representable in the neutral pipeline contract: mode={mode:?}"
+            ),
+            Self::UnsupportedBlendSemantics { target } => match target {
+                Some(target) => write!(
+                    formatter,
+                    "MAXWELL_B enabled blend state is not representable in the neutral pipeline contract: target={target}"
+                ),
+                None => formatter.write_str(
+                    "MAXWELL_B enabled common blend state is not representable in the neutral pipeline contract",
+                ),
+            },
             Self::UnsupportedZCompressionSemantics => formatter.write_str(
                 "MAXWELL_B enabled Z compression has no verified representation or coherency semantics",
             ),
@@ -1788,6 +2054,13 @@ impl Display for MaxwellThreeDLoweringError {
             Self::IncompleteDraw(field) => {
                 write!(formatter, "draw state is incomplete: missing={field}")
             }
+            Self::IncompleteBlendState { target, field } => match target {
+                Some(target) => write!(
+                    formatter,
+                    "blend state is incomplete: target={target} missing={field}"
+                ),
+                None => write!(formatter, "common blend state is incomplete: missing={field}"),
+            },
             Self::ColorTargetRouteUnprogrammed { slot, target } => write!(
                 formatter,
                 "SET_CT_SELECT routes output slot {slot} to unprogrammed color target {target}"

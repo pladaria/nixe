@@ -8,6 +8,8 @@ use super::MaxwellThreeDRegister;
 ///
 /// This type is intentionally distinct from the identically encoded Fermi 2D
 /// register: class state and future execution rules remain engine-owned.
+/// NVIDIA defines the A/B address fragments and all five C mode encodings at:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2759-L2771>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum MaxwellThreeDRenderEnableMode {

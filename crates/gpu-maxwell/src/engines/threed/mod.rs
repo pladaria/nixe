@@ -11,6 +11,7 @@ mod resource;
 mod shader_execution;
 mod state;
 mod vertex;
+mod zcull;
 
 pub use bindings::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT, MAXWELL_PIPELINE_SHADER_COUNT,
@@ -33,12 +34,13 @@ pub use line::{
 };
 
 pub use output::{
-    MAXWELL_SCISSOR_COUNT, MAXWELL_VIEWPORT_COUNT, MaxwellThreeDBlendFactor, MaxwellThreeDBlendOp,
-    MaxwellThreeDColorMask, MaxwellThreeDCompareOp, MaxwellThreeDCullFace,
-    MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
+    MAXWELL_SCISSOR_COUNT, MAXWELL_VIEWPORT_COUNT, MaxwellThreeDBlendEnableCommon,
+    MaxwellThreeDBlendFactor, MaxwellThreeDBlendOp, MaxwellThreeDColorMask, MaxwellThreeDCompareOp,
+    MaxwellThreeDCullFace, MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite, MaxwellThreeDFrontFace,
     MaxwellThreeDPolygonMode, MaxwellThreeDSampleMode, MaxwellThreeDScissorState,
-    MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl, MaxwellThreeDViewportTransformState,
+    MaxwellThreeDShadeMode, MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl,
+    MaxwellThreeDViewportTransformState,
 };
 pub use render_enable::{
     MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableState,
@@ -62,6 +64,7 @@ pub use resource::{
 pub use shader_execution::{
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MaxwellThreeDShaderExecutionState,
     MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDSmTimeoutCounterBit,
+    MaxwellThreeDVisibleCallLimit,
 };
 pub use state::{
     MaxwellThreeDPointSize, MaxwellThreeDRasterState, MaxwellThreeDRegister,
@@ -72,9 +75,13 @@ pub use vertex::{
     MAXWELL_VERTEX_ATTRIBUTE_COUNT, MAXWELL_VERTEX_STREAM_COUNT, MaxwellThreeDBegin,
     MaxwellThreeDIndexBufferState, MaxwellThreeDIndexElementSize, MaxwellThreeDPrimitiveState,
     MaxwellThreeDPrimitiveTopology, MaxwellThreeDUnresolvedAddress,
-    MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
-    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
+    MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAttributeFormat,
+    MaxwellThreeDVertexComponentWidths, MaxwellThreeDVertexInputState,
+    MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
     MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
+};
+pub use zcull::{
+    MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
 };
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
@@ -94,9 +101,11 @@ enum MethodAction {
     PointSize,
     ViewportZClip,
     RenderEnableMode,
+    VisibleCallLimit,
     SmTimeoutCounterBit,
     CsaaEnable,
     AliasedLineWidthEnable,
+    ZCullStatsEnable,
     DrawVertexArray,
     Unsupported,
     Missing(MaxwellEngineCapability),
@@ -131,29 +140,6 @@ macro_rules! methods {
 // public MAXWELL_B header. That header does not publish register reset values,
 // so state begins explicitly unset rather than assuming zero.
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
-// SET_RENDER_ENABLE_A/B/C and all five C modes are defined at:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2759-L2771
-// SET_SM_TIMEOUT_INTERVAL.COUNTER_BIT is defined at bits 5:0 here; this does
-// not document a duration formula or watchdog behavior:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1079-L1090
-// SET_Z_COMPRESSION.ENABLE and its FALSE/TRUE values are defined here:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3545-L3548
-// SET_COLOR_COMPRESSION(i).ENABLE and its FALSE/TRUE values are defined here:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3575-L3578
-// SET_CT_SELECT's count and all eight target selectors are defined here:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2003-L2012
-// NVIDIA's public MAXWELL_B header leaves address 0x15b4 unnamed; that omission
-// is not evidence that the method is a no-op or reserved:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2864-L2888
-// The pinned envytools register database identifies 0x15b4 as CSAA_ENABLE and
-// publishes its FALSE/TRUE values. It does not establish the later execution
-// semantics of enabled coverage sampling:
-// https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L831-L838
-// SET_ALIASED_LINE_WIDTH_ENABLE and its FALSE/TRUE encodings are defined here:
-// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L244-L247
-// The pinned envytools database independently calls the same selector
-// LINE_WIDTH_SEPARATE; that name does not establish broader raster semantics:
-// https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L60-L68
 methods!(
     NO_OPERATION => (0x0100, "NO_OPERATION", u32::MAX, MethodAction::NoOperation),
     SET_ALIASED_LINE_WIDTH_ENABLE => (
@@ -192,6 +178,12 @@ methods!(
         u32::MAX,
         MethodAction::DrawVertexArray
     ),
+    SET_API_VISIBLE_CALL_LIMIT => (
+        0x0d64,
+        "SET_API_VISIBLE_CALL_LIMIT",
+        0x0000_000f,
+        MethodAction::VisibleCallLimit
+    ),
     SET_SM_TIMEOUT_INTERVAL => (
         0x0de4,
         "SET_SM_TIMEOUT_INTERVAL",
@@ -209,6 +201,12 @@ methods!(
         "SET_POINT_SIZE",
         u32::MAX,
         MethodAction::PointSize
+    ),
+    SET_ZCULL_STATS => (
+        0x151c,
+        "SET_ZCULL_STATS",
+        0x0000_0001,
+        MethodAction::ZCullStatsEnable
     ),
     SET_RENDER_ENABLE_C => (
         0x1558,
@@ -311,6 +309,20 @@ pub(super) fn preflight(
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
+            MethodAction::VisibleCallLimit => {
+                let value = MaxwellThreeDVisibleCallLimit::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::SmTimeoutCounterBit => {
                 let value = MaxwellThreeDSmTimeoutCounterBit::new(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -350,6 +362,22 @@ pub(super) fn preflight(
                 let write = MaxwellThreeDStateWrite::Line(
                     MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source },
                 );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ZCullStatsEnable => {
+                let value = MaxwellThreeDZCullStatsEnable::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write =
+                    MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::StatsEnable {
+                        value,
+                        source,
+                    });
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
@@ -513,6 +541,21 @@ fn preflight_vertex_and_binding_state(
         })
     } else {
         match method {
+            0x0de8 => Some((
+                V::VertexArrayPrimitiveRestartEnable {
+                    value: MaxwellThreeDVertexArrayPrimitiveRestartEnable::parse(raw).ok_or_else(
+                        || {
+                            invalid_encoding(
+                                source,
+                                "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY",
+                                "undefined boolean encoding or reserved bits",
+                            )
+                        },
+                    )?,
+                    source,
+                },
+                "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY",
+            )),
             0x0d74 => Some((
                 V::VertexArrayStart { value: raw, source },
                 "SET_VERTEX_ARRAY_START",
@@ -1293,6 +1336,21 @@ fn preflight_output_state(
     use MaxwellThreeDFixedFunctionRegister as R;
     use MaxwellThreeDFixedFunctionValue as V;
     let fixed = match method {
+        0x135c => {
+            let value = MaxwellThreeDBlendEnableCommon::parse(raw).ok_or_else(|| {
+                invalid_encoding(
+                    source,
+                    "SET_BLEND_ENABLE_COMMON",
+                    "undefined boolean encoding or reserved bits",
+                )
+            })?;
+            return Ok(Some((
+                MaxwellThreeDStateWrite::FixedFunction(
+                    MaxwellThreeDFixedFunctionWrite::BlendEnableCommon { value, source },
+                ),
+                "SET_BLEND_ENABLE_COMMON",
+            )));
+        }
         0x037c => (
             R::RasterEnable,
             V::Boolean(checked_bool(source, "SET_RASTER_ENABLE")?),
@@ -1419,6 +1477,11 @@ fn preflight_output_state(
             V::Boolean(checked_bool(source, "SET_DEPTH_TEST")?),
             "SET_DEPTH_TEST",
         ),
+        0x12d4 => {
+            let value = MaxwellThreeDShadeMode::parse(raw)
+                .ok_or_else(|| invalid_encoding(source, "SET_SHADE_MODE", "unknown shade mode"))?;
+            (R::ShadeMode, V::ShadeMode(value), "SET_SHADE_MODE")
+        }
         0x12e4 => (
             R::BlendPerTargetEnable,
             V::Boolean(checked_bool(source, "SET_BLEND_STATE_PER_TARGET")?),

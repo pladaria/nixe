@@ -3,6 +3,12 @@
 //! Selecting the aliased-width path is distinct from programming either line
 //! width and from anti-aliasing or multisample state. This module therefore
 //! retains the selector without inventing execution semantics for that path.
+//!
+//! NVIDIA publishes `SET_ALIASED_LINE_WIDTH_ENABLE` and its boolean values;
+//! the pinned envytools database independently calls the selector
+//! `LINE_WIDTH_SEPARATE`, which does not establish broader raster semantics:
+//! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L244-L247>
+//! <https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L60-L68>
 
 use crate::MaxwellMethodSource;
 

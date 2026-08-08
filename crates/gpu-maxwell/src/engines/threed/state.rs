@@ -13,7 +13,8 @@ use super::{
     MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite,
+    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState,
+    MaxwellThreeDZCullStateWrite,
 };
 
 /// How a modeled Maxwell register acquired its current value.
@@ -192,6 +193,7 @@ pub struct MaxwellThreeDState {
     shader_execution: MaxwellThreeDShaderExecutionState,
     coverage: MaxwellThreeDCoverageState,
     line: MaxwellThreeDLineState,
+    zcull: MaxwellThreeDZCullState,
 }
 
 impl MaxwellThreeDState {
@@ -250,10 +252,15 @@ impl MaxwellThreeDState {
         &self.line
     }
 
-    pub(super) fn pipeline_dependencies(&self) -> Box<[Option<u32>]> {
+    #[must_use]
+    pub const fn zcull(&self) -> &MaxwellThreeDZCullState {
+        &self.zcull
+    }
+
+    pub(crate) fn pipeline_dependencies(&self, active_color_targets: &[u8]) -> Box<[Option<u32>]> {
         let mut dependencies = Vec::new();
         self.fixed_function
-            .append_pipeline_dependencies(&mut dependencies);
+            .append_pipeline_dependencies(&mut dependencies, active_color_targets);
         self.vertex_input
             .append_pipeline_dependencies(&mut dependencies);
         self.shader_bindings
@@ -284,6 +291,7 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::ShaderExecution(write) => self.shader_execution.apply(write),
             MaxwellThreeDStateWrite::Coverage(write) => self.coverage.apply(write),
             MaxwellThreeDStateWrite::Line(write) => self.line.apply(write),
+            MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
         }
     }
 
@@ -462,4 +470,5 @@ pub enum MaxwellThreeDStateWrite {
     ShaderExecution(MaxwellThreeDShaderExecutionStateWrite),
     Coverage(MaxwellThreeDCoverageStateWrite),
     Line(MaxwellThreeDLineStateWrite),
+    ZCull(MaxwellThreeDZCullStateWrite),
 }

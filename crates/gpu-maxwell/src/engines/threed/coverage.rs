@@ -4,6 +4,12 @@
 //! ordinary multisample state. Identifying a selector does not establish
 //! separate coverage/color sample counts, evaluation, resolve, or coherency
 //! semantics.
+//!
+//! NVIDIA's pinned public header leaves address `0x15b4` unnamed; the pinned
+//! envytools register database identifies it as `CSAA_ENABLE` and publishes
+//! its boolean values. Neither source establishes enabled execution semantics:
+//! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2864-L2888>
+//! <https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L831-L838>
 
 use crate::MaxwellMethodSource;
 

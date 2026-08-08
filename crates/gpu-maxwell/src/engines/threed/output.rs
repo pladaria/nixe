@@ -47,6 +47,32 @@ pub enum MaxwellThreeDPolygonMode {
     Line,
     Fill,
 }
+
+/// Provoking-vertex interpolation mode selected by `SET_SHADE_MODE`.
+///
+/// Encodings are defined by NVIDIA's public `MAXWELL_B` class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDShadeMode {
+    Flat = 0x1d00,
+    Smooth = 0x1d01,
+}
+
+impl MaxwellThreeDShadeMode {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0x1d00 => Some(Self::Flat),
+            0x1d01 => Some(Self::Smooth),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
 impl MaxwellThreeDPolygonMode {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
@@ -140,6 +166,34 @@ pub enum MaxwellThreeDBlendOp {
     Min,
     Max,
 }
+
+/// Whether the common blend state is active for later color-target draws.
+///
+/// NVIDIA's public class header defines the boolean selector but does not
+/// establish a neutral host blend-state contract:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDBlendEnableCommon {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDBlendEnableCommon {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 impl MaxwellThreeDBlendOp {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
@@ -236,6 +290,7 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     CullFace,
     LineWidth,
     DepthTestEnable,
+    ShadeMode,
     DepthWriteEnable,
     DepthCompare,
     StencilTestEnable,
@@ -302,6 +357,7 @@ impl MaxwellThreeDFixedFunctionRegister {
 pub enum MaxwellThreeDFixedFunctionValue {
     Boolean(bool),
     PolygonMode(MaxwellThreeDPolygonMode),
+    ShadeMode(MaxwellThreeDShadeMode),
     FrontFace(MaxwellThreeDFrontFace),
     CullFace(MaxwellThreeDCullFace),
     Compare(MaxwellThreeDCompareOp),
@@ -381,6 +437,7 @@ pub struct MaxwellThreeDFixedFunctionState {
     scissor: [MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT],
     registers: [MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>;
         MaxwellThreeDFixedFunctionRegister::COUNT],
+    blend_enable_common: MaxwellThreeDRegister<MaxwellThreeDBlendEnableCommon>,
     blend_enable: [MaxwellThreeDRegister<bool>; 8],
     color_mask: [MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8],
     per_target_blend: [[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8],
@@ -391,6 +448,7 @@ impl Default for MaxwellThreeDFixedFunctionState {
             viewport: std::array::from_fn(|_| Default::default()),
             scissor: std::array::from_fn(|_| Default::default()),
             registers: std::array::from_fn(|_| Default::default()),
+            blend_enable_common: Default::default(),
             blend_enable: Default::default(),
             color_mask: Default::default(),
             per_target_blend: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
@@ -418,6 +476,12 @@ impl MaxwellThreeDFixedFunctionState {
         &self.blend_enable
     }
     #[must_use]
+    pub const fn blend_enable_common(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendEnableCommon> {
+        &self.blend_enable_common
+    }
+    #[must_use]
     pub const fn color_mask(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8] {
         &self.color_mask
     }
@@ -428,7 +492,11 @@ impl MaxwellThreeDFixedFunctionState {
         &self.per_target_blend
     }
 
-    pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+    pub(super) fn append_pipeline_dependencies(
+        &self,
+        dependencies: &mut Vec<Option<u32>>,
+        active_color_targets: &[u8],
+    ) {
         for viewport in &self.viewport {
             dependencies.extend(viewport.scale.iter().map(MaxwellThreeDRegister::raw));
             dependencies.extend(viewport.offset.iter().map(MaxwellThreeDRegister::raw));
@@ -442,12 +510,49 @@ impl MaxwellThreeDFixedFunctionState {
             dependencies.push(scissor.horizontal.raw());
             dependencies.push(scissor.vertical.raw());
         }
-        dependencies.extend(self.registers.iter().map(MaxwellThreeDRegister::raw));
-        dependencies.extend(self.blend_enable.iter().map(MaxwellThreeDRegister::raw));
-        dependencies.extend(self.color_mask.iter().map(MaxwellThreeDRegister::raw));
-        for target in &self.per_target_blend {
-            dependencies.extend(target.iter().map(MaxwellThreeDRegister::raw));
+        // Successful lowering currently requires effective blending to be
+        // disabled. Retain only state that selects that effective result;
+        // inactive equation families and unselected targets cannot affect the
+        // pipeline and therefore must not invalidate its identity.
+        let blend_registers = [
+            MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable,
+            MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
+            MaxwellThreeDFixedFunctionRegister::BlendColorOp,
+            MaxwellThreeDFixedFunctionRegister::BlendColorSource,
+            MaxwellThreeDFixedFunctionRegister::BlendColorDestination,
+            MaxwellThreeDFixedFunctionRegister::BlendAlphaOp,
+            MaxwellThreeDFixedFunctionRegister::BlendAlphaSource,
+            MaxwellThreeDFixedFunctionRegister::BlendAlphaDestination,
+            MaxwellThreeDFixedFunctionRegister::BlendConstantRed,
+            MaxwellThreeDFixedFunctionRegister::BlendConstantGreen,
+            MaxwellThreeDFixedFunctionRegister::BlendConstantBlue,
+            MaxwellThreeDFixedFunctionRegister::BlendConstantAlpha,
+        ];
+        dependencies.extend(
+            self.registers
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    !blend_registers
+                        .iter()
+                        .any(|register| register.index() == *index)
+                })
+                .map(|(_, register)| register.raw()),
+        );
+        if !active_color_targets.is_empty() {
+            let selection = self.register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable);
+            dependencies.push(selection.raw());
+            if selection.value() == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true)) {
+                dependencies.extend(
+                    active_color_targets
+                        .iter()
+                        .map(|target| self.blend_enable[*target as usize].raw()),
+                );
+            } else {
+                dependencies.push(self.blend_enable_common.raw());
+            }
         }
+        dependencies.extend(self.color_mask.iter().map(MaxwellThreeDRegister::raw));
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDFixedFunctionWrite) {
@@ -525,6 +630,9 @@ impl MaxwellThreeDFixedFunctionState {
                 self.registers[register.index()] =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDFixedFunctionWrite::BlendEnableCommon { value, .. } => {
+                self.blend_enable_common = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDFixedFunctionWrite::BlendEnable { target, value, .. } => {
                 self.blend_enable[target as usize] =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -582,6 +690,10 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDFixedFunctionValue,
         source: MaxwellMethodSource,
     },
+    BlendEnableCommon {
+        value: MaxwellThreeDBlendEnableCommon,
+        source: MaxwellMethodSource,
+    },
     BlendEnable {
         target: u8,
         value: bool,
@@ -608,6 +720,7 @@ impl MaxwellThreeDFixedFunctionWrite {
             | Self::ScissorEnable { source, .. }
             | Self::ScissorRectangle { source, .. }
             | Self::Register { source, .. }
+            | Self::BlendEnableCommon { source, .. }
             | Self::BlendEnable { source, .. }
             | Self::ColorMask { source, .. }
             | Self::BlendState { source, .. } => source,
