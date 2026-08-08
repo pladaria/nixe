@@ -322,10 +322,42 @@ impl MaxwellThreeDPrimitiveTopology {
     }
 }
 
+/// Whether non-indexed vertex-array draws recognize primitive restart.
+///
+/// This selector is deliberately distinct from the indexed primitive-restart
+/// enable and index registers. NVIDIA publishes only the boolean encoding;
+/// its enabled execution semantics are validated at the draw boundary.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1084-L1090>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDVertexArrayPrimitiveRestartEnable {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDVertexArrayPrimitiveRestartEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDPrimitiveState {
     topology_override: MaxwellThreeDRegister<bool>,
     topology: MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology>,
+    vertex_array_restart_enabled:
+        MaxwellThreeDRegister<MaxwellThreeDVertexArrayPrimitiveRestartEnable>,
     restart_enabled: MaxwellThreeDRegister<bool>,
     restart_index: MaxwellThreeDRegister<u32>,
     vertex_array_start: MaxwellThreeDRegister<u32>,
@@ -340,6 +372,12 @@ impl MaxwellThreeDPrimitiveState {
     #[must_use]
     pub const fn topology(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology> {
         &self.topology
+    }
+    #[must_use]
+    pub const fn vertex_array_restart_enabled(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexArrayPrimitiveRestartEnable> {
+        &self.vertex_array_restart_enabled
     }
     #[must_use]
     pub const fn restart_enabled(&self) -> &MaxwellThreeDRegister<bool> {
@@ -451,6 +489,7 @@ impl MaxwellThreeDVertexInputState {
         dependencies.push(self.index.element_size.raw());
         dependencies.push(self.primitive.topology_override.raw());
         dependencies.push(self.primitive.topology.raw());
+        dependencies.push(self.primitive.vertex_array_restart_enabled.raw());
         dependencies.push(self.primitive.restart_enabled.raw());
         dependencies.push(self.primitive.restart_index.raw());
         dependencies.push(self.primitive.begin.raw());
@@ -518,6 +557,10 @@ impl MaxwellThreeDVertexInputState {
             }
             MaxwellThreeDVertexInputWrite::Topology { value, .. } => {
                 self.primitive.topology = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::VertexArrayPrimitiveRestartEnable { value, .. } => {
+                self.primitive.vertex_array_restart_enabled =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::PrimitiveRestartEnable { value, .. } => {
                 self.primitive.restart_enabled =
@@ -611,6 +654,10 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: MaxwellThreeDPrimitiveTopology,
         source: MaxwellMethodSource,
     },
+    VertexArrayPrimitiveRestartEnable {
+        value: MaxwellThreeDVertexArrayPrimitiveRestartEnable,
+        source: MaxwellMethodSource,
+    },
     PrimitiveRestartEnable {
         value: bool,
         source: MaxwellMethodSource,
@@ -648,6 +695,7 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::IndexFirst { source, .. }
             | Self::TopologyOverride { source, .. }
             | Self::Topology { source, .. }
+            | Self::VertexArrayPrimitiveRestartEnable { source, .. }
             | Self::PrimitiveRestartEnable { source, .. }
             | Self::PrimitiveRestartIndex { source, .. }
             | Self::VertexArrayStart { source, .. }

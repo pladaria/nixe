@@ -92,6 +92,9 @@ pub enum MaxwellThreeDDepthStencilFormat {
 /// This selector is not a memory kind or image layout. The public class
 /// header establishes only these two values; representation and coherency
 /// semantics remain an execution concern.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3545-L3548>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum MaxwellThreeDZCompressionMode {
@@ -155,6 +158,9 @@ impl MaxwellThreeDRawValue {
 /// This type remains distinct from Z compression even though the currently
 /// verified values share an encoding. It identifies neither a memory kind nor
 /// an image layout and cannot create an attachment by itself.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3575-L3578>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum MaxwellThreeDColorCompressionMode {
@@ -167,6 +173,9 @@ pub enum MaxwellThreeDColorCompressionMode {
 /// The complete register payload is retained, including selectors beyond
 /// `target_count`; they are inactive for the current draw but have no
 /// documented reset semantics and must not be discarded on write.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2003-L2012>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDColorTargetSelection {
     target_count: u8,

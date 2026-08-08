@@ -13,9 +13,9 @@ pub use threed::{
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MaxwellThreeDAliasedLineWidthEnable,
     MaxwellThreeDAttachmentReadiness, MaxwellThreeDBegin, MaxwellThreeDBindGroupState,
-    MaxwellThreeDBlendFactor, MaxwellThreeDBlendOp, MaxwellThreeDClearState,
-    MaxwellThreeDClearSurface, MaxwellThreeDColorCompressionMode, MaxwellThreeDColorMask,
-    MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
+    MaxwellThreeDBlendEnableCommon, MaxwellThreeDBlendFactor, MaxwellThreeDBlendOp,
+    MaxwellThreeDClearState, MaxwellThreeDClearSurface, MaxwellThreeDColorCompressionMode,
+    MaxwellThreeDColorMask, MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
     MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp, MaxwellThreeDConstantBufferBinding,
     MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDCoverageState,
     MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace,
@@ -37,18 +37,20 @@ pub use threed::{
     MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceAccess,
     MaxwellThreeDResourceAlias, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
     MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode, MaxwellThreeDScissorState,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
+    MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
     MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderStage, MaxwellThreeDSmTimeoutCounterBit,
     MaxwellThreeDState, MaxwellThreeDStateWrite, MaxwellThreeDStencilOp,
     MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders, MaxwellThreeDUnresolvedAddress,
-    MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
-    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
+    MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAttributeFormat,
+    MaxwellThreeDVertexComponentWidths, MaxwellThreeDVertexInputState,
+    MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
     MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
     MaxwellThreeDViewportClipControl, MaxwellThreeDViewportState,
     MaxwellThreeDViewportTransformState, MaxwellThreeDViewportZClipRange,
-    MaxwellThreeDZCompressionMode, preflight_maxwell_three_d_operation,
-    resolve_maxwell_three_d_resources,
+    MaxwellThreeDVisibleCallLimit, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullState,
+    MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
+    preflight_maxwell_three_d_operation, resolve_maxwell_three_d_resources,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDClipEnable,
@@ -720,6 +722,8 @@ mod tests {
             (0x0d74, 0),
             (0x1618, 4),
             (0x1970, 4),
+            (0x12e4, 0),
+            (0x135c, 0),
             (0x2000, 0x11),
             (0x2010, 0),
             (0x2040, 0x51),
@@ -1805,6 +1809,422 @@ mod tests {
     }
 
     #[test]
+    fn visible_call_limit_is_typed_source_preserving_execution_state() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let two_d_before = channel.two_d().clone();
+        let timeout_before = channel
+            .three_d()
+            .shader_execution()
+            .sm_timeout_counter_bit()
+            .to_owned();
+        assert_eq!(
+            channel
+                .three_d()
+                .shader_execution()
+                .visible_call_limit()
+                .origin(),
+            MaxwellThreeDRegisterOrigin::Unset
+        );
+
+        for (argument, expected, limit) in [
+            (0, MaxwellThreeDVisibleCallLimit::Calls0, Some(0)),
+            (1, MaxwellThreeDVisibleCallLimit::Calls1, Some(1)),
+            (2, MaxwellThreeDVisibleCallLimit::Calls2, Some(2)),
+            (3, MaxwellThreeDVisibleCallLimit::Calls4, Some(4)),
+            (4, MaxwellThreeDVisibleCallLimit::Calls8, Some(8)),
+            (5, MaxwellThreeDVisibleCallLimit::Calls16, Some(16)),
+            (6, MaxwellThreeDVisibleCallLimit::Calls32, Some(32)),
+            (7, MaxwellThreeDVisibleCallLimit::Calls64, Some(64)),
+            (8, MaxwellThreeDVisibleCallLimit::Calls128, Some(128)),
+            (15, MaxwellThreeDVisibleCallLimit::NoCheck, None),
+        ] {
+            let decoded = packet(0x0d64 / 4, argument);
+            let dispatch = dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0],
+            )
+            .unwrap();
+            let source = dispatch.methods()[0].method().source();
+            let register = channel.three_d().shader_execution().visible_call_limit();
+
+            assert_eq!(
+                dispatch.methods()[0].metadata().method_name(),
+                "SET_API_VISIBLE_CALL_LIMIT"
+            );
+            assert_eq!(
+                dispatch.methods()[0].effect(),
+                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit {
+                        value: expected,
+                        source,
+                    }
+                ))
+            );
+            assert!(dispatch.operations().is_empty());
+            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+            assert_eq!(register.raw(), Some(argument));
+            assert_eq!(register.value().copied(), Some(expected));
+            assert_eq!(register.source(), Some(source));
+            assert_eq!(expected.raw(), argument);
+            assert_eq!(expected.limit(), limit);
+            assert_eq!(
+                channel
+                    .three_d()
+                    .shader_execution()
+                    .sm_timeout_counter_bit(),
+                &timeout_before
+            );
+            assert_eq!(channel.two_d(), &two_d_before);
+        }
+    }
+
+    #[test]
+    fn invalid_visible_call_limits_and_packet_suffix_are_rejected_atomically() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x0d64, 8);
+
+        for argument in [9, 10, 11, 12, 13, 14, 0x10, 0x8000_0000, u32::MAX] {
+            let frontend_before = channel.frontend();
+            let two_d_before = channel.two_d().clone();
+            let three_d_before = channel.three_d().clone();
+            let decoded = packet(0x0d64 / 4, argument);
+
+            assert!(matches!(
+                dispatch_maxwell_engine_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(3),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    defined_mask: 0x0f,
+                    ..
+                }) if source.argument() == argument
+            ));
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d(), &three_d_before);
+        }
+
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = incrementing_packet(0x0d64 / 4, &[15, 0]);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+                if source.method() == GpuMethodId(0x0d68)
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn active_visible_call_limits_block_only_draws_before_cache_effects() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let address_space = resource_address_space();
+        let capabilities = lowering_capabilities(BackendFeatures::empty());
+        let cache = MaxwellThreeDLoweringCache::default();
+
+        for (argument, expected) in [
+            (0, MaxwellThreeDVisibleCallLimit::Calls0),
+            (8, MaxwellThreeDVisibleCallLimit::Calls128),
+        ] {
+            program_three_d(&mut channel, 0x0d64, argument);
+            let source = channel
+                .three_d()
+                .shader_execution()
+                .visible_call_limit()
+                .source()
+                .unwrap();
+            let resources =
+                resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+            let cache_before = cache.clone();
+
+            assert!(matches!(
+                preflight_maxwell_three_d_operation(
+                    channel.three_d(),
+                    &resources,
+                    MaxwellThreeDOperationTrigger::DrawVertexArray {
+                        source,
+                        vertex_count: 3,
+                    },
+                    None,
+                    FrontendSubmissionId::new(10),
+                    Vec::new(),
+                    &capabilities,
+                    &cache,
+                ),
+                Err(MaxwellThreeDLoweringError::UnsupportedVisibleCallLimitSemantics(limit))
+                    if limit == expected
+            ));
+            assert_eq!(cache, cache_before);
+        }
+
+        let clear = packet(0x19d0 / 4, 0x3c);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &clear.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let cache_before = cache.clone();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                triggered.state(),
+                &resources,
+                triggered.trigger(),
+                None,
+                FrontendSubmissionId::new(11),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::IncompleteClear(
+                "horizontal rectangle"
+            ))
+        ));
+        assert_eq!(cache, cache_before);
+    }
+
+    #[test]
+    fn visible_call_no_check_does_not_invent_a_draw_limit() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x0d64, 15);
+        let source = channel
+            .three_d()
+            .shader_execution()
+            .visible_call_limit()
+            .source()
+            .unwrap();
+        let resources =
+            resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space())
+                .unwrap();
+        let cache = MaxwellThreeDLoweringCache::default();
+        let cache_before = cache.clone();
+        let result = preflight_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3,
+            },
+            None,
+            FrontendSubmissionId::new(10),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::empty()),
+            &cache,
+        );
+
+        assert!(!matches!(
+            result,
+            Err(MaxwellThreeDLoweringError::UnsupportedVisibleCallLimitSemantics(_))
+        ));
+        assert_eq!(cache, cache_before);
+    }
+
+    #[test]
+    fn zcull_stats_enable_is_typed_source_preserving_isolated_three_d_state() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let coverage_before = channel.three_d().coverage().clone();
+        assert_eq!(
+            channel.three_d().zcull().stats_enable().origin(),
+            MaxwellThreeDRegisterOrigin::Unset
+        );
+
+        for (argument, expected) in [
+            (0, MaxwellThreeDZCullStatsEnable::Disabled),
+            (1, MaxwellThreeDZCullStatsEnable::Enabled),
+        ] {
+            let decoded = packet(0x151c / 4, argument);
+            let dispatch = dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0],
+            )
+            .unwrap();
+            let source = dispatch.methods()[0].method().source();
+            let register = channel.three_d().zcull().stats_enable();
+
+            assert_eq!(
+                dispatch.methods()[0].metadata().method_name(),
+                "SET_ZCULL_STATS"
+            );
+            assert_eq!(
+                dispatch.methods()[0].effect(),
+                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ZCull(
+                    MaxwellThreeDZCullStateWrite::StatsEnable {
+                        value: expected,
+                        source,
+                    }
+                ))
+            );
+            assert!(dispatch.operations().is_empty());
+            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+            assert_eq!(register.raw(), Some(argument));
+            assert_eq!(register.value().copied(), Some(expected));
+            assert_eq!(register.source(), Some(source));
+            assert_eq!(expected.raw(), argument);
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d().coverage(), &coverage_before);
+        }
+    }
+
+    #[test]
+    fn invalid_zcull_stats_values_and_packet_suffix_are_rejected_atomically() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x151c, 1);
+
+        for argument in [2, 3, 0x8000_0000, u32::MAX] {
+            let frontend_before = channel.frontend();
+            let two_d_before = channel.two_d().clone();
+            let three_d_before = channel.three_d().clone();
+            let decoded = packet(0x151c / 4, argument);
+
+            assert!(matches!(
+                dispatch_maxwell_engine_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(3),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    defined_mask: 1,
+                    ..
+                }) if source.argument() == argument
+            ));
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d(), &three_d_before);
+        }
+
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = incrementing_packet(0x151c / 4, &[0, 0]);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+                if source.method() == GpuMethodId(0x1520)
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn enabled_zcull_stats_block_only_draws_before_cache_effects() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let address_space = resource_address_space();
+        let capabilities = lowering_capabilities(BackendFeatures::empty());
+        let cache = MaxwellThreeDLoweringCache::default();
+
+        program_three_d(&mut channel, 0x151c, 1);
+        let source = channel.three_d().zcull().stats_enable().source().unwrap();
+        let resources =
+            resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+        let cache_before = cache.clone();
+        let error = match preflight_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3,
+            },
+            None,
+            FrontendSubmissionId::new(10),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        ) {
+            Ok(_) => panic!("enabled Z-cull statistics unexpectedly allowed a draw"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            MaxwellThreeDLoweringError::UnsupportedZCullStatsSemantics
+        ));
+        assert_eq!(
+            error.to_string(),
+            "MAXWELL_B enabled Z-cull statistics have no implemented counter accumulation, visibility, or reporting semantics"
+        );
+        assert_eq!(cache, cache_before);
+
+        let clear = packet(0x19d0 / 4, 0x3c);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &clear.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                triggered.state(),
+                &resources,
+                triggered.trigger(),
+                None,
+                FrontendSubmissionId::new(11),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::IncompleteClear(
+                "horizontal rectangle"
+            ))
+        ));
+        assert_eq!(cache, cache_before);
+
+        program_three_d(&mut channel, 0x151c, 0);
+        let source = channel.three_d().zcull().stats_enable().source().unwrap();
+        let resources =
+            resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+        let result = preflight_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: 3,
+            },
+            None,
+            FrontendSubmissionId::new(12),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        );
+        assert!(!matches!(
+            result,
+            Err(MaxwellThreeDLoweringError::UnsupportedZCullStatsSemantics)
+        ));
+        assert_eq!(cache, cache_before);
+    }
+
+    #[test]
     fn sm_timeout_counter_bit_is_bounded_source_preserving_state() {
         let mut channel = channel();
         bind_three_d(&mut channel);
@@ -2012,6 +2432,719 @@ mod tests {
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn vertex_array_restart_is_typed_source_preserving_and_isolated_from_indexed_restart() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let two_d_before = channel.two_d().clone();
+        assert_eq!(
+            channel
+                .three_d()
+                .vertex_input()
+                .primitive()
+                .vertex_array_restart_enabled()
+                .origin(),
+            MaxwellThreeDRegisterOrigin::Unset
+        );
+
+        program_three_d(&mut channel, 0x1644, 1);
+        program_three_d(&mut channel, 0x1648, 0xfeed_beef);
+        let indexed_enable_before = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .restart_enabled()
+            .to_owned();
+        let indexed_index_before = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .restart_index()
+            .to_owned();
+
+        for (argument, expected) in [
+            (0, MaxwellThreeDVertexArrayPrimitiveRestartEnable::Disabled),
+            (1, MaxwellThreeDVertexArrayPrimitiveRestartEnable::Enabled),
+        ] {
+            let decoded = packet(0x0de8 / 4, argument);
+            let dispatch = dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0],
+            )
+            .unwrap();
+            let source = dispatch.methods()[0].method().source();
+            let primitive = channel.three_d().vertex_input().primitive();
+            let register = primitive.vertex_array_restart_enabled();
+
+            assert_eq!(
+                dispatch.methods()[0].metadata().method_name(),
+                "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY"
+            );
+            assert_eq!(
+                dispatch.methods()[0].effect(),
+                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
+                    MaxwellThreeDVertexInputWrite::VertexArrayPrimitiveRestartEnable {
+                        value: expected,
+                        source,
+                    }
+                ))
+            );
+            assert!(dispatch.operations().is_empty());
+            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+            assert_eq!(register.raw(), Some(argument));
+            assert_eq!(register.value().copied(), Some(expected));
+            assert_eq!(register.source(), Some(source));
+            assert_eq!(expected.raw(), argument);
+            assert_eq!(primitive.restart_enabled(), &indexed_enable_before);
+            assert_eq!(primitive.restart_index(), &indexed_index_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+        }
+
+        let vertex_array_before = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .vertex_array_restart_enabled()
+            .to_owned();
+        program_three_d(&mut channel, 0x1644, 0);
+        program_three_d(&mut channel, 0x1648, 7);
+        assert_eq!(
+            channel
+                .three_d()
+                .vertex_input()
+                .primitive()
+                .vertex_array_restart_enabled(),
+            &vertex_array_before
+        );
+    }
+
+    #[test]
+    fn invalid_vertex_array_restart_values_and_packet_suffix_are_atomic() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x0de8, 0);
+
+        for argument in [2, 3, 0x8000_0000, u32::MAX] {
+            let frontend_before = channel.frontend();
+            let two_d_before = channel.two_d().clone();
+            let three_d_before = channel.three_d().clone();
+            let decoded = packet(0x0de8 / 4, argument);
+
+            assert!(matches!(
+                dispatch_maxwell_engine_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(3),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY",
+                    ..
+                }) if source.argument() == argument
+            ));
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d(), &three_d_before);
+        }
+
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = incrementing_packet(0x0de8 / 4, &[1, 0]);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+                if source.method() == GpuMethodId(0x0dec)
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn shade_mode_is_typed_source_preserving_and_part_of_pipeline_identity() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x12cc, 0);
+        let depth_test_before = channel
+            .three_d()
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::DepthTestEnable)
+            .to_owned();
+        let two_d_before = channel.two_d().clone();
+        let unset_dependencies = channel.three_d().pipeline_dependencies(&[]);
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
+                .origin(),
+            MaxwellThreeDRegisterOrigin::Unset
+        );
+
+        let mut previous_dependencies = unset_dependencies;
+        for (argument, expected) in [
+            (0x1d00, MaxwellThreeDShadeMode::Flat),
+            (0x1d01, MaxwellThreeDShadeMode::Smooth),
+        ] {
+            let decoded = packet(0x12d4 / 4, argument);
+            let dispatch = dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0],
+            )
+            .unwrap();
+            let source = dispatch.methods()[0].method().source();
+            let register = channel
+                .three_d()
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ShadeMode);
+
+            assert_eq!(
+                dispatch.methods()[0].metadata().method_name(),
+                "SET_SHADE_MODE"
+            );
+            assert_eq!(
+                dispatch.methods()[0].effect(),
+                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
+                    MaxwellThreeDFixedFunctionWrite::Register {
+                        register: MaxwellThreeDFixedFunctionRegister::ShadeMode,
+                        value: MaxwellThreeDFixedFunctionValue::ShadeMode(expected),
+                        source,
+                    }
+                ))
+            );
+            assert!(dispatch.operations().is_empty());
+            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+            assert_eq!(register.raw(), Some(argument));
+            assert_eq!(
+                register.value().copied(),
+                Some(MaxwellThreeDFixedFunctionValue::ShadeMode(expected))
+            );
+            assert_eq!(register.source(), Some(source));
+            assert_eq!(expected.raw(), argument);
+            assert_eq!(
+                channel
+                    .three_d()
+                    .fixed_function()
+                    .register(MaxwellThreeDFixedFunctionRegister::DepthTestEnable),
+                &depth_test_before
+            );
+            assert_eq!(channel.two_d(), &two_d_before);
+
+            let dependencies = channel.three_d().pipeline_dependencies(&[]);
+            assert_ne!(dependencies, previous_dependencies);
+            previous_dependencies = dependencies;
+        }
+    }
+
+    #[test]
+    fn invalid_shade_modes_and_packet_suffix_are_atomic() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x12d4, 0x1d00);
+
+        for argument in [0, 1, 0x1cff, 0x1d02, 0x8000_0000, u32::MAX] {
+            let frontend_before = channel.frontend();
+            let two_d_before = channel.two_d().clone();
+            let three_d_before = channel.three_d().clone();
+            let decoded = packet(0x12d4 / 4, argument);
+            assert!(matches!(
+                dispatch_maxwell_engine_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(3),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_SHADE_MODE",
+                    ..
+                }) if source.argument() == argument
+            ));
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d(), &three_d_before);
+        }
+
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = incrementing_packet(0x12d4 / 4, &[0x1d01, 0]);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+                if source.method() == GpuMethodId(0x12d8)
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn shade_mode_is_consumed_only_by_draws_before_cache_or_backend_effects() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        let address_space = resource_address_space();
+        let capabilities = lowering_capabilities(BackendFeatures::empty());
+        let cache = MaxwellThreeDLoweringCache::default();
+
+        for (argument, expected) in [
+            (0x1d00, MaxwellThreeDShadeMode::Flat),
+            (0x1d01, MaxwellThreeDShadeMode::Smooth),
+        ] {
+            program_three_d(&mut channel, 0x12d4, argument);
+            let source = channel
+                .three_d()
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
+                .source()
+                .unwrap();
+            let resources =
+                resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+            let cache_before = cache.clone();
+            assert!(matches!(
+                preflight_maxwell_three_d_operation(
+                    channel.three_d(),
+                    &resources,
+                    MaxwellThreeDOperationTrigger::DrawVertexArray {
+                        source,
+                        vertex_count: 3,
+                    },
+                    None,
+                    FrontendSubmissionId::new(10),
+                    Vec::new(),
+                    &capabilities,
+                    &cache,
+                ),
+                Err(MaxwellThreeDLoweringError::UnsupportedShadeModeSemantics(mode))
+                    if mode == expected
+            ));
+            assert_eq!(cache, cache_before);
+        }
+
+        let clear = packet(0x19d0 / 4, 0x3c);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &clear.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let cache_before = cache.clone();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                triggered.state(),
+                &resources,
+                triggered.trigger(),
+                None,
+                FrontendSubmissionId::new(11),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::IncompleteClear(
+                "horizontal rectangle"
+            ))
+        ));
+        assert_eq!(cache, cache_before);
+    }
+
+    #[test]
+    fn common_blend_enable_is_typed_source_preserving_and_family_isolated() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x12e4, 1);
+        program_three_d(&mut channel, 0x1360, 1);
+        program_three_d(&mut channel, 0x1e00, 0);
+        let per_target_mode_before = channel
+            .three_d()
+            .fixed_function()
+            .register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable)
+            .to_owned();
+        let per_target_enable_before = *channel.three_d().fixed_function().blend_enable();
+        let per_target_state_before = *channel.three_d().fixed_function().per_target_blend();
+        let two_d_before = channel.two_d().clone();
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .blend_enable_common()
+                .origin(),
+            MaxwellThreeDRegisterOrigin::Unset
+        );
+
+        for (argument, expected) in [
+            (0, MaxwellThreeDBlendEnableCommon::Disabled),
+            (1, MaxwellThreeDBlendEnableCommon::Enabled),
+        ] {
+            let decoded = packet(0x135c / 4, argument);
+            let dispatch = dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0],
+            )
+            .unwrap();
+            let source = dispatch.methods()[0].method().source();
+            let fixed = channel.three_d().fixed_function();
+            let register = fixed.blend_enable_common();
+
+            assert_eq!(
+                dispatch.methods()[0].metadata().method_name(),
+                "SET_BLEND_ENABLE_COMMON"
+            );
+            assert_eq!(
+                dispatch.methods()[0].effect(),
+                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
+                    MaxwellThreeDFixedFunctionWrite::BlendEnableCommon {
+                        value: expected,
+                        source,
+                    }
+                ))
+            );
+            assert!(dispatch.operations().is_empty());
+            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+            assert_eq!(register.raw(), Some(argument));
+            assert_eq!(register.value().copied(), Some(expected));
+            assert_eq!(register.source(), Some(source));
+            assert_eq!(expected.raw(), argument);
+            assert_eq!(
+                fixed.register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable),
+                &per_target_mode_before
+            );
+            assert_eq!(fixed.blend_enable(), &per_target_enable_before);
+            assert_eq!(fixed.per_target_blend(), &per_target_state_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+        }
+
+        let common_before = channel
+            .three_d()
+            .fixed_function()
+            .blend_enable_common()
+            .to_owned();
+        program_three_d(&mut channel, 0x12e4, 0);
+        program_three_d(&mut channel, 0x1360, 0);
+        program_three_d(&mut channel, 0x1e00, 1);
+        assert_eq!(
+            channel.three_d().fixed_function().blend_enable_common(),
+            &common_before
+        );
+    }
+
+    #[test]
+    fn invalid_common_blend_enable_values_and_packet_suffix_are_atomic() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x135c, 0);
+
+        for argument in [2, 3, 0x8000_0000, u32::MAX] {
+            let frontend_before = channel.frontend();
+            let two_d_before = channel.two_d().clone();
+            let three_d_before = channel.three_d().clone();
+            let decoded = packet(0x135c / 4, argument);
+            assert!(matches!(
+                dispatch_maxwell_engine_packet(
+                    &mut channel,
+                    FrontendSubmissionId::new(3),
+                    &decoded.packets()[0]
+                ),
+                Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_BLEND_ENABLE_COMMON",
+                    ..
+                }) if source.argument() == argument
+            ));
+            assert_eq!(channel.frontend(), frontend_before);
+            assert_eq!(channel.two_d(), &two_d_before);
+            assert_eq!(channel.three_d(), &three_d_before);
+        }
+
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = incrementing_packet(0x135c / 4, &[1, 2]);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_BLEND",
+                ..
+            }) if source.method() == GpuMethodId(0x1360)
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    #[test]
+    fn draw_resolves_common_and_per_target_blend_state_before_effects() {
+        let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let mut address_space = resource_address_space();
+        let target = map_resource(
+            &mut address_space,
+            target_allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            73,
+            0xfe,
+        )
+        .offset()
+        .get();
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_color_target(&mut channel, 0, target, 0xd5);
+        program_three_d(&mut channel, 0x15d0, 0);
+        program_three_d(&mut channel, 0x121c, 1);
+        let cache = MaxwellThreeDLoweringCache::default();
+        let capabilities = lowering_capabilities(BackendFeatures::empty());
+        let source = channel
+            .three_d()
+            .render_targets()
+            .color_target_selection()
+            .source()
+            .unwrap();
+
+        let preflight = |channel: &MaxwellGpuChannel| {
+            let resources =
+                resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
+            preflight_maxwell_three_d_operation(
+                channel.three_d(),
+                &resources,
+                MaxwellThreeDOperationTrigger::DrawVertexArray {
+                    source,
+                    vertex_count: 3,
+                },
+                None,
+                FrontendSubmissionId::new(10),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            )
+        };
+
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_STATE_PER_TARGET"
+            })
+        ));
+        program_three_d(&mut channel, 0x12e4, 0);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_ENABLE_COMMON"
+            })
+        ));
+        program_three_d(&mut channel, 0x135c, 0);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        ));
+
+        program_three_d(&mut channel, 0x135c, 1);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_SEPARATE_FOR_ALPHA"
+            })
+        ));
+        for (method, argument) in [(0x133c, 1), (0x1340, 1), (0x1344, 1), (0x1348, 1)] {
+            program_three_d(&mut channel, method, argument);
+        }
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: None,
+                field: "SET_BLEND_OP_ALPHA"
+            })
+        ));
+        for (method, argument) in [(0x134c, 1), (0x1350, 1), (0x1358, 1)] {
+            program_three_d(&mut channel, method, argument);
+        }
+        let cache_before = cache.clone();
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: None })
+        ));
+        assert_eq!(cache, cache_before);
+
+        program_three_d(&mut channel, 0x12e4, 1);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: Some(0),
+                field: "SET_BLEND(i)"
+            })
+        ));
+        program_three_d(&mut channel, 0x1360, 0);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        ));
+        program_three_d(&mut channel, 0x1360, 1);
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: Some(0),
+                field: "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA"
+            })
+        ));
+        for (method, argument) in [(0x1e00, 1), (0x1e04, 1), (0x1e08, 1), (0x1e0c, 1)] {
+            program_three_d(&mut channel, method, argument);
+        }
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::IncompleteBlendState {
+                target: Some(0),
+                field: "SET_BLEND_PER_TARGET_OP_ALPHA"
+            })
+        ));
+        for (method, argument) in [(0x1e10, 1), (0x1e14, 1), (0x1e18, 1)] {
+            program_three_d(&mut channel, method, argument);
+        }
+        assert!(matches!(
+            preflight(&channel),
+            Err(MaxwellThreeDLoweringError::UnsupportedBlendSemantics { target: Some(0) })
+        ));
+        assert_eq!(cache, cache_before);
+
+        let clear = packet(0x19d0 / 4, 0x3c);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &clear.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                triggered.state(),
+                &resources,
+                triggered.trigger(),
+                None,
+                FrontendSubmissionId::new(11),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::IncompleteClear(
+                "horizontal rectangle"
+            ))
+        ));
+        assert_eq!(cache, cache_before);
+    }
+
+    #[test]
+    fn vertex_array_restart_is_consumed_only_by_non_indexed_draws() {
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_three_d(&mut channel, 0x121c, 0);
+        let cache = MaxwellThreeDLoweringCache::default();
+        let capabilities = lowering_capabilities(BackendFeatures::empty());
+
+        program_three_d(&mut channel, 0x0de8, 0);
+        let source = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .vertex_array_restart_enabled()
+            .source()
+            .unwrap();
+        let resources =
+            resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space())
+                .unwrap();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                channel.three_d(),
+                &resources,
+                MaxwellThreeDOperationTrigger::DrawVertexArray {
+                    source,
+                    vertex_count: 3,
+                },
+                None,
+                FrontendSubmissionId::new(10),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
+        ));
+
+        program_three_d(&mut channel, 0x0de8, 1);
+        let source = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .vertex_array_restart_enabled()
+            .source()
+            .unwrap();
+        let cache_before = cache.clone();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                channel.three_d(),
+                &resources,
+                MaxwellThreeDOperationTrigger::DrawVertexArray {
+                    source,
+                    vertex_count: 3,
+                },
+                None,
+                FrontendSubmissionId::new(11),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::UnsupportedVertexArrayPrimitiveRestartSemantics)
+        ));
+        assert_eq!(cache, cache_before);
+
+        let clear = packet(0x19d0 / 4, 0x3c);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &clear.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let clear_resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &resource_address_space())
+                .unwrap();
+        assert!(matches!(
+            preflight_maxwell_three_d_operation(
+                triggered.state(),
+                &clear_resources,
+                triggered.trigger(),
+                None,
+                FrontendSubmissionId::new(12),
+                Vec::new(),
+                &capabilities,
+                &cache,
+            ),
+            Err(MaxwellThreeDLoweringError::IncompleteClear(
+                "horizontal rectangle"
+            ))
+        ));
+        assert_eq!(cache, cache_before);
     }
 
     #[test]
@@ -2399,7 +3532,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_and_line_selectors_separate_pipeline_identity() {
+    fn coverage_line_and_vertex_array_restart_selectors_separate_pipeline_identity() {
         let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
         let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
         let mut address_space = resource_address_space();
@@ -2521,6 +3654,201 @@ mod tests {
         )));
         plan.commit_cache(&mut cache).unwrap();
         assert_eq!(cache.pipeline_count(), pipeline_count + 1);
+
+        let pipeline_count = cache.pipeline_count();
+        program_three_d(&mut channel, 0x0de8, 0);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &draw.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let plan = preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(23),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        )
+        .unwrap();
+        assert!(plan.resource_creations().iter().any(|creation| matches!(
+            creation,
+            nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
+        )));
+        assert!(!plan.resource_creations().iter().any(|creation| matches!(
+            creation,
+            nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
+        )));
+        plan.commit_cache(&mut cache).unwrap();
+        assert_eq!(cache.pipeline_count(), pipeline_count + 1);
+    }
+
+    #[test]
+    fn disabled_blend_pipeline_identity_tracks_only_effective_active_selectors() {
+        let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+        let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+        let mut address_space = resource_address_space();
+        let vertex = map_resource(
+            &mut address_space,
+            vertex_allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            74,
+            0,
+        )
+        .offset()
+        .get();
+        let target = map_resource(
+            &mut address_space,
+            target_allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+            75,
+            0xfe,
+        )
+        .offset()
+        .get();
+        let mut channel = channel();
+        bind_three_d(&mut channel);
+        program_basic_draw_state(&mut channel, vertex);
+        program_color_target(&mut channel, 0, target, 0xd5);
+        program_three_d(&mut channel, 0x121c, 1);
+        let shaders = translated_graphics_shaders();
+        let capabilities =
+            lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
+        let mut cache = MaxwellThreeDLoweringCache::default();
+        let draw = packet(0x0d78 / 4, 3);
+
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &draw.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(30),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        )
+        .unwrap()
+        .commit_cache(&mut cache)
+        .unwrap();
+        let pipeline_count = cache.pipeline_count();
+
+        // Per-target state and common equations are inactive while common
+        // blending is selected and explicitly disabled.
+        for (method, argument) in [
+            (0x1364, 1),
+            (0x1e20, 1),
+            (0x133c, 1),
+            (0x1340, 1),
+            (0x1344, 1),
+            (0x1348, 1),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &draw.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let plan = preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(31),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        )
+        .unwrap();
+        assert!(!plan.resource_creations().iter().any(|creation| matches!(
+            creation,
+            nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
+        )));
+        plan.commit_cache(&mut cache).unwrap();
+        assert_eq!(cache.pipeline_count(), pipeline_count);
+
+        // Selecting per-target state and explicitly disabling the active
+        // target changes the effective pipeline state.
+        program_three_d(&mut channel, 0x12e4, 1);
+        program_three_d(&mut channel, 0x1360, 0);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &draw.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let plan = preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(32),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        )
+        .unwrap();
+        assert!(plan.resource_creations().iter().any(|creation| matches!(
+            creation,
+            nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
+        )));
+        plan.commit_cache(&mut cache).unwrap();
+        assert_eq!(cache.pipeline_count(), pipeline_count + 1);
+        let pipeline_count = cache.pipeline_count();
+
+        // Common and unselected target selectors are now inactive.
+        program_three_d(&mut channel, 0x135c, 1);
+        program_three_d(&mut channel, 0x1364, 0);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &draw.packets()[0],
+        )
+        .unwrap();
+        let triggered = &dispatch.operations()[0];
+        let resources =
+            resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+        let plan = preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(33),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        )
+        .unwrap();
+        assert!(!plan.resource_creations().iter().any(|creation| matches!(
+            creation,
+            nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
+        )));
+        plan.commit_cache(&mut cache).unwrap();
+        assert_eq!(cache.pipeline_count(), pipeline_count);
     }
 
     #[test]
@@ -2800,6 +4128,8 @@ mod tests {
             (0x15d0, 0),
             (0x19e0, 1),
             (0x121c, 1),
+            (0x12e4, 0),
+            (0x135c, 0),
         ] {
             program_three_d(&mut channel, method, argument);
         }
@@ -3838,6 +5168,8 @@ mod tests {
             (0x0d74, 0),
             (0x1618, 4),
             (0x1970, 4),
+            (0x12e4, 0),
+            (0x135c, 0),
             (0x2000, 0x11),
             (0x2010, 0),
             (0x2040, 0x51),
@@ -4309,7 +5641,7 @@ mod tests {
     fn invalid_method_suffix_discards_candidate_state() {
         let mut channel = channel();
         bind_three_d(&mut channel);
-        let decoded = incrementing_packet(0x1518 / 4, &[0x3f80_0000, 0]);
+        let decoded = incrementing_packet(0x1518 / 4, &[0x3f80_0000, 0, 0]);
         let frontend_before = channel.frontend();
         let three_d_before = channel.three_d().clone();
 
@@ -4320,7 +5652,7 @@ mod tests {
                 &decoded.packets()[0]
             ),
             Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-                if source.method() == GpuMethodId(0x151c)
+                if source.method() == GpuMethodId(0x1520)
         ));
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.three_d(), &three_d_before);
