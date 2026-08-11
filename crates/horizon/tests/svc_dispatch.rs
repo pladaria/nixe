@@ -2,6 +2,7 @@
 mod support;
 
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nixe_cpu::address::AddressSpaceId;
@@ -26,6 +27,11 @@ use nixe_runtime::{
     SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject,
     WritableEventObject,
 };
+
+fn reference_process_builder() -> ProcessBuilder {
+    ProcessBuilder::default()
+        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+}
 
 fn request_owner(thread_id: u64) -> SessionRequestOwner {
     SessionRequestOwner {
@@ -117,7 +123,7 @@ fn fixture_process_with_config(
     let path = directory.path().join("svc.nro");
     fs::write(&path, synthetic_nro(instructions)).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new()
+    let mut process = reference_process_builder()
         .with_config(config)
         .build(&plan)
         .expect("synthetic NRO builds");
@@ -135,7 +141,7 @@ fn fixture_process_with_romfs(
     let romfs = support::synthetic_packages::build_romfs(files);
     fs::write(&path, synthetic_nro_with_romfs(instructions, &romfs)).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new()
+    let mut process = reference_process_builder()
         .build(&plan)
         .expect("synthetic asset NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
@@ -171,7 +177,7 @@ fn fixture_process_for_state(
     let path = directory.path().join("svc-state.nro");
     fs::write(&path, image).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new()
+    let mut process = reference_process_builder()
         .build(&plan)
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + entry_offset as u64;

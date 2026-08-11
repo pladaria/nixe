@@ -1,0 +1,157 @@
+use core::sync::atomic::{Ordering, fence};
+
+use nixe_cpu::{
+    decode::{
+        DecodedOpcode,
+        a64::system::{Instruction, Operands},
+    },
+    location::{DecodedInstruction, LocationDescriptor},
+    profile::{CapabilityStatus, InstructionFeature},
+    state::a64::{A64State, Nzcv},
+};
+
+use super::{advance, read, resume, write};
+use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
+
+pub(super) fn execute(
+    context: InterpreterContext<'_>,
+    state: &mut A64State,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    instruction: Instruction,
+) -> Result<InterpreterOutcome, InterpreterError> {
+    let fields = instruction.operands();
+    let outcome = match instruction {
+        Instruction::Hint(_) => execute_hint(context, state, decoded.location, fields),
+        Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
+        Instruction::WriteRegister(_) => execute_msr(state, fields),
+        Instruction::Barrier(_) => execute_barrier(fields),
+        Instruction::System(_) => execute_system(fields),
+    };
+    if !outcome {
+        return Err(super::super::unsupported(decoded));
+    }
+    advance(state);
+    Ok(resume(state, decoded))
+}
+
+fn execute_hint(
+    context: InterpreterContext<'_>,
+    _state: &mut A64State,
+    _source: LocationDescriptor,
+    fields: Operands,
+) -> bool {
+    match fields.hint {
+        0 => true,
+        // YIELD/WFE/WFI/SEV/SEVL require scheduler/event callbacks. Treating
+        // them as no-ops would make this reference engine an invalid oracle.
+        1..=5 => false,
+        // BTI is encoded in the HINT space. On a profile where FEAT_BTI is
+        // absent these encodings retain their architectural hint behavior;
+        // enabled or unknown profiles require the future branch-type state.
+        32 | 34 | 36 | 38 => matches!(
+            context
+                .process()
+                .profile()
+                .instruction_feature_status(InstructionFeature::BranchTargetIdentification),
+            CapabilityStatus::Disabled
+        ),
+        _ => false,
+    }
+}
+
+fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> bool {
+    let value = match fields.system_key {
+        0xd53b_4200 => u64::from(state.nzcv().bits()),
+        0xd53b_4400 => u64::from(state.fpcr()),
+        0xd53b_4420 => u64::from(state.fpsr()),
+        // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
+        // Switch 1's Cortex-A57 exposes 64-byte instruction and data lines,
+        // hence log2(64 / 4) = 4 in both fields. Register definition:
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
+        0xd53b_0020 => (4_u64 << 16) | 4,
+        0xd53b_d040 => state.tpidr_el0(),
+        0xd53b_d060 => state.tpidrro_el0(),
+        // CNTFRQ_EL0 and CNTVCT_EL0 are runtime-owned architectural timer
+        // observations. Encoding and access semantics:
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTFRQ-EL0--Counter-timer-Frequency-register
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTVCT-EL0--Counter-timer-Virtual-Count-register
+        0xd53b_e000 => {
+            let Some(timer) = context.architectural_timer() else {
+                return false;
+            };
+            timer.frequency
+        }
+        0xd53b_e020 => {
+            let Some(timer) = context.architectural_timer() else {
+                return false;
+            };
+            timer.counter
+        }
+        0xd53b_00e0 => {
+            let profile = context.process().profile().cache_maintenance();
+            let nixe_cpu::profile::ProfileValue::Known(bytes) = profile.data_zero_block_bytes
+            else {
+                return false;
+            };
+            if bytes < 4 || !bytes.is_power_of_two() {
+                return false;
+            }
+            let block_size = bytes.trailing_zeros() - 2;
+            let prohibited = match profile.user_cache_maintenance {
+                CapabilityStatus::Enabled => 0,
+                CapabilityStatus::Disabled => 1 << 4,
+                CapabilityStatus::Unknown => return false,
+            };
+            u64::from(prohibited | block_size)
+        }
+        _ => return false,
+    };
+    write(state, fields.rt, 64, false, value);
+    true
+}
+
+fn execute_msr(state: &mut A64State, fields: Operands) -> bool {
+    let value = read(state, fields.rt, 64, false);
+    match fields.system_key {
+        0xd51b_4200 => state.set_nzcv(Nzcv::from_bits(value as u32)),
+        0xd51b_4400 => state.set_fpcr(value as u32),
+        0xd51b_4420 => state.set_fpsr(value as u32),
+        0xd51b_d040 => state.set_tpidr_el0(value),
+        // TPIDRRO_EL0 is runtime-owned and architecturally read-only here.
+        0xd51b_d060 => return false,
+        _ => return false,
+    }
+    true
+}
+
+fn execute_barrier(fields: Operands) -> bool {
+    match fields.barrier_opcode {
+        4 | 5 if valid_barrier_option(fields.barrier_option) => {
+            // This supplies the local reference engine's host ordering. The
+            // guest multicore scheduler/memory-model contract remains Phase 4.
+            fence(Ordering::SeqCst);
+            true
+        }
+        6 if fields.barrier_option == 15 => true,
+        _ => false,
+    }
+}
+
+fn execute_system(fields: Operands) -> bool {
+    // The reference memory interface is coherent and has no separate guest
+    // cache state. Architecturally valid maintenance operations therefore
+    // complete without changing memory, while unknown SYS encodings remain
+    // explicit unsupported semantics.
+    matches!(
+        fields.system_key,
+        0xd508_7500 // IC IALLU
+            | 0xd50b_7520 // IC IVAU
+            | 0xd508_7620 // DC IVAC
+            | 0xd50b_7b20 // DC CVAU
+            | 0xd50b_7e20 // DC CIVAC
+    )
+}
+
+fn valid_barrier_option(option: u8) -> bool {
+    option & 3 != 0 && option >> 2 <= 3
+}

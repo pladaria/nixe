@@ -1,9 +1,9 @@
 //! Declarative A32 decoder and typed normalization.
 
-pub(crate) mod control;
-pub(crate) mod fp_simd;
-pub(crate) mod integer;
-pub(crate) mod memory;
+pub mod control;
+pub mod fp_simd;
+pub mod integer;
+pub mod memory;
 
 use std::sync::OnceLock;
 

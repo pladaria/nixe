@@ -1,8 +1,8 @@
 //! Declarative T32 decoder and typed normalization.
 
-pub(crate) mod control;
-pub(crate) mod integer;
-pub(crate) mod memory;
+pub mod control;
+pub mod integer;
+pub mod memory;
 
 use super::{
     DecodeResult, DecodedOpcode,

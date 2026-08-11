@@ -32,6 +32,8 @@ pub struct NixeConfig {
     pub system: SystemConfig,
     /// Cross-cutting diagnostic preferences consumed by application runtimes.
     pub diagnostics: DiagnosticsConfig,
+    /// CPU execution-engine selection policy.
+    pub cpu: CpuConfig,
     /// Host gamepad identification and emulated-controller mappings.
     pub input: InputConfig,
     source_path: PathBuf,
@@ -94,6 +96,9 @@ impl NixeConfig {
                 log_level: raw.diagnostics.log_level,
                 report_detail: raw.diagnostics.report_detail,
                 instruction_trace: raw.diagnostics.instruction_trace,
+            },
+            cpu: CpuConfig {
+                engine: raw.cpu.engine,
             },
             input: raw.input,
             source_path,
@@ -227,6 +232,19 @@ pub struct DiagnosticsConfig {
     pub instruction_trace: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuConfig {
+    pub engine: CpuEngineSelection,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CpuEngineSelection {
+    #[default]
+    Auto,
+    Interpreter,
+}
+
 /// Named mappings from host gamepads to the emulated controller.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -342,7 +360,16 @@ struct RawConfig {
     #[serde(default)]
     diagnostics: RawDiagnosticsConfig,
     #[serde(default)]
+    cpu: RawCpuConfig,
+    #[serde(default)]
     input: InputConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpuConfig {
+    #[serde(default)]
+    engine: CpuEngineSelection,
 }
 
 #[derive(Deserialize)]
@@ -695,6 +722,61 @@ mod tests {
         );
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Trace);
         assert!(config.diagnostics.instruction_trace);
+    }
+
+    #[test]
+    fn cpu_engine_selection_defaults_to_auto_and_accepts_interpreter() {
+        let default_file = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+            "#,
+        );
+        assert_eq!(
+            NixeConfig::load(&default_file.path).unwrap().cpu.engine,
+            CpuEngineSelection::Auto
+        );
+
+        let explicit_file = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [cpu]
+                engine = "interpreter"
+            "#,
+        );
+        assert_eq!(
+            NixeConfig::load(&explicit_file.path).unwrap().cpu.engine,
+            CpuEngineSelection::Interpreter
+        );
+
+        let invalid_file = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [cpu]
+                engine = "jit"
+            "#,
+        );
+        assert!(matches!(
+            NixeConfig::load(&invalid_file.path),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

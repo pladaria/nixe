@@ -178,14 +178,7 @@ fn translate_block_internal(
                         crate::decode::disassemble(&decoded.instruction).to_string(),
                     );
                 }
-                if crate::interpreter::has_semantics(&decoded) {
-                    LiftOutcome::Terminate(interpret_terminator(&decoded))
-                } else {
-                    LiftOutcome::Terminate(unsupported_terminator(
-                        &decoded,
-                        "neither the lifter nor interpreter implements this instruction",
-                    ))
-                }
+                LiftOutcome::Terminate(interpret_terminator(&decoded))
             }
             DecodeResult::Unallocated { reason, .. } => {
                 if capture_disassembly {
@@ -259,22 +252,10 @@ fn translate_block_internal(
                 break (terminator, reason);
             }
             LiftOutcome::Interpret(coverage_id) => {
-                let decoded = match crate::decode::decode(profile, location, encoding) {
-                    DecodeResult::Decoded(decoded)
-                    | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
-                    _ => unreachable!("lifter outcome requires a decoded instruction"),
-                };
-                let terminator = if crate::interpreter::has_semantics(&decoded) {
-                    Terminator::InterpretOne {
-                        source: location,
-                        encoding,
-                        coverage_id: coverage_id.get(),
-                    }
-                } else {
-                    unsupported_terminator(
-                        &decoded,
-                        "lifter requested fallback but interpreter semantics are unavailable",
-                    )
+                let terminator = Terminator::InterpretOne {
+                    source: location,
+                    encoding,
+                    coverage_id: coverage_id.get(),
                 };
                 let reason = end_reason_for_terminator(&terminator);
                 break (terminator, reason);
@@ -395,21 +376,6 @@ fn interpret_terminator(decoded: &DecodedInstruction<DecodedOpcode>) -> Terminat
         source: decoded.location,
         encoding: decoded.encoding,
         coverage_id: decoded.instruction.coverage_id().get(),
-    }
-}
-
-fn unsupported_terminator(
-    decoded: &DecodedInstruction<DecodedOpcode>,
-    reason: impl Into<Box<str>>,
-) -> Terminator {
-    Terminator::UnsupportedInstruction {
-        source: decoded.location,
-        encoding: decoded.encoding,
-        coverage_id: decoded.instruction.coverage_id().get(),
-        disassembly: crate::decode::disassemble(&decoded.instruction)
-            .to_string()
-            .into(),
-        reason: reason.into(),
     }
 }
 
@@ -995,20 +961,20 @@ mod tests {
             assert_eq!(block.metadata.guest_instruction_count, 1);
         }
 
-        let mut unsupported = memory_with_pages(0x1000, 1);
-        put(&mut unsupported, 1, 0, &0xd503_20df_u32.to_le_bytes());
+        let mut fallback = memory_with_pages(0x1000, 1);
+        put(&mut fallback, 1, 0, &0xd503_20df_u32.to_le_bytes());
         let block = translate_block(
             BlockTranslationConfig::default(),
             &profile,
             SPACE,
             start(profile, 0x1000, ExecutionState::A64),
-            &unsupported,
+            &fallback,
         )
         .unwrap();
-        assert_eq!(terminator_family(&block.terminator), "unsupported");
+        assert_eq!(terminator_family(&block.terminator), "interpret-one");
         assert_eq!(
             block.metadata.end_reason,
-            BlockEndReason::UnsupportedInstruction
+            BlockEndReason::InterpreterFallback
         );
         assert_eq!(block.metadata.guest_instruction_count, 1);
 
@@ -1216,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn exceptions_unsupported_and_interpreter_fallbacks_cut_immediately() {
+    fn exceptions_and_engine_neutral_fallbacks_cut_immediately() {
         let profile = GuestCpuProfile::switch_1();
         let mut unallocated = memory_with_pages(0x1000, 1);
         put(&mut unallocated, 1, 0, &0_u32.to_le_bytes());
@@ -1250,14 +1216,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             block.terminator,
-            Terminator::UnsupportedInstruction {
-                source,
-                encoding,
-                ref disassembly,
-                ..
-            } if source == start(profile, 0x2000, ExecutionState::A64)
-                && encoding == InstructionEncoding::from_u32(0xd503_20df)
-                && !disassembly.is_empty()
+            Terminator::InterpretOne { source, encoding, .. }
+                if source == start(profile, 0x2000, ExecutionState::A64)
+                    && encoding == InstructionEncoding::from_u32(0xd503_20df)
         ));
 
         let mut interpreter_only = memory_with_pages(0x3000, 1);

@@ -7,11 +7,13 @@ Applies to: Nintendo Switch and Nintendo Switch 2 research profiles
 
 ## 1. Purpose
 
-This document specifies the intended architecture of the Nixe CPU execution
-engine. It is a decision framework for implementation rather than a claim that
-all hardware details of either console are already known.
+This document specifies the intended architecture of Nixe CPU execution
+engines and their scheduler boundary. It is a decision framework for
+implementation rather than a claim that all hardware details of either console
+are already known.
 
-The recommended engine is a specialized dynamic binary translator (DBT):
+The recommended high-performance portable engine is a specialized dynamic
+binary translator (DBT):
 
 ```text
 A64 frontend ----+
@@ -27,6 +29,13 @@ conditions, and interworking semantics are made explicit before lowering.
 An interpreter using the same architectural definitions is required alongside
 the recompiler. It is the correctness oracle, debugging engine, and fallback for
 instructions which have not yet been lowered by the JIT.
+
+The interpreter, DBT, and any future native-code-execution (NCE) backend are
+implementations of one engine-neutral bounded run-slice protocol. NCE is an
+optional family of platform engines backed by a suitable virtualization
+facility, not direct execution of untrusted guest code in Nixe's host process.
+Availability is discovered and rejected with typed diagnostics when the host,
+guest profile, memory model, or requested execution policy is incompatible.
 
 The design prioritizes, in this order:
 
@@ -155,22 +164,19 @@ evidence establishes its guest-visible contract.
 ## 5. System architecture
 
 ```text
-                         Runtime / kernel HLE
+                      Runtime coordinator / scheduler
+                                  |       ^
+              leases + budget     |       | normalized exit
+                                  v       |
+                   +------------------------------+
+                   | execution domain             |
+                   |  `-- vCPU executor.run_slice |
+                   | interpreter / JIT / NCE      |
+                   +--------------+---------------+
                                   |
-                 syscall, exception, scheduling, events
+                           semantic memory access
                                   |
-        +-------------------------v-------------------------+
-        |                  CPU execution engine             |
-        |                                                   |
-        |  A64 frontend --+                                |
-        |  A32 frontend --+-> shared IR -> AMD64 backend   |
-        |  T32 frontend --+                    |            |
-        |                              code cache           |
-        +--------------------+-------------+----------------+
-                             |             |
-                       memory access   execution events
-                             |             |
-                  +----------v-------------v---------+
+                  +---------------v----------------+
                   |       Guest memory system        |
                   | VA, page tables, RAM, MMIO,      |
                   | permissions, dirty ownership     |
@@ -186,49 +192,41 @@ evidence establishes its guest-visible contract.
                              host graphics API
 ```
 
-The memory system is the shared boundary. The JIT does not know whether a guest
-physical page is represented by ordinary host RAM, a host-visible GPU
-allocation, a device-local mirror, a sparse allocation, or an MMIO handler.
-It receives a fast translation for ordinary RAM and exits to a slow path for
-everything else.
+The memory system is the shared semantic boundary. No engine owns a separate
+guest memory model or needs to know whether a guest physical page is represented
+by ordinary host RAM, a host-visible GPU allocation, a device-local mirror, a
+sparse allocation, or an MMIO handler. A JIT may receive a checked fast
+translation for ordinary RAM and exit to a slow path for everything else; an
+NCE engine must bind and reconcile its mappings through the same authority.
 
 ## 6. Component boundaries
 
-The logical crate layout should initially be:
+The target logical crate layout is:
 
 ```text
-crates/cpu/
-    state             A64 and AArch32 thread state
-    vcpu              non-architectural execution resources
-    profile           feature and platform profiles
-    decode            generated or table-driven A64/A32/T32 decoders
-    semantics         canonical instruction behavior
-    interpreter       reference executor
-    ir                IR values, operations, blocks, verifier
-    translate         A64/A32/T32-to-IR lifting
-
-crates/jit/
-    amd64             lowering and machine-code emission
-    regalloc          linear-scan register allocation
-    code_cache        allocation, lookup, links, invalidation
-    dispatch          entry, exit, and indirect-branch dispatch
-    executable_memory platform W^X implementation
-
-crates/memory/
-    address_space     guest VA mappings and permissions
-    fastmem           software TLB and optional fault fastmem
-    physical          RAM and device-backed pages
-    coherency         CPU/GPU ownership and dirty tracking
-
-crates/runtime/
-    process and thread construction
-    exception and syscall routing
-    scheduler integration
+nixe-cpu                    architectural state, profiles, decode, semantics,
+                            IR, and translation
+nixe-cpu-engine             engine identities, capabilities, bounded run-slice
+                            contract, normalized exits, and state commit
+nixe-cpu-engine-interpreter complete reference-interpreter engine, including
+                            semantic dispatch and executor-local state
+nixe-scheduler              console-neutral thread/vCPU state machine,
+                            topology, ready queues, waits, and decisions
+nixe-memory                 mappings, canonical physical identity, aliases,
+                            generations, invalidation, and visibility
+nixe-runtime                process/thread ownership, coordinator, workers,
+                            exception routing, and teardown
+nixe-horizon                versioned Horizon ABI and policy adapters
+future engine crates        JIT and platform NCE implementations
 ```
 
-These are logical ownership boundaries, not a requirement that every directory
-immediately become a separate crate. Circular dependencies are forbidden. In
-particular, `cpu` must not depend on `runtime` or a host graphics API.
+The first four neutral CPU boundaries above are separate workspace crates as of
+Phase A; dependency-boundary tests keep them acyclic. Circular dependencies are forbidden. In
+particular, CPU, engine-protocol, and scheduler code must not depend on Horizon,
+the runtime, a graphics API, or a platform NCE implementation. A concrete engine
+must not call Horizon directly. Product composition owns concrete providers;
+`nixe-runtime` accepts the neutral provider protocol and does not depend on the
+reference interpreter in production.
 
 ## 7. Process, thread, and vCPU state
 
@@ -240,12 +238,18 @@ separate:
   registers.
 - `ThreadCpuState` owns the canonical architectural register state of one guest
   thread. It has distinct A64 and AArch32 representations; CPSR.T selects A32 or
-  T32 within the AArch32 representation.
+  T32 within the AArch32 representation. Architectural state never belongs to
+  an engine.
 - `VcpuExecutionState` owns resources associated with a currently executing
   virtual CPU, such as its software TLB, dispatch budget, pending-event state,
   safepoint data, and local exclusive monitor. These resources are not part of
   a guest thread's register file or a persistent process state. The scheduler
   defines how local-monitor state is handled when a thread migrates.
+
+`VcpuExecutionState` is a scheduler/worker ownership concept, not a concrete
+type in `nixe-cpu`. Until the scheduler introduces the common container, each
+engine owns its executor-local representation; `nixe-cpu` exposes only portable
+exclusive-reservation values required by the memory contract.
 
 Conceptually:
 
@@ -303,11 +307,28 @@ tests and ABI requirements. Important rules are:
   state.
 - Host floating-point state is treated as scratch owned by the executor and is
   restored at all host ABI boundaries.
+- An engine may cache architectural state while executing, but it commits every
+  guest-visible component to `ThreadCpuState` before returning an exit.
 
 One AMD64 nonvolatile register should normally hold the active
 `ThreadCpuState` representation while guest code is running. Another fixed
 pointer or a containing execution context may expose `VcpuExecutionState` if
 benchmarks show a net benefit across supported host ABIs.
+
+### 7.1 Engine run-slice boundary
+
+The runtime leases one guest thread and one vCPU to an engine executor for a
+bounded slice. The request includes an instruction budget or deadline and a
+pending-exit token. The executor returns a normalized result such as budget
+completion, safepoint, synchronous exception or SVC, memory slow path,
+single-instruction interpreter fallback, asynchronous event, termination, or a
+typed engine fault.
+
+Engine-specific traps and host failures are translated inside the concrete
+engine adapter. Guest exceptions remain distinct from engine faults. Every
+successful return reports precise canonical thread state and all guest-visible
+memory effects required at that boundary; neither the scheduler nor Horizon
+consumes engine-private exit types.
 
 ## 8. Decoders and canonical semantics
 
@@ -790,9 +811,13 @@ guest monitor is insufficient.
 
 ## 18. Multicore execution and scheduling
 
-Each emulated CPU thread may run on a host thread. The scheduler owns guest time,
-priorities, affinity, suspension, and event delivery. The JIT cooperates through
-safepoints.
+Guest threads are runtime objects scheduled onto emulated vCPUs; they are not
+permanently represented by host threads. Parallel execution uses at most one
+long-lived host worker per active vCPU, with no more than one leased guest thread
+executing on a vCPU at a time. This bounds host resources and keeps priorities,
+affinity, migration, suspension, and event delivery under the guest scheduler's
+control. Every engine cooperates through the same safepoint and run-slice
+protocol.
 
 A block receives an instruction budget or deadline token. Generated code checks
 for exits at bounded intervals and at backward branches. The check covers:
@@ -806,10 +831,13 @@ for exits at bounded intervals and at backward branches. The check covers:
 Checking only at block boundaries is acceptable while blocks are strictly
 bounded; trace tiers must insert additional polls.
 
-The first scheduler may be deterministic and conservative. Parallel execution
-is enabled only after atomics, invalidation, TLB shootdown, and device visibility
-have tests. Deterministic replay should record scheduling and external events,
-not host timing.
+Deterministic execution is a permanent policy, not temporary bring-up code. It
+models every configured vCPU while allowing only one host worker to execute one
+guest slice at a time, and it remains the oracle for tests, diagnostics, and
+replay. Parallel execution may be enabled only after atomics, invalidation, TLB
+shootdown, shared runtime state, and device visibility have explicit
+concurrency contracts and tests. Deterministic replay records scheduling and
+external events, not host timing.
 
 ## 19. CPU and GPU communication
 
@@ -968,22 +996,39 @@ Separate profiles or platform implementations may define:
 - GPU command processor, submission, and coherency details.
 - Whether a compatibility mode selects Switch 1 behavior on Switch 2.
 
-These differences enter through `GuestCpuProfile`, the memory mapper, kernel
-callbacks, and device implementations. They do not require separate AMD64
-instruction emitters unless guest semantics genuinely differ.
+ISA and execution-state differences enter through `GuestCpuProfile`. Core
+count, topology, priority ranges, and timeslice policy enter through a separate
+immutable machine scheduler profile; memory, kernel, and device differences use
+their respective platform adapters. Unverified Switch 2 CPU or scheduler facts
+remain explicit unknown profile values rather than inheriting Switch 1 values
+or a fixed four-core assumption. These differences do not require separate
+AMD64 instruction emitters unless guest semantics genuinely differ.
 
-## 22. Interpreter and tiering policy
+## 22. Engine and tiering policy
 
-The execution modes are:
+The engine implementations and tiers are:
 
 1. Reference interpreter: always available, simple, instrumentable, and exact.
-2. Baseline JIT: default execution engine and primary implementation target.
+2. Baseline JIT: planned primary portable performance engine.
 3. Optional optimized hot tier: considered only after profiling real workloads.
+4. Optional platform NCE engines: selected only when host virtualization and
+   the full guest profile, state, memory, trap, and execution-policy contracts
+   are supported.
 
-The interpreter and baseline JIT are mandatory. A hot tier is not assumed. If
-added, it should compile only frequently executed units and use guards with
-explicit side exits. Deoptimization metadata must reconstruct the active
-canonical `ThreadCpuState` at every side exit.
+The interpreter is mandatory. JIT and NCE implementations use the same
+run-slice and state-commit boundary and may be unavailable without changing
+scheduler or Horizon semantics. Engine selection is capability-based; an
+explicitly requested incompatible engine fails before guest execution rather
+than silently selecting another engine. A hot tier is not assumed. If added, it
+should compile only frequently executed units and use guards with explicit side
+exits. Deoptimization metadata must reconstruct the active canonical
+`ThreadCpuState` at every side exit.
+
+Platform NCE feasibility, privilege requirements, lifecycle seams, and current
+availability are versioned in [Native Code Execution Platform
+Feasibility](NCE%20Platform%20Feasibility.md). In particular, Android
+virtualization is not currently considered a usable arbitrary-payload NCE
+facility.
 
 Tier counters should be sampled or incremented cheaply; an atomic counter on
 every block execution is not acceptable. Optimization must be disabled in
@@ -1020,17 +1065,20 @@ Fallback helpers declare:
 Unknown instructions do not become no-ops. Profile-disabled or unallocated
 encodings take the correct exception path.
 
-Interpreter availability and IR-lifter availability are tracked independently.
-An instruction may therefore be decoded and executed by the reference engine
-before it can be lowered to IR. In that case translation ends immediately before
-the instruction with an `InterpretOne` terminator carrying its location, raw
-encoding, and stable coverage ID. The dispatcher validates those fields against
-the live architectural state, executes exactly that instruction, and resumes at
-the interpreter-produced PC. Exceptions and scheduler exits do not synthesize a
-normal fallthrough.
+Reference-interpreter availability and IR-lifter availability are owned and
+tracked independently. `nixe-cpu` owns decoder and lowerer metadata; each
+concrete engine owns its semantic coverage. When the frontend cannot lower a
+recognized instruction, translation ends immediately before it with an
+engine-neutral `InterpretOne` terminator carrying its location, raw encoding,
+and stable coverage ID. The selected fallback engine validates those fields and
+its own coverage against the live architectural state, executes exactly that
+instruction when supported, and resumes at the engine-produced PC. Exceptions,
+unsupported semantics, and scheduler exits do not synthesize a normal
+fallthrough.
 
-`UnsupportedInstruction` is reserved for recognized encodings implemented by
-neither engine. Its diagnostic contains the raw encoding, deterministic
+`UnsupportedInstruction` is the normalized engine exit for a recognized
+encoding which the selected fallback engine cannot execute. Its diagnostic
+contains the raw encoding, deterministic
 disassembly, CPU profile through the source location, and the exact guest PC and
 execution state. Unallocated, reserved, and profile-disabled encodings instead
 leave through the architectural undefined-instruction exception path. No path
@@ -1044,15 +1092,16 @@ unexpected fallback coverage into a deterministic test failure.
 
 Frontend coverage is generated from the A64, A32, T32-16, and T32-32
 declarative decoder registries for a selected `GuestCpuProfile`. Every row
-reports decoder availability after execution-state and feature gating, plus
-independently maintained reference-interpreter and IR-lifter availability. A
-decoder entry therefore remains visible when a profile disables it or either
-execution engine is incomplete.
+reports decoder availability after execution-state and feature gating plus IR
+lowering availability. Reference-semantic coverage is generated and tested by
+the interpreter crate instead of being embedded in the neutral frontend. A
+decoder entry therefore remains visible when a profile disables it or frontend
+lowering is incomplete.
 
-`Lifted` is a completion claim, not merely evidence that a lifter match arm
-exists. The generated row may use that state only after it has decoder
-classification, reference semantics or an explicit architectural exception, IR
-lowering, stable printer output, and a redistributable regression fixture. The
+`Lifted` is a frontend completion claim, not merely evidence that a lifter match
+arm exists. The generated row may use that state only after it has decoder
+classification, IR lowering or an explicit architectural exception, stable
+printer output, and a redistributable regression fixture. The
 fixture registry is tested by decoding, lowering, verifying, and printing each
 completed entry. An instruction added because of a workload report must add its
 minimal encoding to that registry and retain a focused semantic test.
@@ -1311,6 +1360,21 @@ Decision: accepted.
 
 Justification: differential testing and incremental instruction coverage are
 essential for a maintainable JIT. The interpreter is not temporary scaffolding.
+
+### D9: Bind host workers to active vCPUs, not guest threads
+
+Decision: accepted.
+
+One long-lived host worker per active emulated vCPU is the parallel execution
+strategy. A guest thread receives a temporary scheduler lease on a vCPU and its
+worker; creating one host thread per guest thread is rejected because it makes
+host scheduling and resource consumption accidentally define guest priority,
+affinity, migration, and suspension behavior. Permanently serialized execution
+is also rejected as the only strategy because it prevents eventual concurrent
+vCPU execution, but it remains a permanent deterministic mode over the same
+scheduler and topology. Unknown Switch 2 core counts and scheduling details are
+supplied by a validated machine scheduler profile and are never encoded as a
+four-vCPU invariant.
 
 ## 29. Implementation phases and exit criteria
 

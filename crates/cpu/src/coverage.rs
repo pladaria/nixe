@@ -4,7 +4,7 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use crate::{
-    decode::{self, DecodeSupport, InstructionPattern, table::EngineAvailability},
+    decode::{self, DecodeSupport, InstructionPattern, table::LoweringAvailability},
     location::{ExecutionState, InstructionEncoding, InstructionSize},
     profile::{CapabilityStatus, CpuProfileId, GuestCpuProfile, InstructionFeature},
 };
@@ -62,9 +62,9 @@ pub enum DecoderCoverage {
     ExecutionStateDisabled,
 }
 
-/// Independently tracked availability of an execution engine.
+/// Independently tracked availability of the shared IR lowerer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EngineCoverage {
+pub enum LoweringCoverage {
     Implemented,
     EncodingDependent,
     Missing,
@@ -74,7 +74,6 @@ pub enum EngineCoverage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompletionEvidence {
     pub decoder_classified: bool,
-    pub interpreter_semantics: bool,
     pub explicit_exception: bool,
     pub ir_lowering: bool,
     pub printer_output: bool,
@@ -85,8 +84,7 @@ impl CompletionEvidence {
     #[must_use]
     pub const fn qualifies_as_lifted(self) -> bool {
         self.decoder_classified
-            && (self.interpreter_semantics || self.explicit_exception)
-            && self.ir_lowering
+            && (self.ir_lowering || self.explicit_exception)
             && self.printer_output
             && self.regression_fixture
     }
@@ -96,12 +94,11 @@ impl CompletionEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionCoverage {
     Lifted,
-    InterpreterOnly,
     Incomplete,
     Unavailable,
 }
 
-/// One row generated from a declarative decoder table and engine registries.
+/// One row generated from the declarative decoder and IR-lowering registries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoverageEntry {
     pub profile_id: CpuProfileId,
@@ -109,8 +106,7 @@ pub struct CoverageEntry {
     pub coverage_id: CoverageId,
     pub instruction_name: &'static str,
     pub decoder: DecoderCoverage,
-    pub interpreter: EngineCoverage,
-    pub lifter: EngineCoverage,
+    pub lifter: LoweringCoverage,
     pub evidence: CompletionEvidence,
     pub completion: CompletionCoverage,
 }
@@ -143,14 +139,12 @@ fn all_pattern_tables() -> [&'static [InstructionPattern]; 4] {
 
 fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> CoverageEntry {
     let decoder = decoder_coverage(profile, pattern);
-    let interpreter = engine_coverage(pattern.registration.interpreter);
-    let lifter = engine_coverage(pattern.registration.lifter);
+    let lifter = lowering_coverage(pattern.registration.lifter);
     let enabled = matches!(decoder, DecoderCoverage::Available);
     let evidence = CompletionEvidence {
         decoder_classified: enabled,
-        interpreter_semantics: interpreter == EngineCoverage::Implemented,
         explicit_exception: false,
-        ir_lowering: lifter == EngineCoverage::Implemented,
+        ir_lowering: lifter == LoweringCoverage::Implemented,
         printer_output: enabled,
         regression_fixture: enabled && pattern.registration.regression_fixture.is_some(),
     };
@@ -158,8 +152,6 @@ fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) ->
         CompletionCoverage::Unavailable
     } else if evidence.qualifies_as_lifted() {
         CompletionCoverage::Lifted
-    } else if interpreter == EngineCoverage::Implemented && lifter == EngineCoverage::Missing {
-        CompletionCoverage::InterpreterOnly
     } else {
         CompletionCoverage::Incomplete
     };
@@ -169,7 +161,6 @@ fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) ->
         coverage_id: pattern.coverage_id,
         instruction_name: pattern.name,
         decoder,
-        interpreter,
         lifter,
         evidence,
         completion,
@@ -198,26 +189,19 @@ fn decoder_coverage(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> 
     }
 }
 
-const fn engine_coverage(availability: EngineAvailability) -> EngineCoverage {
+const fn lowering_coverage(availability: LoweringAvailability) -> LoweringCoverage {
     match availability {
-        EngineAvailability::Implemented => EngineCoverage::Implemented,
-        EngineAvailability::EncodingDependent => EngineCoverage::EncodingDependent,
-        EngineAvailability::Missing => EngineCoverage::Missing,
+        LoweringAvailability::Implemented => LoweringCoverage::Implemented,
+        LoweringAvailability::EncodingDependent => LoweringCoverage::EncodingDependent,
+        LoweringAvailability::Missing => LoweringCoverage::Missing,
     }
 }
 
-pub(crate) fn interpreter_coverage(
-    state: ExecutionState,
-    coverage_id: CoverageId,
-) -> EngineCoverage {
-    registered_pattern(state, coverage_id).map_or(EngineCoverage::Missing, |pattern| {
-        engine_coverage(pattern.registration.interpreter)
-    })
-}
-
-pub(crate) fn lifter_coverage(state: ExecutionState, coverage_id: CoverageId) -> EngineCoverage {
-    registered_pattern(state, coverage_id).map_or(EngineCoverage::Missing, |pattern| {
-        engine_coverage(pattern.registration.lifter)
+/// Returns the registered IR-lifter coverage for one instruction.
+#[must_use]
+pub fn lifter_coverage(state: ExecutionState, coverage_id: CoverageId) -> LoweringCoverage {
+    registered_pattern(state, coverage_id).map_or(LoweringCoverage::Missing, |pattern| {
+        lowering_coverage(pattern.registration.lifter)
     })
 }
 
@@ -641,17 +625,15 @@ mod tests {
     };
 
     #[test]
-    fn generated_table_tracks_profile_and_independent_engines() {
+    fn generated_table_tracks_profile_and_frontend_lowering() {
         let switch_1 = coverage_table(&GuestCpuProfile::switch_1());
         let branch = entry(&switch_1, CoverageId::new(0x0000_0002));
         assert_eq!(branch.decoder, DecoderCoverage::Available);
-        assert_eq!(branch.interpreter, EngineCoverage::Implemented);
-        assert_eq!(branch.lifter, EngineCoverage::Implemented);
+        assert_eq!(branch.lifter, LoweringCoverage::Implemented);
         assert_eq!(branch.completion, CompletionCoverage::Lifted);
 
         let integer = entry(&switch_1, CoverageId::new(0x0000_0003));
-        assert_eq!(integer.interpreter, EngineCoverage::Implemented);
-        assert_eq!(integer.lifter, EngineCoverage::Implemented);
+        assert_eq!(integer.lifter, LoweringCoverage::Implemented);
         assert_eq!(integer.completion, CompletionCoverage::Incomplete);
 
         let simd = entry(&switch_1, CoverageId::new(0x0000_0030));
@@ -715,12 +697,8 @@ mod tests {
 
             let coverage = entry(&table, pattern.coverage_id);
             assert_eq!(
-                coverage.interpreter,
-                engine_coverage(pattern.registration.interpreter)
-            );
-            assert_eq!(
                 coverage.lifter,
-                engine_coverage(pattern.registration.lifter)
+                lowering_coverage(pattern.registration.lifter)
             );
             assert_eq!(
                 coverage.evidence.regression_fixture,
@@ -730,7 +708,7 @@ mod tests {
 
             let block = translate_registered_encoding(&profile, &decoded);
             match pattern.registration.lifter {
-                EngineAvailability::Implemented => assert!(
+                LoweringAvailability::Implemented => assert!(
                     !matches!(
                         block.terminator,
                         Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
@@ -740,7 +718,7 @@ mod tests {
                     pattern.coverage_id,
                     block.terminator
                 ),
-                EngineAvailability::Missing => assert!(
+                LoweringAvailability::Missing => assert!(
                     matches!(
                         block.terminator,
                         Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
@@ -750,7 +728,7 @@ mod tests {
                     pattern.coverage_id,
                     block.terminator
                 ),
-                EngineAvailability::EncodingDependent => {}
+                LoweringAvailability::EncodingDependent => {}
             }
         }
     }

@@ -41,9 +41,9 @@ pub enum DecodeSupport {
     RecognizedUnimplemented,
 }
 
-/// Availability declared by the implementation registered for one decoder entry.
+/// Availability declared by the shared IR lowerer for one decoder entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EngineAvailability {
+pub enum LoweringAvailability {
     Implemented,
     EncodingDependent,
     Missing,
@@ -55,12 +55,11 @@ pub struct RegressionFixture {
     pub encoding: InstructionEncoding,
 }
 
-/// Authoritative implementation and evidence metadata for one instruction.
+/// Authoritative frontend and evidence metadata for one instruction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InstructionRegistration {
     pub decoder: DecodeSupport,
-    pub interpreter: EngineAvailability,
-    pub lifter: EngineAvailability,
+    pub lifter: LoweringAvailability,
     pub regression_fixture: Option<RegressionFixture>,
 }
 
@@ -657,8 +656,7 @@ mod tests {
             priority: 0,
             registration: InstructionRegistration {
                 decoder: DecodeSupport::Ready,
-                interpreter: EngineAvailability::Missing,
-                lifter: EngineAvailability::Missing,
+                lifter: LoweringAvailability::Missing,
                 regression_fixture: None,
             },
             allocation_validator: AllocationValidator::AlwaysAllocated,

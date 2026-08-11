@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nixe_cpu::state::ThreadCpuState;
@@ -12,6 +13,11 @@ use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
     ProcessExecutionStatus, ProcessExitCause,
 };
+
+fn reference_process_builder() -> ProcessBuilder {
+    ProcessBuilder::default()
+        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+}
 
 fn asset(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -74,7 +80,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     )
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     let ThreadCpuState::A64(state) = &process.main_thread().state else {
         panic!("NRO must enter in A64 state")
     };
@@ -145,7 +151,7 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
     fs::create_dir(sd_card.join("switch")).unwrap();
 
     let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
-    let mut process = ProcessBuilder::new()
+    let mut process = reference_process_builder()
         .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
         .build(&plan)
         .unwrap();
@@ -305,7 +311,7 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
 fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initialization() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
@@ -367,7 +373,7 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
 fn libnx_hello_world_publishes_a_software_frame() {
     let path = asset("graphics/printing/hello-world/hello-world.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mailbox = dispatcher.video_system().mailbox();
     let mut executed = 0_u64;

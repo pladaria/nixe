@@ -7,9 +7,9 @@ test-all = ["test", "--workspace"]
 test-diff = [
     "test",
     "--package",
-    "nixe-cpu",
+    "nixe-cpu-engine-interpreter",
     "--test",
-    "differential",
+    "ir_differential",
     "--test",
     "qemu_differential",
     "--",

@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use nixe_cpu::ir::block::IrBlock;
 use nixe_cpu::ir::print::{IrPrintOptions, print_block};
@@ -419,6 +420,12 @@ impl RunnableProcess {
         self.execution.exit()
     }
 
+    /// Returns the selected execution-engine descriptor.
+    #[must_use]
+    pub fn engine_descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
+        self.execution.engine_descriptor()
+    }
+
     /// Requests a stop before the next reference-engine instruction.
     pub fn request_safepoint(&mut self) {
         self.execution.request_safepoint();
@@ -454,15 +461,12 @@ impl RunnableProcess {
         terminated
     }
 
-    /// Runs a bounded slice through the independent reference interpreter.
-    ///
-    /// This is the executable baseline used before an IR evaluator or native
-    /// backend exists. It intentionally does not claim to execute translated IR.
-    pub fn run_reference(
+    /// Runs one bounded slice through the injected CPU engine domain.
+    pub fn run(
         &mut self,
         instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let report = crate::execution::run_reference(
+        let report = crate::execution::run_engine(
             &mut self.execution,
             self.cpu,
             &self.memory,
@@ -491,6 +495,24 @@ impl RunnableProcess {
             });
         }
         Ok(report)
+    }
+
+    /// Deprecated compatibility name for [`Self::run`]. New orchestration must
+    /// use the engine-neutral method; this wrapper is removed after migration.
+    pub fn run_reference(
+        &mut self,
+        instruction_budget: u64,
+    ) -> Result<ExecutionReport, ProcessExecutionError> {
+        self.run(instruction_budget)
+    }
+
+    /// Failure-atomically replaces the process execution domain at a canonical
+    /// state boundary. The old domain remains installed if preparation fails.
+    pub fn switch_engine(
+        &mut self,
+        provider: &dyn nixe_cpu_engine::EngineProvider,
+    ) -> Result<nixe_cpu_engine::StateCommitBarrier, nixe_cpu_engine::HandoffFailure> {
+        self.execution.switch_provider(self.cpu, provider)
     }
 
     /// Routes and atomically applies one supervisor-call decision.
@@ -755,6 +777,7 @@ fn install_continuation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessBuildStage {
     Metadata,
+    EngineInitialization,
     Placement,
     Preparation,
     Mapping,
@@ -801,16 +824,39 @@ impl Display for ProcessBuildError {
 impl Error for ProcessBuildError {}
 
 /// Builds an emulated process from a prepared launch plan.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProcessBuilder {
     diagnostics: crate::DiagnosticsPolicy,
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
+    engine_provider: Option<Arc<dyn nixe_cpu_engine::EngineProvider>>,
+}
+
+impl std::fmt::Debug for ProcessBuilder {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessBuilder")
+            .field("diagnostics", &self.diagnostics)
+            .field("config", &self.config)
+            .field("virtual_clock", &self.virtual_clock)
+            .field("sd_card_root", &self.sd_card_root)
+            .field(
+                "engine_provider",
+                &self
+                    .engine_provider
+                    .as_ref()
+                    .map(|provider| provider.descriptor()),
+            )
+            .finish()
+    }
 }
 
 impl ProcessBuilder {
     /// Creates a process builder using detailed diagnostics and Switch 1 defaults.
+    ///
+    /// The application must inject a selected CPU engine provider before
+    /// [`Self::build`]; runtime deliberately has no concrete-engine default.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -842,6 +888,16 @@ impl ProcessBuilder {
         self
     }
 
+    /// Injects the provider used to create the process-local execution domain.
+    #[must_use]
+    pub fn with_engine_provider(
+        mut self,
+        provider: Arc<dyn nixe_cpu_engine::EngineProvider>,
+    ) -> Self {
+        self.engine_provider = Some(provider);
+        self
+    }
+
     #[must_use]
     pub const fn diagnostics(&self) -> crate::DiagnosticsPolicy {
         self.diagnostics
@@ -857,6 +913,12 @@ impl ProcessBuilder {
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
     /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
+        let engine_provider = self.engine_provider.as_deref().ok_or_else(|| {
+            ProcessBuildError::new(
+                ProcessBuildStage::EngineInitialization,
+                "a CPU engine provider must be selected by the application",
+            )
+        })?;
         if self.config.architectural_timer_frequency == 0 {
             return Err(ProcessBuildError::new(
                 ProcessBuildStage::Metadata,
@@ -1048,11 +1110,16 @@ impl ProcessBuilder {
             main_thread,
             mounts: crate::ProcessMountNamespace::from_launch_plan(plan, self.sd_card_root.clone()),
             handles,
-            execution: crate::execution::ProcessExecutionControl::new(
+            execution: crate::execution::ProcessExecutionControl::with_provider(
                 self.diagnostics,
                 self.virtual_clock.clone(),
                 self.config.architectural_timer_frequency,
-            ),
+                cpu,
+                engine_provider,
+            )
+            .map_err(|error| {
+                ProcessBuildError::new(ProcessBuildStage::EngineInitialization, error)
+            })?,
         };
         process.translate_entry()?;
         Ok(process)
@@ -1374,6 +1441,11 @@ mod tests {
     use super::*;
     use crate::{Launcher, LauncherInput};
 
+    fn reference_process_builder() -> ProcessBuilder {
+        ProcessBuilder::default()
+            .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+    }
+
     #[derive(Default)]
     struct RecordingSupervisorCallDispatcher {
         expected_encoding: Option<InstructionEncoding>,
@@ -1450,6 +1522,107 @@ mod tests {
         outcome: Option<crate::ExceptionDispatchOutcome<F>>,
     }
 
+    struct RuntimeFakeProvider;
+    impl nixe_cpu_engine::EngineProvider for RuntimeFakeProvider {
+        fn descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
+            nixe_cpu_engine::EngineDescriptor {
+                id: nixe_cpu_engine::EngineId::new(99),
+                name: "runtime-fake".into(),
+                kind: nixe_cpu_engine::EngineKind::Test,
+                capabilities: nixe_cpu_engine::EngineCapabilities {
+                    a64: true,
+                    precise_instruction_budget: true,
+                    ..Default::default()
+                },
+            }
+        }
+        fn probe(
+            &self,
+            _profile: nixe_cpu::profile::CpuProfileId,
+            _required: nixe_cpu_engine::EngineCapabilities,
+        ) -> nixe_cpu_engine::CapabilityReport {
+            nixe_cpu_engine::CapabilityReport {
+                descriptor: self.descriptor(),
+                available: true,
+                rejections: Box::new([]),
+            }
+        }
+        fn create_domain(
+            &self,
+            request: nixe_cpu_engine::DomainRequest,
+        ) -> Result<Box<dyn nixe_cpu_engine::EngineDomain>, nixe_cpu_engine::EngineFault> {
+            Ok(Box::new(RuntimeFakeDomain { id: request.domain }))
+        }
+    }
+
+    struct RuntimeFakeDomain {
+        id: nixe_cpu_engine::EngineDomainId,
+    }
+    impl nixe_cpu_engine::EngineDomain for RuntimeFakeDomain {
+        fn descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
+            <RuntimeFakeProvider as nixe_cpu_engine::EngineProvider>::descriptor(
+                &RuntimeFakeProvider,
+            )
+        }
+        fn domain_id(&self) -> nixe_cpu_engine::EngineDomainId {
+            self.id
+        }
+
+        fn create_executor(
+            &mut self,
+            request: nixe_cpu_engine::ExecutorRequest,
+        ) -> Result<Box<dyn nixe_cpu_engine::EngineExecutor>, nixe_cpu_engine::EngineFault>
+        {
+            Ok(Box::new(RuntimeFakeExecutor {
+                id: request.executor,
+            }))
+        }
+
+        fn quiesce(
+            &mut self,
+        ) -> Result<nixe_cpu_engine::DomainQuiescenceToken, nixe_cpu_engine::EngineFault> {
+            Ok(nixe_cpu_engine::DomainQuiescenceToken {
+                domain: self.id,
+                generation: nixe_cpu_engine::EngineGeneration::new(0),
+            })
+        }
+    }
+
+    struct RuntimeFakeExecutor {
+        id: nixe_cpu_engine::EngineExecutorId,
+    }
+
+    impl nixe_cpu_engine::EngineExecutor for RuntimeFakeExecutor {
+        fn descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
+            <RuntimeFakeProvider as nixe_cpu_engine::EngineProvider>::descriptor(
+                &RuntimeFakeProvider,
+            )
+        }
+
+        fn executor_id(&self) -> nixe_cpu_engine::EngineExecutorId {
+            self.id
+        }
+
+        fn run_slice(
+            &mut self,
+            request: nixe_cpu_engine::RunRequest<'_>,
+        ) -> Result<nixe_cpu_engine::ExecutionReport, nixe_cpu_engine::EngineFault> {
+            Ok(nixe_cpu_engine::ExecutionReport {
+                instructions_executed: 0,
+                stop: nixe_cpu_engine::EngineExit::PendingEvent { mask: 0x80 },
+                context: request.state.register_context(),
+                trace: nixe_cpu_engine::InstructionTrace {
+                    enabled: false,
+                    entries: Box::new([]),
+                    discarded: 0,
+                },
+                state_commit: nixe_cpu_engine::StateCommitStatus::Canonical,
+            })
+        }
+        fn request_safepoint(&mut self, _reason: nixe_cpu_engine::SafepointReason) {}
+        fn post_event(&self, _mask: u32) {}
+    }
+
     impl<F> crate::ExceptionDispatcher for PcMutatingSupervisorCallDispatcher<F> {
         type Fault = F;
 
@@ -1470,7 +1643,7 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn replace_entry_instruction(process: &mut RunnableProcess, encoding: u32) {
+    fn replace_entry_instructions(process: &mut RunnableProcess, encodings: &[u32]) {
         let address_space = process.cpu.address_space_id();
         let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
         let mapping = process.memory.mapping_info(address_space, entry).unwrap();
@@ -1482,15 +1655,52 @@ mod tests {
             MemoryPermissions::READ_WRITE,
         ));
         let page_offset = entry.get() % SYNTHETIC_PAGE_SIZE as u64;
-        process
-            .memory
-            .write(
-                address_space,
-                GuestVirtualAddress::new(alias_page.get() + page_offset),
-                MemoryAccess::normal(MemoryAccessSize::Word),
-                MemoryValue::U32(encoding),
-            )
+        for (index, encoding) in encodings.iter().copied().enumerate() {
+            let instruction_offset = u64::try_from(index).unwrap() * 4;
+            process
+                .memory
+                .write(
+                    address_space,
+                    GuestVirtualAddress::new(alias_page.get() + page_offset + instruction_offset),
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                    MemoryValue::U32(encoding),
+                )
+                .unwrap();
+        }
+    }
+
+    fn replace_entry_instruction(process: &mut RunnableProcess, encoding: u32) {
+        replace_entry_instructions(process, &[encoding]);
+    }
+
+    #[test]
+    fn runtime_orchestration_accepts_an_engine_neutral_fake_domain() {
+        let (_directory, plan) = plan();
+        let mut process = reference_process_builder()
+            .with_engine_provider(Arc::new(RuntimeFakeProvider))
+            .build(&plan)
             .unwrap();
+        let before = process.main_thread().state.register_context();
+        let report = process.run_reference(50).unwrap();
+        assert_eq!(report.instructions_executed, 0);
+        assert_eq!(
+            report.stop,
+            crate::ExecutionStop::PendingEvent { mask: 0x80 }
+        );
+        assert_eq!(report.context, before);
+        assert_eq!(
+            process.execution_status(),
+            crate::ProcessExecutionStatus::Ready
+        );
+    }
+
+    #[test]
+    fn application_must_inject_a_cpu_engine_provider() {
+        let (_directory, plan) = plan();
+        let Err(error) = ProcessBuilder::default().build(&plan) else {
+            panic!("process construction must reject a missing CPU engine provider");
+        };
+        assert_eq!(error.stage(), ProcessBuildStage::EngineInitialization);
     }
 
     fn process_stopped_at_svc(
@@ -1502,7 +1712,7 @@ mod tests {
             ExecutionState::T32 => 0xbf00_df7b,
         };
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut process, encoding);
         let entry = process.entry_module().entry_address();
         if execution_state != ExecutionState::A64 {
@@ -1557,7 +1767,7 @@ mod tests {
 
     #[test]
     fn builder_propagates_runtime_diagnostics_to_cpu_resources() {
-        let builder = ProcessBuilder::new();
+        let builder = reference_process_builder();
         assert_eq!(
             builder.cpu_diagnostics().report_detail,
             nixe_cpu::coverage::MissingInstructionReportDetail::Detailed
@@ -1684,7 +1894,7 @@ mod tests {
     #[test]
     fn synthetic_launch_translates_entry_only_through_process_memory() {
         let (_directory, plan) = plan();
-        let process = ProcessBuilder::new().build(&plan).unwrap();
+        let process = reference_process_builder().build(&plan).unwrap();
         let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
         assert_eq!(
             process
@@ -1797,10 +2007,10 @@ mod tests {
     #[test]
     fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut process, 0xd65f_03c0); // RET X30
         let loader_return = process.main_thread().loader_return.unwrap();
-        let ThreadCpuState::A64(state) = &mut process.main_thread.state else {
+        let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
             panic!("homebrew fixture must initialize A64");
         };
         state.write_x(A64Register::General(a64_register(0)), 0x1234_5678);
@@ -1859,14 +2069,14 @@ mod tests {
     #[test]
     fn image_base_is_relocatable_without_changing_pc_relative_translation() {
         let (_directory, plan) = plan();
-        let first = ProcessBuilder::new()
+        let first = reference_process_builder()
             .with_config(ProcessBuildConfig {
                 image_base: GuestVirtualAddress::new(0x7100_0000),
                 ..ProcessBuildConfig::default()
             })
             .build(&plan)
             .unwrap();
-        let second = ProcessBuilder::new()
+        let second = reference_process_builder()
             .with_config(ProcessBuildConfig {
                 image_base: GuestVirtualAddress::new(0x7200_0000),
                 ..ProcessBuildConfig::default()
@@ -1899,7 +2109,7 @@ mod tests {
     #[test]
     fn writable_code_alias_updates_the_fetched_generation() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         let space = process.cpu.address_space_id();
         let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
         let before = process.memory.fetch32(space, entry).unwrap().dependencies;
@@ -1927,7 +2137,7 @@ mod tests {
     #[test]
     fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         let entry = process.entry_module().entry_address();
 
         let report = process.run_reference(1).unwrap();
@@ -1952,9 +2162,240 @@ mod tests {
     }
 
     #[test]
+    fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
+        let (_directory, plan) = plan();
+        let mut process = reference_process_builder()
+            .with_diagnostics(crate::DiagnosticsPolicy {
+                instruction_trace: true,
+                ..crate::DiagnosticsPolicy::default()
+            })
+            .build(&plan)
+            .unwrap();
+        replace_entry_instructions(
+            &mut process,
+            &[
+                0x9100_0400, // ADD X0,X0,#1
+                0x9100_0800, // ADD X0,X0,#2
+                0xd400_0841, // SVC #0x42
+                0x9100_1000, // ADD X0,X0,#4
+            ],
+        );
+        let entry = process.entry_module().entry_address();
+        let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+            panic!("homebrew fixture must initialize A64");
+        };
+        state.write_x(A64Register::General(a64_register(0)), 0);
+
+        let first = process.run_reference(1).unwrap();
+        assert_eq!(first.instructions_executed, 1);
+        assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
+        assert_eq!(state.pc(), entry + 4);
+
+        let second = process.run_reference(1).unwrap();
+        assert_eq!(second.instructions_executed, 1);
+        assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
+        assert_eq!(state.pc(), entry + 8);
+
+        let svc = process.run_reference(1).unwrap();
+        assert_eq!(svc.instructions_executed, 1);
+        assert!(matches!(
+            svc.stop,
+            crate::ExecutionStop::SupervisorCall {
+                source,
+                immediate: 0x42,
+            } if source.pc.get() == entry + 8
+        ));
+        let sources = svc
+            .trace
+            .entries()
+            .iter()
+            .map(|entry| entry.source.pc.get())
+            .collect::<Vec<_>>();
+        assert_eq!(sources, [entry, entry + 4, entry + 8]);
+
+        let mut dispatcher = FixedSupervisorCallDispatcher {
+            outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
+                crate::ExceptionResume::Next,
+            )),
+        };
+        assert_eq!(
+            process
+                .route_supervisor_call(&svc.stop, &mut dispatcher)
+                .unwrap(),
+            crate::ExceptionHandlingResult::Resumed
+        );
+        let resumed = process.run_reference(1).unwrap();
+        assert_eq!(resumed.instructions_executed, 1);
+        assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_x(A64Register::General(a64_register(0))), 7);
+        assert_eq!(state.pc(), entry + 16);
+    }
+
+    #[test]
+    fn fixed_virtual_timer_is_stable_across_reference_slices() {
+        let (_directory, plan) = plan();
+        let frequency = 24_000_000;
+        let mut process = reference_process_builder()
+            .with_config(ProcessBuildConfig {
+                architectural_timer_frequency: frequency,
+                ..ProcessBuildConfig::default()
+            })
+            .with_virtual_clock(crate::VirtualClock::new(crate::VirtualClockMode::Fixed {
+                unix_seconds: 1_700_000_000,
+            }))
+            .build(&plan)
+            .unwrap();
+        replace_entry_instructions(
+            &mut process,
+            &[
+                0xd53b_e001, // MRS X1,CNTFRQ_EL0
+                0xd53b_e022, // MRS X2,CNTVCT_EL0
+                0xd53b_e023, // MRS X3,CNTVCT_EL0
+            ],
+        );
+
+        let first = process.run_reference(2).unwrap();
+        assert_eq!(first.instructions_executed, 2);
+        assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
+        let second = process.run_reference(1).unwrap();
+        assert_eq!(second.instructions_executed, 1);
+        assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
+
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.read_x(A64Register::General(a64_register(1))),
+            frequency
+        );
+        assert_eq!(state.read_x(A64Register::General(a64_register(2))), 0);
+        assert_eq!(state.read_x(A64Register::General(a64_register(3))), 0);
+    }
+
+    #[test]
+    fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
+        let (_directory, plan) = plan();
+        let mut process = reference_process_builder().build(&plan).unwrap();
+        replace_entry_instructions(
+            &mut process,
+            &[
+                0x885f_fc60, // LDAXR W0,[X3]
+                0x8801_fc60, // STLXR W1,W0,[X3]
+            ],
+        );
+        let entry = process.entry_module().entry_address();
+        let data = {
+            let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+                panic!("homebrew fixture must initialize A64");
+            };
+            let address = GuestVirtualAddress::new(
+                state
+                    .read_x(A64Register::StackPointer)
+                    .checked_sub(8)
+                    .unwrap(),
+            );
+            state.write_x(A64Register::General(a64_register(3)), address.get());
+            address
+        };
+        let address_space = process.cpu_context().address_space_id();
+        process
+            .memory()
+            .write(
+                address_space,
+                data,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(7),
+            )
+            .unwrap();
+
+        assert_eq!(
+            process.run_reference(1).unwrap().stop,
+            crate::ExecutionStop::BudgetExhausted
+        );
+        let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_w(A64Register::General(a64_register(0))), 7);
+        state.write_x(A64Register::General(a64_register(0)), 9);
+        assert_eq!(
+            process.run_reference(1).unwrap().stop,
+            crate::ExecutionStop::BudgetExhausted
+        );
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_w(A64Register::General(a64_register(1))), 0);
+        assert_eq!(
+            process
+                .memory()
+                .read(
+                    address_space,
+                    data,
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(9)
+        );
+
+        let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+            unreachable!();
+        };
+        state.set_pc(entry);
+        assert_eq!(
+            process.run_reference(1).unwrap().stop,
+            crate::ExecutionStop::BudgetExhausted
+        );
+        process
+            .memory()
+            .write(
+                address_space,
+                data,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(11),
+            )
+            .unwrap();
+        let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+            unreachable!();
+        };
+        state.write_x(A64Register::General(a64_register(0)), 13);
+        assert_eq!(
+            process.run_reference(1).unwrap().stop,
+            crate::ExecutionStop::BudgetExhausted
+        );
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.read_w(A64Register::General(a64_register(1))), 1);
+        assert_eq!(
+            process
+                .memory()
+                .read(
+                    address_space,
+                    data,
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(11)
+        );
+    }
+
+    #[test]
     fn reference_execution_observes_safepoints_before_fetch() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         let entry = process.entry_module().entry_address();
         process.request_safepoint();
 
@@ -1970,8 +2411,10 @@ mod tests {
     #[test]
     fn reference_execution_observes_pending_events_before_fetch() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
-        process.post_event(0b0101);
+        let mut process = reference_process_builder().build(&plan).unwrap();
+        let entry = process.entry_module().entry_address();
+        process.post_event(0b0001);
+        process.post_event(0b0100);
 
         let report = process.run_reference(10).unwrap();
         assert_eq!(report.instructions_executed, 0);
@@ -1979,12 +2422,19 @@ mod tests {
             report.stop,
             crate::ExecutionStop::PendingEvent { mask: 0b0101 }
         );
+        let next = process.run_reference(1).unwrap();
+        assert_eq!(next.instructions_executed, 1);
+        assert_eq!(next.stop, crate::ExecutionStop::BudgetExhausted);
+        let ThreadCpuState::A64(state) = &process.main_thread().state else {
+            unreachable!();
+        };
+        assert_eq!(state.pc(), entry + 0x80);
     }
 
     #[test]
     fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         let ThreadCpuState::A64(state) = &mut process.main_thread.state else {
             panic!("homebrew fixture must initialize A64");
         };
@@ -2010,7 +2460,7 @@ mod tests {
     #[test]
     fn unallocated_encoding_suspends_until_runtime_resumes_thread() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
 
         let report = process.run_reference(2).unwrap();
         assert!(matches!(
@@ -2039,7 +2489,7 @@ mod tests {
     fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() {
         let (_directory, plan) = plan();
 
-        let mut unsupported = ProcessBuilder::new().build(&plan).unwrap();
+        let mut unsupported = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut unsupported, 0xd503_203f); // YIELD
         let report = unsupported.run_reference(1).unwrap();
         assert!(matches!(
@@ -2052,7 +2502,7 @@ mod tests {
         );
         assert!(report.to_string().contains("unsupported-semantics"));
 
-        let mut profile_disabled = ProcessBuilder::new()
+        let mut profile_disabled = reference_process_builder()
             .with_config(ProcessBuildConfig {
                 cpu_profile: GuestCpuProfile::switch_2_native(),
                 ..ProcessBuildConfig::default()
@@ -2071,7 +2521,7 @@ mod tests {
         ));
         assert!(report.to_string().contains("profile-disabled"));
 
-        let mut unallocated = ProcessBuilder::new().build(&plan).unwrap();
+        let mut unallocated = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut unallocated, 0);
         let report = unallocated.run_reference(1).unwrap();
         assert_eq!(
@@ -2089,7 +2539,7 @@ mod tests {
     fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
         let (_directory, plan) = plan();
 
-        let mut svc = ProcessBuilder::new().build(&plan).unwrap();
+        let mut svc = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut svc, 0xd400_0841); // SVC #0x42
         let report = svc.run_reference(1).unwrap();
         let dispatch = report.stop.exception_dispatch_request().unwrap();
@@ -2107,7 +2557,7 @@ mod tests {
         ));
         assert!(report.to_string().contains("supervisor-call"));
 
-        let mut breakpoint = ProcessBuilder::new().build(&plan).unwrap();
+        let mut breakpoint = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut breakpoint, 0xd420_2460); // BRK #0x123
         let report = breakpoint.run_reference(1).unwrap();
         let dispatch = report.stop.exception_dispatch_request().unwrap();
@@ -2126,7 +2576,7 @@ mod tests {
         ));
         assert!(report.to_string().contains("architectural-exception"));
 
-        let mut data_fault = ProcessBuilder::new().build(&plan).unwrap();
+        let mut data_fault = reference_process_builder().build(&plan).unwrap();
         replace_entry_instruction(&mut data_fault, 0xf940_0020); // LDR X0,[X1]
         let ThreadCpuState::A64(state) = &mut data_fault.main_thread.state else {
             panic!("homebrew fixture must initialize A64");
@@ -2157,7 +2607,7 @@ mod tests {
 
         for (execution_state, encoding, immediate) in cases {
             let (_directory, plan) = plan();
-            let mut process = ProcessBuilder::new().build(&plan).unwrap();
+            let mut process = reference_process_builder().build(&plan).unwrap();
             replace_entry_instruction(&mut process, encoding);
             let entry = process.entry_module().entry_address();
             if execution_state != ExecutionState::A64 {
@@ -2330,9 +2780,61 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_call_termination_scope_is_preserved_through_teardown() {
+        let cases = [
+            (
+                crate::ExceptionTerminationScope::CurrentThread,
+                crate::ProcessExitCause::LastThreadExited,
+            ),
+            (
+                crate::ExceptionTerminationScope::Process,
+                crate::ProcessExitCause::ProcessRequested,
+            ),
+        ];
+
+        for (scope, expected_cause) in cases {
+            let (mut process, report, entry) = process_stopped_at_svc(ExecutionState::A64);
+            let mut dispatcher = FixedSupervisorCallDispatcher {
+                outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Terminate {
+                    scope,
+                    exit_code: 0x55,
+                    reason: crate::ExceptionTerminationReason::Requested,
+                }),
+            };
+
+            assert_eq!(
+                process
+                    .route_supervisor_call(&report.stop, &mut dispatcher)
+                    .unwrap(),
+                crate::ExceptionHandlingResult::Terminated {
+                    scope,
+                    exit_code: 0x55,
+                    reason: crate::ExceptionTerminationReason::Requested,
+                }
+            );
+            assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+            assert_eq!(process.exit().unwrap().cause, expected_cause);
+            assert_eq!(process.exit().unwrap().source.unwrap().pc.get(), entry);
+            assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
+            assert!(matches!(
+                process.run_reference(1),
+                Err(crate::ProcessExecutionError::NotRunnable {
+                    status: ProcessExecutionStatus::Exited,
+                    ..
+                })
+            ));
+
+            let teardown = process.teardown();
+            assert_eq!(teardown.previous_status, ProcessExecutionStatus::Exited);
+            assert_eq!(teardown.exit.unwrap().cause, expected_cause);
+            assert_eq!(teardown.threads_released, 1);
+        }
+    }
+
+    #[test]
     fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new()
+        let mut process = reference_process_builder()
             .with_diagnostics(crate::DiagnosticsPolicy {
                 instruction_trace: true,
                 ..crate::DiagnosticsPolicy::default()
@@ -2376,7 +2878,7 @@ mod tests {
     #[test]
     fn sanitized_instruction_trace_omits_detailed_disassembly() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new()
+        let mut process = reference_process_builder()
             .with_diagnostics(crate::DiagnosticsPolicy {
                 report_detail: crate::ReportDetail::Sanitized,
                 instruction_trace: true,
@@ -2394,7 +2896,7 @@ mod tests {
     #[test]
     fn teardown_reports_resources_owned_by_the_process() {
         let (_directory, plan) = plan();
-        let mut process = ProcessBuilder::new().build(&plan).unwrap();
+        let mut process = reference_process_builder().build(&plan).unwrap();
         assert!(process.terminate());
         assert_eq!(
             process.exit().unwrap().cause,

@@ -918,7 +918,7 @@ impl CpuMemory for SyntheticMemory {
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         access: MemoryAccess,
-    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault> {
+    ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault> {
         let value = self.read(address_space, address, access)?;
         let inner = self.inner.borrow();
         let mapping = mapping_at(&inner, address_space, address).expect("load was validated");
@@ -936,7 +936,7 @@ impl CpuMemory for SyntheticMemory {
         };
         Ok((
             value,
-            crate::vcpu::ExclusiveReservation {
+            crate::exclusive::ExclusiveReservation {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
@@ -951,7 +951,7 @@ impl CpuMemory for SyntheticMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
         value: MemoryValue,
-        reservation: crate::vcpu::ExclusiveReservation,
+        reservation: crate::exclusive::ExclusiveReservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault> {
         let matches = {
             let inner = self.inner.borrow();

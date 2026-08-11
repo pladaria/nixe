@@ -627,7 +627,7 @@ pub trait CpuMemory: InstructionMemory {
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         access: MemoryAccess,
-    ) -> Result<(DataReadResult, crate::vcpu::ExclusiveReservation), DataAccessFault>;
+    ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault>;
 
     /// Conditionally stores if the supplied physical reservation is current.
     fn store_exclusive(
@@ -636,7 +636,7 @@ pub trait CpuMemory: InstructionMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
         value: MemoryValue,
-        reservation: crate::vcpu::ExclusiveReservation,
+        reservation: crate::exclusive::ExclusiveReservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault>;
 }
 
