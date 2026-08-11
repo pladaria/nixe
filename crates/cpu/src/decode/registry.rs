@@ -31,13 +31,15 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002a
                     | 0x0000_0031
+                    | 0x0000_0036..=0x0000_0037
+                    | 0x0000_003a..=0x0000_003d
                     | 0x0000_003e..=0x0000_003f
                     | 0x0000_0040..=0x0000_0042
                     | 0x0000_0044..=0x0000_0045
                     | 0x0000_0048..=0x0000_004b
                     | 0x0000_004e..=0x0000_0058
                     | 0x0000_0059..=0x0000_005d
-                    | 0x0000_0060..=0x0000_0069
+                    | 0x0000_0060..=0x0000_0085
             ) =>
         {
             IMPLEMENTED
@@ -70,7 +72,8 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                     | 0x0000_0010..=0x0000_001d
                     | 0x0000_0020..=0x0000_002c
                     | 0x0000_0030..=0x0000_0037
-                    | 0x0000_003a..=0x0000_0043
+                    | 0x0000_003a..=0x0000_003b
+                    | 0x0000_003e..=0x0000_0043
                     | 0x0000_0044..=0x0000_0045
             ) =>
         {
@@ -108,7 +111,8 @@ pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistra
                 | 0x0000_0010..=0x0000_001d
                 | 0x0000_0022..=0x0000_002c
                 | 0x0000_0030..=0x0000_0037
-                | 0x0000_003a..=0x0000_0043
+                | 0x0000_003a..=0x0000_003b
+                | 0x0000_003e..=0x0000_0043
         )
     {
         lifter = ENCODING_DEPENDENT;
@@ -242,6 +246,14 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0038 if bits & 0xbf20_8c00 == 0x0e00_0800 => {
             validate_a64_simd_permute_two_source(bits)
         }
+        0x0000_0038 if bits & 0xbf20_8400 == 0x2e00_0000 => validate_a64_simd_extract(bits),
+        0x0000_0038 if matches!(bits & 0xbfbf_fc00, 0x0e21_d800 | 0x2e21_d800) => {
+            validate_a64_simd_integer_to_float(bits)
+        }
+        0x0000_0038 if bits & 0xbfa0_fc00 == 0x2e20_fc00 => validate_a64_simd_float_vector(bits),
+        0x0000_0039 if bits & 0xff20_1fe0 == 0x1e20_1000 => {
+            AllocationStatus::Unallocated("unallocated scalar floating-point immediate type")
+        }
         0x0000_0038 if bits & 0xbfe0_fc00 == 0x0e00_3c00 => validate_a64_umov(bits),
         0x0000_004b => validate_a64_umov(bits),
         0x0000_0060 | 0x0000_0061 => validate_a64_simd_insert(id, bits),
@@ -263,6 +275,7 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         }
         0x0000_0062 | 0x0000_0063 => validate_a64_simd_single_structure(bits),
         0x0000_0064 => validate_a64_simd_permute_two_source(bits),
+        0x0000_0085 => validate_a64_simd_extract(bits),
         0x0000_0065 => {
             let immediate_high = (bits >> 19) & 0xf;
             if immediate_high == 0 {
@@ -272,6 +285,9 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             }
         }
         0x0000_0066..=0x0000_0069 => validate_a64_simd_min_max_pairwise(bits),
+        0x0000_006a | 0x0000_006b => validate_a64_simd_integer_to_float(bits),
+        0x0000_006c => validate_a64_simd_float_vector(bits),
+        0x0000_006d..=0x0000_0084 => AllocationStatus::Allocated,
         0x0000_0033 | 0x0000_0034 | 0x0000_0040..=0x0000_0042 => {
             let size = (bits >> 30) as u8;
             let opc = ((bits >> 22) & 3) as u8;
@@ -305,6 +321,22 @@ fn validate_a64_fp_move_general(bits: u32) -> AllocationStatus {
 fn validate_a64_simd_add_sub(bits: u32) -> AllocationStatus {
     if (bits >> 22) & 3 == 3 && bits & (1 << 30) == 0 {
         AllocationStatus::Reserved("64-bit SIMD vector cannot contain a 64-bit lane")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn validate_a64_simd_integer_to_float(bits: u32) -> AllocationStatus {
+    if bits & (1 << 22) != 0 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit SIMD conversion requires a 128-bit vector")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn validate_a64_simd_float_vector(bits: u32) -> AllocationStatus {
+    if bits & (1 << 22) != 0 && bits & (1 << 30) == 0 {
+        AllocationStatus::Reserved("64-bit floating-point lanes require a 128-bit vector")
     } else {
         AllocationStatus::Allocated
     }
@@ -384,6 +416,16 @@ fn validate_a64_simd_insert(id: u32, bits: u32) -> AllocationStatus {
         }
     }
     AllocationStatus::Allocated
+}
+
+fn validate_a64_simd_extract(bits: u32) -> AllocationStatus {
+    let vector_128 = bits & (1 << 30) != 0;
+    let immediate = (bits >> 11) & 0xf;
+    if !vector_128 && immediate >= 8 {
+        AllocationStatus::Reserved("64-bit SIMD EXT byte index is outside the vector")
+    } else {
+        AllocationStatus::Allocated
+    }
 }
 
 fn validate_a64_simd_single_structure(bits: u32) -> AllocationStatus {
@@ -478,7 +520,11 @@ mod tests {
             0x0ee1_3420, // SIMD compare with a reserved one-lane 64-bit arrangement
             0x0ee0_8820, // SIMD zero compare with a reserved one-lane 64-bit arrangement
             0x0ec2_3820, // ZIP1 with a reserved one-lane 64-bit arrangement
+            0x0e61_d820, // 64-bit SIMD conversion requires a Q register
+            0x2e62_fc20, // 64-bit FDIV lanes require a Q register
+            0x1ea0_1000, // unallocated scalar FMOV immediate floating-point type
             0x4c40_1020, // unallocated SIMD multiple-structures opcode
+            0x2e00_4000, // 64-bit EXT byte index exceeds seven
         ];
         for bits in cases {
             let result = classify(ExecutionState::A64, InstructionEncoding::from_u32(bits));

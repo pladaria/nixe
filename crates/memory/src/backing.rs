@@ -1,5 +1,6 @@
 //! Retained canonical RAM backing.
 
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -161,6 +162,45 @@ impl CanonicalBackingPage {
                     // returned but before this lock was acquired. Retry rather
                     // than exposing the now-stale canonical bytes.
                 }
+                PageVisibility::Conflicting => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::ConflictingAccess,
+                    ));
+                }
+                PageVisibility::Invalid => {
+                    return Err(CanonicalPageError::Visibility(
+                        VisibilityError::InvalidState,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn snapshot_cpu_write(
+        &self,
+    ) -> Result<(Box<[u8]>, ContentGeneration, u64), CanonicalPageError> {
+        loop {
+            self.ensure_cpu_visible()
+                .map_err(CanonicalPageError::Visibility)?;
+            let state = self.lock_state();
+            match state.visibility {
+                PageVisibility::Clean | PageVisibility::CpuNewer => {
+                    let mut bytes = Vec::new();
+                    bytes
+                        .try_reserve_exact(self.size())
+                        .map_err(|_| CanonicalPageError::ResourceExhausted)?;
+                    if let Some(contents) = &state.bytes {
+                        bytes.extend_from_slice(contents);
+                    } else {
+                        bytes.resize(self.size(), 0);
+                    }
+                    return Ok((
+                        bytes.into_boxed_slice(),
+                        state.generation,
+                        state.visibility_epoch,
+                    ));
+                }
+                PageVisibility::GpuNewer { .. } => {}
                 PageVisibility::Conflicting => {
                     return Err(CanonicalPageError::Visibility(
                         VisibilityError::ConflictingAccess,
@@ -495,6 +535,241 @@ impl CanonicalBackingPage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
+
+struct PendingCanonicalPageWrite {
+    backing: CanonicalBackingPage,
+    expected_generation: ContentGeneration,
+    expected_visibility_epoch: u64,
+    bytes: Box<[u8]>,
+}
+
+/// Atomic CPU-side mutation assembled over retained canonical ranges.
+///
+/// This is intended for deterministic software device interpreters. Staging
+/// may establish CPU visibility but does not alter bytes or generations. A
+/// successful commit locks every affected page in identity order, validates
+/// all snapshots, and publishes the complete batch at once.
+#[derive(Default)]
+pub struct CanonicalWriteBatch {
+    pages: BTreeMap<CanonicalPageId, PendingCanonicalPageWrite>,
+}
+
+impl CanonicalWriteBatch {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Stages one checked logical write. Discard the batch if this fails.
+    pub fn stage(
+        &mut self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), CanonicalWriteBatchError> {
+        let size =
+            u64::try_from(bytes.len()).map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+        if end > range.size() {
+            return Err(CanonicalWriteBatchError::OutOfBounds {
+                offset,
+                size,
+                range_size: range.size(),
+            });
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let mut logical_start = 0_u64;
+        let mut copied = 0_usize;
+        for segment in range.segments() {
+            let logical_end = logical_start
+                .checked_add(segment.size())
+                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+            let write_start = offset.max(logical_start);
+            let write_end = end.min(logical_end);
+            if write_start < write_end {
+                if !segment.permissions().contains(MemoryPermissions::WRITE) {
+                    return Err(CanonicalWriteBatchError::PermissionDenied {
+                        page: segment.page(),
+                        available: segment.permissions(),
+                    });
+                }
+                let pending = match self.pages.entry(segment.page()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let (page_bytes, generation, visibility_epoch) = segment
+                            .backing()
+                            .snapshot_cpu_write()
+                            .map_err(CanonicalWriteBatchError::Page)?;
+                        entry.insert(PendingCanonicalPageWrite {
+                            backing: segment.backing().clone(),
+                            expected_generation: generation,
+                            expected_visibility_epoch: visibility_epoch,
+                            bytes: page_bytes,
+                        })
+                    }
+                };
+                let within_segment = write_start - logical_start;
+                let page_offset = segment
+                    .offset()
+                    .checked_add(within_segment)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                let page_offset = usize::try_from(page_offset)
+                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                let count = usize::try_from(write_end - write_start)
+                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                let copied_end = copied
+                    .checked_add(count)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                pending.bytes[page_offset..page_offset + count]
+                    .copy_from_slice(&bytes[copied..copied_end]);
+                copied = copied_end;
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        if copied != bytes.len() {
+            return Err(CanonicalWriteBatchError::IncompleteRange);
+        }
+        Ok(())
+    }
+
+    /// Publishes every staged byte mutation and advances each page once.
+    pub fn commit(self) -> Result<(), CanonicalWriteBatchError> {
+        struct Write {
+            expected_generation: ContentGeneration,
+            expected_visibility_epoch: u64,
+            next_generation: ContentGeneration,
+            next_visibility_epoch: u64,
+            bytes: Option<Box<[u8]>>,
+        }
+
+        let mut backings = Vec::new();
+        let mut writes = Vec::new();
+        backings
+            .try_reserve_exact(self.pages.len())
+            .map_err(|_| CanonicalWriteBatchError::ResourceExhausted)?;
+        writes
+            .try_reserve_exact(self.pages.len())
+            .map_err(|_| CanonicalWriteBatchError::ResourceExhausted)?;
+        for pending in self.pages.into_values() {
+            let next_generation = pending
+                .expected_generation
+                .next()
+                .map_err(CanonicalWriteBatchError::GenerationExhausted)?;
+            let next_visibility_epoch = pending
+                .expected_visibility_epoch
+                .checked_add(1)
+                .ok_or(CanonicalWriteBatchError::VisibilityEpochExhausted)?;
+            backings.push(pending.backing);
+            writes.push(Write {
+                expected_generation: pending.expected_generation,
+                expected_visibility_epoch: pending.expected_visibility_epoch,
+                next_generation,
+                next_visibility_epoch,
+                bytes: Some(pending.bytes),
+            });
+        }
+
+        let mut states = backings
+            .iter()
+            .map(CanonicalBackingPage::lock_state)
+            .collect::<Vec<_>>();
+        for (state, write) in states.iter().zip(&writes) {
+            if state.generation != write.expected_generation
+                || state.visibility_epoch != write.expected_visibility_epoch
+                || !matches!(
+                    state.visibility,
+                    PageVisibility::Clean | PageVisibility::CpuNewer
+                )
+            {
+                return Err(CanonicalWriteBatchError::ConcurrentMutation);
+            }
+        }
+        for (state, write) in states.iter_mut().zip(&mut writes) {
+            state.bytes = write.bytes.take();
+            state.generation = write.next_generation;
+            state.visibility = PageVisibility::CpuNewer;
+            state.visibility_epoch = write.next_visibility_epoch;
+        }
+        Ok(())
+    }
+}
+
+/// Failure while staging or atomically committing canonical writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalWriteBatchError {
+    RangeOverflow,
+    OutOfBounds {
+        offset: u64,
+        size: u64,
+        range_size: u64,
+    },
+    PermissionDenied {
+        page: CanonicalPageId,
+        available: MemoryPermissions,
+    },
+    IncompleteRange,
+    Page(CanonicalPageError),
+    GenerationExhausted(GenerationExhausted),
+    VisibilityEpochExhausted,
+    ConcurrentMutation,
+    ResourceExhausted,
+}
+
+impl Display for CanonicalWriteBatchError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RangeOverflow => formatter.write_str("canonical write batch range overflows"),
+            Self::OutOfBounds {
+                offset,
+                size,
+                range_size,
+            } => write!(
+                formatter,
+                "canonical write batch offset={offset:#x} size={size:#x} exceeds range-size={range_size:#x}"
+            ),
+            Self::PermissionDenied { page, available } => write!(
+                formatter,
+                "canonical write batch permission denied for {page}: required=0x{:x} available=0x{:x}",
+                MemoryPermissions::WRITE.bits(),
+                available.bits()
+            ),
+            Self::IncompleteRange => {
+                formatter.write_str("canonical write batch range is incomplete")
+            }
+            Self::Page(error) => write!(
+                formatter,
+                "canonical write batch page access failed: {error}"
+            ),
+            Self::GenerationExhausted(error) => error.fmt(formatter),
+            Self::VisibilityEpochExhausted => {
+                formatter.write_str("canonical write batch visibility epoch is exhausted")
+            }
+            Self::ConcurrentMutation => {
+                formatter.write_str("canonical bytes changed while a write batch was staged")
+            }
+            Self::ResourceExhausted => {
+                formatter.write_str("canonical write batch exhausted host resources")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CanonicalWriteBatchError {}
 
 /// Failure while creating or accessing canonical RAM backing.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1057,5 +1332,59 @@ mod tests {
         );
         assert_eq!(page.visibility_state(), VisibilityState::Invalid);
         assert!(coordinator.downloads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_write_batch_commits_cross_page_bytes_once() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let generations = range
+            .segments()
+            .iter()
+            .map(CanonicalBackingSegment::content_generation)
+            .collect::<Vec<_>>();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0x0ffe, &[1, 2, 3, 4]).unwrap();
+
+        let mut before = [0xff; 4];
+        allocation.read(0x0ffe, &mut before).unwrap();
+        assert_eq!(before, [0; 4]);
+        batch.commit().unwrap();
+
+        allocation.read(0x0ffe, &mut before).unwrap();
+        assert_eq!(before, [1, 2, 3, 4]);
+        for (segment, previous) in allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap()
+            .segments()
+            .iter()
+            .zip(generations)
+        {
+            assert_eq!(segment.content_generation(), previous.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn canonical_write_batch_rejects_every_page_after_a_concurrent_mutation() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0x0fff, &[0xaa, 0xbb]).unwrap();
+        allocation.write(0x1000, &[0x55]).unwrap();
+
+        assert_eq!(
+            batch.commit(),
+            Err(CanonicalWriteBatchError::ConcurrentMutation)
+        );
+        let mut first = [0xff; 1];
+        let mut second = [0xff; 1];
+        allocation.read(0x0fff, &mut first).unwrap();
+        allocation.read(0x1000, &mut second).unwrap();
+        assert_eq!(first, [0]);
+        assert_eq!(second, [0x55]);
     }
 }

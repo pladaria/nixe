@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter, Write};
 use nixe_gpu::GraphicsGapKind;
 use nixe_gpu_maxwell::{
     MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError, MaxwellScheduleError,
-    MaxwellUnsupportedGpfifoSubmission,
+    MaxwellSoftwareInitializationError, MaxwellUnsupportedGpfifoSubmission,
 };
 use nixe_memory::CanonicalRangeTranslationError;
 
@@ -127,6 +127,11 @@ pub enum UnsupportedNvDrvOperation {
         context: NvDrvErrorContext,
         boundary: Box<MaxwellFrontendDispatchBoundary>,
     },
+    ScheduledGpfifoExecution {
+        context: NvDrvErrorContext,
+        boundary: Box<MaxwellFrontendDispatchBoundary>,
+        error: Box<MaxwellSoftwareInitializationError>,
+    },
     CanonicalMemory {
         context: NvDrvErrorContext,
         fault: CanonicalRangeTranslationError,
@@ -147,7 +152,9 @@ impl UnsupportedNvDrvOperation {
             | Self::GpfifoMemory { .. }
             | Self::GpfifoScheduling { .. }
             | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
-            Self::ScheduledGpfifoSubmission { .. } => GraphicsGapKind::GpuPacket,
+            Self::ScheduledGpfifoSubmission { .. } | Self::ScheduledGpfifoExecution { .. } => {
+                GraphicsGapKind::GpuPacket
+            }
         }
     }
 }
@@ -217,6 +224,20 @@ impl Display for UnsupportedNvDrvOperation {
                 context.request(),
                 context.fd(),
                 context.reason(),
+                boundary
+            ),
+            Self::ScheduledGpfifoExecution {
+                context,
+                boundary,
+                error,
+            } => write!(
+                formatter,
+                "validated GPFIFO work cannot execute through the immediate Maxwell initialization path: device={} request={:#010x} fd={} reason={} detail=[{}] dispatch=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                error,
                 boundary
             ),
             Self::CanonicalMemory { context, fault } => {

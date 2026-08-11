@@ -3,14 +3,14 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
-use nixe_memory::MemoryPermissions;
+use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
 use crate::{
-    MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationError,
-    MaxwellComputeSynchronizationPlan, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
-    MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellMethodSource, MaxwellResolvedRange,
-    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
-    MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
+    MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellEngineOperation,
+    MaxwellEnginePacketDispatch, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
+    MaxwellMethodSource, MaxwellResolvedRange, MaxwellThreeDInlineConstantBufferUpload,
+    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
+    MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
     resolve_maxwell_three_d_resources,
@@ -59,6 +59,64 @@ impl MaxwellSubmissionExecutionPlan {
     }
 }
 
+/// Successful immediate software execution of an initialization submission.
+pub struct MaxwellSoftwareInitializationCompletion {
+    staged_cache: MaxwellThreeDLoweringCache,
+    completion: Option<GuestTimelinePoint>,
+}
+
+impl MaxwellSoftwareInitializationCompletion {
+    #[must_use]
+    pub const fn staged_cache(&self) -> &MaxwellThreeDLoweringCache {
+        &self.staged_cache
+    }
+
+    #[must_use]
+    pub const fn completion(&self) -> Option<GuestTimelinePoint> {
+        self.completion
+    }
+}
+
+/// Failure before an initialization submission publishes bytes or completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaxwellSoftwareInitializationError {
+    UnsupportedThreeDWork,
+    OperationAfterCompletionSignal,
+    InconsistentWaitForIdlePlan,
+    StaleInlineTarget {
+        source: MaxwellMethodSource,
+        error: MaxwellGpuAccessError,
+    },
+    InlineWrite {
+        source: MaxwellMethodSource,
+        error: CanonicalWriteBatchError,
+    },
+}
+
+impl Display for MaxwellSoftwareInitializationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedThreeDWork => formatter.write_str(
+                "submission contains 3D work which requires shader translation and a neutral backend",
+            ),
+            Self::OperationAfterCompletionSignal => formatter.write_str(
+                "submission contains executable work after its completion signal",
+            ),
+            Self::InconsistentWaitForIdlePlan => formatter.write_str(
+                "submission WAIT_FOR_IDLE plan does not match its ordered execution prefix",
+            ),
+            Self::StaleInlineTarget { source, error } => {
+                write!(formatter, "inline upload target changed before execution: {source}: {error}")
+            }
+            Self::InlineWrite { source, error } => {
+                write!(formatter, "inline upload could not be staged atomically: {source}: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MaxwellSoftwareInitializationError {}
+
 /// Failure before any guest write, backend submission, or fence publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellSubmissionExecutionError {
@@ -66,7 +124,6 @@ pub enum MaxwellSubmissionExecutionError {
         source: MaxwellMethodSource,
         error: MaxwellGpuAccessError,
     },
-    ComputeSynchronization(MaxwellComputeSynchronizationError),
     ThreeDResource(MaxwellThreeDResourceError),
     ThreeDLowering(MaxwellThreeDLoweringError),
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
@@ -87,7 +144,6 @@ impl Display for MaxwellSubmissionExecutionError {
                     "inline upload target is invalid: {source}: {error}"
                 )
             }
-            Self::ComputeSynchronization(error) => Display::fmt(error, formatter),
             Self::ThreeDResource(error) => Display::fmt(error, formatter),
             Self::ThreeDLowering(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
@@ -142,9 +198,8 @@ pub fn preflight_maxwell_submission_execution(
                 prior_work_pending = true;
             }
             MaxwellEngineOperation::ComputeSynchronization(operation) => {
-                let plan = lower_maxwell_compute_synchronization(operation, prior_work_pending)
-                    .map_err(MaxwellSubmissionExecutionError::ComputeSynchronization)?;
-                if matches!(plan, MaxwellComputeSynchronizationPlan::Neutral) {
+                let plan = lower_maxwell_compute_synchronization(operation, prior_work_pending);
+                if matches!(plan, MaxwellComputeSynchronizationPlan::WaitForIdle { .. }) {
                     prior_work_pending = false;
                 }
                 steps.push(MaxwellSubmissionExecutionStep::ComputeSynchronization(plan));
@@ -217,6 +272,174 @@ pub fn preflight_maxwell_submission_execution(
     })
 }
 
+/// Executes a completely preflighted write-only initialization submission.
+///
+/// Inline payloads are staged into one canonical-memory transaction. Ordering
+/// methods are validated before the transaction commits, and this function
+/// neither consumes nor publishes a guest timeline reservation. Clear, draw,
+/// or any other 3D backend work remains a typed later boundary.
+pub fn execute_maxwell_software_initialization(
+    plan: MaxwellSubmissionExecutionPlan,
+    address_space: &MaxwellGpuAddressSpace,
+) -> Result<MaxwellSoftwareInitializationCompletion, MaxwellSoftwareInitializationError> {
+    let mut writes = CanonicalWriteBatch::new();
+    let mut prior_work_pending = false;
+    let mut completion_seen = false;
+
+    for step in &plan.steps {
+        if completion_seen {
+            return Err(MaxwellSoftwareInitializationError::OperationAfterCompletionSignal);
+        }
+        match step {
+            MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut writes,
+                )?;
+                prior_work_pending = true;
+            }
+            MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut writes,
+                )?;
+                prior_work_pending = true;
+            }
+            MaxwellSubmissionExecutionStep::ComputeSynchronization(
+                MaxwellComputeSynchronizationPlan::WaitForIdle {
+                    prior_work_pending: planned,
+                },
+            ) => {
+                if *planned != prior_work_pending {
+                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
+                }
+                prior_work_pending = false;
+            }
+            MaxwellSubmissionExecutionStep::ComputeSynchronization(
+                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
+            ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. },
+            ) => {
+                prior_work_pending = false;
+            }
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. },
+            ) => {
+                prior_work_pending = false;
+                completion_seen = true;
+            }
+            MaxwellSubmissionExecutionStep::ThreeD(_) => {
+                return Err(MaxwellSoftwareInitializationError::UnsupportedThreeDWork);
+            }
+        }
+    }
+
+    writes
+        .commit()
+        .map_err(|error| MaxwellSoftwareInitializationError::InlineWrite {
+            source: plan
+                .steps
+                .iter()
+                .rev()
+                .find_map(|step| match step {
+                    MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, .. } => {
+                        Some(upload.source())
+                    }
+                    MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
+                        upload, ..
+                    } => Some(upload.source()),
+                    _ => None,
+                })
+                .expect("a non-empty canonical write batch has an inline source"),
+            error,
+        })?;
+
+    Ok(MaxwellSoftwareInitializationCompletion {
+        staged_cache: plan.staged_cache,
+        completion: plan.completion,
+    })
+}
+
+fn stage_inline_write(
+    address_space: &MaxwellGpuAddressSpace,
+    target: &MaxwellResolvedRange,
+    bytes: [u8; 4],
+    source: MaxwellMethodSource,
+    writes: &mut CanonicalWriteBatch,
+) -> Result<(), MaxwellSoftwareInitializationError> {
+    if target.address_space() != address_space.id() {
+        return Err(MaxwellSoftwareInitializationError::StaleInlineTarget {
+            source,
+            error: MaxwellGpuAccessError::WrongAddressSpace {
+                expected: target.address_space(),
+                actual: address_space.id(),
+            },
+        });
+    }
+    if !target.permissions().contains(MemoryPermissions::WRITE) {
+        return Err(MaxwellSoftwareInitializationError::StaleInlineTarget {
+            source,
+            error: MaxwellGpuAccessError::PermissionDenied {
+                address: target.offset(),
+                required: MemoryPermissions::WRITE,
+                available: target.permissions(),
+            },
+        });
+    }
+    if target.size() != bytes.len() as u64 {
+        return Err(MaxwellSoftwareInitializationError::StaleInlineTarget {
+            source,
+            error: MaxwellGpuAccessError::OutputSizeMismatch {
+                expected: target.size(),
+                actual: bytes.len() as u64,
+            },
+        });
+    }
+    for segment in target.segments() {
+        if !address_space.retained_mapping_is_current(segment.mapping()) {
+            return Err(MaxwellSoftwareInitializationError::StaleInlineTarget {
+                source,
+                error: MaxwellGpuAccessError::StaleMapping {
+                    mapping: segment.mapping().id(),
+                    generation: segment.mapping().generation(),
+                },
+            });
+        }
+    }
+
+    let mut copied = 0_usize;
+    for segment in target.segments() {
+        let size = usize::try_from(segment.size()).map_err(|_| {
+            MaxwellSoftwareInitializationError::StaleInlineTarget {
+                source,
+                error: MaxwellGpuAccessError::ArithmeticOverflow,
+            }
+        })?;
+        let end = copied.checked_add(size).ok_or(
+            MaxwellSoftwareInitializationError::StaleInlineTarget {
+                source,
+                error: MaxwellGpuAccessError::ArithmeticOverflow,
+            },
+        )?;
+        writes
+            .stage(
+                segment.mapping().backing(),
+                segment.backing_offset(),
+                &bytes[copied..end],
+            )
+            .map_err(|error| MaxwellSoftwareInitializationError::InlineWrite { source, error })?;
+        copied = end;
+    }
+    Ok(())
+}
+
 fn resolve_inline_target(
     address_space: &MaxwellGpuAddressSpace,
     base: u64,
@@ -242,13 +465,14 @@ mod tests {
         FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
         GuestTimeline, MappingGeneration, TimelineInstanceId, TimelineOwnerId,
     };
+    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 
     use super::*;
     use crate::{
-        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellChannelId,
-        MaxwellChannelOwner, MaxwellGpfifoSourceLocation, MaxwellGpuChannel, MaxwellMappingId,
-        MaxwellPushbufferWord, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
-        dispatch_maxwell_engine_packet,
+        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
+        MaxwellChannelId, MaxwellChannelOwner, MaxwellGpfifoSourceLocation, MaxwellGpuChannel,
+        MaxwellMapRequest, MaxwellMappingId, MaxwellPushbufferWord, SWITCH_1_GM20B_PROFILE,
+        decode_maxwell_pushbuffer, dispatch_maxwell_engine_packet,
     };
 
     fn packet(
@@ -391,5 +615,98 @@ mod tests {
             Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal { reserved })
                 if reserved == reservation.point()
         ));
+    }
+
+    #[test]
+    fn wait_for_idle_orders_an_atomic_software_initialization_prefix() {
+        let mut address_space = address_space();
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset().get();
+
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(1, 0, &[SWITCH_1_GM20B_PROFILE.classes().compute().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        for setup in [
+            packet(1, 0x0188 / 4, &[(address >> 32) as u32, address as u32]),
+            packet(1, 0x0180 / 4, &[4, 1]),
+            packet(1, 0x01b0 / 4, &[0x41]),
+        ] {
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(2),
+                &setup.packets()[0],
+            )
+            .unwrap();
+        }
+        let data = packet(1, 0x01b4 / 4, &[0xfeed_beef]);
+        let data_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &data.packets()[0],
+        )
+        .unwrap();
+        let wait = packet(1, 0x0110 / 4, &[0]);
+        let wait_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &wait.packets()[0],
+        )
+        .unwrap();
+
+        let plan = preflight_maxwell_submission_execution(
+            &[data_dispatch, wait_dispatch],
+            &address_space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.steps(),
+            [
+                MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target },
+                MaxwellSubmissionExecutionStep::ComputeSynchronization(
+                    MaxwellComputeSynchronizationPlan::WaitForIdle {
+                        prior_work_pending: true,
+                    }
+                ),
+            ] if upload.value() == 0xfeed_beef
+                && target.offset().get() == address
+        ));
+
+        let mut bytes = [0xff; 4];
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
+
+        let completion = execute_maxwell_software_initialization(plan, &address_space).unwrap();
+        assert_eq!(completion.completion(), None);
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, 0xfeed_beef_u32.to_le_bytes());
     }
 }

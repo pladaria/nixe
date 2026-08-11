@@ -19,8 +19,8 @@ pub use compute::{
     MaxwellComputeOperationTrigger, MaxwellComputeProgramState, MaxwellComputeRegister,
     MaxwellComputeRegisterOrigin, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
-    MaxwellComputeSynchronizationError, MaxwellComputeSynchronizationPlan,
-    MaxwellComputeTriggeredOperation, lower_maxwell_compute_synchronization,
+    MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
+    lower_maxwell_compute_synchronization,
 };
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
@@ -12759,11 +12759,7 @@ mod tests {
             );
             assert_eq!(
                 lower_maxwell_compute_synchronization(&dispatch.compute_operations()[index], true),
-                Ok(
-                    MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi {
-                        caches: expected,
-                    }
-                )
+                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches: expected }
             );
         }
         let captured = match dispatch.compute_operations()[0].trigger() {
@@ -12938,13 +12934,16 @@ mod tests {
             assert_eq!(operation.state(), &compute_before);
             assert_eq!(
                 lower_maxwell_compute_synchronization(operation, false),
-                Ok(MaxwellComputeSynchronizationPlan::Neutral)
+                MaxwellComputeSynchronizationPlan::WaitForIdle {
+                    prior_work_pending: false,
+                }
             );
-            assert!(matches!(
+            assert_eq!(
                 lower_maxwell_compute_synchronization(operation, true),
-                Err(MaxwellComputeSynchronizationError::PendingWork { source })
-                    if source.argument() == value
-            ));
+                MaxwellComputeSynchronizationPlan::WaitForIdle {
+                    prior_work_pending: true,
+                }
+            );
         }
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.compute(), &compute_before);

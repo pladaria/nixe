@@ -344,6 +344,41 @@ impl NvHostControl {
             })
     }
 
+    /// Executes an already preflighted immediate submission and publishes its
+    /// reservation only after the supplied canonical-memory transaction
+    /// succeeds. The closure cannot access this control object, so timeline
+    /// ordering cannot change between validation and publication.
+    pub(super) fn complete_immediate_channel_submission<E>(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+        completion: &ReservedTimelinePoint,
+        execute: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<GuestTimelinePoint, E>, NvDrvCallError> {
+        let owner = timeline_owner(descriptor);
+        let id = completion.point().syncpoint();
+        self.timeline_mut(descriptor, id)?
+            .validate_advance(owner, completion)
+            .map_err(|_| {
+                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                    context: context(
+                        descriptor,
+                        request,
+                        NvDrvValidationReason::TimelineOrderingUnavailable,
+                    ),
+                })
+            })?;
+        if let Err(error) = execute() {
+            return Ok(Err(error));
+        }
+        let point = self
+            .timeline_mut(descriptor, id)?
+            .advance(owner, completion)
+            .expect("validated timeline cannot change during immediate execution");
+        self.signal_reached(point.syncpoint(), point.value());
+        Ok(Ok(point))
+    }
+
     #[cfg(test)]
     pub(super) fn has_timeline(&self, id: GuestSyncpointId) -> bool {
         self.timelines.contains_key(&id)
@@ -1140,6 +1175,46 @@ mod tests {
             published.guest_point().value(),
         );
         assert!(event.is_signalled());
+    }
+
+    #[test]
+    fn immediate_completion_publishes_only_after_software_execution_succeeds() {
+        let mut control = NvHostControl::default();
+        let owner = timeline_owner(descriptor());
+        let reservation = control
+            .timeline_mut(descriptor(), GuestSyncpointId::new(3))
+            .unwrap()
+            .reserve(owner, 1)
+            .unwrap();
+
+        let failed = control
+            .complete_immediate_channel_submission(
+                descriptor(),
+                IOCTL_SYNCPT_INCREMENT,
+                &reservation,
+                || Err::<(), _>("software failure"),
+            )
+            .unwrap();
+        assert_eq!(failed, Err("software failure"));
+        assert_eq!(
+            control
+                .timeline(descriptor(), GuestSyncpointId::new(3))
+                .unwrap()
+                .current_point()
+                .value(),
+            GuestSyncpointValue::new(0)
+        );
+
+        let completed = control
+            .complete_immediate_channel_submission(
+                descriptor(),
+                IOCTL_SYNCPT_INCREMENT,
+                &reservation,
+                || Ok::<(), &str>(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed, reservation.point());
     }
 
     #[test]

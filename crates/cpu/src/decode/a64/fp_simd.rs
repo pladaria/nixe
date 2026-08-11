@@ -5,6 +5,8 @@ use crate::{decode::table::InstructionPattern, profile::InstructionFeature};
 use super::{A64HelperToken, pattern};
 
 const SIMD: &[InstructionFeature] = &[InstructionFeature::AdvancedSimd];
+const SIMD_FP16: &[InstructionFeature] =
+    &[InstructionFeature::AdvancedSimd, InstructionFeature::Fp16];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
@@ -302,7 +304,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-compare-register",
-        0xff20_fc1f,
+        0xffa0_fc0f,
         0x1e20_2000,
         0x0000_0036,
         108,
@@ -311,7 +313,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-compare-zero",
-        0xff3f_fc1f,
+        0xffbf_fc0f,
         0x1e20_2008,
         0x0000_0037,
         107,
@@ -383,6 +385,18 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 EXT selects a byte-aligned window from the concatenation of two
+    // 64-bit or 128-bit vectors, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/EXT--Extract-vector-from-pair-of-vectors-
+    pattern(
+        "simd-extract",
+        0xbf20_8400,
+        0x2e00_0000,
+        0x0000_0085,
+        171,
+        &[],
+        SIMD,
+    ),
     // Arm A64 SHRN/SHRN2 shifts unsigned lane bit patterns right and narrows
     // them into the lower or upper 64-bit half of the destination:
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHRN--SHRN2--Shift-right-narrow--immediate--
@@ -439,6 +453,209 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 Advanced SIMD integer-to-floating-point vector conversions,
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--vector---Signed-integer-Convert-to-Floating-point--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--vector---Unsigned-integer-Convert-to-Floating-point--vector--
+    pattern(
+        "simd-signed-int-to-float",
+        0xbfbf_fc00,
+        0x0e21_d800,
+        0x0000_006a,
+        160,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-int-to-float",
+        0xbfbf_fc00,
+        0x2e21_d800,
+        0x0000_006b,
+        160,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FDIV (vector), Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--vector---Floating-point-Divide--vector--
+    pattern(
+        "simd-floating-point-divide",
+        0xbfa0_fc00,
+        0x2e20_fc00,
+        0x0000_006c,
+        161,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FMOV (scalar, immediate), including the optional half-precision
+    // form, Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--scalar--immediate---Floating-point-Move-immediate--scalar--
+    pattern(
+        "fp-scalar-immediate",
+        0xffa0_1fe0,
+        0x1e20_1000,
+        0x0000_006d,
+        163,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-immediate-half",
+        0xffe0_1fe0,
+        0x1ee0_1000,
+        0x0000_006e,
+        164,
+        &[],
+        SIMD_FP16,
+    ),
+    // Arm A64 FCVT (scalar) base single/double precision conversions. The
+    // optional half-precision forms remain behind the recognized fallback.
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVT--scalar---Floating-point-Convert-precision--scalar--
+    pattern(
+        "fp-convert-single-to-double",
+        0xffff_fc00,
+        0x1e22_c000,
+        0x0000_006f,
+        165,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-convert-double-to-single",
+        0xffff_fc00,
+        0x1e62_4000,
+        0x0000_0070,
+        165,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FDIV (scalar), base single/double precision forms. The optional
+    // half-precision form remains behind the recognized fallback.
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--scalar---Floating-point-Divide--scalar--
+    pattern(
+        "fp-scalar-floating-point-divide",
+        0xffa0_fc00,
+        0x1e20_1800,
+        0x0000_0071,
+        166,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FADD/FSUB (scalar), base single/double precision forms. They
+    // supersede the broad legacy scalar-two-source classifier while optional
+    // half precision remains behind that typed boundary. Arm ARM DDI 0602
+    // (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FADD--scalar---Floating-point-Add--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FSUB--scalar---Floating-point-Subtract--scalar--
+    pattern(
+        "fp-scalar-floating-point-add",
+        0xffa0_fc00,
+        0x1e20_2800,
+        0x0000_0079,
+        168,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-floating-point-subtract",
+        0xffa0_fc00,
+        0x1e20_3800,
+        0x0000_007a,
+        168,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FMUL/FNMUL (scalar), base single/double precision forms. The
+    // optional half-precision forms remain behind the recognized fallback.
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--scalar---Floating-point-Multiply--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMUL--Floating-point-Negated-Multiply--scalar--
+    pattern(
+        "fp-scalar-floating-point-multiply",
+        0xffa0_fc00,
+        0x1e20_0800,
+        0x0000_007b,
+        169,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-floating-point-negated-multiply",
+        0xffa0_fc00,
+        0x1e20_8800,
+        0x0000_007c,
+        169,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FRINTN/P/M/Z/A/X/I (scalar), base single/double precision
+    // forms. Optional half-precision and later FRINT32/64 forms remain behind
+    // the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FRINTN--FRINTP--FRINTM--FRINTZ--FRINTA--FRINTX--FRINTI--Floating-point-Round-to-Integer--scalar--
+    pattern(
+        "fp-scalar-round-nearest-even",
+        0xffbf_fc00,
+        0x1e24_4000,
+        0x0000_0072,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-positive",
+        0xffbf_fc00,
+        0x1e24_c000,
+        0x0000_0073,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-negative",
+        0xffbf_fc00,
+        0x1e25_4000,
+        0x0000_0074,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-zero",
+        0xffbf_fc00,
+        0x1e25_c000,
+        0x0000_0075,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-nearest-away",
+        0xffbf_fc00,
+        0x1e26_4000,
+        0x0000_0076,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-exact",
+        0xffbf_fc00,
+        0x1e27_4000,
+        0x0000_0077,
+        167,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-round-current-mode",
+        0xffbf_fc00,
+        0x1e27_c000,
+        0x0000_0078,
+        167,
+        &[],
+        SIMD,
+    ),
     pattern(
         "advanced-simd-fallback",
         0x1e00_0000,
@@ -457,9 +674,15 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 SCVTF/UCVTF (scalar, integer), restricted here to the base
+    // W/X-to-S/D forms used by Switch1. Optional FP16 forms remain behind the
+    // recognized floating-point fallback until their feature-gated semantics
+    // are implemented. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--scalar--integer---Signed-integer-Convert-to-Floating-point--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--scalar--integer---Unsigned-integer-Convert-to-Floating-point--scalar--
     pattern(
         "fp-signed-int-to-float",
-        0x5f3f_fc00,
+        0x5fbf_fc00,
         0x1e22_0000,
         0x0000_003a,
         106,
@@ -468,16 +691,21 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-unsigned-int-to-float",
-        0x5f3f_fc00,
+        0x5fbf_fc00,
         0x1e23_0000,
         0x0000_003b,
         105,
         &[],
         SIMD,
     ),
+    // Arm A64 FCVTZS/FCVTZU (scalar, integer), covering the base S/D-to-W/X
+    // forms. Both operations round toward zero and return a saturated integer
+    // for an out-of-range operand. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-toward-Zero--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-toward-Zero--scalar--
     pattern(
         "fp-float-to-signed-int",
-        0x5f3f_fc00,
+        0x5fbf_fc00,
         0x1e38_0000,
         0x0000_003c,
         104,
@@ -486,10 +714,94 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-float-to-unsigned-int",
-        0x5f3f_fc00,
+        0x5fbf_fc00,
         0x1e39_0000,
         0x0000_003d,
         103,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 scalar floating-point to integer conversions with an explicit
+    // rounding direction. These cover the base S/D-to-W/X forms; optional
+    // FP16 forms remain classified by the feature-gated fallback. Arm ARM
+    // DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTNS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-to-nearest-with-ties-to-even--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTNU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-to-nearest-with-ties-to-even--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTPS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-toward-Plus-infinity--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTPU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-toward-Plus-infinity--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTMS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-toward-Minus-infinity--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTMU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-toward-Minus-infinity--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTAS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-to-nearest-with-ties-away-from-zero--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTAU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-to-nearest-with-ties-away-from-zero--scalar--
+    pattern(
+        "fp-float-to-signed-int-nearest-even",
+        0x5fbf_fc00,
+        0x1e20_0000,
+        0x0000_007d,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-unsigned-int-nearest-even",
+        0x5fbf_fc00,
+        0x1e21_0000,
+        0x0000_007e,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-signed-int-nearest-away",
+        0x5fbf_fc00,
+        0x1e24_0000,
+        0x0000_007f,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-unsigned-int-nearest-away",
+        0x5fbf_fc00,
+        0x1e25_0000,
+        0x0000_0080,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-signed-int-positive",
+        0x5fbf_fc00,
+        0x1e28_0000,
+        0x0000_0081,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-unsigned-int-positive",
+        0x5fbf_fc00,
+        0x1e29_0000,
+        0x0000_0082,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-signed-int-negative",
+        0x5fbf_fc00,
+        0x1e30_0000,
+        0x0000_0083,
+        170,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-unsigned-int-negative",
+        0x5fbf_fc00,
+        0x1e31_0000,
+        0x0000_0084,
+        170,
         &[],
         SIMD,
     ),
@@ -582,9 +894,16 @@ pub struct Operands {
     pub pairwise_operation: Option<PairwiseOperation>,
     pub permute_operation: Option<PermuteOperation>,
     pub compare_with_zero: bool,
+    pub signaling_compare: bool,
     pub operation_bit: bool,
     pub immediate_4: u8,
     pub element_size: u8,
+    pub fp_immediate_8: u8,
+    pub float_conversion: Option<FloatConversion>,
+    pub float_to_integer_rounding: Option<FloatToIntegerRounding>,
+    pub float_round_operation: Option<FloatRoundOperation>,
+    pub float_add_operation: Option<FloatAddOperation>,
+    pub float_multiply_operation: Option<FloatMultiplyOperation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -628,6 +947,44 @@ pub enum PermuteOperation {
     TransposeSecondary,
     ZipPrimary,
     ZipSecondary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatConversion {
+    SingleToDouble,
+    DoubleToSingle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatToIntegerRounding {
+    NearestEven,
+    NearestAway,
+    TowardPositive,
+    TowardNegative,
+    TowardZero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatRoundOperation {
+    NearestEven,
+    TowardPositive,
+    TowardNegative,
+    TowardZero,
+    NearestAway,
+    Exact,
+    CurrentMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatAddOperation {
+    Add,
+    Subtract,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatMultiplyOperation {
+    Multiply,
+    NegatedMultiply,
 }
 
 macro_rules! instructions {
@@ -674,10 +1031,20 @@ instructions!(
     MemorySingleStructure,
     MemorySingleStructurePostIndex,
     PermuteTwoSource,
+    Extract,
     IntegerCompare,
     IntegerPairwise,
     IntegerMinMax,
     ShiftRightNarrow,
+    VectorSignedIntToFloat,
+    VectorUnsignedIntToFloat,
+    VectorFloatDivide,
+    ScalarFloatImmediate,
+    ScalarFloatConvert,
+    ScalarFloatDivide,
+    ScalarFloatRound,
+    ScalarFloatAdd,
+    ScalarFloatMultiply,
 );
 
 pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
@@ -715,9 +1082,44 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
                 .expect("allocation validation rejects invalid SIMD two-source permutes")
         }),
         compare_with_zero: matches!(semantic_id, 0x0000_0054..=0x0000_0058),
+        signaling_compare: bits & (1 << 4) != 0,
         operation_bit: bits & (1 << 29) != 0,
         immediate_4: ((bits >> 11) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
+        fp_immediate_8: ((bits >> 13) & 0xff) as u8,
+        float_conversion: match semantic_id {
+            0x0000_006f => Some(FloatConversion::SingleToDouble),
+            0x0000_0070 => Some(FloatConversion::DoubleToSingle),
+            _ => None,
+        },
+        float_to_integer_rounding: match semantic_id {
+            0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
+            0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
+            0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
+            0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
+            0x0000_003c | 0x0000_003d => Some(FloatToIntegerRounding::TowardZero),
+            _ => None,
+        },
+        float_round_operation: match semantic_id {
+            0x0000_0072 => Some(FloatRoundOperation::NearestEven),
+            0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
+            0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
+            0x0000_0075 => Some(FloatRoundOperation::TowardZero),
+            0x0000_0076 => Some(FloatRoundOperation::NearestAway),
+            0x0000_0077 => Some(FloatRoundOperation::Exact),
+            0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
+            _ => None,
+        },
+        float_add_operation: match semantic_id {
+            0x0000_0079 => Some(FloatAddOperation::Add),
+            0x0000_007a => Some(FloatAddOperation::Subtract),
+            _ => None,
+        },
+        float_multiply_operation: match semantic_id {
+            0x0000_007b => Some(FloatMultiplyOperation::Multiply),
+            0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
+            _ => None,
+        },
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -734,8 +1136,12 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0061 => Instruction::InsertGeneral(operands),
         0x0000_003a => Instruction::SignedIntToFloat(operands),
         0x0000_003b => Instruction::UnsignedIntToFloat(operands),
-        0x0000_003c => Instruction::FloatToSignedInt(operands),
-        0x0000_003d => Instruction::FloatToUnsignedInt(operands),
+        0x0000_003c | 0x0000_007d | 0x0000_007f | 0x0000_0081 | 0x0000_0083 => {
+            Instruction::FloatToSignedInt(operands)
+        }
+        0x0000_003d | 0x0000_007e | 0x0000_0080 | 0x0000_0082 | 0x0000_0084 => {
+            Instruction::FloatToUnsignedInt(operands)
+        }
         0x0000_003e => Instruction::MoveToGeneral(operands),
         0x0000_003f => Instruction::MoveFromGeneral(operands),
         0x0000_0033 => Instruction::MemoryUnsigned(operands),
@@ -749,10 +1155,20 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0062 => Instruction::MemorySingleStructure(operands),
         0x0000_0063 => Instruction::MemorySingleStructurePostIndex(operands),
         0x0000_0064 => Instruction::PermuteTwoSource(operands),
+        0x0000_0085 => Instruction::Extract(operands),
         0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
         0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
         0x0000_0065 => Instruction::ShiftRightNarrow(operands),
         0x0000_0066..=0x0000_0069 => Instruction::IntegerMinMax(operands),
+        0x0000_006a => Instruction::VectorSignedIntToFloat(operands),
+        0x0000_006b => Instruction::VectorUnsignedIntToFloat(operands),
+        0x0000_006c => Instruction::VectorFloatDivide(operands),
+        0x0000_006d..=0x0000_006e => Instruction::ScalarFloatImmediate(operands),
+        0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),
+        0x0000_0071 => Instruction::ScalarFloatDivide(operands),
+        0x0000_0072..=0x0000_0078 => Instruction::ScalarFloatRound(operands),
+        0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
+        0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
     }
 }

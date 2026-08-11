@@ -6,8 +6,8 @@ mod state;
 
 pub use operations::{
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation,
-    MaxwellComputeSynchronizationError, MaxwellComputeSynchronizationPlan,
-    MaxwellComputeTriggeredOperation, lower_maxwell_compute_synchronization,
+    MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
+    lower_maxwell_compute_synchronization,
 };
 
 pub use state::{
