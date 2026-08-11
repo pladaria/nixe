@@ -1508,8 +1508,12 @@ emulated architectural TLB.
 
 The access descriptor retains ordering and access class, and exclusive
 reservations use physical identity and generation. The current process model
-executes one guest thread/vCPU at a time, although that execution may run on a
-host worker thread. Canonical backing now records conservative CPU/device
+executes one guest thread on one vCPU at a time. This serialized behavior is
+retained during scheduler migration as a permanent deterministic policy, which
+models all configured vCPUs while permitting only one guest slice to execute at
+once. Parallel policy will instead use at most one long-lived host worker per
+active vCPU; guest threads remain scheduler-owned runtime objects rather than
+dedicated host threads. Canonical backing now records conservative CPU/device
 visibility authority and can invoke an injected reconciliation slow path, but
 no GPU backend is connected yet. Nixe does not reproduce the complete
 multicore Arm memory model, cache hierarchy, device coherence, or all
@@ -1627,9 +1631,16 @@ interior mutability would not define a safe ABI.
 A JIT fast path will therefore need an explicit internal ownership and
 lifetime design for stable RAM pointers and metadata. Mapping mutation must be
 excluded while compiled code can use an affected pointer, or coordinated
-through exits and safepoints. If Nixe later runs multiple guest vCPUs
-concurrently, generations, exclusives, TLB invalidation, and memory ordering
-will additionally require thread-safe synchronization.
+through exits and safepoints. Before Nixe enables its planned parallel policy,
+generations, exclusives, TLB invalidation, memory ordering, mapping mutation,
+and backing lifetimes require explicit thread-safe synchronization. The
+deterministic policy remains supported after that transition and uses the same
+canonical backing and vCPU model.
+
+Every interpreter, JIT, or optional platform NCE engine uses this memory model
+as semantic authority. An NCE domain may mirror or map canonical pages only if
+it observes mapping and invalidation epochs and reconciles dirty state at its
+normalized run-slice exits; it cannot introduce an independent memory model.
 
 ### Fastmem remains an optional later backend
 

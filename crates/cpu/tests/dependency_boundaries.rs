@@ -61,3 +61,30 @@ fn dependency_table_parser_covers_target_specific_dependencies() {
 
     assert_eq!(dependency_names(manifest), ["serde", "host_runtime"]);
 }
+
+#[test]
+fn cpu_frontend_does_not_own_a_concrete_interpreter_engine() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!root.join("src/interpreter").exists());
+    let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    assert!(!library.contains("mod interpreter"));
+
+    for relative in [
+        "src/coverage.rs",
+        "src/decode/registry.rs",
+        "src/decode/table.rs",
+        "src/translate/block.rs",
+    ] {
+        let source = fs::read_to_string(root.join(relative)).unwrap();
+        for forbidden in [
+            "interpreter_coverage",
+            "registration.interpreter",
+            "pub interpreter:",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "neutral frontend source `{relative}` retains concrete interpreter metadata `{forbidden}`"
+            );
+        }
+    }
+}

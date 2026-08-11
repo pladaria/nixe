@@ -190,6 +190,26 @@ impl fmt::Display for LocationDescriptor {
     }
 }
 
+/// Returns the canonical architectural location represented by thread state.
+#[must_use]
+pub fn current_location(
+    cpu: crate::profile::ProcessCpuContext,
+    state: &crate::state::ThreadCpuState,
+) -> LocationDescriptor {
+    let (pc, execution_state) = match state {
+        crate::state::ThreadCpuState::A64(state) => (state.pc(), ExecutionState::A64),
+        crate::state::ThreadCpuState::A32(state) => (
+            u64::from(state.instruction_address()),
+            state.execution_state(),
+        ),
+    };
+    LocationDescriptor::new(
+        GuestVirtualAddress::new(pc),
+        execution_state,
+        cpu.profile().id(),
+    )
+}
+
 /// A decoded semantic instruction with mandatory source metadata.
 ///
 /// Frontends return this envelope rather than a bare decoded opcode, making it

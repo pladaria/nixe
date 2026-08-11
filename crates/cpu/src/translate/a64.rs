@@ -527,7 +527,7 @@ mod tests {
         ));
 
         // The same architectural write is visible before a deterministic
-        // unsupported exit when neither execution engine implements the hint.
+        // engine-neutral fallback boundary for an unlowered hint.
         let fallback = translate(&[0xf100_0400, 0xd503_20df]);
         assert!(fallback.operations.iter().any(|operation| matches!(
             operation.kind,
@@ -538,7 +538,7 @@ mod tests {
         )));
         assert!(matches!(
             fallback.terminator,
-            Terminator::UnsupportedInstruction { .. }
+            Terminator::InterpretOne { .. }
         ));
     }
 

@@ -5,10 +5,7 @@
 //! execution loop applies. Neither side assumes that the source was the
 //! reference interpreter, frontend IR, or a native block.
 
-use nixe_cpu::{
-    exception::ExceptionKind,
-    location::{ExecutionState, LocationDescriptor},
-};
+use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
 use nixe_memory::CanonicalRangeTranslator;
 
@@ -16,50 +13,7 @@ use crate::{
     HandleTable, ProcessExecutionStatus, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
 };
 
-/// One precise synchronous architectural exception presented to the runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ExceptionDispatchRequest {
-    source: LocationDescriptor,
-    kind: ExceptionKind,
-    syndrome: Option<u64>,
-}
-
-impl ExceptionDispatchRequest {
-    /// Creates an engine-neutral exception request.
-    #[must_use]
-    pub const fn new(
-        source: LocationDescriptor,
-        kind: ExceptionKind,
-        syndrome: Option<u64>,
-    ) -> Self {
-        Self {
-            source,
-            kind,
-            syndrome,
-        }
-    }
-
-    /// Returns the exact guest instruction which raised the exception.
-    #[must_use]
-    pub const fn source(self) -> LocationDescriptor {
-        self.source
-    }
-
-    /// Returns the architectural exception classification.
-    #[must_use]
-    pub const fn kind(self) -> ExceptionKind {
-        self.kind
-    }
-
-    /// Returns architecture-defined exception information, when available.
-    ///
-    /// For a supervisor call this is the decoded immediate. Other exception
-    /// classes may use it for an architectural syndrome once implemented.
-    #[must_use]
-    pub const fn syndrome(self) -> Option<u64> {
-        self.syndrome
-    }
-}
+pub use nixe_cpu_engine::ExceptionDispatchRequest;
 
 /// Guest continuation selected after handling an exception.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

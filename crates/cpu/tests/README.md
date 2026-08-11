@@ -17,10 +17,11 @@ Use stable document identifiers in comments and reviews. A dated document
 revision may additionally be recorded when behavior differs between revisions,
 but tests should not depend on network access or scrape Arm's website.
 
-Run the optional QEMU oracle with:
+The interpreter/IR differential suite and optional QEMU oracle are owned by
+`nixe-cpu-engine-interpreter`. Run them with:
 
 ```bash
-cargo test-differential
+cargo test-diff
 ```
 
 Robustness fuzzing is documented in [`fuzz/README.md`](../../../fuzz/README.md).

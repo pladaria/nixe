@@ -9,6 +9,7 @@ getrandom.workspace = true
 log.workspace = true
 nixe-config.workspace = true
 nixe-cpu.workspace = true
+nixe-cpu-engine.workspace = true
 nixe-loader-executable.workspace = true
 nixe-loader-content.workspace = true
 nixe-loader-storage.workspace = true
@@ -16,5 +17,6 @@ nixe-loader-title.workspace = true
 nixe-memory.workspace = true
 
 [dev-dependencies]
+nixe-cpu-engine-interpreter.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

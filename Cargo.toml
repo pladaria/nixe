@@ -3,6 +3,8 @@ members = [
     "apps/cli",
     "crates/config",
     "crates/cpu",
+    "crates/cpu-engine",
+    "crates/cpu-engine-interpreter",
     "crates/gpu",
     "crates/gpu-headless",
     "crates/gpu-maxwell",
@@ -14,6 +16,7 @@ members = [
     "crates/loader/title",
     "crates/memory",
     "crates/runtime",
+    "crates/scheduler",
     "crates/video",
     "crates/video-winit",
     "tools/xtask",
@@ -49,6 +52,8 @@ sha2 = "0.10.9"
 tempfile = "3.27"
 nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
+nixe-cpu-engine = { path = "crates/cpu-engine" }
+nixe-cpu-engine-interpreter = { path = "crates/cpu-engine-interpreter" }
 nixe-gpu = { path = "crates/gpu" }
 nixe-gpu-headless = { path = "crates/gpu-headless" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }
@@ -60,6 +65,7 @@ nixe-loader-storage = { path = "crates/loader/storage" }
 nixe-loader-title = { path = "crates/loader/title" }
 nixe-memory = { path = "crates/memory" }
 nixe-runtime = { path = "crates/runtime" }
+nixe-scheduler = { path = "crates/scheduler" }
 nixe-video = { path = "crates/video" }
 nixe-video-winit = { path = "crates/video-winit" }
 wgpu = { version = "30", default-features = false, features = [

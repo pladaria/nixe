@@ -1,6 +1,7 @@
 mod support;
 
 use std::fs;
+use std::sync::Arc;
 
 use nixe_cpu::memory::MemoryMappingPurpose;
 use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
@@ -11,6 +12,11 @@ use nixe_runtime::{
     LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, ProcessBuilder,
     RelocationState,
 };
+
+fn reference_process_builder() -> ProcessBuilder {
+    ProcessBuilder::default()
+        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+}
 
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
@@ -37,7 +43,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     };
     fs::write(directory.path().join("restricted.nsp"), build_nsp(&package)).unwrap();
     let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     assert_eq!(
         process.connect_ipc_service(IpcService::FileSystem),
         Err(IpcResultCode::ACCESS_DENIED)
@@ -60,7 +66,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     )
     .unwrap();
     let permitted_plan = Launcher::build(LauncherInput::new(permitted_directory.path())).unwrap();
-    let mut permitted = ProcessBuilder::new().build(&permitted_plan).unwrap();
+    let mut permitted = reference_process_builder().build(&permitted_plan).unwrap();
     let session = permitted
         .connect_ipc_service(IpcService::FileSystem)
         .unwrap();
@@ -100,7 +106,7 @@ fn filesystem_operations_require_effective_content_data_read_permission() {
         };
         fs::write(directory.path().join("title.nsp"), build_nsp(&package)).unwrap();
         let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-        ProcessBuilder::new().build(&plan).unwrap()
+        reference_process_builder().build(&plan).unwrap()
     }
 
     let denied_directory = tempfile::tempdir().unwrap();
@@ -305,7 +311,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .unwrap();
     assert_eq!(&second_content_bytes, b"second");
 
-    let mut process = ProcessBuilder::new().build(&plan).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     assert_eq!(process.handles().capacity_limit(), 0x40);
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);

@@ -8,7 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{InitialOperationMode, TimeMode};
+use nixe_config::{CpuEngineSelection, InitialOperationMode, TimeMode};
+use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
+use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
     UnsupportedNvDrvOperation, VideoSystem,
@@ -139,10 +141,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     };
     let virtual_clock = VirtualClock::new(clock_mode);
     let process_started = Instant::now();
+    let engine_provider = select_cpu_engine(config.cpu.engine, diagnostics)?;
     let process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
+        .with_engine_provider(engine_provider)
         .build(&plan)
         .map_err(|error| error.to_string())?;
     log::debug!("process prepared in {:?}", process_started.elapsed());
@@ -214,6 +218,45 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|_| "guest execution worker panicked".to_owned())?;
     let execution_result = finish_execution(worker_result);
     frontend_result.and(execution_result)
+}
+
+fn select_cpu_engine(
+    selection: CpuEngineSelection,
+    diagnostics: DiagnosticsPolicy,
+) -> Result<Arc<dyn EngineProvider>, String> {
+    let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
+    let registry = EngineRegistry::new([interpreter]);
+    let preference = match selection {
+        CpuEngineSelection::Auto => EnginePreference::Auto,
+        CpuEngineSelection::Interpreter => EnginePreference::Explicit(INTERPRETER_ENGINE_ID),
+    };
+    registry
+        .select(
+            nixe_runtime::ProcessBuildConfig::default().cpu_profile.id(),
+            EngineCapabilities {
+                a64: true,
+                a32: false,
+                t32: false,
+                precise_instruction_budget: true,
+                instruction_trace: diagnostics.instruction_trace,
+                native_execution: false,
+            },
+            preference,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod engine_selection_tests {
+    use super::*;
+
+    #[test]
+    fn application_composition_resolves_auto_and_explicit_interpreter() {
+        for selection in [CpuEngineSelection::Auto, CpuEngineSelection::Interpreter] {
+            let provider = select_cpu_engine(selection, DiagnosticsPolicy::default()).unwrap();
+            assert_eq!(provider.descriptor().id, INTERPRETER_ENGINE_ID);
+        }
+    }
 }
 
 fn install_interrupt_handler(control: Option<FrontendControl>) -> Result<Arc<AtomicBool>, String> {
@@ -389,7 +432,7 @@ fn execute(
             return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
         }
         let report = process
-            .run_reference(if print_trace {
+            .run(if print_trace {
                 1
             } else {
                 EXECUTION_SLICE_INSTRUCTIONS

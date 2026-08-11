@@ -22,7 +22,7 @@ use crate::{
         MappingGeneration,
     },
     error::{InstructionFetchFault, InstructionFetchFaultReason},
-    vcpu::ExclusiveReservation,
+    exclusive::ExclusiveReservation,
 };
 
 use super::common::{install_error, page_offset};

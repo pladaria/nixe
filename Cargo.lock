@@ -952,6 +952,8 @@ dependencies = [
  "ctrlc",
  "log",
  "nixe-config",
+ "nixe-cpu-engine",
+ "nixe-cpu-engine-interpreter",
  "nixe-horizon",
  "nixe-input",
  "nixe-loader-content",
@@ -979,6 +981,23 @@ dependencies = [
 name = "nixe-cpu"
 version = "0.1.0"
 dependencies = [
+ "nixe-memory",
+]
+
+[[package]]
+name = "nixe-cpu-engine"
+version = "0.1.0"
+dependencies = [
+ "nixe-cpu",
+ "nixe-memory",
+]
+
+[[package]]
+name = "nixe-cpu-engine-interpreter"
+version = "0.1.0"
+dependencies = [
+ "nixe-cpu",
+ "nixe-cpu-engine",
  "nixe-memory",
 ]
 
@@ -1014,6 +1033,7 @@ dependencies = [
  "chrono-tz",
  "log",
  "nixe-cpu",
+ "nixe-cpu-engine-interpreter",
  "nixe-gpu",
  "nixe-gpu-maxwell",
  "nixe-input",
@@ -1087,6 +1107,8 @@ dependencies = [
  "log",
  "nixe-config",
  "nixe-cpu",
+ "nixe-cpu-engine",
+ "nixe-cpu-engine-interpreter",
  "nixe-loader-content",
  "nixe-loader-executable",
  "nixe-loader-storage",
@@ -1095,6 +1117,10 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "nixe-scheduler"
+version = "0.1.0"
 
 [[package]]
 name = "nixe-video"
