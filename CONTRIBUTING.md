@@ -16,6 +16,14 @@ supported platforms.
 English is the required language for all project content, including: source code, source code comments,
 documentation, commits, etc.
 
+## Testing Guidelines
+
+We follow standard Rust conventions to separate unit and integration tests. Please adhere to the following rules:
+
+- **Unit Tests:** Place them at the bottom of the source file they test (e.g., `src/foo.rs`) inside a `#[cfg(test)] mod tests` block. Use them to verify internal logic and private functions.
+- **Integration Tests:** Place them in separate files inside the root `tests/` directory (e.g., `tests/api_tests.rs`). Use them to test the public API as an external consumer.
+- **Prohibited:** Do **NOT** put integration tests, end-to-end flows, or public API testing inside `src/lib.rs` or `mod.rs`. Keep these files focused exclusively on module definitions and internal unit tests.
+
 ## Contribution Principles
 
 - Prefer correctness and clear behavior over premature optimization.

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::exception::ExceptionKind;
@@ -24,13 +24,24 @@ use nixe_runtime::{
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
     HandleObject, HandleTable, PortEndpoint, PortError, PortObject, ProcessObject,
     ReadableEventObject, SessionEndpoint, SessionError, SessionMessage, SessionObject,
-    SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
-    TransferMemoryObject, WritableEventObject,
+    SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadCreateError,
+    ThreadCreateRequest, ThreadObject, TransferMemoryObject, WritableEventObject,
 };
+use nixe_scheduler::{GuestThreadId, ProcessId, VirtualCpuId};
 
 use crate::ipc_message::HipcRequest;
 use crate::ipc_wire::{IpcWireError, NamedPortResult, SyncRequestResult};
 use crate::{UnsupportedHorizonSvc, decode_horizon_svc};
+
+mod ipc;
+mod memory;
+mod scheduled;
+mod synchronization;
+mod thread;
+use ipc::*;
+use memory::*;
+pub use scheduled::HorizonScheduledDispatchError;
+use synchronization::{get_process_id, get_thread_id, insert_pair};
 
 pub const CURRENT_THREAD_HANDLE: u32 = 0xffff_8000;
 pub const CURRENT_PROCESS_HANDLE: u32 = 0xffff_8001;
@@ -168,6 +179,9 @@ pub enum HorizonSvcFault {
         immediate: u32,
         reason: &'static str,
     },
+    InternalRuntime {
+        operation: &'static str,
+    },
     UnsupportedNvDrv {
         immediate: u32,
         operation: crate::nvdrv::UnsupportedNvDrvOperation,
@@ -220,7 +234,8 @@ impl HorizonSvcFault {
             },
             Self::CanonicalMemory { .. }
             | Self::CanonicalBacking { .. }
-            | Self::InternalIpc { .. } => None,
+            | Self::InternalIpc { .. }
+            | Self::InternalRuntime { .. } => None,
             Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
@@ -286,6 +301,12 @@ impl Display for HorizonSvcFault {
                 formatter,
                 "Horizon SVC {immediate:#x} reached invalid emulator IPC state: {reason}"
             ),
+            Self::InternalRuntime { operation } => {
+                write!(
+                    formatter,
+                    "Horizon runtime operation {operation} violated an invariant"
+                )
+            }
             Self::UnsupportedNvDrv {
                 immediate,
                 operation,
@@ -339,14 +360,87 @@ pub struct HorizonSvcDispatcher {
     hid_system: crate::HidSystem,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
-    wait_deadlines: BTreeMap<(u64, u32), Instant>,
+    wait_deadlines: BTreeMap<(u64, u32), u64>,
+    virtual_clock: nixe_runtime::VirtualClock,
     pending_wakes: BTreeMap<u64, PendingThreadWake>,
+    pending_runtime_requests: BTreeMap<GuestThreadId, PendingRuntimeRequest>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingRuntimeRequest {
+    CreateThread {
+        entry: GuestVirtualAddress,
+        argument: u64,
+        stack_top: GuestVirtualAddress,
+        priority: i32,
+        core_id: i32,
+    },
+    StartThread {
+        object_id: u64,
+    },
+    GetThreadPriority {
+        object_id: u64,
+    },
+    SetThreadPriority {
+        object_id: u64,
+        priority: i32,
+    },
+    GetThreadCoreMask {
+        object_id: u64,
+    },
+    SetThreadCoreMask {
+        object_id: u64,
+        ideal_core: i32,
+        affinity_mask: u64,
+    },
+    SleepThread {
+        nanoseconds: i64,
+    },
+    SetThreadActivity {
+        object_id: u64,
+        paused: bool,
+    },
+    GetThreadContext {
+        object_id: u64,
+        address: GuestVirtualAddress,
+    },
+    InheritPriority {
+        owner_object_id: u64,
+        waiter_object_id: u64,
+        donation_key: u64,
+    },
+    RestorePriority {
+        object_id: u64,
+        donation_key: u64,
+    },
+    ReapThread {
+        object_id: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct PendingThreadWake {
+    events: Vec<ReadableEventObject>,
+    deadline: Option<u64>,
+}
+
+/// Compatibility view used by direct, non-coordinator dispatch tests.
+#[derive(Clone, Debug)]
+pub struct ThreadWakeSource {
     event: ReadableEventObject,
-    deadline: Option<Instant>,
+    timeout: Option<Duration>,
+}
+
+impl ThreadWakeSource {
+    #[must_use]
+    pub fn event(&self) -> ReadableEventObject {
+        self.event.clone()
+    }
+
+    #[must_use]
+    pub const fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -381,6 +475,7 @@ impl HorizonSvcDispatcher {
         time_environment: crate::TimeEnvironment,
         video_system: crate::VideoSystem,
     ) -> Self {
+        let virtual_clock = time_environment.clock();
         Self {
             observed: BTreeMap::new(),
             unknown_calls: 0,
@@ -391,7 +486,9 @@ impl HorizonSvcDispatcher {
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
+            virtual_clock,
             pending_wakes: BTreeMap::new(),
+            pending_runtime_requests: BTreeMap::new(),
         }
     }
 
@@ -439,19 +536,383 @@ impl HorizonSvcDispatcher {
         self.unknown_calls
     }
 
-    /// Sleeps the host scheduler until the suspended thread's registered event
-    /// changes or its deadline expires. Returns `false` when the suspension has
-    /// no event-backed wake condition.
-    #[must_use]
-    pub fn wait_for_thread_wakeup(&self, thread_id: u64) -> bool {
-        let Some(wait) = self.pending_wakes.get(&thread_id) else {
-            return false;
-        };
+    fn take_thread_wait(
+        &mut self,
+        thread_id: u64,
+    ) -> Option<(Vec<ReadableEventObject>, Option<Duration>)> {
+        let wait = self.pending_wakes.remove(&thread_id)?;
         let timeout = wait
             .deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let _ = wait.event.wait(timeout);
-        true
+            .map(|deadline| Duration::from_nanos(deadline.saturating_sub(self.virtual_time_ns())));
+        Some((wait.events, timeout))
+    }
+
+    /// Compatibility accessor for the deprecated direct process runner.
+    #[must_use]
+    pub fn thread_wakeup_source(&self, thread_id: u64) -> Option<ThreadWakeSource> {
+        self.pending_wakes.get(&thread_id).and_then(|wait| {
+            wait.events.first().cloned().map(|event| ThreadWakeSource {
+                event,
+                timeout: wait.deadline.map(|deadline| {
+                    Duration::from_nanos(deadline.saturating_sub(self.virtual_time_ns()))
+                }),
+            })
+        })
+    }
+
+    pub fn synchronize_virtual_time(&self, nanoseconds: u64) {
+        self.virtual_clock.advance_scheduler_to(nanoseconds);
+    }
+
+    fn virtual_time_ns(&self) -> u64 {
+        self.virtual_clock.scheduler_time_ns()
+    }
+
+    /// Applies one Horizon-to-runtime scheduler operation staged during SVC
+    /// dispatch. Returns `Ok(false)` when the calling thread staged none.
+    pub fn apply_pending_runtime_request(
+        &mut self,
+        coordinator: &mut nixe_runtime::RuntimeCoordinator,
+        process_id: ProcessId,
+        thread_id: GuestThreadId,
+    ) -> Result<bool, HorizonSvcFault> {
+        let Some(request) = self.pending_runtime_requests.remove(&thread_id) else {
+            return Ok(false);
+        };
+        let mut fully_handled = true;
+        match request {
+            PendingRuntimeRequest::CreateThread {
+                entry,
+                argument,
+                stack_top,
+                priority,
+                core_id,
+            } => {
+                let default_vcpu = coordinator
+                    .process(process_id)
+                    .ok_or(HorizonSvcFault::InternalRuntime {
+                        operation: "CreateThread",
+                    })?
+                    .initial_ideal_vcpu();
+                let ideal = if core_id == -2 {
+                    default_vcpu
+                } else if let Ok(core) = u32::try_from(core_id) {
+                    VirtualCpuId::new(core)
+                } else {
+                    self.finish_create_thread(
+                        coordinator,
+                        process_id,
+                        thread_id,
+                        Err(ThreadCreateError::InvalidVirtualCpu(VirtualCpuId::new(
+                            u32::MAX,
+                        ))),
+                    )?;
+                    return Ok(true);
+                };
+                let affinity = match coordinator.scheduler().profile().core_set([ideal]) {
+                    Ok(affinity) => affinity,
+                    Err(_) => {
+                        self.finish_create_thread(
+                            coordinator,
+                            process_id,
+                            thread_id,
+                            Err(ThreadCreateError::InvalidVirtualCpu(ideal)),
+                        )?;
+                        return Ok(true);
+                    }
+                };
+                let result = coordinator.create_thread(
+                    process_id,
+                    ThreadCreateRequest {
+                        entry,
+                        argument,
+                        stack_top,
+                        priority,
+                        ideal_vcpu: Some(ideal),
+                        affinity,
+                    },
+                );
+                self.finish_create_thread(coordinator, process_id, thread_id, result)?;
+            }
+            PendingRuntimeRequest::StartThread { object_id } => {
+                let result = coordinator.start_thread(process_id, object_id);
+                let code = match result {
+                    Ok(_) => HorizonKernelResult::SUCCESS,
+                    Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
+                        HorizonKernelResult::INVALID_HANDLE
+                    }
+                    Err(nixe_runtime::ThreadOperationError::InvalidState) => {
+                        HorizonKernelResult::INVALID_STATE
+                    }
+                    Err(nixe_runtime::ThreadOperationError::Internal) => {
+                        return Err(HorizonSvcFault::InternalRuntime {
+                            operation: "StartThread",
+                        });
+                    }
+                };
+                let caller = coordinator
+                    .process_mut(process_id)
+                    .and_then(|process| process.thread_mut(thread_id))
+                    .ok_or(HorizonSvcFault::InternalRuntime {
+                        operation: "StartThread",
+                    })?;
+                write_register(&mut caller.state, 0, u64::from(code.raw()));
+                coordinator.make_thread_ready(thread_id).map_err(|_| {
+                    HorizonSvcFault::InternalRuntime {
+                        operation: "StartThread",
+                    }
+                })?;
+            }
+            PendingRuntimeRequest::GetThreadPriority { object_id } => {
+                let info = coordinator.thread_scheduling_info(process_id, object_id);
+                let (code, priority) = match info {
+                    Ok(info) => (HorizonKernelResult::SUCCESS, Some(info.priority)),
+                    Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
+                        (HorizonKernelResult::INVALID_HANDLE, None)
+                    }
+                    Err(_) => return Err(runtime_fault("GetThreadPriority")),
+                };
+                let state =
+                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadPriority")?;
+                write_register(state, 0, u64::from(code.raw()));
+                if let Some(priority) = priority {
+                    write_register(state, 1, priority as u32 as u64);
+                }
+                resume_pending_caller(coordinator, thread_id, "GetThreadPriority")?;
+            }
+            PendingRuntimeRequest::SetThreadPriority {
+                object_id,
+                priority,
+            } => {
+                let code = map_thread_operation(
+                    coordinator.set_thread_priority(process_id, object_id, priority),
+                    "SetThreadPriority",
+                )?;
+                write_register(
+                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadPriority")?,
+                    0,
+                    u64::from(code.raw()),
+                );
+                resume_pending_caller(coordinator, thread_id, "SetThreadPriority")?;
+            }
+            PendingRuntimeRequest::GetThreadCoreMask { object_id } => {
+                let info = coordinator.thread_scheduling_info(process_id, object_id);
+                let (code, values) = match info {
+                    Ok(info) => {
+                        let ideal = info.ideal_vcpu.map_or(-1, |vcpu| vcpu.get() as i32);
+                        let Some(mask) = horizon_affinity_mask(&info.affinity) else {
+                            return Err(runtime_fault(
+                                "GetThreadCoreMask unrepresentable topology",
+                            ));
+                        };
+                        (HorizonKernelResult::SUCCESS, Some((ideal, mask)))
+                    }
+                    Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
+                        (HorizonKernelResult::INVALID_HANDLE, None)
+                    }
+                    Err(_) => return Err(runtime_fault("GetThreadCoreMask")),
+                };
+                let state =
+                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadCoreMask")?;
+                write_register(state, 0, u64::from(code.raw()));
+                if let Some((ideal, mask)) = values {
+                    write_register(state, 1, ideal as u32 as u64);
+                    write_u64(state, 2, mask);
+                }
+                resume_pending_caller(coordinator, thread_id, "GetThreadCoreMask")?;
+            }
+            PendingRuntimeRequest::SetThreadCoreMask {
+                object_id,
+                ideal_core,
+                affinity_mask,
+            } => {
+                let mut cores = Vec::new();
+                for descriptor in coordinator.scheduler().profile().vcpus() {
+                    if 1_u64
+                        .checked_shl(descriptor.id().get())
+                        .is_some_and(|bit| affinity_mask & bit != 0)
+                    {
+                        cores.push(descriptor.id());
+                    }
+                }
+                let represented = cores.iter().fold(0_u64, |mask, vcpu| {
+                    mask | 1_u64.checked_shl(vcpu.get()).unwrap_or(0)
+                });
+                let code = if represented != affinity_mask || cores.is_empty() {
+                    HorizonKernelResult::OUT_OF_RANGE
+                } else {
+                    let affinity = coordinator
+                        .scheduler()
+                        .profile()
+                        .core_set(cores)
+                        .map_err(|_| runtime_fault("SetThreadCoreMask"))?;
+                    let ideal = if ideal_core == -1 {
+                        None
+                    } else if let Ok(core) = u32::try_from(ideal_core) {
+                        Some(VirtualCpuId::new(core))
+                    } else {
+                        write_register(
+                            pending_caller_state(
+                                coordinator,
+                                process_id,
+                                thread_id,
+                                "SetThreadCoreMask",
+                            )?,
+                            0,
+                            u64::from(HorizonKernelResult::OUT_OF_RANGE.raw()),
+                        );
+                        resume_pending_caller(coordinator, thread_id, "SetThreadCoreMask")?;
+                        return Ok(true);
+                    };
+                    map_thread_operation(
+                        coordinator.set_thread_affinity(process_id, object_id, ideal, affinity),
+                        "SetThreadCoreMask",
+                    )?
+                };
+                write_register(
+                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadCoreMask")?,
+                    0,
+                    u64::from(code.raw()),
+                );
+                resume_pending_caller(coordinator, thread_id, "SetThreadCoreMask")?;
+            }
+            PendingRuntimeRequest::SleepThread { nanoseconds } => {
+                coordinator
+                    .sleep_thread(thread_id, nanoseconds)
+                    .map_err(|_| runtime_fault("SleepThread"))?;
+            }
+            PendingRuntimeRequest::SetThreadActivity { object_id, paused } => {
+                let info = coordinator
+                    .thread_scheduling_info(process_id, object_id)
+                    .map_err(|error| match error {
+                        nixe_runtime::ThreadOperationError::InvalidHandle => {
+                            runtime_fault("SetThreadActivity")
+                        }
+                        _ => runtime_fault("SetThreadActivity"),
+                    })?;
+                let code = if info.id == thread_id {
+                    HorizonKernelResult::INVALID_STATE
+                } else {
+                    map_thread_operation(
+                        coordinator.set_thread_activity(process_id, object_id, paused),
+                        "SetThreadActivity",
+                    )?
+                };
+                write_register(
+                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadActivity")?,
+                    0,
+                    u64::from(code.raw()),
+                );
+                resume_pending_caller(coordinator, thread_id, "SetThreadActivity")?;
+            }
+            PendingRuntimeRequest::GetThreadContext { object_id, address } => {
+                let info = coordinator
+                    .thread_scheduling_info(process_id, object_id)
+                    .map_err(|_| runtime_fault("GetThreadContext3"))?;
+                let code = if info.id == thread_id || !info.paused {
+                    HorizonKernelResult::INVALID_STATE
+                } else {
+                    let state = coordinator
+                        .thread_cpu_state(process_id, object_id)
+                        .map_err(|_| runtime_fault("GetThreadContext3"))?;
+                    let bytes = encode_thread_context(&state);
+                    let process = coordinator
+                        .process(process_id)
+                        .ok_or_else(|| runtime_fault("GetThreadContext3"))?;
+                    if !process.memory().write_mapped_ram(
+                        process.cpu_context().address_space_id(),
+                        address,
+                        &bytes,
+                    ) {
+                        return Err(runtime_fault("GetThreadContext3 atomic context write"));
+                    }
+                    HorizonKernelResult::SUCCESS
+                };
+                write_register(
+                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadContext3")?,
+                    0,
+                    u64::from(code.raw()),
+                );
+                resume_pending_caller(coordinator, thread_id, "GetThreadContext3")?;
+            }
+            PendingRuntimeRequest::InheritPriority {
+                owner_object_id,
+                waiter_object_id,
+                donation_key,
+            } => {
+                coordinator
+                    .inherit_thread_priority(
+                        process_id,
+                        owner_object_id,
+                        waiter_object_id,
+                        donation_key,
+                    )
+                    .map_err(|_| runtime_fault("ArbitrateLock priority inheritance"))?;
+                fully_handled = false;
+            }
+            PendingRuntimeRequest::RestorePriority {
+                object_id,
+                donation_key,
+            } => {
+                coordinator
+                    .restore_thread_priority(process_id, object_id, donation_key)
+                    .map_err(|_| runtime_fault("ArbitrateUnlock priority restoration"))?;
+                fully_handled = false;
+            }
+            PendingRuntimeRequest::ReapThread { object_id } => {
+                coordinator
+                    .reap_thread(object_id)
+                    .map_err(|_| runtime_fault("CloseHandle thread reaping"))?;
+                resume_pending_caller(coordinator, thread_id, "CloseHandle thread reaping")?;
+            }
+        }
+        Ok(fully_handled)
+    }
+
+    fn finish_create_thread(
+        &mut self,
+        coordinator: &mut nixe_runtime::RuntimeCoordinator,
+        process_id: ProcessId,
+        caller: GuestThreadId,
+        creation: Result<nixe_runtime::ThreadCreation, ThreadCreateError>,
+    ) -> Result<(), HorizonSvcFault> {
+        let (code, handle) = match creation {
+            Ok(creation) => (HorizonKernelResult::SUCCESS, Some(creation.handle)),
+            Err(ThreadCreateError::InvalidEntry | ThreadCreateError::InvalidStack) => {
+                (HorizonKernelResult::INVALID_ADDRESS, None)
+            }
+            Err(
+                ThreadCreateError::InvalidPriority(_)
+                | ThreadCreateError::InvalidVirtualCpu(_)
+                | ThreadCreateError::PolicyDenied,
+            ) => (HorizonKernelResult::OUT_OF_RANGE, None),
+            Err(ThreadCreateError::ResourceLimit) => (HorizonKernelResult::RESOURCE_LIMIT, None),
+            Err(ThreadCreateError::IdentityExhausted | ThreadCreateError::Internal) => {
+                return Err(HorizonSvcFault::InternalRuntime {
+                    operation: "CreateThread",
+                });
+            }
+        };
+        let state = &mut coordinator
+            .process_mut(process_id)
+            .ok_or(HorizonSvcFault::InternalRuntime {
+                operation: "CreateThread",
+            })?
+            .thread_mut(caller)
+            .ok_or(HorizonSvcFault::InternalRuntime {
+                operation: "CreateThread",
+            })?
+            .state;
+        write_register(state, 0, u64::from(code.raw()));
+        if let Some(handle) = handle {
+            write_register(state, 1, u64::from(handle));
+        }
+        coordinator
+            .make_thread_ready(caller)
+            .map_err(|_| HorizonSvcFault::InternalRuntime {
+                operation: "CreateThread",
+            })?;
+        Ok(())
     }
 
     fn observe(&mut self, immediate: u32, outcome: &ExceptionDispatchOutcome<HorizonSvcFault>) {
@@ -511,9 +972,17 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x03 => set_memory_attribute(context),
             0x06 => query_memory(context, immediate),
             0x07 => terminate(ExceptionTerminationScope::Process),
+            0x08 => self.create_thread(context),
+            0x09 => self.start_thread(context),
             0x0a => terminate(ExceptionTerminationScope::CurrentThread),
+            0x0b => self.sleep_thread(context),
+            0x0c => self.get_thread_priority(context),
+            0x0d => self.set_thread_priority(context),
+            0x0e => self.get_thread_core_mask(context),
+            0x0f => self.set_thread_core_mask(context),
             0x10 => {
-                write_register(context.thread_mut().state_mut(), 0, 0);
+                let vcpu = context.thread().vcpu().get();
+                write_register(context.thread_mut().state_mut(), 0, u64::from(vcpu));
                 resume()
             }
             0x11 => event_signal(context),
@@ -521,19 +990,23 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x13 => map_shared_memory(context, &mut self.hid_system),
             0x14 => unmap_shared_memory(context, &mut self.hid_system),
             0x15 => create_transfer_memory(context),
-            0x16 => close_handle(context),
+            0x16 => close_handle(self, context),
             0x17 => reset_signal(context),
             0x18 => self.wait_synchronization(context),
-            0x1c => wait_process_wide_key_atomic(context),
-            0x1d => signal_process_wide_key(context),
+            0x1a => self.arbitrate_lock(context),
+            0x1b => self.arbitrate_unlock(context),
+            0x1c => self.wait_process_wide_key_atomic(context),
+            0x1d => self.signal_process_wide_key(context),
             0x1f => self.connect_to_named_port(context),
-            0x20 => send_sync_request_light(context),
+            0x20 => self.send_sync_request_light(context),
             0x21 => self.send_sync_request(context),
             0x22 => self.send_sync_request_with_user_buffer(context),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
             0x26 => break_process(context),
             0x29 => get_info(context),
+            0x32 => self.set_thread_activity(context),
+            0x33 => self.get_thread_context(context),
             0x40 => create_session(context),
             0x41 => accept_session(context),
             0x42 => self.reply_and_receive_light(context),
@@ -566,1118 +1039,16 @@ impl Default for HorizonSvcDispatcher {
 
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
-        0x07 | 0x0a | 0x10 | 0x13 | 0x14 | 0x15 | 0x16 | 0x20 | 0x21 | 0x22 | 0x25 | 0x40
-        | 0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
-        0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1c | 0x1d | 0x24 | 0x26
-        | 0x29 => HorizonSvcSupport::Partial,
+        0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10 | 0x13 | 0x14
+        | 0x15 | 0x16 | 0x25 | 0x32 | 0x40 | 0x41 | 0x45 | 0x70 | 0x71 | 0x72 => {
+            HorizonSvcSupport::Complete
+        }
+        0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c | 0x1d
+        | 0x20 | 0x21 | 0x22 | 0x24 | 0x26 | 0x29 | 0x33 | 0x42 | 0x43 | 0x44 => {
+            HorizonSvcSupport::Partial
+        }
         0x1f => HorizonSvcSupport::Complete,
         _ => HorizonSvcSupport::Unsupported,
-    }
-}
-
-impl HorizonSvcDispatcher {
-    fn connect_to_named_port(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let address = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
-        let name = match read_c_name(
-            context,
-            address,
-            crate::ipc_wire::NAMED_PORT_NAME_SIZE,
-            0x1f,
-        ) {
-            Ok(Some(name)) => name,
-            Ok(None) => {
-                result(context, HorizonKernelResult::OUT_OF_RANGE);
-                return resume();
-            }
-            Err(outcome) => return outcome,
-        };
-        if let Some(port) = self.named_ports.get(&name).cloned() {
-            let session = match port.connect() {
-                Ok(session) => session,
-                Err(PortError::SessionLimit) => {
-                    result(context, HorizonKernelResult::OUT_OF_SESSIONS);
-                    return resume();
-                }
-                Err(PortError::PeerClosed) => {
-                    result(context, HorizonKernelResult::PORT_CLOSED);
-                    return resume();
-                }
-                Err(PortError::WrongEndpoint | PortError::NoPendingSession) => {
-                    result(context, HorizonKernelResult::INVALID_STATE);
-                    return resume();
-                }
-            };
-            match context.process_mut().handles_mut().insert(session) {
-                Ok(handle) => {
-                    result(context, HorizonKernelResult::SUCCESS);
-                    write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-                }
-                Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
-            }
-            return resume();
-        }
-        match crate::ipc_wire::connect_to_named_port(context.process_mut(), address) {
-            Ok(NamedPortResult::Connected(handle)) => {
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-                resume()
-            }
-            Ok(NamedPortResult::NotFound) => {
-                result(context, HorizonKernelResult::NOT_FOUND);
-                resume()
-            }
-            Ok(NamedPortResult::NameOutOfRange) => {
-                result(context, HorizonKernelResult::OUT_OF_RANGE);
-                resume()
-            }
-            Ok(NamedPortResult::OutOfHandles) => {
-                result(context, HorizonKernelResult::OUT_OF_HANDLES);
-                resume()
-            }
-            Err(error) => reject_ipc(context, 0x1f, error),
-        }
-    }
-
-    fn manage_named_port(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let address = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
-        let max_sessions = read_register(context.thread().state(), 2) as u32 as i32;
-        let name = match read_c_name(
-            context,
-            address,
-            crate::ipc_wire::NAMED_PORT_NAME_SIZE,
-            0x71,
-        ) {
-            Ok(Some(name)) => name,
-            Ok(None) => {
-                result(context, HorizonKernelResult::OUT_OF_RANGE);
-                return resume();
-            }
-            Err(outcome) => return outcome,
-        };
-        if max_sessions < 0 {
-            result(context, HorizonKernelResult::OUT_OF_RANGE);
-            return resume();
-        }
-        if max_sessions == 0 {
-            if self
-                .named_ports
-                .get(&name)
-                .is_some_and(PortObject::server_is_open)
-            {
-                result(context, HorizonKernelResult::INVALID_STATE);
-            } else if self.named_ports.remove(&name).is_some() {
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, 0);
-            } else {
-                result(context, HorizonKernelResult::NOT_FOUND);
-            }
-            return resume();
-        }
-        if self.named_ports.contains_key(&name) {
-            result(context, HorizonKernelResult::INVALID_STATE);
-            return resume();
-        }
-        let (server, client) = PortObject::create_pair(max_sessions as usize, false);
-        match context.process_mut().handles_mut().insert(server) {
-            Ok(handle) => {
-                self.named_ports.insert(name, client);
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-            }
-            Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
-        }
-        resume()
-    }
-}
-
-impl HorizonSvcDispatcher {
-    fn send_sync_request(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let handle = read_register(context.thread().state(), 0) as u32;
-        let tls = match context.thread().state() {
-            ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
-            ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
-        };
-        let caller_thread_id = context.thread().object().thread_id();
-        match crate::ipc_wire::send_sync_request(
-            context.process_mut(),
-            tls,
-            handle,
-            self.initial_operation_mode,
-            &self.time_environment,
-            crate::ipc_wire::HostSystems {
-                video: &self.video_system,
-                hid: &self.hid_system,
-                caller_thread_id,
-            },
-        ) {
-            Ok(SyncRequestResult::Success) => {
-                self.pending_wakes
-                    .remove(&context.thread().object().thread_id());
-                result(context, HorizonKernelResult::SUCCESS);
-                resume()
-            }
-            Ok(SyncRequestResult::InvalidHandle) => {
-                generic_sync_request(context, tls, TLS_COMMAND_BUFFER_SIZE, handle, 0x21)
-            }
-            Ok(SyncRequestResult::PendingNvDrv(wait)) => {
-                log::debug!(
-                    "suspending thread {} for nvdrv {} wait request={:#010x} target={} timeout-us={} event-slot={:?}",
-                    caller_thread_id,
-                    wait.kind().as_str(),
-                    wait.request(),
-                    wait.target(),
-                    wait.timeout_microseconds(),
-                    wait.event_slot().map(|slot| slot.get()),
-                );
-                self.pending_wakes.insert(
-                    context.thread().object().thread_id(),
-                    PendingThreadWake {
-                        event: wait.wake_event(),
-                        deadline: wait
-                            .remaining()
-                            .and_then(|remaining| Instant::now().checked_add(remaining)),
-                    },
-                );
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-            }
-            Err(error) => reject_ipc(context, 0x21, error),
-        }
-    }
-
-    fn send_sync_request_with_user_buffer(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let address = read_register(context.thread().state(), 0);
-        let size = read_register(context.thread().state(), 1);
-        let handle = read_register(context.thread().state(), 2) as u32;
-        // Public ABI and validation reference:
-        // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#SendSyncRequestWithUserBuffer
-        if !address.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        }
-        if !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-            result(context, HorizonKernelResult::INVALID_SIZE);
-            return resume();
-        }
-        if size == 0 {
-            result(context, HorizonKernelResult::INVALID_SIZE);
-            return resume();
-        }
-        if address.checked_add(size).is_none_or(|end| address >= end) {
-            result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-            return resume();
-        }
-        let Ok(size) = usize::try_from(size) else {
-            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-            return resume();
-        };
-        let address = GuestVirtualAddress::new(address);
-        let caller_thread_id = context.thread().object().thread_id();
-        match crate::ipc_wire::send_sync_request_from_buffer(
-            context.process_mut(),
-            address,
-            size,
-            handle,
-            self.initial_operation_mode,
-            &self.time_environment,
-            crate::ipc_wire::HostSystems {
-                video: &self.video_system,
-                hid: &self.hid_system,
-                caller_thread_id,
-            },
-        ) {
-            Ok(SyncRequestResult::Success) => {
-                self.pending_wakes
-                    .remove(&context.thread().object().thread_id());
-                result(context, HorizonKernelResult::SUCCESS);
-                resume()
-            }
-            Ok(SyncRequestResult::InvalidHandle) => {
-                generic_sync_request(context, address, size, handle, 0x22)
-            }
-            Ok(SyncRequestResult::PendingNvDrv(wait)) => {
-                self.pending_wakes.insert(
-                    context.thread().object().thread_id(),
-                    PendingThreadWake {
-                        event: wait.wake_event(),
-                        deadline: wait
-                            .remaining()
-                            .and_then(|remaining| Instant::now().checked_add(remaining)),
-                    },
-                );
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-            }
-            Err(error) => reject_ipc(context, 0x22, error),
-        }
-    }
-}
-
-fn send_sync_request_light(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 0) as u32;
-    let Some(session) = context
-        .process()
-        .handles()
-        .get_as::<SessionObject>(handle)
-        .cloned()
-    else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    };
-    if session.endpoint() != SessionEndpoint::Client || !session.is_light() {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    }
-    let owner = session_request_owner(context);
-    let mut words = [0_u32; 7];
-    for (index, word) in words.iter_mut().enumerate() {
-        *word = read_register(context.thread().state(), index as u8 + 1) as u32;
-    }
-    match session.request(owner, SessionMessage::Light(words)) {
-        Ok(SessionRequestResult::Submitted | SessionRequestResult::Waiting) => {
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-        }
-        Ok(SessionRequestResult::Response(SessionMessage::Light(response))) => {
-            for (index, word) in response.into_iter().enumerate() {
-                write_register(
-                    context.thread_mut().state_mut(),
-                    index as u8 + 1,
-                    u64::from(word),
-                );
-            }
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Ok(SessionRequestResult::Response(
-            SessionMessage::Buffer(_) | SessionMessage::TransportedBuffer { .. },
-        ))
-        | Err(SessionError::MessageKindMismatch) => {
-            result(context, HorizonKernelResult::INVALID_STATE);
-            resume()
-        }
-        Err(error) => session_error(context, error),
-    }
-}
-
-fn generic_sync_request(
-    context: &mut ExceptionDispatchContext<'_>,
-    address: GuestVirtualAddress,
-    size: usize,
-    handle: u32,
-    immediate: u32,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let Some(session) = context
-        .process()
-        .handles()
-        .get_as::<SessionObject>(handle)
-        .cloned()
-    else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    };
-    if session.endpoint() != SessionEndpoint::Client || session.is_light() {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    }
-    let owner = session_request_owner(context);
-    match session.poll_request(owner) {
-        Ok(Some(SessionRequestResult::Waiting | SessionRequestResult::Submitted)) => {
-            return ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
-        }
-        Ok(Some(SessionRequestResult::Response(response))) => {
-            return finish_sync_response(context, address, size, immediate, response);
-        }
-        Ok(None) => {}
-        Err(error) => return session_error(context, error),
-    }
-    let mut message = Vec::new();
-    if message.try_reserve_exact(size).is_err() {
-        result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-        return resume();
-    }
-    message.resize(size, 0);
-    if let Err(error) = crate::ipc_wire::read_bytes(context.process(), address, &mut message) {
-        return reject_ipc(context, immediate, error);
-    }
-    let message = match capture_message_handles(context, message, false) {
-        Ok(message) => message,
-        Err(code) => {
-            result(context, code);
-            return resume();
-        }
-    };
-    match session.request(owner, message) {
-        Ok(SessionRequestResult::Submitted | SessionRequestResult::Waiting) => {
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-        }
-        Ok(SessionRequestResult::Response(response)) => {
-            finish_sync_response(context, address, size, immediate, response)
-        }
-        Err(SessionError::MessageKindMismatch) => invalid_state(context),
-        Err(error) => session_error(context, error),
-    }
-}
-
-fn finish_sync_response(
-    context: &mut ExceptionDispatchContext<'_>,
-    address: GuestVirtualAddress,
-    size: usize,
-    immediate: u32,
-    response: SessionMessage,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let response = match materialize_message_handles(context, response) {
-        Ok(Some(response)) => response,
-        Ok(None) => return invalid_state(context),
-        Err(code) => {
-            result(context, code);
-            return resume();
-        }
-    };
-    if response.len() > size {
-        close_encoded_handles(context.process_mut().handles_mut(), &response);
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if let Err(error) = crate::ipc_wire::write_bytes(context.process(), address, &response) {
-        close_encoded_handles(context.process_mut().handles_mut(), &response);
-        return reject_ipc(context, immediate, error);
-    }
-    result(context, HorizonKernelResult::SUCCESS);
-    resume()
-}
-
-fn invalid_state(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    result(context, HorizonKernelResult::INVALID_STATE);
-    resume()
-}
-
-// Handle translation follows the public kernel implementation. Client requests
-// may copy handles but may not move them; server replies may do both, and moved
-// server handles are consumed even when a later handle makes the reply fail:
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_server_session.cpp#L150-L233
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_server_session.cpp#L572-L578
-fn capture_message_handles(
-    context: &mut ExceptionDispatchContext<'_>,
-    bytes: Vec<u8>,
-    allow_move_handles: bool,
-) -> Result<SessionMessage, HorizonKernelResult> {
-    let Some(message) = decode_transport_header(&bytes)? else {
-        return Ok(SessionMessage::Buffer(bytes));
-    };
-    if !allow_move_handles && !message.move_handles.is_empty() {
-        return Err(HorizonKernelResult::INVALID_COMBINATION);
-    }
-    let mut transfer_error = None;
-    let mut copy_handles = Vec::with_capacity(message.copy_handles.len());
-    for handle in &message.copy_handles {
-        if transfer_error.is_some() {
-            copy_handles.push(None);
-            continue;
-        }
-        match copy_ipc_object(context, *handle) {
-            Ok(object) => copy_handles.push(object),
-            Err(error) => {
-                transfer_error = Some(error);
-                copy_handles.push(None);
-            }
-        }
-    }
-
-    let mut move_handles = Vec::with_capacity(message.move_handles.len());
-    for handle in &message.move_handles {
-        if *handle == 0 {
-            move_handles.push(None);
-            continue;
-        }
-        if matches!(*handle, CURRENT_PROCESS_HANDLE | CURRENT_THREAD_HANDLE) {
-            transfer_error = Some(HorizonKernelResult::INVALID_HANDLE);
-            move_handles.push(None);
-            continue;
-        }
-        match context.process_mut().handles_mut().close(*handle) {
-            Ok(object) if transfer_error.is_none() => move_handles.push(Some(object)),
-            Ok(_) => move_handles.push(None),
-            Err(_) => {
-                transfer_error = Some(HorizonKernelResult::INVALID_HANDLE);
-                move_handles.push(None);
-            }
-        }
-    }
-    if let Some(error) = transfer_error {
-        return Err(error);
-    }
-    Ok(SessionMessage::TransportedBuffer {
-        bytes,
-        copy_handles,
-        move_handles,
-    })
-}
-
-fn copy_ipc_object(
-    context: &ExceptionDispatchContext<'_>,
-    handle: u32,
-) -> Result<Option<HandleObject>, HorizonKernelResult> {
-    match handle {
-        0 => Ok(None),
-        CURRENT_PROCESS_HANDLE => Ok(Some(HandleObject::new(ProcessObject::new(
-            context.process().process_id(),
-        )))),
-        CURRENT_THREAD_HANDLE => Ok(Some(HandleObject::new(context.thread().object()))),
-        _ => context
-            .process()
-            .handles()
-            .get(handle)
-            .cloned()
-            .map(Some)
-            .ok_or(HorizonKernelResult::INVALID_HANDLE),
-    }
-}
-
-fn materialize_message_handles(
-    context: &mut ExceptionDispatchContext<'_>,
-    message: SessionMessage,
-) -> Result<Option<Vec<u8>>, HorizonKernelResult> {
-    materialize_message_handles_in_table(context.process_mut().handles_mut(), message)
-}
-
-fn materialize_message_handles_in_table(
-    handles: &mut HandleTable,
-    message: SessionMessage,
-) -> Result<Option<Vec<u8>>, HorizonKernelResult> {
-    let (mut bytes, copy_handles, move_handles) = match message {
-        SessionMessage::Buffer(bytes) => return Ok(Some(bytes)),
-        SessionMessage::Light(_) => return Ok(None),
-        SessionMessage::TransportedBuffer {
-            bytes,
-            copy_handles,
-            move_handles,
-        } => (bytes, copy_handles, move_handles),
-    };
-    let handle_offset = {
-        let Some(header) = decode_transport_header(&bytes)? else {
-            return Err(HorizonKernelResult::INVALID_COMBINATION);
-        };
-        if header.copy_handles.len() != copy_handles.len()
-            || header.move_handles.len() != move_handles.len()
-        {
-            return Err(HorizonKernelResult::INVALID_COMBINATION);
-        }
-        header.handle_offset()
-    };
-
-    let mut allocated = Vec::with_capacity(copy_handles.len() + move_handles.len());
-    let mut encoded = Vec::with_capacity(copy_handles.len() + move_handles.len());
-    for object in copy_handles.into_iter().chain(move_handles) {
-        let handle = match object {
-            Some(object) => match handles.insert_object(object) {
-                Ok(handle) => {
-                    allocated.push(handle);
-                    handle
-                }
-                Err(_) => {
-                    for handle in allocated {
-                        let _ = handles.close(handle);
-                    }
-                    return Err(HorizonKernelResult::OUT_OF_HANDLES);
-                }
-            },
-            None => 0,
-        };
-        encoded.push(handle);
-    }
-    for (index, handle) in encoded.into_iter().enumerate() {
-        let offset = handle_offset + index * 4;
-        bytes[offset..offset + 4].copy_from_slice(&handle.to_le_bytes());
-    }
-    Ok(Some(bytes))
-}
-
-fn decode_transport_header(bytes: &[u8]) -> Result<Option<HipcRequest<'_>>, HorizonKernelResult> {
-    let Some(word1) = bytes
-        .get(4..8)
-        .and_then(|word| <[u8; 4]>::try_from(word).ok())
-        .map(u32::from_le_bytes)
-    else {
-        return Ok(None);
-    };
-    if word1 >> 31 == 0 {
-        return Ok(None);
-    }
-    let bounded = &bytes[..bytes.len().min(TLS_COMMAND_BUFFER_SIZE)];
-    HipcRequest::decode(bounded)
-        .map(Some)
-        .map_err(|_| HorizonKernelResult::INVALID_COMBINATION)
-}
-
-fn close_encoded_handles(handles: &mut HandleTable, bytes: &[u8]) {
-    let Ok(Some(message)) = decode_transport_header(bytes) else {
-        return;
-    };
-    for handle in message
-        .copy_handles
-        .iter()
-        .chain(&message.move_handles)
-        .copied()
-    {
-        if handle != 0 {
-            let _ = handles.close(handle);
-        }
-    }
-}
-
-fn session_error(
-    context: &mut ExceptionDispatchContext<'_>,
-    error: SessionError,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let code = match error {
-        SessionError::PeerClosed => HorizonKernelResult::SESSION_CLOSED,
-        SessionError::QueueFull => HorizonKernelResult::OUT_OF_RESOURCE,
-        SessionError::WrongEndpoint
-        | SessionError::NoRequest
-        | SessionError::ReplyPending
-        | SessionError::MessageKindMismatch => HorizonKernelResult::INVALID_STATE,
-    };
-    result(context, code);
-    resume()
-}
-
-fn reject_ipc(
-    context: &mut ExceptionDispatchContext<'_>,
-    immediate: u32,
-    error: IpcWireError,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    match error {
-        IpcWireError::GuestMemory(fault) => {
-            reject(context, HorizonSvcFault::GuestMemory { immediate, fault })
-        }
-        IpcWireError::Malformed(reason) => {
-            reject(context, HorizonSvcFault::MalformedIpc { immediate, reason })
-        }
-        IpcWireError::Internal(reason) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc { immediate, reason })
-        }
-        IpcWireError::ResourceExhausted => {
-            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-            resume()
-        }
-        IpcWireError::CanonicalBacking(fault) => reject(
-            context,
-            HorizonSvcFault::CanonicalBacking { immediate, fault },
-        ),
-        IpcWireError::UnsupportedNvDrv(operation) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
-                immediate,
-                operation,
-            })
-        }
-        IpcWireError::UnsupportedService(operation) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedService {
-                immediate,
-                operation,
-            })
-        }
-        IpcWireError::PendingNvDrv(_) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc {
-                immediate,
-                reason: "pending nvdrv wait escaped the scheduler boundary",
-            })
-        }
-    }
-}
-
-fn get_info(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let info_type = read_register(context.thread().state(), 1) as u32;
-    let handle = read_register(context.thread().state(), 2) as u32;
-    let subtype = read_register(context.thread().state(), 3);
-    // RandomEntropy validation and its four process-owned values follow the
-    // public kernel implementation:
-    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_info.cpp#L230-L240
-    if info_type == 11 {
-        if handle != INVALID_HANDLE {
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        }
-        let Some(value) = usize::try_from(subtype)
-            .ok()
-            .and_then(|index| context.process().random_entropy(index))
-        else {
-            result(context, HorizonKernelResult::INVALID_COMBINATION);
-            return resume();
-        };
-        result(context, HorizonKernelResult::SUCCESS);
-        write_u64(context.thread_mut().state_mut(), 1, value);
-        return resume();
-    }
-    if subtype != 0 {
-        result(context, HorizonKernelResult::INVALID_COMBINATION);
-        return resume();
-    }
-    if handle != CURRENT_PROCESS_HANDLE {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    }
-    let layout = context.process().memory_layout();
-    let value = match info_type {
-        2 => layout.alias().base().get(),
-        3 => layout.alias().size(),
-        4 => layout.heap().base().get(),
-        5 => layout.heap().size(),
-        12 => layout.aslr().base().get(),
-        13 => layout.aslr().size(),
-        14 => layout.stack().base().get(),
-        15 => layout.stack().size(),
-        6 => layout.memory_capacity(),
-        7 => context.process().used_memory_size(),
-        28 => 0,
-        _ => {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
-                immediate: 0x29,
-                documented_name: "GetInfo",
-            });
-        }
-    };
-    result(context, HorizonKernelResult::SUCCESS);
-    write_u64(context.thread_mut().state_mut(), 1, value);
-    resume()
-}
-
-fn terminate(scope: ExceptionTerminationScope) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    ExceptionDispatchOutcome::Terminate {
-        scope,
-        exit_code: 0,
-        reason: ExceptionTerminationReason::Requested,
-    }
-}
-
-fn break_process(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let reason = read_register(context.thread().state(), 0);
-    let info = read_register(context.thread().state(), 1);
-    let size = read_register(context.thread().state(), 2);
-    if reason & 0x8000_0000 != 0 {
-        result(context, HorizonKernelResult::SUCCESS);
-        return resume();
-    }
-    ExceptionDispatchOutcome::Terminate {
-        scope: ExceptionTerminationScope::Process,
-        exit_code: reason,
-        reason: ExceptionTerminationReason::Break { reason, info, size },
-    }
-}
-
-fn set_memory_permission(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
-    let size = read_register(context.thread().state(), 1);
-    let raw = read_register(context.thread().state(), 2) as u32;
-    let permissions = match raw {
-        0 => MemoryPermissions::NONE,
-        1 => MemoryPermissions::READ,
-        3 => MemoryPermissions::READ_WRITE,
-        _ => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
-    };
-    let end = start.get().checked_add(size);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let valid_range = query.is_some_and(|query| {
-        query.purpose.allows_reprotect()
-            && query.base.get() <= start.get()
-            && end.is_some_and(|end| query.base.get().saturating_add(query.size) >= end)
-    });
-    if !valid_range {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryState {
-                immediate: 0x02,
-                address: start,
-                purpose: query.map_or(MemoryMappingPurpose::Normal, |query| query.purpose),
-            },
-        );
-    }
-    match context.process().memory().set_permissions(
-        context.process().cpu().address_space_id(),
-        start,
-        size,
-        permissions,
-    ) {
-        Ok(()) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryProtection { fault }),
-    }
-}
-
-fn map_shared_memory(
-    context: &mut ExceptionDispatchContext<'_>,
-    hid_system: &mut crate::HidSystem,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 0) as u32;
-    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
-    let size = read_register(context.thread().state(), 2);
-    let raw_permissions = read_register(context.thread().state(), 3) as u32;
-    let permissions = match raw_permissions {
-        1 => MemoryPermissions::READ,
-        3 => MemoryPermissions::READ_WRITE,
-        _ => {
-            return reject(
-                context,
-                HorizonSvcFault::InvalidMemoryPermission {
-                    raw: raw_permissions,
-                },
-            );
-        }
-    };
-    let Some(shared_memory) = context
-        .process()
-        .handles()
-        .get_as::<SharedMemoryObject>(handle)
-        .cloned()
-    else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    };
-    // Public ABI validation and register order:
-    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#MapSharedMemory
-    if size == 0
-        || !size.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || usize::try_from(size).ok() != Some(shared_memory.size())
-    {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if !start.is_aligned_to(USER_BUFFER_ALIGNMENT)
-        || start
-            .get()
-            .checked_add(size)
-            .is_none_or(|end| end > context.process().address_space_limit())
-    {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    if !shared_memory.remote_permissions().contains(permissions) {
-        result(context, HorizonKernelResult::INVALID_STATE);
-        return resume();
-    }
-    let mapping_permissions = if permissions == MemoryPermissions::READ {
-        MemoryPermissions::READ_WRITE
-    } else {
-        permissions
-    };
-    match context.process().memory().resize_zeroed_mapping(
-        context.process().cpu().address_space_id(),
-        start,
-        0,
-        size,
-        mapping_permissions,
-        MemoryMappingPurpose::SharedMemory,
-    ) {
-        Ok(()) => {
-            let mut backing = vec![0_u8; shared_memory.size()];
-            if shared_memory.read(0, &mut backing).is_err() {
-                let _ = context.process().memory().resize_zeroed_mapping(
-                    context.process().cpu().address_space_id(),
-                    start,
-                    size,
-                    0,
-                    mapping_permissions,
-                    MemoryMappingPurpose::SharedMemory,
-                );
-                return reject(
-                    context,
-                    HorizonSvcFault::MalformedIpc {
-                        immediate: 0x13,
-                        reason: "shared-memory backing cannot satisfy its declared size",
-                    },
-                );
-            }
-            for (offset, byte) in backing
-                .into_iter()
-                .enumerate()
-                .filter(|(_, byte)| *byte != 0)
-            {
-                let Some(address) = start.checked_add(offset as u64) else {
-                    unreachable!("validated shared-memory range contains every backing byte")
-                };
-                if let Err(fault) = context.process().memory().write(
-                    context.process().cpu().address_space_id(),
-                    address,
-                    MemoryAccess::normal(MemoryAccessSize::Byte),
-                    MemoryValue::U8(byte),
-                ) {
-                    let _ = context.process().memory().resize_zeroed_mapping(
-                        context.process().cpu().address_space_id(),
-                        start,
-                        size,
-                        0,
-                        mapping_permissions,
-                        MemoryMappingPurpose::SharedMemory,
-                    );
-                    return reject(
-                        context,
-                        HorizonSvcFault::GuestMemory {
-                            immediate: 0x13,
-                            fault,
-                        },
-                    );
-                }
-            }
-            if permissions != mapping_permissions
-                && let Err(fault) = context.process().memory().set_permissions(
-                    context.process().cpu().address_space_id(),
-                    start,
-                    size,
-                    permissions,
-                )
-            {
-                let _ = context.process().memory().resize_zeroed_mapping(
-                    context.process().cpu().address_space_id(),
-                    start,
-                    size,
-                    0,
-                    mapping_permissions,
-                    MemoryMappingPurpose::SharedMemory,
-                );
-                return reject(context, HorizonSvcFault::MemoryProtection { fault });
-            }
-            log::debug!(
-                "mapped temporary shared memory handle {handle:#x} at {start} ({size:#x} bytes)"
-            );
-            if hid_system.owns(&shared_memory) {
-                hid_system.register_mapping(context.process().cpu().address_space_id(), start);
-            }
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
-    }
-}
-
-fn create_transfer_memory(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    // Public ABI and validation reference:
-    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#CreateTransferMemory
-    let address = read_register(context.thread().state(), 1);
-    let size = read_register(context.thread().state(), 2);
-    let raw_permissions = read_register(context.thread().state(), 3) as u32;
-    let permissions = match raw_permissions {
-        0 => MemoryPermissions::NONE,
-        1 => MemoryPermissions::READ,
-        3 => MemoryPermissions::READ_WRITE,
-        raw => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
-    };
-    if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if !address.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || address
-            .checked_add(size)
-            .is_none_or(|end| end > context.process().address_space_limit())
-    {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    let start = GuestVirtualAddress::new(address);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    if !query.is_some_and(|query| {
-        query.base.get() <= address
-            && query
-                .base
-                .get()
-                .checked_add(query.size)
-                .is_some_and(|end| end >= address.saturating_add(size))
-    }) {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-    let backing = match context
-        .process()
-        .canonical_memory()
-        .translate_canonical_range(
-            context.process().cpu().address_space_id(),
-            start,
-            size,
-            MemoryPermissions::NONE,
-        ) {
-        Ok(backing) => backing,
-        Err(fault) => {
-            return reject(
-                context,
-                HorizonSvcFault::CanonicalMemory {
-                    immediate: 0x15,
-                    fault,
-                },
-            );
-        }
-    };
-    match context
-        .process_mut()
-        .handles_mut()
-        .insert(TransferMemoryObject::new(start, size, permissions, backing))
-    {
-        Ok(handle) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-        }
-        Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
-    }
-    resume()
-}
-
-fn unmap_shared_memory(
-    context: &mut ExceptionDispatchContext<'_>,
-    hid_system: &mut crate::HidSystem,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 0) as u32;
-    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
-    let size = read_register(context.thread().state(), 2);
-    let Some(shared_memory) = context
-        .process()
-        .handles()
-        .get_as::<SharedMemoryObject>(handle)
-        .cloned()
-    else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    };
-    if size == 0
-        || !size.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || usize::try_from(size).ok() != Some(shared_memory.size())
-    {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if !start.is_aligned_to(USER_BUFFER_ALIGNMENT) {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let Some(query) = query.filter(|mapping| {
-        mapping.base == start
-            && mapping.size == size
-            && mapping.purpose == MemoryMappingPurpose::SharedMemory
-    }) else {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    };
-    match context.process().memory().resize_zeroed_mapping(
-        context.process().cpu().address_space_id(),
-        start,
-        size,
-        0,
-        query.permissions,
-        MemoryMappingPurpose::SharedMemory,
-    ) {
-        Ok(()) => {
-            if hid_system.owns(&shared_memory) {
-                hid_system.unregister_mapping(context.process().cpu().address_space_id(), start);
-            }
-            log::debug!(
-                "unmapped temporary shared memory handle {handle:#x} from {start} ({size:#x} bytes)"
-            );
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
-    }
-}
-
-fn set_memory_attribute(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
-    let size = read_register(context.thread().state(), 1);
-    let raw_mask = read_register(context.thread().state(), 2) as u32;
-    let raw_value = read_register(context.thread().state(), 3) as u32;
-    let uncached = MemoryAttributes::UNCACHED.bits();
-    let permission_locked = MemoryAttributes::PERMISSION_LOCKED.bits();
-    let valid_update = (raw_mask == uncached && raw_value & !uncached == 0)
-        || (raw_mask == permission_locked && raw_value == permission_locked);
-    if !valid_update {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryAttribute {
-                mask: raw_mask,
-                value: raw_value,
-            },
-        );
-    }
-    let (Some(mask), Some(value)) = (
-        MemoryAttributes::from_bits(raw_mask),
-        MemoryAttributes::from_bits(raw_value),
-    ) else {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryAttribute {
-                mask: raw_mask,
-                value: raw_value,
-            },
-        );
-    };
-    let end = start.get().checked_add(size);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let valid_range = query.is_some_and(|query| {
-        query.purpose.allows_attribute_change()
-            && query.base.get() <= start.get()
-            && end.is_some_and(|end| query.base.get().saturating_add(query.size) >= end)
-    });
-    if !valid_range {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryState {
-                immediate: 0x03,
-                address: start,
-                purpose: query.map_or(MemoryMappingPurpose::Normal, |query| query.purpose),
-            },
-        );
-    }
-    match context.process().memory().set_attributes(
-        context.process().cpu().address_space_id(),
-        start,
-        size,
-        mask,
-        value,
-    ) {
-        Ok(()) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryProtection { fault }),
     }
 }
 
@@ -1816,6 +1187,145 @@ fn read_register(state: &ThreadCpuState, index: u8) -> u64 {
     }
 }
 
+const fn runtime_fault(operation: &'static str) -> HorizonSvcFault {
+    HorizonSvcFault::InternalRuntime { operation }
+}
+
+fn pending_caller_state<'a>(
+    coordinator: &'a mut nixe_runtime::RuntimeCoordinator,
+    process_id: ProcessId,
+    thread_id: GuestThreadId,
+    operation: &'static str,
+) -> Result<&'a mut ThreadCpuState, HorizonSvcFault> {
+    coordinator
+        .process_mut(process_id)
+        .and_then(|process| process.thread_mut(thread_id))
+        .map(|thread| &mut thread.state)
+        .ok_or_else(|| runtime_fault(operation))
+}
+
+fn resume_pending_caller(
+    coordinator: &mut nixe_runtime::RuntimeCoordinator,
+    thread_id: GuestThreadId,
+    operation: &'static str,
+) -> Result<(), HorizonSvcFault> {
+    coordinator
+        .make_thread_ready(thread_id)
+        .map_err(|_| runtime_fault(operation))
+}
+
+fn map_thread_operation(
+    result: Result<(), nixe_runtime::ThreadOperationError>,
+    operation: &'static str,
+) -> Result<HorizonKernelResult, HorizonSvcFault> {
+    match result {
+        Ok(()) => Ok(HorizonKernelResult::SUCCESS),
+        Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
+            Ok(HorizonKernelResult::INVALID_HANDLE)
+        }
+        Err(nixe_runtime::ThreadOperationError::InvalidState) => {
+            Ok(HorizonKernelResult::OUT_OF_RANGE)
+        }
+        Err(nixe_runtime::ThreadOperationError::Internal) => Err(runtime_fault(operation)),
+    }
+}
+
+fn horizon_affinity_mask(affinity: &nixe_scheduler::CoreSet) -> Option<u64> {
+    affinity.iter().try_fold(0_u64, |mask, vcpu| {
+        1_u64.checked_shl(vcpu.get()).map(|bit| mask | bit)
+    })
+}
+
+fn encode_thread_context(state: &ThreadCpuState) -> Vec<u8> {
+    match state {
+        ThreadCpuState::A64(state) => {
+            let mut bytes = vec![0_u8; 0x320];
+            for index in 0..29_u8 {
+                put_context_u64(
+                    &mut bytes,
+                    usize::from(index) * 8,
+                    state.read_x(A64Register::General(
+                        A64GeneralRegister::new(index).expect("context GPR index is valid"),
+                    )),
+                );
+            }
+            put_context_u64(
+                &mut bytes,
+                0xe8,
+                state.read_x(A64Register::General(
+                    A64GeneralRegister::new(29).expect("frame-pointer index is valid"),
+                )),
+            );
+            put_context_u64(
+                &mut bytes,
+                0xf0,
+                state.read_x(A64Register::General(
+                    A64GeneralRegister::new(30).expect("link-register index is valid"),
+                )),
+            );
+            put_context_u64(&mut bytes, 0xf8, state.read_x(A64Register::StackPointer));
+            put_context_u64(&mut bytes, 0x100, state.pc());
+            put_context_u32(&mut bytes, 0x108, state.nzcv().bits());
+            for index in 0..32_u8 {
+                let value = state.vector(index).expect("context vector index is valid");
+                let offset = 0x110 + usize::from(index) * 16;
+                bytes[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+            }
+            put_context_u32(&mut bytes, 0x310, state.fpcr());
+            put_context_u32(&mut bytes, 0x314, state.fpsr());
+            put_context_u64(&mut bytes, 0x318, state.tpidr_el0());
+            bytes
+        }
+        ThreadCpuState::A32(state) => {
+            let mut bytes = vec![0_u8; 0x158];
+            for index in 0..13_u8 {
+                put_context_u32(
+                    &mut bytes,
+                    usize::from(index) * 4,
+                    state.read_r(
+                        A32GeneralRegister::new(index).expect("context GPR index is valid"),
+                    ),
+                );
+            }
+            put_context_u32(
+                &mut bytes,
+                0x34,
+                state.read_r(A32GeneralRegister::new(13).expect("SP index is valid")),
+            );
+            put_context_u32(
+                &mut bytes,
+                0x38,
+                state.read_r(A32GeneralRegister::new(14).expect("LR index is valid")),
+            );
+            put_context_u32(&mut bytes, 0x3c, state.instruction_address());
+            put_context_u32(&mut bytes, 0x40, state.cpsr().bits());
+            for index in 0..32_u8 {
+                put_context_u64(
+                    &mut bytes,
+                    0x48 + usize::from(index) * 8,
+                    state
+                        .read_d(index)
+                        .expect("context D-register index is valid"),
+                );
+            }
+            put_context_u32(&mut bytes, 0x148, state.fpscr());
+            // FPEXC is privileged architectural state and is not part of the
+            // user-mode CPU state. Horizon returns it cleared here.
+            put_context_u32(&mut bytes, 0x14c, 0);
+            put_context_u32(&mut bytes, 0x150, state.tpidrurw());
+            bytes
+        }
+    }
+}
+
+fn put_context_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_context_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn read_reply_timeout(state: &ThreadCpuState, user_buffer: bool) -> i64 {
     match state {
         ThreadCpuState::A64(_) => read_register(state, if user_buffer { 6 } else { 4 }) as i64,
@@ -1889,18 +1399,38 @@ fn read_wait_timeout(state: &ThreadCpuState) -> i64 {
 }
 
 fn close_handle(
+    dispatcher: &mut HorizonSvcDispatcher,
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
-    let code = if matches!(handle, CURRENT_PROCESS_HANDLE | CURRENT_THREAD_HANDLE)
-        || context.process_mut().handles_mut().close(handle).is_err()
-    {
-        HorizonKernelResult::INVALID_HANDLE
-    } else {
-        HorizonKernelResult::SUCCESS
+    if matches!(handle, CURRENT_PROCESS_HANDLE | CURRENT_THREAD_HANDLE) {
+        result(context, HorizonKernelResult::INVALID_HANDLE);
+        return resume();
+    }
+    let closed = context.process_mut().handles_mut().close(handle);
+    let Ok(object) = closed else {
+        result(context, HorizonKernelResult::INVALID_HANDLE);
+        return resume();
     };
-    result(context, code);
-    resume()
+    let reap = (object.strong_count() == 1)
+        .then(|| object.downcast_ref::<ThreadObject>())
+        .flatten()
+        .filter(|thread| thread.is_signalled())
+        .map(ThreadObject::thread_id);
+    let caller = context.thread().id();
+    let Some(object_id) = reap else {
+        result(context, HorizonKernelResult::SUCCESS);
+        return resume();
+    };
+    if dispatcher
+        .pending_runtime_requests
+        .insert(caller, PendingRuntimeRequest::ReapThread { object_id })
+        .is_some()
+    {
+        return ExceptionDispatchOutcome::Fault(runtime_fault("CloseHandle thread reaping"));
+    }
+    result(context, HorizonKernelResult::SUCCESS);
+    ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
 }
 
 fn event_signal(
@@ -2130,557 +1660,6 @@ fn accept_session(
     resume()
 }
 
-#[derive(Clone, Debug)]
-enum ReplyWaitTarget {
-    Port(PortObject),
-    Session(SessionObject),
-}
-
-impl HorizonSvcDispatcher {
-    fn reply_and_receive(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-        user_buffer: bool,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        // ABI and ordering reference:
-        // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#ReplyAndReceive
-        // Kernel control-flow reference:
-        // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_ipc.cpp
-        let (immediate, address, size, handles_address, count, reply_target, timeout) =
-            if user_buffer {
-                let address = read_register(context.thread().state(), 1);
-                let size = read_register(context.thread().state(), 2);
-                let timeout = read_reply_timeout(context.thread().state(), true);
-                (
-                    0x44,
-                    GuestVirtualAddress::new(address),
-                    size,
-                    read_register(context.thread().state(), 3),
-                    read_register(context.thread().state(), 4) as u32,
-                    read_register(context.thread().state(), 5) as u32,
-                    timeout,
-                )
-            } else {
-                let timeout = read_reply_timeout(context.thread().state(), false);
-                (
-                    0x43,
-                    thread_tls(context.thread().state()),
-                    TLS_COMMAND_BUFFER_SIZE as u64,
-                    read_register(context.thread().state(), 1),
-                    read_register(context.thread().state(), 2) as u32,
-                    read_register(context.thread().state(), 3) as u32,
-                    timeout,
-                )
-            };
-        if user_buffer && !address.get().is_multiple_of(USER_BUFFER_ALIGNMENT) {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        }
-        if user_buffer && !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
-            result(context, HorizonKernelResult::INVALID_SIZE);
-            return resume();
-        }
-        if user_buffer && size == 0 {
-            result(context, HorizonKernelResult::INVALID_SIZE);
-            return resume();
-        }
-        if user_buffer
-            && address
-                .get()
-                .checked_add(size)
-                .is_none_or(|end| address.get() >= end)
-        {
-            result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-            return resume();
-        }
-        let Ok(size) = usize::try_from(size) else {
-            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-            return resume();
-        };
-        if count > MAX_WAIT_HANDLES {
-            result(context, HorizonKernelResult::OUT_OF_RANGE);
-            return resume();
-        }
-        let handles = match read_handle_array(context, handles_address, count, immediate) {
-            Ok(handles) => handles,
-            Err(outcome) => return outcome,
-        };
-        let mut targets = Vec::with_capacity(handles.len());
-        for handle in handles {
-            if let Some(port) = context
-                .process()
-                .handles()
-                .get_as::<PortObject>(handle)
-                .cloned()
-                && port.endpoint() == PortEndpoint::Server
-            {
-                targets.push(ReplyWaitTarget::Port(port));
-                continue;
-            }
-            if let Some(session) = context
-                .process()
-                .handles()
-                .get_as::<SessionObject>(handle)
-                .cloned()
-                && session.endpoint() == SessionEndpoint::Server
-                && !session.is_light()
-            {
-                targets.push(ReplyWaitTarget::Session(session));
-                continue;
-            }
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        }
-
-        let thread_id = context.thread().object().thread_id();
-        if reply_target != 0 && !self.reply_sent.contains(&thread_id) {
-            let Some(session) = context
-                .process()
-                .handles()
-                .get_as::<SessionObject>(reply_target)
-                .cloned()
-            else {
-                result(context, HorizonKernelResult::INVALID_HANDLE);
-                return resume();
-            };
-            if session.endpoint() != SessionEndpoint::Server || session.is_light() {
-                result(context, HorizonKernelResult::INVALID_HANDLE);
-                return resume();
-            }
-            let reply = match read_guest_message(context, address, size, immediate) {
-                Ok(reply) => reply,
-                Err(outcome) => {
-                    write_register(context.thread_mut().state_mut(), 1, u64::from(u32::MAX));
-                    return outcome;
-                }
-            };
-            let reply = match capture_message_handles(context, reply, true) {
-                Ok(reply) => reply,
-                Err(code) => {
-                    result(context, code);
-                    write_register(context.thread_mut().state_mut(), 1, u64::from(u32::MAX));
-                    return resume();
-                }
-            };
-            if let Err(error) = session.reply(reply) {
-                write_register(context.thread_mut().state_mut(), 1, u64::from(u32::MAX));
-                return session_error(context, error);
-            }
-            self.reply_sent.insert(thread_id);
-        } else if reply_target == 0 {
-            self.reply_sent.remove(&thread_id);
-        }
-
-        for (index, target) in targets.into_iter().enumerate() {
-            match target {
-                ReplyWaitTarget::Port(port) if port.is_signalled() => {
-                    self.finish_reply_wait(thread_id, immediate);
-                    result(context, HorizonKernelResult::SUCCESS);
-                    write_register(context.thread_mut().state_mut(), 1, index as u64);
-                    return resume();
-                }
-                ReplyWaitTarget::Session(session) if session.is_signalled() => {
-                    match session.receive() {
-                        Ok(
-                            message @ (SessionMessage::Buffer(_)
-                            | SessionMessage::TransportedBuffer { .. }),
-                        ) => {
-                            let request = match materialize_message_handles(context, message) {
-                                Ok(Some(request)) => request,
-                                Ok(None) => unreachable!("buffer message materializes as bytes"),
-                                Err(code) => {
-                                    self.finish_reply_wait(thread_id, immediate);
-                                    result(context, code);
-                                    return resume();
-                                }
-                            };
-                            if request.len() > size {
-                                close_encoded_handles(
-                                    context.process_mut().handles_mut(),
-                                    &request,
-                                );
-                                self.finish_reply_wait(thread_id, immediate);
-                                result(context, HorizonKernelResult::INVALID_SIZE);
-                                return resume();
-                            }
-                            if let Err(error) =
-                                crate::ipc_wire::write_bytes(context.process(), address, &request)
-                            {
-                                close_encoded_handles(
-                                    context.process_mut().handles_mut(),
-                                    &request,
-                                );
-                                self.finish_reply_wait(thread_id, immediate);
-                                return reject_ipc(context, immediate, error);
-                            }
-                            self.finish_reply_wait(thread_id, immediate);
-                            result(context, HorizonKernelResult::SUCCESS);
-                            write_register(context.thread_mut().state_mut(), 1, index as u64);
-                            return resume();
-                        }
-                        Ok(SessionMessage::Light(_)) | Err(SessionError::MessageKindMismatch) => {
-                            self.finish_reply_wait(thread_id, immediate);
-                            result(context, HorizonKernelResult::INVALID_STATE);
-                            return resume();
-                        }
-                        Err(SessionError::PeerClosed) => {
-                            self.finish_reply_wait(thread_id, immediate);
-                            result(context, HorizonKernelResult::SESSION_CLOSED);
-                            write_register(context.thread_mut().state_mut(), 1, index as u64);
-                            return resume();
-                        }
-                        Err(SessionError::NoRequest) => {}
-                        Err(error) => {
-                            self.finish_reply_wait(thread_id, immediate);
-                            return session_error(context, error);
-                        }
-                    }
-                }
-                ReplyWaitTarget::Port(_) | ReplyWaitTarget::Session(_) => {}
-            }
-        }
-
-        if self.wait_expired(thread_id, immediate, timeout) {
-            self.finish_reply_wait(thread_id, immediate);
-            result(context, HorizonKernelResult::TIMED_OUT);
-            resume()
-        } else {
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-        }
-    }
-
-    fn wait_expired(&mut self, thread_id: u64, immediate: u32, timeout: i64) -> bool {
-        if timeout == 0 {
-            return true;
-        }
-        if timeout < 0 {
-            return false;
-        }
-        let now = Instant::now();
-        let deadline = self
-            .wait_deadlines
-            .entry((thread_id, immediate))
-            .or_insert_with(|| {
-                now.checked_add(Duration::from_nanos(timeout as u64))
-                    .unwrap_or(now)
-            });
-        now >= *deadline
-    }
-
-    fn finish_reply_wait(&mut self, thread_id: u64, immediate: u32) {
-        self.reply_sent.remove(&thread_id);
-        self.finish_wait(thread_id, immediate);
-    }
-
-    fn finish_wait(&mut self, thread_id: u64, immediate: u32) {
-        self.wait_deadlines.remove(&(thread_id, immediate));
-        self.pending_wakes.remove(&thread_id);
-    }
-}
-
-impl HorizonSvcDispatcher {
-    fn reply_and_receive_light(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        // Light IPC carries seven u32 words in registers and uses bit 31 of the
-        // first word as the reply flag:
-        // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_light_server_session.cpp
-        let handle = read_register(context.thread().state(), 0) as u32;
-        let Some(session) = context
-            .process()
-            .handles()
-            .get_as::<SessionObject>(handle)
-            .cloned()
-        else {
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        };
-        if session.endpoint() != SessionEndpoint::Server || !session.is_light() {
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        }
-        let mut words = [0_u32; 7];
-        for (index, word) in words.iter_mut().enumerate() {
-            *word = read_register(context.thread().state(), index as u8 + 1) as u32;
-        }
-        let thread_id = context.thread().object().thread_id();
-        if words[0] & (1 << 31) != 0
-            && !self.reply_sent.contains(&thread_id)
-            && let Err(error) = session.reply(SessionMessage::Light(words))
-        {
-            return session_error(context, error);
-        }
-        if words[0] & (1 << 31) != 0 {
-            self.reply_sent.insert(thread_id);
-        } else {
-            self.reply_sent.remove(&thread_id);
-        }
-        match session.receive() {
-            Ok(SessionMessage::Light(request)) => {
-                self.reply_sent.remove(&thread_id);
-                for (index, word) in request.into_iter().enumerate() {
-                    write_register(
-                        context.thread_mut().state_mut(),
-                        index as u8 + 1,
-                        u64::from(word),
-                    );
-                }
-                result(context, HorizonKernelResult::SUCCESS);
-                resume()
-            }
-            Ok(SessionMessage::Buffer(_) | SessionMessage::TransportedBuffer { .. })
-            | Err(SessionError::MessageKindMismatch) => {
-                self.reply_sent.remove(&thread_id);
-                result(context, HorizonKernelResult::INVALID_STATE);
-                resume()
-            }
-            Err(SessionError::NoRequest) => {
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-            }
-            Err(error) => {
-                self.reply_sent.remove(&thread_id);
-                session_error(context, error)
-            }
-        }
-    }
-}
-
-fn insert_pair<A, B>(handles: &mut HandleTable, first: A, second: B) -> Result<(u32, u32), ()>
-where
-    A: nixe_runtime::HandleValue,
-    B: nixe_runtime::HandleValue,
-{
-    let first_handle = handles.insert(first).map_err(|_| ())?;
-    match handles.insert(second) {
-        Ok(second_handle) => Ok((first_handle, second_handle)),
-        Err(_) => {
-            let _ = handles.close(first_handle);
-            Err(())
-        }
-    }
-}
-
-fn get_process_id(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 1) as u32;
-    let process_id = if handle == CURRENT_PROCESS_HANDLE {
-        Some(context.process().process_id())
-    } else {
-        context
-            .process()
-            .handles()
-            .get_as::<ProcessObject>(handle)
-            .map(|process| process.process_id())
-    };
-    if let Some(process_id) = process_id {
-        result(context, HorizonKernelResult::SUCCESS);
-        write_u64(context.thread_mut().state_mut(), 1, process_id);
-    } else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-    }
-    resume()
-}
-
-fn get_thread_id(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 1) as u32;
-    let thread_id = if handle == CURRENT_THREAD_HANDLE || handle == context.thread().handle() {
-        Some(context.thread().object().thread_id())
-    } else {
-        context
-            .process()
-            .handles()
-            .get_as::<ThreadObject>(handle)
-            .map(|thread| thread.thread_id())
-    };
-    if let Some(thread_id) = thread_id {
-        result(context, HorizonKernelResult::SUCCESS);
-        write_u64(context.thread_mut().state_mut(), 1, thread_id);
-    } else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-    }
-    resume()
-}
-
-impl HorizonSvcDispatcher {
-    fn wait_synchronization(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let pointer = read_register(context.thread().state(), 1);
-        let count = read_register(context.thread().state(), 2) as u32;
-        let timeout = read_wait_timeout(context.thread().state());
-        if count > MAX_WAIT_HANDLES {
-            result(context, HorizonKernelResult::OUT_OF_RANGE);
-            return resume();
-        }
-        let mut handles = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let Some(address) = pointer.checked_add(u64::from(index) * 4) else {
-                result(context, HorizonKernelResult::INVALID_ADDRESS);
-                return resume();
-            };
-            let value = match context.process().memory().read(
-                context.process().cpu().address_space_id(),
-                GuestVirtualAddress::new(address),
-                MemoryAccess::normal(MemoryAccessSize::Word),
-            ) {
-                Ok(read) => read.value,
-                Err(_) => {
-                    result(context, HorizonKernelResult::INVALID_ADDRESS);
-                    return resume();
-                }
-            };
-            let MemoryValue::U32(handle) = value else {
-                unreachable!("word access returns a word value")
-            };
-            handles.push(handle);
-        }
-        for (index, handle) in handles.iter().copied().enumerate() {
-            let Some(event) = context
-                .process()
-                .handles()
-                .get_as::<ReadableEventObject>(handle)
-            else {
-                result(context, HorizonKernelResult::INVALID_HANDLE);
-                return resume();
-            };
-            if event.is_signalled() {
-                self.finish_wait(context.thread().object().thread_id(), 0x18);
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, index as u64);
-                return resume();
-            }
-        }
-        let thread_id = context.thread().object().thread_id();
-        if self.wait_expired(thread_id, 0x18, timeout) {
-            self.finish_wait(thread_id, 0x18);
-            result(context, HorizonKernelResult::TIMED_OUT);
-            resume()
-        } else {
-            if handles.len() == 1
-                && let Some(event) = context
-                    .process()
-                    .handles()
-                    .get_as::<ReadableEventObject>(handles[0])
-                    .cloned()
-            {
-                let deadline = self.wait_deadlines.get(&(thread_id, 0x18)).copied();
-                self.pending_wakes
-                    .insert(thread_id, PendingThreadWake { event, deadline });
-            }
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-        }
-    }
-}
-
-// Public ABI declarations and kernel behavior:
-// https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_condition_variable.cpp
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_condition_variable.cpp
-//
-// A zero-timeout wait still publishes the condition-variable waiter flag and
-// atomically releases the userspace mutex before returning TimedOut. Blocking
-// waits require a multi-thread scheduler and must stop before guest mutation
-// until that scheduler can retain waiter priority and mutex reacquisition.
-fn wait_process_wide_key_atomic(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    if !matches!(context.thread().state(), ThreadCpuState::A64(_)) {
-        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
-            immediate: 0x1c,
-            documented_name: "WaitProcessWideKeyAtomic AArch32 ABI",
-        });
-    }
-    let mutex_address = read_register(context.thread().state(), 0);
-    let key_address = read_register(context.thread().state(), 1) & !3;
-    let timeout = read_register(context.thread().state(), 3) as i64;
-    if mutex_address >= context.process().address_space_limit() {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-    if !mutex_address.is_multiple_of(4) {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    if timeout != 0 {
-        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
-            immediate: 0x1c,
-            documented_name: "WaitProcessWideKeyAtomic blocking wait",
-        });
-    }
-
-    if let Err(fault) = write_process_wide_key_word(context, key_address, 1)
-        && process_wide_key_fault_is_internal(&fault)
-    {
-        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
-            immediate: 0x1c,
-            fault,
-        });
-    }
-    // Horizon deliberately ignores guest access failure while publishing the
-    // waiter flag; releasing the mutex below determines the syscall result.
-    if let Err(fault) = write_process_wide_key_word(context, mutex_address, 0) {
-        if process_wide_key_fault_is_internal(&fault) {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
-                immediate: 0x1c,
-                fault,
-            });
-        }
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-    result(context, HorizonKernelResult::TIMED_OUT);
-    resume()
-}
-
-// No blocking process-wide waits can currently enter the dispatcher, so the
-// waiter set is necessarily empty. Horizon's exact empty-set behavior is to
-// clear the aligned userspace key regardless of `count`; the SVC has a void
-// ABI and therefore leaves X0 untouched. Guest access failures are ignored by
-// the kernel, while emulator-internal backing failures remain typed faults.
-fn signal_process_wide_key(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let key_address = read_register(context.thread().state(), 0) & !3;
-    if let Err(fault) = write_process_wide_key_word(context, key_address, 0)
-        && process_wide_key_fault_is_internal(&fault)
-    {
-        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
-            immediate: 0x1d,
-            fault,
-        });
-    }
-    resume()
-}
-
-fn write_process_wide_key_word(
-    context: &ExceptionDispatchContext<'_>,
-    address: u64,
-    value: u32,
-) -> Result<(), DataAccessFault> {
-    context
-        .process()
-        .memory()
-        .write(
-            context.process().cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            MemoryAccess::normal(MemoryAccessSize::Word),
-            MemoryValue::U32(value),
-        )
-        .map(|_| ())
-}
-
-fn process_wide_key_fault_is_internal(fault: &DataAccessFault) -> bool {
-    matches!(
-        fault.reason,
-        DataAccessFaultReason::ContentGenerationExhausted | DataAccessFaultReason::HostBacking(_)
-    )
-}
-
 fn query_memory(
     context: &mut ExceptionDispatchContext<'_>,
     immediate: u32,
@@ -2744,6 +1723,32 @@ fn query_memory(
 mod tests {
     use super::*;
     use nixe_runtime::EventObject;
+
+    #[test]
+    fn thread_context_encoding_uses_architecture_specific_horizon_layouts() {
+        let mut a32 = nixe_cpu::state::a32::A32State::a32();
+        a32.write_r(A32GeneralRegister::new(0).expect("R0 exists"), 0x1122_3344);
+        a32.write_r(A32GeneralRegister::new(13).expect("SP exists"), 0x5566_7788);
+        a32.set_instruction_address(0x1000).unwrap();
+        a32.write_d(31, 0x0102_0304_0506_0708);
+        a32.set_fpscr(0xaabb_ccdd);
+        a32.set_tpidrurw(0xdead_beef);
+        let encoded = encode_thread_context(&ThreadCpuState::A32(Box::new(a32)));
+        assert_eq!(encoded.len(), 0x158);
+        assert_eq!(&encoded[0..4], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(&encoded[0x34..0x38], &0x5566_7788_u32.to_le_bytes());
+        assert_eq!(&encoded[0x3c..0x40], &0x1000_u32.to_le_bytes());
+        assert_eq!(
+            &encoded[0x140..0x148],
+            &0x0102_0304_0506_0708_u64.to_le_bytes()
+        );
+        assert_eq!(&encoded[0x148..0x14c], &0xaabb_ccdd_u32.to_le_bytes());
+        assert_eq!(&encoded[0x14c..0x150], &[0; 4]);
+        assert_eq!(&encoded[0x150..0x154], &0xdead_beef_u32.to_le_bytes());
+
+        let encoded = encode_thread_context(&ThreadCpuState::A64(Box::default()));
+        assert_eq!(encoded.len(), 0x320);
+    }
 
     #[test]
     fn failed_handle_materialization_rolls_back_partial_allocations() {

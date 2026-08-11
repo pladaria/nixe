@@ -8,9 +8,11 @@
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
 use nixe_memory::CanonicalRangeTranslator;
+use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
-    HandleTable, ProcessExecutionStatus, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
+    AddressWaitRegistry, HandleTable, ProcessExecutionStatus, ProcessMemoryLayout,
+    ProcessMountNamespace, ThreadObject,
 };
 
 pub use nixe_cpu_engine::ExceptionDispatchRequest;
@@ -120,6 +122,7 @@ pub struct ExceptionProcessContext<'a> {
     canonical_memory: &'a dyn CanonicalRangeTranslator,
     mounts: &'a ProcessMountNamespace,
     handles: &'a mut HandleTable,
+    address_waits: &'a mut AddressWaitRegistry,
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +143,7 @@ impl<'a> ExceptionProcessContext<'a> {
         canonical_memory: &'a dyn CanonicalRangeTranslator,
         mounts: &'a ProcessMountNamespace,
         handles: &'a mut HandleTable,
+        address_waits: &'a mut AddressWaitRegistry,
     ) -> Self {
         Self {
             process_id: metadata.process_id,
@@ -153,6 +157,7 @@ impl<'a> ExceptionProcessContext<'a> {
             canonical_memory,
             mounts,
             handles,
+            address_waits,
         }
     }
 
@@ -237,6 +242,15 @@ impl<'a> ExceptionProcessContext<'a> {
         self.handles
     }
 
+    #[must_use]
+    pub const fn address_waits(&self) -> &AddressWaitRegistry {
+        self.address_waits
+    }
+
+    pub const fn address_waits_mut(&mut self) -> &mut AddressWaitRegistry {
+        self.address_waits
+    }
+
     /// Borrows the immutable mount namespace and mutable handle table together.
     ///
     /// Platform IPC adapters need both resources for an atomic service lookup
@@ -248,6 +262,8 @@ impl<'a> ExceptionProcessContext<'a> {
 
 /// Current guest thread visible while runtime policy handles an exception.
 pub struct ExceptionThreadContext<'a> {
+    id: GuestThreadId,
+    vcpu: VirtualCpuId,
     object: ThreadObject,
     handle: u32,
     state: &'a mut ThreadCpuState,
@@ -255,21 +271,35 @@ pub struct ExceptionThreadContext<'a> {
 
 impl<'a> ExceptionThreadContext<'a> {
     pub(crate) const fn new(
+        id: GuestThreadId,
+        vcpu: VirtualCpuId,
         object: ThreadObject,
         handle: u32,
         state: &'a mut ThreadCpuState,
     ) -> Self {
         Self {
+            id,
+            vcpu,
             object,
             handle,
             state,
         }
     }
 
+    #[must_use]
+    pub const fn id(&self) -> GuestThreadId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn vcpu(&self) -> VirtualCpuId {
+        self.vcpu
+    }
+
     /// Returns the runtime-owned identity of the current thread.
     #[must_use]
-    pub const fn object(&self) -> ThreadObject {
-        self.object
+    pub fn object(&self) -> ThreadObject {
+        self.object.clone()
     }
 
     /// Returns the process-local handle installed for the current thread.
@@ -327,6 +357,7 @@ impl<'a> ExceptionDispatchContext<'a> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExceptionRouteError {
     NotSupervisorCall,
+    UnknownThread(GuestThreadId),
     ProcessNotSuspended {
         status: ProcessExecutionStatus,
     },
@@ -359,6 +390,7 @@ impl std::fmt::Display for ExceptionRouteError {
             Self::NotSupervisorCall => {
                 formatter.write_str("execution stop is not a supervisor call")
             }
+            Self::UnknownThread(id) => write!(formatter, "guest thread {id} does not exist"),
             Self::ProcessNotSuspended { status } => {
                 write!(
                     formatter,

@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 #[test]
-fn scheduler_shell_has_no_execution_or_platform_dependencies() {
+fn scheduler_state_machine_has_no_execution_or_platform_dependencies() {
     let manifest =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
     let dependencies = dependency_names(&manifest);

@@ -2,17 +2,25 @@
 
 pub use nixe_loader_executable::RelocationState;
 
+mod address_wait;
+mod coordinator;
 mod diagnostics;
 mod exception_dispatch;
-mod execution;
+mod external_event;
 mod handle;
 mod launch_plan;
 mod launcher;
 mod module_memory;
-mod process_builder;
+mod process;
 mod process_mount;
 mod virtual_time;
 
+pub use address_wait::AddressWaitRegistry;
+pub use coordinator::{
+    CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
+    CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
+    ThreadSchedulingInfo,
+};
 pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
@@ -20,11 +28,9 @@ pub use exception_dispatch::{
     ExceptionRouteError, ExceptionTerminationReason, ExceptionTerminationScope,
     ExceptionThreadContext,
 };
-pub use execution::{
-    ExecutionReport, ExecutionStop, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-    ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
-    ProcessTeardownReport, ThreadExit,
+pub use external_event::{
+    ExternalEvent, ExternalEventInbox, ExternalEventSendError, ExternalEventSender,
+    ExternalEventSource,
 };
 pub use handle::{
     EventObject, EventWaitOutcome, HandleError, HandleObject, HandleTable, HandleValue,
@@ -42,10 +48,14 @@ pub use module_memory::{
     BackendInstallError, InstallStage, ModuleInstallError, ModuleMemoryBackend, PageRequest,
     install_prepared_module,
 };
-pub use process_builder::{
+pub use process::{
+    ExecutionReport, ExecutionStop, GuestThread, InstructionTrace, InstructionTraceEntry,
+    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
     MainThread, ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage,
-    ProcessBuilder, ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessVirtualRegion,
-    RunnableProcess,
+    ProcessBuilder, ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
+    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownReport, ProcessVirtualRegion,
+    RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadExit,
+    ThreadTable, ThreadTableError,
 };
 pub use process_mount::ProcessMountNamespace;
 pub use virtual_time::{VirtualClock, VirtualClockMode};

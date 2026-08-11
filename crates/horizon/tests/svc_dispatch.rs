@@ -17,15 +17,15 @@ use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonProcess,
     HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
-    OperationMode, UnsupportedServiceOperation,
+    OperationMode, UnsupportedServiceOperation, switch_1_scheduler_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
     Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExecutionError,
-    ProcessExecutionStatus, ProcessExitCause, ProcessObject, ReadableEventObject, RunnableProcess,
-    SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject,
-    WritableEventObject,
+    ProcessExecutionStatus, ProcessExitCause, ProcessObject, ProcessRegistration,
+    ReadableEventObject, RunnableProcess, RuntimeCoordinator, SessionMessage, SessionObject,
+    SessionRequestOwner, SessionRequestResult, SharedMemoryObject, WritableEventObject,
 };
 
 fn reference_process_builder() -> ProcessBuilder {
@@ -503,7 +503,7 @@ fn process_wide_key_signal_and_zero_timeout_wait_have_exact_memory_effects() {
 }
 
 #[test]
-fn blocking_process_wide_key_wait_stops_before_mutating_guest_memory() {
+fn blocking_process_wide_key_wait_releases_mutex_and_publishes_wakeup() {
     let (_directory, mut process) = fixture_process(&[svc(0x1c)]);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let key = process.main_thread().stack_bottom;
@@ -524,14 +524,12 @@ fn blocking_process_wide_key_wait_stops_before_mutating_guest_memory() {
     state(&mut process).write_w(x(2), 0x1234_5678);
     state(&mut process).write_x(x(3), u64::MAX);
 
-    assert!(matches!(
+    assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedSemantics {
-            immediate: 0x1c,
-            documented_name: "WaitProcessWideKeyAtomic blocking wait",
-        })
-    ));
-    for (address, expected) in [(key, 0_u32), (mutex, 0x1234_5678)] {
+        ExceptionHandlingResult::Suspended
+    );
+    assert!(dispatcher.thread_wakeup_source(1).is_some());
+    for (address, expected) in [(key, 1_u32), (mutex, 0)] {
         assert_eq!(
             process
                 .memory()
@@ -630,7 +628,7 @@ fn unsignalled_wait_times_out_or_suspends_without_becoming_a_no_op() {
 }
 
 #[test]
-fn finite_event_wait_sleeps_until_its_deadline_then_returns_timed_out() {
+fn finite_event_wait_uses_virtual_deadline_then_returns_timed_out() {
     let (_directory, mut process) = fixture_process(&[svc(0x45), svc(0x18)]);
     let mut dispatcher = HorizonSvcDispatcher::default();
     assert_eq!(
@@ -657,7 +655,9 @@ fn finite_event_wait_sleeps_until_its_deadline_then_returns_timed_out() {
         ExceptionHandlingResult::Suspended
     );
     let thread_id = process.main_thread().object().thread_id();
-    assert!(dispatcher.wait_for_thread_wakeup(thread_id));
+    let source = dispatcher.thread_wakeup_source(thread_id).unwrap();
+    assert_eq!(source.timeout(), Some(Duration::from_millis(2)));
+    dispatcher.synchronize_virtual_time(2_000_000);
     assert!(process.resume());
     assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -1435,6 +1435,7 @@ fn reply_and_receive_positive_timeout_expires_after_retry() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     );
+    dispatcher.synchronize_virtual_time(1);
     assert!(process.resume());
     assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -2534,6 +2535,7 @@ fn closing_the_initial_thread_handle_does_not_destroy_the_current_thread() {
         ExceptionHandlingResult::Resumed
     );
     assert!(process.handles().get(initial_handle).is_none());
+    assert!(!process.main_thread().object().is_signalled());
 
     state(&mut process).write_w(x(1), CURRENT_THREAD_HANDLE);
     assert_eq!(
@@ -2614,6 +2616,171 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
             assert!(teardown.physical_pages_released > 0);
         }
     }
+}
+
+#[test]
+fn create_thread_commits_through_a64_abi() {
+    let (_directory, mut process) = fixture_process_for_state(ExecutionState::A64, &[0x08, 0x09]);
+    let entry = process.entry_module().entry_address() + 0x80;
+    let stack_top = process.entry_module().entry_address() + 0x2800;
+    write_abi_register(&mut process, 1, entry);
+    write_abi_register(&mut process, 2, 0x1234_5678);
+    write_abi_register(&mut process, 3, stack_top);
+    write_abi_register(&mut process, 4, 20);
+    write_abi_register(&mut process, 5, (-2_i32) as u32 as u64);
+    let registration = ProcessRegistration {
+        priority: process.initial_thread_priority(),
+        ideal_vcpu: Some(process.initial_ideal_vcpu()),
+        affinity: switch_1_scheduler_profile().all_cores(),
+    };
+    let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
+    let process_id = coordinator.register_process(process, registration).unwrap();
+    let execution = coordinator.run_next(1).unwrap().unwrap();
+    let caller = execution.lease.thread;
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    assert_eq!(
+        coordinator
+            .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
+            .unwrap(),
+        ExceptionHandlingResult::Suspended
+    );
+    assert!(
+        dispatcher
+            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
+            .unwrap()
+    );
+    let process = coordinator.process(process_id).unwrap();
+    let result = match &process.thread(caller).unwrap().state {
+        ThreadCpuState::A64(state) => state.read_w(x(0)),
+        ThreadCpuState::A32(state) => state.read_r(A32GeneralRegister::new(0).unwrap()),
+    };
+    assert_eq!(result, HorizonKernelResult::SUCCESS.raw());
+    assert_eq!(process.threads().len(), 2);
+    let created = process
+        .threads()
+        .iter()
+        .find_map(|(id, thread)| (*id != caller).then_some(thread))
+        .unwrap();
+    assert_eq!(
+        created.lifecycle(),
+        nixe_scheduler::ThreadLifecycle::Created
+    );
+    assert_eq!(created.stack_top.get(), stack_top);
+    match &created.state {
+        ThreadCpuState::A64(state) => assert_eq!(state.read_x(x(0)), 0x1234_5678),
+        ThreadCpuState::A32(state) => assert_eq!(
+            state.read_r(A32GeneralRegister::new(0).unwrap()),
+            0x1234_5678
+        ),
+    }
+    assert_eq!(
+        process.thread(caller).unwrap().lifecycle(),
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+    let created_id = created.id();
+    let created_handle = created.handle;
+    write_abi_register(
+        coordinator.process_mut(process_id).unwrap(),
+        0,
+        u64::from(created_handle),
+    );
+    let execution = coordinator.run_next(1).unwrap().unwrap();
+    assert_eq!(execution.lease.thread, caller);
+    assert_eq!(
+        coordinator
+            .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
+            .unwrap(),
+        ExceptionHandlingResult::Suspended
+    );
+    assert!(
+        dispatcher
+            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
+            .unwrap()
+    );
+    assert_eq!(
+        coordinator
+            .scheduler()
+            .thread(created_id)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+}
+
+#[test]
+fn create_thread_commits_through_aarch32_abi_in_a_32_bit_process() {
+    use support::synthetic_packages::{
+        APPLICATION_ID, MetaKind, Package, aarch32_program_content_with_svc, build_nsp, content_id,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let package = Package {
+        title_id: APPLICATION_ID,
+        version: 0,
+        kind: MetaKind::Application,
+        contents: vec![aarch32_program_content_with_svc(content_id(1), 0x08)],
+    };
+    fs::write(directory.path().join("aarch32.nsp"), build_nsp(&package)).unwrap();
+    let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
+    assert_eq!(
+        process.main_thread().state.execution_state(),
+        ExecutionState::A32
+    );
+    let entry = process.entry_module().entry_address() + 4;
+    let stack_top = process.main_thread().stack_top.get();
+    write_abi_register(&mut process, 0, 20);
+    write_abi_register(&mut process, 1, entry);
+    write_abi_register(&mut process, 2, 0x1234_5678);
+    write_abi_register(&mut process, 3, stack_top);
+    write_abi_register(&mut process, 4, (-2_i32) as u32 as u64);
+
+    let registration = ProcessRegistration {
+        priority: process.initial_thread_priority(),
+        ideal_vcpu: Some(process.initial_ideal_vcpu()),
+        affinity: switch_1_scheduler_profile().all_cores(),
+    };
+    let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
+    let process_id = coordinator.register_process(process, registration).unwrap();
+    let execution = coordinator.run_next(1).unwrap().unwrap();
+    let caller = execution.lease.thread;
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    assert_eq!(
+        coordinator
+            .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
+            .unwrap(),
+        ExceptionHandlingResult::Suspended
+    );
+    assert!(
+        dispatcher
+            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
+            .unwrap()
+    );
+    let process = coordinator.process(process_id).unwrap();
+    let ThreadCpuState::A32(caller_state) = &process.thread(caller).unwrap().state else {
+        panic!("the caller must remain AArch32");
+    };
+    assert_eq!(
+        caller_state.read_r(A32GeneralRegister::new(0).unwrap()),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    let created = process
+        .threads()
+        .iter()
+        .find_map(|(id, thread)| (*id != caller).then_some(thread))
+        .unwrap();
+    let ThreadCpuState::A32(created_state) = &created.state else {
+        panic!("the created thread must inherit AArch32 execution");
+    };
+    assert_eq!(created_state.instruction_address(), entry as u32);
+    assert_eq!(
+        created_state.read_r(A32GeneralRegister::new(0).unwrap()),
+        0x1234_5678
+    );
+    assert_eq!(
+        created_state.read_r(A32GeneralRegister::new(13).unwrap()),
+        stack_top as u32
+    );
 }
 
 #[test]

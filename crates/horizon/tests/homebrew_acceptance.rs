@@ -361,10 +361,10 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
         assert!(
             coverage.iter().any(|entry| {
                 entry.immediate == immediate
-                    && entry.support == HorizonSvcSupport::Complete
+                    && entry.support != HorizonSvcSupport::Unsupported
                     && entry.resumed > 0
             }),
-            "missing completed SVC {immediate:#x}; coverage={coverage:?}"
+            "missing supported successful SVC {immediate:#x}; coverage={coverage:?}"
         );
     }
 }

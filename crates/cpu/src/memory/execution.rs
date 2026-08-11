@@ -568,6 +568,28 @@ impl ExecutionMemory {
         address: GuestVirtualAddress,
         bytes: &[u8],
     ) -> bool {
+        self.write_mapped_ram_checked(address_space, address, bytes, false)
+    }
+
+    /// Atomically writes a fully validated guest-writable RAM range. No byte
+    /// is changed when any page is unmapped, non-RAM, read-only, or unable to
+    /// publish its next content generation.
+    pub fn write_mapped_ram(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+    ) -> bool {
+        self.write_mapped_ram_checked(address_space, address, bytes, true)
+    }
+
+    fn write_mapped_ram_checked(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+        require_write: bool,
+    ) -> bool {
         let Some(end) = address.get().checked_add(bytes.len() as u64) else {
             return false;
         };
@@ -579,6 +601,9 @@ impl ExecutionMemory {
             let Some(mapping) = inner.mapping_at(address_space, virtual_address) else {
                 return false;
             };
+            if require_write && !mapping.permissions.contains(MemoryPermissions::WRITE) {
+                return false;
+            }
             let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
             else {
                 return false;
@@ -1729,6 +1754,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::memory::MemoryAccessSize;
     use nixe_memory::{
         CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
         DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
@@ -1817,6 +1843,42 @@ mod tests {
                 address: GuestVirtualAddress::new(0x2000),
                 reason: CanonicalRangeTranslationErrorReason::PermissionDenied,
             }
+        );
+    }
+
+    #[test]
+    fn mapped_ram_write_is_atomic_across_a_read_only_page() {
+        let memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(9);
+        memory
+            .resize_zeroed_mapping(
+                space,
+                GuestVirtualAddress::new(0x1000),
+                0,
+                0x2000,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Heap,
+            )
+            .unwrap();
+        memory
+            .set_permissions(
+                space,
+                GuestVirtualAddress::new(0x2000),
+                0x1000,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        assert!(!memory.write_mapped_ram(space, GuestVirtualAddress::new(0x1fff), &[0xaa, 0xbb],));
+        assert_eq!(
+            memory
+                .read(
+                    space,
+                    GuestVirtualAddress::new(0x1fff),
+                    MemoryAccess::normal(MemoryAccessSize::Byte),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U8(0),
         );
     }
 

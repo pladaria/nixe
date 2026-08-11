@@ -961,6 +961,7 @@ dependencies = [
  "nixe-loader-storage",
  "nixe-loader-title",
  "nixe-runtime",
+ "nixe-scheduler",
  "nixe-video",
  "nixe-video-winit",
  "sha2",
@@ -1041,6 +1042,7 @@ dependencies = [
  "nixe-loader-title",
  "nixe-memory",
  "nixe-runtime",
+ "nixe-scheduler",
  "nixe-video",
  "sha2",
  "tempfile",
@@ -1114,6 +1116,7 @@ dependencies = [
  "nixe-loader-storage",
  "nixe-loader-title",
  "nixe-memory",
+ "nixe-scheduler",
  "sha2",
  "tempfile",
 ]

@@ -20,6 +20,13 @@ pub(super) fn execute(
     instruction: Instruction,
 ) -> Result<InterpreterOutcome, InterpreterError> {
     let fields = instruction.operands();
+    if matches!(instruction, Instruction::Hint(_)) && fields.hint == 1 {
+        // Arm YIELD retires before handing control to the runtime scheduler.
+        // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/YIELD--Yield-instruction
+        let source = decoded.location;
+        advance(state);
+        return Ok(InterpreterOutcome::Scheduled { source });
+    }
     let outcome = match instruction {
         Instruction::Hint(_) => execute_hint(context, state, decoded.location, fields),
         Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
@@ -42,9 +49,9 @@ fn execute_hint(
 ) -> bool {
     match fields.hint {
         0 => true,
-        // YIELD/WFE/WFI/SEV/SEVL require scheduler/event callbacks. Treating
+        // WFE/WFI/SEV/SEVL still require verified event callbacks. Treating
         // them as no-ops would make this reference engine an invalid oracle.
-        1..=5 => false,
+        2..=5 => false,
         // BTI is encoded in the HINT space. On a profile where FEAT_BTI is
         // absent these encodings retain their architectural hint behavior;
         // enabled or unknown profiles require the future branch-type state.

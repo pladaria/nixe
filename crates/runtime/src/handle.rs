@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
 use nixe_cpu::memory::MemoryPermissions;
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, GuestVirtualAddress};
 
+mod event;
+mod port;
+mod session;
+pub(crate) use event::EventWatchRegistration;
+pub use event::{EventObject, EventWaitOutcome, ReadableEventObject, WritableEventObject};
+use port::PortState;
+pub use port::{PortEndpoint, PortError, PortObject};
+pub use session::{
+    MAX_SESSION_REQUESTS, SessionEndpoint, SessionError, SessionMessage, SessionObject,
+    SessionRequestOwner, SessionRequestResult,
+};
+
 const FIRST_HANDLE: u32 = 1;
 const LAST_HANDLE: u32 = 0x7fff_ffff;
 /// Safety limit for the temporary host-backed shared-memory object.
@@ -64,6 +76,11 @@ impl HandleObject {
     pub fn same_identity(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.value, &other.value)
     }
+
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.value)
+    }
 }
 
 impl PartialEq for HandleObject {
@@ -81,9 +98,15 @@ impl Debug for HandleObject {
 }
 
 /// Runtime-owned thread identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ThreadObject {
-    thread_id: u64,
+    identity: Arc<ThreadIdentity>,
+}
+
+#[derive(Debug)]
+struct ThreadIdentity {
+    thread_id: AtomicU64,
+    completion: EventObject,
 }
 
 /// Runtime-owned process identity transported through copied pseudo-handles.
@@ -106,173 +129,50 @@ impl ProcessObject {
 
 impl ThreadObject {
     #[must_use]
-    pub const fn new(thread_id: u64) -> Self {
-        Self { thread_id }
-    }
-
-    #[must_use]
-    pub const fn thread_id(self) -> u64 {
-        self.thread_id
-    }
-}
-
-/// A minimal event object with state shared by duplicated handles.
-#[derive(Clone, Debug)]
-pub struct EventObject {
-    state: Arc<EventState>,
-}
-
-#[derive(Debug)]
-struct EventState {
-    signalled: std::sync::atomic::AtomicBool,
-    generation: Mutex<u64>,
-    changed: Condvar,
-}
-
-/// Host scheduling result from sleeping on one runtime event.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EventWaitOutcome {
-    Signalled,
-    TimedOut,
-}
-
-impl Default for EventObject {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EventObject {
-    #[must_use]
-    pub fn new() -> Self {
+    pub fn new(thread_id: u64) -> Self {
         Self {
-            state: Arc::new(EventState {
-                signalled: std::sync::atomic::AtomicBool::new(false),
-                generation: Mutex::new(0),
-                changed: Condvar::new(),
+            identity: Arc::new(ThreadIdentity {
+                thread_id: AtomicU64::new(thread_id),
+                completion: EventObject::new(),
             }),
         }
     }
 
-    /// Creates the writable/readable handle views returned by Horizon's
-    /// `CreateEvent` without duplicating the underlying signal state.
     #[must_use]
-    pub fn create_pair() -> (WritableEventObject, ReadableEventObject) {
-        let event = Self::new();
-        (
-            WritableEventObject(event.clone()),
-            ReadableEventObject(event),
-        )
+    pub fn thread_id(&self) -> u64 {
+        self.identity.thread_id.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn assign_thread_id(&self, thread_id: u64) {
+        self.identity.thread_id.store(thread_id, Ordering::Release);
+    }
+
+    pub(crate) fn identity_reference_count(&self) -> usize {
+        Arc::strong_count(&self.identity)
     }
 
     #[must_use]
     pub fn is_signalled(&self) -> bool {
-        self.state
-            .signalled
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.identity.completion.is_signalled()
     }
 
-    pub fn signal(&self) {
-        self.state
-            .signalled
-            .store(true, std::sync::atomic::Ordering::Release);
-        let mut generation = self
-            .state
-            .generation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *generation = generation.wrapping_add(1);
-        self.state.changed.notify_all();
+    pub(crate) fn signal(&self) {
+        self.identity.completion.signal();
     }
 
-    pub fn clear(&self) {
-        self.state
-            .signalled
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    fn wait_until(&self, deadline: Option<Instant>) -> EventWaitOutcome {
-        if self.is_signalled() {
-            return EventWaitOutcome::Signalled;
-        }
-        let mut generation = self
-            .state
-            .generation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let observed = *generation;
-        loop {
-            if self.is_signalled() || *generation != observed {
-                return EventWaitOutcome::Signalled;
-            }
-            generation = match deadline {
-                None => self
-                    .state
-                    .changed
-                    .wait(generation)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return EventWaitOutcome::TimedOut;
-                    }
-                    let (next, timeout) = self
-                        .state
-                        .changed
-                        .wait_timeout(generation, deadline.saturating_duration_since(now))
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if timeout.timed_out() && Instant::now() >= deadline {
-                        return EventWaitOutcome::TimedOut;
-                    }
-                    next
-                }
-            };
-        }
+    #[must_use]
+    pub fn readable_event(&self) -> ReadableEventObject {
+        ReadableEventObject(self.identity.completion.clone())
     }
 }
 
-/// Writable side of a kernel event pair.
-#[derive(Clone, Debug)]
-pub struct WritableEventObject(EventObject);
-
-impl WritableEventObject {
-    #[must_use]
-    pub fn is_signalled(&self) -> bool {
-        self.0.is_signalled()
-    }
-
-    pub fn signal(&self) {
-        self.0.signal();
-    }
-
-    pub fn clear(&self) {
-        self.0.clear();
+impl PartialEq for ThreadObject {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
     }
 }
 
-/// Readable synchronization side of a kernel event pair.
-#[derive(Clone, Debug)]
-pub struct ReadableEventObject(EventObject);
-
-impl ReadableEventObject {
-    #[must_use]
-    pub fn is_signalled(&self) -> bool {
-        self.0.is_signalled()
-    }
-
-    pub fn clear(&self) {
-        self.0.clear();
-    }
-
-    /// Sleeps until this event is signalled or the relative timeout expires.
-    /// `None` represents an infinite wait.
-    #[must_use]
-    pub fn wait(&self, timeout: Option<Duration>) -> EventWaitOutcome {
-        let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
-        self.0.wait_until(deadline)
-    }
-}
-
+impl Eq for ThreadObject {}
 /// Guest-owned memory range exported through a Horizon transfer-memory handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferMemoryObject {
@@ -318,547 +218,6 @@ impl TransferMemoryObject {
     pub const fn backing(&self) -> &CanonicalBackingRange {
         &self.backing
     }
-}
-
-/// Endpoint role of one process-local session pair.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SessionEndpoint {
-    Server,
-    Client,
-}
-
-/// Maximum number of requests retained by one session before back-pressure.
-pub const MAX_SESSION_REQUESTS: usize = 0x40;
-
-// Session request/reply and peer-close behavior follows the public
-// implementation in Atmosphère's kernel:
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_client_session.cpp
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_server_session.cpp
-
-/// Message transported by a normal or light Horizon session.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionMessage {
-    Buffer(Vec<u8>),
-    TransportedBuffer {
-        bytes: Vec<u8>,
-        copy_handles: Vec<Option<HandleObject>>,
-        move_handles: Vec<Option<HandleObject>>,
-    },
-    Light([u32; 7]),
-}
-
-impl SessionMessage {
-    #[must_use]
-    pub const fn is_light(&self) -> bool {
-        matches!(self, Self::Light(_))
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SessionRequest {
-    id: u64,
-    owner: SessionRequestOwner,
-    message: SessionMessage,
-}
-
-/// Process/thread identity of one synchronous session request owner.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SessionRequestOwner {
-    pub process_id: u64,
-    pub thread_id: u64,
-}
-
-#[derive(Debug)]
-struct SessionState {
-    server_open: bool,
-    client_open: bool,
-    next_request_id: u64,
-    queued: VecDeque<SessionRequest>,
-    current: Option<SessionRequest>,
-    pending_by_owner: BTreeMap<SessionRequestOwner, u64>,
-    responses: BTreeMap<u64, SessionMessage>,
-    owning_port: Option<Weak<Mutex<PortState>>>,
-}
-
-#[derive(Debug)]
-struct SessionIdentity {
-    state: Mutex<SessionState>,
-    wake_generation: AtomicU64,
-}
-
-#[derive(Debug)]
-struct SessionEndpointLease {
-    identity: Arc<SessionIdentity>,
-    endpoint: SessionEndpoint,
-}
-
-impl Drop for SessionEndpointLease {
-    fn drop(&mut self) {
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.endpoint {
-            SessionEndpoint::Server => state.server_open = false,
-            SessionEndpoint::Client => state.client_open = false,
-        }
-        state.queued.clear();
-        state.current = None;
-        state.responses.clear();
-        state.pending_by_owner.clear();
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-    }
-}
-
-/// Result of submitting or polling one synchronous client request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionRequestResult {
-    Submitted,
-    Waiting,
-    Response(SessionMessage),
-}
-
-/// Deterministic session transport failure.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SessionError {
-    WrongEndpoint,
-    PeerClosed,
-    QueueFull,
-    NoRequest,
-    ReplyPending,
-    MessageKindMismatch,
-}
-
-/// One endpoint of a paired, bounded synchronous session transport.
-#[derive(Clone, Debug)]
-pub struct SessionObject {
-    identity: Arc<SessionIdentity>,
-    endpoint: SessionEndpoint,
-    _lease: Arc<SessionEndpointLease>,
-    is_light: bool,
-}
-
-impl SessionObject {
-    #[must_use]
-    pub fn create_pair() -> (Self, Self) {
-        Self::create_pair_with_kind(false, None)
-    }
-
-    #[must_use]
-    pub fn create_light_pair() -> (Self, Self) {
-        Self::create_pair_with_kind(true, None)
-    }
-
-    fn create_pair_with_kind(
-        is_light: bool,
-        owning_port: Option<Weak<Mutex<PortState>>>,
-    ) -> (Self, Self) {
-        let identity = Arc::new(SessionIdentity {
-            state: Mutex::new(SessionState {
-                server_open: true,
-                client_open: true,
-                next_request_id: 1,
-                queued: VecDeque::new(),
-                current: None,
-                pending_by_owner: BTreeMap::new(),
-                responses: BTreeMap::new(),
-                owning_port,
-            }),
-            wake_generation: AtomicU64::new(0),
-        });
-        let server_lease = Arc::new(SessionEndpointLease {
-            identity: Arc::clone(&identity),
-            endpoint: SessionEndpoint::Server,
-        });
-        let client_lease = Arc::new(SessionEndpointLease {
-            identity: Arc::clone(&identity),
-            endpoint: SessionEndpoint::Client,
-        });
-        (
-            Self {
-                identity: identity.clone(),
-                endpoint: SessionEndpoint::Server,
-                _lease: server_lease,
-                is_light,
-            },
-            Self {
-                identity,
-                endpoint: SessionEndpoint::Client,
-                _lease: client_lease,
-                is_light,
-            },
-        )
-    }
-
-    #[must_use]
-    pub const fn endpoint(&self) -> SessionEndpoint {
-        self.endpoint
-    }
-
-    #[must_use]
-    pub fn same_session(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
-    }
-
-    #[must_use]
-    pub const fn is_light(&self) -> bool {
-        self.is_light
-    }
-
-    #[must_use]
-    pub fn wake_generation(&self) -> u64 {
-        self.identity.wake_generation.load(Ordering::Acquire)
-    }
-
-    #[must_use]
-    pub fn is_signalled(&self) -> bool {
-        let state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.endpoint {
-            SessionEndpoint::Server => !state.queued.is_empty() || !state.client_open,
-            SessionEndpoint::Client => !state.responses.is_empty() || !state.server_open,
-        }
-    }
-
-    pub fn request(
-        &self,
-        owner: SessionRequestOwner,
-        message: SessionMessage,
-    ) -> Result<SessionRequestResult, SessionError> {
-        if self.endpoint != SessionEndpoint::Client {
-            return Err(SessionError::WrongEndpoint);
-        }
-        if self.is_light != message.is_light() {
-            return Err(SessionError::MessageKindMismatch);
-        }
-        if let Some(result) = self.poll_request(owner)? {
-            return Ok(result);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.server_open {
-            return Err(SessionError::PeerClosed);
-        }
-        if state.pending_by_owner.len() >= MAX_SESSION_REQUESTS {
-            return Err(SessionError::QueueFull);
-        }
-        let id = state.next_request_id;
-        state.next_request_id = state.next_request_id.saturating_add(1);
-        state.pending_by_owner.insert(owner, id);
-        state
-            .queued
-            .push_back(SessionRequest { id, owner, message });
-        drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        Ok(SessionRequestResult::Submitted)
-    }
-
-    /// Polls a previously submitted request without enqueueing another message.
-    pub fn poll_request(
-        &self,
-        owner: SessionRequestOwner,
-    ) -> Result<Option<SessionRequestResult>, SessionError> {
-        if self.endpoint != SessionEndpoint::Client {
-            return Err(SessionError::WrongEndpoint);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(request_id) = state.pending_by_owner.get(&owner).copied() else {
-            return Ok(None);
-        };
-        if let Some(response) = state.responses.remove(&request_id) {
-            state.pending_by_owner.remove(&owner);
-            drop(state);
-            self.identity
-                .wake_generation
-                .fetch_add(1, Ordering::Release);
-            return Ok(Some(SessionRequestResult::Response(response)));
-        }
-        if !state.server_open {
-            state.pending_by_owner.remove(&owner);
-            drop(state);
-            self.identity
-                .wake_generation
-                .fetch_add(1, Ordering::Release);
-            return Err(SessionError::PeerClosed);
-        }
-        Ok(Some(SessionRequestResult::Waiting))
-    }
-
-    pub fn receive(&self) -> Result<SessionMessage, SessionError> {
-        if self.endpoint != SessionEndpoint::Server {
-            return Err(SessionError::WrongEndpoint);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.current.is_some() {
-            return Err(SessionError::ReplyPending);
-        }
-        let request = state.queued.pop_front().ok_or_else(|| {
-            if state.client_open {
-                SessionError::NoRequest
-            } else {
-                SessionError::PeerClosed
-            }
-        })?;
-        let message = request.message.clone();
-        state.current = Some(request);
-        drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        Ok(message)
-    }
-
-    pub fn reply(&self, message: SessionMessage) -> Result<(), SessionError> {
-        if self.endpoint != SessionEndpoint::Server {
-            return Err(SessionError::WrongEndpoint);
-        }
-        if self.is_light != message.is_light() {
-            return Err(SessionError::MessageKindMismatch);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.client_open {
-            return Err(SessionError::PeerClosed);
-        }
-        let request = state.current.take().ok_or(SessionError::NoRequest)?;
-        debug_assert_eq!(
-            state.pending_by_owner.get(&request.owner),
-            Some(&request.id)
-        );
-        state.responses.insert(request.id, message);
-        drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-}
-
-impl Drop for SessionIdentity {
-    fn drop(&mut self) {
-        let owning_port = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .owning_port
-            .take();
-        if let Some(port) = owning_port.and_then(|port| port.upgrade()) {
-            let mut port = port
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            port.active_sessions = port.active_sessions.saturating_sub(1);
-        }
-    }
-}
-
-/// Endpoint role of a paired port.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum PortEndpoint {
-    Server,
-    Client,
-}
-
-// Port connection queues and endpoint-close state follow:
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_port.cpp
-
-#[derive(Debug)]
-struct PortState {
-    server_open: bool,
-    client_open: bool,
-    max_sessions: usize,
-    active_sessions: usize,
-    is_light: bool,
-    pending: VecDeque<SessionObject>,
-}
-
-#[derive(Debug)]
-struct PortIdentity {
-    state: Arc<Mutex<PortState>>,
-    wake_generation: AtomicU64,
-}
-
-#[derive(Debug)]
-struct PortEndpointLease {
-    identity: Arc<PortIdentity>,
-    endpoint: PortEndpoint,
-}
-
-impl Drop for PortEndpointLease {
-    fn drop(&mut self) {
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.endpoint {
-            PortEndpoint::Server => state.server_open = false,
-            PortEndpoint::Client => state.client_open = false,
-        }
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-    }
-}
-
-/// One endpoint of a bounded Horizon port.
-#[derive(Clone, Debug)]
-pub struct PortObject {
-    identity: Arc<PortIdentity>,
-    endpoint: PortEndpoint,
-    _lease: Arc<PortEndpointLease>,
-}
-
-impl PortObject {
-    #[must_use]
-    pub fn create_pair(max_sessions: usize, is_light: bool) -> (Self, Self) {
-        let identity = Arc::new(PortIdentity {
-            state: Arc::new(Mutex::new(PortState {
-                server_open: true,
-                client_open: true,
-                max_sessions,
-                active_sessions: 0,
-                is_light,
-                pending: VecDeque::new(),
-            })),
-            wake_generation: AtomicU64::new(0),
-        });
-        let server_lease = Arc::new(PortEndpointLease {
-            identity: Arc::clone(&identity),
-            endpoint: PortEndpoint::Server,
-        });
-        let client_lease = Arc::new(PortEndpointLease {
-            identity: Arc::clone(&identity),
-            endpoint: PortEndpoint::Client,
-        });
-        (
-            Self {
-                identity: Arc::clone(&identity),
-                endpoint: PortEndpoint::Server,
-                _lease: server_lease,
-            },
-            Self {
-                identity,
-                endpoint: PortEndpoint::Client,
-                _lease: client_lease,
-            },
-        )
-    }
-
-    #[must_use]
-    pub const fn endpoint(&self) -> PortEndpoint {
-        self.endpoint
-    }
-
-    #[must_use]
-    pub fn same_port(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
-    }
-
-    #[must_use]
-    pub fn server_is_open(&self) -> bool {
-        self.identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_open
-    }
-
-    #[must_use]
-    pub fn wake_generation(&self) -> u64 {
-        self.identity.wake_generation.load(Ordering::Acquire)
-    }
-
-    #[must_use]
-    pub fn is_signalled(&self) -> bool {
-        let state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.endpoint == PortEndpoint::Server && (!state.pending.is_empty() || !state.client_open)
-    }
-
-    pub fn connect(&self) -> Result<SessionObject, PortError> {
-        if self.endpoint != PortEndpoint::Client {
-            return Err(PortError::WrongEndpoint);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.server_open {
-            return Err(PortError::PeerClosed);
-        }
-        if state.active_sessions >= state.max_sessions {
-            return Err(PortError::SessionLimit);
-        }
-        let (server, client) = SessionObject::create_pair_with_kind(
-            state.is_light,
-            Some(Arc::downgrade(&self.identity.state)),
-        );
-        state.active_sessions += 1;
-        state.pending.push_back(server);
-        drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        Ok(client)
-    }
-
-    pub fn accept(&self) -> Result<SessionObject, PortError> {
-        if self.endpoint != PortEndpoint::Server {
-            return Err(PortError::WrongEndpoint);
-        }
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session = state.pending.pop_front().ok_or_else(|| {
-            if state.client_open {
-                PortError::NoPendingSession
-            } else {
-                PortError::PeerClosed
-            }
-        })?;
-        drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        Ok(session)
-    }
-}
-
-/// Deterministic port operation failure.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum PortError {
-    WrongEndpoint,
-    PeerClosed,
-    SessionLimit,
-    NoPendingSession,
 }
 
 /// Shared-memory identity backed by device-neutral canonical storage.
@@ -972,6 +331,7 @@ pub struct HandleTable {
     recycled: BTreeSet<u32>,
     next_handle: u32,
     capacity_limit: usize,
+    changed: EventObject,
 }
 
 impl Default for HandleTable {
@@ -982,12 +342,13 @@ impl Default for HandleTable {
 
 impl HandleTable {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             objects: BTreeMap::new(),
             recycled: BTreeSet::new(),
             next_handle: FIRST_HANDLE,
             capacity_limit: (LAST_HANDLE - FIRST_HANDLE + 1) as usize,
+            changed: EventObject::new(),
         }
     }
 
@@ -996,12 +357,13 @@ impl HandleTable {
     /// This models the per-process handle-table capacity carried by Horizon
     /// process metadata while retaining the ordinary numeric handle range.
     #[must_use]
-    pub const fn with_capacity_limit(capacity_limit: usize) -> Self {
+    pub fn with_capacity_limit(capacity_limit: usize) -> Self {
         Self {
             objects: BTreeMap::new(),
             recycled: BTreeSet::new(),
             next_handle: FIRST_HANDLE,
             capacity_limit,
+            changed: EventObject::new(),
         }
     }
 
@@ -1027,6 +389,7 @@ impl HandleTable {
             handle
         };
         self.objects.insert(handle, object);
+        self.changed.signal();
         Ok(handle)
     }
 
@@ -1055,7 +418,22 @@ impl HandleTable {
             .remove(&handle)
             .ok_or(HandleError::InvalidHandle(handle))?;
         self.recycled.insert(handle);
+        self.changed.signal();
         Ok(object)
+    }
+
+    #[must_use]
+    pub fn changed_event(&self) -> ReadableEventObject {
+        ReadableEventObject(self.changed.clone())
+    }
+
+    #[must_use]
+    pub fn contains_thread_object(&self, target: &ThreadObject) -> bool {
+        self.objects.values().any(|object| {
+            object
+                .downcast_ref::<ThreadObject>()
+                .is_some_and(|thread| thread == target)
+        })
     }
 
     /// Moves one object to another process table without cloning its runtime state.

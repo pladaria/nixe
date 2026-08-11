@@ -13,16 +13,17 @@ use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, Engi
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
-    UnsupportedNvDrvOperation, VideoSystem,
+    UnsupportedNvDrvOperation, VideoSystem, switch_1_scheduler_profile,
 };
 use nixe_input::{
     ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
 };
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessTeardownReport, RunnableProcess,
-    VirtualClock, VirtualClockMode,
+    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
+    RunnableProcess, RuntimeCoordinator, VirtualClock, VirtualClockMode,
 };
+use nixe_scheduler::ProcessId;
 use nixe_video::FrameMailbox;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
 
@@ -30,7 +31,6 @@ use crate::logging::LogLevel;
 
 use super::load_config;
 
-const EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
 const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
@@ -61,7 +61,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         let mailbox = frontend.mailbox();
         (Some(frontend), Some(control), mailbox)
     };
-    let interrupted = install_interrupt_handler(frontend_control.clone())?;
+    let scheduler_profile = switch_1_scheduler_profile();
     let config = load_config(config_path, log_level_override)?;
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
@@ -140,6 +140,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         },
     };
     let virtual_clock = VirtualClock::new(clock_mode);
+    let coordinator =
+        RuntimeCoordinator::with_virtual_clock(scheduler_profile, virtual_clock.clone());
+    let external_events = coordinator.event_sender();
+    install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
     let engine_provider = select_cpu_engine(config.cpu.engine, diagnostics)?;
     let process = ProcessBuilder::new()
@@ -173,12 +177,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
 
     let Some(frontend) = frontend else {
         return finish_execution(execute_worker(
+            coordinator,
             process,
             instruction_trace,
-            HostStopSignals {
-                ctrl_c: interrupted,
-                frontend: frontend_stop_requested,
-            },
             initial_operation_mode,
             time_environment,
             video_system,
@@ -186,8 +187,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         ));
     };
 
-    let worker_frontend_stop = Arc::clone(&frontend_stop_requested);
-    let worker_interrupted = Arc::clone(&interrupted);
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");
     let worker = thread::Builder::new()
@@ -195,12 +194,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .spawn(move || {
             let _completion = WorkerCompletion(worker_control);
             execute_worker(
+                coordinator,
                 process,
                 instruction_trace,
-                HostStopSignals {
-                    ctrl_c: worker_interrupted,
-                    frontend: worker_frontend_stop,
-                },
                 initial_operation_mode,
                 time_environment,
                 video_system,
@@ -210,9 +206,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
 
     let frontend_result = frontend.run().map_err(|error| error.to_string());
-    if frontend_result.is_err() {
-        frontend_stop_requested.store(true, Ordering::Release);
-    }
+    frontend_stop_requested.store(true, Ordering::Release);
+    let _ = external_events.submit(nixe_runtime::ExternalEvent::HostStop);
     let worker_result = worker
         .join()
         .map_err(|_| "guest execution worker panicked".to_owned())?;
@@ -259,17 +254,18 @@ mod engine_selection_tests {
     }
 }
 
-fn install_interrupt_handler(control: Option<FrontendControl>) -> Result<Arc<AtomicBool>, String> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let signal_flag = Arc::clone(&interrupted);
+fn install_interrupt_handler(
+    control: Option<FrontendControl>,
+    external_events: nixe_runtime::ExternalEventSender,
+) -> Result<(), String> {
     ctrlc::set_handler(move || {
-        signal_flag.store(true, Ordering::SeqCst);
+        let _ = external_events.submit(nixe_runtime::ExternalEvent::HostStop);
         if let Some(control) = &control {
             control.stop_requested();
         }
     })
     .map_err(|error| format!("cannot install Ctrl+C handler: {error}"))?;
-    Ok(interrupted)
+    Ok(())
 }
 
 struct WorkerCompletion(FrontendControl);
@@ -287,24 +283,35 @@ struct WorkerResult {
 }
 
 fn execute_worker(
-    mut process: RunnableProcess,
+    mut coordinator: RuntimeCoordinator,
+    process: RunnableProcess,
     instruction_trace: bool,
-    stop_signals: HostStopSignals,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
     gamepad_profiles: GamepadProfiles,
 ) -> WorkerResult {
+    let registration = ProcessRegistration {
+        priority: process.initial_thread_priority(),
+        ideal_vcpu: Some(process.initial_ideal_vcpu()),
+        affinity: coordinator.scheduler().profile().all_cores(),
+    };
+    let process_id = coordinator
+        .register_process(process, registration)
+        .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
     let execution = SdlInputBackend::new()
         .map_err(|error| error.to_string())
         .and_then(|backend| {
             let mut input = InputManager::with_profiles(backend, gamepad_profiles);
+            let mut scheduled = ScheduledProcess {
+                coordinator: &mut coordinator,
+                process_id,
+            };
             execute(
-                &mut process,
+                &mut scheduled,
                 instruction_trace,
-                &stop_signals,
                 initial_operation_mode,
                 time_environment,
                 execution_video,
@@ -315,6 +322,9 @@ fn execute_worker(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
     );
+    let process = coordinator
+        .remove_process(process_id)
+        .expect("serialized execution returns every scheduler lease");
     WorkerResult {
         execution,
         teardown: process.teardown(),
@@ -324,9 +334,10 @@ fn execute_worker(
 
 fn finish_execution(result: WorkerResult) -> Result<(), String> {
     log::debug!(
-        "graphics resources released: handles={}, layers={}, queues={}, pending_frames={}, \
-         nvdrv_fds={}, nvmap_allocations={}",
+        "resources released: handles={}, address_waiters={}, layers={}, queues={}, \
+         pending_frames={}, nvdrv_fds={}, nvmap_allocations={}",
         result.teardown.handles_released,
+        result.teardown.address_waiters_released,
         result.graphics_teardown.layers_released,
         result.graphics_teardown.queues_released,
         result.graphics_teardown.pending_frames_released,
@@ -362,20 +373,21 @@ struct ExecutionSummary {
     rejected_svc_kinds: usize,
 }
 
-struct HostStopSignals {
-    ctrl_c: Arc<AtomicBool>,
-    frontend: Arc<AtomicBool>,
+struct ScheduledProcess<'a> {
+    coordinator: &'a mut RuntimeCoordinator,
+    process_id: ProcessId,
 }
 
 fn execute(
-    process: &mut RunnableProcess,
+    scheduled: &mut ScheduledProcess<'_>,
     print_trace: bool,
-    stop_signals: &HostStopSignals,
     initial_operation_mode: OperationMode,
     time_environment: TimeEnvironment,
     video_system: VideoSystem,
     input: &mut InputManager<SdlInputBackend>,
 ) -> Result<ExecutionSummary, String> {
+    let coordinator = &mut *scheduled.coordinator;
+    let process_id = scheduled.process_id;
     let mut dispatcher = HorizonSvcDispatcher::new_with_video(
         initial_operation_mode,
         time_environment,
@@ -393,6 +405,21 @@ fn execute(
     let mut active_input = None;
     let mut input_observed = false;
     loop {
+        dispatcher.synchronize_virtual_time(coordinator.virtual_time_ns());
+        coordinator
+            .drain_external_events()
+            .map_err(|error| error.to_string())?;
+        if coordinator.host_stop_requested() {
+            log::info!("host stop received; stopping the guest process cleanly");
+            if !coordinator
+                .process_mut(process_id)
+                .expect("registered process remains available")
+                .terminate()
+            {
+                return Err("host stop could not terminate the guest process cleanly".to_owned());
+            }
+            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+        }
         let elapsed = execution_started.elapsed();
         dispatcher.advance_video(elapsed);
         if elapsed >= next_input_poll {
@@ -403,7 +430,9 @@ fn execute(
             input_observed = true;
             dispatcher
                 .advance_input(
-                    process,
+                    coordinator
+                        .process_mut(process_id)
+                        .expect("registered process remains available"),
                     profiled.as_ref().map(|controller| &controller.state),
                     elapsed.saturating_sub(last_input_poll),
                 )
@@ -411,33 +440,24 @@ fn execute(
             last_input_poll = elapsed;
             next_input_poll = elapsed.saturating_add(INPUT_POLL_INTERVAL);
         }
-        if stop_signals.frontend.load(Ordering::Acquire) {
-            log::info!("video window closed; stopping the guest process cleanly");
-            if !process.terminate() {
-                return Err(
-                    "video window closed, but the guest process could not be terminated cleanly"
-                        .to_owned(),
-                );
-            }
-            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
-        }
-        if stop_signals.ctrl_c.load(Ordering::SeqCst) {
-            log::info!("Ctrl+C received; stopping the guest process cleanly");
-            if !process.terminate() {
-                return Err(
-                    "Ctrl+C received, but the guest process could not be terminated cleanly"
-                        .to_owned(),
-                );
-            }
-            return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
-        }
-        let report = process
-            .run(if print_trace {
+        let Some(execution) = coordinator
+            .run_next(if print_trace {
                 1
             } else {
-                EXECUTION_SLICE_INSTRUCTIONS
+                coordinator
+                    .scheduler()
+                    .profile()
+                    .default_timeslice_instructions()
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+        else {
+            coordinator
+                .wait_for_external_event()
+                .map_err(|error| error.to_string())?;
+            continue;
+        };
+        let thread_id = execution.lease.thread;
+        let report = execution.report;
         instructions = instructions.saturating_add(report.instructions_executed);
         if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
             let elapsed = execution_started.elapsed();
@@ -464,15 +484,15 @@ fn execute(
             | ExecutionStop::Safepoint
             | ExecutionStop::PendingEvent { .. } => {}
             ExecutionStop::Scheduled { .. } => {
-                if !process.resume() {
-                    return Err(format!("cannot resume scheduled process: {report}"));
-                }
+                coordinator
+                    .make_thread_ready(thread_id)
+                    .map_err(|error| error.to_string())?;
             }
             ExecutionStop::SupervisorCall { .. } => {
-                match process
-                    .route_supervisor_call(&report.stop, &mut dispatcher)
-                    .map_err(|error| error.to_string())?
-                {
+                let handling = dispatcher
+                    .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
+                    .map_err(|error| error.to_string())?;
+                match handling {
                     ExceptionHandlingResult::Resumed => {}
                     ExceptionHandlingResult::Rejected(error) => {
                         let diagnostic = error.to_string();
@@ -483,18 +503,7 @@ fn execute(
                     ExceptionHandlingResult::Terminated { .. } => {
                         return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
                     }
-                    ExceptionHandlingResult::Suspended => {
-                        let thread_id = process.main_thread().object().thread_id();
-                        let waited = dispatcher.wait_for_thread_wakeup(thread_id);
-                        if !process.resume() {
-                            return Err(format!(
-                                "title suspended but could not be resumed after its scheduler wakeup at {instructions} instructions: {report}"
-                            ));
-                        }
-                        if !waited {
-                            std::thread::yield_now();
-                        }
-                    }
+                    ExceptionHandlingResult::Suspended => {}
                     ExceptionHandlingResult::Fault(error) => {
                         dump_maxwell_pushbuffer_on_fault(&error);
                         return Err(format!(

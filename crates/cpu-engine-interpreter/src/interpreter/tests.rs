@@ -491,15 +491,12 @@ fn a64_basic_system_semantics_are_exact_and_runtime_hints_remain_explicit() {
     assert_eq!(a64.tpidr_el0(), 0xfeed_face_cafe_beef);
     assert_eq!(a64.pc(), 16);
 
-    let error = execute_one(&profile, &mut state, 0xd503_203f_u32.into()).unwrap_err(); // YIELD
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    let outcome = execute_one(&profile, &mut state, 0xd503_203f_u32.into()).unwrap(); // YIELD
+    assert!(matches!(outcome, InterpreterOutcome::Scheduled { .. }));
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
-    assert_eq!(a64.pc(), 16, "unsupported scheduler hint must not retire");
+    assert_eq!(a64.pc(), 20, "YIELD retires before scheduler handoff");
 }
 
 #[test]

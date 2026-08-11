@@ -16,6 +16,7 @@ nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-memory.workspace = true
 nixe-runtime.workspace = true
+nixe-scheduler.workspace = true
 nixe-video.workspace = true
 
 [dev-dependencies]
