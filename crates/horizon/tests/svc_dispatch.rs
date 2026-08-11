@@ -434,6 +434,114 @@ fn event_wait_and_close_execute_through_the_reference_engine() {
 }
 
 #[test]
+fn process_wide_key_signal_and_zero_timeout_wait_have_exact_memory_effects() {
+    let (_directory, mut process) = fixture_process(&[svc(0x1d), svc(0x1c)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let key = process.main_thread().stack_bottom;
+    let mutex = key.checked_add(4).unwrap();
+    let write_word = |process: &RunnableProcess, address, value| {
+        process
+            .memory()
+            .write(
+                process.cpu_context().address_space_id(),
+                address,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(value),
+            )
+            .unwrap();
+    };
+    let read_word = |process: &RunnableProcess, address| {
+        process
+            .memory()
+            .read(
+                process.cpu_context().address_space_id(),
+                address,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value
+    };
+
+    write_word(&process, key, 1);
+    state(&mut process).write_x(x(0), key.get());
+    state(&mut process).write_x(x(1), u64::from(u32::MAX));
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(state(&mut process).read_x(x(0)), key.get());
+    assert_eq!(read_word(&process, key), MemoryValue::U32(0));
+
+    write_word(&process, mutex, 0x1234_5678);
+    state(&mut process).write_x(x(0), mutex.get());
+    state(&mut process).write_x(x(1), key.get() + 3); // Kernel aligns the key down.
+    state(&mut process).write_w(x(2), 0x1234_5678);
+    state(&mut process).write_x(x(3), 0);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::TIMED_OUT.raw()
+    );
+    assert_eq!(read_word(&process, key), MemoryValue::U32(1));
+    assert_eq!(read_word(&process, mutex), MemoryValue::U32(0));
+    assert_eq!(dispatcher.coverage().len(), 2);
+    assert!(
+        dispatcher
+            .coverage()
+            .iter()
+            .all(|entry| entry.support == HorizonSvcSupport::Partial)
+    );
+}
+
+#[test]
+fn blocking_process_wide_key_wait_stops_before_mutating_guest_memory() {
+    let (_directory, mut process) = fixture_process(&[svc(0x1c)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let key = process.main_thread().stack_bottom;
+    let mutex = key.checked_add(4).unwrap();
+    for (address, value) in [(key, 0_u32), (mutex, 0x1234_5678)] {
+        process
+            .memory()
+            .write(
+                process.cpu_context().address_space_id(),
+                address,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(value),
+            )
+            .unwrap();
+    }
+    state(&mut process).write_x(x(0), mutex.get());
+    state(&mut process).write_x(x(1), key.get());
+    state(&mut process).write_w(x(2), 0x1234_5678);
+    state(&mut process).write_x(x(3), u64::MAX);
+
+    assert!(matches!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedSemantics {
+            immediate: 0x1c,
+            documented_name: "WaitProcessWideKeyAtomic blocking wait",
+        })
+    ));
+    for (address, expected) in [(key, 0_u32), (mutex, 0x1234_5678)] {
+        assert_eq!(
+            process
+                .memory()
+                .read(
+                    process.cpu_context().address_space_id(),
+                    address,
+                    MemoryAccess::normal(MemoryAccessSize::Word),
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(expected)
+        );
+    }
+}
+
+#[test]
 fn query_memory_writes_verified_layout_and_page_info() {
     let (_directory, mut process) = fixture_process(&[svc(0x06)]);
     let output = process.main_thread().stack_bottom;

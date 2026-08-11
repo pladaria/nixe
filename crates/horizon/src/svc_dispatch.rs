@@ -524,6 +524,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x16 => close_handle(context),
             0x17 => reset_signal(context),
             0x18 => self.wait_synchronization(context),
+            0x1c => wait_process_wide_key_atomic(context),
+            0x1d => signal_process_wide_key(context),
             0x1f => self.connect_to_named_port(context),
             0x20 => send_sync_request_light(context),
             0x21 => self.send_sync_request(context),
@@ -566,9 +568,8 @@ const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
         0x07 | 0x0a | 0x10 | 0x13 | 0x14 | 0x15 | 0x16 | 0x20 | 0x21 | 0x22 | 0x25 | 0x40
         | 0x41 | 0x42 | 0x43 | 0x44 | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
-        0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x24 | 0x26 | 0x29 => {
-            HorizonSvcSupport::Partial
-        }
+        0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1c | 0x1d | 0x24 | 0x26
+        | 0x29 => HorizonSvcSupport::Partial,
         0x1f => HorizonSvcSupport::Complete,
         _ => HorizonSvcSupport::Unsupported,
     }
@@ -2574,6 +2575,110 @@ impl HorizonSvcDispatcher {
             ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
         }
     }
+}
+
+// Public ABI declarations and kernel behavior:
+// https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h
+// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_condition_variable.cpp
+// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_condition_variable.cpp
+//
+// A zero-timeout wait still publishes the condition-variable waiter flag and
+// atomically releases the userspace mutex before returning TimedOut. Blocking
+// waits require a multi-thread scheduler and must stop before guest mutation
+// until that scheduler can retain waiter priority and mutex reacquisition.
+fn wait_process_wide_key_atomic(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    if !matches!(context.thread().state(), ThreadCpuState::A64(_)) {
+        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
+            immediate: 0x1c,
+            documented_name: "WaitProcessWideKeyAtomic AArch32 ABI",
+        });
+    }
+    let mutex_address = read_register(context.thread().state(), 0);
+    let key_address = read_register(context.thread().state(), 1) & !3;
+    let timeout = read_register(context.thread().state(), 3) as i64;
+    if mutex_address >= context.process().address_space_limit() {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    }
+    if !mutex_address.is_multiple_of(4) {
+        result(context, HorizonKernelResult::INVALID_ADDRESS);
+        return resume();
+    }
+    if timeout != 0 {
+        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
+            immediate: 0x1c,
+            documented_name: "WaitProcessWideKeyAtomic blocking wait",
+        });
+    }
+
+    if let Err(fault) = write_process_wide_key_word(context, key_address, 1)
+        && process_wide_key_fault_is_internal(&fault)
+    {
+        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
+            immediate: 0x1c,
+            fault,
+        });
+    }
+    // Horizon deliberately ignores guest access failure while publishing the
+    // waiter flag; releasing the mutex below determines the syscall result.
+    if let Err(fault) = write_process_wide_key_word(context, mutex_address, 0) {
+        if process_wide_key_fault_is_internal(&fault) {
+            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
+                immediate: 0x1c,
+                fault,
+            });
+        }
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    }
+    result(context, HorizonKernelResult::TIMED_OUT);
+    resume()
+}
+
+// No blocking process-wide waits can currently enter the dispatcher, so the
+// waiter set is necessarily empty. Horizon's exact empty-set behavior is to
+// clear the aligned userspace key regardless of `count`; the SVC has a void
+// ABI and therefore leaves X0 untouched. Guest access failures are ignored by
+// the kernel, while emulator-internal backing failures remain typed faults.
+fn signal_process_wide_key(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let key_address = read_register(context.thread().state(), 0) & !3;
+    if let Err(fault) = write_process_wide_key_word(context, key_address, 0)
+        && process_wide_key_fault_is_internal(&fault)
+    {
+        return ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory {
+            immediate: 0x1d,
+            fault,
+        });
+    }
+    resume()
+}
+
+fn write_process_wide_key_word(
+    context: &ExceptionDispatchContext<'_>,
+    address: u64,
+    value: u32,
+) -> Result<(), DataAccessFault> {
+    context
+        .process()
+        .memory()
+        .write(
+            context.process().cpu().address_space_id(),
+            GuestVirtualAddress::new(address),
+            MemoryAccess::normal(MemoryAccessSize::Word),
+            MemoryValue::U32(value),
+        )
+        .map(|_| ())
+}
+
+fn process_wide_key_fault_is_internal(fault: &DataAccessFault) -> bool {
+    matches!(
+        fault.reason,
+        DataAccessFaultReason::ContentGenerationExhausted | DataAccessFaultReason::HostBacking(_)
+    )
 }
 
 fn query_memory(

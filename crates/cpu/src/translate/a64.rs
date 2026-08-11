@@ -837,10 +837,10 @@ mod tests {
                 0x4e20_1c00, // and v0.16b,v0.16b,v0.16b
                 0x4e20_8400, // add v0.16b,v0.16b,v0.16b
                 0x1e60_4000, // fmov d0,d0
-                0x1e61_2800, // fadd d0,d0,d1
+                0x1e61_4800, // fmax d0,d0,d1
                 0x1e61_2000, // fcmp d0,d1
                 0x9e62_0000, // scvtf d0,x0
-                0x9e78_0001, // fcvtzs x1,d0
+                0x9e63_0001, // ucvtf d1,x0
                 0x9e66_0002, // fmov x2,d0
                 0x9e67_0040, // fmov d0,x2
                 0x3dc0_0000, // ldr q0,[x0]

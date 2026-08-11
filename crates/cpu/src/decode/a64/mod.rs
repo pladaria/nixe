@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0069 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0085 => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -211,11 +211,30 @@ mod tests {
             (0x6e31_a631, "simd-unsigned-max-pairwise"),
             (0x6e21_3ca3, "simd-compare-unsigned-higher-same"),
             (0x4e20_9823, "simd-compare-zero-equal"),
-            (0x1e61_2800, "fp-scalar-two-source"),
+            (0x4e21_dbfc, "simd-signed-int-to-float"),
+            (0x6e21_d928, "simd-unsigned-int-to-float"),
+            (0x6e3e_ff9c, "simd-floating-point-divide"),
+            (0x1e2e_101f, "fp-scalar-immediate"),
+            (0x1e6e_1002, "fp-scalar-immediate"),
+            (0x1e22_c3de, "fp-convert-single-to-double"),
+            (0x1e62_4020, "fp-convert-double-to-single"),
+            (0x1e7e_1bff, "fp-scalar-floating-point-divide"),
+            (0x1e65_43ff, "fp-scalar-round-negative"),
+            (0x1e24_4020, "fp-scalar-round-nearest-even"),
+            (0x1e67_c37a, "fp-scalar-round-current-mode"),
+            (0x1e7d_2bfd, "fp-scalar-floating-point-add"),
+            (0x1e62_3820, "fp-scalar-floating-point-subtract"),
+            (0x1e61_2800, "fp-scalar-floating-point-add"),
+            (0x1e7c_0bbc, "fp-scalar-floating-point-multiply"),
+            (0x1e6b_8949, "fp-scalar-floating-point-negated-multiply"),
             (0x1e60_4000, "fp-scalar-move"),
             (0x1e61_2000, "fp-compare-register"),
+            (0x1e7f_2010, "fp-compare-register"),
+            (0x1e60_2008, "fp-compare-zero"),
+            (0x1e60_2018, "fp-compare-zero"),
             (0x9e62_0000, "fp-signed-int-to-float"),
             (0x1e39_0000, "fp-float-to-unsigned-int"),
+            (0x9e71_0381, "fp-float-to-unsigned-int-negative"),
             (0x9e66_0000, "fp-move-to-general"),
             (0x9e67_0000, "fp-move-from-general"),
             (0x9eae_0000, "fp-move-to-general"),
@@ -231,6 +250,7 @@ mod tests {
             ),
             (0x0ddf_1e30, "simd-load-store-single-structure-post-index"),
             (0x4e1d_3bde, "simd-permute-two-source"),
+            (0x6e1f_43ff, "simd-extract"),
         ];
         for (bits, expected) in cases {
             assert_eq!(
@@ -242,6 +262,31 @@ mod tests {
         assert_eq!(
             decoded_name(profile, 0x1e21_c000),
             "floating-point-fallback"
+        );
+        assert_eq!(
+            decoded_name(profile, 0x1ee1_2010),
+            "floating-point-fallback"
+        );
+    }
+
+    #[test]
+    fn scalar_fmov_immediate_half_precision_is_fp16_gated() {
+        let base_profile = GuestCpuProfile::switch_1();
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            base_profile.id(),
+        );
+        assert!(matches!(
+            decode(&base_profile, location, 0x1eee_1000_u32.into()),
+            DecodeResult::ProfileDisabled { .. }
+        ));
+
+        let fp16_profile = base_profile
+            .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
+        assert_eq!(
+            decoded_name(fp16_profile, 0x1eee_1000),
+            "fp-scalar-immediate-half"
         );
     }
 

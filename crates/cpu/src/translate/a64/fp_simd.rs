@@ -29,9 +29,21 @@ pub(super) fn lift(
         | FpSimdInstruction::MemorySingleStructure(_)
         | FpSimdInstruction::MemorySingleStructurePostIndex(_)
         | FpSimdInstruction::PermuteTwoSource(_)
+        | FpSimdInstruction::Extract(_)
         | FpSimdInstruction::IntegerCompare(_)
         | FpSimdInstruction::IntegerPairwise(_)
-        | FpSimdInstruction::IntegerMinMax(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::IntegerMinMax(_)
+        | FpSimdInstruction::VectorSignedIntToFloat(_)
+        | FpSimdInstruction::VectorUnsignedIntToFloat(_)
+        | FpSimdInstruction::VectorFloatDivide(_)
+        | FpSimdInstruction::FloatToSignedInt(_)
+        | FpSimdInstruction::FloatToUnsignedInt(_)
+        | FpSimdInstruction::ScalarFloatImmediate(_)
+        | FpSimdInstruction::ScalarFloatConvert(_)
+        | FpSimdInstruction::ScalarFloatDivide(_)
+        | FpSimdInstruction::ScalarFloatRound(_)
+        | FpSimdInstruction::ScalarFloatAdd(_)
+        | FpSimdInstruction::ScalarFloatMultiply(_) => Ok(interpret(decoded)),
         FpSimdInstruction::ShiftRightNarrow(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
@@ -43,8 +55,6 @@ pub(super) fn lift(
         }
         FpSimdInstruction::SignedIntToFloat(_)
         | FpSimdInstruction::UnsignedIntToFloat(_)
-        | FpSimdInstruction::FloatToSignedInt(_)
-        | FpSimdInstruction::FloatToUnsignedInt(_)
         | FpSimdInstruction::MoveToGeneral(_)
         | FpSimdInstruction::MoveFromGeneral(_) => {
             lift_fp_conversion(builder, decoded, fields, instruction)

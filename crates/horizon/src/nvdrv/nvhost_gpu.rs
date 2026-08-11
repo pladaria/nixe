@@ -12,7 +12,8 @@ use nixe_gpu_maxwell::{
     MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
     MaxwellInvalidGpfifoSubmission, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
     MaxwellThreeDLoweringCache, MaxwellZCullMode, capture_maxwell_frontend_dispatch,
-    decode_gpfifo_submission, preflight_maxwell_submission_execution, resolve_gpfifo_submission,
+    decode_gpfifo_submission, execute_maxwell_software_initialization,
+    preflight_maxwell_submission_execution, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -79,6 +80,7 @@ pub(super) struct NvHostGpu {
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
     scheduler: MaxwellScheduler,
+    lowering_cache: MaxwellThreeDLoweringCache,
 }
 
 pub(super) struct NvHostGpuIoctlResources<'a> {
@@ -90,6 +92,13 @@ pub(super) struct NvHostGpuIoctlResources<'a> {
 struct NvHostGpuSubmit<'a> {
     header: MaxwellGpfifoSubmitRequest,
     entries: &'a [u8],
+    response: &'a [u8],
+}
+
+struct NvHostGpuSubmissionState<'a> {
+    scheduler: &'a mut MaxwellScheduler,
+    next_frontend_submission: &'a mut u64,
+    lowering_cache: &'a mut MaxwellThreeDLoweringCache,
 }
 
 impl Default for NvHostGpu {
@@ -99,6 +108,7 @@ impl Default for NvHostGpu {
             error_events: BTreeMap::new(),
             next_frontend_submission: 1,
             scheduler: MaxwellScheduler::default(),
+            lowering_cache: MaxwellThreeDLoweringCache::default(),
         }
     }
 }
@@ -235,14 +245,18 @@ impl NvHostGpu {
                 require_input_size(input, CHANNEL_SUBMIT_GPFIFO_HEADER_SIZE)?;
                 submit_gpfifo(
                     channel,
-                    &mut self.scheduler,
-                    &mut self.next_frontend_submission,
+                    NvHostGpuSubmissionState {
+                        scheduler: &mut self.scheduler,
+                        next_frontend_submission: &mut self.next_frontend_submission,
+                        lowering_cache: &mut self.lowering_cache,
+                    },
                     resources,
                     descriptor,
                     request,
                     NvHostGpuSubmit {
                         header: decode_submit_header(input)?,
                         entries: additional_input,
+                        response: input,
                     },
                 )
             }
@@ -253,12 +267,19 @@ impl NvHostGpu {
                 let (header, entries) = decode_legacy_submit_gpfifo(request, input)?;
                 submit_gpfifo(
                     channel,
-                    &mut self.scheduler,
-                    &mut self.next_frontend_submission,
+                    NvHostGpuSubmissionState {
+                        scheduler: &mut self.scheduler,
+                        next_frontend_submission: &mut self.next_frontend_submission,
+                        lowering_cache: &mut self.lowering_cache,
+                    },
                     resources,
                     descriptor,
                     request,
-                    NvHostGpuSubmit { header, entries },
+                    NvHostGpuSubmit {
+                        header,
+                        entries,
+                        response: input,
+                    },
                 )
             }
             IOCTL_CHANNEL_ALLOC_OBJ_CTX => {
@@ -408,13 +429,17 @@ fn decode_legacy_submit_gpfifo(
 
 fn submit_gpfifo(
     channel: &mut MaxwellGpuChannel,
-    scheduler: &mut MaxwellScheduler,
-    next_frontend_submission: &mut u64,
+    state: NvHostGpuSubmissionState<'_>,
     resources: NvHostGpuIoctlResources<'_>,
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     submit: NvHostGpuSubmit<'_>,
 ) -> Result<Vec<u8>, NvDrvCallError> {
+    let NvHostGpuSubmissionState {
+        scheduler,
+        next_frontend_submission,
+        lowering_cache,
+    } = state;
     let allocated_entries = channel
         .frontend()
         .gpfifo_entries()
@@ -518,43 +543,107 @@ fn submit_gpfifo(
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let (capture, replay) =
         capture_maxwell_frontend_dispatch(&dispatch, channel, dispatch_address_space);
-    let execution_failure = matches!(
+    if !matches!(
         replay.failure(),
         MaxwellFrontendFailure::ExecutionUnavailable
-    )
-    .then(|| {
-        preflight_maxwell_submission_execution(
-            replay.packets(),
-            dispatch_address_space,
-            dispatch.scheduled().frontend(),
-            Vec::new(),
-            dispatch.scheduled().completion(),
-            &MaxwellThreeDLoweringCache::default(),
-        )
-        .err()
-        .map(Box::new)
-    })
-    .flatten();
-    let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-        dispatch: Box::new(dispatch),
-        capture: Box::new(capture),
-        replay: Box::new(replay),
-        execution_failure,
+    ) {
+        let boundary = MaxwellFrontendDispatchBoundary::Frontend {
+            dispatch: Box::new(dispatch),
+            capture: Box::new(capture),
+            replay: Box::new(replay),
+            execution_failure: None,
+        };
+        return Err(unsupported_frontend_boundary(descriptor, request, boundary));
+    }
+    let plan = match preflight_maxwell_submission_execution(
+        replay.packets(),
+        dispatch_address_space,
+        dispatch.scheduled().frontend(),
+        Vec::new(),
+        dispatch.scheduled().completion(),
+        lowering_cache,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
+                dispatch: Box::new(dispatch),
+                capture: Box::new(capture),
+                replay: Box::new(replay),
+                execution_failure: Some(Box::new(error)),
+            };
+            return Err(unsupported_frontend_boundary(descriptor, request, boundary));
+        }
     };
-    // The reservation remains embedded in this fatal boundary and is neither
-    // backend-complete nor guest-visible. T8 and later own neutral execution.
-    Err(NvDrvCallError::Unsupported(
-        UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
-            context: NvDrvErrorContext::new(
-                descriptor.kind(),
-                request,
-                descriptor.fd(),
-                None,
-                NvDrvValidationReason::MaxwellPacketSemanticsUnavailable,
-            ),
-            boundary: Box::new(boundary),
+
+    let reservation = dispatch.scheduled().completion().cloned();
+    let mut executed = None;
+    let software_error = match reservation.as_ref() {
+        Some(reservation) => resources
+            .control
+            .complete_immediate_channel_submission(descriptor, request, reservation, || {
+                executed = Some(
+                    execute_maxwell_software_initialization(plan, dispatch_address_space)
+                        .map_err(Box::new)?,
+                );
+                Ok(())
+            })?
+            .err(),
+        None => match execute_maxwell_software_initialization(plan, dispatch_address_space) {
+            Ok(completion) => {
+                executed = Some(completion);
+                None
+            }
+            Err(error) => Some(Box::new(error)),
         },
-    ))
+    };
+    if let Some(error) = software_error {
+        let boundary = MaxwellFrontendDispatchBoundary::Frontend {
+            dispatch: Box::new(dispatch),
+            capture: Box::new(capture),
+            replay: Box::new(replay),
+            execution_failure: None,
+        };
+        return Err(NvDrvCallError::Unsupported(
+            UnsupportedNvDrvOperation::ScheduledGpfifoExecution {
+                context: NvDrvErrorContext::new(
+                    descriptor.kind(),
+                    request,
+                    descriptor.fd(),
+                    None,
+                    NvDrvValidationReason::MaxwellPacketSemanticsUnavailable,
+                ),
+                boundary: Box::new(boundary),
+                error,
+            },
+        ));
+    }
+
+    let executed = executed.expect("successful immediate execution records its result");
+    *lowering_cache = executed.staged_cache().clone();
+    let mut output = submit.response.to_vec();
+    if let Some(reservation) = reservation {
+        debug_assert_eq!(executed.completion(), Some(reservation.point()));
+        write_u32(&mut output, 16, reservation.point().syncpoint().get())?;
+        write_u32(&mut output, 20, reservation.point().value().get())?;
+    }
+    Ok(output)
+}
+
+fn unsupported_frontend_boundary(
+    descriptor: NvDrvDeviceDescriptor,
+    request: u32,
+    boundary: MaxwellFrontendDispatchBoundary,
+) -> NvDrvCallError {
+    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission {
+        context: NvDrvErrorContext::new(
+            descriptor.kind(),
+            request,
+            descriptor.fd(),
+            None,
+            NvDrvValidationReason::MaxwellPacketSemanticsUnavailable,
+        ),
+        boundary: Box::new(boundary),
+    })
 }
 
 fn gpfifo_driver_result(

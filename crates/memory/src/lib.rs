@@ -18,6 +18,7 @@ pub use access::{
 };
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalPageError,
+    CanonicalWriteBatch, CanonicalWriteBatchError,
 };
 pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalRangeAccessError, CanonicalRangeError,

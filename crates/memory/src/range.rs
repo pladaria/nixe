@@ -24,6 +24,10 @@ pub struct CanonicalBackingSegment {
 }
 
 impl CanonicalBackingSegment {
+    pub(crate) const fn backing(&self) -> &CanonicalBackingPage {
+        &self.backing
+    }
+
     /// Creates a checked segment and retains its canonical page.
     pub fn new(
         backing: CanonicalBackingPage,
