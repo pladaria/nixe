@@ -138,7 +138,7 @@ impl RuntimeCoordinator {
             .ok_or(ThreadOperationError::Internal)?;
         process
             .thread(id)
-            .map(|thread| thread.state.clone())
+            .map(|thread| thread.state().clone())
             .ok_or(ThreadOperationError::Internal)
     }
 
@@ -390,10 +390,17 @@ impl RuntimeCoordinator {
             ..
         } = decision
         {
-            self.processes
-                .get_mut(&process)
+            let domain = self
+                .processes
+                .get(&process)
                 .expect("scheduled thread has an owning process")
-                .clear_local_exclusive_reservation(old_vcpu);
+                .engine_domain_id();
+            self.workers
+                .clear_local_exclusive(
+                    old_vcpu,
+                    super::worker::WorkerExecutorKey { process, domain },
+                )
+                .map_err(CoordinatorError::Worker)?;
         }
         Ok(())
     }

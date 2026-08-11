@@ -1,8 +1,8 @@
 //! Deterministic memory backend for frontend and runtime tests.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use crate::{
@@ -79,7 +79,7 @@ impl SyntheticMemoryInner {
 /// pointer crosses the CPU/memory boundary.
 #[derive(Default)]
 pub struct SyntheticMemory {
-    inner: RefCell<SyntheticMemoryInner>,
+    inner: Mutex<SyntheticMemoryInner>,
 }
 
 impl SyntheticMemory {
@@ -87,6 +87,14 @@ impl SyntheticMemory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, SyntheticMemoryInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn inner_mut(&mut self) -> &mut SyntheticMemoryInner {
+        self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Atomically creates, initializes, and publishes ordinary RAM pages.
@@ -98,7 +106,7 @@ impl SyntheticMemory {
         address_space: AddressSpaceId,
         requests: &[SyntheticRamPage<'_>],
     ) -> Result<(), SyntheticInstallError> {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         let mut virtual_pages = Vec::with_capacity(requests.len());
         let mut unique_virtual_pages = BTreeSet::new();
         for (index, request) in requests.iter().enumerate() {
@@ -248,7 +256,7 @@ impl SyntheticMemory {
         request_index: usize,
         reason: impl Into<Box<str>>,
     ) {
-        self.inner.get_mut().install_failure = Some((stage, request_index, reason.into()));
+        self.inner_mut().install_failure = Some((stage, request_index, reason.into()));
     }
 
     /// Returns mapping identity and permissions for a page containing `address`.
@@ -257,14 +265,12 @@ impl SyntheticMemory {
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Option<SyntheticMappingInfo> {
-        mapping_at(&self.inner.borrow(), address_space, address).map(|mapping| {
-            SyntheticMappingInfo {
-                physical_page: mapping.physical_page,
-                mapping_generation: mapping.mapping_generation,
-                permissions: mapping.permissions,
-                attributes: mapping.attributes,
-                purpose: mapping.purpose,
-            }
+        mapping_at(&self.lock_inner(), address_space, address).map(|mapping| SyntheticMappingInfo {
+            physical_page: mapping.physical_page,
+            mapping_generation: mapping.mapping_generation,
+            permissions: mapping.permissions,
+            attributes: mapping.attributes,
+            purpose: mapping.purpose,
         })
     }
 
@@ -287,7 +293,7 @@ impl SyntheticMemory {
         };
         let first_page = start.get() / page_size;
         let end_page = end / page_size;
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         if !(first_page..end_page).all(|page| inner.mappings.contains_key(&(address_space, page))) {
             return false;
         }
@@ -307,13 +313,12 @@ impl SyntheticMemory {
 
     /// Returns the number of physical pages currently owned by this backend.
     pub fn physical_page_count(&self) -> usize {
-        self.inner.borrow().pages.len()
+        self.lock_inner().pages.len()
     }
 
     /// Creates a zero-filled ordinary physical page.
     pub fn add_ram_page(&mut self, page: GuestPhysicalPageId) -> bool {
-        self.inner
-            .get_mut()
+        self.inner_mut()
             .pages
             .insert(
                 page,
@@ -331,8 +336,7 @@ impl SyntheticMemory {
         page: GuestPhysicalPageId,
         handler: impl SyntheticMmio + 'static,
     ) -> bool {
-        self.inner
-            .get_mut()
+        self.inner_mut()
             .pages
             .insert(page, PhysicalPage::Mmio(Box::new(handler)))
             .is_none()
@@ -349,7 +353,7 @@ impl SyntheticMemory {
         if !virtual_address.is_aligned_to(SYNTHETIC_PAGE_SIZE as u64) {
             return false;
         }
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         if !inner.pages.contains_key(&physical_page) {
             return false;
         }
@@ -387,7 +391,7 @@ impl SyntheticMemory {
         let Some(PhysicalPage::Ram {
             bytes: contents,
             generation,
-        }) = self.inner.get_mut().pages.get_mut(&page)
+        }) = self.inner_mut().pages.get_mut(&page)
         else {
             return false;
         };
@@ -413,8 +417,7 @@ impl SyntheticMemory {
         address: GuestVirtualAddress,
         reason: impl Into<Box<str>>,
     ) {
-        self.inner
-            .get_mut()
+        self.inner_mut()
             .instruction_faults
             .insert((address_space, address), reason.into());
     }
@@ -427,8 +430,7 @@ impl SyntheticMemory {
         kind: DataAccessKind,
         reason: impl Into<Box<str>>,
     ) {
-        self.inner
-            .get_mut()
+        self.inner_mut()
             .data_faults
             .insert((address_space, address, kind), reason.into());
     }
@@ -448,7 +450,7 @@ impl SyntheticMemory {
                 },
             ));
         }
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let end_offset = page_offset(address) + N;
         if end_offset <= SYNTHETIC_PAGE_SIZE {
             if !inner.instruction_faults.is_empty()
@@ -593,7 +595,7 @@ impl InstructionMemory for SyntheticMemory {
         let page_start = GuestVirtualAddress::new(
             address.get() / SYNTHETIC_PAGE_SIZE as u64 * SYNTHETIC_PAGE_SIZE as u64,
         );
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let mapping = mapping_at(&inner, address_space, address).ok_or_else(|| {
             InstructionFetchFault::new(
                 address_space,
@@ -645,7 +647,7 @@ impl CpuMemory for SyntheticMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<DataReadResult, DataAccessFault> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         let resolved =
             resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
         if let Some(reason) = inner
@@ -762,7 +764,7 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::ValueSizeMismatch,
             ));
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         let resolved = resolve_data_access(
             &inner,
             address_space,
@@ -919,10 +921,19 @@ impl CpuMemory for SyntheticMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault> {
-        let value = self.read(address_space, address, access)?;
-        let inner = self.inner.borrow();
-        let mapping = mapping_at(&inner, address_space, address).expect("load was validated");
-        let PhysicalPage::Ram { generation, .. } = inner
+        let inner = self.lock_inner();
+        let resolved =
+            resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+        if resolved.second.is_some() {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        }
+        let mapping = resolved.first;
+        let PhysicalPage::Ram { bytes, generation } = inner
             .pages
             .get(&mapping.physical_page)
             .expect("mapping references a page")
@@ -934,8 +945,17 @@ impl CpuMemory for SyntheticMemory {
                 DataAccessFaultReason::MixedRegions,
             ));
         };
+        let byte_count = access.size.bytes();
+        let offset = page_offset(address);
+        let mut value_bytes = [0_u8; 16];
+        if let Some(bytes) = bytes {
+            value_bytes[..byte_count].copy_from_slice(&bytes[offset..offset + byte_count]);
+        }
         Ok((
-            value,
+            DataReadResult {
+                value: MemoryValue::from_le_slice(access.size, &value_bytes[..byte_count]),
+                region: MemoryRegionKind::Ram,
+            },
             crate::exclusive::ExclusiveReservation {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
@@ -953,31 +973,45 @@ impl CpuMemory for SyntheticMemory {
         value: MemoryValue,
         reservation: crate::exclusive::ExclusiveReservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault> {
-        let matches = {
-            let inner = self.inner.borrow();
-            let resolved = resolve_data_access(
-                &inner,
+        if value.size() != access.size {
+            return Err(DataAccessFault::new(
                 address_space,
                 address,
-                access,
                 DataAccessKind::Write,
-            )?;
-            let generation = match inner.pages.get(&resolved.first.physical_page) {
-                Some(PhysicalPage::Ram { generation, .. }) => *generation,
-                _ => {
-                    return Err(DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Write,
-                        DataAccessFaultReason::MixedRegions,
-                    ));
-                }
-            };
-            reservation.page == resolved.first.physical_page
-                && usize::from(reservation.byte_offset) == page_offset(address)
-                && usize::from(reservation.access_size) == access.size.bytes()
-                && reservation.generation == generation
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        let mut inner = self.lock_inner();
+        let resolved = resolve_data_access(
+            &inner,
+            address_space,
+            address,
+            access,
+            DataAccessKind::Write,
+        )?;
+        if resolved.second.is_some() {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        }
+        let generation = match inner.pages.get(&resolved.first.physical_page) {
+            Some(PhysicalPage::Ram { generation, .. }) => *generation,
+            _ => {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::MixedRegions,
+                ));
+            }
         };
+        let matches = reservation.page == resolved.first.physical_page
+            && usize::from(reservation.byte_offset) == page_offset(address)
+            && usize::from(reservation.access_size) == access.size.bytes()
+            && reservation.generation == generation;
         if !matches {
             return Ok((
                 DataWriteResult {
@@ -986,8 +1020,35 @@ impl CpuMemory for SyntheticMemory {
                 false,
             ));
         }
-        self.write(address_space, address, access, value)
-            .map(|result| (result, true))
+        let PhysicalPage::Ram {
+            bytes: contents,
+            generation,
+        } = inner
+            .pages
+            .get_mut(&resolved.first.physical_page)
+            .expect("resolved exclusive RAM page exists")
+        else {
+            unreachable!()
+        };
+        let next_generation = generation.next().map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ContentGenerationExhausted,
+            )
+        })?;
+        let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+        let byte_count = access.size.bytes();
+        let offset = page_offset(address);
+        value.copy_le_bytes(&mut contents[offset..offset + byte_count]);
+        *generation = next_generation;
+        Ok((
+            DataWriteResult {
+                region: MemoryRegionKind::Ram,
+            },
+            true,
+        ))
     }
 
     fn query_memory(
@@ -999,7 +1060,7 @@ impl CpuMemory for SyntheticMemory {
         if address.get() >= end_exclusive.get() {
             return None;
         }
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let page_size = SYNTHETIC_PAGE_SIZE as u64;
         let page = address.get() / page_size;
         let end_page = end_exclusive.get() / page_size;
@@ -1090,7 +1151,7 @@ impl ProcessMemory for SyntheticMemory {
         let first_page = start.get() / page_size;
         let old_end_page = first_page + old_size / page_size;
         let new_end_page = first_page + new_size / page_size;
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         for page in first_page..old_end_page {
             let Some(mapping) = inner.mappings.get(&(address_space, page)) else {
                 return Err(error(
@@ -1211,7 +1272,7 @@ impl ProcessMemory for SyntheticMemory {
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
         let first_page = start.get() / page_size;
         let end_page = end / page_size;
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         for page in first_page..end_page {
             let Some(mapping) = inner.mappings.get(&(address_space, page)) else {
                 return Err(error(
@@ -1280,7 +1341,7 @@ impl ProcessMemory for SyntheticMemory {
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
         let first_page = start.get() / page_size;
         let end_page = end / page_size;
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         for page in first_page..end_page {
             if !inner.mappings.contains_key(&(address_space, page)) {
                 return Err(error(
@@ -1773,7 +1834,7 @@ mod tests {
             .unwrap();
         let before_mapping = memory.mapping_info(SPACE, CODE).unwrap();
 
-        let inner = memory.inner.get_mut();
+        let inner = memory.inner_mut();
         let Some(PhysicalPage::Ram { generation, .. }) = inner.pages.get_mut(&PAGE_1) else {
             panic!("test RAM page must exist");
         };
@@ -2056,7 +2117,7 @@ mod tests {
     #[test]
     fn atomic_page_install_rejects_identity_exhaustion_without_changes() {
         let mut memory = SyntheticMemory::new();
-        memory.inner.get_mut().next_page_id = u64::MAX;
+        memory.inner_mut().next_page_id = u64::MAX;
         let bytes = [0x5a; SYNTHETIC_PAGE_SIZE];
         let request = SyntheticRamPage {
             virtual_address: CODE,

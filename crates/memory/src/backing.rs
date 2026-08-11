@@ -143,6 +143,17 @@ impl CanonicalBackingPage {
 
     /// Copies a checked byte range out of canonical storage.
     pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), CanonicalPageError> {
+        self.read_with_generation(offset, output).map(|_| ())
+    }
+
+    /// Copies bytes and observes their content generation under the same page
+    /// lock. Exclusive-load adapters use this to avoid pairing stale bytes with
+    /// a newer reservation generation.
+    pub fn read_with_generation(
+        &self,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<ContentGeneration, CanonicalPageError> {
         let end = self.checked_end(offset, output.len())?;
         loop {
             self.ensure_cpu_visible()
@@ -155,7 +166,7 @@ impl CanonicalBackingPage {
                     } else {
                         output.fill(0);
                     }
-                    return Ok(());
+                    return Ok(state.generation);
                 }
                 PageVisibility::GpuNewer { .. } => {
                     // A device published newer contents after the slow path

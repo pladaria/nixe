@@ -6,6 +6,7 @@ mod address_wait;
 mod coordinator;
 mod diagnostics;
 mod exception_dispatch;
+mod execution_record;
 mod external_event;
 mod handle;
 mod launch_plan;
@@ -19,7 +20,7 @@ pub use address_wait::AddressWaitRegistry;
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
     CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
-    ThreadSchedulingInfo,
+    ThreadSchedulingInfo, VcpuExecutionMode, WorkerFailure,
 };
 pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use exception_dispatch::{
@@ -28,9 +29,13 @@ pub use exception_dispatch::{
     ExceptionRouteError, ExceptionTerminationReason, ExceptionTerminationScope,
     ExceptionThreadContext,
 };
+pub use execution_record::{
+    ExecutionObservation, ExecutionRecord, MAX_EXECUTION_RECORD_OBSERVATIONS, RecordedStop,
+    ReplayMismatch, ReplayMismatchKind,
+};
 pub use external_event::{
     ExternalEvent, ExternalEventInbox, ExternalEventSendError, ExternalEventSender,
-    ExternalEventSource,
+    ExternalEventSequence, ExternalEventSource, SequencedExternalEvent,
 };
 pub use handle::{
     EventObject, EventWaitOutcome, HandleError, HandleObject, HandleTable, HandleValue,
@@ -53,9 +58,9 @@ pub use process::{
     MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
     MainThread, ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage,
     ProcessBuilder, ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
-    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownReport, ProcessVirtualRegion,
-    RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadExit,
-    ThreadTable, ThreadTableError,
+    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
+    ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
+    ThreadExit, ThreadTable, ThreadTableError,
 };
 pub use process_mount::ProcessMountNamespace;
 pub use virtual_time::{VirtualClock, VirtualClockMode};

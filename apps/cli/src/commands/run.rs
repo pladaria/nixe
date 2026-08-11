@@ -8,7 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{CpuEngineSelection, InitialOperationMode, TimeMode};
+use nixe_config::{
+    CpuEngineSelection, DiagnosticReportDetail, DiagnosticsConfig, InitialOperationMode, TimeMode,
+};
 use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_horizon::{
@@ -21,7 +23,8 @@ use nixe_input::{
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
-    RunnableProcess, RuntimeCoordinator, VirtualClock, VirtualClockMode,
+    ReportDetail, RunnableProcess, RuntimeCoordinator, VcpuExecutionMode, VirtualClock,
+    VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video::FrameMailbox;
@@ -123,7 +126,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     }
 
     log::info!("preparing process memory and initial thread state");
-    let mut diagnostics = DiagnosticsPolicy::from(config.diagnostics);
+    let mut diagnostics = diagnostics_policy(config.diagnostics);
     let instruction_trace = log::log_enabled!(log::Level::Trace);
     if instruction_trace {
         diagnostics.instruction_trace = true;
@@ -140,12 +143,22 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         },
     };
     let virtual_clock = VirtualClock::new(clock_mode);
-    let coordinator =
-        RuntimeCoordinator::with_virtual_clock(scheduler_profile, virtual_clock.clone());
+    let execution_mode = if config.cpu.parallel_vcpus {
+        VcpuExecutionMode::Parallel
+    } else {
+        VcpuExecutionMode::Deterministic
+    };
+    let coordinator = RuntimeCoordinator::try_with_execution_mode(
+        scheduler_profile,
+        virtual_clock.clone(),
+        execution_mode,
+    )
+    .map_err(|error| error.to_string())?;
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
-    let engine_provider = select_cpu_engine(config.cpu.engine, diagnostics)?;
+    let engine_provider =
+        select_cpu_engine(config.cpu.engine, diagnostics, config.cpu.parallel_vcpus)?;
     let process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
@@ -215,9 +228,21 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     frontend_result.and(execution_result)
 }
 
+fn diagnostics_policy(config: DiagnosticsConfig) -> DiagnosticsPolicy {
+    DiagnosticsPolicy {
+        report_detail: match config.report_detail {
+            DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
+            DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
+        },
+        instruction_trace: config.instruction_trace,
+        ..DiagnosticsPolicy::default()
+    }
+}
+
 fn select_cpu_engine(
     selection: CpuEngineSelection,
     diagnostics: DiagnosticsPolicy,
+    parallel_vcpus: bool,
 ) -> Result<Arc<dyn EngineProvider>, String> {
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
     let registry = EngineRegistry::new([interpreter]);
@@ -235,6 +260,10 @@ fn select_cpu_engine(
                 precise_instruction_budget: true,
                 instruction_trace: diagnostics.instruction_trace,
                 native_execution: false,
+                concurrent_executors: parallel_vcpus,
+                max_safepoint_instructions: parallel_vcpus
+                    .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
+                acknowledged_invalidation: parallel_vcpus,
             },
             preference,
         )
@@ -248,9 +277,18 @@ mod engine_selection_tests {
     #[test]
     fn application_composition_resolves_auto_and_explicit_interpreter() {
         for selection in [CpuEngineSelection::Auto, CpuEngineSelection::Interpreter] {
-            let provider = select_cpu_engine(selection, DiagnosticsPolicy::default()).unwrap();
+            let provider =
+                select_cpu_engine(selection, DiagnosticsPolicy::default(), false).unwrap();
             assert_eq!(provider.descriptor().id, INTERPRETER_ENGINE_ID);
         }
+        assert!(
+            select_cpu_engine(
+                CpuEngineSelection::Interpreter,
+                DiagnosticsPolicy::default(),
+                true,
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -301,7 +339,7 @@ fn execute_worker(
         .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
-    let execution = SdlInputBackend::new()
+    let mut execution = SdlInputBackend::new()
         .map_err(|error| error.to_string())
         .and_then(|backend| {
             let mut input = InputManager::with_profiles(backend, gamepad_profiles);
@@ -325,9 +363,21 @@ fn execute_worker(
     let process = coordinator
         .remove_process(process_id)
         .expect("serialized execution returns every scheduler lease");
+    let teardown = match process.try_teardown() {
+        Ok(report) => report,
+        Err(failure) => {
+            let diagnostic = failure.to_string();
+            let report = *failure.report;
+            execution = Err(match execution {
+                Ok(_) => diagnostic,
+                Err(error) => format!("{error}; {diagnostic}"),
+            });
+            report
+        }
+    };
     WorkerResult {
         execution,
-        teardown: process.teardown(),
+        teardown,
         graphics_teardown: video_system.teardown(),
     }
 }
@@ -440,82 +490,95 @@ fn execute(
             last_input_poll = elapsed;
             next_input_poll = elapsed.saturating_add(INPUT_POLL_INTERVAL);
         }
-        let Some(execution) = coordinator
-            .run_next(if print_trace {
-                1
-            } else {
-                coordinator
-                    .scheduler()
-                    .profile()
-                    .default_timeslice_instructions()
-            })
-            .map_err(|error| error.to_string())?
-        else {
+        let instruction_budget = if print_trace {
+            1
+        } else {
+            coordinator
+                .scheduler()
+                .profile()
+                .default_timeslice_instructions()
+        };
+        let executions = match coordinator.execution_mode() {
+            VcpuExecutionMode::Deterministic => coordinator
+                .run_next(instruction_budget)
+                .map(|execution| execution.into_iter().collect()),
+            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave(instruction_budget),
+        }
+        .map_err(|error| error.to_string())?;
+        if executions.is_empty() {
             coordinator
                 .wait_for_external_event()
                 .map_err(|error| error.to_string())?;
             continue;
-        };
-        let thread_id = execution.lease.thread;
-        let report = execution.report;
-        instructions = instructions.saturating_add(report.instructions_executed);
-        if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
-            let elapsed = execution_started.elapsed();
-            let interval_instructions = instructions.saturating_sub(last_progress_instructions);
-            let interval_elapsed = elapsed.saturating_sub(last_progress_elapsed);
-            let interval_ips = instructions_per_second(interval_instructions, interval_elapsed);
-            log::debug!(
-                "guest execution progress: instructions={instructions}, elapsed={elapsed:?}, interval_ips={interval_ips:.0}"
-            );
-            last_progress_instructions = instructions;
-            last_progress_elapsed = elapsed;
-            next_progress = next_progress.saturating_add(EXECUTION_PROGRESS_INTERVAL);
         }
-        if print_trace {
-            for entry in report.trace.entries() {
-                if last_trace_sequence.is_none_or(|sequence| entry.sequence > sequence) {
-                    log::trace!("{entry}");
-                    last_trace_sequence = Some(entry.sequence);
+        for execution in executions {
+            let thread_id = execution.lease.thread;
+            let report = execution.report;
+            instructions = instructions.saturating_add(report.instructions_executed);
+            if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
+                let elapsed = execution_started.elapsed();
+                let interval_instructions = instructions.saturating_sub(last_progress_instructions);
+                let interval_elapsed = elapsed.saturating_sub(last_progress_elapsed);
+                let interval_ips = instructions_per_second(interval_instructions, interval_elapsed);
+                log::debug!(
+                    "guest execution progress: instructions={instructions}, elapsed={elapsed:?}, interval_ips={interval_ips:.0}"
+                );
+                last_progress_instructions = instructions;
+                last_progress_elapsed = elapsed;
+                next_progress = next_progress.saturating_add(EXECUTION_PROGRESS_INTERVAL);
+            }
+            if print_trace {
+                for entry in report.trace.entries() {
+                    if last_trace_sequence.is_none_or(|sequence| entry.sequence > sequence) {
+                        log::trace!("{entry}");
+                        last_trace_sequence = Some(entry.sequence);
+                    }
                 }
             }
-        }
-        match &report.stop {
-            ExecutionStop::BudgetExhausted
-            | ExecutionStop::Safepoint
-            | ExecutionStop::PendingEvent { .. } => {}
-            ExecutionStop::Scheduled { .. } => {
-                coordinator
-                    .make_thread_ready(thread_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            ExecutionStop::SupervisorCall { .. } => {
-                let handling = dispatcher
-                    .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
-                    .map_err(|error| error.to_string())?;
-                match handling {
-                    ExceptionHandlingResult::Resumed => {}
-                    ExceptionHandlingResult::Rejected(error) => {
-                        let diagnostic = error.to_string();
-                        if rejected.insert(diagnostic.clone()) {
-                            log::debug!("guest operation returned a Horizon error: {diagnostic}");
+            match &report.stop {
+                ExecutionStop::BudgetExhausted
+                | ExecutionStop::Safepoint
+                | ExecutionStop::PendingEvent { .. } => {}
+                ExecutionStop::Scheduled { .. } => {
+                    coordinator
+                        .make_thread_ready(thread_id)
+                        .map_err(|error| error.to_string())?;
+                }
+                ExecutionStop::SupervisorCall { .. } => {
+                    let handling = dispatcher
+                        .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
+                        .map_err(|error| error.to_string())?;
+                    match handling {
+                        ExceptionHandlingResult::Resumed => {}
+                        ExceptionHandlingResult::Rejected(error) => {
+                            let diagnostic = error.to_string();
+                            if rejected.insert(diagnostic.clone()) {
+                                log::debug!(
+                                    "guest operation returned a Horizon error: {diagnostic}"
+                                );
+                            }
+                        }
+                        ExceptionHandlingResult::Terminated { .. } => {
+                            return Ok(execution_summary(
+                                instructions,
+                                &dispatcher,
+                                rejected.len(),
+                            ));
+                        }
+                        ExceptionHandlingResult::Suspended => {}
+                        ExceptionHandlingResult::Fault(error) => {
+                            dump_maxwell_pushbuffer_on_fault(&error);
+                            return Err(format!(
+                                "Horizon SVC dispatch failed after {instructions} instructions: {error}; {report}"
+                            ));
                         }
                     }
-                    ExceptionHandlingResult::Terminated { .. } => {
-                        return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
-                    }
-                    ExceptionHandlingResult::Suspended => {}
-                    ExceptionHandlingResult::Fault(error) => {
-                        dump_maxwell_pushbuffer_on_fault(&error);
-                        return Err(format!(
-                            "Horizon SVC dispatch failed after {instructions} instructions: {error}; {report}"
-                        ));
-                    }
                 }
+                ExecutionStop::LoaderReturn { .. } => {
+                    return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
+                }
+                stop => return Err(execution_stop_error(stop, instructions, &report)),
             }
-            ExecutionStop::LoaderReturn { .. } => {
-                return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
-            }
-            stop => return Err(execution_stop_error(stop, instructions, &report)),
         }
     }
 }

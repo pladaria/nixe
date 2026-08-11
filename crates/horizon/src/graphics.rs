@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
+use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, Frame, FrameMailbox};
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
@@ -25,7 +25,8 @@ struct ViVsyncEvent {
 
 impl ViVsyncEvent {
     fn new(display_id: u64) -> Self {
-        let (writable, readable) = EventObject::create_pair();
+        let (writable, readable) =
+            EventObject::create_pair_with_source(ExternalEventSource::Display);
         Self {
             source: GraphicsEventSource::ViVsync { display_id },
             writable,
@@ -53,7 +54,8 @@ struct BufferQueueAvailabilityEvent {
 
 impl BufferQueueAvailabilityEvent {
     fn new(binder_id: i32) -> Self {
-        let (writable, readable) = EventObject::create_pair();
+        let (writable, readable) =
+            EventObject::create_pair_with_source(ExternalEventSource::Display);
         Self {
             source: GraphicsEventSource::BufferQueueAvailability { binder_id },
             writable,

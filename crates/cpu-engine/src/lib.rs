@@ -11,10 +11,24 @@ use nixe_cpu::coverage::CoverageId;
 use nixe_cpu::error::{InstructionFetchFault, ProfileDisabledInstruction, UnallocatedEncoding};
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
-use nixe_cpu::memory::{CpuMemory, DataAccessFault, MemoryPermissions};
+use nixe_cpu::memory::{CpuMemory, DataAccessFault};
 use nixe_cpu::profile::{CpuProfileId, ProcessCpuContext};
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::GuestVirtualAddress;
+
+mod capability;
+mod control;
+mod handoff;
+pub use capability::{
+    CapabilityRejection, CapabilityRejectionReason, CapabilityReport, EngineCapabilities,
+    EngineDescriptor, EngineKind, HostArchitecture, HostCapabilities,
+};
+pub use control::{ControlSnapshot, CrossVcpuRequest, EngineControl, EngineExecutionGuard};
+pub use handoff::{
+    DomainQuiescenceToken, HandoffFailure, HandoffFailureStage, MemorySynchronizationRecord,
+    NceExecutionDomain, NceMappingChange, NceMappingChangeKind, NceSupervisorState, NceTrap,
+    NceTrapKind, NceVcpuState, StateCommitBarrier, prepare_handoff,
+};
 
 pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
 pub const MAX_TRACE_DISASSEMBLY_BYTES: usize = 96;
@@ -43,108 +57,7 @@ identity!(EngineId);
 identity!(EngineDomainId);
 identity!(EngineExecutorId);
 identity!(EngineGeneration);
-
-/// Stable implementation family used for selection and diagnostics.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EngineKind {
-    Interpreter,
-    NativeCodeExecution,
-    Test,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum HostArchitecture {
-    Aarch64,
-    X86_64,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct HostCapabilities {
-    pub architecture: HostArchitecture,
-    pub logical_parallelism: Option<usize>,
-}
-
-impl HostCapabilities {
-    /// Discovers only portable host facts. Privileged virtualization features
-    /// remain provider-specific probes and are never guessed from the ISA.
-    #[must_use]
-    pub fn discover() -> Self {
-        let architecture = if cfg!(target_arch = "aarch64") {
-            HostArchitecture::Aarch64
-        } else if cfg!(target_arch = "x86_64") {
-            HostArchitecture::X86_64
-        } else {
-            HostArchitecture::Other
-        };
-        Self {
-            architecture,
-            logical_parallelism: std::thread::available_parallelism()
-                .ok()
-                .map(std::num::NonZero::get),
-        }
-    }
-}
-
-/// Capabilities offered by one provider on the current host.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct EngineCapabilities {
-    pub a64: bool,
-    pub a32: bool,
-    pub t32: bool,
-    pub precise_instruction_budget: bool,
-    pub instruction_trace: bool,
-    pub native_execution: bool,
-}
-
-impl EngineCapabilities {
-    #[must_use]
-    pub const fn supports_profile(self, profile: CpuProfileId) -> bool {
-        let _ = profile;
-        self.a64
-    }
-
-    #[must_use]
-    pub const fn contains(self, required: Self) -> bool {
-        (!required.a64 || self.a64)
-            && (!required.a32 || self.a32)
-            && (!required.t32 || self.t32)
-            && (!required.precise_instruction_budget || self.precise_instruction_budget)
-            && (!required.instruction_trace || self.instruction_trace)
-            && (!required.native_execution || self.native_execution)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EngineDescriptor {
-    pub id: EngineId,
-    pub name: Box<str>,
-    pub kind: EngineKind,
-    pub capabilities: EngineCapabilities,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum CapabilityRejectionReason {
-    HostUnavailable,
-    GuestProfileUnsupported,
-    MissingCapabilities,
-    PrivilegeUnavailable,
-    PlatformUnsupported,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityRejection {
-    pub engine: EngineId,
-    pub reason: CapabilityRejectionReason,
-    pub detail: Box<str>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityReport {
-    pub descriptor: EngineDescriptor,
-    pub available: bool,
-    pub rejections: Box<[CapabilityRejection]>,
-}
+identity!(ControlEpoch);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SafepointReason {
@@ -565,6 +478,32 @@ pub trait EngineExecutor: Send {
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault>;
     fn request_safepoint(&mut self, reason: SafepointReason);
     fn post_event(&self, mask: u32);
+    /// Applies mapping/code invalidation before guest re-entry. Providers which
+    /// advertise acknowledged invalidation must override this method.
+    fn synchronize_invalidation(
+        &mut self,
+        epoch: u64,
+        state: &ThreadCpuState,
+    ) -> Result<(), EngineFault> {
+        if !self.descriptor().capabilities.acknowledged_invalidation {
+            return Ok(());
+        }
+        Err(EngineFault {
+            engine: self.descriptor().id,
+            kind: EngineFaultKind::InvalidRequest,
+            instructions_executed: 0,
+            message: format!(
+                "engine advertises invalidation acknowledgement but cannot synchronize epoch {epoch}"
+            )
+            .into_boxed_str(),
+            context: Box::new(state.register_context()),
+        })
+    }
+    /// Returns a cloneable control path which remains usable while a worker
+    /// exclusively owns this executor.
+    fn control(&self) -> Option<EngineControl> {
+        None
+    }
     /// Clears executor-local exclusive-reservation state at an explicit
     /// scheduler migration or context-switch boundary.
     fn clear_local_exclusive_reservation(&mut self);
@@ -581,136 +520,4 @@ pub fn run_interpret_one_fallback(
         instruction_budget: 1,
         ..request
     })
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DomainQuiescenceToken {
-    pub domain: EngineDomainId,
-    pub generation: EngineGeneration,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MemorySynchronizationRecord {
-    pub address_space: AddressSpaceId,
-    pub invalidation_generation: u64,
-    pub dirty_generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StateCommitBarrier {
-    pub quiescence: DomainQuiescenceToken,
-    pub memory: MemorySynchronizationRecord,
-    pub state: StateCommitStatus,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum HandoffFailureStage {
-    Quiesce,
-    Export,
-    MemorySync,
-    Import,
-    Commit,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HandoffFailure {
-    pub stage: HandoffFailureStage,
-    pub fault: EngineFault,
-}
-
-/// Runs a failure-atomic switch. The old domain is retained unless every
-/// preparation step succeeds; callers commit the returned domain explicitly.
-pub fn prepare_handoff(
-    old: &mut dyn EngineDomain,
-    mut replacement: Box<dyn EngineDomain>,
-    memory: MemorySynchronizationRecord,
-) -> Result<(Box<dyn EngineDomain>, StateCommitBarrier), HandoffFailure> {
-    let quiescence = old.quiesce().map_err(|fault| HandoffFailure {
-        stage: HandoffFailureStage::Quiesce,
-        fault,
-    })?;
-    let replacement_quiescence = replacement.quiesce().map_err(|fault| HandoffFailure {
-        stage: HandoffFailureStage::Import,
-        fault,
-    })?;
-    let _ = replacement_quiescence;
-    Ok((
-        replacement,
-        StateCommitBarrier {
-            quiescence,
-            memory,
-            state: StateCommitStatus::Canonical,
-        },
-    ))
-}
-
-/// NCE-owned supervisor state which must never leak host handles.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NceSupervisorState {
-    pub virtual_exception_level: u8,
-    pub pending_interrupt_mask: u32,
-    pub timer_deadline: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum NceMappingChangeKind {
-    Map,
-    Unmap,
-    Protect,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct NceMappingChange {
-    pub address_space: AddressSpaceId,
-    pub start: GuestVirtualAddress,
-    pub size: u64,
-    pub kind: NceMappingChangeKind,
-    pub permissions: Option<MemoryPermissions>,
-    pub generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum NceTrapKind {
-    SupervisorCall,
-    DataAbort,
-    InstructionAbort,
-    Timer,
-    Interrupt,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct NceTrap {
-    pub source: LocationDescriptor,
-    pub kind: NceTrapKind,
-    pub syndrome: Option<u64>,
-    pub data_fault: Option<DataAccessFault>,
-}
-
-/// Lossless vCPU interchange state.
-///
-/// `canonical` includes, for A64, X0-X30, SP, PC, NZCV, V0-V31, FPCR, FPSR,
-/// TPIDR_EL0, and TPIDRRO_EL0. For A32/T32 it includes R0-R14, the stored PC,
-/// CPSR/ITSTATE, D0-D31, FPSCR, TPIDRURW, and TPIDRURO. Exclusive-monitor,
-/// interrupt, timer, mapping, and privileged supervisor state are deliberately
-/// carried by the domain contract rather than hidden in this value.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NceVcpuState {
-    pub canonical: ThreadCpuState,
-    pub supervisor: NceSupervisorState,
-}
-
-pub trait NceExecutionDomain: EngineDomain {
-    fn bind_address_space(&mut self, address_space: AddressSpaceId) -> Result<(), EngineFault>;
-    fn notify_mapping(&mut self, change: NceMappingChange) -> Result<(), EngineFault>;
-    fn reconcile_dirty_memory(&mut self) -> Result<MemorySynchronizationRecord, EngineFault>;
-    fn inject_interrupt(&mut self, mask: u32) -> Result<(), EngineFault>;
-    fn import_vcpu(
-        &mut self,
-        executor: EngineExecutorId,
-        state: NceVcpuState,
-    ) -> Result<(), EngineFault>;
-    fn export_vcpu(&mut self, executor: EngineExecutorId) -> Result<NceVcpuState, EngineFault>;
-    fn normalize_trap(&self, trap: NceTrap) -> EngineExit;
-    fn teardown(&mut self) -> Result<(), EngineFault>;
 }

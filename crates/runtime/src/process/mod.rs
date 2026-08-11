@@ -1,7 +1,9 @@
 //! Construction of a runnable CPU process from an immutable launch plan.
 
 mod builder;
-mod execution;
+mod dispatch;
+mod exception;
+pub(crate) mod execution;
 mod layout;
 mod thread;
 
@@ -13,7 +15,7 @@ pub use execution::{
     ExecutionReport, ExecutionStop, InstructionTrace, InstructionTraceEntry,
     MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
     ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
-    ProcessTeardownReport, ThreadExit,
+    ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
@@ -33,7 +35,8 @@ use nixe_cpu::ir::block::IrBlock;
 use nixe_cpu::ir::print::{IrPrintOptions, print_block};
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MemoryMappingPurpose, MemoryPermissions, ProcessMemory,
+    CpuMemory, ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError,
+    MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, ProcessMemory,
     SYNTHETIC_PAGE_SIZE, SyntheticRamPage,
 };
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
@@ -46,7 +49,7 @@ use nixe_loader_executable::{
 };
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
-use crate::exception_dispatch::ExceptionProcessMetadata;
+use crate::exception_dispatch::{ExceptionProcessMetadata, ExceptionProcessResources};
 use crate::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatcher,
     ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume, ExceptionRouteError,
@@ -76,7 +79,7 @@ pub struct RunnableProcess {
     random_entropy: [u64; 4],
     heap_size: u64,
     initial_memory_size: u64,
-    memory: ExecutionMemory,
+    memory: std::sync::Arc<ExecutionMemory>,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
     main_thread_id: nixe_scheduler::GuestThreadId,
@@ -129,8 +132,71 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub const fn memory(&self) -> &ExecutionMemory {
-        &self.memory
+    pub fn memory(&self) -> &ExecutionMemory {
+        self.memory.as_ref()
+    }
+
+    /// Applies one runtime mapping resize after closing new execution leases,
+    /// then publishes the committed epoch to every executor control path.
+    pub fn resize_memory_mapping(
+        &self,
+        start: GuestVirtualAddress,
+        old_size: u64,
+        new_size: u64,
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+    ) -> Result<(), MemoryMappingError> {
+        self.execution.request_mapping_safepoint();
+        self.memory.resize_zeroed_mapping(
+            self.cpu.address_space_id(),
+            start,
+            old_size,
+            new_size,
+            permissions,
+            purpose,
+        )?;
+        self.execution
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
+    }
+
+    pub fn set_memory_permissions(
+        &self,
+        start: GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryProtectionError> {
+        self.execution.request_mapping_safepoint();
+        self.memory
+            .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
+        self.execution
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
+    }
+
+    pub fn set_memory_attributes(
+        &self,
+        start: GuestVirtualAddress,
+        size: u64,
+        mask: MemoryAttributes,
+        value: MemoryAttributes,
+    ) -> Result<(), MemoryProtectionError> {
+        self.execution.request_mapping_safepoint();
+        self.memory
+            .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
+        self.execution
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn mapping_epoch(&self) -> MappingEpoch {
+        self.memory.mapping_epoch()
+    }
+
+    #[must_use]
+    pub fn mapping_invalidation_acknowledged(&self, epoch: MappingEpoch) -> bool {
+        self.execution.mapping_invalidation_acknowledged(epoch)
     }
 
     #[must_use]
@@ -176,7 +242,7 @@ impl RunnableProcess {
         &self,
         request: &ThreadCreateRequest,
     ) -> Result<(), ThreadCreateError> {
-        let execution_state = match &self.main_thread().state {
+        let execution_state = match self.main_thread().state() {
             ThreadCpuState::A64(_) => ExecutionState::A64,
             ThreadCpuState::A32(state) => state.execution_state(),
         };
@@ -276,16 +342,14 @@ impl RunnableProcess {
         if tls_base.get() < self.memory_layout.stack().base().get() {
             return Err(ThreadCreateError::ResourceLimit);
         }
-        self.memory
-            .resize_zeroed_mapping(
-                self.cpu.address_space_id(),
-                tls_base,
-                0,
-                TLS_SIZE,
-                MemoryPermissions::READ_WRITE,
-                MemoryMappingPurpose::ThreadLocal,
-            )
-            .map_err(|_| ThreadCreateError::ResourceLimit)?;
+        self.resize_memory_mapping(
+            tls_base,
+            0,
+            TLS_SIZE,
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::ThreadLocal,
+        )
+        .map_err(|_| ThreadCreateError::ResourceLimit)?;
         let object = crate::ThreadObject::new(id.get());
         let handle = match self.handles.insert(object.clone()) {
             Ok(handle) => handle,
@@ -297,7 +361,7 @@ impl RunnableProcess {
                 return Err(ThreadCreateError::ResourceLimit);
             }
         };
-        let execution_state = match &self.main_thread().state {
+        let execution_state = match self.main_thread().state() {
             ThreadCpuState::A64(_) => ExecutionState::A64,
             ThreadCpuState::A32(state) => state.execution_state(),
         };
@@ -321,7 +385,7 @@ impl RunnableProcess {
             lifecycle: nixe_scheduler::ThreadLifecycle::Created,
             wait_reason: None,
             continuation: None,
-            state,
+            state: Some(state),
             handle,
             stack_bottom: request.stack_top,
             stack_top: request.stack_top,
@@ -390,8 +454,7 @@ impl RunnableProcess {
     }
 
     fn rollback_thread_tls(&self, tls_base: GuestVirtualAddress) {
-        let _ = self.memory.resize_zeroed_mapping(
-            self.cpu.address_space_id(),
+        let _ = self.resize_memory_mapping(
             tls_base,
             TLS_SIZE,
             0,
@@ -530,532 +593,10 @@ impl RunnableProcess {
         (&self.mounts, &mut self.handles)
     }
 
-    /// Returns the host-side lifecycle state of this process.
-    #[must_use]
-    pub fn execution_status(&self) -> ProcessExecutionStatus {
-        match self.lifecycle {
-            nixe_scheduler::ProcessLifecycle::Exited => ProcessExecutionStatus::Exited,
-            nixe_scheduler::ProcessLifecycle::Faulted => ProcessExecutionStatus::Faulted,
-            _ => match self.main_thread().lifecycle {
-                nixe_scheduler::ThreadLifecycle::Running => ProcessExecutionStatus::Running,
-                nixe_scheduler::ThreadLifecycle::Waiting => ProcessExecutionStatus::Suspended,
-                nixe_scheduler::ThreadLifecycle::Suspended => ProcessExecutionStatus::Suspended,
-                nixe_scheduler::ThreadLifecycle::Exited => ProcessExecutionStatus::Exited,
-                nixe_scheduler::ThreadLifecycle::Faulted => ProcessExecutionStatus::Faulted,
-                _ => ProcessExecutionStatus::Ready,
-            },
-        }
-    }
-
-    /// Returns the process exit record retained until teardown.
-    #[must_use]
-    pub const fn exit(&self) -> Option<ProcessExit> {
-        self.process_exit
-    }
-
-    /// Returns the selected execution-engine descriptor.
-    #[must_use]
-    pub fn engine_descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
-        self.execution.engine_descriptor()
-    }
-
-    /// Requests a stop before the next reference-engine instruction.
-    pub fn request_safepoint(&mut self) {
-        self.execution.request_safepoint();
-    }
-
-    /// Publishes runtime event bits to be observed at the next safepoint.
-    pub fn post_event(&self, mask: u32) {
-        self.execution.post_event(mask);
-    }
-
-    pub(crate) fn clear_local_exclusive_reservation(&mut self, vcpu: nixe_scheduler::VirtualCpuId) {
-        self.execution.clear_local_exclusive_reservation(vcpu);
-    }
-
-    /// Resumes a process suspended by an exception or scheduling instruction.
-    pub fn resume(&mut self) -> bool {
-        self.resume_thread(self.main_thread_id)
-    }
-
-    /// Resumes one explicit guest thread. Scheduler-facing code must use this
-    /// operation rather than the main-thread compatibility adapter.
-    pub(crate) fn resume_thread(&mut self, id: nixe_scheduler::GuestThreadId) -> bool {
-        if self.lifecycle != nixe_scheduler::ProcessLifecycle::Running {
-            return false;
-        }
-        let Some(thread) = self.threads.get_mut(id) else {
-            return false;
-        };
-        if thread.lifecycle != nixe_scheduler::ThreadLifecycle::Waiting {
-            return false;
-        }
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Ready,
-        )
-        .expect("runtime and compatibility execution lifecycles remain synchronized");
-        thread.wait_reason = None;
-        true
-    }
-
-    /// Marks the process exited. Resource release occurs in [`Self::teardown`]
-    /// or when the process is dropped.
-    pub fn terminate(&mut self) -> bool {
-        let thread_id = self.main_thread().object.thread_id();
-        let exit = ProcessExit {
-            cause: ProcessExitCause::HostRequested,
-            exit_code: 0,
-            source: None,
-            thread_id,
-        };
-        let terminated = !matches!(
-            self.lifecycle,
-            nixe_scheduler::ProcessLifecycle::Exited | nixe_scheduler::ProcessLifecycle::Faulted
-        );
-        if terminated {
-            nixe_scheduler::transition_process(
-                &mut self.lifecycle,
-                nixe_scheduler::ProcessLifecycle::Terminating,
-            )
-            .expect("a live process can terminate");
-            nixe_scheduler::transition_process(
-                &mut self.lifecycle,
-                nixe_scheduler::ProcessLifecycle::Exited,
-            )
-            .expect("a terminating process can exit");
-            let thread_lifecycle = self.main_thread().lifecycle;
-            if !matches!(
-                thread_lifecycle,
-                nixe_scheduler::ThreadLifecycle::Exited | nixe_scheduler::ThreadLifecycle::Faulted
-            ) {
-                nixe_scheduler::transition_thread(
-                    &mut self.main_thread_mut().lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Terminating,
-                )
-                .expect("a live main thread can terminate");
-                nixe_scheduler::transition_thread(
-                    &mut self.main_thread_mut().lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited,
-                )
-                .expect("a terminating main thread can exit");
-            }
-            self.process_exit = Some(exit);
-            self.main_thread_mut().exit = Some(ThreadExit {
-                requested_scope: ExceptionTerminationScope::Process,
-                exit_code: 0,
-                source: None,
-            });
-        }
-        terminated
-    }
-
-    /// Runs one bounded slice through the injected CPU engine domain.
-    pub fn run(
-        &mut self,
-        instruction_budget: u64,
-    ) -> Result<ExecutionReport, ProcessExecutionError> {
-        self.run_thread(
-            self.main_thread_id,
-            nixe_scheduler::VirtualCpuId::new(0),
-            instruction_budget,
-        )
-    }
-
-    /// Runs one bounded slice for the thread and emulated vCPU selected by the
-    /// scheduler. This is the production execution entry point.
-    pub(crate) fn run_thread(
-        &mut self,
-        thread_id: nixe_scheduler::GuestThreadId,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        instruction_budget: u64,
-    ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let Some(selected) = self.threads.get(thread_id) else {
-            return Err(ProcessExecutionError::UnknownThread(thread_id));
-        };
-        if selected.lifecycle != nixe_scheduler::ThreadLifecycle::Ready {
-            return Err(ProcessExecutionError::NotRunnable {
-                status: self.execution_status(),
-                context: Box::new(selected.state.register_context()),
-            });
-        }
-        let loader_return = selected.loader_return;
-        let thread = self
-            .threads
-            .get_mut(thread_id)
-            .expect("the selected thread was validated");
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Running,
-        )
-        .expect("a ready thread can run");
-        let report_result = execution::run_engine(
-            &mut self.execution,
-            vcpu,
-            self.cpu,
-            &self.memory,
-            &mut thread.state,
-            instruction_budget,
-            loader_return,
-        );
-        let report = match report_result {
-            Ok(report) => report,
-            Err(error) => {
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Faulted,
-                )
-                .expect("a running thread may fault");
-                nixe_scheduler::transition_process(
-                    &mut self.lifecycle,
-                    nixe_scheduler::ProcessLifecycle::Faulted,
-                )
-                .expect("a running process may fault");
-                return Err(error);
-            }
-        };
-        let target = match report.stop {
-            ExecutionStop::BudgetExhausted
-            | ExecutionStop::Safepoint
-            | ExecutionStop::PendingEvent { .. } => nixe_scheduler::ThreadLifecycle::Ready,
-            ExecutionStop::FetchFault { .. } | ExecutionStop::UnsupportedSemantics { .. } => {
-                nixe_scheduler::ThreadLifecycle::Faulted
-            }
-            ExecutionStop::LoaderReturn { .. } => nixe_scheduler::ThreadLifecycle::Exited,
-            _ => nixe_scheduler::ThreadLifecycle::Waiting,
-        };
-        if target == nixe_scheduler::ThreadLifecycle::Exited {
-            nixe_scheduler::transition_thread(
-                &mut thread.lifecycle,
-                nixe_scheduler::ThreadLifecycle::Terminating,
-            )
-            .expect("a running thread may terminate");
-        }
-        nixe_scheduler::transition_thread(&mut thread.lifecycle, target)
-            .expect("engine exits define legal running-thread transitions");
-        thread.wait_reason = (thread.lifecycle == nixe_scheduler::ThreadLifecycle::Waiting)
-            .then_some(nixe_scheduler::WaitReason::Scheduler);
-        if let ExecutionStop::LoaderReturn {
-            source,
-            result_code,
-        } = &report.stop
-        {
-            let object_thread_id = thread.object.thread_id();
-            let exit = ProcessExit {
-                cause: ProcessExitCause::LoaderReturned,
-                exit_code: *result_code,
-                source: Some(*source),
-                thread_id: object_thread_id,
-            };
-            nixe_scheduler::transition_process(
-                &mut self.lifecycle,
-                nixe_scheduler::ProcessLifecycle::Terminating,
-            )
-            .expect("a running process may terminate");
-            nixe_scheduler::transition_process(
-                &mut self.lifecycle,
-                nixe_scheduler::ProcessLifecycle::Exited,
-            )
-            .expect("a terminating process may exit");
-            self.process_exit = Some(exit);
-            let thread = self
-                .threads
-                .get_mut(thread_id)
-                .expect("the executed thread remains registered");
-            thread.exit = Some(ThreadExit {
-                requested_scope: ExceptionTerminationScope::Process,
-                exit_code: *result_code,
-                source: Some(*source),
-            });
-        }
-        Ok(report)
-    }
-
-    /// Deprecated compatibility name for [`Self::run`]. New orchestration must
-    /// use the engine-neutral method; this wrapper is removed after migration.
-    pub fn run_reference(
-        &mut self,
-        instruction_budget: u64,
-    ) -> Result<ExecutionReport, ProcessExecutionError> {
-        self.run(instruction_budget)
-    }
-
-    /// Failure-atomically replaces the process execution domain at a canonical
-    /// state boundary. The old domain remains installed if preparation fails.
-    pub fn switch_engine(
-        &mut self,
-        provider: &dyn nixe_cpu_engine::EngineProvider,
-    ) -> Result<nixe_cpu_engine::StateCommitBarrier, nixe_cpu_engine::HandoffFailure> {
-        self.execution.switch_provider(self.cpu, provider)
-    }
-
-    /// Routes and atomically applies one supervisor-call decision.
-    ///
-    /// A normal handler must return [`ExceptionResume::Next`]; this method then
-    /// advances past the SVC exactly once. Retry is explicit, suspension keeps
-    /// its selected continuation non-runnable, and faults retain the SVC source
-    /// for deterministic diagnostics.
-    pub fn route_supervisor_call<D: ExceptionDispatcher>(
-        &mut self,
-        stop: &ExecutionStop,
-        dispatcher: &mut D,
-    ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
-        self.route_supervisor_call_for(
-            self.main_thread_id,
-            nixe_scheduler::VirtualCpuId::new(0),
-            stop,
-            dispatcher,
-        )
-    }
-
-    /// Routes an exception to the explicit thread and vCPU from a completed
-    /// scheduler lease.
-    pub fn route_supervisor_call_for<D: ExceptionDispatcher>(
-        &mut self,
-        thread_id: nixe_scheduler::GuestThreadId,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        stop: &ExecutionStop,
-        dispatcher: &mut D,
-    ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
-        let request = stop
-            .exception_dispatch_request()
-            .filter(|request| request.kind() == nixe_cpu::exception::ExceptionKind::SupervisorCall)
-            .ok_or(ExceptionRouteError::NotSupervisorCall)?;
-        let selected = self
-            .threads
-            .get(thread_id)
-            .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-        if selected.lifecycle != nixe_scheduler::ThreadLifecycle::Waiting {
-            return Err(ExceptionRouteError::ProcessNotSuspended {
-                status: self.execution_status(),
-            });
-        }
-        let current = execution::current_location(self.cpu, &selected.state);
-        if request.source() != current {
-            return Err(ExceptionRouteError::SourceMismatch {
-                requested: request.source(),
-                current,
-            });
-        }
-        let thread = self
-            .threads
-            .get_mut(thread_id)
-            .expect("the selected thread was validated");
-        let handle = thread.handle;
-        let object = thread.object.clone();
-        let process = ExceptionProcessContext::new(
-            ExceptionProcessMetadata {
-                process_id: self.process_id,
-                cpu: self.cpu,
-                address_space_limit: self.address_space.exclusive_limit(),
-                memory_layout: self.memory_layout,
-                random_entropy: self.random_entropy,
-                initial_memory_size: self.initial_memory_size,
-            },
-            &mut self.heap_size,
-            &self.memory,
-            &self.memory,
-            &self.mounts,
-            &mut self.handles,
-            &mut self.address_waits,
-        );
-        let thread =
-            ExceptionThreadContext::new(thread_id, vcpu, object, handle, &mut thread.state);
-        let mut context = ExceptionDispatchContext::new(process, thread);
-        let outcome = dispatcher.dispatch(&mut context, request);
-        self.apply_supervisor_call_outcome(thread_id, request.source(), outcome)
-    }
-
-    fn apply_supervisor_call_outcome<F>(
-        &mut self,
-        thread_id: nixe_scheduler::GuestThreadId,
-        source: LocationDescriptor,
-        outcome: ExceptionDispatchOutcome<F>,
-    ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
-        match outcome {
-            ExceptionDispatchOutcome::Resume(continuation) => {
-                let target = supervisor_call_continuation(source, continuation)?;
-                let cpu = self.cpu;
-                install_continuation(
-                    cpu,
-                    &mut self
-                        .thread_mut(thread_id)
-                        .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                        .state,
-                    target,
-                )?;
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Ready,
-                )
-                .expect("a waiting exception thread may resume");
-                thread.wait_reason = None;
-                Ok(ExceptionHandlingResult::Resumed)
-            }
-            ExceptionDispatchOutcome::Suspend(continuation) => {
-                let target = supervisor_call_continuation(source, continuation)?;
-                let cpu = self.cpu;
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                install_continuation(cpu, &mut thread.state, target)?;
-                thread.continuation = Some(match continuation {
-                    ExceptionResume::Retry => nixe_scheduler::Continuation::Retry,
-                    ExceptionResume::Next => nixe_scheduler::Continuation::Next,
-                    ExceptionResume::At(target) => {
-                        nixe_scheduler::Continuation::Address(target.pc.get())
-                    }
-                });
-                Ok(ExceptionHandlingResult::Suspended)
-            }
-            ExceptionDispatchOutcome::Reject { diagnostic } => {
-                let target = supervisor_call_continuation(source, ExceptionResume::Next)?;
-                let cpu = self.cpu;
-                install_continuation(
-                    cpu,
-                    &mut self
-                        .thread_mut(thread_id)
-                        .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                        .state,
-                    target,
-                )?;
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Ready,
-                )
-                .expect("a rejected call resumes its waiting thread");
-                thread.wait_reason = None;
-                Ok(ExceptionHandlingResult::Rejected(diagnostic))
-            }
-            ExceptionDispatchOutcome::Terminate {
-                scope,
-                exit_code,
-                reason,
-            } => {
-                let cpu = self.cpu;
-                install_continuation(
-                    cpu,
-                    &mut self
-                        .thread_mut(thread_id)
-                        .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                        .state,
-                    source,
-                )?;
-                let exit = ProcessExit {
-                    cause: match reason {
-                        ExceptionTerminationReason::Break { reason, info, size } => {
-                            ProcessExitCause::GuestBreak { reason, info, size }
-                        }
-                        ExceptionTerminationReason::Requested => match scope {
-                            ExceptionTerminationScope::CurrentThread => {
-                                ProcessExitCause::LastThreadExited
-                            }
-                            ExceptionTerminationScope::Process => {
-                                ProcessExitCause::ProcessRequested
-                            }
-                        },
-                    },
-                    exit_code,
-                    source: Some(source),
-                    thread_id: thread_id.get(),
-                };
-                let terminate_process = scope == ExceptionTerminationScope::Process
-                    || !self.threads.iter().any(|(id, thread)| {
-                        *id != thread_id
-                            && !matches!(
-                                thread.lifecycle,
-                                nixe_scheduler::ThreadLifecycle::Exited
-                                    | nixe_scheduler::ThreadLifecycle::Faulted
-                            )
-                    });
-                if terminate_process {
-                    nixe_scheduler::transition_process(
-                        &mut self.lifecycle,
-                        nixe_scheduler::ProcessLifecycle::Terminating,
-                    )
-                    .expect("a live process may terminate");
-                    nixe_scheduler::transition_process(
-                        &mut self.lifecycle,
-                        nixe_scheduler::ProcessLifecycle::Exited,
-                    )
-                    .expect("a terminating process may exit");
-                    self.process_exit = Some(exit);
-                }
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Terminating,
-                )
-                .expect("a waiting exception thread may terminate");
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited,
-                )
-                .expect("a terminating exception thread may exit");
-                thread.exit = Some(ThreadExit {
-                    requested_scope: scope,
-                    exit_code,
-                    source: Some(source),
-                });
-                thread.object.signal();
-                Ok(ExceptionHandlingResult::Terminated {
-                    scope,
-                    exit_code,
-                    reason,
-                })
-            }
-            ExceptionDispatchOutcome::Fault(fault) => {
-                let cpu = self.cpu;
-                install_continuation(
-                    cpu,
-                    &mut self
-                        .thread_mut(thread_id)
-                        .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                        .state,
-                    source,
-                )?;
-                let has_other_live = self.threads.iter().any(|(id, thread)| {
-                    *id != thread_id
-                        && !matches!(
-                            thread.lifecycle,
-                            nixe_scheduler::ThreadLifecycle::Exited
-                                | nixe_scheduler::ThreadLifecycle::Faulted
-                        )
-                });
-                if !has_other_live {
-                    nixe_scheduler::transition_process(
-                        &mut self.lifecycle,
-                        nixe_scheduler::ProcessLifecycle::Faulted,
-                    )
-                    .expect("a live process may fault");
-                }
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Faulted,
-                )
-                .expect("a waiting exception thread may fault");
-                thread.object.signal();
-                Ok(ExceptionHandlingResult::Fault(fault))
-            }
-        }
-    }
-
     /// Consumes the process and deterministically releases all process-owned resources.
-    #[must_use]
-    pub fn teardown(self) -> ProcessTeardownReport {
+    pub fn try_teardown(mut self) -> Result<ProcessTeardownReport, ProcessTeardownFailure> {
         let previous_status = self.execution_status();
-        ProcessTeardownReport {
+        let report = ProcessTeardownReport {
             previous_status,
             exit: self.process_exit,
             threads_released: self.threads.len(),
@@ -1069,7 +610,28 @@ impl RunnableProcess {
             mounts_released: self.mounts.mount_count(),
             handles_released: self.handles.len(),
             address_waiters_released: self.address_waits.waiter_count(),
+        };
+        self.execution
+            .quiesce()
+            .map_err(|fault| ProcessTeardownFailure {
+                report: Box::new(report),
+                fault: Box::new(fault),
+            })?;
+        Ok(report)
+    }
+
+    /// Migration compatibility wrapper. Applications should use
+    /// [`Self::try_teardown`] so engine quiescence failure remains observable.
+    #[must_use]
+    pub fn teardown(self) -> ProcessTeardownReport {
+        match self.try_teardown() {
+            Ok(report) => report,
+            Err(failure) => *failure.report,
         }
+    }
+
+    pub(crate) fn request_execution_safepoint(&self) {
+        self.execution.request_safepoint();
     }
 
     /// Translates and verifies the initialized entry block through process memory.
@@ -1079,7 +641,7 @@ impl RunnableProcess {
             &self.cpu.profile(),
             self.cpu.address_space_id(),
             self.entry_location(),
-            &self.memory,
+            self.memory.as_ref(),
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))
     }
@@ -1093,7 +655,7 @@ impl RunnableProcess {
             &self.cpu.profile(),
             self.cpu.address_space_id(),
             self.entry_location(),
-            &self.memory,
+            self.memory.as_ref(),
         )
     }
 
@@ -1116,7 +678,7 @@ impl RunnableProcess {
     fn entry_location(&self) -> LocationDescriptor {
         LocationDescriptor::new(
             GuestVirtualAddress::new(self.entry_module().entry_address()),
-            self.main_thread().state.execution_state(),
+            self.main_thread().state().execution_state(),
             self.cpu.profile().id(),
         )
     }

@@ -81,7 +81,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = reference_process_builder().build(&plan).unwrap();
-    let ThreadCpuState::A64(state) = &process.main_thread().state else {
+    let ThreadCpuState::A64(state) = process.main_thread().state() else {
         panic!("NRO must enter in A64 state")
     };
     assert_ne!(

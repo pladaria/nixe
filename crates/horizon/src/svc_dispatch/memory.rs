@@ -118,12 +118,10 @@ pub(super) fn set_memory_permission(
             },
         );
     }
-    match context.process().memory().set_permissions(
-        context.process().cpu().address_space_id(),
-        start,
-        size,
-        permissions,
-    ) {
+    match context
+        .process()
+        .set_memory_permissions(start, size, permissions)
+    {
         Ok(()) => {
             result(context, HorizonKernelResult::SUCCESS);
             resume()
@@ -188,8 +186,7 @@ pub(super) fn map_shared_memory(
     } else {
         permissions
     };
-    match context.process().memory().resize_zeroed_mapping(
-        context.process().cpu().address_space_id(),
+    match context.process().resize_memory_mapping(
         start,
         0,
         size,
@@ -199,8 +196,7 @@ pub(super) fn map_shared_memory(
         Ok(()) => {
             let mut backing = vec![0_u8; shared_memory.size()];
             if shared_memory.read(0, &mut backing).is_err() {
-                let _ = context.process().memory().resize_zeroed_mapping(
-                    context.process().cpu().address_space_id(),
+                let _ = context.process().resize_memory_mapping(
                     start,
                     size,
                     0,
@@ -229,8 +225,7 @@ pub(super) fn map_shared_memory(
                     MemoryAccess::normal(MemoryAccessSize::Byte),
                     MemoryValue::U8(byte),
                 ) {
-                    let _ = context.process().memory().resize_zeroed_mapping(
-                        context.process().cpu().address_space_id(),
+                    let _ = context.process().resize_memory_mapping(
                         start,
                         size,
                         0,
@@ -247,15 +242,12 @@ pub(super) fn map_shared_memory(
                 }
             }
             if permissions != mapping_permissions
-                && let Err(fault) = context.process().memory().set_permissions(
-                    context.process().cpu().address_space_id(),
-                    start,
-                    size,
-                    permissions,
-                )
+                && let Err(fault) =
+                    context
+                        .process()
+                        .set_memory_permissions(start, size, permissions)
             {
-                let _ = context.process().memory().resize_zeroed_mapping(
-                    context.process().cpu().address_space_id(),
+                let _ = context.process().resize_memory_mapping(
                     start,
                     size,
                     0,
@@ -394,8 +386,7 @@ pub(super) fn unmap_shared_memory(
         result(context, HorizonKernelResult::INVALID_ADDRESS);
         return resume();
     };
-    match context.process().memory().resize_zeroed_mapping(
-        context.process().cpu().address_space_id(),
+    match context.process().resize_memory_mapping(
         start,
         size,
         0,
@@ -469,13 +460,10 @@ pub(super) fn set_memory_attribute(
             },
         );
     }
-    match context.process().memory().set_attributes(
-        context.process().cpu().address_space_id(),
-        start,
-        size,
-        mask,
-        value,
-    ) {
+    match context
+        .process()
+        .set_memory_attributes(start, size, mask, value)
+    {
         Ok(()) => {
             result(context, HorizonKernelResult::SUCCESS);
             resume()

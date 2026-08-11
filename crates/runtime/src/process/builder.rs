@@ -262,7 +262,7 @@ impl ProcessBuilder {
             lifecycle: nixe_scheduler::ThreadLifecycle::Ready,
             wait_reason: None,
             continuation: None,
-            state,
+            state: Some(state),
             handle: main_thread_handle,
             stack_bottom,
             stack_top,
@@ -290,6 +290,12 @@ impl ProcessBuilder {
                 "initial process mappings exceed the configured physical-memory limit",
             ));
         }
+        let domain_id = execution::allocate_engine_domain_id().ok_or_else(|| {
+            ProcessBuildError::new(
+                ProcessBuildStage::EngineInitialization,
+                "engine domain identity exhausted",
+            )
+        })?;
         let process = RunnableProcess {
             process_id: self.config.process_id,
             lifecycle: nixe_scheduler::ProcessLifecycle::Running,
@@ -300,7 +306,7 @@ impl ProcessBuilder {
             random_entropy,
             heap_size: 0,
             initial_memory_size,
-            memory,
+            memory: std::sync::Arc::new(memory),
             modules: modules.into_boxed_slice(),
             entry_module,
             main_thread_id,
@@ -322,6 +328,7 @@ impl ProcessBuilder {
                 self.virtual_clock.clone(),
                 self.config.architectural_timer_frequency,
                 cpu,
+                domain_id,
                 engine_provider,
             )
             .map_err(|error| {

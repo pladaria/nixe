@@ -6,7 +6,14 @@
 //! reference interpreter, frontend IR, or a native block.
 
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
-use nixe_cpu::{memory::ProcessMemory, profile::ProcessCpuContext, state::ThreadCpuState};
+use nixe_cpu::{
+    memory::{
+        ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError, MemoryMappingPurpose,
+        MemoryPermissions, MemoryProtectionError, ProcessMemory,
+    },
+    profile::ProcessCpuContext,
+    state::ThreadCpuState,
+};
 use nixe_memory::CanonicalRangeTranslator;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
@@ -16,6 +23,20 @@ use crate::{
 };
 
 pub use nixe_cpu_engine::ExceptionDispatchRequest;
+
+pub(crate) trait MappingInvalidationControl {
+    fn request_mapping_safepoint(&self);
+    fn publish_mapping_invalidation(&self, epoch: MappingEpoch);
+}
+
+pub(crate) struct ExceptionProcessResources<'a> {
+    pub memory: &'a ExecutionMemory,
+    pub mapping_control: &'a dyn MappingInvalidationControl,
+    pub canonical_memory: &'a dyn CanonicalRangeTranslator,
+    pub mounts: &'a ProcessMountNamespace,
+    pub handles: &'a mut HandleTable,
+    pub address_waits: &'a mut AddressWaitRegistry,
+}
 
 /// Guest continuation selected after handling an exception.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -118,7 +139,8 @@ pub struct ExceptionProcessContext<'a> {
     random_entropy: [u64; 4],
     heap_size: &'a mut u64,
     initial_memory_size: u64,
-    memory: &'a dyn ProcessMemory,
+    memory: &'a ExecutionMemory,
+    mapping_control: &'a dyn MappingInvalidationControl,
     canonical_memory: &'a dyn CanonicalRangeTranslator,
     mounts: &'a ProcessMountNamespace,
     handles: &'a mut HandleTable,
@@ -139,11 +161,7 @@ impl<'a> ExceptionProcessContext<'a> {
     pub(crate) const fn new(
         metadata: ExceptionProcessMetadata,
         heap_size: &'a mut u64,
-        memory: &'a dyn ProcessMemory,
-        canonical_memory: &'a dyn CanonicalRangeTranslator,
-        mounts: &'a ProcessMountNamespace,
-        handles: &'a mut HandleTable,
-        address_waits: &'a mut AddressWaitRegistry,
+        resources: ExceptionProcessResources<'a>,
     ) -> Self {
         Self {
             process_id: metadata.process_id,
@@ -153,11 +171,12 @@ impl<'a> ExceptionProcessContext<'a> {
             random_entropy: metadata.random_entropy,
             heap_size,
             initial_memory_size: metadata.initial_memory_size,
-            memory,
-            canonical_memory,
-            mounts,
-            handles,
-            address_waits,
+            memory: resources.memory,
+            mapping_control: resources.mapping_control,
+            canonical_memory: resources.canonical_memory,
+            mounts: resources.mounts,
+            handles: resources.handles,
+            address_waits: resources.address_waits,
         }
     }
 
@@ -217,6 +236,57 @@ impl<'a> ExceptionProcessContext<'a> {
     #[must_use]
     pub const fn memory(&self) -> &dyn ProcessMemory {
         self.memory
+    }
+
+    pub fn resize_memory_mapping(
+        &self,
+        start: nixe_memory::GuestVirtualAddress,
+        old_size: u64,
+        new_size: u64,
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+    ) -> Result<(), MemoryMappingError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory.resize_zeroed_mapping(
+            self.cpu.address_space_id(),
+            start,
+            old_size,
+            new_size,
+            permissions,
+            purpose,
+        )?;
+        self.mapping_control
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
+    }
+
+    pub fn set_memory_permissions(
+        &self,
+        start: nixe_memory::GuestVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Result<(), MemoryProtectionError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory
+            .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
+        self.mapping_control
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
+    }
+
+    pub fn set_memory_attributes(
+        &self,
+        start: nixe_memory::GuestVirtualAddress,
+        size: u64,
+        mask: MemoryAttributes,
+        value: MemoryAttributes,
+    ) -> Result<(), MemoryProtectionError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory
+            .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
+        self.mapping_control
+            .publish_mapping_invalidation(self.memory.mapping_epoch());
+        Ok(())
     }
 
     /// Returns pointer-free translation into retained canonical backing.

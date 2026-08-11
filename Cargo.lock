@@ -1107,7 +1107,6 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "log",
- "nixe-config",
  "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",

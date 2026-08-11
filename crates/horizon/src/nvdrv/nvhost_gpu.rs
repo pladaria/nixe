@@ -61,7 +61,8 @@ struct NvHostGpuErrorEvent {
 
 impl NvHostGpuErrorEvent {
     fn new(channel_id: u64) -> Self {
-        let (writable, readable) = EventObject::create_pair();
+        let (writable, readable) =
+            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
         Self {
             source: GraphicsEventSource::GpuChannelError { channel_id },
             _writable: writable,

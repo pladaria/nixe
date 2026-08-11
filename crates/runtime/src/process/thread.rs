@@ -56,7 +56,7 @@ pub struct GuestThread {
     pub(crate) lifecycle: ThreadLifecycle,
     pub(crate) wait_reason: Option<WaitReason>,
     pub(crate) continuation: Option<Continuation>,
-    pub state: ThreadCpuState,
+    pub(crate) state: Option<ThreadCpuState>,
     pub handle: u32,
     pub stack_bottom: GuestVirtualAddress,
     pub stack_top: GuestVirtualAddress,
@@ -99,6 +99,30 @@ impl GuestThread {
     #[must_use]
     pub const fn continuation(&self) -> Option<Continuation> {
         self.continuation
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &ThreadCpuState {
+        self.state
+            .as_ref()
+            .expect("thread state is unavailable only while its scheduler lease runs")
+    }
+
+    pub fn state_mut(&mut self) -> &mut ThreadCpuState {
+        self.state
+            .as_mut()
+            .expect("thread state is unavailable only while its scheduler lease runs")
+    }
+
+    pub(crate) fn take_state(&mut self) -> Option<ThreadCpuState> {
+        self.state.take()
+    }
+
+    pub(crate) fn restore_state(&mut self, state: ThreadCpuState) {
+        assert!(
+            self.state.replace(state).is_none(),
+            "a scheduler lease restores thread state exactly once"
+        );
     }
 }
 
@@ -204,7 +228,7 @@ mod tests {
             lifecycle: ThreadLifecycle::Created,
             wait_reason: None,
             continuation: None,
-            state: ThreadCpuState::A64(Box::default()),
+            state: Some(ThreadCpuState::A64(Box::default())),
             handle: 0,
             stack_bottom: GuestVirtualAddress::new(0),
             stack_top: GuestVirtualAddress::new(0),
