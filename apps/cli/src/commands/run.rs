@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{InitialOperationMode, TimeMode};
-use nixe_horizon::{HorizonSvcDispatcher, OperationMode, TimeEnvironment, VideoSystem};
+use nixe_horizon::{
+    HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
+    UnsupportedNvDrvOperation, VideoSystem,
+};
 use nixe_input::{
     ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
 };
@@ -26,6 +31,8 @@ use super::load_config;
 const EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
 const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
+const MAXWELL_PUSHBUFFER_DUMP_FILENAME: &str = "pushbuffer.bin";
 
 pub struct Arguments {
     pub config_path: Option<PathBuf>,
@@ -446,6 +453,7 @@ fn execute(
                         }
                     }
                     ExceptionHandlingResult::Fault(error) => {
+                        dump_maxwell_pushbuffer_on_fault(&error);
                         return Err(format!(
                             "Horizon SVC dispatch failed after {instructions} instructions: {error}; {report}"
                         ));
@@ -458,6 +466,55 @@ fn execute(
             stop => return Err(execution_stop_error(stop, instructions, &report)),
         }
     }
+}
+
+fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
+    let HorizonSvcFault::UnsupportedNvDrv {
+        operation: UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { boundary, .. },
+        ..
+    } = fault
+    else {
+        return;
+    };
+    let Some(capture) = boundary.frontend_capture() else {
+        return;
+    };
+    let directory = PathBuf::from(MAXWELL_PUSHBUFFER_DUMP_DIRECTORY);
+    let path = directory.join(MAXWELL_PUSHBUFFER_DUMP_FILENAME);
+
+    let result = (|| -> io::Result<()> {
+        std::fs::create_dir_all(&directory)?;
+        let file = File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+        write_nv_push_dump_words(&mut writer, capture.words().iter().map(|word| word.value()))?;
+        writer.flush()
+    })();
+
+    match result {
+        Ok(()) => log::info!(
+            "Maxwell pushbuffer dumped for nv_push_dump: path={} words={} complete={}",
+            path.display(),
+            capture.words().len(),
+            capture.is_complete(),
+        ),
+        Err(error) => log::warn!(
+            "cannot dump Maxwell pushbuffer to {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn write_nv_push_dump_words(
+    writer: &mut impl Write,
+    words: impl IntoIterator<Item = u32>,
+) -> io::Result<()> {
+    // Mesa's nv_push_dump consumes a headerless array of native uint32_t
+    // command words. Nixe emits the Switch/Maxwell little-endian form.
+    // https://android.googlesource.com/platform/external/mesa3d/+/refs/tags/upstream-mesa-26.0.6/src/nouveau/headers/nv_push_dump.c
+    for word in words {
+        writer.write_all(&word.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -604,6 +661,14 @@ mod tests {
             8_000_000.0
         );
         assert_eq!(instructions_per_second(1, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn nv_push_dump_words_are_headerless_little_endian_u32_values() {
+        let mut bytes = Vec::new();
+        write_nv_push_dump_words(&mut bytes, [0x2001_4000, 0x0002_0002]).unwrap();
+
+        assert_eq!(bytes, [0x00, 0x40, 0x01, 0x20, 0x02, 0x00, 0x02, 0x00]);
     }
 
     fn process_exit(cause: ProcessExitCause, exit_code: u64) -> ProcessExit {

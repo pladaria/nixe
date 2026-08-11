@@ -6,7 +6,161 @@
 
 use crate::MaxwellMethodSource;
 
-use super::MaxwellThreeDRegister;
+use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
+
+/// Largest byte count representable by
+/// `SET_SHADER_LOCAL_MEMORY_E.DEFAULT_SIZE_PER_WARP`.
+pub const MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX: u32 = 0x03ff_ffff;
+
+/// Default shader-local-memory allocation requested for one Maxwell warp.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L603-L604>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDShaderLocalMemoryPerWarpSize(u32);
+
+impl MaxwellThreeDShaderLocalMemoryPerWarpSize {
+    #[must_use]
+    pub const fn new(raw: u32) -> Option<Self> {
+        if raw <= MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Backing-region and allocation registers for Maxwell shader local memory.
+///
+/// NVIDIA exposes a 40-bit address, a 38-bit size, a per-warp default size,
+/// and an independent 32-bit window base. Each register remains independently
+/// sourced because the public ABI does not define hardware reset values.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L588-L604>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDShaderLocalMemoryState {
+    address_upper: MaxwellThreeDRegister<u8>,
+    address_lower: MaxwellThreeDRegister<u32>,
+    size_upper: MaxwellThreeDRegister<u8>,
+    size_lower: MaxwellThreeDRegister<u32>,
+    default_size_per_warp: MaxwellThreeDRegister<MaxwellThreeDShaderLocalMemoryPerWarpSize>,
+    window_base_address: MaxwellThreeDRegister<u32>,
+}
+
+impl MaxwellThreeDShaderLocalMemoryState {
+    #[must_use]
+    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.address_upper
+    }
+
+    #[must_use]
+    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.address_lower
+    }
+
+    #[must_use]
+    pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
+        Some(MaxwellThreeDUnresolvedAddress::new(
+            *self.address_upper.value()?,
+            *self.address_lower.value()?,
+        ))
+    }
+
+    #[must_use]
+    pub const fn size_upper(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.size_upper
+    }
+
+    #[must_use]
+    pub const fn size_lower(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.size_lower
+    }
+
+    #[must_use]
+    pub fn size(&self) -> Option<u64> {
+        Some((u64::from(*self.size_upper.value()?) << 32) | u64::from(*self.size_lower.value()?))
+    }
+
+    #[must_use]
+    pub const fn default_size_per_warp(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderLocalMemoryPerWarpSize> {
+        &self.default_size_per_warp
+    }
+
+    #[must_use]
+    pub const fn window_base_address(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.window_base_address
+    }
+
+    pub(super) fn region_is_partially_programmed(&self) -> bool {
+        let programmed = self.address_upper.raw().is_some()
+            || self.address_lower.raw().is_some()
+            || self.size_upper.raw().is_some()
+            || self.size_lower.raw().is_some();
+        programmed && (self.address().is_none() || self.size().is_none())
+    }
+
+    fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+        dependencies.push(self.address_upper.raw());
+        dependencies.push(self.address_lower.raw());
+        dependencies.push(self.size_upper.raw());
+        dependencies.push(self.size_lower.raw());
+        dependencies.push(self.default_size_per_warp.raw());
+        dependencies.push(self.window_base_address.raw());
+    }
+}
+
+/// Directly addressable memory partition selected by `SET_L1_CONFIGURATION`.
+///
+/// This is guest Maxwell shader memory, not a description of a host CPU/GPU
+/// cache. NVIDIA's public class header defines only these two selector values;
+/// it does not establish a reset value.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L388-L391>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDDirectlyAddressableMemory {
+    Size16KiB = 1,
+    Size48KiB = 3,
+}
+
+impl MaxwellThreeDDirectlyAddressableMemory {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Size16KiB),
+            3 => Some(Self::Size48KiB),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::Size16KiB => 16 * 1024,
+            Self::Size48KiB => 48 * 1024,
+        }
+    }
+}
 
 /// API-visible draw-call limit selected by `SET_API_VISIBLE_CALL_LIMIT`.
 ///
@@ -113,6 +267,10 @@ impl MaxwellThreeDSmTimeoutCounterBit {
 /// One validated shader-execution register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderExecutionStateWrite {
+    L1Configuration {
+        value: MaxwellThreeDDirectlyAddressableMemory,
+        source: MaxwellMethodSource,
+    },
     VisibleCallLimit {
         value: MaxwellThreeDVisibleCallLimit,
         source: MaxwellMethodSource,
@@ -121,16 +279,49 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
         value: MaxwellThreeDSmTimeoutCounterBit,
         source: MaxwellMethodSource,
     },
+    ShaderLocalMemoryWindowBaseAddress {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    ShaderLocalMemoryAddressUpper {
+        value: u8,
+        source: MaxwellMethodSource,
+    },
+    ShaderLocalMemoryAddressLower {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    ShaderLocalMemorySizeUpper {
+        value: u8,
+        source: MaxwellMethodSource,
+    },
+    ShaderLocalMemorySizeLower {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    ShaderLocalMemoryDefaultSizePerWarp {
+        value: MaxwellThreeDShaderLocalMemoryPerWarpSize,
+        source: MaxwellMethodSource,
+    },
 }
 
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
+    l1_configuration: MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory>,
     visible_call_limit: MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit>,
     sm_timeout_counter_bit: MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit>,
+    shader_local_memory: MaxwellThreeDShaderLocalMemoryState,
 }
 
 impl MaxwellThreeDShaderExecutionState {
+    #[must_use]
+    pub const fn l1_configuration(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory> {
+        &self.l1_configuration
+    }
+
     #[must_use]
     pub const fn visible_call_limit(
         &self,
@@ -145,14 +336,70 @@ impl MaxwellThreeDShaderExecutionState {
         &self.sm_timeout_counter_bit
     }
 
+    #[must_use]
+    pub const fn shader_local_memory(&self) -> &MaxwellThreeDShaderLocalMemoryState {
+        &self.shader_local_memory
+    }
+
+    pub(super) fn append_shader_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+        self.shader_local_memory
+            .append_pipeline_dependencies(dependencies);
+    }
+
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
+            MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source } => {
+                self.l1_configuration =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source } => {
                 self.visible_call_limit =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source } => {
                 self.sm_timeout_counter_bit =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.window_base_address =
+                    MaxwellThreeDRegister::programmed(value, value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.address_upper =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.address_lower =
+                    MaxwellThreeDRegister::programmed(value, value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.size_upper =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.size_lower =
+                    MaxwellThreeDRegister::programmed(value, value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
+                value,
+                source,
+            } => {
+                self.shader_local_memory.default_size_per_warp =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
         }

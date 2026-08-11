@@ -10,8 +10,8 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 
 use crate::{
-    GpuProfileId, MaxwellAddressSpaceId, MaxwellGpuProfile, MaxwellPushbufferSubchannel,
-    MaxwellThreeDState, MaxwellTwoDState,
+    GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellGpuProfile,
+    MaxwellPushbufferSubchannel, MaxwellThreeDState, MaxwellTwoDState,
 };
 
 /// Stable identity of one Maxwell channel lifetime.
@@ -267,6 +267,7 @@ pub struct MaxwellGpuChannel {
     address_space: Option<MaxwellAddressSpaceId>,
     syncpoint: Option<GuestSyncpointId>,
     frontend: MaxwellChannelFrontendState,
+    compute: MaxwellComputeState,
     two_d: MaxwellTwoDState,
     three_d: MaxwellThreeDState,
     priority: MaxwellChannelPriority,
@@ -297,6 +298,7 @@ impl MaxwellGpuChannel {
                 z_cull_binding: None,
                 subchannel_bindings: [None; 8],
             },
+            compute: MaxwellComputeState::new(),
             two_d: MaxwellTwoDState::new(),
             three_d: MaxwellThreeDState::new(),
             priority: MaxwellChannelPriority::Medium,
@@ -348,6 +350,16 @@ impl MaxwellGpuChannel {
 
     pub(crate) fn replace_frontend(&mut self, frontend: MaxwellChannelFrontendState) {
         self.frontend = frontend;
+    }
+
+    /// Returns an immutable snapshot of channel-owned `MAXWELL_COMPUTE_B` state.
+    #[must_use]
+    pub const fn compute(&self) -> &MaxwellComputeState {
+        &self.compute
+    }
+
+    pub(crate) fn replace_compute(&mut self, compute: MaxwellComputeState) {
+        self.compute = compute;
     }
 
     /// Returns an immutable snapshot of channel-owned `FERMI_TWOD_A` state.

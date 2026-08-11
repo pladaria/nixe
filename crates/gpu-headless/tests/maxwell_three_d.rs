@@ -9,11 +9,11 @@ use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
     MaxwellChannelId, MaxwellChannelOwner, MaxwellDecodedPushbuffer, MaxwellGpfifoSourceLocation,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellMapRequest,
-    MaxwellMappingId, MaxwellPushbufferWord, MaxwellThreeDLoweringCache,
-    MaxwellThreeDLoweringError, MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
-    MaxwellThreeDTriggeredOperation, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
-    dispatch_maxwell_engine_pushbuffer, preflight_maxwell_three_d_operation,
-    resolve_maxwell_three_d_resources,
+    MaxwellMappingId, MaxwellPushbufferWord, MaxwellThreeDDirectlyAddressableMemory,
+    MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, MaxwellThreeDTranslatedShader,
+    MaxwellThreeDTranslatedShaders, MaxwellThreeDTriggeredOperation, SWITCH_1_GM20B_PROFILE,
+    decode_maxwell_pushbuffer, dispatch_maxwell_engine_pushbuffer,
+    preflight_maxwell_three_d_operation, resolve_maxwell_three_d_resources,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
@@ -146,6 +146,7 @@ fn draw_stream(vertex: u64) -> Vec<(u32, u32)> {
         (0x1f04, (vertex + 0xff) as u32),
         (0x1160, 0x3820_0000),
         (0x0d74, 0),
+        (0x0308, 3),
         (0x1618, 4),
         (0x1970, 4),
         (0x2000, 0x11),
@@ -189,8 +190,18 @@ fn synthetic_maxwell_clear_and_draw_execute_through_headless_contract() {
 
     let translated = MaxwellThreeDTranslatedShaders::new(
         vec![
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Vertex, ShaderId::new(1), 1),
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Fragment, ShaderId::new(2), 1),
+            MaxwellThreeDTranslatedShader::new(
+                ShaderStage::Vertex,
+                ShaderId::new(1),
+                1,
+                MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+            ),
+            MaxwellThreeDTranslatedShader::new(
+                ShaderStage::Fragment,
+                ShaderId::new(2),
+                1,
+                MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+            ),
         ],
         Vec::new(),
     )

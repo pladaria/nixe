@@ -22,12 +22,16 @@ use crate::MaxwellMethodSource;
 
 use super::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDBegin, MaxwellThreeDBlendEnableCommon,
-    MaxwellThreeDColorCompressionMode, MaxwellThreeDCsaaEnable, MaxwellThreeDFixedFunctionRegister,
-    MaxwellThreeDFixedFunctionValue, MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableMode,
-    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole,
-    MaxwellThreeDShadeMode, MaxwellThreeDShaderStage, MaxwellThreeDSmTimeoutCounterBit,
-    MaxwellThreeDState, MaxwellThreeDVisibleCallLimit, MaxwellThreeDZCompressionMode,
-    MaxwellThreeDZCullStatsEnable,
+    MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode,
+    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDConditionalLoadConstantBuffer,
+    MaxwellThreeDCsaaEnable, MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
+    MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionValue, MaxwellThreeDPatchSize,
+    MaxwellThreeDPointCenterMode, MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonMode,
+    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderTargetLayer, MaxwellThreeDResolvedResource,
+    MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole, MaxwellThreeDSeparateFragmentData,
+    MaxwellThreeDShadeMode, MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage,
+    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDVisibleCallLimit, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullStatsEnable,
 };
 
 #[derive(Clone, Debug)]
@@ -77,15 +81,22 @@ pub struct MaxwellThreeDTranslatedShader {
     stage: ShaderStage,
     shader: ShaderId,
     translation_generation: u64,
+    directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
 }
 
 impl MaxwellThreeDTranslatedShader {
     #[must_use]
-    pub const fn new(stage: ShaderStage, shader: ShaderId, translation_generation: u64) -> Self {
+    pub const fn new(
+        stage: ShaderStage,
+        shader: ShaderId,
+        translation_generation: u64,
+        directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
+    ) -> Self {
         Self {
             stage,
             shader,
             translation_generation,
+            directly_addressable_memory,
         }
     }
     #[must_use]
@@ -99,6 +110,13 @@ impl MaxwellThreeDTranslatedShader {
     #[must_use]
     pub const fn translation_generation(self) -> u64 {
         self.translation_generation
+    }
+
+    /// Guest shader-memory configuration for which T10 produced this shader.
+    /// This is never inferred from host cache topology.
+    #[must_use]
+    pub const fn directly_addressable_memory(self) -> MaxwellThreeDDirectlyAddressableMemory {
+        self.directly_addressable_memory
     }
 }
 
@@ -306,6 +324,81 @@ impl MaxwellThreeDLoweringCache {
 
 /// Immutable preflight result. Resource creation, backend submission, and
 /// cache publication remain separate caller-controlled phases.
+pub struct MaxwellThreeDUnnegotiatedLoweringPlan {
+    expected_revision: u64,
+    candidate: MaxwellThreeDLoweringCache,
+    creations: Box<[BackendResourceCreateInfo]>,
+    invalidations: Box<[ResourceDependency]>,
+    submission: OperationSubmission,
+    dirty_images: Box<[usize]>,
+}
+
+impl MaxwellThreeDUnnegotiatedLoweringPlan {
+    #[must_use]
+    pub fn resource_creations(&self) -> &[BackendResourceCreateInfo] {
+        &self.creations
+    }
+
+    #[must_use]
+    pub fn resource_invalidations(&self) -> &[ResourceDependency] {
+        &self.invalidations
+    }
+
+    #[must_use]
+    pub const fn submission(&self) -> &OperationSubmission {
+        &self.submission
+    }
+
+    #[must_use]
+    pub fn dirty_images(&self) -> &[usize] {
+        &self.dirty_images
+    }
+
+    /// Negotiates the already complete neutral description with one real
+    /// backend capability set, without changing frontend cache state.
+    pub fn negotiate(
+        self,
+        capabilities: &BackendCapabilities,
+    ) -> Result<MaxwellThreeDLoweringPlan, MaxwellThreeDLoweringError> {
+        for creation in &self.creations {
+            let requirements = creation
+                .capability_requirements()
+                .map_err(|_| MaxwellThreeDLoweringError::InvalidResourceCreation)?;
+            capabilities
+                .negotiate(&requirements)
+                .map_err(MaxwellThreeDLoweringError::Capability)?;
+        }
+        let agreement = capabilities
+            .negotiate_all(&self.submission.capability_requirements())
+            .map_err(MaxwellThreeDLoweringError::Capability)?;
+        Ok(MaxwellThreeDLoweringPlan {
+            expected_revision: self.expected_revision,
+            candidate: self.candidate,
+            creations: self.creations,
+            invalidations: self.invalidations,
+            submission: self.submission,
+            agreement,
+            dirty_images: self.dirty_images,
+        })
+    }
+
+    pub(crate) fn stage_cache(
+        self,
+        cache: &mut MaxwellThreeDLoweringCache,
+    ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
+        commit_lowering_cache(
+            self.expected_revision,
+            self.candidate,
+            self.creations,
+            self.invalidations,
+            self.submission,
+            self.dirty_images,
+            cache,
+        )
+    }
+}
+
+/// Immutable preflight result negotiated with one backend capability set.
 pub struct MaxwellThreeDLoweringPlan {
     expected_revision: u64,
     candidate: MaxwellThreeDLoweringCache,
@@ -341,28 +434,48 @@ impl MaxwellThreeDLoweringPlan {
     /// Publishes derived identities only after the caller has successfully
     /// completed its resource-ownership and backend-submission phases.
     pub fn commit_cache(
-        mut self,
+        self,
         cache: &mut MaxwellThreeDLoweringCache,
     ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
-        if cache.revision != self.expected_revision {
-            return Err(MaxwellThreeDLoweringError::CacheChanged {
-                expected: self.expected_revision,
-                actual: cache.revision,
-            });
-        }
-        self.candidate.revision = self
-            .candidate
-            .revision
-            .checked_add(1)
-            .ok_or(MaxwellThreeDLoweringError::ResourceExhausted)?;
-        *cache = self.candidate;
-        Ok(MaxwellThreeDLoweredWork {
-            creations: self.creations,
-            invalidations: self.invalidations,
-            submission: self.submission,
-            dirty_images: self.dirty_images,
-        })
+        commit_lowering_cache(
+            self.expected_revision,
+            self.candidate,
+            self.creations,
+            self.invalidations,
+            self.submission,
+            self.dirty_images,
+            cache,
+        )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_lowering_cache(
+    expected_revision: u64,
+    mut candidate: MaxwellThreeDLoweringCache,
+    creations: Box<[BackendResourceCreateInfo]>,
+    invalidations: Box<[ResourceDependency]>,
+    submission: OperationSubmission,
+    dirty_images: Box<[usize]>,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
+    if cache.revision != expected_revision {
+        return Err(MaxwellThreeDLoweringError::CacheChanged {
+            expected: expected_revision,
+            actual: cache.revision,
+        });
+    }
+    candidate.revision = candidate
+        .revision
+        .checked_add(1)
+        .ok_or(MaxwellThreeDLoweringError::ResourceExhausted)?;
+    *cache = candidate;
+    Ok(MaxwellThreeDLoweredWork {
+        creations,
+        invalidations,
+        submission,
+        dirty_images,
+    })
 }
 
 /// Committed frontend record retained independently from backend handles.
@@ -405,6 +518,30 @@ pub fn preflight_maxwell_three_d_operation(
     capabilities: &BackendCapabilities,
     cache: &MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellThreeDLoweringPlan, MaxwellThreeDLoweringError> {
+    preflight_maxwell_three_d_operation_unnegotiated(
+        state,
+        resources,
+        trigger,
+        translated_shaders,
+        submission,
+        predecessors,
+        cache,
+    )?
+    .negotiate(capabilities)
+}
+
+/// Produces a complete neutral operation description before selecting or
+/// claiming support from a concrete backend.
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_maxwell_three_d_operation_unnegotiated(
+    state: &MaxwellThreeDState,
+    resources: &MaxwellThreeDResolvedResources,
+    trigger: MaxwellThreeDOperationTrigger,
+    translated_shaders: Option<&MaxwellThreeDTranslatedShaders>,
+    submission: FrontendSubmissionId,
+    predecessors: Vec<FrontendSubmissionId>,
+    cache: &MaxwellThreeDLoweringCache,
+) -> Result<MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDLoweringError> {
     state.validate_cross_registers().map_err(|error| {
         MaxwellThreeDLoweringError::ContradictoryState {
             reason: error.reason,
@@ -416,6 +553,14 @@ pub fn preflight_maxwell_three_d_operation(
         return Err(MaxwellThreeDLoweringError::UnsupportedRenderEnableMode(
             mode,
         ));
+    }
+    if state
+        .render_enable()
+        .conditional_load_constant_buffer()
+        .value()
+        == Some(&MaxwellThreeDConditionalLoadConstantBuffer::Enabled)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedConditionalLoadConstantBufferSemantics);
     }
     if matches!(
         trigger,
@@ -462,9 +607,57 @@ pub fn preflight_maxwell_three_d_operation(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.shader_bindings().has_enabled_pipeline()
+    {
+        let local_memory = state.shader_execution().shader_local_memory();
+        if local_memory.region_is_partially_programmed() {
+            return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+                "SET_SHADER_LOCAL_MEMORY_A-D",
+            ));
+        }
+        if let Some(default_size_per_warp) = local_memory
+            .default_size_per_warp()
+            .value()
+            .copied()
+            .filter(|size| size.bytes() != 0)
+        {
+            if local_memory.address().is_none() || local_memory.size().is_none() {
+                return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+                    "SET_SHADER_LOCAL_MEMORY_A-D",
+                ));
+            }
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedShaderLocalMemorySemantics {
+                    default_size_per_warp,
+                },
+            );
+        }
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.color_reduction().enable().value()
+        == Some(&MaxwellThreeDColorReductionThresholdsEnable::Enabled)
+    {
+        // NVIDIA exposes a dedicated activation method, so merely programming
+        // a threshold is not enough to make it effective. Once explicitly
+        // enabled, however, the current neutral pipeline cannot represent the
+        // reduction decision and must stop before cache/backend effects.
+        return Err(MaxwellThreeDLoweringError::UnsupportedColorReductionSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedCsaaSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.ps_output_sample_mask_effective() == Some(true)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPsOutputSampleMaskSemantics);
     }
     if matches!(
         trigger,
@@ -476,7 +669,54 @@ pub fn preflight_maxwell_three_d_operation(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable)
+        .value()
+        == Some(&MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
+            MaxwellThreeDViewportScaleOffsetEnable::Enabled,
+        ))
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedViewportScaleOffsetSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
+        .value()
+        == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedWindowClipSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
+        .value()
+        == Some(&MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(
+            MaxwellThreeDClipIdTestEnable::Enabled,
+        ))
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedClipIdTestSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) {
+        if state.shader_bindings().has_enabled_pipeline()
+            && state
+                .shader_bindings()
+                .program_region()
+                .is_partially_programmed()
+        {
+            return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+                "SET_PROGRAM_REGION_A/B",
+            ));
+        }
         if state
             .vertex_input()
             .primitive()
@@ -487,6 +727,56 @@ pub fn preflight_maxwell_three_d_operation(
             return Err(
                 MaxwellThreeDLoweringError::UnsupportedVertexArrayPrimitiveRestartSemantics,
             );
+        }
+        if state
+            .vertex_input()
+            .primitive()
+            .begin()
+            .value()
+            .is_some_and(|begin| begin.topology() == 14)
+        {
+            let patch_size = state
+                .vertex_input()
+                .primitive()
+                .patch_size()
+                .value()
+                .copied()
+                .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_PATCH"))?;
+            if patch_size.control_points() == 0 {
+                return Err(MaxwellThreeDLoweringError::InvalidPatchSize(patch_size));
+            }
+            return Err(MaxwellThreeDLoweringError::UnsupportedPatchSemantics(
+                patch_size,
+            ));
+        }
+        if state
+            .vertex_input()
+            .primitive()
+            .begin()
+            .value()
+            .is_some_and(|begin| begin.topology() == 0)
+        {
+            if let Some(select) = state
+                .raster()
+                .point_sprite_select()
+                .value()
+                .copied()
+                .filter(|select| select.affects_point_coordinates())
+            {
+                return Err(
+                    MaxwellThreeDLoweringError::UnsupportedPointSpriteCoordinatesSemantics(select),
+                );
+            }
+            if let Some(mode) = state.raster().point_center_mode().value().copied() {
+                return Err(MaxwellThreeDLoweringError::UnsupportedPointCenterSemantics(
+                    mode,
+                ));
+            }
+        }
+        if state.edge_flag_affects_draw() {
+            return Err(MaxwellThreeDLoweringError::UnsupportedEdgeFlagSemantics(
+                MaxwellThreeDEdgeFlag::Disabled,
+            ));
         }
         validate_line_rasterization_state(state)?;
     }
@@ -508,6 +798,24 @@ pub fn preflight_maxwell_three_d_operation(
         let attachments = draw_attachments
             .as_ref()
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
+        if attachments.colors.len() > 1
+            && state.render_targets().separate_fragment_data().value()
+                == Some(&MaxwellThreeDSeparateFragmentData::Disabled)
+        {
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedReplicatedColorTargetOutputSemantics,
+            );
+        }
+        if (!attachments.colors.is_empty() || attachments.depth_stencil.is_some())
+            && let Some(value) = state
+                .render_targets()
+                .render_target_layer()
+                .value()
+                .copied()
+                .filter(|value| value.affects_draw_layering())
+        {
+            return Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value));
+        }
         validate_draw_blending_state(state, attachments)?;
         reject_unsupported_z_compression(state, resources, trigger)?;
         reject_unsupported_color_compression(state, resources, trigger, Some(attachments))?;
@@ -520,6 +828,9 @@ pub fn preflight_maxwell_three_d_operation(
     } else {
         None
     };
+    if let Some(shaders) = shaders {
+        validate_shader_memory_configuration(state, shaders)?;
+    }
     let resource_indices = operation_resource_indices(
         state,
         resources,
@@ -565,26 +876,41 @@ pub fn preflight_maxwell_three_d_operation(
     let operations = sequence_with_transitions(commands, &mut candidate)?;
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellThreeDLoweringError::Command)?;
-    for creation in &creations {
-        let requirements = creation
-            .capability_requirements()
-            .map_err(|_| MaxwellThreeDLoweringError::InvalidResourceCreation)?;
-        capabilities
-            .negotiate(&requirements)
-            .map_err(MaxwellThreeDLoweringError::Capability)?;
-    }
-    let agreement = capabilities
-        .negotiate_all(&submission.capability_requirements())
-        .map_err(MaxwellThreeDLoweringError::Capability)?;
-    Ok(MaxwellThreeDLoweringPlan {
+    Ok(MaxwellThreeDUnnegotiatedLoweringPlan {
         expected_revision: cache.revision,
         candidate,
         creations: creations.into_boxed_slice(),
         invalidations: invalidations.into_boxed_slice(),
         submission,
-        agreement,
         dirty_images: dirty_images.into_boxed_slice(),
     })
+}
+
+fn validate_shader_memory_configuration(
+    state: &MaxwellThreeDState,
+    shaders: &MaxwellThreeDTranslatedShaders,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    let configured = state
+        .shader_execution()
+        .l1_configuration()
+        .value()
+        .copied()
+        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_L1_CONFIGURATION",
+        ))?;
+    for shader in shaders.shaders() {
+        let required = shader.directly_addressable_memory();
+        if required != configured {
+            return Err(
+                MaxwellThreeDLoweringError::TranslatedShaderMemoryConfigurationMismatch {
+                    stage: shader.stage(),
+                    configured,
+                    required,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_draw_blending_state(
@@ -1178,6 +1504,57 @@ fn binding_at(
     )
 }
 
+fn clear_image_region(
+    image: ImageId,
+    subresources: ImageSubresourceRange,
+    attachment_width: u32,
+    attachment_height: u32,
+    array_layer: u16,
+    rectangle: Option<(super::MaxwellThreeDRectangle, super::MaxwellThreeDRectangle)>,
+) -> Result<ImageRegion, MaxwellThreeDLoweringError> {
+    if array_layer != subresources.base_layer {
+        return Err(MaxwellThreeDLoweringError::ClearOutsideAttachment);
+    }
+    let (origin, width, height) = match rectangle {
+        Some((horizontal, vertical)) => {
+            let width = u32::from(horizontal.max.saturating_sub(horizontal.min));
+            let height = u32::from(vertical.max.saturating_sub(vertical.min));
+            if width == 0 || height == 0 {
+                return Err(MaxwellThreeDLoweringError::EmptyClearRectangle);
+            }
+            if u32::from(horizontal.max) > attachment_width
+                || u32::from(vertical.max) > attachment_height
+            {
+                return Err(MaxwellThreeDLoweringError::ClearOutsideAttachment);
+            }
+            (
+                ImageOrigin {
+                    x: u32::from(horizontal.min),
+                    y: u32::from(vertical.min),
+                    z: 0,
+                },
+                width,
+                height,
+            )
+        }
+        None => (
+            ImageOrigin { x: 0, y: 0, z: 0 },
+            attachment_width,
+            attachment_height,
+        ),
+    };
+    Ok(ImageRegion {
+        image,
+        subresources,
+        origin,
+        extent: nixe_gpu::ImageExtent {
+            width,
+            height,
+            depth: 1,
+        },
+    })
+}
+
 fn lower_clear(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
@@ -1189,27 +1566,33 @@ fn lower_clear(
         .value()
         .copied()
         .ok_or(MaxwellThreeDLoweringError::IncompleteClear("CLEAR_SURFACE"))?;
-    let horizontal =
-        clear
-            .horizontal()
-            .value()
-            .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteClear(
-                "horizontal rectangle",
-            ))?;
-    let vertical =
-        clear
-            .vertical()
-            .value()
-            .copied()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteClear(
-                "vertical rectangle",
-            ))?;
-    let width = u32::from(horizontal.max.saturating_sub(horizontal.min));
-    let height = u32::from(vertical.max.saturating_sub(vertical.min));
-    if width == 0 || height == 0 {
-        return Err(MaxwellThreeDLoweringError::EmptyClearRectangle);
+    if surface.color_mask() == 0 && !surface.depth() && !surface.stencil() {
+        return Err(MaxwellThreeDLoweringError::EmptyClearMask);
     }
+    let control = clear.surface_control().value().copied();
+    if control.is_some_and(|control| control.use_scissor_zero()) {
+        return Err(MaxwellThreeDLoweringError::UnsupportedClearScissorSemantics);
+    }
+    if control.is_some_and(|control| control.use_viewport_clip_zero()) {
+        return Err(MaxwellThreeDLoweringError::UnsupportedClearViewportClipSemantics);
+    }
+    if surface.stencil() && control.is_some_and(|control| control.respect_stencil_mask()) {
+        return Err(MaxwellThreeDLoweringError::UnsupportedClearStencilMaskSemantics);
+    }
+    // An unprogrammed control retains the pre-existing explicit-rectangle
+    // contract without claiming an undocumented hardware reset value.
+    let rectangle = if control.is_none_or(|control| control.use_clear_rect()) {
+        Some((
+            clear.horizontal().value().copied().ok_or(
+                MaxwellThreeDLoweringError::IncompleteClear("horizontal rectangle"),
+            )?,
+            clear.vertical().value().copied().ok_or(
+                MaxwellThreeDLoweringError::IncompleteClear("vertical rectangle"),
+            )?,
+        ))
+    } else {
+        None
+    };
     let mut operations = Vec::new();
     let mut dirty = Vec::new();
     if surface.color_mask() != 0 {
@@ -1225,12 +1608,14 @@ fn lower_clear(
         let image = resolved_image(resources, index)?;
         let image_id = image_dependency(binding_at(resources, bindings, index)?)?;
         let subresources = image.view().bindings()[0].subresources();
-        if surface.array_layer() != subresources.base_layer
-            || u32::from(horizontal.max) > image.description().extent().width
-            || u32::from(vertical.max) > image.description().extent().height
-        {
-            return Err(MaxwellThreeDLoweringError::ClearOutsideAttachment);
-        }
+        let region = clear_image_region(
+            image_id,
+            subresources,
+            image.description().extent().width,
+            image.description().extent().height,
+            surface.array_layer(),
+            rectangle,
+        )?;
         let mut color = [0.0; 4];
         for (component, output) in clear.color().iter().zip(&mut color) {
             *output = f32::from_bits(
@@ -1241,20 +1626,7 @@ fn lower_clear(
             );
         }
         let operation = ClearOperation::image(
-            ImageRegion {
-                image: image_id,
-                subresources,
-                origin: ImageOrigin {
-                    x: u32::from(horizontal.min),
-                    y: u32::from(vertical.min),
-                    z: 0,
-                },
-                extent: nixe_gpu::ImageExtent {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            },
+            region,
             image.description().kind(),
             image.description().format(),
             image.description().samples(),
@@ -1277,6 +1649,14 @@ fn lower_clear(
         let image = resolved_image(resources, index)?;
         let image_id = image_dependency(binding_at(resources, bindings, index)?)?;
         let subresources = image.view().bindings()[0].subresources();
+        let region = clear_image_region(
+            image_id,
+            subresources,
+            image.description().extent().width,
+            image.description().extent().height,
+            surface.array_layer(),
+            rectangle,
+        )?;
         let depth = f32::from_bits(
             clear
                 .depth()
@@ -1289,20 +1669,7 @@ fn lower_clear(
             .value()
             .ok_or(MaxwellThreeDLoweringError::IncompleteClear("stencil value"))?;
         let operation = ClearOperation::image(
-            ImageRegion {
-                image: image_id,
-                subresources,
-                origin: ImageOrigin {
-                    x: u32::from(horizontal.min),
-                    y: u32::from(vertical.min),
-                    z: 0,
-                },
-                extent: nixe_gpu::ImageExtent {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            },
+            region,
             image.description().kind(),
             image.description().format(),
             image.description().samples(),
@@ -1316,9 +1683,6 @@ fn lower_clear(
             CapabilityRequirements::none(),
         ));
         dirty.push(index);
-    }
-    if operations.is_empty() {
-        return Err(MaxwellThreeDLoweringError::EmptyClearMask);
     }
     Ok((operations, dirty))
 }
@@ -1859,19 +2223,38 @@ fn take_identity(
 }
 
 /// Typed failure before any cache or backend effect is published.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDLoweringError {
     ContradictoryState {
         reason: &'static str,
     },
     TriggerStateMismatch,
     UnsupportedRenderEnableMode(MaxwellThreeDRenderEnableMode),
+    UnsupportedConditionalLoadConstantBufferSemantics,
     UnsupportedSmTimeoutIntervalSemantics(MaxwellThreeDSmTimeoutCounterBit),
     UnsupportedVisibleCallLimitSemantics(MaxwellThreeDVisibleCallLimit),
+    UnsupportedColorReductionSemantics,
     UnsupportedCsaaSemantics,
+    UnsupportedPsOutputSampleMaskSemantics,
+    UnsupportedReplicatedColorTargetOutputSemantics,
+    UnsupportedRenderTargetLayerSemantics(MaxwellThreeDRenderTargetLayer),
+    UnsupportedShaderLocalMemorySemantics {
+        default_size_per_warp: MaxwellThreeDShaderLocalMemoryPerWarpSize,
+    },
     UnsupportedZCullStatsSemantics,
+    UnsupportedViewportScaleOffsetSemantics,
+    UnsupportedWindowClipSemantics,
+    UnsupportedClipIdTestSemantics,
+    UnsupportedClearStencilMaskSemantics,
+    UnsupportedClearScissorSemantics,
+    UnsupportedClearViewportClipSemantics,
     UnsupportedAliasedLineWidthSemantics,
     UnsupportedVertexArrayPrimitiveRestartSemantics,
+    InvalidPatchSize(MaxwellThreeDPatchSize),
+    UnsupportedPatchSemantics(MaxwellThreeDPatchSize),
+    UnsupportedPointSpriteCoordinatesSemantics(MaxwellThreeDPointSpriteSelect),
+    UnsupportedPointCenterSemantics(MaxwellThreeDPointCenterMode),
+    UnsupportedEdgeFlagSemantics(MaxwellThreeDEdgeFlag),
     UnsupportedShadeModeSemantics(MaxwellThreeDShadeMode),
     UnsupportedBlendSemantics {
         target: Option<u8>,
@@ -1883,6 +2266,11 @@ pub enum MaxwellThreeDLoweringError {
     ShaderTranslationRequired,
     InvalidTranslatedShaders,
     TranslatedShaderStageMismatch,
+    TranslatedShaderMemoryConfigurationMismatch {
+        stage: ShaderStage,
+        configured: MaxwellThreeDDirectlyAddressableMemory,
+        required: MaxwellThreeDDirectlyAddressableMemory,
+    },
     UnsupportedShaderStage(MaxwellThreeDShaderStage),
     InvalidShaderResourceUse {
         role: MaxwellThreeDResourceRole,
@@ -1956,6 +2344,9 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "MAXWELL_B render-enable mode has no verified neutral execution: mode={mode:?}"
             ),
+            Self::UnsupportedConditionalLoadConstantBufferSemantics => formatter.write_str(
+                "MAXWELL_B conditional constant-buffer load has no verified execution semantics",
+            ),
             Self::UnsupportedSmTimeoutIntervalSemantics(value) => write!(
                 formatter,
                 "MAXWELL_B SM timeout interval has no verified temporal semantics: counter-bit={}",
@@ -1971,17 +2362,82 @@ impl Display for MaxwellThreeDLoweringError {
                     "MAXWELL_B API-visible call limiting reported an unsupported boundary for NO_CHECK",
                 ),
             },
+            Self::UnsupportedColorReductionSemantics => formatter.write_str(
+                "MAXWELL_B enabled color reduction has no verified neutral threshold evaluation or color-output semantics",
+            ),
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
             ),
+            Self::UnsupportedPsOutputSampleMaskSemantics => formatter.write_str(
+                "MAXWELL_B effective pixel-shader sample-mask output has no shader translation or neutral backend representation",
+            ),
+            Self::UnsupportedReplicatedColorTargetOutputSemantics => formatter.write_str(
+                "MAXWELL_B disabled separate MRT fragment data requires replicating fragment color output zero to every active color target",
+            ),
+            Self::UnsupportedRenderTargetLayerSemantics(value) => write!(
+                formatter,
+                "MAXWELL_B render-target layer routing is not represented by shader translation or the neutral attachment contract: layer={} control={:?}",
+                value.layer(),
+                value.control()
+            ),
+            Self::UnsupportedShaderLocalMemorySemantics {
+                default_size_per_warp,
+            } => write!(
+                formatter,
+                "MAXWELL_B active shader-local-memory allocation has no translated-shader or neutral backend representation: default-size-per-warp={}",
+                default_size_per_warp.bytes()
+            ),
             Self::UnsupportedZCullStatsSemantics => formatter.write_str(
                 "MAXWELL_B enabled Z-cull statistics have no implemented counter accumulation, visibility, or reporting semantics",
+            ),
+            Self::UnsupportedViewportScaleOffsetSemantics => formatter.write_str(
+                "MAXWELL_B enabled viewport scale/offset transform is not represented by the neutral pipeline or backend draw contract",
+            ),
+            Self::UnsupportedWindowClipSemantics => formatter.write_str(
+                "MAXWELL_B enabled window clipping has no neutral pipeline or backend rasterization semantics",
+            ),
+            Self::UnsupportedClipIdTestSemantics => formatter.write_str(
+                "MAXWELL_B enabled clip-ID testing has no implemented extent, surface-ID, comparison, or backend rasterization semantics",
+            ),
+            Self::UnsupportedClearStencilMaskSemantics => formatter.write_str(
+                "MAXWELL_B stencil-masked clear has no neutral backend representation",
+            ),
+            Self::UnsupportedClearScissorSemantics => formatter.write_str(
+                "MAXWELL_B clear constrained by scissor 0 has no verified region-composition semantics",
+            ),
+            Self::UnsupportedClearViewportClipSemantics => formatter.write_str(
+                "MAXWELL_B clear constrained by viewport clip 0 has no verified region-composition semantics",
             ),
             Self::UnsupportedAliasedLineWidthSemantics => formatter.write_str(
                 "MAXWELL_B aliased line-width selection has no represented width register or host rasterization semantics",
             ),
             Self::UnsupportedVertexArrayPrimitiveRestartSemantics => formatter.write_str(
                 "MAXWELL_B enabled vertex-array primitive restart has no verified marker, segmentation, draw-accounting, or neutral backend semantics",
+            ),
+            Self::InvalidPatchSize(size) => write!(
+                formatter,
+                "MAXWELL_B patch draw has an invalid control-point count: {}",
+                size.control_points()
+            ),
+            Self::UnsupportedPatchSemantics(size) => write!(
+                formatter,
+                "MAXWELL_B patch control-point count is not represented by the neutral pipeline contract: {}",
+                size.control_points()
+            ),
+            Self::UnsupportedPointSpriteCoordinatesSemantics(select) => write!(
+                formatter,
+                "MAXWELL_B generated point-sprite coordinates are not represented by shader translation or the neutral pipeline contract: texture-mask=0x{:03x} r-mode={:?} origin={:?}",
+                select.generated_texture_mask(),
+                select.r_mode(),
+                select.origin()
+            ),
+            Self::UnsupportedPointCenterSemantics(mode) => write!(
+                formatter,
+                "MAXWELL_B point-center convention is not represented by the neutral pipeline contract: mode={mode:?}"
+            ),
+            Self::UnsupportedEdgeFlagSemantics(flag) => write!(
+                formatter,
+                "MAXWELL_B disabled polygon edge flag is not represented by the neutral pipeline contract: flag={flag:?}"
             ),
             Self::UnsupportedShadeModeSemantics(mode) => write!(
                 formatter,
@@ -2011,6 +2467,16 @@ impl Display for MaxwellThreeDLoweringError {
             }
             Self::TranslatedShaderStageMismatch => formatter
                 .write_str("translated shader stages do not match enabled Maxwell pipeline stages"),
+            Self::TranslatedShaderMemoryConfigurationMismatch {
+                stage,
+                configured,
+                required,
+            } => write!(
+                formatter,
+                "translated shader requires a different Maxwell directly addressable memory configuration: stage={stage:?} configured-bytes={} translated-for-bytes={}",
+                configured.bytes(),
+                required.bytes()
+            ),
             Self::UnsupportedShaderStage(stage) => write!(
                 formatter,
                 "Maxwell shader stage has no neutral lowering: {stage:?}"

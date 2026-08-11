@@ -835,7 +835,7 @@ fn ioctl_nvmap(
                     address_space,
                     address,
                     u64::from(size),
-                    allocation.required_permissions(),
+                    allocation.cpu_mapping_permissions(),
                 )
                 .map_err(|fault| {
                     NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::CanonicalMemory {
@@ -2629,7 +2629,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, NV_SUCCESS);
         let handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
-        let allocation = nvmap_allocate_input(handle, 1, 0x20_000, 0, cpu_address);
+        let allocation = nvmap_allocate_input(handle, 0, 0x20_000, 0, cpu_address);
         assert_eq!(
             session
                 .ioctl_with_memory(
@@ -2685,6 +2685,8 @@ mod tests {
         let second_address = address_space.address(second_offset).unwrap();
         let retained = address_space.mapping(first_address).unwrap();
         let alias = address_space.mapping(second_address).unwrap();
+        assert_eq!(retained.permissions(), MemoryPermissions::READ_WRITE);
+        assert_eq!(alias.permissions(), MemoryPermissions::READ_WRITE);
         assert_eq!(retained.page_size(), 0x2_0000);
         assert_eq!(retained.allocation(), alias.allocation());
         assert_eq!(
@@ -2814,7 +2816,7 @@ mod tests {
             .ioctl(nvmap_fd, IOCTL_NVMAP_CREATE, &nvmap_create_input(0x40_000))
             .unwrap();
         let handle = NvMapHandle::new(u32::from_le_bytes(created[4..8].try_into().unwrap()));
-        let allocation = nvmap_allocate_input(handle, 1, 0x20_000, 0, cpu_address);
+        let allocation = nvmap_allocate_input(handle, 0, 0x20_000, 0, cpu_address);
         assert_eq!(
             session
                 .ioctl_with_memory(
@@ -2890,6 +2892,11 @@ mod tests {
                 .mapping_count(),
             1
         );
+        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
+        let mapped = address_space
+            .mapping(address_space.address(0x4_0000_0000).unwrap())
+            .unwrap();
+        assert_eq!(mapped.permissions(), MemoryPermissions::READ_WRITE);
         let mut hole = entry.to_vec();
         hole[4..8].fill(0);
         assert_eq!(
