@@ -3,10 +3,11 @@
 use crate::MaxwellMethodSource;
 
 use super::render_targets::{MaxwellThreeDRawValue, MaxwellThreeDRectangle};
-use super::state::MaxwellThreeDRegister;
+use super::state::{MAXWELL_THREE_D_POLYGON_MODE_RESET, MaxwellThreeDRegister};
 
 pub const MAXWELL_VIEWPORT_COUNT: usize = 16;
 pub const MAXWELL_SCISSOR_COUNT: usize = 16;
+pub const MAXWELL_WINDOW_CLIP_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDCompareOp {
@@ -57,6 +58,61 @@ pub enum MaxwellThreeDPolygonMode {
 pub enum MaxwellThreeDShadeMode {
     Flat = 0x1d00,
     Smooth = 0x1d01,
+}
+
+/// Combination rule applied to the programmed window-clip rectangles.
+///
+/// NVIDIA publishes all three encodings in the pinned public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3443-L3447>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDWindowClipType {
+    Inclusive = 0,
+    Exclusive = 1,
+    ClipAll = 2,
+}
+
+impl MaxwellThreeDWindowClipType {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Inclusive),
+            1 => Some(Self::Exclusive),
+            2 => Some(Self::ClipAll),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Whether later rasterization applies the surface clip-ID test.
+///
+/// NVIDIA publishes `SET_CLIP_ID_TEST`, its one-bit `ENABLE` field, and both
+/// boolean encodings in the pinned public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3500-L3503>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDClipIdTestEnable {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDClipIdTestEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
 }
 
 impl MaxwellThreeDShadeMode {
@@ -194,6 +250,114 @@ impl MaxwellThreeDBlendEnableCommon {
     }
 }
 
+/// Whether format-specific blend handling is selected for
+/// `SNORM8`/`UNORM16`/`SNORM16` color targets.
+///
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1828-L1831>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDBlendPerFormatEnable {
+    Disabled = 0,
+    Enabled = 0x10,
+}
+
+impl MaxwellThreeDBlendPerFormatEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            0x10 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Whether hardware may apply floating-point pixel-kill optimization.
+///
+/// This is an optimization permission, not output arithmetic or coherency.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1345-L1348>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDBlendFloatPixelKillEnable {
+    Disallowed = 0,
+    Allowed = 1,
+}
+
+impl MaxwellThreeDBlendFloatPixelKillEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disallowed),
+            1 => Some(Self::Allowed),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Whether blend arithmetic defines zero multiplied by any value as zero.
+///
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3516-L3519>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDBlendZeroTimesAnythingIsZero {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDBlendZeroTimesAnythingIsZero {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Format, arithmetic, and optimization controls shared by blend paths.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDBlendControlState {
+    per_format_enable: MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable>,
+    float_pixel_kill_enable: MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable>,
+    zero_times_anything_is_zero: MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero>,
+}
+
+impl MaxwellThreeDBlendControlState {
+    #[must_use]
+    pub const fn per_format_enable(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable> {
+        &self.per_format_enable
+    }
+
+    #[must_use]
+    pub const fn float_pixel_kill_enable(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable> {
+        &self.float_pixel_kill_enable
+    }
+
+    #[must_use]
+    pub const fn zero_times_anything_is_zero(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero> {
+        &self.zero_times_anything_is_zero
+    }
+}
+
 impl MaxwellThreeDBlendOp {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
@@ -280,6 +444,33 @@ impl MaxwellThreeDViewportClipControl {
     }
 }
 
+/// Selects whether the programmed viewport scale and offset transform is active.
+///
+/// NVIDIA defines this as the sole bit of `SET_VIEWPORT_SCALE_OFFSET` in its
+/// pinned public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3367-L3370>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDViewportScaleOffsetEnable {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDViewportScaleOffsetEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDFixedFunctionRegister {
     RasterEnable,
@@ -306,6 +497,7 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     SampleMask2,
     SampleMask3,
     UserClipEnable,
+    ViewportScaleOffsetEnable,
     ViewportClipControl,
     DepthBoundsEnable,
     DepthBoundsMin,
@@ -343,6 +535,7 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     UserClipOperation,
     WindowClipEnable,
     WindowClipType,
+    ClipIdTestEnable,
     DepthBoundsMax,
 }
 
@@ -367,7 +560,10 @@ pub enum MaxwellThreeDFixedFunctionValue {
     FloatBits(MaxwellThreeDRawValue),
     SampleMode(MaxwellThreeDSampleMode),
     Mask(u32),
+    ViewportScaleOffsetEnable(MaxwellThreeDViewportScaleOffsetEnable),
     ClipControl(MaxwellThreeDViewportClipControl),
+    WindowClipType(MaxwellThreeDWindowClipType),
+    ClipIdTestEnable(MaxwellThreeDClipIdTestEnable),
     AlphaControl {
         alpha_to_coverage: bool,
         alpha_to_one: bool,
@@ -416,6 +612,29 @@ pub struct MaxwellThreeDScissorState {
     horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
     vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
 }
+
+/// One source-preserving horizontal/vertical window-clip rectangle pair.
+///
+/// The eight pairs and their packed 16-bit minimum/maximum fields are defined
+/// by NVIDIA's pinned public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L855-L861>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDWindowClipState {
+    horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
+    vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
+}
+
+impl MaxwellThreeDWindowClipState {
+    #[must_use]
+    pub const fn horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        &self.horizontal
+    }
+
+    #[must_use]
+    pub const fn vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        &self.vertical
+    }
+}
 impl MaxwellThreeDScissorState {
     #[must_use]
     pub const fn enable(&self) -> &MaxwellThreeDRegister<bool> {
@@ -435,23 +654,35 @@ impl MaxwellThreeDScissorState {
 pub struct MaxwellThreeDFixedFunctionState {
     viewport: [MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT],
     scissor: [MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT],
+    window_clip: [MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT],
     registers: [MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>;
         MaxwellThreeDFixedFunctionRegister::COUNT],
     blend_enable_common: MaxwellThreeDRegister<MaxwellThreeDBlendEnableCommon>,
     blend_enable: [MaxwellThreeDRegister<bool>; 8],
     color_mask: [MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8],
     per_target_blend: [[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8],
+    blend_controls: MaxwellThreeDBlendControlState,
 }
 impl Default for MaxwellThreeDFixedFunctionState {
     fn default() -> Self {
+        let mut registers = std::array::from_fn(|_| Default::default());
+        for register in [
+            MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
+            MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
+        ] {
+            registers[register.index()] =
+                MaxwellThreeDRegister::verified_reset(MAXWELL_THREE_D_POLYGON_MODE_RESET, None);
+        }
         Self {
             viewport: std::array::from_fn(|_| Default::default()),
             scissor: std::array::from_fn(|_| Default::default()),
-            registers: std::array::from_fn(|_| Default::default()),
+            window_clip: std::array::from_fn(|_| Default::default()),
+            registers,
             blend_enable_common: Default::default(),
             blend_enable: Default::default(),
             color_mask: Default::default(),
             per_target_blend: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
+            blend_controls: Default::default(),
         }
     }
 }
@@ -463,6 +694,10 @@ impl MaxwellThreeDFixedFunctionState {
     #[must_use]
     pub const fn scissor(&self) -> &[MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT] {
         &self.scissor
+    }
+    #[must_use]
+    pub const fn window_clip(&self) -> &[MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT] {
+        &self.window_clip
     }
     #[must_use]
     pub const fn register(
@@ -491,15 +726,27 @@ impl MaxwellThreeDFixedFunctionState {
     ) -> &[[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8] {
         &self.per_target_blend
     }
+    #[must_use]
+    pub const fn blend_controls(&self) -> &MaxwellThreeDBlendControlState {
+        &self.blend_controls
+    }
 
     pub(super) fn append_pipeline_dependencies(
         &self,
         dependencies: &mut Vec<Option<u32>>,
         active_color_targets: &[u8],
     ) {
+        let viewport_scale_offset_enable =
+            self.register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable);
+        let scale_offset_may_be_effective = viewport_scale_offset_enable.value()
+            != Some(&MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
+                MaxwellThreeDViewportScaleOffsetEnable::Disabled,
+            ));
         for viewport in &self.viewport {
-            dependencies.extend(viewport.scale.iter().map(MaxwellThreeDRegister::raw));
-            dependencies.extend(viewport.offset.iter().map(MaxwellThreeDRegister::raw));
+            if scale_offset_may_be_effective {
+                dependencies.extend(viewport.scale.iter().map(MaxwellThreeDRegister::raw));
+                dependencies.extend(viewport.offset.iter().map(MaxwellThreeDRegister::raw));
+            }
             dependencies.push(viewport.clip_horizontal.raw());
             dependencies.push(viewport.clip_vertical.raw());
             dependencies.push(viewport.clip_min_z.raw());
@@ -514,7 +761,7 @@ impl MaxwellThreeDFixedFunctionState {
         // disabled. Retain only state that selects that effective result;
         // inactive equation families and unselected targets cannot affect the
         // pipeline and therefore must not invalidate its identity.
-        let blend_registers = [
+        let conditionally_effective_registers = [
             MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable,
             MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
             MaxwellThreeDFixedFunctionRegister::BlendColorOp,
@@ -527,18 +774,32 @@ impl MaxwellThreeDFixedFunctionState {
             MaxwellThreeDFixedFunctionRegister::BlendConstantGreen,
             MaxwellThreeDFixedFunctionRegister::BlendConstantBlue,
             MaxwellThreeDFixedFunctionRegister::BlendConstantAlpha,
+            MaxwellThreeDFixedFunctionRegister::WindowClipType,
         ];
         dependencies.extend(
             self.registers
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| {
-                    !blend_registers
+                    !conditionally_effective_registers
                         .iter()
                         .any(|register| register.index() == *index)
                 })
                 .map(|(_, register)| register.raw()),
         );
+        let window_clip_enable =
+            self.register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable);
+        if window_clip_enable.value() != Some(&MaxwellThreeDFixedFunctionValue::Boolean(false)) {
+            dependencies.push(
+                self.register(MaxwellThreeDFixedFunctionRegister::WindowClipType)
+                    .raw(),
+            );
+            for region in &self.window_clip {
+                dependencies.push(region.horizontal.raw());
+                dependencies.push(region.vertical.raw());
+            }
+        }
+        let mut blending_enabled = false;
         if !active_color_targets.is_empty() {
             let selection = self.register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable);
             dependencies.push(selection.raw());
@@ -548,9 +809,18 @@ impl MaxwellThreeDFixedFunctionState {
                         .iter()
                         .map(|target| self.blend_enable[*target as usize].raw()),
                 );
+                blending_enabled = active_color_targets
+                    .iter()
+                    .any(|target| self.blend_enable[*target as usize].value() == Some(&true));
             } else {
                 dependencies.push(self.blend_enable_common.raw());
+                blending_enabled = self.blend_enable_common.value()
+                    == Some(&MaxwellThreeDBlendEnableCommon::Enabled);
             }
+        }
+        if blending_enabled {
+            dependencies.push(self.blend_controls.per_format_enable.raw());
+            dependencies.push(self.blend_controls.zero_times_anything_is_zero.raw());
         }
         dependencies.extend(self.color_mask.iter().map(MaxwellThreeDRegister::raw));
     }
@@ -624,6 +894,20 @@ impl MaxwellThreeDFixedFunctionState {
                         MaxwellThreeDRegister::programmed(raw, value, source)
                 }
             }
+            MaxwellThreeDFixedFunctionWrite::WindowClipRectangle {
+                region,
+                vertical,
+                value,
+                ..
+            } => {
+                if vertical {
+                    self.window_clip[region as usize].vertical =
+                        MaxwellThreeDRegister::programmed(raw, value, source)
+                } else {
+                    self.window_clip[region as usize].horizontal =
+                        MaxwellThreeDRegister::programmed(raw, value, source)
+                }
+            }
             MaxwellThreeDFixedFunctionWrite::Register {
                 register, value, ..
             } => {
@@ -648,6 +932,18 @@ impl MaxwellThreeDFixedFunctionState {
                 ..
             } => {
                 self.per_target_blend[target as usize][field as usize] =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDFixedFunctionWrite::BlendPerFormatEnable { value, .. } => {
+                self.blend_controls.per_format_enable =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDFixedFunctionWrite::BlendFloatPixelKillEnable { value, .. } => {
+                self.blend_controls.float_pixel_kill_enable =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDFixedFunctionWrite::BlendZeroTimesAnythingIsZero { value, .. } => {
+                self.blend_controls.zero_times_anything_is_zero =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
         }
@@ -685,6 +981,12 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDRectangle,
         source: MaxwellMethodSource,
     },
+    WindowClipRectangle {
+        region: u8,
+        vertical: bool,
+        value: MaxwellThreeDRectangle,
+        source: MaxwellMethodSource,
+    },
     Register {
         register: MaxwellThreeDFixedFunctionRegister,
         value: MaxwellThreeDFixedFunctionValue,
@@ -710,6 +1012,18 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDFixedFunctionValue,
         source: MaxwellMethodSource,
     },
+    BlendPerFormatEnable {
+        value: MaxwellThreeDBlendPerFormatEnable,
+        source: MaxwellMethodSource,
+    },
+    BlendFloatPixelKillEnable {
+        value: MaxwellThreeDBlendFloatPixelKillEnable,
+        source: MaxwellMethodSource,
+    },
+    BlendZeroTimesAnythingIsZero {
+        value: MaxwellThreeDBlendZeroTimesAnythingIsZero,
+        source: MaxwellMethodSource,
+    },
 }
 impl MaxwellThreeDFixedFunctionWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
@@ -719,11 +1033,15 @@ impl MaxwellThreeDFixedFunctionWrite {
             | Self::ViewportDepth { source, .. }
             | Self::ScissorEnable { source, .. }
             | Self::ScissorRectangle { source, .. }
+            | Self::WindowClipRectangle { source, .. }
             | Self::Register { source, .. }
             | Self::BlendEnableCommon { source, .. }
             | Self::BlendEnable { source, .. }
             | Self::ColorMask { source, .. }
-            | Self::BlendState { source, .. } => source,
+            | Self::BlendState { source, .. }
+            | Self::BlendPerFormatEnable { source, .. }
+            | Self::BlendFloatPixelKillEnable { source, .. }
+            | Self::BlendZeroTimesAnythingIsZero { source, .. } => source,
         }
     }
 }

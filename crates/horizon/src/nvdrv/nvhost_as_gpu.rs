@@ -171,7 +171,7 @@ pub(super) fn ioctl_nvhost_as_gpu(
                     page_size: 0,
                     kind: decode_kind(kind, metadata.kind())?,
                     cacheable: flags & MAP_CACHEABLE != 0,
-                    permissions: metadata.required_permissions(),
+                    permissions: metadata.gpu_mapping_permissions(),
                     fixed_offset: (flags & MAP_FIXED != 0).then_some(offset),
                 })
                 .map_err(driver_result)?;
@@ -272,7 +272,7 @@ fn remap(
                 backing_offset,
                 kind: decode_explicit_kind(u32::from(input_u16(entry, 2)?))?,
                 cacheable: flags & REMAP_CACHEABLE != 0,
-                permissions: metadata.required_permissions(),
+                permissions: metadata.gpu_mapping_permissions(),
             })
         };
         entries.push(MaxwellSparseRemapRequest {

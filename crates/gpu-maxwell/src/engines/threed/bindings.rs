@@ -7,11 +7,47 @@
 
 use crate::MaxwellMethodSource;
 
+use super::state::MAXWELL_THREE_D_PIPELINE_SHADER_RESET;
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
 pub const MAXWELL_BIND_GROUP_COUNT: usize = 8;
 pub const MAXWELL_CONSTANT_BUFFER_SLOT_COUNT: usize = 32;
+
+/// Source-preserving base address of the Maxwell shader-program region.
+///
+/// NVIDIA defines an eight-bit upper field followed by a 32-bit lower field:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2996-L3000>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDProgramRegionState {
+    address_upper: MaxwellThreeDRegister<u8>,
+    address_lower: MaxwellThreeDRegister<u32>,
+}
+
+impl MaxwellThreeDProgramRegionState {
+    #[must_use]
+    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.address_upper
+    }
+
+    #[must_use]
+    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.address_lower
+    }
+
+    #[must_use]
+    pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
+        Some(MaxwellThreeDUnresolvedAddress::new(
+            *self.address_upper.value()?,
+            *self.address_lower.value()?,
+        ))
+    }
+
+    pub(super) fn is_partially_programmed(&self) -> bool {
+        self.address().is_none()
+            && (self.address_upper.raw().is_some() || self.address_lower.raw().is_some())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDShaderStage {
@@ -37,11 +73,27 @@ impl MaxwellThreeDShaderStage {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDPipelineBindingState {
     enabled: MaxwellThreeDRegister<bool>,
     stage: MaxwellThreeDRegister<MaxwellThreeDShaderStage>,
     group: MaxwellThreeDRegister<u8>,
+}
+
+impl Default for MaxwellThreeDPipelineBindingState {
+    fn default() -> Self {
+        Self {
+            enabled: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
+                Some(false),
+            ),
+            stage: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
+                Some(MaxwellThreeDShaderStage::VertexCullBeforeFetch),
+            ),
+            group: MaxwellThreeDRegister::default(),
+        }
+    }
 }
 
 impl MaxwellThreeDPipelineBindingState {
@@ -64,6 +116,83 @@ pub struct MaxwellThreeDConstantBufferSelectorState {
     size: MaxwellThreeDRegister<u32>,
     address_upper: MaxwellThreeDRegister<u8>,
     address_lower: MaxwellThreeDRegister<u32>,
+}
+
+/// Inline constant-buffer upload cursor and the last accepted data word.
+///
+/// The selector supplies the destination range. `LOAD_CONSTANT_BUFFER_OFFSET`
+/// selects a byte offset within that range, and each
+/// `LOAD_CONSTANT_BUFFER(0)` word advances the internal cursor by four bytes.
+///
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L4067-L4080>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDConstantBufferLoadState {
+    offset: MaxwellThreeDRegister<u16>,
+    next_offset: Option<u32>,
+    last_data: MaxwellThreeDRegister<u32>,
+}
+
+impl MaxwellThreeDConstantBufferLoadState {
+    #[must_use]
+    pub const fn offset(&self) -> &MaxwellThreeDRegister<u16> {
+        &self.offset
+    }
+
+    #[must_use]
+    pub const fn next_offset(&self) -> Option<u32> {
+        self.next_offset
+    }
+
+    #[must_use]
+    pub const fn last_data(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.last_data
+    }
+}
+
+/// One validated inline word awaiting execution against the GPU address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDInlineConstantBufferUpload {
+    address: MaxwellThreeDUnresolvedAddress,
+    offset: u32,
+    value: u32,
+    source: MaxwellMethodSource,
+}
+
+impl MaxwellThreeDInlineConstantBufferUpload {
+    #[must_use]
+    pub const fn new(
+        address: MaxwellThreeDUnresolvedAddress,
+        offset: u32,
+        value: u32,
+        source: MaxwellMethodSource,
+    ) -> Self {
+        Self {
+            address,
+            offset,
+            value,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub const fn address(self) -> MaxwellThreeDUnresolvedAddress {
+        self.address
+    }
+
+    #[must_use]
+    pub const fn offset(self) -> u32 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn source(self) -> MaxwellMethodSource {
+        self.source
+    }
 }
 
 impl MaxwellThreeDConstantBufferSelectorState {
@@ -175,8 +304,10 @@ impl MaxwellThreeDDescriptorPoolState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderBindingState {
+    program_region: MaxwellThreeDProgramRegionState,
     pipeline: [MaxwellThreeDPipelineBindingState; MAXWELL_PIPELINE_SHADER_COUNT],
     selector: MaxwellThreeDConstantBufferSelectorState,
+    constant_buffer_load: MaxwellThreeDConstantBufferLoadState,
     groups: Box<[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT]>,
     texture_headers: MaxwellThreeDDescriptorPoolState,
     samplers: MaxwellThreeDDescriptorPoolState,
@@ -188,8 +319,10 @@ pub struct MaxwellThreeDShaderBindingState {
 impl Default for MaxwellThreeDShaderBindingState {
     fn default() -> Self {
         Self {
+            program_region: MaxwellThreeDProgramRegionState::default(),
             pipeline: std::array::from_fn(|_| MaxwellThreeDPipelineBindingState::default()),
             selector: MaxwellThreeDConstantBufferSelectorState::default(),
+            constant_buffer_load: MaxwellThreeDConstantBufferLoadState::default(),
             groups: Box::new(std::array::from_fn(|_| {
                 MaxwellThreeDBindGroupState::default()
             })),
@@ -204,6 +337,17 @@ impl Default for MaxwellThreeDShaderBindingState {
 
 impl MaxwellThreeDShaderBindingState {
     #[must_use]
+    pub const fn program_region(&self) -> &MaxwellThreeDProgramRegionState {
+        &self.program_region
+    }
+
+    pub(super) fn has_enabled_pipeline(&self) -> bool {
+        self.pipeline
+            .iter()
+            .any(|pipeline| pipeline.enabled.value() == Some(&true))
+    }
+
+    #[must_use]
     pub const fn pipeline(
         &self,
     ) -> &[MaxwellThreeDPipelineBindingState; MAXWELL_PIPELINE_SHADER_COUNT] {
@@ -212,6 +356,10 @@ impl MaxwellThreeDShaderBindingState {
     #[must_use]
     pub const fn selector(&self) -> &MaxwellThreeDConstantBufferSelectorState {
         &self.selector
+    }
+    #[must_use]
+    pub const fn constant_buffer_load(&self) -> &MaxwellThreeDConstantBufferLoadState {
+        &self.constant_buffer_load
     }
     #[must_use]
     pub fn groups(&self) -> &[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT] {
@@ -257,6 +405,12 @@ impl MaxwellThreeDShaderBindingState {
     }
 
     pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+        if self.has_enabled_pipeline() {
+            // Shader translation interprets stage programs relative to this
+            // base, so both halves participate only while a stage is active.
+            dependencies.push(self.program_region.address_upper.raw());
+            dependencies.push(self.program_region.address_lower.raw());
+        }
         for pipeline in &self.pipeline {
             dependencies.push(pipeline.enabled.raw());
             dependencies.push(pipeline.stage.raw());
@@ -271,6 +425,14 @@ impl MaxwellThreeDShaderBindingState {
         let raw = write.raw();
         let source = write.source();
         match write {
+            MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { value, .. } => {
+                self.program_region.address_upper =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { value, .. } => {
+                self.program_region.address_lower =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDShaderBindingWrite::PipelineShader {
                 pipeline,
                 enabled,
@@ -296,6 +458,18 @@ impl MaxwellThreeDShaderBindingState {
             }
             MaxwellThreeDShaderBindingWrite::SelectorAddressLower { value, .. } => {
                 self.selector.address_lower = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadOffset { value, .. } => {
+                self.constant_buffer_load.offset =
+                    MaxwellThreeDRegister::programmed(raw, value, source);
+                self.constant_buffer_load.next_offset = Some(u32::from(value));
+            }
+            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
+                value, next_offset, ..
+            } => {
+                self.constant_buffer_load.last_data =
+                    MaxwellThreeDRegister::programmed(raw, value, source);
+                self.constant_buffer_load.next_offset = Some(next_offset);
             }
             MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
                 group,
@@ -350,6 +524,14 @@ impl MaxwellThreeDShaderBindingState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderBindingWrite {
+    ProgramRegionAddressUpper {
+        value: u8,
+        source: MaxwellMethodSource,
+    },
+    ProgramRegionAddressLower {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     PipelineShader {
         pipeline: u8,
         enabled: bool,
@@ -371,6 +553,15 @@ pub enum MaxwellThreeDShaderBindingWrite {
     },
     SelectorAddressLower {
         value: u32,
+        source: MaxwellMethodSource,
+    },
+    ConstantBufferLoadOffset {
+        value: u16,
+        source: MaxwellMethodSource,
+    },
+    ConstantBufferLoadData {
+        value: u32,
+        next_offset: u32,
         source: MaxwellMethodSource,
     },
     BindConstantBuffer {
@@ -422,11 +613,15 @@ pub enum MaxwellThreeDShaderBindingWrite {
 impl MaxwellThreeDShaderBindingWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::PipelineShader { source, .. }
+            Self::ProgramRegionAddressUpper { source, .. }
+            | Self::ProgramRegionAddressLower { source, .. }
+            | Self::PipelineShader { source, .. }
             | Self::PipelineGroup { source, .. }
             | Self::SelectorSize { source, .. }
             | Self::SelectorAddressUpper { source, .. }
             | Self::SelectorAddressLower { source, .. }
+            | Self::ConstantBufferLoadOffset { source, .. }
+            | Self::ConstantBufferLoadData { source, .. }
             | Self::BindConstantBuffer { source, .. }
             | Self::TextureHeaderAddressUpper { source, .. }
             | Self::TextureHeaderAddressLower { source, .. }

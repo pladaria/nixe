@@ -8,8 +8,8 @@ use nixe_memory::{
 
 // Switch nvmap ABI values and parameter behavior:
 // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvmap
-// The libnx wrappers pin flags bit 0 to read/write access and zero-initialize
-// the remaining ABI fields:
+// The libnx wrappers pin flags bit 0 to CPU read/write access and
+// zero-initialize the remaining ABI fields:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvmap.c
 const NVMAP_MINIMUM_ALIGNMENT: u32 = 0x1000;
 const NVMAP_SYSTEM_HEAP_MASK: u32 = 0x4000_0000;
@@ -155,12 +155,23 @@ impl NvMapAllocationMetadata {
         self.kind
     }
 
-    pub(super) const fn required_permissions(self) -> MemoryPermissions {
+    /// Permissions required from the CPU virtual mapping supplied to
+    /// `NVMAP_IOC_ALLOC`.
+    pub(super) const fn cpu_mapping_permissions(self) -> MemoryPermissions {
         if self.flags & NVMAP_READ_WRITE_FLAG != 0 {
             MemoryPermissions::READ_WRITE
         } else {
             MemoryPermissions::READ
         }
+    }
+
+    /// Permissions installed in a GPU address-space mapping.
+    ///
+    /// Switch `NVMAP_IOC_ALLOC` access flags qualify the supplied CPU mapping.
+    /// `NVHOST_AS_GPU_MAP_BUFFER_EX` has no corresponding read-only flag, and
+    /// Maxwell may write an allocation created from a CPU-read-only mapping.
+    pub(super) const fn gpu_mapping_permissions(self) -> MemoryPermissions {
+        MemoryPermissions::READ_WRITE
     }
 
     pub(super) const fn validate(self) -> Result<(), NvMapStateError> {
@@ -551,7 +562,7 @@ impl NvMapObjects {
             || backing.segments().iter().any(|segment| {
                 !segment
                     .permissions()
-                    .contains(allocation.required_permissions())
+                    .contains(allocation.cpu_mapping_permissions())
             })
         {
             return Err(NvMapStateError::InvalidBacking);
@@ -787,6 +798,26 @@ pub(super) enum NvMapStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_access_flags_do_not_restrict_gpu_mapping_permissions() {
+        let read_only = NvMapAllocationMetadata::new(0, 0, 0x1000, 0);
+        assert_eq!(read_only.cpu_mapping_permissions(), MemoryPermissions::READ);
+        assert_eq!(
+            read_only.gpu_mapping_permissions(),
+            MemoryPermissions::READ_WRITE
+        );
+
+        let read_write = NvMapAllocationMetadata::new(0, 1, 0x1000, 0);
+        assert_eq!(
+            read_write.cpu_mapping_permissions(),
+            MemoryPermissions::READ_WRITE
+        );
+        assert_eq!(
+            read_write.gpu_mapping_permissions(),
+            MemoryPermissions::READ_WRITE
+        );
+    }
 
     #[test]
     fn every_object_reference_operation_rejects_a_foreign_owner() {

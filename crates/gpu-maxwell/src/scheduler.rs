@@ -14,7 +14,7 @@ use crate::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
     MaxwellFrontendCapture, MaxwellFrontendReplay, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
     MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellGpuChannel,
-    MaxwellValidatedGpfifoSubmission,
+    MaxwellSubmissionExecutionError, MaxwellValidatedGpfifoSubmission,
 };
 
 /// Global acceptance order assigned by one deterministic scheduler.
@@ -183,6 +183,7 @@ pub enum MaxwellFrontendDispatchBoundary {
         dispatch: Box<MaxwellFrontendDispatch>,
         capture: Box<MaxwellFrontendCapture>,
         replay: Box<MaxwellFrontendReplay>,
+        execution_failure: Option<Box<MaxwellSubmissionExecutionError>>,
     },
 }
 
@@ -220,6 +221,18 @@ impl MaxwellFrontendDispatchBoundary {
             Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
         }
     }
+
+    /// Returns the first submission-execution preflight failure, if decoding
+    /// and method dispatch completed far enough to reach that layer.
+    #[must_use]
+    pub fn execution_failure(&self) -> Option<&MaxwellSubmissionExecutionError> {
+        match self {
+            Self::Frontend {
+                execution_failure, ..
+            } => execution_failure.as_deref(),
+            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
+        }
+    }
 }
 
 impl Display for MaxwellFrontendDispatchBoundary {
@@ -248,12 +261,17 @@ impl Display for MaxwellFrontendDispatchBoundary {
                 formatter.write_str("empty-submission completion semantics are unavailable")
             }
             Self::Frontend {
-                capture, replay, ..
+                capture,
+                replay,
+                execution_failure,
+                ..
             } => write!(
                 formatter,
                 "frontend-packets={} first-fatal=[{}] frontend-capture=[{}]",
                 replay.packets().len(),
-                replay.failure(),
+                execution_failure
+                    .as_deref()
+                    .map_or_else(|| replay.failure() as &dyn Display, |error| error),
                 capture
             ),
         }?;

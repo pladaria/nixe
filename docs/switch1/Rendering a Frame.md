@@ -357,6 +357,12 @@ increment mode, class binding, and word availability across mapping boundaries.
 Class dispatch additionally checks that a method is valid for the bound class and
 hardware profile.
 
+Some class methods invoke Maxwell Macro Method Expander microcode rather than
+changing 3D state directly. The MME consumes call parameters and existing
+register state, then emits ordinary Maxwell methods back into the same validated
+dispatch path. See [Maxwell Macro Method Expander (MME)](Macro%20Method%20Expander%20%28MME%29.md)
+for its execution and memory model.
+
 Unknown packet encodings, unsupported classes, and unsupported methods are
 distinct diagnostics. Source context should include channel, submission, GPFIFO
 entry, pushbuffer GPU address, word offset, class, method, and mapping

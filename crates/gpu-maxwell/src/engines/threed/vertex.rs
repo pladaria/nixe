@@ -10,11 +10,191 @@ use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_VERTEX_STREAM_COUNT: usize = 32;
 pub const MAXWELL_VERTEX_ATTRIBUTE_COUNT: usize = 32;
+pub const MAXWELL_THREE_D_PRIMITIVE_AREA_MAX: u32 = 0x003f_ffff;
+
+/// One constant vector selected for an absent vertex attribute.
+///
+/// The individual `SET_ATTRIBUTE_DEFAULT` fields expose different subsets of
+/// these three vectors. Keeping the decoded vector rather than a bare bit
+/// preserves that field-specific meaning.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3002-L3020>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDAttributeDefaultVector {
+    Vector0000,
+    Vector0001,
+    Vector1111,
+}
+
+/// Complete typed value written by `SET_ATTRIBUTE_DEFAULT`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDAttributeDefaults {
+    color_front_diffuse: MaxwellThreeDAttributeDefaultVector,
+    color_front_specular: MaxwellThreeDAttributeDefaultVector,
+    generic_vector: MaxwellThreeDAttributeDefaultVector,
+    fixed_function_texture: MaxwellThreeDAttributeDefaultVector,
+    dx9_color0: MaxwellThreeDAttributeDefaultVector,
+    dx9_color1_to_color15: MaxwellThreeDAttributeDefaultVector,
+}
+
+impl MaxwellThreeDAttributeDefaults {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x3f != 0 {
+            return None;
+        }
+        Some(Self {
+            color_front_diffuse: if raw & 1 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector1111
+            },
+            color_front_specular: if raw & 2 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0000
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            },
+            generic_vector: if raw & 4 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0000
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            },
+            fixed_function_texture: if raw & 8 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0000
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            },
+            dx9_color0: if raw & 0x10 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector1111
+            },
+            dx9_color1_to_color15: if raw & 0x20 == 0 {
+                MaxwellThreeDAttributeDefaultVector::Vector0000
+            } else {
+                MaxwellThreeDAttributeDefaultVector::Vector0001
+            },
+        })
+    }
+
+    #[must_use]
+    pub const fn color_front_diffuse(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.color_front_diffuse
+    }
+
+    #[must_use]
+    pub const fn color_front_specular(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.color_front_specular
+    }
+
+    #[must_use]
+    pub const fn generic_vector(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.generic_vector
+    }
+
+    #[must_use]
+    pub const fn fixed_function_texture(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.fixed_function_texture
+    }
+
+    #[must_use]
+    pub const fn dx9_color0(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.dx9_color0
+    }
+
+    #[must_use]
+    pub const fn dx9_color1_to_color15(self) -> MaxwellThreeDAttributeDefaultVector {
+        self.dx9_color1_to_color15
+    }
+}
+
+/// Whether the vertex shader's vertex ID includes `SET_VERTEX_ARRAY_START`.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3087-L3090>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDVertexIdUsesArrayStart {
+    Disabled = 0,
+    Enabled = 0x1000,
+}
+
+impl MaxwellThreeDVertexIdUsesArrayStart {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            0x1000 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Data-assembly controls that affect values presented to the vertex shader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexAssemblyState {
+    attribute_defaults: MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults>,
+    vertex_id_uses_array_start: MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart>,
+}
+
+impl MaxwellThreeDVertexAssemblyState {
+    #[must_use]
+    pub const fn attribute_defaults(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults> {
+        &self.attribute_defaults
+    }
+
+    #[must_use]
+    pub const fn vertex_id_uses_array_start(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart> {
+        &self.vertex_id_uses_array_start
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDUnresolvedAddress {
     upper: u8,
     lower: u32,
+}
+
+/// GPU address programmed by `SET_VERTEX_STREAM_SUBSTITUTE_A/B`.
+///
+/// NVIDIA's public class header defines this as one 40-bit address split into
+/// an eight-bit upper field and a 32-bit lower field, but does not document
+/// the condition that consumes it.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1255-L1259>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexStreamSubstituteState {
+    address_upper: MaxwellThreeDRegister<u8>,
+    address_lower: MaxwellThreeDRegister<u32>,
+}
+
+impl MaxwellThreeDVertexStreamSubstituteState {
+    #[must_use]
+    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.address_upper
+    }
+
+    #[must_use]
+    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.address_lower
+    }
+
+    #[must_use]
+    pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
+        Some(MaxwellThreeDUnresolvedAddress::new(
+            *self.address_upper.value()?,
+            *self.address_lower.value()?,
+        ))
+    }
 }
 
 impl MaxwellThreeDUnresolvedAddress {
@@ -352,8 +532,63 @@ impl MaxwellThreeDVertexArrayPrimitiveRestartEnable {
     }
 }
 
+/// Primitive-area threshold for internal circular-buffer throttling.
+///
+/// NVIDIA's public ABI defines `PRIM_AREA` as bits 21:0, but exposes no
+/// output-visible rendering selection through this method. The frontend keeps
+/// the value and its source for diagnostics and future scheduling models while
+/// excluding this internal throttle from logical pipeline identity.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L293-L294>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDPrimitiveCircularBufferThrottle(u32);
+
+impl MaxwellThreeDPrimitiveCircularBufferThrottle {
+    pub(super) const fn new(primitive_area: u32) -> Option<Self> {
+        if primitive_area <= MAXWELL_THREE_D_PRIMITIVE_AREA_MAX {
+            Some(Self(primitive_area))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn primitive_area(self) -> u32 {
+        self.0
+    }
+}
+
+/// Number of control points in one patch primitive.
+///
+/// NVIDIA publishes an eight-bit field but no narrower validity range in the
+/// public class header. All encodings are therefore retained; execution-time
+/// constraints are checked only when a patch topology consumes the value.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1046-L1047>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDPatchSize(u8);
+
+impl MaxwellThreeDPatchSize {
+    #[must_use]
+    pub const fn new(control_points: u8) -> Self {
+        Self(control_points)
+    }
+
+    #[must_use]
+    pub const fn control_points(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0 as u32
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDPrimitiveState {
+    circular_buffer_throttle: MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle>,
+    patch_size: MaxwellThreeDRegister<MaxwellThreeDPatchSize>,
     topology_override: MaxwellThreeDRegister<bool>,
     topology: MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology>,
     vertex_array_restart_enabled:
@@ -365,6 +600,18 @@ pub struct MaxwellThreeDPrimitiveState {
 }
 
 impl MaxwellThreeDPrimitiveState {
+    #[must_use]
+    pub const fn circular_buffer_throttle(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle> {
+        &self.circular_buffer_throttle
+    }
+
+    #[must_use]
+    pub const fn patch_size(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPatchSize> {
+        &self.patch_size
+    }
+
     #[must_use]
     pub const fn topology_override(&self) -> &MaxwellThreeDRegister<bool> {
         &self.topology_override
@@ -443,6 +690,8 @@ pub struct MaxwellThreeDVertexInputState {
     >,
     index: MaxwellThreeDIndexBufferState,
     primitive: MaxwellThreeDPrimitiveState,
+    assembly: MaxwellThreeDVertexAssemblyState,
+    stream_substitute: MaxwellThreeDVertexStreamSubstituteState,
 }
 
 impl Default for MaxwellThreeDVertexInputState {
@@ -454,6 +703,8 @@ impl Default for MaxwellThreeDVertexInputState {
             attributes: Box::new(std::array::from_fn(|_| MaxwellThreeDRegister::default())),
             index: MaxwellThreeDIndexBufferState::default(),
             primitive: MaxwellThreeDPrimitiveState::default(),
+            assembly: MaxwellThreeDVertexAssemblyState::default(),
+            stream_substitute: MaxwellThreeDVertexStreamSubstituteState::default(),
         }
     }
 }
@@ -478,6 +729,15 @@ impl MaxwellThreeDVertexInputState {
     pub const fn primitive(&self) -> &MaxwellThreeDPrimitiveState {
         &self.primitive
     }
+    #[must_use]
+    pub const fn assembly(&self) -> &MaxwellThreeDVertexAssemblyState {
+        &self.assembly
+    }
+
+    #[must_use]
+    pub const fn stream_substitute(&self) -> &MaxwellThreeDVertexStreamSubstituteState {
+        &self.stream_substitute
+    }
 
     pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
         for stream in self.streams.iter() {
@@ -487,18 +747,40 @@ impl MaxwellThreeDVertexInputState {
         }
         dependencies.extend(self.attributes.iter().map(MaxwellThreeDRegister::raw));
         dependencies.push(self.index.element_size.raw());
+        // Circular-buffer throttling changes internal scheduling, not the
+        // logical vertex-input or pipeline configuration.
         dependencies.push(self.primitive.topology_override.raw());
         dependencies.push(self.primitive.topology.raw());
         dependencies.push(self.primitive.vertex_array_restart_enabled.raw());
         dependencies.push(self.primitive.restart_enabled.raw());
         dependencies.push(self.primitive.restart_index.raw());
         dependencies.push(self.primitive.begin.raw());
+        if self
+            .primitive
+            .begin
+            .value()
+            .is_some_and(|begin| begin.topology() == 14)
+        {
+            dependencies.push(self.primitive.patch_size.raw());
+        }
+        dependencies.push(self.assembly.attribute_defaults.raw());
+        dependencies.push(self.assembly.vertex_id_uses_array_start.raw());
+        // The public ABI identifies the substitute address but not the state
+        // that makes it active. An unconsumed address does not alter a host
+        // pipeline key.
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDVertexInputWrite) {
         let raw = write.raw();
         let source = write.source();
         match write {
+            MaxwellThreeDVertexInputWrite::PrimitiveCircularBufferThrottle { value, .. } => {
+                self.primitive.circular_buffer_throttle =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::PatchSize { value, .. } => {
+                self.primitive.patch_size = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDVertexInputWrite::StreamFormat { stream, value, .. } => {
                 self.streams[stream as usize].format =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -576,12 +858,36 @@ impl MaxwellThreeDVertexInputState {
             MaxwellThreeDVertexInputWrite::Begin { value, .. } => {
                 self.primitive.begin = MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDVertexInputWrite::AttributeDefaults { value, .. } => {
+                self.assembly.attribute_defaults =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::VertexIdUsesArrayStart { value, .. } => {
+                self.assembly.vertex_id_uses_array_start =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressUpper { value, .. } => {
+                self.stream_substitute.address_upper =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressLower { value, .. } => {
+                self.stream_substitute.address_lower =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDVertexInputWrite {
+    PrimitiveCircularBufferThrottle {
+        value: MaxwellThreeDPrimitiveCircularBufferThrottle,
+        source: MaxwellMethodSource,
+    },
+    PatchSize {
+        value: MaxwellThreeDPatchSize,
+        source: MaxwellMethodSource,
+    },
     StreamFormat {
         stream: u8,
         value: MaxwellThreeDVertexStreamFormat,
@@ -674,12 +980,30 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: MaxwellThreeDBegin,
         source: MaxwellMethodSource,
     },
+    AttributeDefaults {
+        value: MaxwellThreeDAttributeDefaults,
+        source: MaxwellMethodSource,
+    },
+    VertexIdUsesArrayStart {
+        value: MaxwellThreeDVertexIdUsesArrayStart,
+        source: MaxwellMethodSource,
+    },
+    StreamSubstituteAddressUpper {
+        value: u8,
+        source: MaxwellMethodSource,
+    },
+    StreamSubstituteAddressLower {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
 }
 
 impl MaxwellThreeDVertexInputWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::StreamFormat { source, .. }
+            Self::PrimitiveCircularBufferThrottle { source, .. }
+            | Self::PatchSize { source, .. }
+            | Self::StreamFormat { source, .. }
             | Self::StreamAddressUpper { source, .. }
             | Self::StreamAddressLower { source, .. }
             | Self::StreamLimitUpper { source, .. }
@@ -699,7 +1023,11 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::PrimitiveRestartEnable { source, .. }
             | Self::PrimitiveRestartIndex { source, .. }
             | Self::VertexArrayStart { source, .. }
-            | Self::Begin { source, .. } => source,
+            | Self::Begin { source, .. }
+            | Self::AttributeDefaults { source, .. }
+            | Self::VertexIdUsesArrayStart { source, .. }
+            | Self::StreamSubstituteAddressUpper { source, .. }
+            | Self::StreamSubstituteAddressLower { source, .. } => source,
         }
     }
     pub(super) const fn raw(self) -> u32 {

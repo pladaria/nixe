@@ -37,6 +37,14 @@ pub struct MaxwellMethodSource {
 }
 
 impl MaxwellMethodSource {
+    pub(crate) const fn emitted_by_mme(self, method: GpuMethodId, argument: u32) -> Self {
+        Self {
+            method,
+            argument,
+            ..self
+        }
+    }
+
     #[must_use]
     pub const fn channel(self) -> MaxwellChannelId {
         self.channel
@@ -102,6 +110,14 @@ pub struct MaxwellMethodDispatch {
 }
 
 impl MaxwellMethodDispatch {
+    pub(crate) const fn emitted_by_mme(source: MaxwellMethodSource, class: GpuClassId) -> Self {
+        Self {
+            source,
+            class,
+            kind: MaxwellMethodDispatchKind::ClassMethod,
+        }
+    }
+
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         self.source

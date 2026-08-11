@@ -74,6 +74,139 @@ raw_u32_type!(
 );
 raw_u32_type!("Guest-visible shader architecture version.", ShaderVersion);
 
+/// One shader-program-header format version.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct MaxwellShaderProgramHeaderVersion(u16);
+
+impl MaxwellShaderProgramHeaderVersion {
+    #[must_use]
+    pub const fn new(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// Inclusive shader-program-header versions understood by one producer.
+///
+/// The two-field command encoding is pinned to NVIDIA's public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3153-L3159>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellShaderProgramHeaderVersionRange {
+    current: MaxwellShaderProgramHeaderVersion,
+    oldest_supported: MaxwellShaderProgramHeaderVersion,
+}
+
+impl MaxwellShaderProgramHeaderVersionRange {
+    #[must_use]
+    pub const fn new(
+        current: MaxwellShaderProgramHeaderVersion,
+        oldest_supported: MaxwellShaderProgramHeaderVersion,
+    ) -> Self {
+        Self {
+            current,
+            oldest_supported,
+        }
+    }
+
+    #[must_use]
+    pub const fn current(self) -> MaxwellShaderProgramHeaderVersion {
+        self.current
+    }
+
+    #[must_use]
+    pub const fn oldest_supported(self) -> MaxwellShaderProgramHeaderVersion {
+        self.oldest_supported
+    }
+
+    #[must_use]
+    pub const fn is_well_ordered(self) -> bool {
+        self.oldest_supported.raw() <= self.current.raw()
+    }
+
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.is_well_ordered()
+            && other.is_well_ordered()
+            && self.oldest_supported.raw() <= other.current.raw()
+            && other.oldest_supported.raw() <= self.current.raw()
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.current.raw() as u32 | ((self.oldest_supported.raw() as u32) << 16)
+    }
+}
+
+/// One AAM version.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct MaxwellAamVersion(u16);
+
+impl MaxwellAamVersion {
+    #[must_use]
+    pub const fn new(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// Inclusive AAM versions accepted by one profile.
+///
+/// The two-field command encoding is pinned to NVIDIA's public class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1110-L1116>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellAamVersionRange {
+    current: MaxwellAamVersion,
+    oldest_supported: MaxwellAamVersion,
+}
+
+impl MaxwellAamVersionRange {
+    #[must_use]
+    pub const fn new(current: MaxwellAamVersion, oldest_supported: MaxwellAamVersion) -> Self {
+        Self {
+            current,
+            oldest_supported,
+        }
+    }
+
+    #[must_use]
+    pub const fn current(self) -> MaxwellAamVersion {
+        self.current
+    }
+
+    #[must_use]
+    pub const fn oldest_supported(self) -> MaxwellAamVersion {
+        self.oldest_supported
+    }
+
+    #[must_use]
+    pub const fn is_well_ordered(self) -> bool {
+        self.oldest_supported.raw() <= self.current.raw()
+    }
+
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.is_well_ordered()
+            && other.is_well_ordered()
+            && self.oldest_supported.raw() <= other.current.raw()
+            && other.oldest_supported.raw() <= self.current.raw()
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.current.raw() as u32 | ((self.oldest_supported.raw() as u32) << 16)
+    }
+}
+
 /// Number of implemented bits in one guest GPU address.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -438,6 +571,7 @@ impl MaxwellZCullCapabilities {
 pub struct MaxwellShaderCapabilities {
     sm_version: ShaderVersion,
     spa_version: ShaderVersion,
+    sph_versions: MaxwellShaderProgramHeaderVersionRange,
     warp_count: u32,
 }
 
@@ -450,6 +584,11 @@ impl MaxwellShaderCapabilities {
     #[must_use]
     pub const fn spa_version(self) -> ShaderVersion {
         self.spa_version
+    }
+
+    #[must_use]
+    pub const fn sph_versions(self) -> MaxwellShaderProgramHeaderVersionRange {
+        self.sph_versions
     }
 
     #[must_use]
@@ -471,6 +610,7 @@ pub struct MaxwellGpuProfile {
     interconnect: MaxwellInterconnectCapabilities,
     z_cull: MaxwellZCullCapabilities,
     shader: MaxwellShaderCapabilities,
+    aam_versions: MaxwellAamVersionRange,
     feature_flags: GpuFeatureFlags,
 }
 
@@ -523,6 +663,11 @@ impl MaxwellGpuProfile {
     #[must_use]
     pub const fn shader(self) -> MaxwellShaderCapabilities {
         self.shader
+    }
+
+    #[must_use]
+    pub const fn aam_versions(self) -> MaxwellAamVersionRange {
+        self.aam_versions
     }
 
     #[must_use]
@@ -666,6 +811,20 @@ impl MaxwellGpuProfile {
                 },
             );
         }
+        if !shader.sph_versions.is_well_ordered() {
+            return Err(
+                MaxwellProfileValidationError::InvalidShaderProgramHeaderVersionRange {
+                    current: shader.sph_versions.current(),
+                    oldest_supported: shader.sph_versions.oldest_supported(),
+                },
+            );
+        }
+        if !self.aam_versions.is_well_ordered() {
+            return Err(MaxwellProfileValidationError::InvalidAamVersionRange {
+                current: self.aam_versions.current(),
+                oldest_supported: self.aam_versions.oldest_supported(),
+            });
+        }
 
         Ok(())
     }
@@ -739,6 +898,14 @@ pub enum MaxwellProfileValidationError {
         sm_version: ShaderVersion,
         spa_version: ShaderVersion,
         warp_count: u32,
+    },
+    InvalidShaderProgramHeaderVersionRange {
+        current: MaxwellShaderProgramHeaderVersion,
+        oldest_supported: MaxwellShaderProgramHeaderVersion,
+    },
+    InvalidAamVersionRange {
+        current: MaxwellAamVersion,
+        oldest_supported: MaxwellAamVersion,
     },
 }
 
@@ -827,8 +994,15 @@ pub const SWITCH_1_GM20B_PROFILE: MaxwellGpuProfile = MaxwellGpuProfile {
     shader: MaxwellShaderCapabilities {
         sm_version: ShaderVersion::from_raw(0x503),
         spa_version: ShaderVersion::from_raw(0x503),
+        // Switch 1 command streams select and check SPH format version 3.
+        sph_versions: MaxwellShaderProgramHeaderVersionRange::new(
+            MaxwellShaderProgramHeaderVersion::new(3),
+            MaxwellShaderProgramHeaderVersion::new(3),
+        ),
         warp_count: 0x80,
     },
+    // Switch 1 command streams select and check AAM version 2.
+    aam_versions: MaxwellAamVersionRange::new(MaxwellAamVersion::new(2), MaxwellAamVersion::new(2)),
     feature_flags: GpuFeatureFlags::from_raw(0x55),
 };
 
@@ -905,8 +1079,16 @@ mod tests {
         shader: MaxwellShaderCapabilities {
             sm_version: ShaderVersion::from_raw(0x101),
             spa_version: ShaderVersion::from_raw(0x101),
+            sph_versions: MaxwellShaderProgramHeaderVersionRange::new(
+                MaxwellShaderProgramHeaderVersion::new(4),
+                MaxwellShaderProgramHeaderVersion::new(2),
+            ),
             warp_count: 8,
         },
+        aam_versions: MaxwellAamVersionRange::new(
+            MaxwellAamVersion::new(5),
+            MaxwellAamVersion::new(2),
+        ),
         feature_flags: GpuFeatureFlags::from_raw(0xa5),
     };
 
@@ -928,6 +1110,8 @@ mod tests {
         assert_eq!(PROFILE.interconnect().bus_type().raw(), 7);
         assert_eq!(PROFILE.z_cull().subregion_count(), 3);
         assert_eq!(PROFILE.shader().sm_version().raw(), 0x101);
+        assert_eq!(PROFILE.shader().sph_versions().raw(), 0x0002_0004);
+        assert_eq!(PROFILE.aam_versions().raw(), 0x0002_0005);
         assert_eq!(PROFILE.feature_flags().raw(), 0xa5);
     }
 
@@ -943,6 +1127,11 @@ mod tests {
     #[test]
     fn switch_1_gm20b_profile_is_internally_consistent() {
         assert_eq!(SWITCH_1_GM20B_PROFILE.validate(), Ok(()));
+        assert_eq!(
+            SWITCH_1_GM20B_PROFILE.shader().sph_versions().raw(),
+            0x0003_0003
+        );
+        assert_eq!(SWITCH_1_GM20B_PROFILE.aam_versions().raw(), 0x0002_0002);
         assert_eq!(
             SWITCH_1_GM20B_PROFILE.topology().tpc_enable_masks(),
             &[0b11]
@@ -1030,6 +1219,41 @@ mod tests {
                     warp_count: 8,
                 }
             )
+        );
+
+        let invalid = MaxwellGpuProfile {
+            shader: MaxwellShaderCapabilities {
+                sph_versions: MaxwellShaderProgramHeaderVersionRange::new(
+                    MaxwellShaderProgramHeaderVersion::new(2),
+                    MaxwellShaderProgramHeaderVersion::new(3),
+                ),
+                ..PROFILE.shader
+            },
+            ..PROFILE
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(
+                MaxwellProfileValidationError::InvalidShaderProgramHeaderVersionRange {
+                    current: MaxwellShaderProgramHeaderVersion::new(2),
+                    oldest_supported: MaxwellShaderProgramHeaderVersion::new(3),
+                }
+            )
+        );
+
+        let invalid = MaxwellGpuProfile {
+            aam_versions: MaxwellAamVersionRange::new(
+                MaxwellAamVersion::new(2),
+                MaxwellAamVersion::new(3),
+            ),
+            ..PROFILE
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(MaxwellProfileValidationError::InvalidAamVersionRange {
+                current: MaxwellAamVersion::new(2),
+                oldest_supported: MaxwellAamVersion::new(3),
+            })
         );
     }
 }

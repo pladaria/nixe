@@ -8,10 +8,11 @@ use nixe_gpu::{
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
-    MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
-    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
-    capture_maxwell_frontend_dispatch, decode_gpfifo_submission, resolve_gpfifo_submission,
+    MaxwellFrontendDispatchBoundary, MaxwellFrontendFailure, MaxwellGpfifoDecodeError,
+    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+    MaxwellInvalidGpfifoSubmission, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
+    MaxwellThreeDLoweringCache, MaxwellZCullMode, capture_maxwell_frontend_dispatch,
+    decode_gpfifo_submission, preflight_maxwell_submission_execution, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -517,10 +518,28 @@ fn submit_gpfifo(
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let (capture, replay) =
         capture_maxwell_frontend_dispatch(&dispatch, channel, dispatch_address_space);
+    let execution_failure = matches!(
+        replay.failure(),
+        MaxwellFrontendFailure::ExecutionUnavailable
+    )
+    .then(|| {
+        preflight_maxwell_submission_execution(
+            replay.packets(),
+            dispatch_address_space,
+            dispatch.scheduled().frontend(),
+            Vec::new(),
+            dispatch.scheduled().completion(),
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .err()
+        .map(Box::new)
+    })
+    .flatten();
     let boundary = MaxwellFrontendDispatchBoundary::Frontend {
         dispatch: Box::new(dispatch),
         capture: Box::new(capture),
         replay: Box::new(replay),
+        execution_failure,
     };
     // The reservation remains embedded in this fatal boundary and is neither
     // backend-complete nor guest-visible. T8 and later own neutral execution.

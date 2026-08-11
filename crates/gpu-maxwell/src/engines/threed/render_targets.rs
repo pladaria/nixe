@@ -6,6 +6,99 @@ use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_COLOR_TARGET_COUNT: usize = 8;
 
+/// Source of the render-target layer selected for rasterized primitives.
+///
+/// The public `MAXWELL_B` class header defines the fixed layer and selector
+/// fields. It does not document how a non-zero fixed layer composes with the
+/// per-attachment `SET_COLOR_TARGET_LAYER` offset, so that execution remains
+/// an explicit lowering boundary.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2907-L2911>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDRenderTargetLayerControl {
+    Fixed = 0,
+    GeometryShader = 1,
+}
+
+/// Validated `SET_RT_LAYER` value.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDRenderTargetLayer {
+    layer: u16,
+    control: MaxwellThreeDRenderTargetLayerControl,
+}
+
+impl MaxwellThreeDRenderTargetLayer {
+    #[must_use]
+    pub const fn new(layer: u16, control: MaxwellThreeDRenderTargetLayerControl) -> Self {
+        Self { layer, control }
+    }
+
+    pub(super) const fn parse(raw: u32) -> Self {
+        let control = if raw & 0x0001_0000 == 0 {
+            MaxwellThreeDRenderTargetLayerControl::Fixed
+        } else {
+            MaxwellThreeDRenderTargetLayerControl::GeometryShader
+        };
+        Self::new(raw as u16, control)
+    }
+
+    #[must_use]
+    pub const fn layer(self) -> u16 {
+        self.layer
+    }
+
+    #[must_use]
+    pub const fn control(self) -> MaxwellThreeDRenderTargetLayerControl {
+        self.control
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.layer as u32 | ((self.control as u32) << 16)
+    }
+
+    #[must_use]
+    pub const fn affects_draw_layering(self) -> bool {
+        self.layer != 0
+            || matches!(
+                self.control,
+                MaxwellThreeDRenderTargetLayerControl::GeometryShader
+            )
+    }
+}
+
+/// Whether fragment color outputs are routed separately to MRT slots.
+///
+/// NVIDIA publishes the boolean field and encodings. The pinned envytools
+/// register description establishes that disabling it sends fragment color
+/// output zero to every render target, independently of `SET_CT_SELECT` and
+/// the fragment-program header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1292-L1295>
+/// <https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L453-L456>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDSeparateFragmentData {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDSeparateFragmentData {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Readiness of a frontend attachment description. A disabled attachment is
 /// intentionally different from one never programmed or unsupported by the
 /// selected immutable GPU profile.
@@ -423,6 +516,61 @@ pub struct MaxwellThreeDClearSurface {
     array_layer: u16,
 }
 
+/// Modifiers applied by a later `CLEAR_SURFACE` trigger.
+///
+/// NVIDIA publishes the four independent boolean fields in the pinned public
+/// class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1560-L1572>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDClearSurfaceControl {
+    respect_stencil_mask: bool,
+    use_clear_rect: bool,
+    use_scissor_zero: bool,
+    use_viewport_clip_zero: bool,
+}
+
+impl MaxwellThreeDClearSurfaceControl {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x0000_1111 != 0 {
+            return None;
+        }
+        Some(Self {
+            respect_stencil_mask: raw & 0x0000_0001 != 0,
+            use_clear_rect: raw & 0x0000_0010 != 0,
+            use_scissor_zero: raw & 0x0000_0100 != 0,
+            use_viewport_clip_zero: raw & 0x0000_1000 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn respect_stencil_mask(self) -> bool {
+        self.respect_stencil_mask
+    }
+
+    #[must_use]
+    pub const fn use_clear_rect(self) -> bool {
+        self.use_clear_rect
+    }
+
+    #[must_use]
+    pub const fn use_scissor_zero(self) -> bool {
+        self.use_scissor_zero
+    }
+
+    #[must_use]
+    pub const fn use_viewport_clip_zero(self) -> bool {
+        self.use_viewport_clip_zero
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.respect_stencil_mask as u32
+            | ((self.use_clear_rect as u32) << 4)
+            | ((self.use_scissor_zero as u32) << 8)
+            | ((self.use_viewport_clip_zero as u32) << 12)
+    }
+}
+
 impl MaxwellThreeDClearSurface {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         let color_target = ((raw >> 6) & 0xf) as u8;
@@ -469,6 +617,7 @@ pub struct MaxwellThreeDClearState {
     stencil: MaxwellThreeDRegister<u8>,
     horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
     vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
+    surface_control: MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl>,
     last_surface: MaxwellThreeDRegister<MaxwellThreeDClearSurface>,
 }
 
@@ -494,6 +643,12 @@ impl MaxwellThreeDClearState {
         &self.vertical
     }
     #[must_use]
+    pub const fn surface_control(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl> {
+        &self.surface_control
+    }
+    #[must_use]
     pub const fn last_surface(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClearSurface> {
         &self.last_surface
     }
@@ -503,6 +658,8 @@ impl MaxwellThreeDClearState {
 pub struct MaxwellThreeDRenderTargetState {
     color: [MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT],
     color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
+    separate_fragment_data: MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData>,
+    render_target_layer: MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer>,
     depth_stencil: MaxwellThreeDDepthStencilTargetState,
     clear: MaxwellThreeDClearState,
 }
@@ -517,6 +674,18 @@ impl MaxwellThreeDRenderTargetState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection> {
         &self.color_target_selection
+    }
+    #[must_use]
+    pub const fn separate_fragment_data(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData> {
+        &self.separate_fragment_data
+    }
+    #[must_use]
+    pub const fn render_target_layer(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer> {
+        &self.render_target_layer
     }
     #[must_use]
     pub const fn depth_stencil(&self) -> &MaxwellThreeDDepthStencilTargetState {
@@ -581,6 +750,12 @@ impl MaxwellThreeDRenderTargetState {
             MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, .. } => {
                 self.color_target_selection = MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
+                self.separate_fragment_data = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::RenderTargetLayer { value, .. } => {
+                self.render_target_layer = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDRenderTargetWrite::DepthAddressUpper { value, .. } => {
                 self.depth_stencil.address_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -631,6 +806,9 @@ impl MaxwellThreeDRenderTargetState {
             }
             MaxwellThreeDRenderTargetWrite::ClearVertical { value, .. } => {
                 self.clear.vertical = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { value, .. } => {
+                self.clear.surface_control = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDRenderTargetWrite::ClearSurface { value, .. } => {
                 self.clear.last_surface = MaxwellThreeDRegister::programmed(raw, value, source)
@@ -696,6 +874,14 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: MaxwellThreeDColorTargetSelection,
         source: MaxwellMethodSource,
     },
+    SeparateFragmentData {
+        value: MaxwellThreeDSeparateFragmentData,
+        source: MaxwellMethodSource,
+    },
+    RenderTargetLayer {
+        value: MaxwellThreeDRenderTargetLayer,
+        source: MaxwellMethodSource,
+    },
     DepthAddressUpper {
         value: u8,
         source: MaxwellMethodSource,
@@ -754,6 +940,10 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: MaxwellThreeDRectangle,
         source: MaxwellMethodSource,
     },
+    ClearSurfaceControl {
+        value: MaxwellThreeDClearSurfaceControl,
+        source: MaxwellMethodSource,
+    },
     ClearSurface {
         value: MaxwellThreeDClearSurface,
         source: MaxwellMethodSource,
@@ -774,6 +964,8 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::ColorLayer { source, .. }
             | Self::ColorCompression { source, .. }
             | Self::ColorTargetSelection { source, .. }
+            | Self::SeparateFragmentData { source, .. }
+            | Self::RenderTargetLayer { source, .. }
             | Self::DepthAddressUpper { source, .. }
             | Self::DepthAddressLower { source, .. }
             | Self::DepthFormat { source, .. }
@@ -788,6 +980,7 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::ClearStencil { source, .. }
             | Self::ClearHorizontal { source, .. }
             | Self::ClearVertical { source, .. }
+            | Self::ClearSurfaceControl { source, .. }
             | Self::ClearSurface { source, .. } => source,
         }
     }
