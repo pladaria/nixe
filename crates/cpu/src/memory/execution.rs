@@ -6,14 +6,14 @@
 //! sparse radix leaf and then indexes a stable physical-page slot directly.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    sync::{Condvar, Mutex, MutexGuard, PoisonError},
 };
 
 use nixe_memory::{
     BackingStoreId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageId, CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason,
-    CanonicalRangeTranslator,
+    CanonicalPageError, CanonicalPageId, CanonicalRangeTranslationError,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
 };
 
 use crate::{
@@ -245,12 +245,87 @@ impl ExecutionMemoryInner {
 /// slots. It shares public semantic types with [`super::SyntheticMemory`], but
 /// neither its storage nor any instruction/data hot path delegates to it.
 ///
-/// Interior mutability remains necessary because [`CpuMemory`] models guest
-/// writes and MMIO through shared references. The `RefCell` protects the safe,
-/// single-threaded ownership contract; resolved physical pages are nevertheless
-/// reached by direct slot indexing rather than a second associative lookup.
+/// Semantic accesses are serialized by one process-memory transaction lock.
+/// This intentionally conservative Phase-D policy makes cross-page validation,
+/// canonical-page generation changes, MMIO callbacks, and mapping lookup one
+/// indivisible operation while permitting the memory object to be shared by
+/// future vCPU workers.
 pub struct ExecutionMemory {
-    inner: RefCell<ExecutionMemoryInner>,
+    inner: Mutex<ExecutionMemoryInner>,
+    lease_state: Mutex<ExecutionLeaseState>,
+    lease_changed: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MappingEpoch(u64);
+
+impl MappingEpoch {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionLeaseState {
+    active: usize,
+    mutating: bool,
+    epoch: MappingEpoch,
+}
+
+/// RAII proof that one executor may use mappings from the recorded epoch.
+/// Mapping mutation waits for every such lease to be released at a safepoint.
+pub struct ExecutionMemoryLease<'a> {
+    memory: &'a ExecutionMemory,
+    epoch: MappingEpoch,
+}
+
+impl ExecutionMemoryLease<'_> {
+    #[must_use]
+    pub const fn epoch(&self) -> MappingEpoch {
+        self.epoch
+    }
+}
+
+impl Drop for ExecutionMemoryLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.memory.lock_lease_state();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("an execution lease is released exactly once");
+        if state.active == 0 {
+            self.memory.lease_changed.notify_all();
+        }
+    }
+}
+
+struct MappingMutationGuard<'a> {
+    memory: &'a ExecutionMemory,
+    state: MutexGuard<'a, ExecutionLeaseState>,
+    committed: bool,
+}
+
+impl MappingMutationGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for MappingMutationGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            self.state.epoch = MappingEpoch(
+                self.state
+                    .epoch
+                    .0
+                    .checked_add(1)
+                    .expect("mapping epoch exhaustion is unreachable in one host run"),
+            );
+        }
+        self.state.mutating = false;
+        self.memory.lease_changed.notify_all();
+    }
 }
 
 impl Default for ExecutionMemory {
@@ -269,7 +344,85 @@ impl ExecutionMemory {
             ..ExecutionMemoryInner::default()
         };
         Self {
-            inner: RefCell::new(inner),
+            inner: Mutex::new(inner),
+            lease_state: Mutex::new(ExecutionLeaseState {
+                active: 0,
+                mutating: false,
+                epoch: MappingEpoch(1),
+            }),
+            lease_changed: Condvar::new(),
+        }
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, ExecutionMemoryInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn inner_mut(&mut self) -> &mut ExecutionMemoryInner {
+        self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_lease_state(&self) -> MutexGuard<'_, ExecutionLeaseState> {
+        self.lease_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Acquires one mapping-stable execution lease for a bounded engine slice.
+    pub fn acquire_execution_lease(&self) -> ExecutionMemoryLease<'_> {
+        let mut state = self.lock_lease_state();
+        while state.mutating {
+            state = self
+                .lease_changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("host execution lease count is bounded by active vCPUs");
+        let epoch = state.epoch;
+        ExecutionMemoryLease {
+            memory: self,
+            epoch,
+        }
+    }
+
+    /// Returns the mapping epoch visible to newly acquired execution leases.
+    #[must_use]
+    pub fn mapping_epoch(&self) -> MappingEpoch {
+        self.lock_lease_state().epoch
+    }
+
+    /// Reports whether a mapping mutation has closed admission to new engine
+    /// slices and is waiting for, or currently owns, quiescence.
+    #[must_use]
+    pub fn mapping_mutation_pending(&self) -> bool {
+        self.lock_lease_state().mutating
+    }
+
+    fn begin_mapping_mutation(&self) -> MappingMutationGuard<'_> {
+        let mut state = self.lock_lease_state();
+        while state.mutating {
+            state = self
+                .lease_changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        // Publish the mutation intent before waiting for existing executors.
+        // Otherwise new leases could continuously overtake a pending mapping
+        // change and prevent the coordinator from ever reaching quiescence.
+        state.mutating = true;
+        while state.active != 0 {
+            state = self
+                .lease_changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        MappingMutationGuard {
+            memory: self,
+            state,
+            committed: false,
         }
     }
 
@@ -279,7 +432,7 @@ impl ExecutionMemory {
         address_space: AddressSpaceId,
         requests: &[SyntheticRamPage<'_>],
     ) -> Result<(), SyntheticInstallError> {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         let mut virtual_pages = Vec::with_capacity(requests.len());
         let mut unique_virtual_pages = BTreeSet::new();
         for request in requests {
@@ -442,8 +595,7 @@ impl ExecutionMemory {
         address_space: AddressSpaceId,
         virtual_address: GuestVirtualAddress,
     ) -> Option<SyntheticMappingInfo> {
-        self.inner
-            .borrow()
+        self.lock_inner()
             .mapping_at(address_space, virtual_address)
             .map(|mapping| SyntheticMappingInfo {
                 physical_page: mapping.physical_page,
@@ -471,7 +623,7 @@ impl ExecutionMemory {
         };
         let first_page = start.get() >> PAGE_SHIFT;
         let end_page = end >> PAGE_SHIFT;
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         if !(first_page..end_page).all(|page| inner.mappings.get(address_space, page).is_some()) {
             return false;
         }
@@ -492,12 +644,29 @@ impl ExecutionMemory {
     /// Returns the number of physical pages owned by this backend.
     #[must_use]
     pub fn physical_page_count(&self) -> usize {
-        self.inner.borrow().slots_by_id.len()
+        self.lock_inner().slots_by_id.len()
+    }
+
+    /// Returns a deterministic watermark covering every resident canonical RAM
+    /// page. Engine handoff uses it to detect dirty-state reconciliation.
+    #[must_use]
+    pub fn content_generation_watermark(&self) -> u64 {
+        self.lock_inner()
+            .physical_slots
+            .iter()
+            .filter_map(|slot| match slot.as_ref() {
+                Some(ExecutionPhysicalPage::Ram(backing)) => {
+                    Some(backing.content_generation().get())
+                }
+                Some(ExecutionPhysicalPage::Mmio(_)) | None => None,
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     /// Creates a zero-filled RAM page for explicit runtime or differential setup.
     pub fn add_ram_page(&mut self, page: GuestPhysicalPageId) -> bool {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         let Some(identity) = inner.canonical_page_id(page) else {
             return false;
         };
@@ -519,8 +688,7 @@ impl ExecutionMemory {
         page: GuestPhysicalPageId,
         handler: impl SyntheticMmio + 'static,
     ) -> bool {
-        self.inner
-            .get_mut()
+        self.inner_mut()
             .push_page(page, ExecutionPhysicalPage::Mmio(Box::new(handler)))
             .is_some()
     }
@@ -532,7 +700,7 @@ impl ExecutionMemory {
         offset: usize,
         bytes: &[u8],
     ) -> bool {
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         let Some(&slot) = inner.slots_by_id.get(&page) else {
             return false;
         };
@@ -593,7 +761,7 @@ impl ExecutionMemory {
         let Some(end) = address.get().checked_add(bytes.len() as u64) else {
             return false;
         };
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let mut cursor = address.get();
         let mut pending_generations = BTreeMap::new();
         while cursor < end {
@@ -663,7 +831,7 @@ impl ExecutionMemory {
         if !virtual_address.is_aligned_to(SYNTHETIC_PAGE_SIZE as u64) {
             return false;
         }
-        let inner = self.inner.get_mut();
+        let inner = self.inner_mut();
         let Some(&physical_slot) = inner.slots_by_id.get(&physical_page) else {
             return false;
         };
@@ -705,7 +873,7 @@ impl ExecutionMemory {
                 },
             ));
         }
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let end_offset = page_offset(address) + N;
         // The only callers request aligned 2-byte or 4-byte architectural
         // encodings. Both widths divide the page size, so a valid fetch cannot
@@ -761,7 +929,7 @@ impl InstructionMemory for ExecutionMemory {
         address: GuestVirtualAddress,
     ) -> Result<CodePageSpan, InstructionFetchFault> {
         let page_start = GuestVirtualAddress::new(address.get() >> PAGE_SHIFT << PAGE_SHIFT);
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
             InstructionFetchFault::new(
                 address_space,
@@ -856,7 +1024,7 @@ impl CanonicalRangeTranslator for ExecutionMemory {
             )
         })?;
 
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let mut cursor = address;
         let mut remaining = size;
         while remaining != 0 {
@@ -1029,7 +1197,7 @@ impl CpuMemory for ExecutionMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<DataReadResult, DataAccessFault> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         let resolved =
             resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
         if resolved.region == MemoryRegionKind::Device {
@@ -1140,7 +1308,7 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::ValueSizeMismatch,
             ));
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.lock_inner();
         let resolved = resolve_data_access(
             &inner,
             address_space,
@@ -1323,7 +1491,7 @@ impl CpuMemory for ExecutionMemory {
         if address.get() >= end_exclusive.get() {
             return None;
         }
-        let inner = self.inner.borrow();
+        let inner = self.lock_inner();
         let page_size = SYNTHETIC_PAGE_SIZE as u64;
         let page = address.get() >> PAGE_SHIFT;
         let end_page = end_exclusive.get() >> PAGE_SHIFT;
@@ -1382,11 +1550,18 @@ impl CpuMemory for ExecutionMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
     ) -> Result<(DataReadResult, ExclusiveReservation), DataAccessFault> {
-        let value = self.read(address_space, address, access)?;
-        let inner = self.inner.borrow();
-        let mapping = inner
-            .mapping_at(address_space, address)
-            .expect("load was validated");
+        let inner = self.lock_inner();
+        let resolved =
+            resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+        if resolved.second.is_some() {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        }
+        let mapping = resolved.first;
         let ExecutionPhysicalPage::Ram(backing) = inner
             .page(mapping.physical_slot)
             .expect("mapping references a page")
@@ -1398,13 +1573,28 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::MixedRegions,
             ));
         };
+        let byte_count = access.size.bytes();
+        let mut bytes = [0_u8; 16];
+        let generation = backing
+            .read_with_generation(page_offset(address), &mut bytes[..byte_count])
+            .map_err(|reason| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?;
         Ok((
-            value,
+            DataReadResult {
+                value: MemoryValue::from_le_slice(access.size, &bytes[..byte_count]),
+                region: MemoryRegionKind::Ram,
+            },
             ExclusiveReservation {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                generation: backing.content_generation(),
+                generation,
             },
         ))
     }
@@ -1417,41 +1607,52 @@ impl CpuMemory for ExecutionMemory {
         value: MemoryValue,
         reservation: ExclusiveReservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault> {
-        let matches = {
-            let inner = self.inner.borrow();
-            let resolved = resolve_data_access(
-                &inner,
+        if value.size() != access.size {
+            return Err(DataAccessFault::new(
                 address_space,
                 address,
-                access,
                 DataAccessKind::Write,
-            )?;
-            let generation = match inner.page(resolved.first.physical_slot) {
-                Some(ExecutionPhysicalPage::Ram(backing)) => {
-                    backing.prepare_cpu_access().map_err(|reason| {
-                        DataAccessFault::new(
-                            address_space,
-                            address,
-                            DataAccessKind::Write,
-                            DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                        )
-                    })?;
-                    backing.content_generation()
-                }
-                _ => {
-                    return Err(DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Write,
-                        DataAccessFaultReason::MixedRegions,
-                    ));
-                }
-            };
-            reservation.page == resolved.first.physical_page
-                && usize::from(reservation.byte_offset) == page_offset(address)
-                && usize::from(reservation.access_size) == access.size.bytes()
-                && reservation.generation == generation
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        let inner = self.lock_inner();
+        let resolved = resolve_data_access(
+            &inner,
+            address_space,
+            address,
+            access,
+            DataAccessKind::Write,
+        )?;
+        if resolved.second.is_some() {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        }
+        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(resolved.first.physical_slot)
+        else {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::MixedRegions,
+            ));
         };
+        backing.prepare_cpu_access().map_err(|reason| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::HostBacking(reason.to_string().into()),
+            )
+        })?;
+        let generation = backing.content_generation();
+        let matches = reservation.page == resolved.first.physical_page
+            && usize::from(reservation.byte_offset) == page_offset(address)
+            && usize::from(reservation.access_size) == access.size.bytes()
+            && reservation.generation == generation;
         if !matches {
             return Ok((
                 DataWriteResult {
@@ -1460,8 +1661,55 @@ impl CpuMemory for ExecutionMemory {
                 false,
             ));
         }
-        self.write(address_space, address, access, value)
-            .map(|result| (result, true))
+        backing.prepare_write().map_err(|reason| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::HostBacking(reason.to_string().into()),
+            )
+        })?;
+        let next_generation = generation.next().map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ContentGenerationExhausted,
+            )
+        })?;
+        let mut bytes = [0_u8; 16];
+        let byte_count = access.size.bytes();
+        value.copy_le_bytes(&mut bytes[..byte_count]);
+        match backing.write_preflighted(
+            page_offset(address),
+            &bytes[..byte_count],
+            generation,
+            next_generation,
+        ) {
+            Ok(()) => {}
+            Err(CanonicalPageError::StaleGeneration { .. }) => {
+                return Ok((
+                    DataWriteResult {
+                        region: MemoryRegionKind::Ram,
+                    },
+                    false,
+                ));
+            }
+            Err(reason) => {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                ));
+            }
+        }
+        Ok((
+            DataWriteResult {
+                region: MemoryRegionKind::Ram,
+            },
+            true,
+        ))
     }
 }
 
@@ -1497,7 +1745,8 @@ impl ProcessMemory for ExecutionMemory {
         let first_page = start.get() >> PAGE_SHIFT;
         let old_end_page = first_page + old_size / page_size;
         let new_end_page = first_page + new_size / page_size;
-        let mut inner = self.inner.borrow_mut();
+        let mut mutation = self.begin_mapping_mutation();
+        let mut inner = self.lock_inner();
         for page in first_page..old_end_page {
             let Some(mapping) = inner.mappings.get(address_space, page) else {
                 return Err(error(
@@ -1541,6 +1790,7 @@ impl ProcessMemory for ExecutionMemory {
                     inner.remove_page(mapping.physical_page, mapping.physical_slot);
                 }
             }
+            mutation.commit();
             return Ok(());
         }
         if new_end_page == old_end_page {
@@ -1610,6 +1860,7 @@ impl ProcessMemory for ExecutionMemory {
             debug_assert!(previous.is_none());
         }
         inner.next_page_id = next_page_id;
+        mutation.commit();
         Ok(())
     }
 
@@ -1643,7 +1894,8 @@ impl ProcessMemory for ExecutionMemory {
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
         let first_page = start.get() >> PAGE_SHIFT;
         let end_page = end >> PAGE_SHIFT;
-        let mut inner = self.inner.borrow_mut();
+        let mut mutation = self.begin_mapping_mutation();
+        let mut inner = self.lock_inner();
         for page in first_page..end_page {
             let Some(mapping) = inner.mappings.get(address_space, page) else {
                 return Err(error(
@@ -1682,6 +1934,7 @@ impl ProcessMemory for ExecutionMemory {
             mapping.permissions = permissions;
             mapping.mapping_generation = mapping_generation;
         }
+        mutation.commit();
         Ok(())
     }
 
@@ -1712,7 +1965,8 @@ impl ProcessMemory for ExecutionMemory {
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
         let first_page = start.get() >> PAGE_SHIFT;
         let end_page = end >> PAGE_SHIFT;
-        let mut inner = self.inner.borrow_mut();
+        let mut mutation = self.begin_mapping_mutation();
+        let mut inner = self.lock_inner();
         for page in first_page..end_page {
             if inner.mappings.get(address_space, page).is_none() {
                 return Err(error(
@@ -1745,6 +1999,7 @@ impl ProcessMemory for ExecutionMemory {
                 .expect("existing, masked, and replacement attributes are bounded");
             mapping.mapping_generation = mapping_generation;
         }
+        mutation.commit();
         Ok(())
     }
 }
@@ -2097,7 +2352,7 @@ mod tests {
             MemoryPermissions::READ,
         ));
 
-        let inner = memory.inner.get_mut();
+        let inner = memory.inner_mut();
         assert_eq!(inner.mappings.leaves.len(), 2);
         assert_eq!(inner.mappings.mappings().count(), 2);
     }
@@ -2140,7 +2395,7 @@ mod tests {
             )
             .unwrap();
 
-        let inner = memory.inner.borrow();
+        let inner = memory.lock_inner();
         assert_eq!(inner.physical_slots.len(), 4);
         assert_eq!(inner.slots_by_id.len(), 4);
         assert!(inner.free_physical_slots.is_empty());
@@ -2149,7 +2404,7 @@ mod tests {
     #[test]
     fn identity_exhaustion_does_not_publish_partial_installation() {
         let mut memory = ExecutionMemory::new();
-        memory.inner.get_mut().next_page_id = u64::MAX;
+        memory.inner_mut().next_page_id = u64::MAX;
         let bytes = [0x5a; SYNTHETIC_PAGE_SIZE];
         let address = GuestVirtualAddress::new(0x1000);
 

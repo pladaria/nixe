@@ -145,7 +145,7 @@ impl RuntimeCoordinator {
     /// are counted and ignored after their generation loses the race.
     pub fn drain_external_events(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
         let mut report = CoordinatorDrainReport::default();
-        while let Some(event) = self.inbox.try_recv()? {
+        while let Some(event) = self.inbox.try_recv_sequenced()? {
             self.apply_external_event(event, &mut report)?;
         }
         Ok(report)
@@ -153,7 +153,7 @@ impl RuntimeCoordinator {
 
     /// Blocks only at the external ingress when no guest thread is runnable.
     pub fn wait_for_external_event(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
-        let event = self.inbox.recv()?;
+        let event = self.inbox.recv_sequenced()?;
         let mut report = CoordinatorDrainReport::default();
         self.apply_external_event(event, &mut report)?;
         Ok(report)
@@ -161,11 +161,14 @@ impl RuntimeCoordinator {
 
     pub(super) fn apply_external_event(
         &mut self,
-        event: ExternalEvent,
+        event: crate::SequencedExternalEvent,
         report: &mut CoordinatorDrainReport,
     ) -> Result<(), CoordinatorError> {
+        self.record_external_event(event);
         report.received += 1;
-        match event {
+        report.first_sequence.get_or_insert(event.sequence);
+        report.last_sequence = Some(event.sequence);
+        match event.event {
             ExternalEvent::HostStop => self.host_stop_requested = true,
             ExternalEvent::Wake { token, .. } => {
                 if self.apply_wake(token, false)? {
@@ -180,11 +183,6 @@ impl RuntimeCoordinator {
                 } else {
                     report.stale += 1;
                 }
-            }
-            ExternalEvent::WorkerCompleted { lease, outcome } => {
-                self.scheduler
-                    .apply(SchedulerCommand::Complete { lease, outcome })?;
-                report.worker_results += 1;
             }
         }
         Ok(())

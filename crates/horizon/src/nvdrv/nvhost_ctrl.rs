@@ -165,7 +165,8 @@ struct GpuSyncpointEvent {
 
 impl GpuSyncpointEvent {
     fn new(slot: GpuSyncpointEventSlot, registered: bool) -> Self {
-        let (writable, readable) = EventObject::create_pair();
+        let (writable, readable) =
+            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
         Self {
             source: GraphicsEventSource::GpuSyncpoint {
                 event_slot: slot.get(),
@@ -590,7 +591,8 @@ impl NvHostControl {
         let deadline = u64::try_from(timeout_microseconds)
             .ok()
             .and_then(|timeout| Instant::now().checked_add(Duration::from_micros(timeout)));
-        let (writable, readable) = EventObject::create_pair();
+        let (writable, readable) =
+            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
         self.direct_waits.insert(
             waiter_id,
             DirectWait {

@@ -109,8 +109,7 @@ fn set_heap_size(
         return resume();
     }
     let old_size = context.process().heap_size();
-    match context.process().memory().resize_zeroed_mapping(
-        context.process().cpu().address_space_id(),
+    match context.process().resize_memory_mapping(
         layout.heap().base(),
         old_size,
         new_size,
@@ -656,7 +655,7 @@ impl HorizonSvcDispatcher {
                     .ok_or(HorizonSvcFault::InternalRuntime {
                         operation: "StartThread",
                     })?;
-                write_register(&mut caller.state, 0, u64::from(code.raw()));
+                write_register(caller.state_mut(), 0, u64::from(code.raw()));
                 coordinator.make_thread_ready(thread_id).map_err(|_| {
                     HorizonSvcFault::InternalRuntime {
                         operation: "StartThread",
@@ -893,7 +892,7 @@ impl HorizonSvcDispatcher {
                 });
             }
         };
-        let state = &mut coordinator
+        let state = coordinator
             .process_mut(process_id)
             .ok_or(HorizonSvcFault::InternalRuntime {
                 operation: "CreateThread",
@@ -902,7 +901,7 @@ impl HorizonSvcDispatcher {
             .ok_or(HorizonSvcFault::InternalRuntime {
                 operation: "CreateThread",
             })?
-            .state;
+            .state_mut();
         write_register(state, 0, u64::from(code.raw()));
         if let Some(handle) = handle {
             write_register(state, 1, u64::from(handle));
@@ -1200,7 +1199,7 @@ fn pending_caller_state<'a>(
     coordinator
         .process_mut(process_id)
         .and_then(|process| process.thread_mut(thread_id))
-        .map(|thread| &mut thread.state)
+        .map(nixe_runtime::GuestThread::state_mut)
         .ok_or_else(|| runtime_fault(operation))
 }
 

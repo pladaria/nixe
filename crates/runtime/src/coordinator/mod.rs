@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -14,13 +14,24 @@ use crate::{
     ProcessExecutionError, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
 };
 
+mod execution;
 mod identity;
 mod thread;
 mod vcpu;
 mod wait;
+mod worker;
 
 use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
 use vcpu::RuntimeVcpuSlot;
+pub use worker::WorkerFailure;
+use worker::{VcpuWorkerPool, WorkerExecutorKey, WorkerRequest, WorkerRunFailure};
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum VcpuExecutionMode {
+    #[default]
+    Deterministic,
+    Parallel,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRegistration {
@@ -72,8 +83,15 @@ pub struct RuntimeCoordinator {
     scheduler: SchedulerState,
     processes: BTreeMap<ProcessId, RunnableProcess>,
     process_ids: ProcessIdAllocator,
-    in_flight: Option<Lease>,
+    in_flight: BTreeMap<VirtualCpuId, Lease>,
     vcpu_slots: BTreeMap<VirtualCpuId, RuntimeVcpuSlot>,
+    workers: VcpuWorkerPool,
+    execution_mode: VcpuExecutionMode,
+    execution_record: Option<crate::ExecutionRecord>,
+    next_record_sequence: u64,
+    record_dispatch_sequences: BTreeMap<VirtualCpuId, u64>,
+    replay_expected: Option<crate::ExecutionRecord>,
+    replay_dispatches: VecDeque<(u64, Lease, u64)>,
     thread_ids: GuestThreadIdAllocator,
     inbox: ExternalEventInbox,
     host_stop_requested: bool,
@@ -98,17 +116,38 @@ impl RuntimeCoordinator {
         profile: MachineSchedulerProfile,
         virtual_clock: crate::VirtualClock,
     ) -> Self {
+        Self::try_with_execution_mode(profile, virtual_clock, VcpuExecutionMode::Deterministic)
+            .expect("vCPU worker construction failed")
+    }
+
+    pub fn try_with_execution_mode(
+        profile: MachineSchedulerProfile,
+        virtual_clock: crate::VirtualClock,
+        execution_mode: VcpuExecutionMode,
+    ) -> Result<Self, CoordinatorError> {
         let vcpu_slots = profile
             .vcpus()
             .iter()
             .map(|descriptor| (descriptor.id(), RuntimeVcpuSlot::default()))
             .collect();
-        Self {
+        let workers = VcpuWorkerPool::start(
+            profile.vcpus().iter().map(|descriptor| descriptor.id()),
+            execution_mode == VcpuExecutionMode::Deterministic,
+        )
+        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
+        Ok(Self {
             scheduler: SchedulerState::new(profile),
             processes: BTreeMap::new(),
             process_ids: ProcessIdAllocator::new(),
-            in_flight: None,
+            in_flight: BTreeMap::new(),
             vcpu_slots,
+            workers,
+            execution_mode,
+            execution_record: None,
+            next_record_sequence: 1,
+            record_dispatch_sequences: BTreeMap::new(),
+            replay_expected: None,
+            replay_dispatches: VecDeque::new(),
             thread_ids: GuestThreadIdAllocator::new(),
             inbox: ExternalEventInbox::bounded(1_024)
                 .expect("the default external event capacity is non-zero"),
@@ -118,6 +157,134 @@ impl RuntimeCoordinator {
             next_deadline_sequence: 1,
             active_waits: BTreeMap::new(),
             priority_donations: BTreeSet::new(),
+        })
+    }
+
+    #[must_use]
+    pub const fn execution_mode(&self) -> VcpuExecutionMode {
+        self.execution_mode
+    }
+
+    pub fn enable_execution_recording(&mut self, capacity: std::num::NonZeroUsize) {
+        self.execution_record = Some(crate::ExecutionRecord::new(capacity));
+        self.next_record_sequence = 1;
+        self.record_dispatch_sequences.clear();
+    }
+
+    pub fn enable_sanitized_execution_recording(&mut self, capacity: std::num::NonZeroUsize) {
+        self.execution_record = Some(crate::ExecutionRecord::sanitized(capacity));
+        self.next_record_sequence = 1;
+        self.record_dispatch_sequences.clear();
+    }
+
+    #[must_use]
+    pub fn execution_record(&self) -> Option<&crate::ExecutionRecord> {
+        self.execution_record.as_ref()
+    }
+
+    pub fn take_execution_record(&mut self) -> Option<crate::ExecutionRecord> {
+        self.record_dispatch_sequences.clear();
+        self.execution_record.take()
+    }
+
+    /// Installs a parallel observation record as deterministic dispatch input.
+    /// The scheduler must independently reproduce every recorded thread lease.
+    pub fn begin_differential_replay(
+        &mut self,
+        expected: crate::ExecutionRecord,
+    ) -> Result<(), CoordinatorError> {
+        if self.execution_mode != VcpuExecutionMode::Deterministic {
+            return Err(CoordinatorError::ReplayRequiresDeterministicMode);
+        }
+        let observed = if expected.retains_architectural_context() {
+            crate::ExecutionRecord::new(expected.capacity())
+        } else {
+            crate::ExecutionRecord::sanitized(expected.capacity())
+        };
+        self.replay_dispatches = expected.dispatches().into();
+        self.replay_expected = Some(expected);
+        self.execution_record = Some(observed);
+        self.next_record_sequence = 1;
+        self.record_dispatch_sequences.clear();
+        Ok(())
+    }
+
+    pub fn finish_differential_replay(
+        &mut self,
+    ) -> Result<crate::ExecutionRecord, CoordinatorError> {
+        if !self.replay_dispatches.is_empty() {
+            return Err(CoordinatorError::ReplayIncomplete {
+                remaining_dispatches: self.replay_dispatches.len(),
+            });
+        }
+        let expected = self
+            .replay_expected
+            .take()
+            .ok_or(CoordinatorError::ReplayNotActive)?;
+        let observed = self
+            .take_execution_record()
+            .ok_or(CoordinatorError::ReplayNotActive)?;
+        expected
+            .compare(&observed)
+            .map_err(CoordinatorError::ReplayMismatch)?;
+        Ok(observed)
+    }
+
+    /// Stops worker activity after requesting a bounded engine safepoint.
+    /// Repeated shutdown calls are harmless.
+    pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
+        if let Some(lease) = self.in_flight.values().next().copied() {
+            return Err(CoordinatorError::ShutdownWithOutstandingLease(lease));
+        }
+        for process in self.processes.values() {
+            process.request_execution_safepoint();
+        }
+        let waiting_threads: Vec<_> = self.active_waits.keys().copied().collect();
+        for thread in waiting_threads {
+            self.release_wait_resources(thread);
+        }
+        self.deadlines.clear();
+        self.host_stop_requested = true;
+        self.workers.shutdown().map_err(CoordinatorError::Worker)
+    }
+
+    fn record_dispatch(&mut self, lease: Lease, instruction_budget: u64) {
+        let sequence = self.next_record_sequence;
+        self.next_record_sequence = self.next_record_sequence.saturating_add(1);
+        self.record_dispatch_sequences.insert(lease.vcpu, sequence);
+        if let Some(record) = &mut self.execution_record {
+            record.push(crate::ExecutionObservation::Dispatch {
+                sequence,
+                lease,
+                instruction_budget,
+            });
+        }
+    }
+
+    fn record_completion(&mut self, lease: Lease, report: &ExecutionReport) {
+        let sequence = self
+            .record_dispatch_sequences
+            .remove(&lease.vcpu)
+            .unwrap_or_default();
+        if let Some(record) = &mut self.execution_record {
+            record.push(crate::ExecutionObservation::Completion {
+                sequence,
+                lease,
+                instructions_executed: report.instructions_executed,
+                stop: recorded_stop(&report.stop),
+                context: record
+                    .retains_architectural_context()
+                    .then(|| Box::new(report.context.clone())),
+            });
+        }
+    }
+
+    pub(super) fn record_external_event(&mut self, event: crate::SequencedExternalEvent) {
+        if let Some(record) = &mut self.execution_record {
+            record.push(crate::ExecutionObservation::External {
+                sequence: event.sequence,
+                event: event.event,
+            });
         }
     }
 
@@ -140,6 +307,18 @@ impl RuntimeCoordinator {
         mut process: RunnableProcess,
         registration: ProcessRegistration,
     ) -> Result<ProcessId, CoordinatorError> {
+        if self.execution_mode == VcpuExecutionMode::Parallel {
+            let descriptor = process.engine_descriptor();
+            let capabilities = descriptor.capabilities;
+            if !capabilities.concurrent_executors
+                || capabilities.max_safepoint_instructions.is_none()
+                || !capabilities.acknowledged_invalidation
+            {
+                return Err(CoordinatorError::ParallelEngineUnsupported {
+                    engine: descriptor.id,
+                });
+            }
+        }
         let (id, next_process_id) = self
             .process_ids
             .candidate()
@@ -164,6 +343,12 @@ impl RuntimeCoordinator {
                 .apply(SchedulerCommand::Unregister(thread))
                 .expect("registration rollback removes an unleased created thread");
             return Err(error.into());
+        }
+        if let Err(error) = self.install_process_executors(id, &mut process, thread) {
+            self.scheduler
+                .apply(SchedulerCommand::Unregister(thread))
+                .expect("executor installation rollback removes an unleased ready thread");
+            return Err(error);
         }
         let replaced = self.processes.insert(id, process);
         debug_assert!(replaced.is_none());
@@ -190,6 +375,7 @@ impl RuntimeCoordinator {
                 return Err(SchedulerError::ThreadLeased(*thread).into());
             }
         }
+        self.retire_process_executors(id)?;
         let removed_threads: BTreeSet<_> = threads.iter().copied().collect();
         self.priority_donations.retain(|donation| {
             !removed_threads.contains(&donation.owner)
@@ -207,78 +393,181 @@ impl RuntimeCoordinator {
         Ok(process)
     }
 
-    /// Executes at most one deterministic slice and returns its scheduler lease.
-    pub fn run_next(
+    fn install_process_executors(
         &mut self,
-        instruction_budget: u64,
-    ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
-        if let Some(lease) = self.in_flight {
+        process_id: ProcessId,
+        process: &mut RunnableProcess,
+        thread: GuestThreadId,
+    ) -> Result<(), CoordinatorError> {
+        let key = WorkerExecutorKey {
+            process: process_id,
+            domain: process.engine_domain_id(),
+        };
+        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let mut installed = Vec::new();
+        for vcpu in vcpus {
+            let executor = process.take_worker_executor(vcpu).map_err(|fault| {
+                CoordinatorError::Execution {
+                    process: process_id,
+                    thread,
+                    error: ProcessExecutionError::Engine { fault },
+                }
+            })?;
+            if let Err(failure) = self.workers.install_executor(vcpu, key, executor) {
+                for installed_vcpu in installed {
+                    if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key) {
+                        process.restore_worker_executor(installed_vcpu, executor);
+                    }
+                }
+                return Err(CoordinatorError::Worker(failure));
+            }
+            installed.push(vcpu);
+        }
+        process.set_worker_executors_resident(true);
+        Ok(())
+    }
+
+    fn retire_process_executors(&mut self, process_id: ProcessId) -> Result<(), CoordinatorError> {
+        let domain = self
+            .processes
+            .get(&process_id)
+            .ok_or(CoordinatorError::UnknownProcess(process_id))?
+            .engine_domain_id();
+        let main_thread = self
+            .processes
+            .get(&process_id)
+            .expect("the process remains registered during executor retirement")
+            .main_thread_id();
+        let key = WorkerExecutorKey {
+            process: process_id,
+            domain,
+        };
+        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let mut retired = Vec::new();
+        for vcpu in vcpus {
+            match self.workers.retire_executor(vcpu, key) {
+                Ok(()) => retired.push(vcpu),
+                Err(failure) => {
+                    for retired_vcpu in retired {
+                        let executor = self
+                            .processes
+                            .get_mut(&process_id)
+                            .expect("the process remains registered during rollback")
+                            .take_worker_executor(retired_vcpu)
+                            .map_err(|fault| CoordinatorError::Execution {
+                                process: process_id,
+                                thread: main_thread,
+                                error: ProcessExecutionError::Engine { fault },
+                            })?;
+                        self.workers
+                            .install_executor(retired_vcpu, key, executor)
+                            .map_err(CoordinatorError::Worker)?;
+                    }
+                    return Err(CoordinatorError::Worker(failure));
+                }
+            }
+        }
+        self.processes
+            .get_mut(&process_id)
+            .expect("the process remains registered during executor retirement")
+            .set_worker_executors_resident(false);
+        Ok(())
+    }
+
+    /// Failure-atomically switches a registered process to a replacement
+    /// engine domain while keeping both executor generations worker-resident.
+    pub fn switch_process_engine(
+        &mut self,
+        process_id: ProcessId,
+        provider: &dyn nixe_cpu_engine::EngineProvider,
+    ) -> Result<nixe_cpu_engine::StateCommitBarrier, CoordinatorError> {
+        if let Some(lease) = self
+            .in_flight
+            .values()
+            .find(|lease| lease.process == process_id)
+            .copied()
+        {
             return Err(CoordinatorError::InFlightLease(lease));
         }
-        let SchedulerDecision::Selected(lease) =
-            self.scheduler.apply(SchedulerCommand::SelectNext)?
-        else {
-            unreachable!("select commands always produce a selected decision")
+        let descriptor = provider.descriptor();
+        if self.execution_mode == VcpuExecutionMode::Parallel {
+            let capabilities = descriptor.capabilities;
+            if !capabilities.concurrent_executors
+                || capabilities.max_safepoint_instructions.is_none()
+                || !capabilities.acknowledged_invalidation
+            {
+                return Err(CoordinatorError::ParallelEngineUnsupported {
+                    engine: descriptor.id,
+                });
+            }
+        }
+        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let old_domain = self
+            .processes
+            .get(&process_id)
+            .ok_or(CoordinatorError::UnknownProcess(process_id))?
+            .engine_domain_id();
+        let mut prepared = self
+            .processes
+            .get_mut(&process_id)
+            .expect("the process was validated")
+            .prepare_engine_switch(vcpus.iter().copied(), provider)
+            .map_err(CoordinatorError::Handoff)?;
+        let new_key = WorkerExecutorKey {
+            process: process_id,
+            domain: prepared.domain_id(),
         };
-        let lease = match lease {
-            Some(lease) => lease,
-            None => {
-                if !self.fast_forward_to_next_deadline()? {
-                    return Ok(None);
+        let mut installed_new = Vec::new();
+        for vcpu in &vcpus {
+            let executor = prepared
+                .take_executor(*vcpu)
+                .expect("engine preparation creates one executor per active vCPU");
+            if let Err(failure) = self.workers.install_executor(*vcpu, new_key, executor) {
+                for installed in installed_new {
+                    let _ = self.workers.retire_executor(installed, new_key);
                 }
-                let SchedulerDecision::Selected(lease) =
-                    self.scheduler.apply(SchedulerCommand::SelectNext)?
-                else {
-                    unreachable!("select commands always produce a selected decision")
-                };
-                let Some(lease) = lease else {
-                    return Ok(None);
-                };
-                lease
+                return Err(CoordinatorError::Worker(failure));
             }
+            installed_new.push(*vcpu);
+        }
+
+        let old_key = WorkerExecutorKey {
+            process: process_id,
+            domain: old_domain,
         };
-        self.in_flight = Some(lease);
-        let slot = self
-            .vcpu_slots
-            .get_mut(&lease.vcpu)
-            .expect("scheduler leases only configured vCPUs");
-        slot.begin(lease);
-        let result = match self.processes.get_mut(&lease.process) {
-            Some(process) => process.run_thread(lease.thread, lease.vcpu, instruction_budget),
-            None => {
-                self.scheduler.apply(SchedulerCommand::Complete {
-                    lease,
-                    outcome: Completion::Faulted,
-                })?;
-                self.in_flight = None;
-                self.vcpu_slots
-                    .get_mut(&lease.vcpu)
-                    .expect("leased vCPU slot remains configured")
-                    .finish(lease);
-                return Err(CoordinatorError::UnknownProcess(lease.process));
+        let mut retired_old = Vec::new();
+        for vcpu in &vcpus {
+            if let Err(failure) = self.workers.retire_executor(*vcpu, old_key) {
+                for installed in installed_new {
+                    let _ = self.workers.retire_executor(installed, new_key);
+                }
+                for retired in retired_old {
+                    let executor = self
+                        .processes
+                        .get_mut(&process_id)
+                        .expect("the old domain remains installed during rollback")
+                        .take_worker_executor(retired)
+                        .map_err(|fault| {
+                            CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
+                                stage: nixe_cpu_engine::HandoffFailureStage::Import,
+                                fault,
+                            })
+                        })?;
+                    self.workers
+                        .install_executor(retired, old_key, executor)
+                        .map_err(CoordinatorError::Worker)?;
+                }
+                return Err(CoordinatorError::Worker(failure));
             }
-        };
-        let completion = match &result {
-            Ok(report) => completion_for_stop(&report.stop),
-            Err(_) => Completion::Faulted,
-        };
-        let completion_result = self.scheduler.apply(SchedulerCommand::Complete {
-            lease,
-            outcome: completion,
-        });
-        self.in_flight = None;
-        self.vcpu_slots
-            .get_mut(&lease.vcpu)
-            .expect("leased vCPU slot remains configured")
-            .finish(lease);
-        completion_result?;
-        result
-            .map(|report| Some(CoordinatorExecution { lease, report }))
-            .map_err(|error| CoordinatorError::Execution {
-                process: lease.process,
-                thread: lease.thread,
-                error,
-            })
+            retired_old.push(*vcpu);
+        }
+        let (barrier, old_domain) = self
+            .processes
+            .get_mut(&process_id)
+            .expect("the process remains registered through handoff commit")
+            .commit_engine_switch(prepared);
+        drop(old_domain);
+        Ok(barrier)
     }
 
     /// Synchronizes a compatibility API which resumed one waiting thread.
@@ -430,6 +719,25 @@ pub enum CoordinatorError {
         error: ProcessExecutionError,
     },
     ExternalEvent(ExternalEventSendError),
+    WorkerStartup(std::io::ErrorKind),
+    Worker(WorkerFailure),
+    ParallelModeRequired,
+    ParallelEngineUnsupported {
+        engine: nixe_cpu_engine::EngineId,
+    },
+    ShutdownWithOutstandingLease(Lease),
+    ReplayRequiresDeterministicMode,
+    ReplayIncomplete {
+        remaining_dispatches: usize,
+    },
+    ReplayNotActive,
+    ReplayLeaseMismatch {
+        sequence: u64,
+        expected: Lease,
+        observed: Lease,
+    },
+    ReplayMismatch(crate::ReplayMismatch),
+    Handoff(nixe_cpu_engine::HandoffFailure),
 }
 
 impl From<crate::ThreadTableError> for CoordinatorError {
@@ -461,6 +769,15 @@ impl Display for CoordinatorError {
 
 impl Error for CoordinatorError {}
 
+impl Drop for RuntimeCoordinator {
+    fn drop(&mut self) {
+        for process in self.processes.values() {
+            process.request_execution_safepoint();
+        }
+        let _ = self.workers.shutdown();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoordinatorRouteError {
     UnknownProcess(ProcessId),
@@ -490,7 +807,8 @@ pub struct CoordinatorDrainReport {
     pub woken: usize,
     pub cancelled: usize,
     pub stale: usize,
-    pub worker_results: usize,
+    pub first_sequence: Option<crate::ExternalEventSequence>,
+    pub last_sequence: Option<crate::ExternalEventSequence>,
 }
 
 fn completion_for_stop(stop: &ExecutionStop) -> Completion {
@@ -503,6 +821,23 @@ fn completion_for_stop(stop: &ExecutionStop) -> Completion {
             Completion::Faulted
         }
         _ => Completion::Waiting,
+    }
+}
+
+fn recorded_stop(stop: &ExecutionStop) -> crate::RecordedStop {
+    match stop {
+        ExecutionStop::BudgetExhausted => crate::RecordedStop::BudgetExhausted,
+        ExecutionStop::Safepoint => crate::RecordedStop::Safepoint,
+        ExecutionStop::PendingEvent { .. } => crate::RecordedStop::PendingEvent,
+        ExecutionStop::Scheduled { .. } => crate::RecordedStop::Scheduled,
+        ExecutionStop::ArchitecturalException { .. } => crate::RecordedStop::ArchitecturalException,
+        ExecutionStop::SupervisorCall { .. } => crate::RecordedStop::SupervisorCall,
+        ExecutionStop::DataFault { .. } => crate::RecordedStop::DataFault,
+        ExecutionStop::LoaderReturn { .. } => crate::RecordedStop::LoaderReturn,
+        ExecutionStop::FetchFault { .. } => crate::RecordedStop::FetchFault,
+        ExecutionStop::UnsupportedSemantics { .. } => crate::RecordedStop::UnsupportedSemantics,
+        ExecutionStop::ProfileDisabled { .. } => crate::RecordedStop::ProfileDisabled,
+        ExecutionStop::UnallocatedEncoding { .. } => crate::RecordedStop::UnallocatedEncoding,
     }
 }
 

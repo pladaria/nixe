@@ -44,6 +44,15 @@ report_detail = "detailed"
 # disassembly; sanitized mode retains only sequence, guest location and bits.
 instruction_trace = false
 
+[cpu]
+# CPU engine selected through the capability registry: "auto" or
+# "interpreter". Future engines extend this list without changing runtime.
+engine = "auto"
+# Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
+# selected engine provides concurrent executors, bounded safepoints, and
+# acknowledged mapping invalidation. False keeps deterministic serialization.
+parallel_vcpus = false
+
 # Use `cargo cli input` to get your controller's SDL gamepad information
 [input.profiles.switch-pro]
 device = "Nintendo Switch Pro Controller"

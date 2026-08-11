@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use nixe_cpu::decode::{DecodeResult, decode, disassemble};
 use nixe_cpu::error::InstructionFetchFault;
@@ -33,7 +32,6 @@ pub const INTERPRETER_ENGINE_ID: EngineId = EngineId::new(1);
 #[derive(Clone, Copy, Debug, Default)]
 struct DispatchState {
     budget: u64,
-    safepoint_requested: bool,
 }
 
 impl DispatchState {
@@ -43,21 +41,12 @@ impl DispatchState {
     const fn set_budget(&mut self, budget: u64) {
         self.budget = budget;
     }
-    const fn safepoint_requested(self) -> bool {
-        self.safepoint_requested
-    }
-    const fn request_safepoint(&mut self) {
-        self.safepoint_requested = true;
-    }
-    const fn clear_safepoint(&mut self) {
-        self.safepoint_requested = false;
-    }
 }
 
 /// Transient state owned by one interpreter executor, never by a guest thread.
 struct InterpreterExecutionState {
     exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
-    pending_interrupts: AtomicU32,
+    control: nixe_cpu_engine::EngineControl,
     dispatch: DispatchState,
 }
 
@@ -65,11 +54,8 @@ impl InterpreterExecutionState {
     fn new() -> Self {
         Self {
             exclusive_monitor: RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default()),
-            pending_interrupts: AtomicU32::new(0),
-            dispatch: DispatchState {
-                budget: 0,
-                safepoint_requested: false,
-            },
+            control: nixe_cpu_engine::EngineControl::default(),
+            dispatch: DispatchState { budget: 0 },
         }
     }
     const fn dispatch(&self) -> &DispatchState {
@@ -80,12 +66,6 @@ impl InterpreterExecutionState {
     }
     const fn exclusive_monitor_cell(&self) -> &RefCell<nixe_cpu::exclusive::ExclusiveMonitorState> {
         &self.exclusive_monitor
-    }
-    fn post_interrupts(&self, mask: u32) {
-        self.pending_interrupts.fetch_or(mask, Ordering::Release);
-    }
-    fn take_pending_interrupts(&self) -> u32 {
-        self.pending_interrupts.swap(0, Ordering::AcqRel)
     }
     fn clear_local_exclusive_reservation(&mut self) {
         *self.exclusive_monitor.get_mut() = nixe_cpu::exclusive::ExclusiveMonitorState::default();
@@ -151,6 +131,10 @@ const fn capabilities() -> EngineCapabilities {
         precise_instruction_budget: true,
         instruction_trace: true,
         native_execution: false,
+        concurrent_executors: true,
+        max_safepoint_instructions: std::num::NonZeroU64::new(1),
+        // The interpreter retains neither translated code nor TLB entries.
+        acknowledged_invalidation: true,
     }
 }
 
@@ -240,21 +224,35 @@ impl EngineExecutor for InterpreterExecutor {
                     request.state,
                 ));
             }
-            if self.execution.dispatch().safepoint_requested() {
-                self.execution.dispatch_mut().clear_safepoint();
-                return Ok(self.report(
-                    executed,
-                    nixe_cpu_engine::EngineExit::Safepoint,
-                    request.state,
-                ));
-            }
-            let events = self.execution.take_pending_interrupts();
-            if events != 0 {
-                return Ok(self.report(
-                    executed,
-                    nixe_cpu_engine::EngineExit::PendingEvent { mask: events },
-                    request.state,
-                ));
+            if let Some(control) = self.execution.control.take_pending() {
+                // The interpreter retains no code cache or TLB. Observing the
+                // request at this instruction boundary completes every effect.
+                self.execution.control.acknowledge(control);
+                if control.event_mask != 0 {
+                    return Ok(self.report(
+                        executed,
+                        nixe_cpu_engine::EngineExit::PendingEvent {
+                            mask: control.event_mask,
+                        },
+                        request.state,
+                    ));
+                }
+                let must_stop = [
+                    nixe_cpu_engine::CrossVcpuRequest::Preempt,
+                    nixe_cpu_engine::CrossVcpuRequest::ProcessStop,
+                    nixe_cpu_engine::CrossVcpuRequest::DebuggerStop,
+                    nixe_cpu_engine::CrossVcpuRequest::EngineHandoff,
+                ]
+                .into_iter()
+                .any(|request| control.contains(request));
+                if must_stop {
+                    return Ok(self.report(
+                        executed,
+                        nixe_cpu_engine::EngineExit::Safepoint,
+                        request.state,
+                    ));
+                }
+                continue;
             }
             if self.execution.dispatch().budget() == 0 {
                 return Ok(self.report(
@@ -351,11 +349,35 @@ impl EngineExecutor for InterpreterExecutor {
         self.execution.clear_local_exclusive_reservation();
     }
 
-    fn request_safepoint(&mut self, _reason: SafepointReason) {
-        self.execution.dispatch_mut().request_safepoint();
+    fn request_safepoint(&mut self, reason: SafepointReason) {
+        let request = match reason {
+            SafepointReason::Requested | SafepointReason::Timer => {
+                nixe_cpu_engine::CrossVcpuRequest::Preempt
+            }
+            SafepointReason::PendingEvent { mask } => {
+                self.execution.control.post_event(mask);
+                return;
+            }
+            SafepointReason::MappingChanged => nixe_cpu_engine::CrossVcpuRequest::TlbShootdown,
+            SafepointReason::EngineHandoff => nixe_cpu_engine::CrossVcpuRequest::EngineHandoff,
+        };
+        let _ = self.execution.control.request(request);
     }
     fn post_event(&self, mask: u32) {
-        self.execution.post_interrupts(mask);
+        self.execution.control.post_event(mask);
+    }
+
+    fn synchronize_invalidation(
+        &mut self,
+        epoch: u64,
+        _state: &ThreadCpuState,
+    ) -> Result<(), EngineFault> {
+        // The interpreter retains no translation cache or TLB.
+        self.execution.control.acknowledge_invalidation(epoch);
+        Ok(())
+    }
+    fn control(&self) -> Option<nixe_cpu_engine::EngineControl> {
+        Some(self.execution.control.clone())
     }
 }
 

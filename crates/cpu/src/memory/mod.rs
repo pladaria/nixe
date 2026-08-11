@@ -9,5 +9,5 @@ mod execution;
 mod synthetic;
 
 pub use contracts::*;
-pub use execution::ExecutionMemory;
+pub use execution::{ExecutionMemory, ExecutionMemoryLease, MappingEpoch};
 pub use synthetic::SyntheticMemory;

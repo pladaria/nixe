@@ -190,7 +190,7 @@ impl CodePageSpan {
 /// Implementations enforce execute permission and the alignment implied by the
 /// operation. Returned integers are canonical bit patterns; implementations
 /// must decode guest bytes explicitly and never rely on host endianness.
-pub trait InstructionMemory {
+pub trait InstructionMemory: Send + Sync {
     /// Returns the virtual code-page extent containing `address`.
     ///
     /// Translators use this only as a block-cut boundary. Fetch methods remain

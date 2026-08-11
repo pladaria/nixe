@@ -192,7 +192,7 @@ fn fixture_process_for_state(
             state
                 .set_instruction_address(u32::try_from(test_entry).unwrap())
                 .unwrap();
-            process.main_thread_mut().state = ThreadCpuState::A32(Box::new(state));
+            *process.main_thread_mut().state_mut() = ThreadCpuState::A32(Box::new(state));
         }
     }
     (directory, process)
@@ -203,7 +203,7 @@ fn x(index: u8) -> A64Register {
 }
 
 fn state(process: &mut RunnableProcess) -> &mut nixe_cpu::state::A64State {
-    let ThreadCpuState::A64(state) = &mut process.main_thread_mut().state else {
+    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
         panic!("homebrew process must use A64")
     };
     state.as_mut()
@@ -214,21 +214,21 @@ fn abi_register(index: u8) -> A32GeneralRegister {
 }
 
 fn read_abi_register(process: &RunnableProcess, index: u8) -> u64 {
-    match &process.main_thread().state {
+    match process.main_thread().state() {
         ThreadCpuState::A64(state) => state.read_x(x(index)),
         ThreadCpuState::A32(state) => u64::from(state.read_r(abi_register(index))),
     }
 }
 
 fn write_abi_register(process: &mut RunnableProcess, index: u8, value: u64) {
-    match &mut process.main_thread_mut().state {
+    match process.main_thread_mut().state_mut() {
         ThreadCpuState::A64(state) => state.write_x(x(index), value),
         ThreadCpuState::A32(state) => state.write_r(abi_register(index), value as u32),
     }
 }
 
 fn write_wait_timeout(process: &mut RunnableProcess, timeout: i64) {
-    match &mut process.main_thread_mut().state {
+    match process.main_thread_mut().state_mut() {
         ThreadCpuState::A64(state) => state.write_x(x(3), timeout as u64),
         ThreadCpuState::A32(state) => {
             state.write_r(abi_register(0), timeout as u32);
@@ -238,7 +238,7 @@ fn write_wait_timeout(process: &mut RunnableProcess, timeout: i64) {
 }
 
 fn instruction_address(process: &RunnableProcess) -> u64 {
-    match &process.main_thread().state {
+    match process.main_thread().state() {
         ThreadCpuState::A64(state) => state.pc(),
         ThreadCpuState::A32(state) => u64::from(state.instruction_address()),
     }
@@ -2650,7 +2650,7 @@ fn create_thread_commits_through_a64_abi() {
             .unwrap()
     );
     let process = coordinator.process(process_id).unwrap();
-    let result = match &process.thread(caller).unwrap().state {
+    let result = match process.thread(caller).unwrap().state() {
         ThreadCpuState::A64(state) => state.read_w(x(0)),
         ThreadCpuState::A32(state) => state.read_r(A32GeneralRegister::new(0).unwrap()),
     };
@@ -2666,7 +2666,7 @@ fn create_thread_commits_through_a64_abi() {
         nixe_scheduler::ThreadLifecycle::Created
     );
     assert_eq!(created.stack_top.get(), stack_top);
-    match &created.state {
+    match created.state() {
         ThreadCpuState::A64(state) => assert_eq!(state.read_x(x(0)), 0x1234_5678),
         ThreadCpuState::A32(state) => assert_eq!(
             state.read_r(A32GeneralRegister::new(0).unwrap()),
@@ -2724,7 +2724,7 @@ fn create_thread_commits_through_aarch32_abi_in_a_32_bit_process() {
     let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
     let mut process = reference_process_builder().build(&plan).unwrap();
     assert_eq!(
-        process.main_thread().state.execution_state(),
+        process.main_thread().state().execution_state(),
         ExecutionState::A32
     );
     let entry = process.entry_module().entry_address() + 4;
@@ -2757,7 +2757,7 @@ fn create_thread_commits_through_aarch32_abi_in_a_32_bit_process() {
             .unwrap()
     );
     let process = coordinator.process(process_id).unwrap();
-    let ThreadCpuState::A32(caller_state) = &process.thread(caller).unwrap().state else {
+    let ThreadCpuState::A32(caller_state) = process.thread(caller).unwrap().state() else {
         panic!("the caller must remain AArch32");
     };
     assert_eq!(
@@ -2769,7 +2769,7 @@ fn create_thread_commits_through_aarch32_abi_in_a_32_bit_process() {
         .iter()
         .find_map(|(id, thread)| (*id != caller).then_some(thread))
         .unwrap();
-    let ThreadCpuState::A32(created_state) = &created.state else {
+    let ThreadCpuState::A32(created_state) = created.state() else {
         panic!("the created thread must inherit AArch32 execution");
     };
     assert_eq!(created_state.instruction_address(), entry as u32);

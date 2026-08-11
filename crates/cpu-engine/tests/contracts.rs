@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Barrier, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
@@ -63,7 +67,68 @@ fn descriptor(id: EngineId) -> EngineDescriptor {
             precise_instruction_budget: true,
             instruction_trace: false,
             native_execution: false,
+            concurrent_executors: false,
+            max_safepoint_instructions: None,
+            acknowledged_invalidation: false,
         },
+    }
+}
+
+#[test]
+fn safepoint_capability_reports_a_verifiable_instruction_bound() {
+    let offered = EngineCapabilities {
+        max_safepoint_instructions: NonZeroU64::new(1),
+        ..EngineCapabilities::default()
+    };
+    let relaxed_requirement = EngineCapabilities {
+        max_safepoint_instructions: NonZeroU64::new(8),
+        ..EngineCapabilities::default()
+    };
+    assert!(offered.contains(relaxed_requirement));
+    assert!(!relaxed_requirement.contains(offered));
+    assert!(offered.requires_control_path());
+}
+
+#[test]
+fn independent_worker_controls_acknowledge_cross_vcpu_invalidation() {
+    let controls = [EngineControl::default(), EngineControl::default()];
+    let start = Arc::new(Barrier::new(3));
+    let (acknowledged_tx, acknowledged_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    for control in controls.clone() {
+        let start = Arc::clone(&start);
+        let acknowledged_tx = acknowledged_tx.clone();
+        workers.push(thread::spawn(move || {
+            start.wait();
+            loop {
+                if let Some(snapshot) = control.take_pending() {
+                    assert!(snapshot.contains(CrossVcpuRequest::CodeInvalidation));
+                    assert_eq!(snapshot.invalidation_epoch, 7);
+                    assert!(!control.acknowledged_invalidation(7));
+                    control.acknowledge(snapshot);
+                    acknowledged_tx.send(snapshot.epoch).unwrap();
+                    break;
+                }
+                thread::yield_now();
+            }
+        }));
+    }
+
+    for control in &controls {
+        let _ = control.request_invalidation(7);
+    }
+    start.wait();
+    for _ in 0..2 {
+        acknowledged_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+    for control in &controls {
+        assert!(control.acknowledged_invalidation(7));
+    }
+    for worker in workers {
+        worker.join().unwrap();
     }
 }
 

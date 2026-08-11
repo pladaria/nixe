@@ -59,6 +59,21 @@ fn registration_removal_and_identity_retirement_are_atomic() {
 }
 
 #[test]
+fn coordinator_preserves_external_event_sequence_boundaries() {
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    let sender = coordinator.event_sender();
+    sender.submit(crate::ExternalEvent::HostStop).unwrap();
+    sender.submit(crate::ExternalEvent::HostStop).unwrap();
+    let report = coordinator.drain_external_events().unwrap();
+    assert_eq!(report.received, 2);
+    assert_eq!(
+        report.first_sequence.map(|sequence| sequence.get()),
+        Some(1)
+    );
+    assert_eq!(report.last_sequence.map(|sequence| sequence.get()), Some(2));
+}
+
+#[test]
 fn one_slice_flows_through_a_scheduler_lease() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process = synthetic_process_for_coordinator(1);
@@ -76,6 +91,44 @@ fn one_slice_flows_through_a_scheduler_lease() {
             .unwrap()
             .lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
+    );
+}
+
+#[test]
+fn registered_engine_handoff_replaces_worker_resident_executors_at_a_real_barrier() {
+    let mut coordinator = RuntimeCoordinator::new(two_core_profile());
+    let process = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let old_domain = coordinator.process(process).unwrap().engine_domain_id();
+    let mapping_epoch = coordinator.process(process).unwrap().mapping_epoch().get();
+    let dirty_generation = coordinator
+        .process(process)
+        .unwrap()
+        .memory()
+        .content_generation_watermark();
+
+    let barrier = coordinator
+        .switch_process_engine(process, &nixe_cpu_engine_interpreter::InterpreterProvider)
+        .unwrap();
+    let new_domain = coordinator.process(process).unwrap().engine_domain_id();
+
+    assert_ne!(new_domain, old_domain);
+    assert_eq!(barrier.quiescence.domain, old_domain);
+    assert_eq!(barrier.memory.invalidation_generation, mapping_epoch);
+    assert_eq!(barrier.memory.dirty_generation, dirty_generation);
+    assert_eq!(barrier.state, nixe_cpu_engine::StateCommitStatus::Canonical);
+    assert_eq!(
+        coordinator
+            .run_next(1)
+            .unwrap()
+            .unwrap()
+            .report
+            .instructions_executed,
+        1
     );
 }
 
@@ -834,4 +887,145 @@ fn equal_virtual_deadlines_wake_in_registration_order() {
             .process,
         second
     );
+}
+
+#[test]
+fn parallel_wave_assigns_at_most_one_thread_to_each_vcpu() {
+    let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
+    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+        two_core_profile(),
+        clock,
+        VcpuExecutionMode::Parallel,
+    )
+    .unwrap();
+    for (process_id, ideal_vcpu) in [(1, 3), (2, 7)] {
+        let affinity = coordinator.scheduler().profile().all_cores();
+        coordinator
+            .register_process(
+                synthetic_process_for_coordinator(process_id),
+                ProcessRegistration {
+                    priority: 44,
+                    ideal_vcpu: Some(VirtualCpuId::new(ideal_vcpu)),
+                    affinity,
+                },
+            )
+            .unwrap();
+    }
+    let executions = coordinator.run_parallel_wave(1).unwrap();
+    assert_eq!(executions.len(), 2);
+    assert_ne!(executions[0].lease.thread, executions[1].lease.thread);
+    assert_ne!(executions[0].lease.vcpu, executions[1].lease.vcpu);
+    assert!(coordinator.in_flight.is_empty());
+}
+
+#[test]
+fn parallel_wave_runs_distinct_threads_from_one_process() {
+    let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
+    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+        two_core_profile(),
+        clock,
+        VcpuExecutionMode::Parallel,
+    )
+    .unwrap();
+    let process_id = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(VirtualCpuId::new(7)),
+                affinity: coordinator.scheduler().profile().all_cores(),
+            },
+        )
+        .unwrap();
+    let request = ThreadCreateRequest {
+        ideal_vcpu: Some(VirtualCpuId::new(3)),
+        affinity: coordinator
+            .scheduler()
+            .profile()
+            .core_set([VirtualCpuId::new(3)])
+            .unwrap(),
+        ..valid_thread_request(&coordinator, process_id)
+    };
+    let created = coordinator.create_thread(process_id, request).unwrap();
+    let object_id = coordinator
+        .process(process_id)
+        .unwrap()
+        .thread(created.id)
+        .unwrap()
+        .object()
+        .thread_id();
+    coordinator.start_thread(process_id, object_id).unwrap();
+
+    let executions = coordinator.run_parallel_wave(1).unwrap();
+    assert_eq!(executions.len(), 2);
+    assert!(
+        executions
+            .iter()
+            .all(|execution| execution.lease.process == process_id)
+    );
+    assert_ne!(executions[0].lease.thread, executions[1].lease.thread);
+}
+
+#[test]
+fn deterministic_records_reproduce_architectural_observations() {
+    fn recorded_run() -> crate::ExecutionRecord {
+        let mut coordinator = RuntimeCoordinator::new(profile());
+        coordinator.enable_execution_recording(std::num::NonZeroUsize::new(16).unwrap());
+        let registration = registration(&coordinator);
+        coordinator
+            .register_process(synthetic_process_for_coordinator(1), registration)
+            .unwrap();
+        coordinator.run_next(1).unwrap().unwrap();
+        coordinator.take_execution_record().unwrap()
+    }
+
+    let expected = recorded_run();
+    let observed = recorded_run();
+    expected.compare(&observed).unwrap();
+    assert_eq!(expected.observations().len(), 2);
+}
+
+#[test]
+fn parallel_observations_replay_through_deterministic_workers() {
+    fn register_pair(coordinator: &mut RuntimeCoordinator) {
+        for (process_id, ideal_vcpu) in [(1, 3), (2, 7)] {
+            let affinity = coordinator.scheduler().profile().all_cores();
+            coordinator
+                .register_process(
+                    synthetic_process_for_coordinator(process_id),
+                    ProcessRegistration {
+                        priority: 44,
+                        ideal_vcpu: Some(VirtualCpuId::new(ideal_vcpu)),
+                        affinity,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
+    let mut parallel = RuntimeCoordinator::try_with_execution_mode(
+        two_core_profile(),
+        clock.clone(),
+        VcpuExecutionMode::Parallel,
+    )
+    .unwrap();
+    parallel.enable_execution_recording(std::num::NonZeroUsize::new(16).unwrap());
+    register_pair(&mut parallel);
+    assert_eq!(parallel.run_parallel_wave(1).unwrap().len(), 2);
+    let expected = parallel.take_execution_record().unwrap();
+
+    let mut replay = RuntimeCoordinator::with_virtual_clock(two_core_profile(), clock);
+    register_pair(&mut replay);
+    replay.begin_differential_replay(expected).unwrap();
+    replay.run_next(999).unwrap().unwrap();
+    replay.run_next(999).unwrap().unwrap();
+    replay.finish_differential_replay().unwrap();
+}
+
+#[test]
+fn coordinator_worker_shutdown_is_idempotent() {
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    coordinator.shutdown().unwrap();
+    coordinator.shutdown().unwrap();
 }

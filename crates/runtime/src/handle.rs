@@ -438,11 +438,19 @@ impl HandleTable {
 
     /// Moves one object to another process table without cloning its runtime state.
     pub fn transfer_to(&mut self, destination: &mut Self, handle: u32) -> Result<u32, HandleError> {
-        if destination.next_handle > LAST_HANDLE && destination.recycled.is_empty() {
+        if !self.objects.contains_key(&handle) {
+            return Err(HandleError::InvalidHandle(handle));
+        }
+        if destination.objects.len() >= destination.capacity_limit
+            || (destination.next_handle > LAST_HANDLE && destination.recycled.is_empty())
+        {
             return Err(HandleError::Exhausted);
         }
         let object = self.close(handle)?;
-        destination.insert_object(object)
+        let inserted = destination
+            .insert_object(object)
+            .expect("destination capacity and numeric handle were reserved before source removal");
+        Ok(inserted)
     }
 
     #[must_use]

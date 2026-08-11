@@ -99,6 +99,7 @@ impl NixeConfig {
             },
             cpu: CpuConfig {
                 engine: raw.cpu.engine,
+                parallel_vcpus: raw.cpu.parallel_vcpus,
             },
             input: raw.input,
             source_path,
@@ -235,6 +236,9 @@ pub struct DiagnosticsConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuConfig {
     pub engine: CpuEngineSelection,
+    /// Enables capability-gated host-parallel execution. Deterministic
+    /// serialized workers remain the default.
+    pub parallel_vcpus: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -370,6 +374,8 @@ struct RawConfig {
 struct RawCpuConfig {
     #[serde(default)]
     engine: CpuEngineSelection,
+    #[serde(default)]
+    parallel_vcpus: bool,
 }
 
 #[derive(Deserialize)]
@@ -741,6 +747,12 @@ mod tests {
             NixeConfig::load(&default_file.path).unwrap().cpu.engine,
             CpuEngineSelection::Auto
         );
+        assert!(
+            !NixeConfig::load(&default_file.path)
+                .unwrap()
+                .cpu
+                .parallel_vcpus
+        );
 
         let explicit_file = TemporaryConfig::new(
             r#"
@@ -753,11 +765,18 @@ mod tests {
                 initial_operation_mode = "handheld"
                 [cpu]
                 engine = "interpreter"
+                parallel_vcpus = true
             "#,
         );
         assert_eq!(
             NixeConfig::load(&explicit_file.path).unwrap().cpu.engine,
             CpuEngineSelection::Interpreter
+        );
+        assert!(
+            NixeConfig::load(&explicit_file.path)
+                .unwrap()
+                .cpu
+                .parallel_vcpus
         );
 
         let invalid_file = TemporaryConfig::new(

@@ -8,6 +8,7 @@ pub struct EventObject {
 
 struct EventState {
     signalled: std::sync::atomic::AtomicBool,
+    source: Option<crate::ExternalEventSource>,
     generation: Mutex<EventGeneration>,
     changed: Condvar,
 }
@@ -69,9 +70,14 @@ impl Default for EventObject {
 impl EventObject {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_source(None)
+    }
+
+    fn with_source(source: Option<crate::ExternalEventSource>) -> Self {
         Self {
             state: Arc::new(EventState {
                 signalled: std::sync::atomic::AtomicBool::new(false),
+                source,
                 generation: Mutex::new(EventGeneration {
                     value: 0,
                     next_watcher_id: 1,
@@ -87,6 +93,19 @@ impl EventObject {
     #[must_use]
     pub fn create_pair() -> (WritableEventObject, ReadableEventObject) {
         let event = Self::new();
+        (
+            WritableEventObject(event.clone()),
+            ReadableEventObject(event),
+        )
+    }
+
+    /// Creates an event pair carrying its device-ingress classification all
+    /// the way to the runtime coordinator.
+    #[must_use]
+    pub fn create_pair_with_source(
+        source: crate::ExternalEventSource,
+    ) -> (WritableEventObject, ReadableEventObject) {
+        let event = Self::with_source(Some(source));
         (
             WritableEventObject(event.clone()),
             ReadableEventObject(event),
@@ -210,6 +229,10 @@ impl WritableEventObject {
 pub struct ReadableEventObject(pub(super) EventObject);
 
 impl ReadableEventObject {
+    #[must_use]
+    pub fn source(&self) -> Option<crate::ExternalEventSource> {
+        self.0.state.source
+    }
     #[must_use]
     pub fn is_signalled(&self) -> bool {
         self.0.is_signalled()

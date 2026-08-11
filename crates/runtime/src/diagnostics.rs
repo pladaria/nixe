@@ -54,19 +54,6 @@ impl Default for DiagnosticsPolicy {
     }
 }
 
-impl From<nixe_config::DiagnosticsConfig> for DiagnosticsPolicy {
-    fn from(config: nixe_config::DiagnosticsConfig) -> Self {
-        Self {
-            report_detail: match config.report_detail {
-                nixe_config::DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
-                nixe_config::DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
-            },
-            instruction_trace: config.instruction_trace,
-            ..Self::default()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,17 +87,5 @@ mod tests {
                 report_detail: MissingInstructionReportDetail::Sanitized,
             }
         );
-    }
-
-    #[test]
-    fn runtime_normalizes_the_application_configuration() {
-        let policy = DiagnosticsPolicy::from(nixe_config::DiagnosticsConfig {
-            log_level: nixe_config::DiagnosticLogLevel::Trace,
-            report_detail: nixe_config::DiagnosticReportDetail::Sanitized,
-            instruction_trace: true,
-        });
-        assert_eq!(policy.report_detail, ReportDetail::Sanitized);
-        assert!(policy.instruction_trace);
-        assert!(policy.missing_instruction_reports);
     }
 }
