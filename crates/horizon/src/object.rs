@@ -284,6 +284,10 @@ impl TimeEnvironment {
     pub(crate) fn create_service(&self) -> Result<TimeServiceSession, nixe_runtime::HandleError> {
         TimeServiceSession::new(self.clone())
     }
+
+    pub(crate) fn clock(&self) -> VirtualClock {
+        self.clock.clone()
+    }
 }
 
 impl Default for TimeEnvironment {

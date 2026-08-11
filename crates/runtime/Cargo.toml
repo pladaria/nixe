@@ -15,6 +15,7 @@ nixe-loader-content.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-memory.workspace = true
+nixe-scheduler.workspace = true
 
 [dev-dependencies]
 nixe-cpu-engine-interpreter.workspace = true

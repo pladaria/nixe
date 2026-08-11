@@ -2,6 +2,7 @@
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Initial wall-clock policy selected by the application runtime.
@@ -18,6 +19,7 @@ struct VirtualClockState {
     mode: VirtualClockMode,
     wall_anchor: i64,
     monotonic_anchor: Instant,
+    scheduler_time_ns: AtomicU64,
 }
 
 /// One cloneable clock source shared by all services of an emulated process.
@@ -43,6 +45,7 @@ impl VirtualClock {
                 mode,
                 wall_anchor,
                 monotonic_anchor: Instant::now(),
+                scheduler_time_ns: AtomicU64::new(0),
             }),
         }
     }
@@ -71,6 +74,22 @@ impl VirtualClock {
     #[must_use]
     pub fn mode(&self) -> VirtualClockMode {
         self.state.mode
+    }
+
+    /// Deterministic scheduler timeline. Unlike service wall time, this value
+    /// advances only through coordinator decisions and never samples the host.
+    #[must_use]
+    pub fn scheduler_time_ns(&self) -> u64 {
+        self.state.scheduler_time_ns.load(Ordering::Acquire)
+    }
+
+    /// Advances the deterministic scheduler timeline monotonically. Runtime
+    /// coordinators are the production authority; adapters use this only to
+    /// synchronize compatibility dispatch paths with that authority.
+    pub fn advance_scheduler_to(&self, nanoseconds: u64) {
+        self.state
+            .scheduler_time_ns
+            .fetch_max(nanoseconds, Ordering::AcqRel);
     }
 }
 

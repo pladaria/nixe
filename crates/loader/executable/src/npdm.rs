@@ -421,6 +421,19 @@ impl KernelCapabilities {
         })
     }
 
+    /// Returns the authorized thread priority/core policy, when present.
+    pub fn thread_info(&self) -> Option<(u8, u8, u8, u8)> {
+        self.0.iter().find_map(|capability| match capability {
+            KernelCapability::ThreadInfo {
+                lowest_priority,
+                highest_priority,
+                min_core,
+                max_core,
+            } => Some((*lowest_priority, *highest_priority, *min_core, *max_core)),
+            _ => None,
+        })
+    }
+
     fn authorized_by(&self, ceiling: &Self) -> bool {
         self.0
             .iter()

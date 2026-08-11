@@ -43,6 +43,22 @@ pub fn program_content(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
     program_content_with_npdm_policy(id, modules, true, 1_u64 << 63)
 }
 
+#[allow(dead_code)]
+pub fn aarch32_program_content_with_svc(id: [u8; 16], immediate: u8) -> Content {
+    let npdm = build_npdm(APPLICATION_ID, true, 1_u64 << 63, 0);
+    let mut module = build_nso(1);
+    let text_offset = u32::from_le_bytes(module[0x10..0x14].try_into().unwrap()) as usize;
+    module[text_offset..text_offset + 4]
+        .copy_from_slice(&(0xef00_0000 | u32::from(immediate)).to_le_bytes());
+    let exefs = build_pfs0(&[("main", module.as_slice()), ("main.npdm", npdm.as_slice())]);
+    Content {
+        id,
+        content_type: 1,
+        id_offset: 0,
+        nca: build_nca(APPLICATION_ID, 0, vec![pfs0_section(exefs)]),
+    }
+}
+
 pub fn program_content_without_services(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
     program_content_with_npdm_policy(id, modules, false, 1_u64 << 63)
 }
@@ -61,7 +77,12 @@ fn program_content_with_npdm_policy(
     include_services: bool,
     filesystem_permissions: u64,
 ) -> Content {
-    let npdm = build_npdm(APPLICATION_ID, include_services, filesystem_permissions);
+    let npdm = build_npdm(
+        APPLICATION_ID,
+        include_services,
+        filesystem_permissions,
+        1 | (3 << 1),
+    );
     let module_bytes = modules
         .iter()
         .map(|(name, seed)| ((*name).to_owned(), build_nso(*seed)))
@@ -372,7 +393,12 @@ fn build_nca(title_id: u64, content_type: u8, sections: Vec<NcaSectionFixture>) 
     nca
 }
 
-fn build_npdm(program_id: u64, include_services: bool, filesystem_permissions: u64) -> Vec<u8> {
+fn build_npdm(
+    program_id: u64,
+    include_services: bool,
+    filesystem_permissions: u64,
+    process_flags: u8,
+) -> Vec<u8> {
     const META: usize = 0x80;
     const ACID_HEADER: usize = 0x240;
     const FAC_SIZE: usize = 0x2c;
@@ -401,7 +427,7 @@ fn build_npdm(program_id: u64, include_services: bool, filesystem_permissions: u
     let aci_size = aci_kac + kac.len();
     let mut data = vec![0_u8; aci + aci_size];
     data[..4].copy_from_slice(b"META");
-    data[0x0c] = 1 | (3 << 1);
+    data[0x0c] = process_flags;
     data[0x0e] = 0x20;
     data[0x0f] = 2;
     put_u32(&mut data, 0x1c, 0x4000);

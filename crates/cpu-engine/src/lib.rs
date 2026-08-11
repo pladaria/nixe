@@ -565,6 +565,9 @@ pub trait EngineExecutor: Send {
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault>;
     fn request_safepoint(&mut self, reason: SafepointReason);
     fn post_event(&self, mask: u32);
+    /// Clears executor-local exclusive-reservation state at an explicit
+    /// scheduler migration or context-switch boundary.
+    fn clear_local_exclusive_reservation(&mut self);
 }
 
 /// Executes the canonical `InterpretOne` fallback contract. The helper forces

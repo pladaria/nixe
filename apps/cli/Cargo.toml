@@ -18,5 +18,6 @@ nixe-loader-executable.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-runtime.workspace = true
+nixe-scheduler.workspace = true
 nixe-video.workspace = true
 nixe-video-winit.workspace = true

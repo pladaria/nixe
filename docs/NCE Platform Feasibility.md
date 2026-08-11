@@ -1,8 +1,7 @@
 # Native Code Execution Platform Feasibility
 
-Status: Phase A design record  
-Revision: 2026-08-11  
-Contract revision: `nixe-cpu-engine` 0.1 / SEA-008
+Status: design record
+Revision: 2026-08-11
 
 This note records integration seams, not backend commitments. Nixe must probe
 each facility at runtime and expose an unavailable engine with a typed reason.
@@ -32,7 +31,7 @@ reconciliation design.
 
 Versioned basis: Apple Developer Documentation retrieved 2026-08-11 for the
 [Hypervisor framework](https://developer.apple.com/documentation/hypervisor),
-[`hv_vcpu_create`](https://developer.apple.com/documentation/hypervisor/hv_vcpu_create(_:_:_:)),
+[`hv_vcpu_create`](<https://developer.apple.com/documentation/hypervisor/hv_vcpu_create(_:_:_:)>),
 [`hv_vm_map`](https://developer.apple.com/documentation/hypervisor/1441187-hv_vm_map),
 and the
 [`com.apple.security.hypervisor` entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.hypervisor).
@@ -124,16 +123,16 @@ Versioned basis: Android Open Source Project
 
 ## Contract mapping and decision
 
-| Platform operation | Common seam |
-| --- | --- |
-| Host/device/entitlement probe | `EngineProvider::probe` and rejection report |
-| VM creation and destruction | `create_domain` / `NceExecutionDomain::teardown` |
-| vCPU creation, migration, registers | `import_vcpu` / `export_vcpu` |
-| Map, unmap, protect | `bind_address_space` / `notify_mapping` |
-| Dirty pages and invalidation | `reconcile_dirty_memory` and handoff record |
-| SVC, abort, timer, interrupt exit | `NceTrap` / `normalize_trap` |
-| Virtual interrupt delivery | `inject_interrupt` |
-| Stable stop boundary | `quiesce` and `StateCommitBarrier` |
+| Platform operation                  | Common seam                                      |
+| ----------------------------------- | ------------------------------------------------ |
+| Host/device/entitlement probe       | `EngineProvider::probe` and rejection report     |
+| VM creation and destruction         | `create_domain` / `NceExecutionDomain::teardown` |
+| vCPU creation, migration, registers | `import_vcpu` / `export_vcpu`                    |
+| Map, unmap, protect                 | `bind_address_space` / `notify_mapping`          |
+| Dirty pages and invalidation        | `reconcile_dirty_memory` and handoff record      |
+| SVC, abort, timer, interrupt exit   | `NceTrap` / `normalize_trap`                     |
+| Virtual interrupt delivery          | `inject_interrupt`                               |
+| Stable stop boundary                | `quiesce` and `StateCommitBarrier`               |
 
 HVF and Linux KVM map to the common contracts without exposing backend handles.
 Android currently maps only at the conceptual VM lifecycle level and therefore

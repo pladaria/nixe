@@ -1,5 +1,6 @@
-//! Runtime lifecycle around an injected CPU engine domain.
+//! Process-local execution domain and per-vCPU executor ownership.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -56,6 +57,7 @@ pub struct ThreadExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProcessExecutionError {
+    UnknownThread(nixe_scheduler::GuestThreadId),
     NotRunnable {
         status: ProcessExecutionStatus,
         context: Box<RegisterContext>,
@@ -68,6 +70,9 @@ pub enum ProcessExecutionError {
 impl Display for ProcessExecutionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownThread(thread) => {
+                write!(formatter, "guest thread {thread} does not exist")
+            }
             Self::NotRunnable { status, context } => write!(
                 formatter,
                 "process is not runnable while {status:?}: registers=[{context}]"
@@ -88,13 +93,12 @@ pub struct ProcessTeardownReport {
     pub physical_pages_released: usize,
     pub mounts_released: usize,
     pub handles_released: usize,
+    pub address_waiters_released: usize,
 }
 
 pub(crate) struct ProcessExecutionControl {
-    status: ProcessExecutionStatus,
-    exit: Option<ProcessExit>,
     domain: Box<dyn EngineDomain>,
-    executor: Box<dyn EngineExecutor>,
+    executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
     trace_policy: TracePolicy,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
@@ -120,58 +124,54 @@ impl ProcessExecutionControl {
             executor: EngineExecutorId::new(1),
             trace,
         })?;
+        let mut executors = BTreeMap::new();
+        executors.insert(nixe_scheduler::VirtualCpuId::new(0), executor);
         Ok(Self {
-            status: ProcessExecutionStatus::Ready,
-            exit: None,
             domain,
-            executor,
+            executors,
             trace_policy: trace,
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
         })
     }
 
-    pub(crate) const fn status(&self) -> ProcessExecutionStatus {
-        self.status
-    }
-    pub(crate) const fn exit(&self) -> Option<ProcessExit> {
-        self.exit
-    }
     pub(crate) fn engine_descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
         self.domain.descriptor()
     }
     pub(crate) fn request_safepoint(&mut self) {
-        self.executor.request_safepoint(SafepointReason::Requested);
+        for executor in self.executors.values_mut() {
+            executor.request_safepoint(SafepointReason::Requested);
+        }
     }
     pub(crate) fn post_event(&self, mask: u32) {
-        self.executor.post_event(mask);
-    }
-    pub(crate) fn resume(&mut self) -> bool {
-        if self.status != ProcessExecutionStatus::Suspended {
-            return false;
+        for executor in self.executors.values() {
+            executor.post_event(mask);
         }
-        self.status = ProcessExecutionStatus::Ready;
-        true
     }
-    pub(crate) fn terminate(&mut self, exit: ProcessExit) -> bool {
-        if matches!(
-            self.status,
-            ProcessExecutionStatus::Exited | ProcessExecutionStatus::Faulted
-        ) {
-            return false;
+    fn executor_id(vcpu: nixe_scheduler::VirtualCpuId) -> EngineExecutorId {
+        EngineExecutorId::new(u64::from(vcpu.get()) + 1)
+    }
+    fn executor_for(
+        &mut self,
+        vcpu: nixe_scheduler::VirtualCpuId,
+    ) -> Result<&mut Box<dyn EngineExecutor>, EngineFault> {
+        if !self.executors.contains_key(&vcpu) {
+            let executor = self.domain.create_executor(ExecutorRequest {
+                executor: Self::executor_id(vcpu),
+                trace: self.trace_policy,
+            })?;
+            self.executors.insert(vcpu, executor);
         }
-        self.status = ProcessExecutionStatus::Exited;
-        self.exit = Some(exit);
-        true
+        Ok(self
+            .executors
+            .get_mut(&vcpu)
+            .expect("executor was installed"))
     }
-    pub(crate) fn fault(&mut self) -> bool {
-        if self.status != ProcessExecutionStatus::Suspended {
-            return false;
+    pub(crate) fn clear_local_exclusive_reservation(&mut self, vcpu: nixe_scheduler::VirtualCpuId) {
+        if let Some(executor) = self.executors.get_mut(&vcpu) {
+            executor.clear_local_exclusive_reservation();
         }
-        self.status = ProcessExecutionStatus::Faulted;
-        true
     }
-
     pub(crate) fn switch_provider(
         &mut self,
         cpu: ProcessCpuContext,
@@ -186,15 +186,19 @@ impl ProcessExecutionControl {
                 stage: nixe_cpu_engine::HandoffFailureStage::Import,
                 fault,
             })?;
-        let replacement_executor = replacement
-            .create_executor(ExecutorRequest {
-                executor: self.executor.executor_id(),
-                trace: self.trace_policy,
-            })
-            .map_err(|fault| nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                fault,
-            })?;
+        let mut replacement_executors = BTreeMap::new();
+        for vcpu in self.executors.keys().copied() {
+            let executor = replacement
+                .create_executor(ExecutorRequest {
+                    executor: Self::executor_id(vcpu),
+                    trace: self.trace_policy,
+                })
+                .map_err(|fault| nixe_cpu_engine::HandoffFailure {
+                    stage: nixe_cpu_engine::HandoffFailureStage::Import,
+                    fault,
+                })?;
+            replacement_executors.insert(vcpu, executor);
+        }
         let memory = nixe_cpu_engine::MemorySynchronizationRecord {
             address_space: cpu.address_space_id(),
             invalidation_generation: 0,
@@ -203,7 +207,7 @@ impl ProcessExecutionControl {
         let (replacement, barrier) =
             nixe_cpu_engine::prepare_handoff(self.domain.as_mut(), replacement, memory)?;
         self.domain = replacement;
-        self.executor = replacement_executor;
+        self.executors = replacement_executors;
         Ok(barrier)
     }
 }
@@ -229,24 +233,23 @@ impl EngineTimer for RuntimeTimer<'_> {
 
 pub(crate) fn run_engine(
     control: &mut ProcessExecutionControl,
+    vcpu: nixe_scheduler::VirtualCpuId,
     cpu: ProcessCpuContext,
     memory: &ExecutionMemory,
     state: &mut ThreadCpuState,
     instruction_budget: u64,
     loader_return: Option<GuestVirtualAddress>,
 ) -> Result<ExecutionReport, ProcessExecutionError> {
-    if control.status != ProcessExecutionStatus::Ready {
-        return Err(ProcessExecutionError::NotRunnable {
-            status: control.status,
-            context: Box::new(state.register_context()),
-        });
-    }
-    control.status = ProcessExecutionStatus::Running;
+    let virtual_clock = control.virtual_clock.clone();
+    let frequency = control.architectural_timer_frequency;
     let timer = RuntimeTimer {
-        clock: &control.virtual_clock,
-        frequency: control.architectural_timer_frequency,
+        clock: &virtual_clock,
+        frequency,
     };
-    let result = control.executor.run_slice(RunRequest {
+    let executor = control
+        .executor_for(vcpu)
+        .map_err(|fault| ProcessExecutionError::Engine { fault })?;
+    let result = executor.run_slice(RunRequest {
         cpu,
         memory,
         state,
@@ -258,30 +261,17 @@ pub(crate) fn run_engine(
         Ok(report) => {
             if report.state_commit != nixe_cpu_engine::StateCommitStatus::Canonical {
                 let fault = EngineFault {
-                    engine: control.executor.descriptor().id,
+                    engine: executor.descriptor().id,
                     kind: nixe_cpu_engine::EngineFaultKind::StateExport,
                     instructions_executed: report.instructions_executed,
                     message: "engine returned before committing canonical thread state".into(),
                     context: Box::new(report.context),
                 };
-                control.status = ProcessExecutionStatus::Faulted;
                 return Err(ProcessExecutionError::Engine { fault });
             }
-            control.status = match report.stop {
-                ExecutionStop::BudgetExhausted
-                | ExecutionStop::Safepoint
-                | ExecutionStop::PendingEvent { .. } => ProcessExecutionStatus::Ready,
-                ExecutionStop::FetchFault { .. } | ExecutionStop::UnsupportedSemantics { .. } => {
-                    ProcessExecutionStatus::Faulted
-                }
-                _ => ProcessExecutionStatus::Suspended,
-            };
             Ok(report)
         }
-        Err(fault) => {
-            control.status = ProcessExecutionStatus::Faulted;
-            Err(ProcessExecutionError::Engine { fault })
-        }
+        Err(fault) => Err(ProcessExecutionError::Engine { fault }),
     }
 }
 

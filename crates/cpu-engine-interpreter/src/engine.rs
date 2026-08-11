@@ -87,6 +87,9 @@ impl InterpreterExecutionState {
     fn take_pending_interrupts(&self) -> u32 {
         self.pending_interrupts.swap(0, Ordering::AcqRel)
     }
+    fn clear_local_exclusive_reservation(&mut self) {
+        *self.exclusive_monitor.get_mut() = nixe_cpu::exclusive::ExclusiveMonitorState::default();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -342,6 +345,10 @@ impl EngineExecutor for InterpreterExecutor {
             };
             return Ok(self.report(executed, stop, request.state));
         }
+    }
+
+    fn clear_local_exclusive_reservation(&mut self) {
+        self.execution.clear_local_exclusive_reservation();
     }
 
     fn request_safepoint(&mut self, _reason: SafepointReason) {

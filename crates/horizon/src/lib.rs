@@ -13,6 +13,7 @@ mod ipc_wire;
 mod nvdrv;
 mod object;
 mod parcel;
+mod scheduler_profile;
 mod svc;
 mod svc_dispatch;
 
@@ -40,10 +41,12 @@ pub use object::{
     SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
     TimeZoneServiceSession,
 };
+pub use scheduler_profile::switch_1_scheduler_profile;
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,
 };
 pub use svc_dispatch::{
-    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonSvcCoverageEntry,
-    HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, MAX_WAIT_HANDLES,
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult,
+    HorizonScheduledDispatchError, HorizonSvcCoverageEntry, HorizonSvcDispatcher, HorizonSvcFault,
+    HorizonSvcSupport, MAX_WAIT_HANDLES,
 };

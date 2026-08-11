@@ -133,6 +133,8 @@ impl EngineExecutor for FakeExecutor {
             state_commit: StateCommitStatus::Canonical,
         })
     }
+
+    fn clear_local_exclusive_reservation(&mut self) {}
     fn request_safepoint(&mut self, _reason: SafepointReason) {}
     fn post_event(&self, _mask: u32) {}
 }
