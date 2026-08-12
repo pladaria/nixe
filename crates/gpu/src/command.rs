@@ -292,6 +292,25 @@ pub struct BarrierOperation {
     transitions: Box<[ResourceTransition]>,
 }
 
+/// Backend-independent device cache-maintenance operation.
+///
+/// This is an ordering command, not a model of any host GPU's physical cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheMaintenanceOperation {
+    /// Discard device-side cached reads so later reads observe canonical memory.
+    InvalidateDeviceReadCaches,
+    /// Discard cached texture fetches so later sampling observes current data.
+    InvalidateTextureReadCaches,
+    /// Discard selected shader-side caches without implying an idle wait.
+    InvalidateShaderCaches {
+        instruction: bool,
+        global_data: bool,
+        constant: bool,
+    },
+    /// Make dirty device writes visible before later work on the submission.
+    FlushDirtyDeviceWrites,
+}
+
 impl BarrierOperation {
     pub fn new(transitions: Vec<ResourceTransition>) -> Result<Self, CommandDescriptionError> {
         if transitions.is_empty() {
@@ -457,6 +476,7 @@ pub enum GpuCommand {
     Draw(DrawOperation),
     Dispatch(DispatchOperation),
     Barrier(BarrierOperation),
+    CacheMaintenance(CacheMaintenanceOperation),
     Query(QueryOperation),
     RenderPass(RenderPassOperation),
 }
@@ -526,6 +546,7 @@ impl GpuCommand {
             Self::Draw(draw) => draw_accesses(draw),
             Self::Dispatch(_) => Vec::new(),
             Self::Barrier(_) => Vec::new(),
+            Self::CacheMaintenance(_) => Vec::new(),
             Self::Query(query) => query_accesses(query),
             Self::RenderPass(pass) => render_pass_accesses(pass),
         }
@@ -569,6 +590,7 @@ impl GpuCommand {
                     push_target_dependency(&mut dependencies, transition.target());
                 }
             }
+            Self::CacheMaintenance(_) => {}
             Self::Query(query) => {
                 for access in query_accesses(query) {
                     push_target_dependency(&mut dependencies, access.target());
@@ -598,6 +620,7 @@ impl GpuCommand {
             Self::Draw(_) => BackendFeatures::DRAW,
             Self::Dispatch(_) => BackendFeatures::DISPATCH,
             Self::Barrier(_) => BackendFeatures::BARRIER,
+            Self::CacheMaintenance(_) => BackendFeatures::BARRIER,
             Self::Query(_) => BackendFeatures::QUERY,
             Self::RenderPass(_) => BackendFeatures::RENDER_PASS,
         })];
@@ -1115,6 +1138,34 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.operation_index(), 1);
         assert_eq!(submission.predecessors(), &[FrontendSubmissionId::new(2)]);
+    }
+
+    #[test]
+    fn cache_maintenance_commands_are_global_ordering_operations_requiring_barrier_support() {
+        for maintenance in [
+            CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+            CacheMaintenanceOperation::InvalidateDeviceReadCaches,
+            CacheMaintenanceOperation::InvalidateTextureReadCaches,
+            CacheMaintenanceOperation::InvalidateShaderCaches {
+                instruction: true,
+                global_data: true,
+                constant: true,
+            },
+        ] {
+            let operation = GpuOperation::new(
+                GpuCommand::CacheMaintenance(maintenance),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            );
+
+            assert!(operation.accesses().is_empty());
+            assert!(operation.dependencies().is_empty());
+            assert_eq!(
+                operation.capability_requirements().requirements(),
+                &[CapabilityRequirement::Features(BackendFeatures::BARRIER)]
+            );
+        }
     }
 
     #[test]

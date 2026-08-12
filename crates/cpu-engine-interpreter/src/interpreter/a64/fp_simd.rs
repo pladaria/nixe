@@ -8,6 +8,7 @@ use nixe_cpu::{
             PairwiseOperation, PermuteOperation,
         },
     },
+    ir::op::Condition,
     location::DecodedInstruction,
     memory::{
         CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
@@ -15,6 +16,7 @@ use nixe_cpu::{
     },
     semantics::{
         bits::{BitWidth, replicate},
+        conditions::evaluate_a64,
         floating_point::{FpFormat, FpRoundingMode, FpStatus},
         vector::{LaneWidth, VectorArrangement, extract_lane},
     },
@@ -36,6 +38,10 @@ pub(super) fn execute(
     let result = match instruction {
         Instruction::DuplicateGeneral(_) => {
             duplicate_general(state, fields);
+            None
+        }
+        Instruction::DuplicateElement(_) => {
+            duplicate_element(state, fields);
             None
         }
         Instruction::ModifiedImmediate(_) => {
@@ -60,6 +66,18 @@ pub(super) fn execute(
         }
         Instruction::MoveFromGeneral(_) => {
             floating_move_from_general(state, fields);
+            None
+        }
+        Instruction::ScalarMove(_) => {
+            scalar_move(state, fields);
+            None
+        }
+        Instruction::ScalarAbsolute(_) | Instruction::ScalarNegate(_) => {
+            scalar_sign_operation(
+                state,
+                fields,
+                matches!(instruction, Instruction::ScalarNegate(_)),
+            );
             None
         }
         Instruction::Integer(_) => {
@@ -124,6 +142,26 @@ pub(super) fn execute(
             shift_right_narrow(state, fields);
             None
         }
+        Instruction::ScalarShiftRightImmediate(_) | Instruction::VectorShiftRightImmediate(_) => {
+            shift_right_immediate(
+                state,
+                fields,
+                matches!(instruction, Instruction::ScalarShiftRightImmediate(_)),
+            );
+            None
+        }
+        Instruction::CountBits(_) => {
+            count_bits(state, fields);
+            None
+        }
+        Instruction::AddAcrossVector(_) => {
+            add_across_vector(state, fields);
+            None
+        }
+        Instruction::ExtractNarrow(_) => {
+            extract_narrow(state, fields);
+            None
+        }
         Instruction::VectorSignedIntToFloat(_) | Instruction::VectorUnsignedIntToFloat(_) => {
             let signed = matches!(instruction, Instruction::VectorSignedIntToFloat(_));
             let (value, inexact) = vector_integer_to_float(state, fields, signed);
@@ -134,6 +172,19 @@ pub(super) fn execute(
                 return Err(super::super::unsupported(decoded));
             }
             assert!(state.set_vector(fields.rd, value));
+            if inexact {
+                state.set_fpsr(state.fpsr() | (1 << 4));
+            }
+            None
+        }
+        Instruction::ScalarVectorSignedIntToFloat(_)
+        | Instruction::ScalarVectorUnsignedIntToFloat(_) => {
+            let signed = matches!(instruction, Instruction::ScalarVectorSignedIntToFloat(_));
+            let (value, inexact) = scalar_vector_integer_to_float(state, fields, signed);
+            if inexact && state.fpcr() & (1 << 12) != 0 {
+                return Err(super::super::unsupported(decoded));
+            }
+            assert!(state.set_vector(fields.rd, u128::from(value)));
             if inexact {
                 state.set_fpsr(state.fpsr() | (1 << 4));
             }
@@ -178,6 +229,10 @@ pub(super) fn execute(
             }
             assert!(state.set_vector(fields.rd, value));
             state.set_fpsr(state.fpsr() | fp_status_bits(status));
+            None
+        }
+        Instruction::VectorFloatImmediate(_) => {
+            vector_float_immediate(state, fields);
             None
         }
         Instruction::ScalarFloatImmediate(_) => {
@@ -251,6 +306,10 @@ pub(super) fn execute(
             }
             assert!(state.set_vector(fields.rd, u128::from(outcome.bits)));
             state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            None
+        }
+        Instruction::ScalarFloatConditionalSelect(_) => {
+            scalar_float_conditional_select(state, fields);
             None
         }
         Instruction::CompareRegister(_) | Instruction::CompareZero(_) => {
@@ -387,6 +446,56 @@ pub(super) fn execute(
     }
     advance(state);
     Ok(resume(state, decoded))
+}
+
+// FMOV (register) copies the scalar bit pattern without floating-point
+// processing. This preserves every NaN payload, subnormal, and signed zero,
+// clears the remaining destination bits, and leaves FPCR/FPSR unchanged. Arm
+// ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
+fn scalar_move(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let width = match fields.opc {
+        0 => 32,
+        1 => 64,
+        3 => 16,
+        _ => unreachable!("allocated scalar FMOV register precision"),
+    };
+    let mask = (1_u128 << width) - 1;
+    let value = state
+        .vector(fields.rn)
+        .expect("normalized scalar FMOV source register")
+        & mask;
+    assert!(state.set_vector(fields.rd, value));
+}
+
+// FABS clears and FNEG toggles the scalar sign bit without floating-point
+// processing, preserving NaN payloads and leaving FPCR/FPSR untouched. Arm ARM
+// DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FABS--scalar---Floating-point-Absolute-value--scalar--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNEG--scalar---Floating-point-Negate--scalar--
+fn scalar_sign_operation(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    negate: bool,
+) {
+    let width = match fields.opc {
+        0 => 32,
+        1 => 64,
+        3 => 16,
+        _ => unreachable!("allocated scalar sign-operation precision"),
+    };
+    let mask = (1_u128 << width) - 1;
+    let sign = 1_u128 << (width - 1);
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized scalar sign-operation source register")
+        & mask;
+    let result = if negate {
+        source ^ sign
+    } else {
+        source & !sign
+    };
+    assert!(state.set_vector(fields.rd, result));
 }
 
 fn pair_access_size(size: u8) -> MemoryAccessSize {
@@ -566,6 +675,28 @@ fn duplicate_general(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_sim
         BitWidth::new(vector_bits).expect("allocated SIMD vector width"),
     )
     .expect("allocated SIMD lane arrangement");
+    assert!(state.set_vector(fields.rd, value));
+}
+
+// DUP (element) decodes both element size and index from imm5, reads the
+// source before writing so aliases are exact, and clears inactive upper bits
+// for 64-bit destinations. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/DUP--element---Duplicate-vector-element-to-vector-or-scalar-
+fn duplicate_element(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let size_shift = fields.immediate_5.trailing_zeros();
+    let lane_bits = 8_u32 << size_shift;
+    let lane = fields.immediate_5 >> (size_shift + 1);
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized DUP element source register");
+    let element = (source >> (u32::from(lane) * lane_bits)) & ((1_u128 << lane_bits) - 1);
+    let value = replicate(
+        element,
+        BitWidth::new(lane_bits as u8).expect("allocated DUP element width"),
+        BitWidth::new(vector_bits).expect("allocated DUP destination width"),
+    )
+    .expect("allocated DUP destination arrangement");
     assert!(state.set_vector(fields.rd, value));
 }
 
@@ -760,6 +891,26 @@ fn scalar_float_immediate(state: &mut A64State, fields: nixe_cpu::decode::a64::f
     assert!(state.set_vector(fields.rd, u128::from(value)));
 }
 
+// FMOV (vector, immediate) uses VFPExpandImm and replicates the exact bit
+// pattern into every active 32-bit or 64-bit element. It neither performs
+// floating-point arithmetic nor changes FPCR/FPSR. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--vector--immediate---Floating-point-Move-immediate--vector--
+fn vector_float_immediate(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let (lane, lane_bits) = if fields.operation_bit {
+        (expand_vfp_immediate(fields.immediate_8, 11, 52), 64)
+    } else {
+        (expand_vfp_immediate(fields.immediate_8, 8, 23), 32)
+    };
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let value = replicate(
+        u128::from(lane),
+        BitWidth::new(lane_bits).expect("allocated FMOV vector lane width"),
+        BitWidth::new(vector_bits).expect("allocated FMOV vector width"),
+    )
+    .expect("allocated FMOV vector arrangement");
+    assert!(state.set_vector(fields.rd, value));
+}
+
 fn expand_vfp_immediate(immediate: u8, exponent_bits: u32, fraction_bits: u32) -> u64 {
     let sign = u64::from(immediate >> 7);
     let exponent_control = u64::from((immediate >> 6) & 1);
@@ -837,6 +988,36 @@ fn vector_integer_to_float(
         any_inexact |= inexact;
     }
     (result, any_inexact)
+}
+
+// Scalar SCVTF/UCVTF in the Advanced SIMD encoding reads the low 32-bit or
+// 64-bit integer element of Vn. It shares the exact conversion and FPCR
+// rounding rules with the vector and GPR-source forms, while clearing every
+// destination bit above the scalar result. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--scalar---Signed-integer-Convert-to-Floating-point--scalar--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--scalar---Unsigned-integer-Convert-to-Floating-point--scalar--
+fn scalar_vector_integer_to_float(
+    state: &A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    signed: bool,
+) -> (u64, bool) {
+    let lane_bits = if fields.opc == 0 { 32_u32 } else { 64_u32 };
+    let mask = if lane_bits == 32 {
+        u128::from(u32::MAX)
+    } else {
+        u128::from(u64::MAX)
+    };
+    let source = (state
+        .vector(fields.rn)
+        .expect("normalized scalar SIMD conversion source register")
+        & mask) as u64;
+    let (negative, magnitude) = integer_sign_and_magnitude(source, lane_bits, signed);
+    integer_magnitude_to_ieee(
+        magnitude,
+        negative,
+        lane_bits,
+        fpcr_rounding_mode(state.fpcr()),
+    )
 }
 
 // SCVTF and UCVTF scalar integer forms use FPCR.RMode, set FPSR.IXC for a
@@ -1441,6 +1622,34 @@ fn scalar_float_multiply(
         outcome.bits ^= format.sign_mask();
     }
     outcome
+}
+
+// FCSEL copies the selected scalar bit pattern without interpreting it, so
+// NaNs, subnormals, and signed zero are preserved exactly and FPSR is unchanged.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCSEL--Floating-point-Conditional-Select--scalar--
+fn scalar_float_conditional_select(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) {
+    let source = if evaluate_a64(
+        Condition::from_encoding(fields.condition),
+        state.nzcv().bits(),
+    ) {
+        fields.rn
+    } else {
+        fields.rm
+    };
+    let mask = if fields.opc == 0 {
+        u128::from(u32::MAX)
+    } else {
+        u128::from(u64::MAX)
+    };
+    let value = state
+        .vector(source)
+        .expect("normalized scalar FCSEL source")
+        & mask;
+    assert!(state.set_vector(fields.rd, value));
 }
 
 fn multiply_ieee_lane(
@@ -2573,6 +2782,114 @@ fn shift_right_narrow(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_si
         let previous = state
             .vector(fields.rd)
             .expect("normalized SHRN2 destination register");
+        (previous & u128::from(u64::MAX)) | (narrowed << 64)
+    } else {
+        narrowed
+    };
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// SSHR and USHR interpret the immediate as twice the element width minus the
+// requested shift. Scalar forms always operate on Dn; vector forms apply the
+// operation independently to every active lane and clear inactive upper bits.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHR--Signed-shift-right--immediate--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHR--Unsigned-shift-right--immediate--
+fn shift_right_immediate(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    scalar: bool,
+) {
+    let bits = fields.helper_token.helper_abi_value();
+    let immediate = (bits >> 16) & 0x7f;
+    let immediate_high = immediate >> 3;
+    let lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+    let shift = 2 * lane_bits - immediate;
+    let active_bits = if scalar || !fields.vector_128 {
+        64
+    } else {
+        128
+    };
+    let lane_count = active_bits / lane_bits;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized SSHR/USHR source register");
+    let signed = !fields.operation_bit;
+    let mut result = 0_u128;
+    for lane in 0..lane_count {
+        let value = (source >> (lane * lane_bits)) & lane_mask;
+        let shifted = if signed && value & (1_u128 << (lane_bits - 1)) != 0 {
+            let extended = value | !lane_mask;
+            ((extended as i128) >> shift) as u128
+        } else {
+            value >> shift
+        };
+        result |= (shifted & lane_mask) << (lane * lane_bits);
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// CNT writes the population count of each source byte into the corresponding
+// destination byte. The 8B form clears the inactive upper 64 bits.
+// Arm A64 ISA (2025):
+// https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+fn count_bits(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let byte_count = if fields.vector_128 { 16 } else { 8 };
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized CNT source register");
+    let mut result = 0_u128;
+    for byte in 0..byte_count {
+        let value = ((source >> (byte * 8)) & 0xff) as u8;
+        result |= u128::from(value.count_ones()) << (byte * 8);
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// ADDV reduces all active lanes with modular addition and writes only the
+// scalar result, clearing every destination bit above the result element.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDV--Add-across-vector-
+fn add_across_vector(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let bits = fields.helper_token.helper_abi_value();
+    let lane_bits = 8_u32 << ((bits >> 22) & 3);
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized ADDV source register");
+    let mut result = 0_u128;
+    for lane in 0..lane_count {
+        result = result.wrapping_add((source >> (lane * lane_bits)) & lane_mask) & lane_mask;
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// XTN copies the least-significant half of every source lane to the lower
+// destination half and clears the upper half. XTN2 preserves the lower half
+// and writes the narrowed lanes to the upper half. Reading both source and old
+// destination before the write makes Rd == Rn behave architecturally. Arm ARM
+// DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/XTN--XTN2--Extract-Narrow--vector--
+fn extract_narrow(state: &mut A64State, fields: nixe_cpu::decode::a64::fp_simd::Operands) {
+    let destination_lane_bits = 8_u32 << fields.opc;
+    let source_lane_bits = destination_lane_bits * 2;
+    let lane_count = 128 / source_lane_bits;
+    let destination_mask = (1_u128 << destination_lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized XTN source register");
+    let previous = state
+        .vector(fields.rd)
+        .expect("normalized XTN destination register");
+    let mut narrowed = 0_u128;
+    for lane in 0..lane_count {
+        narrowed |= ((source >> (lane * source_lane_bits)) & destination_mask)
+            << (lane * destination_lane_bits);
+    }
+    let result = if fields.vector_128 {
         (previous & u128::from(u64::MAX)) | (narrowed << 64)
     } else {
         narrowed

@@ -16,4 +16,15 @@ test-diff = [
     "--include-ignored",
     "--nocapture",
 ]
+test-diff-a64 = [
+    "test",
+    "--package",
+    "nixe-cpu-engine-interpreter",
+    "--test",
+    "qemu_differential",
+    "qemu_a64_matches_every_register_semantic_family",
+    "--",
+    "--ignored",
+    "--nocapture",
+]
 fuzz-all = ["run", "--quiet", "--package", "nixe-xtask", "--", "fuzz"]

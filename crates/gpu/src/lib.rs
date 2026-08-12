@@ -35,10 +35,10 @@ pub use capability::{
     CapabilityAgreement, CapabilityRequirement, CapabilityRequirements,
 };
 pub use command::{
-    AttachmentLoad, AttachmentStore, BarrierOperation, BufferRegion, ClearOperation, ClearValue,
-    CommandDescriptionError, CopyOperation, DispatchOperation, DrawArguments, DrawOperation,
-    GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType, OperationSubmission,
-    PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
+    AttachmentLoad, AttachmentStore, BarrierOperation, BufferRegion, CacheMaintenanceOperation,
+    ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DispatchOperation,
+    DrawArguments, DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
+    OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,

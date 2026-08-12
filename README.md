@@ -55,6 +55,13 @@ Then run
 cargo test-diff
 ```
 
+To run a fast, focused A64 differential test for one instruction family or coverage ID, use:
+
+```bash
+NIXE_DIFF_FAMILY=simd-duplicate-element cargo test-diff-a64
+NIXE_DIFF_COVERAGE_ID=0x8c cargo test-diff-a64
+```
+
 ### Fuzz tests
 
 CPU decoder, translation, IR verifier, and diagnostic fuzz targets require a nightly Rust toolchain

@@ -2,15 +2,18 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
+use nixe_gpu::{
+    CacheMaintenanceOperation, CapabilityRequirements, FrontendSubmissionId, GpuCommand,
+    GpuOperation, GuestTimelinePoint, ReservedTimelinePoint,
+};
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
 use crate::{
     MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellEngineOperation,
     MaxwellEnginePacketDispatch, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
-    MaxwellMethodSource, MaxwellResolvedRange, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
-    MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
+    MaxwellHostMemoryOperation, MaxwellMethodSource, MaxwellResolvedRange,
+    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
+    MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
     resolve_maxwell_three_d_resources,
@@ -18,6 +21,11 @@ use crate::{
 
 /// One ordered operation whose inputs have been resolved without side effects.
 pub enum MaxwellSubmissionExecutionStep {
+    HostSynchronization {
+        source: MaxwellMethodSource,
+        operation: GpuOperation,
+        prior_work_pending: bool,
+    },
     ComputeInlineToMemory {
         upload: MaxwellComputeInlineToMemoryUpload,
         target: MaxwellResolvedRange,
@@ -82,6 +90,7 @@ impl MaxwellSoftwareInitializationCompletion {
 pub enum MaxwellSoftwareInitializationError {
     UnsupportedThreeDWork,
     OperationAfterCompletionSignal,
+    InconsistentHostSynchronizationPlan,
     InconsistentWaitForIdlePlan,
     StaleInlineTarget {
         source: MaxwellMethodSource,
@@ -101,6 +110,9 @@ impl Display for MaxwellSoftwareInitializationError {
             ),
             Self::OperationAfterCompletionSignal => formatter.write_str(
                 "submission contains executable work after its completion signal",
+            ),
+            Self::InconsistentHostSynchronizationPlan => formatter.write_str(
+                "submission host cache-maintenance plan does not match its ordered execution prefix",
             ),
             Self::InconsistentWaitForIdlePlan => formatter.write_str(
                 "submission WAIT_FOR_IDLE plan does not match its ordered execution prefix",
@@ -184,6 +196,25 @@ pub fn preflight_maxwell_submission_execution(
         .flat_map(MaxwellEnginePacketDispatch::ordered_operations)
     {
         match operation {
+            MaxwellEngineOperation::HostSynchronization(operation) => {
+                let command = match operation.operation() {
+                    MaxwellHostMemoryOperation::L2SysmemInvalidate { .. } => {
+                        GpuCommand::CacheMaintenance(
+                            CacheMaintenanceOperation::InvalidateDeviceReadCaches,
+                        )
+                    }
+                    MaxwellHostMemoryOperation::L2FlushDirty { .. } => {
+                        GpuCommand::CacheMaintenance(
+                            CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+                        )
+                    }
+                };
+                steps.push(MaxwellSubmissionExecutionStep::HostSynchronization {
+                    source: operation.source(),
+                    operation: GpuOperation::new(command, [], [], CapabilityRequirements::none()),
+                    prior_work_pending,
+                });
+            }
             MaxwellEngineOperation::ComputeInlineToMemory(upload) => {
                 let target = resolve_inline_target(
                     address_space,
@@ -251,8 +282,15 @@ pub fn preflight_maxwell_submission_execution(
                         });
                     }
                 }
+                let drains_prior_work = matches!(
+                    plan,
+                    MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+                        | MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
+                );
                 steps.push(MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan));
-                prior_work_pending = false;
+                if drains_prior_work {
+                    prior_work_pending = false;
+                }
             }
         }
     }
@@ -291,6 +329,21 @@ pub fn execute_maxwell_software_initialization(
             return Err(MaxwellSoftwareInitializationError::OperationAfterCompletionSignal);
         }
         match step {
+            MaxwellSubmissionExecutionStep::HostSynchronization {
+                operation,
+                prior_work_pending: planned,
+                ..
+            } => {
+                if *planned != prior_work_pending {
+                    return Err(
+                        MaxwellSoftwareInitializationError::InconsistentHostSynchronizationPlan,
+                    );
+                }
+                debug_assert!(matches!(
+                    operation.command(),
+                    GpuCommand::CacheMaintenance(_)
+                ));
+            }
             MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
                 stage_inline_write(
                     address_space,
@@ -323,6 +376,12 @@ pub fn execute_maxwell_software_initialization(
             }
             MaxwellSubmissionExecutionStep::ComputeSynchronization(
                 MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
+            ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
+            ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi { .. },
             ) => {}
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. },
@@ -618,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_idle_orders_an_atomic_software_initialization_prefix() {
+    fn cache_maintenance_without_wfi_preserves_pending_work_until_an_explicit_wait() {
         let mut address_space = address_space();
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         let mapping = address_space
@@ -670,6 +729,41 @@ mod tests {
             &data.packets()[0],
         )
         .unwrap();
+        let flush = packet(6, 0x002c / 4, &[0x8000_0000]);
+        let flush_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &flush.packets()[0],
+        )
+        .unwrap();
+        let invalidate = packet(6, 0x002c / 4, &[0x7000_0000]);
+        let invalidate_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &invalidate.packets()[0],
+        )
+        .unwrap();
+        let bind_three_d = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind_three_d.packets()[0],
+        )
+        .unwrap();
+        let texture_invalidate = packet(0, 0x1288 / 4, &[0]);
+        let texture_invalidate_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &texture_invalidate.packets()[0],
+        )
+        .unwrap();
+        let shader_invalidate = packet(0, 0x0da4 / 4, &[0x1011]);
+        let shader_invalidate_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &shader_invalidate.packets()[0],
+        )
+        .unwrap();
         let wait = packet(1, 0x0110 / 4, &[0]);
         let wait_dispatch = dispatch_maxwell_engine_packet(
             &mut channel,
@@ -679,7 +773,14 @@ mod tests {
         .unwrap();
 
         let plan = preflight_maxwell_submission_execution(
-            &[data_dispatch, wait_dispatch],
+            &[
+                data_dispatch,
+                flush_dispatch,
+                invalidate_dispatch,
+                texture_invalidate_dispatch,
+                shader_invalidate_dispatch,
+                wait_dispatch,
+            ],
             &address_space,
             FrontendSubmissionId::new(2),
             Vec::new(),
@@ -691,6 +792,32 @@ mod tests {
             plan.steps(),
             [
                 MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target },
+                MaxwellSubmissionExecutionStep::HostSynchronization {
+                    operation: flush,
+                    prior_work_pending: true,
+                    ..
+                },
+                MaxwellSubmissionExecutionStep::HostSynchronization {
+                    operation: invalidate,
+                    prior_work_pending: true,
+                    ..
+                },
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi {
+                        request: texture_request,
+                        maintenance: CacheMaintenanceOperation::InvalidateTextureReadCaches,
+                    }
+                ),
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
+                        caches,
+                        maintenance: CacheMaintenanceOperation::InvalidateShaderCaches {
+                            instruction: true,
+                            global_data: true,
+                            constant: true,
+                        },
+                    }
+                ),
                 MaxwellSubmissionExecutionStep::ComputeSynchronization(
                     MaxwellComputeSynchronizationPlan::WaitForIdle {
                         prior_work_pending: true,
@@ -698,6 +825,23 @@ mod tests {
                 ),
             ] if upload.value() == 0xfeed_beef
                 && target.offset().get() == address
+                && matches!(
+                    flush.command(),
+                    GpuCommand::CacheMaintenance(
+                        CacheMaintenanceOperation::FlushDirtyDeviceWrites
+                    )
+                )
+                && matches!(
+                    invalidate.command(),
+                    GpuCommand::CacheMaintenance(
+                        CacheMaintenanceOperation::InvalidateDeviceReadCaches
+                    )
+                )
+                && texture_request.lines() == crate::MaxwellThreeDTextureCacheLines::All
+                && texture_request.tag() == 0
+                && caches.instruction()
+                && caches.global_data()
+                && caches.constant()
         ));
 
         let mut bytes = [0xff; 4];

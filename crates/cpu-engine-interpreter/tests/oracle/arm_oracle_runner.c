@@ -7,6 +7,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(__aarch64__)
+// QEMU's GDB stub patches this slot and single-steps exactly one instruction.
+// Keeping the scratch area in the same static executable gives the Nixe and
+// QEMU fixtures stable, equally mapped code and data addresses.
+__asm__(
+    ".pushsection .nixe_oracle,\"awx\",@progbits\n"
+    ".balign 16\n"
+    ".global nixe_oracle_slot\n"
+    "nixe_oracle_slot:\n"
+    ".rept 1024\n"
+    ".word 0xd503201f\n"
+    ".endr\n"
+    ".global nixe_oracle_after\n"
+    "nixe_oracle_after:\n"
+    ".word 0xd4200000\n"
+    ".popsection\n");
+
+__attribute__((aligned(4096), used)) uint8_t nixe_oracle_scratch[4096];
+#endif
+
 static uint64_t parse(const char *text) {
     char *end = NULL;
     const uint64_t value = strtoull(text, &end, 16);

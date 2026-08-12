@@ -2,10 +2,12 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_gpu::{GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint};
+use nixe_gpu::{
+    CacheMaintenanceOperation, GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint,
+};
 
 use super::MaxwellThreeDState;
-use crate::MaxwellMethodSource;
+use crate::{MaxwellMethodSource, MaxwellShaderCacheInvalidation};
 
 // Method fields and enum values come from NVIDIA's generated MAXWELL_B
 // header at the repository-pinned revision:
@@ -23,6 +25,37 @@ pub enum MaxwellThreeDSyncpointCondition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDFlushPendingWrites {
     sm_does_global_store: bool,
+}
+
+/// Texture-cache line selection encoded by
+/// `INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellThreeDTextureCacheLines {
+    All,
+    One,
+}
+
+/// Decoded texture-data cache invalidation request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDTextureDataCacheInvalidation {
+    lines: MaxwellThreeDTextureCacheLines,
+    tag: u32,
+}
+
+impl MaxwellThreeDTextureDataCacheInvalidation {
+    pub(crate) const fn new(lines: MaxwellThreeDTextureCacheLines, tag: u32) -> Self {
+        Self { lines, tag }
+    }
+
+    #[must_use]
+    pub const fn lines(self) -> MaxwellThreeDTextureCacheLines {
+        self.lines
+    }
+
+    #[must_use]
+    pub const fn tag(self) -> u32 {
+        self.tag
+    }
 }
 
 impl MaxwellThreeDFlushPendingWrites {
@@ -78,6 +111,14 @@ impl MaxwellThreeDSyncpointIncrement {
 /// One 3D execution-order trigger emitted by a class method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationTrigger {
+    InvalidateShaderCachesNoWfi {
+        caches: MaxwellShaderCacheInvalidation,
+        source: MaxwellMethodSource,
+    },
+    InvalidateTextureDataCacheNoWfi {
+        request: MaxwellThreeDTextureDataCacheInvalidation,
+        source: MaxwellMethodSource,
+    },
     FlushPendingWrites {
         request: MaxwellThreeDFlushPendingWrites,
         source: MaxwellMethodSource,
@@ -92,9 +133,10 @@ impl MaxwellThreeDSynchronizationTrigger {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::FlushPendingWrites { source, .. } | Self::IncrementSyncpoint { source, .. } => {
-                source
-            }
+            Self::InvalidateShaderCachesNoWfi { source, .. }
+            | Self::InvalidateTextureDataCacheNoWfi { source, .. }
+            | Self::FlushPendingWrites { source, .. }
+            | Self::IncrementSyncpoint { source, .. } => source,
         }
     }
 }
@@ -128,6 +170,14 @@ impl MaxwellThreeDSynchronizationOperation {
 /// Validated host-independent lowering of one 3D synchronization operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationPlan {
+    InvalidateShaderCachesNoWfi {
+        caches: MaxwellShaderCacheInvalidation,
+        maintenance: CacheMaintenanceOperation,
+    },
+    InvalidateTextureDataCacheNoWfi {
+        request: MaxwellThreeDTextureDataCacheInvalidation,
+        maintenance: CacheMaintenanceOperation,
+    },
     FlushPendingWrites {
         request: MaxwellThreeDFlushPendingWrites,
     },
@@ -182,6 +232,24 @@ pub fn lower_maxwell_three_d_synchronization(
     completion: Option<&ReservedTimelinePoint>,
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
     match operation.trigger() {
+        MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi { caches, .. } => Ok(
+            MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
+                caches,
+                maintenance: CacheMaintenanceOperation::InvalidateShaderCaches {
+                    instruction: caches.instruction(),
+                    global_data: caches.global_data(),
+                    constant: caches.constant(),
+                },
+            },
+        ),
+        MaxwellThreeDSynchronizationTrigger::InvalidateTextureDataCacheNoWfi {
+            request, ..
+        } => Ok(
+            MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi {
+                request,
+                maintenance: CacheMaintenanceOperation::InvalidateTextureReadCaches,
+            },
+        ),
         MaxwellThreeDSynchronizationTrigger::FlushPendingWrites { request, .. } => {
             Ok(MaxwellThreeDSynchronizationPlan::FlushPendingWrites { request })
         }

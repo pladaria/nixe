@@ -19,6 +19,7 @@ pub(super) fn lift(
     let fields = instruction.operands();
     match instruction {
         FpSimdInstruction::DuplicateGeneral(_)
+        | FpSimdInstruction::DuplicateElement(_)
         | FpSimdInstruction::MemoryPair(_)
         | FpSimdInstruction::ModifiedImmediate(_)
         | FpSimdInstruction::UnsignedMoveToGeneral(_)
@@ -30,12 +31,16 @@ pub(super) fn lift(
         | FpSimdInstruction::MemorySingleStructurePostIndex(_)
         | FpSimdInstruction::PermuteTwoSource(_)
         | FpSimdInstruction::Extract(_)
+        | FpSimdInstruction::ExtractNarrow(_)
         | FpSimdInstruction::IntegerCompare(_)
         | FpSimdInstruction::IntegerPairwise(_)
         | FpSimdInstruction::IntegerMinMax(_)
         | FpSimdInstruction::VectorSignedIntToFloat(_)
         | FpSimdInstruction::VectorUnsignedIntToFloat(_)
+        | FpSimdInstruction::ScalarVectorSignedIntToFloat(_)
+        | FpSimdInstruction::ScalarVectorUnsignedIntToFloat(_)
         | FpSimdInstruction::VectorFloatDivide(_)
+        | FpSimdInstruction::VectorFloatImmediate(_)
         | FpSimdInstruction::FloatToSignedInt(_)
         | FpSimdInstruction::FloatToUnsignedInt(_)
         | FpSimdInstruction::ScalarFloatImmediate(_)
@@ -43,8 +48,16 @@ pub(super) fn lift(
         | FpSimdInstruction::ScalarFloatDivide(_)
         | FpSimdInstruction::ScalarFloatRound(_)
         | FpSimdInstruction::ScalarFloatAdd(_)
-        | FpSimdInstruction::ScalarFloatMultiply(_) => Ok(interpret(decoded)),
-        FpSimdInstruction::ShiftRightNarrow(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::ScalarFloatMultiply(_)
+        | FpSimdInstruction::ScalarFloatConditionalSelect(_) => Ok(interpret(decoded)),
+        FpSimdInstruction::ScalarAbsolute(_) | FpSimdInstruction::ScalarNegate(_) => {
+            Ok(interpret(decoded))
+        }
+        FpSimdInstruction::ShiftRightNarrow(_)
+        | FpSimdInstruction::ScalarShiftRightImmediate(_)
+        | FpSimdInstruction::VectorShiftRightImmediate(_) => Ok(interpret(decoded)),
+        FpSimdInstruction::CountBits(_) => Ok(interpret(decoded)),
+        FpSimdInstruction::AddAcrossVector(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)

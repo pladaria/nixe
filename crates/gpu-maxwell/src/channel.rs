@@ -205,6 +205,7 @@ pub struct MaxwellChannelFrontendState {
     object_context: Option<MaxwellObjectContext>,
     error_notifier_enabled: bool,
     z_cull_binding: Option<MaxwellZCullBinding>,
+    legacy_mem_op_a: Option<u32>,
     subchannel_bindings: [Option<GpuClassId>; 8],
 }
 
@@ -234,6 +235,12 @@ impl MaxwellChannelFrontendState {
         self.z_cull_binding
     }
 
+    /// Returns the last source-preserving legacy `MEM_OP_A` operand.
+    #[must_use]
+    pub const fn legacy_mem_op_a(self) -> Option<u32> {
+        self.legacy_mem_op_a
+    }
+
     /// Returns the engine class currently selected for one pushbuffer
     /// subchannel. The binding contains no engine state or backend object.
     #[must_use]
@@ -250,6 +257,10 @@ impl MaxwellChannelFrontendState {
         class: GpuClassId,
     ) -> Option<GpuClassId> {
         self.subchannel_bindings[subchannel.get() as usize].replace(class)
+    }
+
+    pub(crate) fn set_legacy_mem_op_a(&mut self, operand: u32) {
+        self.legacy_mem_op_a = Some(operand);
     }
 
     pub(crate) fn reset_subchannel_bindings(&mut self) {
@@ -296,6 +307,7 @@ impl MaxwellGpuChannel {
                 object_context: None,
                 error_notifier_enabled: false,
                 z_cull_binding: None,
+                legacy_mem_op_a: None,
                 subchannel_bindings: [None; 8],
             },
             compute: MaxwellComputeState::new(),

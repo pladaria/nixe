@@ -59,7 +59,8 @@ pub use operations::{
     MaxwellThreeDFlushPendingWrites, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationOperation, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
-    MaxwellThreeDSyncpointIncrement, lower_maxwell_three_d_synchronization,
+    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTextureCacheLines,
+    MaxwellThreeDTextureDataCacheInvalidation, lower_maxwell_three_d_synchronization,
 };
 
 pub use output::{
@@ -142,7 +143,7 @@ use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 use super::{
     MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodDispatch,
     MaxwellEngineMethodEffect, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
-    MaxwellThreeDTriggeredOperation,
+    MaxwellShaderCacheInvalidation, MaxwellThreeDTriggeredOperation,
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
@@ -171,6 +172,8 @@ enum MethodAction {
     PointSpriteSelect,
     PointCenterMode,
     EdgeFlag,
+    InvalidateShaderCachesNoWfi,
+    InvalidateTextureDataCacheNoWfi,
     FlushPendingWrites,
     IncrementSyncpoint,
     ViewportZClip,
@@ -254,6 +257,12 @@ methods!(
         "SET_REDUCE_COLOR_THRESHOLDS_ENABLE",
         0x0000_0001,
         MethodAction::ColorReductionThresholdsEnable
+    ),
+    INVALIDATE_SHADER_CACHES_NO_WFI => (
+        0x0da4,
+        "INVALIDATE_SHADER_CACHES_NO_WFI",
+        0x0000_1011,
+        MethodAction::InvalidateShaderCachesNoWfi
     ),
     SET_REDUCE_COLOR_THRESHOLDS_UNORM8 => (
         0x10cc,
@@ -362,6 +371,12 @@ methods!(
         "SET_L2_CACHE_CONTROL_FOR_ROP_INTERLOCKED_READ_REQUESTS",
         0x0000_0030,
         MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::InterlockedRead)
+    ),
+    INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI => (
+        0x1288,
+        "INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI",
+        0x03ff_fff1,
+        MethodAction::InvalidateTextureDataCacheNoWfi
     ),
     SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_WRITE_REQUESTS => (
         0x12d8,
@@ -996,6 +1011,35 @@ fn preflight_register(
                 let write = MaxwellThreeDStateWrite::EdgeFlag { value, source };
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::InvalidateShaderCachesNoWfi => {
+                let caches = MaxwellShaderCacheInvalidation::new(
+                    source.argument() & 1 != 0,
+                    source.argument() & (1 << 4) != 0,
+                    source.argument() & (1 << 12) != 0,
+                );
+                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                    MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi {
+                        caches,
+                        source,
+                    },
+                )
+            }
+            MethodAction::InvalidateTextureDataCacheNoWfi => {
+                let request = MaxwellThreeDTextureDataCacheInvalidation::new(
+                    if source.argument() & 1 == 0 {
+                        MaxwellThreeDTextureCacheLines::All
+                    } else {
+                        MaxwellThreeDTextureCacheLines::One
+                    },
+                    (source.argument() >> 4) & 0x003f_ffff,
+                );
+                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                    MaxwellThreeDSynchronizationTrigger::InvalidateTextureDataCacheNoWfi {
+                        request,
+                        source,
+                    },
+                )
             }
             MethodAction::FlushPendingWrites => {
                 let request = MaxwellThreeDFlushPendingWrites::new(source.argument() != 0);
