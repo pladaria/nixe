@@ -9,6 +9,7 @@ ctrlc.workspace = true
 log.workspace = true
 sha2.workspace = true
 nixe-config.workspace = true
+nixe-cpu.workspace = true
 nixe-cpu-engine.workspace = true
 nixe-cpu-engine-interpreter.workspace = true
 nixe-horizon.workspace = true

@@ -25,7 +25,7 @@ fn supervisor_calls_route_a64_a32_and_t32_with_current_runtime_context() {
             *process.main_thread_mut().state_mut() = ThreadCpuState::A32(Box::new(state));
         }
 
-        let report = process.run_reference(1).unwrap();
+        let report = process.run(1).unwrap();
         let expected_encoding = match execution_state {
             ExecutionState::T32 => InstructionEncoding::from_u16(encoding as u16),
             ExecutionState::A64 | ExecutionState::A32 => InstructionEncoding::from_u32(encoding),
@@ -171,7 +171,7 @@ fn handled_supervisor_calls_advance_once_in_a64_a32_and_t32() {
             instruction_address(process.main_thread_mut().state_mut()),
             entry + width
         );
-        let next = process.run_reference(1).unwrap();
+        let next = process.run(1).unwrap();
         assert!(!matches!(
             next.stop,
             crate::ExecutionStop::SupervisorCall { source, .. } if source.pc.get() == entry
@@ -203,7 +203,7 @@ fn supervisor_call_retry_is_explicit_and_reexecutes_the_source() {
             instruction_address(process.main_thread_mut().state_mut()),
             entry
         );
-        let retried = process.run_reference(1).unwrap();
+        let retried = process.run(1).unwrap();
         assert!(matches!(
             retried.stop,
             crate::ExecutionStop::SupervisorCall { source, .. } if source.pc.get() == entry
@@ -235,13 +235,13 @@ fn suspended_supervisor_call_installs_continuation_without_becoming_runnable() {
         ProcessExecutionStatus::Suspended
     );
     assert!(matches!(
-        process.run_reference(1),
+        process.run(1),
         Err(crate::ProcessExecutionError::NotRunnable {
             status: ProcessExecutionStatus::Suspended,
             ..
         })
     ));
-    assert!(process.resume());
+    assert!(process.resume_thread(process.main_thread_id()));
     assert_eq!(
         instruction_address(process.main_thread_mut().state_mut()),
         entry + 4
@@ -269,13 +269,13 @@ fn faulted_supervisor_call_retains_source_and_cannot_run() {
     );
     assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
     assert!(matches!(
-        process.run_reference(1),
+        process.run(1),
         Err(crate::ProcessExecutionError::NotRunnable {
             status: ProcessExecutionStatus::Faulted,
             ..
         })
     ));
-    assert!(!process.resume());
+    assert!(!process.resume_thread(process.main_thread_id()));
 }
 
 #[test]
@@ -316,14 +316,14 @@ fn supervisor_call_termination_scope_is_preserved_through_teardown() {
         assert_eq!(process.exit().unwrap().source.unwrap().pc.get(), entry);
         assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
         assert!(matches!(
-            process.run_reference(1),
+            process.run(1),
             Err(crate::ProcessExecutionError::NotRunnable {
                 status: ProcessExecutionStatus::Exited,
                 ..
             })
         ));
 
-        let teardown = process.teardown();
+        let teardown = process.try_teardown().unwrap();
         assert_eq!(teardown.previous_status, ProcessExecutionStatus::Exited);
         assert_eq!(teardown.exit.unwrap().cause, expected_cause);
         assert_eq!(teardown.threads_released, 1);
@@ -343,7 +343,7 @@ fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
     replace_entry_instruction(&mut process, 0x1400_0000); // B #0
 
     let first = process
-        .run_reference(crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3)
+        .run(crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3)
         .unwrap();
     assert!(first.trace.enabled());
     assert_eq!(
@@ -365,7 +365,7 @@ fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
     );
     assert!(first.trace.to_string().len() <= crate::MAX_INSTRUCTION_TRACE_EXPORT_BYTES);
 
-    let second = process.run_reference(1).unwrap();
+    let second = process.run(1).unwrap();
     assert_eq!(second.trace.discarded(), 4);
     assert_eq!(second.trace.entries()[0].sequence, 4);
     assert_eq!(
@@ -386,7 +386,7 @@ fn sanitized_instruction_trace_omits_detailed_disassembly() {
         .build(&plan)
         .unwrap();
 
-    let report = process.run_reference(1).unwrap();
+    let report = process.run(1).unwrap();
     assert_eq!(report.trace.entries().len(), 1);
     assert!(report.trace.entries()[0].disassembly.is_none());
     assert!(!report.trace.to_string().contains("disassembly="));
@@ -396,7 +396,7 @@ fn sanitized_instruction_trace_omits_detailed_disassembly() {
 fn teardown_reports_resources_owned_by_the_process() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
-    assert!(process.terminate());
+    assert!(process.terminate_from_host());
     assert_eq!(
         process.exit().unwrap().cause,
         crate::ProcessExitCause::HostRequested
@@ -406,7 +406,7 @@ fn teardown_reports_resources_owned_by_the_process() {
         crate::ExceptionTerminationScope::Process
     );
 
-    let report = process.teardown();
+    let report = process.try_teardown().unwrap();
     assert_eq!(
         report.previous_status,
         crate::ProcessExecutionStatus::Exited

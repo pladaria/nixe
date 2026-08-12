@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Barrier, mpsc};
@@ -8,7 +7,7 @@ use std::time::Duration;
 
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
-use nixe_cpu::memory::{MemoryPermissions, SyntheticMemory};
+use nixe_cpu::memory::{ExecutionMemory, SyntheticMemory};
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu_engine::*;
@@ -28,7 +27,7 @@ impl EngineProvider for FakeProvider {
     }
     fn probe(
         &self,
-        _profile: nixe_cpu::profile::CpuProfileId,
+        _profile: nixe_cpu::profile::GuestCpuProfile,
         _required: EngineCapabilities,
     ) -> CapabilityReport {
         CapabilityReport {
@@ -50,6 +49,7 @@ impl EngineProvider for FakeProvider {
             id: request.domain,
             executor_budget: Arc::new(AtomicU64::new(0)),
             fail_quiesce: !self.available,
+            fail_activate: false,
             generation: 0,
         }))
     }
@@ -66,10 +66,17 @@ fn descriptor(id: EngineId) -> EngineDescriptor {
             t32: true,
             precise_instruction_budget: true,
             instruction_trace: false,
+            interpret_one_fallback: false,
             native_execution: false,
             concurrent_executors: false,
             max_safepoint_instructions: None,
             acknowledged_invalidation: false,
+            canonical_state_version: 1,
+            deterministic_execution: true,
+            precise_exceptions: true,
+            engine_handoff: true,
+            canonical_memory_binding: false,
+            max_concurrent_executors: Some(NonZeroUsize::new(1).unwrap()),
         },
     }
 }
@@ -87,6 +94,32 @@ fn safepoint_capability_reports_a_verifiable_instruction_bound() {
     assert!(offered.contains(relaxed_requirement));
     assert!(!relaxed_requirement.contains(offered));
     assert!(offered.requires_control_path());
+
+    let native_without_memory = EngineCapabilities {
+        native_execution: true,
+        acknowledged_invalidation: true,
+        ..EngineCapabilities::default()
+    };
+    assert!(!native_without_memory.is_coherent());
+    let four_executors = EngineCapabilities {
+        concurrent_executors: true,
+        max_safepoint_instructions: NonZeroU64::new(1),
+        max_concurrent_executors: NonZeroUsize::new(4),
+        ..EngineCapabilities::default()
+    };
+    let two_executors = EngineCapabilities {
+        max_concurrent_executors: NonZeroUsize::new(2),
+        ..EngineCapabilities::default()
+    };
+    assert!(four_executors.contains(two_executors));
+    assert!(!two_executors.contains(four_executors));
+    assert!(!four_executors.supports_profile(
+        GuestCpuProfile::switch_2_native(),
+        EngineCapabilities {
+            a32: true,
+            ..EngineCapabilities::default()
+        }
+    ));
 }
 
 #[test]
@@ -136,6 +169,7 @@ struct FakeDomain {
     id: EngineDomainId,
     executor_budget: Arc<AtomicU64>,
     fail_quiesce: bool,
+    fail_activate: bool,
     generation: u64,
 }
 impl EngineDomain for FakeDomain {
@@ -166,6 +200,14 @@ impl EngineDomain for FakeDomain {
         };
         self.generation += 1;
         Ok(token)
+    }
+
+    fn activate(&mut self) -> Result<(), EngineFault> {
+        if self.fail_activate {
+            Err(fault(self.id))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -200,8 +242,6 @@ impl EngineExecutor for FakeExecutor {
     }
 
     fn clear_local_exclusive_reservation(&mut self) {}
-    fn request_safepoint(&mut self, _reason: SafepointReason) {}
-    fn post_event(&self, _mask: u32) {}
 }
 
 fn cpu_and_state() -> (ProcessCpuContext, ThreadCpuState) {
@@ -296,7 +336,7 @@ fn selection_is_deterministic_and_explicit_unavailability_is_typed() {
         available: true,
     });
     let registry = EngineRegistry::new([unavailable, Arc::clone(&available)]);
-    let profile = GuestCpuProfile::switch_1().id();
+    let profile = GuestCpuProfile::switch_1();
     assert_eq!(
         registry
             .select(
@@ -351,37 +391,40 @@ fn interpret_one_forces_one_instruction_and_handoff_failure_keeps_old_domain() {
         id: EngineDomainId::new(1),
         executor_budget: Arc::new(AtomicU64::new(0)),
         fail_quiesce: false,
+        fail_activate: false,
         generation: 0,
     };
 
-    let replacement: Box<dyn EngineDomain> = Box::new(FakeDomain {
+    let mut replacement: Box<dyn EngineDomain> = Box::new(FakeDomain {
         id: EngineDomainId::new(2),
         executor_budget: Arc::new(AtomicU64::new(0)),
-        fail_quiesce: true,
+        fail_quiesce: false,
+        fail_activate: true,
         generation: 0,
     });
-    let synchronization = MemorySynchronizationRecord {
+    let memory = ExecutionMemory::new();
+    let binding = DomainMemoryBinding {
         address_space: cpu.address_space_id(),
+        end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
+        memory: &memory,
         invalidation_generation: 4,
         dirty_generation: 5,
     };
-    let Err(error) = prepare_handoff(&mut domain, replacement, synchronization) else {
+    let Err(error) = prepare_handoff(&mut domain, replacement.as_mut(), binding) else {
         panic!("failing replacement must not commit");
     };
     assert_eq!(error.stage, HandoffFailureStage::Import);
     assert_eq!(domain.quiesce().unwrap().domain, EngineDomainId::new(1));
 }
 
-struct FakeNceDomain {
+struct RecordingDomain {
     base: FakeDomain,
-    address_space: Option<AddressSpaceId>,
-    mappings: Vec<NceMappingChange>,
-    vcpus: BTreeMap<u64, NceVcpuState>,
-    interrupts: u32,
-    torn_down: bool,
+    bound: Option<AddressSpaceId>,
+    synchronized: Option<MemorySynchronizationRecord>,
+    shutdown: bool,
 }
 
-impl EngineDomain for FakeNceDomain {
+impl EngineDomain for RecordingDomain {
     fn descriptor(&self) -> EngineDescriptor {
         EngineDescriptor {
             kind: EngineKind::NativeCodeExecution,
@@ -397,177 +440,65 @@ impl EngineDomain for FakeNceDomain {
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
         self.base.create_executor(request)
     }
+
+    fn bind_memory(&mut self, binding: DomainMemoryBinding<'_>) -> Result<(), EngineFault> {
+        assert!(binding.end_exclusive.get() > 0);
+        self.bound = Some(binding.address_space);
+        Ok(())
+    }
+
+    fn synchronize_memory(
+        &mut self,
+        binding: DomainMemoryBinding<'_>,
+    ) -> Result<MemorySynchronizationRecord, EngineFault> {
+        let record = binding.synchronization_record();
+        self.synchronized = Some(record);
+        Ok(record)
+    }
+
+    fn import_memory(&mut self, record: MemorySynchronizationRecord) -> Result<(), EngineFault> {
+        self.synchronized = Some(record);
+        Ok(())
+    }
+
     fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
         self.base.quiesce()
     }
-}
 
-impl NceExecutionDomain for FakeNceDomain {
-    fn bind_address_space(&mut self, address_space: AddressSpaceId) -> Result<(), EngineFault> {
-        self.address_space = Some(address_space);
-        Ok(())
-    }
-    fn notify_mapping(&mut self, change: NceMappingChange) -> Result<(), EngineFault> {
-        self.mappings.push(change);
-        Ok(())
-    }
-    fn reconcile_dirty_memory(&mut self) -> Result<MemorySynchronizationRecord, EngineFault> {
-        Ok(MemorySynchronizationRecord {
-            address_space: self.address_space.unwrap(),
-            invalidation_generation: self.mappings.last().map_or(0, |change| change.generation),
-            dirty_generation: 1,
-        })
-    }
-    fn inject_interrupt(&mut self, mask: u32) -> Result<(), EngineFault> {
-        self.interrupts |= mask;
-        Ok(())
-    }
-    fn import_vcpu(
-        &mut self,
-        executor: EngineExecutorId,
-        state: NceVcpuState,
-    ) -> Result<(), EngineFault> {
-        self.vcpus.insert(executor.get(), state);
-        Ok(())
-    }
-    fn export_vcpu(&mut self, executor: EngineExecutorId) -> Result<NceVcpuState, EngineFault> {
-        self.vcpus
-            .remove(&executor.get())
-            .ok_or_else(|| fault(self.base.id))
-    }
-    fn normalize_trap(&self, trap: NceTrap) -> EngineExit {
-        match trap.kind {
-            NceTrapKind::SupervisorCall => EngineExit::SupervisorCall {
-                source: trap.source,
-                immediate: trap
-                    .syndrome
-                    .and_then(|value| u32::try_from(value).ok())
-                    .unwrap_or(0),
-            },
-            NceTrapKind::Timer | NceTrapKind::Interrupt => EngineExit::Safepoint,
-            NceTrapKind::DataAbort if let Some(fault) = trap.data_fault => EngineExit::DataFault {
-                source: trap.source,
-                fault,
-            },
-            _ => EngineExit::ArchitecturalException {
-                source: trap.source,
-                kind: ExceptionKind::DataAbort,
-                syndrome: trap.syndrome,
-            },
-        }
-    }
-    fn teardown(&mut self) -> Result<(), EngineFault> {
-        self.vcpus.clear();
-        self.torn_down = true;
+    fn shutdown(&mut self) -> Result<(), EngineFault> {
+        self.shutdown = true;
         Ok(())
     }
 }
 
 #[test]
-fn fake_nce_contract_covers_mapping_traps_migration_and_teardown() {
-    let (cpu, state) = cpu_and_state();
-    let source = LocationDescriptor::new(
-        GuestVirtualAddress::new(0x2000),
-        ExecutionState::A64,
-        cpu.profile().id(),
-    );
-    let mut nce = FakeNceDomain {
+fn generic_domain_contract_binds_reconciles_imports_and_shuts_down_memory() {
+    let (cpu, _) = cpu_and_state();
+    let memory = ExecutionMemory::new();
+    let binding = DomainMemoryBinding {
+        address_space: cpu.address_space_id(),
+        end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
+        memory: &memory,
+        invalidation_generation: 8,
+        dirty_generation: 9,
+    };
+    let mut domain = RecordingDomain {
         base: FakeDomain {
             id: EngineDomainId::new(5),
             executor_budget: Arc::new(AtomicU64::new(0)),
             fail_quiesce: false,
+            fail_activate: false,
             generation: 0,
         },
-        address_space: None,
-        mappings: Vec::new(),
-        vcpus: BTreeMap::new(),
-        interrupts: 0,
-        torn_down: false,
+        bound: None,
+        synchronized: None,
+        shutdown: false,
     };
-    nce.bind_address_space(cpu.address_space_id()).unwrap();
-    nce.notify_mapping(NceMappingChange {
-        address_space: cpu.address_space_id(),
-        start: GuestVirtualAddress::new(0x1000),
-        size: 0x1000,
-        kind: NceMappingChangeKind::Map,
-        permissions: Some(MemoryPermissions::READ_EXECUTE),
-        generation: 8,
-    })
-    .unwrap();
-    nce.notify_mapping(NceMappingChange {
-        address_space: cpu.address_space_id(),
-        start: GuestVirtualAddress::new(0x1000),
-        size: 0x1000,
-        kind: NceMappingChangeKind::Protect,
-        permissions: Some(MemoryPermissions::READ),
-        generation: 9,
-    })
-    .unwrap();
-    nce.notify_mapping(NceMappingChange {
-        address_space: cpu.address_space_id(),
-        start: GuestVirtualAddress::new(0x1000),
-        size: 0x1000,
-        kind: NceMappingChangeKind::Unmap,
-        permissions: None,
-        generation: 10,
-    })
-    .unwrap();
-    assert_eq!(
-        nce.reconcile_dirty_memory()
-            .unwrap()
-            .invalidation_generation,
-        10
-    );
-    nce.inject_interrupt(4).unwrap();
-    assert_eq!(nce.interrupts, 4);
-    let supervisor = NceSupervisorState {
-        virtual_exception_level: 0,
-        pending_interrupt_mask: 4,
-        timer_deadline: Some(20),
-    };
-    nce.import_vcpu(
-        EngineExecutorId::new(1),
-        NceVcpuState {
-            canonical: state.clone(),
-            supervisor: supervisor.clone(),
-        },
-    )
-    .unwrap();
-    let migrated = nce.export_vcpu(EngineExecutorId::new(1)).unwrap();
-    nce.import_vcpu(EngineExecutorId::new(2), migrated).unwrap();
-    assert!(matches!(
-        nce.normalize_trap(NceTrap {
-            source,
-            kind: NceTrapKind::SupervisorCall,
-            syndrome: Some(3),
-            data_fault: None
-        }),
-        EngineExit::SupervisorCall { immediate: 3, .. }
-    ));
-    assert!(matches!(
-        nce.normalize_trap(NceTrap {
-            source,
-            kind: NceTrapKind::DataAbort,
-            syndrome: Some(9),
-            data_fault: Some(nixe_cpu::memory::DataAccessFault::new(
-                cpu.address_space_id(),
-                GuestVirtualAddress::new(0x3000),
-                nixe_cpu::memory::DataAccessKind::Read,
-                nixe_cpu::memory::DataAccessFaultReason::Unmapped,
-            ))
-        }),
-        EngineExit::DataFault { .. }
-    ));
-    assert_eq!(
-        nce.normalize_trap(NceTrap {
-            source,
-            kind: NceTrapKind::Timer,
-            syndrome: None,
-            data_fault: None,
-        }),
-        EngineExit::Safepoint
-    );
-    assert_eq!(nce.vcpus.get(&2).unwrap().canonical, state);
-    nce.teardown().unwrap();
-    assert!(nce.torn_down && nce.vcpus.is_empty());
+    domain.bind_memory(binding).unwrap();
+    let record = domain.synchronize_memory(binding).unwrap();
+    domain.import_memory(record).unwrap();
+    assert_eq!(domain.bound, Some(cpu.address_space_id()));
+    assert_eq!(domain.synchronized, Some(binding.synchronization_record()));
+    domain.shutdown().unwrap();
+    assert!(domain.shutdown);
 }

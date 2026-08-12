@@ -18,7 +18,7 @@ use nixe_cpu_engine::{
     EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind, EngineGeneration, EngineId,
     EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace,
     InstructionTraceEntry, MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest,
-    SafepointReason, StateCommitStatus, TimerSnapshot, TracePolicy,
+    StateCommitStatus, TimerSnapshot, TracePolicy,
 };
 use nixe_memory::GuestVirtualAddress;
 
@@ -82,12 +82,12 @@ impl EngineProvider for InterpreterProvider {
 
     fn probe(
         &self,
-        profile: nixe_cpu::profile::CpuProfileId,
+        profile: nixe_cpu::profile::GuestCpuProfile,
         required: EngineCapabilities,
     ) -> CapabilityReport {
         let capabilities = capabilities();
         let mut rejections = Vec::new();
-        if !capabilities.supports_profile(profile) {
+        if !capabilities.supports_profile(profile, required) {
             rejections.push(CapabilityRejection {
                 engine: INTERPRETER_ENGINE_ID,
                 reason: CapabilityRejectionReason::GuestProfileUnsupported,
@@ -130,11 +130,18 @@ const fn capabilities() -> EngineCapabilities {
         t32: true,
         precise_instruction_budget: true,
         instruction_trace: true,
+        interpret_one_fallback: false,
         native_execution: false,
         concurrent_executors: true,
         max_safepoint_instructions: std::num::NonZeroU64::new(1),
         // The interpreter retains neither translated code nor TLB entries.
         acknowledged_invalidation: true,
+        canonical_state_version: 1,
+        deterministic_execution: true,
+        precise_exceptions: true,
+        engine_handoff: true,
+        canonical_memory_binding: false,
+        max_concurrent_executors: None,
     }
 }
 
@@ -349,28 +356,11 @@ impl EngineExecutor for InterpreterExecutor {
         self.execution.clear_local_exclusive_reservation();
     }
 
-    fn request_safepoint(&mut self, reason: SafepointReason) {
-        let request = match reason {
-            SafepointReason::Requested | SafepointReason::Timer => {
-                nixe_cpu_engine::CrossVcpuRequest::Preempt
-            }
-            SafepointReason::PendingEvent { mask } => {
-                self.execution.control.post_event(mask);
-                return;
-            }
-            SafepointReason::MappingChanged => nixe_cpu_engine::CrossVcpuRequest::TlbShootdown,
-            SafepointReason::EngineHandoff => nixe_cpu_engine::CrossVcpuRequest::EngineHandoff,
-        };
-        let _ = self.execution.control.request(request);
-    }
-    fn post_event(&self, mask: u32) {
-        self.execution.control.post_event(mask);
-    }
-
     fn synchronize_invalidation(
         &mut self,
         epoch: u64,
         _state: &ThreadCpuState,
+        _memory: &dyn nixe_cpu::memory::CpuMemory,
     ) -> Result<(), EngineFault> {
         // The interpreter retains no translation cache or TLB.
         self.execution.control.acknowledge_invalidation(epoch);

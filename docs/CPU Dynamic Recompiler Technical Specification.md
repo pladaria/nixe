@@ -210,6 +210,8 @@ nixe-cpu-engine             engine identities, capabilities, bounded run-slice
                             contract, normalized exits, and state commit
 nixe-cpu-engine-interpreter complete reference-interpreter engine, including
                             semantic dispatch and executor-local state
+nixe-cpu-engine-testkit     dev-only fake JIT/NCE providers and reusable
+                            engine-boundary acceptance fixtures
 nixe-scheduler              console-neutral thread/vCPU state machine,
                             topology, ready queues, waits, and decisions
 nixe-memory                 mappings, canonical physical identity, aliases,
@@ -227,6 +229,21 @@ the runtime, a graphics API, or a platform NCE implementation. A concrete engine
 must not call Horizon directly. Product composition owns concrete providers;
 `nixe-runtime` accepts the neutral provider protocol and does not depend on the
 reference interpreter in production.
+
+Phase F completed the implementation handoff at this boundary. The runtime has
+no product-name engine selection and owns no JIT- or NCE-specific execution
+branch. A backend supplies a provider, process domain, worker executor, memory
+synchronization, and normalized exit/trap behavior; canonical thread state,
+scheduling, exceptions, and Horizon policy stay unchanged. Every new backend
+must first pass the reusable conformance suite. The dev-only fake block engine
+also proves exact one-instruction fallback and stale-block invalidation, while
+the dev-only fake NCE proves shadow registers, mirrored bindings, dirty-memory
+reconciliation, migration, and teardown without a host virtualization API.
+
+Implementation proceeds as four independent projects: the portable baseline
+JIT, Apple HVF, Linux KVM, and an Android feasibility decision. Platform NCE
+projects must not duplicate architectural semantics or add platform branches
+to runtime, scheduler, or Horizon code.
 
 ## 7. Process, thread, and vCPU state
 

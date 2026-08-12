@@ -952,6 +952,7 @@ dependencies = [
  "ctrlc",
  "log",
  "nixe-config",
+ "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",
  "nixe-horizon",
@@ -999,6 +1000,16 @@ version = "0.1.0"
 dependencies = [
  "nixe-cpu",
  "nixe-cpu-engine",
+ "nixe-memory",
+]
+
+[[package]]
+name = "nixe-cpu-engine-testkit"
+version = "0.1.0"
+dependencies = [
+ "nixe-cpu",
+ "nixe-cpu-engine",
+ "nixe-cpu-engine-interpreter",
  "nixe-memory",
 ]
 
@@ -1110,6 +1121,7 @@ dependencies = [
  "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",
+ "nixe-cpu-engine-testkit",
  "nixe-loader-content",
  "nixe-loader-executable",
  "nixe-loader-storage",

@@ -13,6 +13,7 @@ use crate::{ExecutionReport, ProcessExecutionError};
 pub(super) struct WorkerRequest {
     pub(super) lease: Lease,
     pub(super) executor: WorkerExecutorKey,
+    pub(super) fallback: Option<WorkerExecutorKey>,
     pub(super) execution: VcpuExecutionState,
 }
 
@@ -63,9 +64,9 @@ enum WorkerCommand {
         key: WorkerExecutorKey,
         reply: SyncSender<Option<Box<dyn EngineExecutor>>>,
     },
-    Retire {
-        key: WorkerExecutorKey,
-        reply: SyncSender<bool>,
+    RetireProcess {
+        process: ProcessId,
+        reply: SyncSender<usize>,
     },
     ClearLocalExclusive {
         key: WorkerExecutorKey,
@@ -202,25 +203,18 @@ impl VcpuWorkerPool {
         )
     }
 
-    pub(super) fn retire_executor(
+    pub(super) fn retire_process(
         &self,
         vcpu: VirtualCpuId,
-        key: WorkerExecutorKey,
-    ) -> Result<(), WorkerFailure> {
+        process: ProcessId,
+    ) -> Result<usize, WorkerFailure> {
         let worker = self.workers.get(&vcpu).ok_or(WorkerFailure::Lost(vcpu))?;
         let (reply, result) = sync_channel(1);
         worker
             .commands
-            .send(WorkerCommand::Retire { key, reply })
+            .send(WorkerCommand::RetireProcess { process, reply })
             .map_err(|_| WorkerFailure::Lost(vcpu))?;
-        result
-            .recv()
-            .map_err(|_| WorkerFailure::Lost(vcpu))?
-            .then_some(())
-            .ok_or(WorkerFailure::ExecutorUnavailable {
-                process: key.process,
-                vcpu,
-            })
+        result.recv().map_err(|_| WorkerFailure::Lost(vcpu))
     }
 
     pub(super) fn clear_local_exclusive(
@@ -308,9 +302,10 @@ fn worker_main(
                 let _ = reply.send(executors.remove(&key));
                 continue;
             }
-            WorkerCommand::Retire { key, reply } => {
-                let removed = executors.remove(&key).is_some();
-                let _ = reply.send(removed);
+            WorkerCommand::RetireProcess { process, reply } => {
+                let before = executors.len();
+                executors.retain(|key, _| key.process != process);
+                let _ = reply.send(before - executors.len());
                 continue;
             }
             WorkerCommand::ClearLocalExclusive { key, reply } => {
@@ -327,12 +322,53 @@ fn worker_main(
             WorkerCommand::Shutdown => break,
         };
         let run = || {
+            let fallback_boundary = crate::process::execution::current_location(
+                request.execution.cpu,
+                &request.execution.thread,
+            );
             let executor = executors.get_mut(&request.executor).ok_or(
                 ProcessExecutionError::ExecutorUnavailable {
                     engine: request.executor.domain,
                 },
             )?;
-            request.execution.run(executor.as_mut())
+            let primary_engine = executor.descriptor().id;
+            let report = request.execution.run(executor.as_mut())?;
+            let crate::ExecutionStop::InterpretOne { source } = report.stop else {
+                return Ok(report);
+            };
+            if source != fallback_boundary || report.instructions_executed != 0 {
+                return Err(ProcessExecutionError::InvalidFallbackBoundary {
+                    engine: primary_engine,
+                    expected: fallback_boundary,
+                    requested: source,
+                });
+            }
+            let Some(fallback_key) = request.fallback else {
+                return Err(ProcessExecutionError::FallbackUnavailable {
+                    engine: primary_engine,
+                });
+            };
+            let fallback = executors.get_mut(&fallback_key).ok_or(
+                ProcessExecutionError::FallbackUnavailable {
+                    engine: primary_engine,
+                },
+            )?;
+            let fallback_report = request.execution.run_with_budget(fallback.as_mut(), 1)?;
+            if matches!(
+                fallback_report.stop,
+                crate::ExecutionStop::InterpretOne { .. }
+            ) || fallback_report.instructions_executed != 1
+            {
+                return Err(ProcessExecutionError::FallbackUnavailable {
+                    engine: fallback.descriptor().id,
+                });
+            }
+            Ok(ExecutionReport {
+                instructions_executed: report
+                    .instructions_executed
+                    .saturating_add(fallback_report.instructions_executed),
+                ..fallback_report
+            })
         };
         let outcome = if let Some(permit) = &global_permit {
             let _permit = permit
@@ -373,7 +409,7 @@ mod tests {
     use nixe_cpu::state::ThreadCpuState;
     use nixe_cpu_engine::{
         EngineCapabilities, EngineDescriptor, EngineExecutor, EngineExecutorId, EngineId,
-        EngineKind, RunRequest, SafepointReason,
+        EngineKind, RunRequest,
     };
     use nixe_memory::AddressSpaceId;
     use nixe_scheduler::{GuestThreadId, LeaseGeneration, ProcessId};
@@ -401,8 +437,6 @@ mod tests {
             panic!("injected engine panic")
         }
 
-        fn request_safepoint(&mut self, _reason: SafepointReason) {}
-        fn post_event(&self, _mask: u32) {}
         fn clear_local_exclusive_reservation(&mut self) {}
     }
 
@@ -421,12 +455,14 @@ mod tests {
                 process: ProcessId::new(1),
                 domain: nixe_cpu_engine::EngineDomainId::new(1),
             },
+            fallback: None,
             execution: VcpuExecutionState {
                 thread,
                 cpu,
                 memory: Arc::new(ExecutionMemory::new()),
                 virtual_clock: crate::VirtualClock::default(),
                 architectural_timer_frequency: 19_200_000,
+                address_space_end: nixe_memory::GuestVirtualAddress::new(1_u64 << 39),
                 instruction_budget: 1,
                 loader_return: None,
             },

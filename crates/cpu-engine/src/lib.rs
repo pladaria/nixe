@@ -12,22 +12,26 @@ use nixe_cpu::error::{InstructionFetchFault, ProfileDisabledInstruction, Unalloc
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{CpuMemory, DataAccessFault};
-use nixe_cpu::profile::{CpuProfileId, ProcessCpuContext};
+use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_memory::GuestVirtualAddress;
 
 mod capability;
+mod conformance;
 mod control;
 mod handoff;
 pub use capability::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, EngineCapabilities,
     EngineDescriptor, EngineKind, HostArchitecture, HostCapabilities,
 };
+pub use conformance::{
+    CONFORMANCE_FALLBACK_ENCODING, ConformanceCase, ConformanceFailure, ConformanceReport,
+    run_provider_conformance,
+};
 pub use control::{ControlSnapshot, CrossVcpuRequest, EngineControl, EngineExecutionGuard};
 pub use handoff::{
-    DomainQuiescenceToken, HandoffFailure, HandoffFailureStage, MemorySynchronizationRecord,
-    NceExecutionDomain, NceMappingChange, NceMappingChangeKind, NceSupervisorState, NceTrap,
-    NceTrapKind, NceVcpuState, StateCommitBarrier, prepare_handoff,
+    DomainMemory, DomainMemoryBinding, DomainQuiescenceToken, HandoffFailure, HandoffFailureStage,
+    MemorySynchronizationRecord, StateCommitBarrier, prepare_handoff,
 };
 
 pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
@@ -171,6 +175,11 @@ pub struct RunRequest<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineExit {
+    /// Requests one precise instruction through the configured semantic
+    /// fallback engine. State and memory are canonical at `source`.
+    InterpretOne {
+        source: LocationDescriptor,
+    },
     UnsupportedSemantics {
         source: LocationDescriptor,
         encoding: InstructionEncoding,
@@ -282,6 +291,7 @@ impl EngineExit {
 impl Display for EngineExit {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InterpretOne { source } => write!(formatter, "interpret-one source=[{source}]"),
             Self::UnsupportedSemantics {
                 source,
                 encoding,
@@ -395,7 +405,9 @@ pub struct ExecutorRequest {
 
 pub trait EngineProvider: Send + Sync {
     fn descriptor(&self) -> EngineDescriptor;
-    fn probe(&self, profile: CpuProfileId, required: EngineCapabilities) -> CapabilityReport;
+    /// Probes the complete guest profile rather than a registry identity. This
+    /// lets providers conservatively reject unknown architectural features.
+    fn probe(&self, profile: GuestCpuProfile, required: EngineCapabilities) -> CapabilityReport;
     fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault>;
 }
 
@@ -437,14 +449,33 @@ impl EngineRegistry {
 
     pub fn select(
         &self,
-        profile: CpuProfileId,
+        profile: GuestCpuProfile,
         required: EngineCapabilities,
         preference: EnginePreference,
     ) -> Result<Arc<dyn EngineProvider>, EngineSelectionError> {
         let reports: Vec<_> = self
             .providers
             .iter()
-            .map(|provider| provider.probe(profile, required))
+            .map(|provider| {
+                let declared = provider.descriptor();
+                let mut report = provider.probe(profile, required);
+                if report.descriptor != declared
+                    || !declared.capabilities.is_coherent()
+                    || !declared.capabilities.contains(required)
+                    || !declared.capabilities.supports_profile(profile, required)
+                {
+                    report.available = false;
+                    let mut rejections = Vec::from(report.rejections);
+                    rejections.push(CapabilityRejection {
+                        engine: declared.id,
+                        reason: CapabilityRejectionReason::MissingCapabilities,
+                        detail: "provider report disagrees with its descriptor or guest profile"
+                            .into(),
+                    });
+                    report.rejections = rejections.into_boxed_slice();
+                }
+                report
+            })
             .collect();
         let selected = match preference {
             EnginePreference::Auto => reports.iter().position(|report| report.available),
@@ -464,11 +495,41 @@ impl EngineRegistry {
 pub trait EngineDomain: Send {
     fn descriptor(&self) -> EngineDescriptor;
     fn domain_id(&self) -> EngineDomainId;
+    /// Creates executor-local state for an already-bound domain. Transactional
+    /// replacement may create executors before [`Self::activate`]; they cannot
+    /// enter guest execution until activation succeeds.
     fn create_executor(
         &mut self,
         request: ExecutorRequest,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault>;
+    /// Binds the complete canonical address-space view before executors are
+    /// created. Implementations must copy or retain safe backing objects; they
+    /// must not retain the borrowed trait object.
+    fn bind_memory(&mut self, _binding: DomainMemoryBinding<'_>) -> Result<(), EngineFault> {
+        Ok(())
+    }
+    /// Flushes backend-private writes and acknowledges the current mapping
+    /// generation before an engine handoff or teardown.
+    fn synchronize_memory(
+        &mut self,
+        binding: DomainMemoryBinding<'_>,
+    ) -> Result<MemorySynchronizationRecord, EngineFault> {
+        Ok(binding.synchronization_record())
+    }
+    /// Imports the synchronization point exported by the previous domain.
+    fn import_memory(&mut self, _record: MemorySynchronizationRecord) -> Result<(), EngineFault> {
+        Ok(())
+    }
+    /// Makes a bound, synchronized domain available for executor entry.
+    fn activate(&mut self) -> Result<(), EngineFault> {
+        Ok(())
+    }
     fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault>;
+    /// Permanently releases domain resources after every executor was dropped.
+    /// Implementations with external resources must make this idempotent.
+    fn shutdown(&mut self) -> Result<(), EngineFault> {
+        self.quiesce().map(|_| ())
+    }
 }
 
 /// Mutable execution resources leased exclusively to one host worker.
@@ -476,15 +537,15 @@ pub trait EngineExecutor: Send {
     fn descriptor(&self) -> EngineDescriptor;
     fn executor_id(&self) -> EngineExecutorId;
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault>;
-    fn request_safepoint(&mut self, reason: SafepointReason);
-    fn post_event(&self, mask: u32);
     /// Applies mapping/code invalidation before guest re-entry. Providers which
     /// advertise acknowledged invalidation must override this method.
     fn synchronize_invalidation(
         &mut self,
         epoch: u64,
         state: &ThreadCpuState,
+        memory: &dyn CpuMemory,
     ) -> Result<(), EngineFault> {
+        let _ = memory;
         if !self.descriptor().capabilities.acknowledged_invalidation {
             return Ok(());
         }
@@ -498,6 +559,15 @@ pub trait EngineExecutor: Send {
             .into_boxed_str(),
             context: Box::new(state.register_context()),
         })
+    }
+    /// Reconciles mappings and canonical backing before guest re-entry. Native
+    /// engines override this hook; semantic engines inherit epoch handling.
+    fn synchronize_address_space(
+        &mut self,
+        binding: DomainMemoryBinding<'_>,
+        state: &ThreadCpuState,
+    ) -> Result<(), EngineFault> {
+        self.synchronize_invalidation(binding.invalidation_generation, state, binding.memory)
     }
     /// Returns a cloneable control path which remains usable while a worker
     /// exclusively owns this executor.

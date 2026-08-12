@@ -22,11 +22,12 @@ use nixe_horizon::{
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
-    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExecutionError,
-    ProcessExecutionStatus, ProcessExitCause, ProcessObject, ProcessRegistration,
-    ReadableEventObject, RunnableProcess, RuntimeCoordinator, SessionMessage, SessionObject,
-    SessionRequestOwner, SessionRequestResult, SharedMemoryObject, WritableEventObject,
+    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExecutionStatus,
+    ProcessExitCause, ProcessObject, ProcessRegistration, ReadableEventObject, RunnableProcess,
+    RuntimeCoordinator, SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult,
+    SharedMemoryObject, WritableEventObject,
 };
+use support::ScheduledProcess;
 
 fn reference_process_builder() -> ProcessBuilder {
     ProcessBuilder::default()
@@ -111,14 +112,14 @@ fn synthetic_nro_with_romfs(instructions: &[u32], romfs: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn fixture_process(instructions: &[u32]) -> (tempfile::TempDir, RunnableProcess) {
+fn fixture_process(instructions: &[u32]) -> (tempfile::TempDir, ScheduledProcess) {
     fixture_process_with_config(instructions, ProcessBuildConfig::default())
 }
 
 fn fixture_process_with_config(
     instructions: &[u32],
     config: ProcessBuildConfig,
-) -> (tempfile::TempDir, RunnableProcess) {
+) -> (tempfile::TempDir, ScheduledProcess) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("svc.nro");
     fs::write(&path, synthetic_nro(instructions)).unwrap();
@@ -129,13 +130,13 @@ fn fixture_process_with_config(
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
     state(&mut process).set_pc(test_entry);
-    (directory, process)
+    (directory, ScheduledProcess::new(process))
 }
 
 fn fixture_process_with_romfs(
     instructions: &[u32],
     files: &[(&str, &[u8])],
-) -> (tempfile::TempDir, RunnableProcess) {
+) -> (tempfile::TempDir, ScheduledProcess) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("svc-romfs.nro");
     let romfs = support::synthetic_packages::build_romfs(files);
@@ -146,13 +147,13 @@ fn fixture_process_with_romfs(
         .expect("synthetic asset NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
     state(&mut process).set_pc(test_entry);
-    (directory, process)
+    (directory, ScheduledProcess::new(process))
 }
 
 fn fixture_process_for_state(
     execution_state: ExecutionState,
     immediates: &[u8],
-) -> (tempfile::TempDir, RunnableProcess) {
+) -> (tempfile::TempDir, ScheduledProcess) {
     let mut image = synthetic_nro(&[]);
     let entry_offset = 0x80;
     for (index, immediate) in immediates.iter().copied().enumerate() {
@@ -195,7 +196,7 @@ fn fixture_process_for_state(
             *process.main_thread_mut().state_mut() = ThreadCpuState::A32(Box::new(state));
         }
     }
-    (directory, process)
+    (directory, ScheduledProcess::new(process))
 }
 
 fn x(index: u8) -> A64Register {
@@ -252,10 +253,10 @@ const fn instruction_width(execution_state: ExecutionState) -> u64 {
 }
 
 fn dispatch_next(
-    process: &mut RunnableProcess,
+    process: &mut ScheduledProcess,
     dispatcher: &mut HorizonSvcDispatcher,
 ) -> ExceptionHandlingResult<HorizonSvcFault> {
-    let report = process.run_reference(1).unwrap();
+    let report = process.run_slice(1).unwrap();
     process
         .route_supervisor_call(&report.stop, dispatcher)
         .unwrap()
@@ -528,7 +529,7 @@ fn blocking_process_wide_key_wait_releases_mutex_and_publishes_wakeup() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     );
-    assert!(dispatcher.thread_wakeup_source(1).is_some());
+    assert!(dispatcher.pending_thread_wait(1).is_some());
     for (address, expected) in [(key, 1_u32), (mutex, 0)] {
         assert_eq!(
             process
@@ -655,7 +656,7 @@ fn finite_event_wait_uses_virtual_deadline_then_returns_timed_out() {
         ExceptionHandlingResult::Suspended
     );
     let thread_id = process.main_thread().object().thread_id();
-    let source = dispatcher.thread_wakeup_source(thread_id).unwrap();
+    let source = dispatcher.pending_thread_wait(thread_id).unwrap();
     assert_eq!(source.timeout(), Some(Duration::from_millis(2)));
     dispatcher.synchronize_virtual_time(2_000_000);
     assert!(process.resume());
@@ -2597,13 +2598,7 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
             );
             assert_eq!(process.exit().unwrap().thread_id, 1);
             assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
-            assert!(matches!(
-                process.run_reference(1),
-                Err(ProcessExecutionError::NotRunnable {
-                    status: ProcessExecutionStatus::Exited,
-                    ..
-                })
-            ));
+            assert!(process.run_slice(1).is_err());
             assert!(!process.resume());
             assert!(!process.terminate());
 
@@ -2634,7 +2629,9 @@ fn create_thread_commits_through_a64_abi() {
         affinity: switch_1_scheduler_profile().all_cores(),
     };
     let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
-    let process_id = coordinator.register_process(process, registration).unwrap();
+    let process_id = coordinator
+        .register_process(process.into_process(), registration)
+        .unwrap();
     let execution = coordinator.run_next(1).unwrap().unwrap();
     let caller = execution.lease.thread;
     let mut dispatcher = HorizonSvcDispatcher::default();

@@ -117,13 +117,17 @@ impl nixe_cpu_engine::EngineProvider for RuntimeFakeProvider {
             capabilities: nixe_cpu_engine::EngineCapabilities {
                 a64: true,
                 precise_instruction_budget: true,
+                canonical_state_version: 1,
+                deterministic_execution: true,
+                precise_exceptions: true,
+                engine_handoff: true,
                 ..Default::default()
             },
         }
     }
     fn probe(
         &self,
-        _profile: nixe_cpu::profile::CpuProfileId,
+        _profile: nixe_cpu::profile::GuestCpuProfile,
         _required: nixe_cpu_engine::EngineCapabilities,
     ) -> nixe_cpu_engine::CapabilityReport {
         nixe_cpu_engine::CapabilityReport {
@@ -149,9 +153,14 @@ fn control_lying_descriptor() -> nixe_cpu_engine::EngineDescriptor {
         kind: nixe_cpu_engine::EngineKind::Test,
         capabilities: nixe_cpu_engine::EngineCapabilities {
             a64: true,
+            precise_instruction_budget: true,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
             acknowledged_invalidation: true,
+            canonical_state_version: 1,
+            deterministic_execution: true,
+            precise_exceptions: true,
+            engine_handoff: true,
             ..Default::default()
         },
     }
@@ -164,7 +173,7 @@ impl nixe_cpu_engine::EngineProvider for ControlLyingProvider {
 
     fn probe(
         &self,
-        _profile: nixe_cpu::profile::CpuProfileId,
+        _profile: nixe_cpu::profile::GuestCpuProfile,
         _required: nixe_cpu_engine::EngineCapabilities,
     ) -> nixe_cpu_engine::CapabilityReport {
         nixe_cpu_engine::CapabilityReport {
@@ -273,8 +282,6 @@ impl nixe_cpu_engine::EngineExecutor for RuntimeFakeExecutor {
             state_commit: nixe_cpu_engine::StateCommitStatus::Canonical,
         })
     }
-    fn request_safepoint(&mut self, _reason: nixe_cpu_engine::SafepointReason) {}
-    fn post_event(&self, _mask: u32) {}
     fn clear_local_exclusive_reservation(&mut self) {}
 }
 
@@ -340,7 +347,7 @@ fn runtime_orchestration_accepts_an_engine_neutral_fake_domain() {
         .build(&plan)
         .unwrap();
     let before = process.main_thread().state().register_context();
-    let report = process.run_reference(50).unwrap();
+    let report = process.run(50).unwrap();
     assert_eq!(report.instructions_executed, 0);
     assert_eq!(
         report.stop,
@@ -396,7 +403,7 @@ fn runtime_mapping_mutation_requires_engine_acknowledgement_before_reentry() {
     let epoch = process.mapping_epoch();
     assert!(!process.mapping_invalidation_acknowledged(epoch));
     assert_eq!(
-        process.run_reference(0).unwrap().stop,
+        process.run(0).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
     assert!(process.mapping_invalidation_acknowledged(epoch));
@@ -438,7 +445,7 @@ fn process_stopped_at_svc(
             .unwrap();
         *process.main_thread_mut().state_mut() = ThreadCpuState::A32(Box::new(state));
     }
-    let report = process.run_reference(1).unwrap();
+    let report = process.run(1).unwrap();
     assert!(matches!(
         report.stop,
         crate::ExecutionStop::SupervisorCall { .. }

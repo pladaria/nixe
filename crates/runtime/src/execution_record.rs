@@ -12,6 +12,7 @@ pub const MAX_EXECUTION_RECORD_OBSERVATIONS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RecordedStop {
+    InterpretOne,
     BudgetExhausted,
     Safepoint,
     PendingEvent,

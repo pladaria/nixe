@@ -56,8 +56,8 @@ pub use module_memory::{
 pub use process::{
     ExecutionReport, ExecutionStop, GuestThread, InstructionTrace, InstructionTraceEntry,
     MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-    MainThread, ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage,
-    ProcessBuilder, ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
+    ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
+    ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
     ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
     ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
     ThreadExit, ThreadTable, ThreadTableError,

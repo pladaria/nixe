@@ -18,5 +18,6 @@ nixe-scheduler.workspace = true
 
 [dev-dependencies]
 nixe-cpu-engine-interpreter.workspace = true
+nixe-cpu-engine-testkit.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

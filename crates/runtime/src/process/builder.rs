@@ -8,6 +8,7 @@ pub struct ProcessBuilder {
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
     engine_provider: Option<Arc<dyn nixe_cpu_engine::EngineProvider>>,
+    fallback_engine_provider: Option<Arc<dyn nixe_cpu_engine::EngineProvider>>,
 }
 
 impl std::fmt::Debug for ProcessBuilder {
@@ -22,6 +23,13 @@ impl std::fmt::Debug for ProcessBuilder {
                 "engine_provider",
                 &self
                     .engine_provider
+                    .as_ref()
+                    .map(|provider| provider.descriptor()),
+            )
+            .field(
+                "fallback_engine_provider",
+                &self
+                    .fallback_engine_provider
                     .as_ref()
                     .map(|provider| provider.descriptor()),
             )
@@ -75,6 +83,16 @@ impl ProcessBuilder {
         self
     }
 
+    /// Injects the semantic engine used for exact `InterpretOne` exits.
+    #[must_use]
+    pub fn with_fallback_engine_provider(
+        mut self,
+        provider: Arc<dyn nixe_cpu_engine::EngineProvider>,
+    ) -> Self {
+        self.fallback_engine_provider = Some(provider);
+        self
+    }
+
     #[must_use]
     pub const fn diagnostics(&self) -> crate::DiagnosticsPolicy {
         self.diagnostics
@@ -109,6 +127,50 @@ impl ProcessBuilder {
         let abi = metadata.abi;
         let random_entropy = generate_process_entropy()?;
         let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
+        let required = engine_requirements(execution_state, self.diagnostics.instruction_trace);
+        let report = engine_provider.probe(self.config.cpu_profile, required);
+        if !report.available
+            || report.descriptor != engine_provider.descriptor()
+            || !report.descriptor.capabilities.is_coherent()
+            || !report.descriptor.capabilities.contains(required)
+            || !report
+                .descriptor
+                .capabilities
+                .supports_profile(self.config.cpu_profile, required)
+        {
+            return Err(ProcessBuildError::new(
+                ProcessBuildStage::EngineInitialization,
+                format!(
+                    "CPU engine {} rejected guest profile {}: {:?}",
+                    report.descriptor.name, self.config.cpu_profile, report.rejections
+                ),
+            ));
+        }
+        if let Some(fallback) = self.fallback_engine_provider.as_deref() {
+            let report = fallback.probe(
+                self.config.cpu_profile,
+                engine_requirements(execution_state, false),
+            );
+            let fallback_required = engine_requirements(execution_state, false);
+            if !report.available
+                || report.descriptor != fallback.descriptor()
+                || !report.descriptor.capabilities.is_coherent()
+                || !report.descriptor.capabilities.contains(fallback_required)
+                || !report
+                    .descriptor
+                    .capabilities
+                    .supports_profile(self.config.cpu_profile, fallback_required)
+                || report.descriptor.capabilities.interpret_one_fallback
+            {
+                return Err(ProcessBuildError::new(
+                    ProcessBuildStage::EngineInitialization,
+                    format!(
+                        "fallback CPU engine {} rejected guest profile {}",
+                        report.descriptor.name, self.config.cpu_profile
+                    ),
+                ));
+            }
+        }
         let thread_configuration = cpu
             .thread_configuration(execution_state)
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Metadata, error))?;
@@ -296,6 +358,36 @@ impl ProcessBuilder {
                 "engine domain identity exhausted",
             )
         })?;
+        let fallback_domain = self
+            .fallback_engine_provider
+            .as_deref()
+            .map(|provider| {
+                execution::allocate_engine_domain_id()
+                    .map(|id| (id, provider))
+                    .ok_or_else(|| {
+                        ProcessBuildError::new(
+                            ProcessBuildStage::EngineInitialization,
+                            "fallback engine domain identity exhausted",
+                        )
+                    })
+            })
+            .transpose()?;
+        let execution = execution::ProcessExecutionControl::with_provider(
+            execution::ProcessExecutionConfiguration {
+                diagnostics: self.diagnostics,
+                virtual_clock: self.virtual_clock.clone(),
+                timer_frequency: self.config.architectural_timer_frequency,
+                cpu,
+                address_space_end: nixe_memory::GuestVirtualAddress::new(
+                    address_space.exclusive_limit(),
+                ),
+            },
+            &memory,
+            domain_id,
+            engine_provider,
+            fallback_domain,
+        )
+        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EngineInitialization, error))?;
         let process = RunnableProcess {
             process_id: self.config.process_id,
             lifecycle: nixe_scheduler::ProcessLifecycle::Running,
@@ -323,20 +415,28 @@ impl ProcessBuilder {
             mounts: crate::ProcessMountNamespace::from_launch_plan(plan, self.sd_card_root.clone()),
             handles,
             address_waits: crate::AddressWaitRegistry::default(),
-            execution: execution::ProcessExecutionControl::with_provider(
-                self.diagnostics,
-                self.virtual_clock.clone(),
-                self.config.architectural_timer_frequency,
-                cpu,
-                domain_id,
-                engine_provider,
-            )
-            .map_err(|error| {
-                ProcessBuildError::new(ProcessBuildStage::EngineInitialization, error)
-            })?,
+            execution,
         };
         process.translate_entry()?;
         Ok(process)
+    }
+}
+
+fn engine_requirements(
+    state: ExecutionState,
+    instruction_trace: bool,
+) -> nixe_cpu_engine::EngineCapabilities {
+    nixe_cpu_engine::EngineCapabilities {
+        a64: state == ExecutionState::A64,
+        a32: state == ExecutionState::A32,
+        t32: state == ExecutionState::T32,
+        precise_instruction_budget: true,
+        instruction_trace,
+        precise_exceptions: true,
+        canonical_state_version: 1,
+        deterministic_execution: true,
+        engine_handoff: true,
+        ..Default::default()
     }
 }
 
