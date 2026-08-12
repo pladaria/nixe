@@ -1,14 +1,38 @@
-//! Failure-atomic engine handoff and native-execution interchange contracts.
+//! Failure-atomic engine-domain lifecycle and memory interchange contracts.
 
-use nixe_cpu::location::LocationDescriptor;
-use nixe_cpu::memory::{DataAccessFault, MemoryPermissions};
-use nixe_cpu::state::ThreadCpuState;
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_cpu::memory::CpuMemory;
+use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
 
-use crate::{
-    EngineDomain, EngineDomainId, EngineExecutorId, EngineExit, EngineFault, EngineGeneration,
-    StateCommitStatus,
-};
+use crate::{EngineDomain, EngineDomainId, EngineFault, EngineGeneration, StateCommitStatus};
+
+/// Memory surface available while a domain binds or reconciles an address space.
+///
+/// Semantic access remains authoritative through [`CpuMemory`]. Native engines
+/// may additionally retain checked canonical backing ranges for host mappings.
+pub trait DomainMemory: CpuMemory + CanonicalRangeTranslator {}
+
+impl<T> DomainMemory for T where T: CpuMemory + CanonicalRangeTranslator {}
+
+/// Complete, borrowed description used to bind or reconcile one domain.
+#[derive(Clone, Copy)]
+pub struct DomainMemoryBinding<'a> {
+    pub address_space: AddressSpaceId,
+    pub end_exclusive: GuestVirtualAddress,
+    pub memory: &'a dyn DomainMemory,
+    pub invalidation_generation: u64,
+    pub dirty_generation: u64,
+}
+
+impl DomainMemoryBinding<'_> {
+    #[must_use]
+    pub const fn synchronization_record(self) -> MemorySynchronizationRecord {
+        MemorySynchronizationRecord {
+            address_space: self.address_space,
+            invalidation_generation: self.invalidation_generation,
+            dirty_generation: self.dirty_generation,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DomainQuiescenceToken {
@@ -33,7 +57,6 @@ pub struct StateCommitBarrier {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HandoffFailureStage {
     Quiesce,
-    Export,
     MemorySync,
     Import,
     Commit,
@@ -45,101 +68,42 @@ pub struct HandoffFailure {
     pub fault: EngineFault,
 }
 
-/// Runs a failure-atomic switch. The old domain is retained unless every
-/// preparation step succeeds; callers commit the returned domain explicitly.
+/// Reconciles the old domain, publishes canonical state, and activates the
+/// already-bound replacement. No executor may be running while this function
+/// is called. A failure after old-domain quiescence reactivates the old domain.
 pub fn prepare_handoff(
     old: &mut dyn EngineDomain,
-    mut replacement: Box<dyn EngineDomain>,
-    memory: MemorySynchronizationRecord,
-) -> Result<(Box<dyn EngineDomain>, StateCommitBarrier), HandoffFailure> {
-    let replacement_quiescence = replacement.quiesce().map_err(|fault| HandoffFailure {
-        stage: HandoffFailureStage::Import,
-        fault,
-    })?;
-    let _ = replacement_quiescence;
-    // Validate the replacement before changing the old domain. A failed
-    // import therefore leaves the currently selected engine runnable.
+    replacement: &mut dyn EngineDomain,
+    binding: DomainMemoryBinding<'_>,
+) -> Result<StateCommitBarrier, HandoffFailure> {
+    let memory = old
+        .synchronize_memory(binding)
+        .map_err(|fault| HandoffFailure {
+            stage: HandoffFailureStage::MemorySync,
+            fault,
+        })?;
     let quiescence = old.quiesce().map_err(|fault| HandoffFailure {
         stage: HandoffFailureStage::Quiesce,
         fault,
     })?;
-    Ok((
-        replacement,
-        StateCommitBarrier {
-            quiescence,
-            memory,
-            state: StateCommitStatus::Canonical,
-        },
-    ))
-}
-
-/// NCE-owned supervisor state which must never leak host handles.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NceSupervisorState {
-    pub virtual_exception_level: u8,
-    pub pending_interrupt_mask: u32,
-    pub timer_deadline: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum NceMappingChangeKind {
-    Map,
-    Unmap,
-    Protect,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct NceMappingChange {
-    pub address_space: AddressSpaceId,
-    pub start: GuestVirtualAddress,
-    pub size: u64,
-    pub kind: NceMappingChangeKind,
-    pub permissions: Option<MemoryPermissions>,
-    pub generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum NceTrapKind {
-    SupervisorCall,
-    DataAbort,
-    InstructionAbort,
-    Timer,
-    Interrupt,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct NceTrap {
-    pub source: LocationDescriptor,
-    pub kind: NceTrapKind,
-    pub syndrome: Option<u64>,
-    pub data_fault: Option<DataAccessFault>,
-}
-
-/// Lossless vCPU interchange state.
-///
-/// `canonical` includes, for A64, X0-X30, SP, PC, NZCV, V0-V31, FPCR, FPSR,
-/// TPIDR_EL0, and TPIDRRO_EL0. For A32/T32 it includes R0-R14, the stored PC,
-/// CPSR/ITSTATE, D0-D31, FPSCR, TPIDRURW, and TPIDRURO. Exclusive-monitor,
-/// interrupt, timer, mapping, and privileged supervisor state are deliberately
-/// carried by the domain contract rather than hidden in this value.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NceVcpuState {
-    pub canonical: ThreadCpuState,
-    pub supervisor: NceSupervisorState,
-}
-
-pub trait NceExecutionDomain: EngineDomain {
-    fn bind_address_space(&mut self, address_space: AddressSpaceId) -> Result<(), EngineFault>;
-    fn notify_mapping(&mut self, change: NceMappingChange) -> Result<(), EngineFault>;
-    fn reconcile_dirty_memory(&mut self) -> Result<MemorySynchronizationRecord, EngineFault>;
-    fn inject_interrupt(&mut self, mask: u32) -> Result<(), EngineFault>;
-    fn import_vcpu(
-        &mut self,
-        executor: EngineExecutorId,
-        state: NceVcpuState,
-    ) -> Result<(), EngineFault>;
-    fn export_vcpu(&mut self, executor: EngineExecutorId) -> Result<NceVcpuState, EngineFault>;
-    fn normalize_trap(&self, trap: NceTrap) -> EngineExit;
-    fn teardown(&mut self) -> Result<(), EngineFault>;
+    let activate = replacement
+        .import_memory(memory)
+        .and_then(|()| replacement.activate());
+    if let Err(fault) = activate {
+        if let Err(restore) = old.activate() {
+            return Err(HandoffFailure {
+                stage: HandoffFailureStage::Commit,
+                fault: restore,
+            });
+        }
+        return Err(HandoffFailure {
+            stage: HandoffFailureStage::Import,
+            fault,
+        });
+    }
+    Ok(StateCommitBarrier {
+        quiescence,
+        memory,
+        state: StateCommitStatus::Canonical,
+    })
 }

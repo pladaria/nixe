@@ -86,6 +86,14 @@ pub enum ProcessExecutionError {
     ExecutorUnavailable {
         engine: EngineDomainId,
     },
+    FallbackUnavailable {
+        engine: nixe_cpu_engine::EngineId,
+    },
+    InvalidFallbackBoundary {
+        engine: nixe_cpu_engine::EngineId,
+        expected: LocationDescriptor,
+        requested: LocationDescriptor,
+    },
 }
 
 impl Display for ProcessExecutionError {
@@ -110,6 +118,22 @@ impl Display for ProcessExecutionError {
                     engine.get()
                 )
             }
+            Self::FallbackUnavailable { engine } => {
+                write!(
+                    formatter,
+                    "CPU engine {} requested an unavailable semantic fallback",
+                    engine.get()
+                )
+            }
+            Self::InvalidFallbackBoundary {
+                engine,
+                expected,
+                requested,
+            } => write!(
+                formatter,
+                "CPU engine {} requested semantic fallback at {requested:?}, but canonical execution is at {expected:?}",
+                engine.get()
+            ),
         }
     }
 }
@@ -149,17 +173,31 @@ impl Error for ProcessTeardownFailure {}
 pub(crate) struct ProcessExecutionControl {
     domain: Box<dyn EngineDomain>,
     executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
+    fallback: Option<FallbackExecutionControl>,
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
     cpu: ProcessCpuContext,
     trace_policy: TracePolicy,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
+    address_space_end: nixe_memory::GuestVirtualAddress,
     quiesced: bool,
     quiesce_attempted: bool,
     quiesce_failure: Option<EngineFault>,
-    worker_resident: bool,
     pending_safepoint: AtomicBool,
     pending_events: AtomicU32,
+}
+
+struct FallbackExecutionControl {
+    domain: Box<dyn EngineDomain>,
+    executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
+}
+
+pub(crate) struct ProcessExecutionConfiguration {
+    pub(crate) diagnostics: DiagnosticsPolicy,
+    pub(crate) virtual_clock: VirtualClock,
+    pub(crate) timer_frequency: u64,
+    pub(crate) cpu: ProcessCpuContext,
+    pub(crate) address_space_end: nixe_memory::GuestVirtualAddress,
 }
 
 pub(crate) struct PreparedEngineSwitch {
@@ -167,7 +205,7 @@ pub(crate) struct PreparedEngineSwitch {
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
     replacement: Box<dyn EngineDomain>,
     cpu: ProcessCpuContext,
-    barrier: nixe_cpu_engine::StateCommitBarrier,
+    barrier: Option<nixe_cpu_engine::StateCommitBarrier>,
 }
 
 impl PreparedEngineSwitch {
@@ -181,17 +219,36 @@ impl PreparedEngineSwitch {
     ) -> Option<Box<dyn EngineExecutor>> {
         self.executors.remove(&vcpu)
     }
+
+    pub(crate) fn restore_executor(
+        &mut self,
+        vcpu: nixe_scheduler::VirtualCpuId,
+        executor: Box<dyn EngineExecutor>,
+    ) {
+        debug_assert!(self.executors.insert(vcpu, executor).is_none());
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<(), EngineFault> {
+        self.executors.clear();
+        self.replacement.shutdown()
+    }
 }
 
 impl ProcessExecutionControl {
     pub(crate) fn with_provider(
-        diagnostics: DiagnosticsPolicy,
-        virtual_clock: VirtualClock,
-        timer_frequency: u64,
-        cpu: ProcessCpuContext,
+        configuration: ProcessExecutionConfiguration,
+        memory: &nixe_cpu::memory::ExecutionMemory,
         domain_id: EngineDomainId,
         provider: &dyn EngineProvider,
+        fallback: Option<(EngineDomainId, &dyn EngineProvider)>,
     ) -> Result<Self, EngineFault> {
+        let ProcessExecutionConfiguration {
+            diagnostics,
+            virtual_clock,
+            timer_frequency,
+            cpu,
+            address_space_end,
+        } = configuration;
         let trace = TracePolicy {
             enabled: diagnostics.instruction_trace,
             detailed: diagnostics.report_detail == ReportDetail::Detailed,
@@ -200,35 +257,89 @@ impl ProcessExecutionControl {
             domain: domain_id,
             cpu,
         })?;
+        let binding = nixe_cpu_engine::DomainMemoryBinding {
+            address_space: cpu.address_space_id(),
+            end_exclusive: address_space_end,
+            memory,
+            invalidation_generation: memory.mapping_epoch().get(),
+            dirty_generation: memory.content_generation_watermark(),
+        };
+        if let Err(fault) = domain.bind_memory(binding) {
+            let _ = domain.shutdown();
+            return Err(fault);
+        }
+        if let Err(fault) = domain.activate() {
+            let _ = domain.shutdown();
+            return Err(fault);
+        }
         let executor = match domain.create_executor(ExecutorRequest {
             executor: EngineExecutorId::new(1),
             trace,
         }) {
             Ok(executor) => executor,
             Err(fault) => {
-                let _ = domain.quiesce();
+                let _ = domain.shutdown();
                 return Err(fault);
             }
         };
         let descriptor = domain.descriptor();
         if executor.control().is_none() && descriptor.capabilities.requires_control_path() {
             let fault = missing_control_path_fault(cpu, descriptor.id);
-            let _ = domain.quiesce();
+            let _ = domain.shutdown();
             return Err(fault);
         }
         drop(executor);
+        let fallback = match fallback
+            .map(|(domain_id, provider)| create_fallback_domain(cpu, binding, domain_id, provider))
+            .transpose()
+        {
+            Ok(fallback) => fallback,
+            Err(fault) => {
+                let _ = domain.shutdown();
+                return Err(fault);
+            }
+        };
+        if fallback.as_ref().is_some_and(|fallback| {
+            fallback
+                .domain
+                .descriptor()
+                .capabilities
+                .interpret_one_fallback
+        }) {
+            let fault = engine_fault(
+                cpu,
+                descriptor.id,
+                nixe_cpu_engine::EngineFaultKind::InvalidRequest,
+                "semantic fallback engines cannot recursively request InterpretOne",
+            );
+            let _ = domain.shutdown();
+            if let Some(mut fallback) = fallback {
+                let _ = fallback.domain.shutdown();
+            }
+            return Err(fault);
+        }
+        if descriptor.capabilities.interpret_one_fallback && fallback.is_none() {
+            let _ = domain.shutdown();
+            return Err(engine_fault(
+                cpu,
+                descriptor.id,
+                nixe_cpu_engine::EngineFaultKind::InvalidRequest,
+                "engine advertises InterpretOne exits without a configured fallback provider",
+            ));
+        }
         Ok(Self {
             domain,
             executors: BTreeMap::new(),
+            fallback,
             controls: BTreeMap::new(),
             cpu,
             trace_policy: trace,
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
+            address_space_end,
             quiesced: false,
             quiesce_attempted: false,
             quiesce_failure: None,
-            worker_resident: false,
             pending_safepoint: AtomicBool::new(false),
             pending_events: AtomicU32::new(0),
         })
@@ -238,8 +349,18 @@ impl ProcessExecutionControl {
         self.domain.descriptor()
     }
 
+    pub(crate) const fn instruction_trace_enabled(&self) -> bool {
+        self.trace_policy.enabled
+    }
+
     pub(crate) fn domain_id(&self) -> EngineDomainId {
         self.domain.domain_id()
+    }
+
+    pub(crate) fn fallback_domain_id(&self) -> Option<EngineDomainId> {
+        self.fallback
+            .as_ref()
+            .map(|fallback| fallback.domain.domain_id())
     }
     pub(crate) fn request_safepoint(&self) {
         if self.controls.is_empty() {
@@ -264,7 +385,15 @@ impl ProcessExecutionControl {
         self.quiesce_attempted = true;
         self.request_safepoint();
         self.executors.clear();
-        if let Err(fault) = self.domain.quiesce() {
+        if let Some(fallback) = &mut self.fallback {
+            fallback.executors.clear();
+        }
+        let primary_result = self.domain.shutdown();
+        let fallback_result = self
+            .fallback
+            .as_mut()
+            .map_or(Ok(()), |fallback| fallback.domain.shutdown());
+        if let Err(fault) = primary_result.and(fallback_result) {
             self.quiesce_failure = Some(fault.clone());
             return Err(fault);
         }
@@ -293,6 +422,7 @@ impl ProcessExecutionControl {
                 .all(|control| control.acknowledged_invalidation(epoch.get()))
         })
     }
+    #[cfg(test)]
     pub(crate) fn post_event(&self, mask: u32) {
         if self.controls.is_empty() {
             self.pending_events.fetch_or(mask, Ordering::Release);
@@ -356,6 +486,36 @@ impl ProcessExecutionControl {
         self.executors.insert(vcpu, executor);
     }
 
+    pub(crate) fn lease_fallback_executor(
+        &mut self,
+        vcpu: nixe_scheduler::VirtualCpuId,
+    ) -> Result<Option<Box<dyn EngineExecutor>>, EngineFault> {
+        let Some(fallback) = &mut self.fallback else {
+            return Ok(None);
+        };
+        if !fallback.executors.contains_key(&vcpu) {
+            let executor = fallback.domain.create_executor(ExecutorRequest {
+                executor: Self::executor_id(vcpu),
+                trace: self.trace_policy,
+            })?;
+            fallback.executors.insert(vcpu, executor);
+        }
+        Ok(fallback.executors.remove(&vcpu))
+    }
+
+    pub(crate) fn restore_fallback_executor(
+        &mut self,
+        vcpu: nixe_scheduler::VirtualCpuId,
+        executor: Box<dyn EngineExecutor>,
+    ) {
+        let fallback = self
+            .fallback
+            .as_mut()
+            .expect("a leased fallback executor retains its domain");
+        debug_assert!(!fallback.executors.contains_key(&vcpu));
+        fallback.executors.insert(vcpu, executor);
+    }
+
     fn publish_pending_control(&self, control: &nixe_cpu_engine::EngineControl) {
         if self.pending_safepoint.swap(false, Ordering::AcqRel) {
             let _ = control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
@@ -366,22 +526,26 @@ impl ProcessExecutionControl {
         }
     }
 
-    pub(crate) fn execution_environment(&self) -> (VirtualClock, u64, ProcessCpuContext) {
+    pub(crate) fn execution_environment(
+        &self,
+    ) -> (
+        VirtualClock,
+        u64,
+        ProcessCpuContext,
+        nixe_memory::GuestVirtualAddress,
+    ) {
         (
             self.virtual_clock.clone(),
             self.architectural_timer_frequency,
             self.cpu,
+            self.address_space_end,
         )
-    }
-
-    pub(crate) const fn set_worker_resident(&mut self, resident: bool) {
-        self.worker_resident = resident;
     }
 
     pub(crate) fn prepare_provider_switch(
         &mut self,
         cpu: ProcessCpuContext,
-        memory: nixe_cpu_engine::MemorySynchronizationRecord,
+        memory: nixe_cpu_engine::DomainMemoryBinding<'_>,
         vcpus: impl IntoIterator<Item = nixe_scheduler::VirtualCpuId>,
         provider: &dyn EngineProvider,
     ) -> Result<PreparedEngineSwitch, nixe_cpu_engine::HandoffFailure> {
@@ -404,18 +568,43 @@ impl ProcessExecutionControl {
                 stage: nixe_cpu_engine::HandoffFailureStage::Import,
                 fault,
             })?;
+        if let Err(fault) = replacement.bind_memory(memory) {
+            let _ = replacement.shutdown();
+            return Err(nixe_cpu_engine::HandoffFailure {
+                stage: nixe_cpu_engine::HandoffFailureStage::Import,
+                fault,
+            });
+        }
+        if replacement.descriptor().capabilities.interpret_one_fallback && self.fallback.is_none() {
+            let fault = nixe_cpu_engine::HandoffFailure {
+                stage: nixe_cpu_engine::HandoffFailureStage::Import,
+                fault: engine_fault(
+                    cpu,
+                    replacement.descriptor().id,
+                    nixe_cpu_engine::EngineFaultKind::InvalidRequest,
+                    "replacement engine requires an unconfigured InterpretOne fallback",
+                ),
+            };
+            let _ = replacement.shutdown();
+            return Err(fault);
+        }
         let mut executors = BTreeMap::new();
         let mut controls = BTreeMap::new();
         for vcpu in vcpus {
-            let executor = replacement
-                .create_executor(ExecutorRequest {
-                    executor: Self::executor_id(vcpu),
-                    trace: self.trace_policy,
-                })
-                .map_err(|fault| nixe_cpu_engine::HandoffFailure {
-                    stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                    fault,
-                })?;
+            let executor = match replacement.create_executor(ExecutorRequest {
+                executor: Self::executor_id(vcpu),
+                trace: self.trace_policy,
+            }) {
+                Ok(executor) => executor,
+                Err(fault) => {
+                    executors.clear();
+                    let _ = replacement.shutdown();
+                    return Err(nixe_cpu_engine::HandoffFailure {
+                        stage: nixe_cpu_engine::HandoffFailureStage::Import,
+                        fault,
+                    });
+                }
+            };
             if let Some(control) = executor.control() {
                 if controls.is_empty() {
                     self.publish_pending_control(&control);
@@ -426,22 +615,42 @@ impl ProcessExecutionControl {
                 .capabilities
                 .requires_control_path()
             {
-                return Err(nixe_cpu_engine::HandoffFailure {
+                let fault = nixe_cpu_engine::HandoffFailure {
                     stage: nixe_cpu_engine::HandoffFailureStage::Import,
                     fault: missing_control_path_fault(cpu, replacement.descriptor().id),
-                });
+                };
+                drop(executor);
+                executors.clear();
+                let _ = replacement.shutdown();
+                return Err(fault);
             }
             executors.insert(vcpu, executor);
         }
-        let (replacement, barrier) =
-            nixe_cpu_engine::prepare_handoff(self.domain.as_mut(), replacement, memory)?;
         Ok(PreparedEngineSwitch {
             replacement,
             executors,
             controls,
             cpu,
-            barrier,
+            barrier: None,
         })
+    }
+
+    pub(crate) fn complete_provider_switch(
+        &mut self,
+        prepared: &mut PreparedEngineSwitch,
+        memory: nixe_cpu_engine::DomainMemoryBinding<'_>,
+    ) -> Result<(), nixe_cpu_engine::HandoffFailure> {
+        let barrier = nixe_cpu_engine::prepare_handoff(
+            self.domain.as_mut(),
+            prepared.replacement.as_mut(),
+            memory,
+        )?;
+        prepared.barrier = Some(barrier);
+        Ok(())
+    }
+
+    pub(crate) fn reactivate_after_switch_failure(&mut self) -> Result<(), EngineFault> {
+        self.domain.activate()
     }
 
     pub(crate) fn commit_provider_switch(
@@ -449,33 +658,58 @@ impl ProcessExecutionControl {
         prepared: PreparedEngineSwitch,
     ) -> (nixe_cpu_engine::StateCommitBarrier, Box<dyn EngineDomain>) {
         debug_assert!(prepared.executors.is_empty());
-        let old = std::mem::replace(&mut self.domain, prepared.replacement);
-        self.controls = prepared.controls;
-        self.cpu = prepared.cpu;
+        let PreparedEngineSwitch {
+            replacement,
+            controls,
+            cpu,
+            barrier,
+            ..
+        } = prepared;
+        let old = std::mem::replace(&mut self.domain, replacement);
+        self.controls = controls;
+        self.cpu = cpu;
         self.quiesced = false;
         self.quiesce_attempted = false;
         self.quiesce_failure = None;
-        (prepared.barrier, old)
+        (
+            barrier.expect("a committed provider switch completed its handoff"),
+            old,
+        )
     }
+}
 
-    pub(crate) fn switch_provider(
-        &mut self,
-        cpu: ProcessCpuContext,
-        memory: nixe_cpu_engine::MemorySynchronizationRecord,
-        provider: &dyn EngineProvider,
-    ) -> Result<nixe_cpu_engine::StateCommitBarrier, nixe_cpu_engine::HandoffFailure> {
-        if self.worker_resident {
-            return Err(nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Quiesce,
-                fault: missing_control_path_fault(cpu, self.domain.descriptor().id),
-            });
-        }
-        let vcpus: Vec<_> = self.executors.keys().copied().collect();
-        let mut prepared = self.prepare_provider_switch(cpu, memory, vcpus, provider)?;
-        self.executors = std::mem::take(&mut prepared.executors);
-        let (barrier, _old) = self.commit_provider_switch(prepared);
-        Ok(barrier)
+fn create_fallback_domain(
+    cpu: ProcessCpuContext,
+    binding: nixe_cpu_engine::DomainMemoryBinding<'_>,
+    domain_id: EngineDomainId,
+    provider: &dyn EngineProvider,
+) -> Result<FallbackExecutionControl, EngineFault> {
+    let mut domain = provider.create_domain(DomainRequest {
+        domain: domain_id,
+        cpu,
+    })?;
+    let result = domain
+        .bind_memory(binding)
+        .and_then(|()| domain.activate())
+        .and_then(|()| {
+            domain
+                .create_executor(ExecutorRequest {
+                    executor: EngineExecutorId::new(1),
+                    trace: TracePolicy {
+                        enabled: false,
+                        detailed: false,
+                    },
+                })
+                .map(drop)
+        });
+    if let Err(fault) = result {
+        let _ = domain.shutdown();
+        return Err(fault);
     }
+    Ok(FallbackExecutionControl {
+        domain,
+        executors: BTreeMap::new(),
+    })
 }
 
 impl Drop for ProcessExecutionControl {
@@ -541,6 +775,7 @@ pub(crate) struct VcpuExecutionState {
     pub(crate) memory: Arc<ExecutionMemory>,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
+    pub(crate) address_space_end: GuestVirtualAddress,
     pub(crate) instruction_budget: u64,
     pub(crate) loader_return: Option<GuestVirtualAddress>,
 }
@@ -550,9 +785,26 @@ impl VcpuExecutionState {
         &mut self,
         executor: &mut dyn EngineExecutor,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
+        self.run_with_budget(executor, self.instruction_budget)
+    }
+
+    pub(crate) fn run_with_budget(
+        &mut self,
+        executor: &mut dyn EngineExecutor,
+        instruction_budget: u64,
+    ) -> Result<ExecutionReport, ProcessExecutionError> {
         let memory_lease = self.memory.acquire_execution_lease();
         executor
-            .synchronize_invalidation(memory_lease.epoch().get(), &self.thread)
+            .synchronize_address_space(
+                nixe_cpu_engine::DomainMemoryBinding {
+                    address_space: self.cpu.address_space_id(),
+                    end_exclusive: self.address_space_end,
+                    memory: self.memory.as_ref(),
+                    invalidation_generation: memory_lease.epoch().get(),
+                    dirty_generation: self.memory.content_generation_watermark(),
+                },
+                &self.thread,
+            )
             .map_err(|fault| ProcessExecutionError::Engine { fault })?;
         let timer = RuntimeTimer {
             clock: &self.virtual_clock,
@@ -563,7 +815,7 @@ impl VcpuExecutionState {
             cpu: self.cpu,
             memory: self.memory.as_ref(),
             state: &mut self.thread,
-            instruction_budget: self.instruction_budget,
+            instruction_budget,
             loader_return: self.loader_return,
             timer: &timer,
         });
@@ -621,7 +873,7 @@ mod tests {
     use super::*;
     use nixe_cpu_engine::{
         CapabilityReport, DomainQuiescenceToken, EngineCapabilities, EngineDescriptor, EngineId,
-        EngineKind, SafepointReason,
+        EngineKind,
     };
     use nixe_memory::AddressSpaceId;
 
@@ -648,7 +900,7 @@ mod tests {
 
         fn probe(
             &self,
-            _profile: nixe_cpu::profile::CpuProfileId,
+            _profile: nixe_cpu::profile::GuestCpuProfile,
             _required: EngineCapabilities,
         ) -> CapabilityReport {
             CapabilityReport {
@@ -718,10 +970,6 @@ mod tests {
             unreachable!("the quiesce test never enters guest execution")
         }
 
-        fn request_safepoint(&mut self, _reason: SafepointReason) {}
-
-        fn post_event(&self, _mask: u32) {}
-
         fn clear_local_exclusive_reservation(&mut self) {}
     }
 
@@ -734,13 +982,19 @@ mod tests {
         );
         {
             let provider = FailingProvider(Arc::clone(&attempts));
+            let memory = nixe_cpu::memory::ExecutionMemory::new();
             let mut execution = ProcessExecutionControl::with_provider(
-                DiagnosticsPolicy::default(),
-                VirtualClock::default(),
-                19_200_000,
-                cpu,
+                ProcessExecutionConfiguration {
+                    diagnostics: DiagnosticsPolicy::default(),
+                    virtual_clock: VirtualClock::default(),
+                    timer_frequency: 19_200_000,
+                    cpu,
+                    address_space_end: nixe_memory::GuestVirtualAddress::new(1_u64 << 39),
+                },
+                &memory,
                 allocate_engine_domain_id().unwrap(),
                 &provider,
+                None,
             )
             .unwrap();
             assert!(execution.quiesce().is_err());

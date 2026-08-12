@@ -91,9 +91,18 @@ impl RuntimeCoordinator {
                 .expect("the dispatched process remains registered")
                 .engine_domain_id(),
         };
+        let fallback = self
+            .processes
+            .get(&lease.process)
+            .and_then(RunnableProcess::fallback_engine_domain_id)
+            .map(|domain| WorkerExecutorKey {
+                process: lease.process,
+                domain,
+            });
         if let Err(failure) = self.workers.dispatch(WorkerRequest {
             lease,
             executor,
+            fallback,
             execution,
         }) {
             self.processes
@@ -239,9 +248,18 @@ impl RuntimeCoordinator {
                     .expect("the dispatched process remains registered")
                     .engine_domain_id(),
             };
+            let fallback = self
+                .processes
+                .get(&lease.process)
+                .and_then(RunnableProcess::fallback_engine_domain_id)
+                .map(|domain| WorkerExecutorKey {
+                    process: lease.process,
+                    domain,
+                });
             match self.workers.dispatch(WorkerRequest {
                 lease,
                 executor,
+                fallback,
                 execution,
             }) {
                 Ok(()) => {

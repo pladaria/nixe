@@ -15,7 +15,7 @@ use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, Engi
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
-    UnsupportedNvDrvOperation, VideoSystem, switch_1_scheduler_profile,
+    UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
 };
 use nixe_input::{
     ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
@@ -64,7 +64,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         let mailbox = frontend.mailbox();
         (Some(frontend), Some(control), mailbox)
     };
-    let scheduler_profile = switch_1_scheduler_profile();
+    let machine_profile = switch_1_machine_profile();
+    let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
@@ -157,12 +158,18 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
-    let engine_provider =
-        select_cpu_engine(config.cpu.engine, diagnostics, config.cpu.parallel_vcpus)?;
+    let engine_provider = select_cpu_engine(
+        config.cpu.engine,
+        diagnostics,
+        config.cpu.parallel_vcpus,
+        machine_profile.cpu(),
+        machine_profile.scheduler().vcpus().len(),
+    )?;
     let process = ProcessBuilder::new()
         .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
+        .with_config(machine_profile.process_build_config())
         .with_engine_provider(engine_provider)
         .build(&plan)
         .map_err(|error| error.to_string())?;
@@ -243,6 +250,8 @@ fn select_cpu_engine(
     selection: CpuEngineSelection,
     diagnostics: DiagnosticsPolicy,
     parallel_vcpus: bool,
+    profile: nixe_cpu::profile::GuestCpuProfile,
+    vcpu_count: usize,
 ) -> Result<Arc<dyn EngineProvider>, String> {
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
     let registry = EngineRegistry::new([interpreter]);
@@ -252,18 +261,28 @@ fn select_cpu_engine(
     };
     registry
         .select(
-            nixe_runtime::ProcessBuildConfig::default().cpu_profile.id(),
+            profile,
             EngineCapabilities {
                 a64: true,
                 a32: false,
                 t32: false,
                 precise_instruction_budget: true,
                 instruction_trace: diagnostics.instruction_trace,
+                interpret_one_fallback: false,
                 native_execution: false,
                 concurrent_executors: parallel_vcpus,
                 max_safepoint_instructions: parallel_vcpus
                     .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
                 acknowledged_invalidation: parallel_vcpus,
+                canonical_state_version: 1,
+                deterministic_execution: !parallel_vcpus,
+                precise_exceptions: true,
+                engine_handoff: true,
+                canonical_memory_binding: false,
+                max_concurrent_executors: parallel_vcpus.then(|| {
+                    std::num::NonZeroUsize::new(vcpu_count)
+                        .expect("a machine profile contains at least one vCPU")
+                }),
             },
             preference,
         )
@@ -276,9 +295,16 @@ mod engine_selection_tests {
 
     #[test]
     fn application_composition_resolves_auto_and_explicit_interpreter() {
+        let profile = switch_1_machine_profile();
         for selection in [CpuEngineSelection::Auto, CpuEngineSelection::Interpreter] {
-            let provider =
-                select_cpu_engine(selection, DiagnosticsPolicy::default(), false).unwrap();
+            let provider = select_cpu_engine(
+                selection,
+                DiagnosticsPolicy::default(),
+                false,
+                profile.cpu(),
+                profile.scheduler().vcpus().len(),
+            )
+            .unwrap();
             assert_eq!(provider.descriptor().id, INTERPRETER_ENGINE_ID);
         }
         assert!(
@@ -286,6 +312,8 @@ mod engine_selection_tests {
                 CpuEngineSelection::Interpreter,
                 DiagnosticsPolicy::default(),
                 true,
+                profile.cpu(),
+                profile.scheduler().vcpus().len(),
             )
             .is_ok()
         );
@@ -462,9 +490,8 @@ fn execute(
         if coordinator.host_stop_requested() {
             log::info!("host stop received; stopping the guest process cleanly");
             if !coordinator
-                .process_mut(process_id)
-                .expect("registered process remains available")
-                .terminate()
+                .terminate_process(process_id)
+                .map_err(|error| error.to_string())?
             {
                 return Err("host stop could not terminate the guest process cleanly".to_owned());
             }

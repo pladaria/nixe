@@ -22,7 +22,7 @@ pub use layout::{
     ProcessVirtualRegion,
 };
 pub use thread::{
-    GuestThread, MainThread, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadTable,
+    GuestThread, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadTable,
     ThreadTableError,
 };
 
@@ -210,14 +210,14 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub fn main_thread(&self) -> &crate::MainThread {
+    pub fn main_thread(&self) -> &crate::GuestThread {
         self.threads
             .get(self.main_thread_id)
             .expect("a runnable process always retains its main thread")
     }
 
     /// Returns mutable main-thread state for runtime scheduling and ABI setup.
-    pub fn main_thread_mut(&mut self) -> &mut crate::MainThread {
+    pub fn main_thread_mut(&mut self) -> &mut crate::GuestThread {
         self.threads
             .get_mut(self.main_thread_id)
             .expect("a runnable process always retains its main thread")
@@ -618,16 +618,6 @@ impl RunnableProcess {
                 fault: Box::new(fault),
             })?;
         Ok(report)
-    }
-
-    /// Migration compatibility wrapper. Applications should use
-    /// [`Self::try_teardown`] so engine quiescence failure remains observable.
-    #[must_use]
-    pub fn teardown(self) -> ProcessTeardownReport {
-        match self.try_teardown() {
-            Ok(report) => report,
-            Err(failure) => *failure.report,
-        }
     }
 
     pub(crate) fn request_execution_safepoint(&self) {

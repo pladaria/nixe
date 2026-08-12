@@ -126,9 +126,6 @@ impl GuestThread {
     }
 }
 
-/// Migration compatibility name. It is a view type, not separate storage.
-pub type MainThread = GuestThread;
-
 #[derive(Debug, Default)]
 pub struct ThreadTable {
     entries: BTreeMap<GuestThreadId, GuestThread>,

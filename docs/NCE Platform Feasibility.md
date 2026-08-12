@@ -7,8 +7,10 @@ This note records integration seams, not backend commitments. Nixe must probe
 each facility at runtime and expose an unavailable engine with a typed reason.
 No frontend may infer availability from the operating-system name or CPU ISA.
 Every backend remains behind `EngineProvider`, `EngineDomain`, and
-`NceExecutionDomain`; raw framework objects, file descriptors, and host pointers
-must not cross into runtime or scheduler code.
+`EngineExecutor`; raw framework objects, file descriptors, and host pointers
+must not cross into runtime or scheduler code. `DomainMemoryBinding` supplies
+the common mapping and retained-canonical-backing seam, so runtime never
+downcasts a domain or selects a native-specific path.
 
 ## Common requirements
 
@@ -49,8 +51,8 @@ and the
   execute simultaneously unless the canonical memory policy explicitly permits
   it; code mutation is reconciled through canonical generations.
 - Exits and interrupts: `hv_vcpu_run` updates the vCPU exit structure. The
-  backend translates exit reason and syndrome into `NceTrap`, and uses the
-  framework interrupt APIs only behind `inject_interrupt`.
+  backend translates exit reason and syndrome directly into `EngineExit` and
+  consumes interrupts through the common executor control path.
 - Supervisor: a minimal EL1 image must establish the EL0 address space, trap
   SVC and faults, virtualize timer state, and return a bounded exit record. Its
   ABI is backend-private and versioned with the backend.
@@ -77,9 +79,9 @@ minimum tested kernel version and UAPI headers in its crate.
   vCPUs and update memslots before acknowledging the generation. Dirty logging
   or an equivalent explicit reconciliation strategy is mandatory for writable
   mirrors and aliases.
-- Exits and interrupts: KVM run exits and Arm register ioctls map to `NceTrap`,
-  import/export, and interrupt injection. Unsupported or lossy register sets
-  reject the profile before execution.
+- Exits and interrupts: KVM run exits and Arm register ioctls map to canonical
+  `ThreadCpuState`, `EngineExit`, and the executor control path. Unsupported or
+  lossy register sets reject the profile before execution.
 - Executable memory and supervisor: KVM models guest-physical memory rather than
   the runtime's process permissions, so the backend-private EL1 supervisor must
   enforce guest stage-1 permissions and trap EL0 SVC/faults. Host W^X and
@@ -111,7 +113,7 @@ Versioned basis: Android Open Source Project
   pages and to import/export every thread register at instruction boundaries.
 - Traps and interrupts: the underlying KVM/crosvm stack has exits and vCPU
   control, but a usable public application API exposing the exact trap,
-  register, mapping, and interrupt operations required by `NceExecutionDomain`
+  register, mapping, and interrupt operations required by the common domain and executor contracts
   has not been established.
 - Executable memory and supervisor: any implementation would need a supported
   VM payload containing Nixe's supervisor and a lawful shared-memory protocol;
@@ -126,12 +128,12 @@ Versioned basis: Android Open Source Project
 | Platform operation                  | Common seam                                      |
 | ----------------------------------- | ------------------------------------------------ |
 | Host/device/entitlement probe       | `EngineProvider::probe` and rejection report     |
-| VM creation and destruction         | `create_domain` / `NceExecutionDomain::teardown` |
-| vCPU creation, migration, registers | `import_vcpu` / `export_vcpu`                    |
-| Map, unmap, protect                 | `bind_address_space` / `notify_mapping`          |
-| Dirty pages and invalidation        | `reconcile_dirty_memory` and handoff record      |
-| SVC, abort, timer, interrupt exit   | `NceTrap` / `normalize_trap`                     |
-| Virtual interrupt delivery          | `inject_interrupt`                               |
+| VM creation and destruction         | `create_domain` / `EngineDomain::shutdown`       |
+| vCPU creation, migration, registers | `create_executor` / canonical `RunRequest` state |
+| Map, unmap, protect                 | `DomainMemoryBinding` and executor synchronization |
+| Dirty pages and invalidation        | `synchronize_memory` and handoff record          |
+| SVC, abort, timer, interrupt exit   | normalized `EngineExit`                          |
+| Virtual interrupt delivery          | `EngineControl`                                  |
 | Stable stop boundary                | `quiesce` and `StateCommitBarrier`               |
 
 HVF and Linux KVM map to the common contracts without exposing backend handles.

@@ -310,9 +310,9 @@ impl RuntimeCoordinator {
         if self.execution_mode == VcpuExecutionMode::Parallel {
             let descriptor = process.engine_descriptor();
             let capabilities = descriptor.capabilities;
-            if !capabilities.concurrent_executors
-                || capabilities.max_safepoint_instructions.is_none()
-                || !capabilities.acknowledged_invalidation
+            let required = process.engine_requirements(true, self.vcpu_slots.len());
+            if !capabilities.contains(required)
+                || !capabilities.supports_profile(process.cpu_context().profile(), required)
             {
                 return Err(CoordinatorError::ParallelEngineUnsupported {
                     engine: descriptor.id,
@@ -393,6 +393,41 @@ impl RuntimeCoordinator {
         Ok(process)
     }
 
+    /// Terminates every thread in a registered process through the scheduler
+    /// and records a host-requested process exit without releasing resources.
+    pub fn terminate_process(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
+        if let Some(lease) = self
+            .in_flight
+            .values()
+            .find(|lease| lease.process == id)
+            .copied()
+        {
+            return Err(CoordinatorError::InFlightLease(lease));
+        }
+        let threads: Vec<_> = self
+            .processes
+            .get(&id)
+            .ok_or(CoordinatorError::UnknownProcess(id))?
+            .threads()
+            .iter()
+            .map(|(thread, _)| *thread)
+            .collect();
+        let terminated = self
+            .processes
+            .get_mut(&id)
+            .expect("the process was validated")
+            .terminate_from_host();
+        if terminated {
+            for thread in threads {
+                self.scheduler.apply(SchedulerCommand::Terminate {
+                    thread,
+                    faulted: false,
+                })?;
+            }
+        }
+        Ok(terminated)
+    }
+
     fn install_process_executors(
         &mut self,
         process_id: ProcessId,
@@ -403,6 +438,12 @@ impl RuntimeCoordinator {
             process: process_id,
             domain: process.engine_domain_id(),
         };
+        let fallback_key = process
+            .fallback_engine_domain_id()
+            .map(|domain| WorkerExecutorKey {
+                process: process_id,
+                domain,
+            });
         let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
         let mut installed = Vec::new();
         for vcpu in vcpus {
@@ -421,61 +462,79 @@ impl RuntimeCoordinator {
                 }
                 return Err(CoordinatorError::Worker(failure));
             }
-            installed.push(vcpu);
-        }
-        process.set_worker_executors_resident(true);
-        Ok(())
-    }
-
-    fn retire_process_executors(&mut self, process_id: ProcessId) -> Result<(), CoordinatorError> {
-        let domain = self
-            .processes
-            .get(&process_id)
-            .ok_or(CoordinatorError::UnknownProcess(process_id))?
-            .engine_domain_id();
-        let main_thread = self
-            .processes
-            .get(&process_id)
-            .expect("the process remains registered during executor retirement")
-            .main_thread_id();
-        let key = WorkerExecutorKey {
-            process: process_id,
-            domain,
-        };
-        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
-        let mut retired = Vec::new();
-        for vcpu in vcpus {
-            match self.workers.retire_executor(vcpu, key) {
-                Ok(()) => retired.push(vcpu),
-                Err(failure) => {
-                    for retired_vcpu in retired {
-                        let executor = self
-                            .processes
-                            .get_mut(&process_id)
-                            .expect("the process remains registered during rollback")
-                            .take_worker_executor(retired_vcpu)
-                            .map_err(|fault| CoordinatorError::Execution {
-                                process: process_id,
-                                thread: main_thread,
-                                error: ProcessExecutionError::Engine { fault },
-                            })?;
-                        self.workers
-                            .install_executor(retired_vcpu, key, executor)
-                            .map_err(CoordinatorError::Worker)?;
+            if let Some(fallback_key) = fallback_key {
+                let fallback = match process.take_worker_fallback_executor(vcpu) {
+                    Ok(Some(executor)) => executor,
+                    Ok(None) => unreachable!("a configured fallback domain creates executors"),
+                    Err(fault) => {
+                        if let Ok(executor) = self.workers.remove_executor(vcpu, key) {
+                            process.restore_worker_executor(vcpu, executor);
+                        }
+                        for installed_vcpu in installed {
+                            if let Ok(executor) =
+                                self.workers.remove_executor(installed_vcpu, fallback_key)
+                            {
+                                process.restore_worker_fallback_executor(installed_vcpu, executor);
+                            }
+                            if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key)
+                            {
+                                process.restore_worker_executor(installed_vcpu, executor);
+                            }
+                        }
+                        return Err(CoordinatorError::Execution {
+                            process: process_id,
+                            thread,
+                            error: ProcessExecutionError::Engine { fault },
+                        });
+                    }
+                };
+                if let Err(failure) = self.workers.install_executor(vcpu, fallback_key, fallback) {
+                    if let Ok(executor) = self.workers.remove_executor(vcpu, key) {
+                        process.restore_worker_executor(vcpu, executor);
+                    }
+                    for installed_vcpu in installed {
+                        if let Ok(executor) =
+                            self.workers.remove_executor(installed_vcpu, fallback_key)
+                        {
+                            process.restore_worker_fallback_executor(installed_vcpu, executor);
+                        }
+                        if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key) {
+                            process.restore_worker_executor(installed_vcpu, executor);
+                        }
                     }
                     return Err(CoordinatorError::Worker(failure));
                 }
             }
+            installed.push(vcpu);
         }
+        Ok(())
+    }
+
+    fn retire_process_executors(&mut self, process_id: ProcessId) -> Result<(), CoordinatorError> {
         self.processes
-            .get_mut(&process_id)
-            .expect("the process remains registered during executor retirement")
-            .set_worker_executors_resident(false);
+            .get(&process_id)
+            .ok_or(CoordinatorError::UnknownProcess(process_id))?;
+        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        for vcpu in vcpus {
+            if self
+                .workers
+                .retire_process(vcpu, process_id)
+                .map_err(CoordinatorError::Worker)?
+                == 0
+            {
+                return Err(CoordinatorError::Worker(
+                    WorkerFailure::ExecutorUnavailable {
+                        process: process_id,
+                        vcpu,
+                    },
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Failure-atomically switches a registered process to a replacement
-    /// engine domain while keeping both executor generations worker-resident.
+    /// engine domain while retaining the old executor generation for rollback.
     pub fn switch_process_engine(
         &mut self,
         process_id: ProcessId,
@@ -490,18 +549,26 @@ impl RuntimeCoordinator {
             return Err(CoordinatorError::InFlightLease(lease));
         }
         let descriptor = provider.descriptor();
-        if self.execution_mode == VcpuExecutionMode::Parallel {
-            let capabilities = descriptor.capabilities;
-            if !capabilities.concurrent_executors
-                || capabilities.max_safepoint_instructions.is_none()
-                || !capabilities.acknowledged_invalidation
-            {
-                return Err(CoordinatorError::ParallelEngineUnsupported {
-                    engine: descriptor.id,
-                });
-            }
-        }
         let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let process = self
+            .processes
+            .get(&process_id)
+            .ok_or(CoordinatorError::UnknownProcess(process_id))?;
+        let required = process.engine_requirements(
+            self.execution_mode == VcpuExecutionMode::Parallel,
+            vcpus.len(),
+        );
+        let report = provider.probe(process.cpu_context().profile(), required);
+        if !report.available
+            || report.descriptor != descriptor
+            || !descriptor.capabilities.is_coherent()
+            || !descriptor.capabilities.contains(required)
+            || !descriptor
+                .capabilities
+                .supports_profile(process.cpu_context().profile(), required)
+        {
+            return Err(CoordinatorError::EngineUnavailable(report));
+        }
         let old_domain = self
             .processes
             .get(&process_id)
@@ -513,6 +580,51 @@ impl RuntimeCoordinator {
             .expect("the process was validated")
             .prepare_engine_switch(vcpus.iter().copied(), provider)
             .map_err(CoordinatorError::Handoff)?;
+        let old_key = WorkerExecutorKey {
+            process: process_id,
+            domain: old_domain,
+        };
+        let mut old_executors = BTreeMap::new();
+        for vcpu in &vcpus {
+            match self.workers.remove_executor(*vcpu, old_key) {
+                Ok(executor) => {
+                    old_executors.insert(*vcpu, executor);
+                }
+                Err(failure) => {
+                    for (restored_vcpu, executor) in old_executors {
+                        self.workers
+                            .install_executor(restored_vcpu, old_key, executor)
+                            .map_err(CoordinatorError::Worker)?;
+                    }
+                    prepared.shutdown().map_err(|fault| {
+                        CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
+                            stage: nixe_cpu_engine::HandoffFailureStage::Commit,
+                            fault,
+                        })
+                    })?;
+                    return Err(CoordinatorError::Worker(failure));
+                }
+            }
+        }
+        if let Err(failure) = self
+            .processes
+            .get_mut(&process_id)
+            .expect("the process remains registered during handoff")
+            .complete_engine_switch(&mut prepared)
+        {
+            for (vcpu, executor) in old_executors {
+                self.workers
+                    .install_executor(vcpu, old_key, executor)
+                    .map_err(CoordinatorError::Worker)?;
+            }
+            prepared.shutdown().map_err(|fault| {
+                CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
+                    stage: nixe_cpu_engine::HandoffFailureStage::Commit,
+                    fault,
+                })
+            })?;
+            return Err(CoordinatorError::Handoff(failure));
+        }
         let new_key = WorkerExecutorKey {
             process: process_id,
             domain: prepared.domain_id(),
@@ -524,53 +636,49 @@ impl RuntimeCoordinator {
                 .expect("engine preparation creates one executor per active vCPU");
             if let Err(failure) = self.workers.install_executor(*vcpu, new_key, executor) {
                 for installed in installed_new {
-                    let _ = self.workers.retire_executor(installed, new_key);
+                    if let Ok(executor) = self.workers.remove_executor(installed, new_key) {
+                        prepared.restore_executor(installed, executor);
+                    }
+                }
+                prepared.shutdown().map_err(|fault| {
+                    CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
+                        stage: nixe_cpu_engine::HandoffFailureStage::Commit,
+                        fault,
+                    })
+                })?;
+                self.processes
+                    .get_mut(&process_id)
+                    .expect("the old process domain remains installed during rollback")
+                    .reactivate_engine_after_switch_failure()
+                    .map_err(|fault| {
+                        CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
+                            stage: nixe_cpu_engine::HandoffFailureStage::Commit,
+                            fault,
+                        })
+                    })?;
+                for (old_vcpu, old_executor) in old_executors {
+                    self.workers
+                        .install_executor(old_vcpu, old_key, old_executor)
+                        .map_err(CoordinatorError::Worker)?;
                 }
                 return Err(CoordinatorError::Worker(failure));
             }
             installed_new.push(*vcpu);
         }
-
-        let old_key = WorkerExecutorKey {
-            process: process_id,
-            domain: old_domain,
-        };
-        let mut retired_old = Vec::new();
-        for vcpu in &vcpus {
-            if let Err(failure) = self.workers.retire_executor(*vcpu, old_key) {
-                for installed in installed_new {
-                    let _ = self.workers.retire_executor(installed, new_key);
-                }
-                for retired in retired_old {
-                    let executor = self
-                        .processes
-                        .get_mut(&process_id)
-                        .expect("the old domain remains installed during rollback")
-                        .take_worker_executor(retired)
-                        .map_err(|fault| {
-                            CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
-                                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                                fault,
-                            })
-                        })?;
-                    self.workers
-                        .install_executor(retired, old_key, executor)
-                        .map_err(CoordinatorError::Worker)?;
-                }
-                return Err(CoordinatorError::Worker(failure));
-            }
-            retired_old.push(*vcpu);
-        }
+        drop(old_executors);
         let (barrier, old_domain) = self
             .processes
             .get_mut(&process_id)
             .expect("the process remains registered through handoff commit")
             .commit_engine_switch(prepared);
-        drop(old_domain);
+        let mut old_domain = old_domain;
+        if let Err(fault) = old_domain.shutdown() {
+            return Err(CoordinatorError::CommittedHandoffTeardown { barrier, fault });
+        }
         Ok(barrier)
     }
 
-    /// Synchronizes a compatibility API which resumed one waiting thread.
+    /// Makes one waiting guest thread ready in both scheduler and process state.
     pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
         let view = self
             .scheduler
@@ -725,6 +833,7 @@ pub enum CoordinatorError {
     ParallelEngineUnsupported {
         engine: nixe_cpu_engine::EngineId,
     },
+    EngineUnavailable(nixe_cpu_engine::CapabilityReport),
     ShutdownWithOutstandingLease(Lease),
     ReplayRequiresDeterministicMode,
     ReplayIncomplete {
@@ -738,6 +847,12 @@ pub enum CoordinatorError {
     },
     ReplayMismatch(crate::ReplayMismatch),
     Handoff(nixe_cpu_engine::HandoffFailure),
+    /// The replacement is active and canonical, but the retired domain failed
+    /// to release all of its backend resources.
+    CommittedHandoffTeardown {
+        barrier: nixe_cpu_engine::StateCommitBarrier,
+        fault: nixe_cpu_engine::EngineFault,
+    },
 }
 
 impl From<crate::ThreadTableError> for CoordinatorError {
@@ -826,6 +941,7 @@ fn completion_for_stop(stop: &ExecutionStop) -> Completion {
 
 fn recorded_stop(stop: &ExecutionStop) -> crate::RecordedStop {
     match stop {
+        ExecutionStop::InterpretOne { .. } => crate::RecordedStop::InterpretOne,
         ExecutionStop::BudgetExhausted => crate::RecordedStop::BudgetExhausted,
         ExecutionStop::Safepoint => crate::RecordedStop::Safepoint,
         ExecutionStop::PendingEvent { .. } => crate::RecordedStop::PendingEvent,

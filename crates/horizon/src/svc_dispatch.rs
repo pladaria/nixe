@@ -423,14 +423,14 @@ struct PendingThreadWake {
     deadline: Option<u64>,
 }
 
-/// Compatibility view used by direct, non-coordinator dispatch tests.
+/// Read-only diagnostic view of one Horizon wait staged for coordinator registration.
 #[derive(Clone, Debug)]
-pub struct ThreadWakeSource {
+pub struct PendingThreadWait {
     event: ReadableEventObject,
     timeout: Option<Duration>,
 }
 
-impl ThreadWakeSource {
+impl PendingThreadWait {
     #[must_use]
     pub fn event(&self) -> ReadableEventObject {
         self.event.clone()
@@ -546,11 +546,11 @@ impl HorizonSvcDispatcher {
         Some((wait.events, timeout))
     }
 
-    /// Compatibility accessor for the deprecated direct process runner.
+    /// Returns the staged wait that the coordinator will consume for a thread.
     #[must_use]
-    pub fn thread_wakeup_source(&self, thread_id: u64) -> Option<ThreadWakeSource> {
+    pub fn pending_thread_wait(&self, thread_id: u64) -> Option<PendingThreadWait> {
         self.pending_wakes.get(&thread_id).and_then(|wait| {
-            wait.events.first().cloned().map(|event| ThreadWakeSource {
+            wait.events.first().cloned().map(|event| PendingThreadWait {
                 event,
                 timeout: wait.deadline.map(|deadline| {
                     Duration::from_nanos(deadline.saturating_sub(self.virtual_time_ns()))

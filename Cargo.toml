@@ -5,6 +5,7 @@ members = [
     "crates/cpu",
     "crates/cpu-engine",
     "crates/cpu-engine-interpreter",
+    "crates/cpu-engine-testkit",
     "crates/gpu",
     "crates/gpu-headless",
     "crates/gpu-maxwell",
@@ -54,6 +55,7 @@ nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
 nixe-cpu-engine = { path = "crates/cpu-engine" }
 nixe-cpu-engine-interpreter = { path = "crates/cpu-engine-interpreter" }
+nixe-cpu-engine-testkit = { path = "crates/cpu-engine-testkit" }
 nixe-gpu = { path = "crates/gpu" }
 nixe-gpu-headless = { path = "crates/gpu-headless" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }

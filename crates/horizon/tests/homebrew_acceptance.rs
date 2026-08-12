@@ -14,6 +14,11 @@ use nixe_runtime::{
     ProcessExecutionStatus, ProcessExitCause,
 };
 
+use support::ScheduledProcess;
+
+#[allow(dead_code)]
+mod support;
+
 fn reference_process_builder() -> ProcessBuilder {
     ProcessBuilder::default()
         .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
@@ -80,7 +85,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     )
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = reference_process_builder().build(&plan).unwrap();
+    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
         panic!("NRO must enter in A64 state")
     };
@@ -98,7 +103,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     );
 
     let mut dispatcher = HorizonSvcDispatcher::default();
-    let first = process.run_reference(16).unwrap();
+    let first = process.run_slice(16).unwrap();
     assert!(matches!(
         first.stop,
         ExecutionStop::SupervisorCall {
@@ -113,7 +118,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
         ExceptionHandlingResult::<HorizonSvcFault>::Resumed
     );
 
-    let second = process.run_reference(16).unwrap();
+    let second = process.run_slice(16).unwrap();
     assert!(matches!(
         second.stop,
         ExecutionStop::LoaderReturn { result_code: 0, .. }
@@ -151,10 +156,12 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
     fs::create_dir(sd_card.join("switch")).unwrap();
 
     let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
-    let mut process = reference_process_builder()
-        .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
-        .build(&plan)
-        .unwrap();
+    let mut process = ScheduledProcess::new(
+        reference_process_builder()
+            .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
+            .build(&plan)
+            .unwrap(),
+    );
     let fsp = process.connect_ipc_service(IpcService::FileSystem).unwrap();
     let IpcResponse::Handle(filesystem) = process
         .dispatch_ipc(fsp, IpcRequest::OpenSdCardFileSystem)
@@ -311,12 +318,12 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
 fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initialization() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = reference_process_builder().build(&plan).unwrap();
+    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mut executed = 0_u64;
 
     loop {
-        let report = process.run_reference(512).unwrap();
+        let report = process.run_slice(512).unwrap();
         executed += report.instructions_executed;
         assert!(
             executed <= 100_000,
@@ -373,7 +380,7 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
 fn libnx_hello_world_publishes_a_software_frame() {
     let path = asset("graphics/printing/hello-world/hello-world.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = reference_process_builder().build(&plan).unwrap();
+    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
     let mut dispatcher = HorizonSvcDispatcher::default();
     let mailbox = dispatcher.video_system().mailbox();
     let mut executed = 0_u64;
@@ -382,7 +389,7 @@ fn libnx_hello_world_publishes_a_software_frame() {
     while mailbox.statistics().published == 0 {
         elapsed += Duration::from_millis(1);
         dispatcher.advance_video(elapsed);
-        let report = process.run_reference(4_096).unwrap();
+        let report = process.run_slice(4_096).unwrap();
         executed += report.instructions_executed;
         assert!(
             executed <= 20_000_000,

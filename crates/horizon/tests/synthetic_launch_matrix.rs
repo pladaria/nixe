@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod support;
 
 use std::fs;
@@ -338,7 +339,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         u64::from(process.main_thread().handle)
     );
     exercise_read_only_ipc(&mut process);
-    let _ = process.teardown();
+    let _ = process.try_teardown().unwrap();
 }
 
 fn x(index: u8) -> nixe_cpu::state::a64::A64GeneralRegister {

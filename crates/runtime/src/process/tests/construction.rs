@@ -287,7 +287,7 @@ fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
     };
     state.write_x(A64Register::General(a64_register(0)), 0x1234_5678);
 
-    let report = process.run_reference(1).unwrap();
+    let report = process.run(1).unwrap();
 
     assert_eq!(report.instructions_executed, 1);
     assert_eq!(
@@ -328,13 +328,13 @@ fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
         })
     );
     assert!(matches!(
-        process.run_reference(1),
+        process.run(1),
         Err(ProcessExecutionError::NotRunnable {
             status: ProcessExecutionStatus::Exited,
             ..
         })
     ));
-    let teardown = process.teardown();
+    let teardown = process.try_teardown().unwrap();
     assert_eq!(teardown.exit.unwrap().exit_code, 0x1234_5678);
 }
 

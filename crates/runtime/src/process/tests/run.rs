@@ -6,7 +6,7 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     let mut process = reference_process_builder().build(&plan).unwrap();
     let entry = process.entry_module().entry_address();
 
-    let report = process.run_reference(1).unwrap();
+    let report = process.run(1).unwrap();
     assert_eq!(report.instructions_executed, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
@@ -52,7 +52,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     };
     state.write_x(A64Register::General(a64_register(0)), 0);
 
-    let first = process.run_reference(1).unwrap();
+    let first = process.run(1).unwrap();
     assert_eq!(first.instructions_executed, 1);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -61,7 +61,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
     assert_eq!(state.pc(), entry + 4);
 
-    let second = process.run_reference(1).unwrap();
+    let second = process.run(1).unwrap();
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -70,7 +70,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
     assert_eq!(state.pc(), entry + 8);
 
-    let svc = process.run_reference(1).unwrap();
+    let svc = process.run(1).unwrap();
     assert_eq!(svc.instructions_executed, 1);
     assert!(matches!(
         svc.stop,
@@ -98,7 +98,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
             .unwrap(),
         crate::ExceptionHandlingResult::Resumed
     );
-    let resumed = process.run_reference(1).unwrap();
+    let resumed = process.run(1).unwrap();
     assert_eq!(resumed.instructions_executed, 1);
     assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -130,10 +130,10 @@ fn fixed_virtual_timer_is_stable_across_reference_slices() {
         ],
     );
 
-    let first = process.run_reference(2).unwrap();
+    let first = process.run(2).unwrap();
     assert_eq!(first.instructions_executed, 2);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
-    let second = process.run_reference(1).unwrap();
+    let second = process.run(1).unwrap();
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
 
@@ -185,7 +185,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
         .unwrap();
 
     assert_eq!(
-        process.run_reference(1).unwrap().stop,
+        process.run(1).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
@@ -194,7 +194,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     assert_eq!(state.read_w(A64Register::General(a64_register(0))), 7);
     state.write_x(A64Register::General(a64_register(0)), 9);
     assert_eq!(
-        process.run_reference(1).unwrap().stop,
+        process.run(1).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -219,7 +219,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     };
     state.set_pc(entry);
     assert_eq!(
-        process.run_reference(1).unwrap().stop,
+        process.run(1).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
     process
@@ -236,7 +236,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     };
     state.write_x(A64Register::General(a64_register(0)), 13);
     assert_eq!(
-        process.run_reference(1).unwrap().stop,
+        process.run(1).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -264,7 +264,7 @@ fn reference_execution_observes_safepoints_before_fetch() {
     let entry = process.entry_module().entry_address();
     process.request_safepoint();
 
-    let report = process.run_reference(10).unwrap();
+    let report = process.run(10).unwrap();
     assert_eq!(report.instructions_executed, 0);
     assert_eq!(report.stop, crate::ExecutionStop::Safepoint);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -281,13 +281,13 @@ fn reference_execution_observes_pending_events_before_fetch() {
     process.post_event(0b0001);
     process.post_event(0b0100);
 
-    let report = process.run_reference(10).unwrap();
+    let report = process.run(10).unwrap();
     assert_eq!(report.instructions_executed, 0);
     assert_eq!(
         report.stop,
         crate::ExecutionStop::PendingEvent { mask: 0b0101 }
     );
-    let next = process.run_reference(1).unwrap();
+    let next = process.run(1).unwrap();
     assert_eq!(next.instructions_executed, 1);
     assert_eq!(next.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -305,7 +305,7 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     };
     state.set_pc(0x1000);
 
-    let report = process.run_reference(1).unwrap();
+    let report = process.run(1).unwrap();
     assert_eq!(report.instructions_executed, 0);
     assert!(matches!(
         report.stop,
@@ -327,7 +327,7 @@ fn unallocated_encoding_suspends_until_runtime_resumes_thread() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
 
-    let report = process.run_reference(2).unwrap();
+    let report = process.run(2).unwrap();
     assert!(matches!(
         report.stop,
         crate::ExecutionStop::UnallocatedEncoding { .. }
@@ -337,13 +337,13 @@ fn unallocated_encoding_suspends_until_runtime_resumes_thread() {
         crate::ProcessExecutionStatus::Suspended
     );
     assert!(matches!(
-        process.run_reference(1),
+        process.run(1),
         Err(crate::ProcessExecutionError::NotRunnable {
             status: crate::ProcessExecutionStatus::Suspended,
             ..
         })
     ));
-    assert!(process.resume());
+    assert!(process.resume_thread(process.main_thread_id()));
     assert_eq!(
         process.execution_status(),
         crate::ProcessExecutionStatus::Ready
@@ -356,7 +356,7 @@ fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() 
 
     let mut unsupported = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut unsupported, 0xd503_205f); // WFE
-    let report = unsupported.run_reference(1).unwrap();
+    let report = unsupported.run(1).unwrap();
     assert!(matches!(
         report.stop,
         crate::ExecutionStop::UnsupportedSemantics { .. }
@@ -375,7 +375,7 @@ fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() 
         .build(&plan)
         .unwrap();
     replace_entry_instruction(&mut profile_disabled, 0x4e22_1c20);
-    let report = profile_disabled.run_reference(1).unwrap();
+    let report = profile_disabled.run(1).unwrap();
     assert_eq!(
         report.stop.exception_dispatch_request().unwrap().kind(),
         nixe_cpu::exception::ExceptionKind::UndefinedInstruction
@@ -388,7 +388,7 @@ fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() 
 
     let mut unallocated = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut unallocated, 0);
-    let report = unallocated.run_reference(1).unwrap();
+    let report = unallocated.run(1).unwrap();
     assert_eq!(
         report.stop.exception_dispatch_request().unwrap().kind(),
         nixe_cpu::exception::ExceptionKind::UndefinedInstruction
@@ -406,7 +406,7 @@ fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
 
     let mut svc = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut svc, 0xd400_0841); // SVC #0x42
-    let report = svc.run_reference(1).unwrap();
+    let report = svc.run(1).unwrap();
     let dispatch = report.stop.exception_dispatch_request().unwrap();
     assert_eq!(
         dispatch.kind(),
@@ -424,7 +424,7 @@ fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
 
     let mut breakpoint = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut breakpoint, 0xd420_2460); // BRK #0x123
-    let report = breakpoint.run_reference(1).unwrap();
+    let report = breakpoint.run(1).unwrap();
     let dispatch = report.stop.exception_dispatch_request().unwrap();
     assert_eq!(
         dispatch.kind(),
@@ -450,7 +450,7 @@ fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
         nixe_cpu::state::a64::A64Register::General(a64_register(1)),
         0x1000,
     );
-    let report = data_fault.run_reference(1).unwrap();
+    let report = data_fault.run(1).unwrap();
     assert_eq!(
         report.stop.exception_dispatch_request().unwrap().kind(),
         nixe_cpu::exception::ExceptionKind::DataAbort

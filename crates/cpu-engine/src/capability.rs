@@ -1,8 +1,9 @@
 //! Host discovery and engine capability declarations.
 
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 
-use nixe_cpu::profile::CpuProfileId;
+use nixe_cpu::location::ExecutionState;
+use nixe_cpu::profile::GuestCpuProfile;
 
 use crate::EngineId;
 
@@ -10,6 +11,7 @@ use crate::EngineId;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EngineKind {
     Interpreter,
+    BlockJit,
     NativeCodeExecution,
     Test,
 }
@@ -56,6 +58,9 @@ pub struct EngineCapabilities {
     pub t32: bool,
     pub precise_instruction_budget: bool,
     pub instruction_trace: bool,
+    /// The engine can stop at a canonical boundary and request that the
+    /// reference engine execute exactly one guest instruction.
+    pub interpret_one_fallback: bool,
     pub native_execution: bool,
     /// Distinct executors may run concurrently without sharing mutable state.
     pub concurrent_executors: bool,
@@ -64,13 +69,36 @@ pub struct EngineCapabilities {
     pub max_safepoint_instructions: Option<NonZeroU64>,
     /// Mapping and code invalidation epochs are acknowledged before reuse.
     pub acknowledged_invalidation: bool,
+    /// Portable canonical-state ABI implemented by the provider. Zero means
+    /// that no interchange contract is advertised.
+    pub canonical_state_version: u16,
+    pub deterministic_execution: bool,
+    pub precise_exceptions: bool,
+    pub engine_handoff: bool,
+    /// The domain can bind retained canonical backing ranges for native access.
+    pub canonical_memory_binding: bool,
+    /// Finite executor limit. `None` is unbounded when concurrency is offered.
+    pub max_concurrent_executors: Option<NonZeroUsize>,
 }
 
 impl EngineCapabilities {
     #[must_use]
-    pub const fn supports_profile(self, profile: CpuProfileId) -> bool {
-        let _ = profile;
-        self.a64
+    pub const fn supports_profile(self, profile: GuestCpuProfile, required: Self) -> bool {
+        (!required.a64
+            || (self.a64
+                && profile
+                    .allowed_execution_states()
+                    .contains(ExecutionState::A64)))
+            && (!required.a32
+                || (self.a32
+                    && profile
+                        .allowed_execution_states()
+                        .contains(ExecutionState::A32)))
+            && (!required.t32
+                || (self.t32
+                    && profile
+                        .allowed_execution_states()
+                        .contains(ExecutionState::T32)))
     }
 
     #[must_use]
@@ -80,6 +108,7 @@ impl EngineCapabilities {
             && (!required.t32 || self.t32)
             && (!required.precise_instruction_budget || self.precise_instruction_budget)
             && (!required.instruction_trace || self.instruction_trace)
+            && (!required.interpret_one_fallback || self.interpret_one_fallback)
             && (!required.native_execution || self.native_execution)
             && (!required.concurrent_executors || self.concurrent_executors)
             && match (
@@ -91,6 +120,18 @@ impl EngineCapabilities {
                 (None, Some(_)) => false,
             }
             && (!required.acknowledged_invalidation || self.acknowledged_invalidation)
+            && self.canonical_state_version >= required.canonical_state_version
+            && (!required.deterministic_execution || self.deterministic_execution)
+            && (!required.precise_exceptions || self.precise_exceptions)
+            && (!required.engine_handoff || self.engine_handoff)
+            && (!required.canonical_memory_binding || self.canonical_memory_binding)
+            && match (
+                self.max_concurrent_executors,
+                required.max_concurrent_executors,
+            ) {
+                (_, None) | (None, Some(_)) => true,
+                (Some(offered), Some(required)) => offered.get() >= required.get(),
+            }
     }
 
     /// Whether a parallel runtime must retain an out-of-band control path for
@@ -100,6 +141,16 @@ impl EngineCapabilities {
         self.concurrent_executors
             || self.max_safepoint_instructions.is_some()
             || self.acknowledged_invalidation
+    }
+
+    /// Rejects combinations which cannot satisfy the common runtime contract,
+    /// independently of a particular guest request.
+    #[must_use]
+    pub const fn is_coherent(self) -> bool {
+        (!self.native_execution
+            || (self.canonical_memory_binding && self.acknowledged_invalidation))
+            && (!self.engine_handoff || self.canonical_state_version != 0)
+            && (!self.concurrent_executors || self.max_safepoint_instructions.is_some())
     }
 }
 

@@ -41,12 +41,14 @@ pub use object::{
     SystemClockSession, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
     TimeZoneServiceSession,
 };
-pub use scheduler_profile::switch_1_scheduler_profile;
+pub use scheduler_profile::{
+    HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,
+};
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,
 };
 pub use svc_dispatch::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult,
     HorizonScheduledDispatchError, HorizonSvcCoverageEntry, HorizonSvcDispatcher, HorizonSvcFault,
-    HorizonSvcSupport, MAX_WAIT_HANDLES,
+    HorizonSvcSupport, MAX_WAIT_HANDLES, PendingThreadWait,
 };
