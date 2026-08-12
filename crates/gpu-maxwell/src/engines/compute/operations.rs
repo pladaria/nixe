@@ -11,6 +11,9 @@ pub struct MaxwellComputeShaderCacheInvalidation {
     constant: bool,
 }
 
+/// Engine-independent name for the identical Maxwell shader-cache selectors.
+pub type MaxwellShaderCacheInvalidation = MaxwellComputeShaderCacheInvalidation;
+
 impl MaxwellComputeShaderCacheInvalidation {
     pub(crate) const fn new(instruction: bool, global_data: bool, constant: bool) -> Self {
         Self {

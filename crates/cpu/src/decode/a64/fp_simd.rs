@@ -11,10 +11,22 @@ const SIMD_FP16: &[InstructionFeature] =
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
         "simd-duplicate-general",
-        0xbf20_fc00,
+        0xbfe0_fc00,
         0x0e00_0c00,
         0x0000_0048,
         130,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 DUP (element) broadcasts one selected vector element across all
+    // active destination lanes. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/DUP--element---Duplicate-vector-element-to-vector-or-scalar-
+    pattern(
+        "simd-duplicate-element",
+        0xbfe0_fc00,
+        0x0e00_0400,
+        0x0000_008c,
+        174,
         &[],
         SIMD,
     ),
@@ -295,12 +307,66 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     pattern(
         "fp-scalar-move",
-        0xff3f_fc00,
+        0xffbf_fc00,
         0x1e20_4000,
         0x0000_0035,
         109,
         &[],
         SIMD,
+    ),
+    // Arm A64 FMOV (register), optional half-precision form. The base S/D
+    // forms above remain available with Advanced SIMD while H is explicitly
+    // gated by FEAT_FP16. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
+    pattern(
+        "fp-scalar-move-half",
+        0xffff_fc00,
+        0x1ee0_4000,
+        0x0000_0089,
+        110,
+        &[],
+        SIMD_FP16,
+    ),
+    // Arm A64 FABS/FNEG (scalar) only transform the sign bit. Base S/D and
+    // optional FP16 forms are kept as distinct feature-gated patterns. Arm ARM
+    // DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FABS--scalar---Floating-point-Absolute-value--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNEG--scalar---Floating-point-Negate--scalar--
+    pattern(
+        "fp-scalar-absolute",
+        0xffbf_fc00,
+        0x1e20_c000,
+        0x0000_008d,
+        175,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-negate",
+        0xffbf_fc00,
+        0x1e21_4000,
+        0x0000_008e,
+        175,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-scalar-absolute-half",
+        0xffff_fc00,
+        0x1ee0_c000,
+        0x0000_008f,
+        176,
+        &[],
+        SIMD_FP16,
+    ),
+    pattern(
+        "fp-scalar-negate-half",
+        0xffff_fc00,
+        0x1ee1_4000,
+        0x0000_0090,
+        176,
+        &[],
+        SIMD_FP16,
     ),
     pattern(
         "fp-compare-register",
@@ -332,6 +398,20 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0f00_0400,
         0x0000_004a,
         132,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FMOV (vector, immediate). This is the floating-point subfamily
+    // of the Advanced SIMD modified-immediate encoding: 2S/4S use a 32-bit
+    // VFP immediate and 2D uses a 64-bit VFP immediate. Arm ARM DDI 0602
+    // (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--vector--immediate---Floating-point-Move-immediate--vector--
+    pattern(
+        "simd-floating-point-immediate",
+        0x9ff8_fc00,
+        0x0f00_f400,
+        0x0000_0086,
+        201,
         &[],
         SIMD,
     ),
@@ -409,6 +489,66 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 SSHR/USHR shift each signed or unsigned lane right by an
+    // immediate in the range 1..=element size. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHR--Signed-shift-right--immediate--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHR--Unsigned-shift-right--immediate--
+    pattern(
+        "simd-scalar-shift-right-immediate",
+        0xdf80_fc00,
+        0x5f00_0400,
+        0x0000_0091,
+        203,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-vector-shift-right-immediate",
+        0x9f80_fc00,
+        0x0f00_0400,
+        0x0000_0092,
+        202,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 CNT computes the population count of each byte in a 64-bit or
+    // 128-bit vector independently. Arm A64 ISA (2025):
+    // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85
+    pattern(
+        "simd-count-bits",
+        0xbfff_fc00,
+        0x0e20_5800,
+        0x0000_0093,
+        204,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 ADDV adds every active vector element and writes the modular
+    // scalar result while clearing the remaining destination bits. Arm ARM
+    // DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDV--Add-across-vector-
+    pattern(
+        "simd-add-across-vector",
+        0xbf3f_fc00,
+        0x0e31_b800,
+        0x0000_0094,
+        205,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 XTN/XTN2 extract the low half of every source element into the
+    // lower or upper 64-bit half of the destination, respectively. Arm ARM
+    // DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/XTN--XTN2--Extract-Narrow--vector--
+    pattern(
+        "simd-extract-narrow",
+        0xbf3f_fc00,
+        0x0e21_2800,
+        0x0000_0088,
+        172,
+        &[],
+        SIMD,
+    ),
     // Arm A64 Advanced SIMD load/store multiple structures allocation and
     // operation, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--multiple-structures---Load-multiple-single-element-structures-to-one--two--three--or-four-registers-
@@ -472,6 +612,29 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x2e21_d800,
         0x0000_006b,
         160,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 SCVTF/UCVTF (scalar, SIMD register), base single/double
+    // precision forms. These consume the low integer element of Vn and write
+    // the converted scalar to Vd. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--scalar---Signed-integer-Convert-to-Floating-point--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--scalar---Unsigned-integer-Convert-to-Floating-point--scalar--
+    pattern(
+        "simd-scalar-signed-int-to-float",
+        0xffbf_fc00,
+        0x5e21_d800,
+        0x0000_008a,
+        173,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-scalar-unsigned-int-to-float",
+        0xffbf_fc00,
+        0x7e21_d800,
+        0x0000_008b,
+        173,
         &[],
         SIMD,
     ),
@@ -586,6 +749,20 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x1e20_8800,
         0x0000_007c,
         169,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FCSEL (scalar), base single/double precision forms. FCSEL is a
+    // bitwise choice between scalar register contents and does not process the
+    // selected value as floating point. Optional half precision remains behind
+    // the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCSEL--Floating-point-Conditional-Select--scalar--
+    pattern(
+        "fp-scalar-floating-point-conditional-select",
+        0xffa0_0c00,
+        0x1e20_0c00,
+        0x0000_0087,
+        170,
         &[],
         SIMD,
     ),
@@ -897,6 +1074,7 @@ pub struct Operands {
     pub signaling_compare: bool,
     pub operation_bit: bool,
     pub immediate_4: u8,
+    pub condition: u8,
     pub element_size: u8,
     pub fp_immediate_8: u8,
     pub float_conversion: Option<FloatConversion>,
@@ -1003,11 +1181,14 @@ macro_rules! instructions {
 
 instructions!(
     DuplicateGeneral,
+    DuplicateElement,
     MemoryPair,
     Bitwise,
     Integer,
     ScalarTwoSource,
     ScalarMove,
+    ScalarAbsolute,
+    ScalarNegate,
     CompareRegister,
     CompareZero,
     ModifiedImmediate,
@@ -1036,15 +1217,24 @@ instructions!(
     IntegerPairwise,
     IntegerMinMax,
     ShiftRightNarrow,
+    ScalarShiftRightImmediate,
+    VectorShiftRightImmediate,
+    CountBits,
+    AddAcrossVector,
+    ExtractNarrow,
     VectorSignedIntToFloat,
     VectorUnsignedIntToFloat,
+    ScalarVectorSignedIntToFloat,
+    ScalarVectorUnsignedIntToFloat,
     VectorFloatDivide,
+    VectorFloatImmediate,
     ScalarFloatImmediate,
     ScalarFloatConvert,
     ScalarFloatDivide,
     ScalarFloatRound,
     ScalarFloatAdd,
     ScalarFloatMultiply,
+    ScalarFloatConditionalSelect,
 );
 
 pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
@@ -1085,6 +1275,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         signaling_compare: bits & (1 << 4) != 0,
         operation_bit: bits & (1 << 29) != 0,
         immediate_4: ((bits >> 11) & 0xf) as u8,
+        condition: ((bits >> 12) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
         fp_immediate_8: ((bits >> 13) & 0xff) as u8,
         float_conversion: match semantic_id {
@@ -1123,11 +1314,14 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
+        0x0000_008c => Instruction::DuplicateElement(operands),
         0x0000_0049 => Instruction::MemoryPair(operands),
         0x0000_0030 => Instruction::Bitwise(operands),
         0x0000_0031 => Instruction::Integer(operands),
         0x0000_0032 => Instruction::ScalarTwoSource(operands),
-        0x0000_0035 => Instruction::ScalarMove(operands),
+        0x0000_0035 | 0x0000_0089 => Instruction::ScalarMove(operands),
+        0x0000_008d | 0x0000_008f => Instruction::ScalarAbsolute(operands),
+        0x0000_008e | 0x0000_0090 => Instruction::ScalarNegate(operands),
         0x0000_0036 => Instruction::CompareRegister(operands),
         0x0000_0037 => Instruction::CompareZero(operands),
         0x0000_004a => Instruction::ModifiedImmediate(operands),
@@ -1159,16 +1353,25 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_004e..=0x0000_0058 => Instruction::IntegerCompare(operands),
         0x0000_0059..=0x0000_005d => Instruction::IntegerPairwise(operands),
         0x0000_0065 => Instruction::ShiftRightNarrow(operands),
+        0x0000_0091 => Instruction::ScalarShiftRightImmediate(operands),
+        0x0000_0092 => Instruction::VectorShiftRightImmediate(operands),
+        0x0000_0093 => Instruction::CountBits(operands),
+        0x0000_0094 => Instruction::AddAcrossVector(operands),
+        0x0000_0088 => Instruction::ExtractNarrow(operands),
         0x0000_0066..=0x0000_0069 => Instruction::IntegerMinMax(operands),
         0x0000_006a => Instruction::VectorSignedIntToFloat(operands),
         0x0000_006b => Instruction::VectorUnsignedIntToFloat(operands),
+        0x0000_008a => Instruction::ScalarVectorSignedIntToFloat(operands),
+        0x0000_008b => Instruction::ScalarVectorUnsignedIntToFloat(operands),
         0x0000_006c => Instruction::VectorFloatDivide(operands),
+        0x0000_0086 => Instruction::VectorFloatImmediate(operands),
         0x0000_006d..=0x0000_006e => Instruction::ScalarFloatImmediate(operands),
         0x0000_006f..=0x0000_0070 => Instruction::ScalarFloatConvert(operands),
         0x0000_0071 => Instruction::ScalarFloatDivide(operands),
         0x0000_0072..=0x0000_0078 => Instruction::ScalarFloatRound(operands),
         0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
         0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
+        0x0000_0087 => Instruction::ScalarFloatConditionalSelect(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
     }
 }

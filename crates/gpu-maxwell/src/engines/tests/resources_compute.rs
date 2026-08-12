@@ -2475,6 +2475,144 @@ fn three_d_flush_and_syncpoint_increment_are_ordered_completion_operations() {
 }
 
 #[test]
+fn three_d_texture_cache_invalidation_preserves_scope_without_waiting_for_idle() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let three_d_before = channel.three_d().clone();
+    let tag = 0x002a_55aa;
+    let invalidations = non_incrementing_packet_on_subchannel(0, 0x1288 / 4, &[0, (tag << 4) | 1]);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &invalidations.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(dispatch.synchronization_operations().len(), 2);
+    for (index, expected_lines) in [
+        MaxwellThreeDTextureCacheLines::All,
+        MaxwellThreeDTextureCacheLines::One,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            dispatch.methods()[index].metadata().method_name(),
+            "INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI"
+        );
+        let operation = &dispatch.synchronization_operations()[index];
+        let expected_tag = if index == 0 { 0 } else { tag };
+        assert!(matches!(
+            operation.trigger(),
+            MaxwellThreeDSynchronizationTrigger::InvalidateTextureDataCacheNoWfi {
+                request,
+                source,
+            } if request.lines() == expected_lines
+                && request.tag() == expected_tag
+                && source.method() == GpuMethodId(0x1288)
+        ));
+        assert_eq!(operation.state(), &three_d_before);
+        assert_eq!(
+            lower_maxwell_three_d_synchronization(operation, None),
+            Ok(
+                MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi {
+                    request: MaxwellThreeDTextureDataCacheInvalidation::new(
+                        expected_lines,
+                        expected_tag,
+                    ),
+                    maintenance: nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
+                }
+            )
+        );
+    }
+    assert_eq!(channel.three_d(), &three_d_before);
+
+    let before = channel.clone();
+    let invalid = non_incrementing_packet_on_subchannel(0, 0x1288 / 4, &[0, 1 << 1]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            source,
+            defined_mask: 0x03ff_fff1,
+            ..
+        }) if source.argument() == 1 << 1
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
+fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let three_d_before = channel.three_d().clone();
+    let arguments = [0, 1, 0x10, 0x11, 0x1000, 0x1001, 0x1010, 0x1011];
+    let invalidations = non_incrementing_packet_on_subchannel(0, 0x0da4 / 4, &arguments);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &invalidations.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(dispatch.synchronization_operations().len(), arguments.len());
+    for (index, argument) in arguments.into_iter().enumerate() {
+        assert_eq!(
+            dispatch.methods()[index].metadata().method_name(),
+            "INVALIDATE_SHADER_CACHES_NO_WFI"
+        );
+        let expected = MaxwellShaderCacheInvalidation::new(
+            argument & 1 != 0,
+            argument & 0x10 != 0,
+            argument & 0x1000 != 0,
+        );
+        let operation = &dispatch.synchronization_operations()[index];
+        assert!(matches!(
+            operation.trigger(),
+            MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi {
+                caches,
+                source,
+            } if caches == expected
+                && source.argument() == argument
+                && source.method() == GpuMethodId(0x0da4)
+        ));
+        assert_eq!(
+            lower_maxwell_three_d_synchronization(operation, None),
+            Ok(
+                MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
+                    caches: expected,
+                    maintenance: nixe_gpu::CacheMaintenanceOperation::InvalidateShaderCaches {
+                        instruction: expected.instruction(),
+                        global_data: expected.global_data(),
+                        constant: expected.constant(),
+                    },
+                }
+            )
+        );
+    }
+    assert_eq!(channel.three_d(), &three_d_before);
+
+    let before = channel.clone();
+    let invalid = non_incrementing_packet_on_subchannel(0, 0x0da4 / 4, &[0x1011, 1 << 1]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            source,
+            defined_mask: 0x0000_1011,
+            ..
+        }) if source.argument() == 1 << 1
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
 fn three_d_completion_reserved_bits_reject_the_whole_packet_atomically() {
     let mut channel = channel();
     bind_three_d(&mut channel);

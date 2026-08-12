@@ -283,21 +283,23 @@ fn bitfield(state: &mut A64State, fields: Operands) -> bool {
         return false;
     };
     let source = read(state, fields.rn, bits, false);
+    let destination = read(state, fields.rd, bits, false);
     let rotated = rotate_right(
         u128::from(source),
         bit_width(fields),
         u32::from(fields.immediate_6_high),
     ) as u64;
     let bottom = match opcode {
-        1 => {
-            (read(state, fields.rd, bits, false) & !masks.write_mask) | (rotated & masks.write_mask)
-        }
+        1 => (destination & !masks.write_mask) | (rotated & masks.write_mask),
         _ => rotated & masks.write_mask,
     };
-    let top = if opcode == 0 && source & (1_u64 << fields.shift_amount) != 0 {
-        mask(fields)
-    } else {
-        0
+    // Arm ARM DDI 0602 (2024-09), "BFM, Bitfield move": BFM preserves
+    // destination bits outside the decoded test mask, unlike SBFM and UBFM.
+    // https://developer.arm.com/documentation/ddi0602/2024-09/Base-Instructions/BFM--Bitfield-move-
+    let top = match opcode {
+        0 if source & (1_u64 << fields.shift_amount) != 0 => mask(fields),
+        1 => destination,
+        _ => 0,
     };
     let result = ((top & !masks.test_mask) | (bottom & masks.test_mask)) & mask(fields);
     write(state, fields.rd, bits, false, result);
@@ -542,4 +544,66 @@ fn adr(state: &mut A64State, source: LocationDescriptor, fields: Operands, page:
     });
     write(state, fields.rd, 64, false, value);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+
+    use super::*;
+
+    fn register(index: u8) -> A64Register {
+        A64Register::General(A64GeneralRegister::new(index).unwrap())
+    }
+
+    fn bitfield_operands(encoding: u32) -> Operands {
+        Operands {
+            rd: (encoding & 0x1f) as u8,
+            rn: ((encoding >> 5) & 0x1f) as u8,
+            ra: 0,
+            rm: 0,
+            nzcv: 0,
+            condition: 0,
+            shift_amount: ((encoding >> 10) & 0x3f) as u8,
+            small_shift: 0,
+            shift_kind: 0,
+            immediate_6_high: ((encoding >> 16) & 0x3f) as u8,
+            immediate_12: 0,
+            immediate_16: 0,
+            extension: 0,
+            opcode_2: 0,
+            opcode_3: 0,
+            n: encoding & (1 << 22) != 0,
+            bit10: false,
+            invert: false,
+            immediate_form: false,
+            subtract_product: encoding & (1 << 15) != 0,
+            set_flags: encoding & (1 << 29) != 0,
+            subtract: encoding & (1 << 30) != 0,
+            width_64: encoding & (1 << 31) != 0,
+            adr_immediate: 0,
+        }
+    }
+
+    #[test]
+    fn bfi_preserves_destination_bits_outside_inserted_field() {
+        let mut state = A64State::default();
+        state.write_w(register(0), 0xa5a5_a5a5);
+        state.write_w(register(1), 0x0000_000f);
+
+        assert!(bitfield(&mut state, bitfield_operands(0x331b_0c20))); // BFI W0,W1,#5,#4
+
+        assert_eq!(state.read_w(register(0)), 0xa5a5_a5e5);
+    }
+
+    #[test]
+    fn bfxil_preserves_destination_bits_above_extracted_field() {
+        let mut state = A64State::default();
+        state.write_w(register(0), 0xdead_bee0);
+        state.write_w(register(1), 0x1234_567f);
+
+        assert!(bitfield(&mut state, bitfield_operands(0x3300_1020))); // BFXIL W0,W1,#0,#5
+
+        assert_eq!(state.read_w(register(0)), 0xdead_beff);
+    }
 }

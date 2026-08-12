@@ -17,6 +17,10 @@ use crate::{
 
 /// Byte address of the PBDMA SetObject host method.
 pub const MAXWELL_SET_OBJECT_METHOD: GpuMethodId = GpuMethodId(0);
+/// Byte address of the legacy channel `MEM_OP_A` host method accepted by GM20B.
+pub const MAXWELL_LEGACY_MEM_OP_A_METHOD: GpuMethodId = GpuMethodId(0x28);
+/// Byte address of the legacy channel `MEM_OP_B` host method accepted by GM20B.
+pub const MAXWELL_LEGACY_MEM_OP_B_METHOD: GpuMethodId = GpuMethodId(0x2c);
 
 const HOST_METHOD_LIMIT: u32 = 0x100;
 const SET_OBJECT_CLASS_MASK: u32 = 0xffff;
@@ -24,6 +28,13 @@ const SET_OBJECT_ENGINE_SHIFT: u32 = 16;
 const SET_OBJECT_ENGINE_MASK: u32 = 0x1f;
 const SET_OBJECT_DEFINED_MASK: u32 =
     SET_OBJECT_CLASS_MASK | (SET_OBJECT_ENGINE_MASK << SET_OBJECT_ENGINE_SHIFT);
+const MEM_OP_A_DEFINED_MASK: u32 = 0xffff_fffc;
+const MEM_OP_B_OPERAND_HIGH_MASK: u32 = 0xff;
+const MEM_OP_B_OPERATION_SHIFT: u32 = 27;
+const MEM_OP_B_OPERATION_MASK: u32 = 0x1f << MEM_OP_B_OPERATION_SHIFT;
+const MEM_OP_B_DEFINED_MASK: u32 = MEM_OP_B_OPERATION_MASK | MEM_OP_B_OPERAND_HIGH_MASK;
+const MEM_OP_B_L2_SYSMEM_INVALIDATE: u8 = 0x0e;
+const MEM_OP_B_L2_FLUSH_DIRTY: u8 = 0x10;
 
 /// Complete pointer-free source of one expanded Maxwell method write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,10 +105,27 @@ pub enum MaxwellSetObjectTransition {
     Replaced { previous: GpuClassId },
 }
 
+/// Verified operation selected by a legacy channel `MEM_OP_B` write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellHostMemoryOperation {
+    /// Discard cached system-memory reads before later channel work proceeds.
+    L2SysmemInvalidate { operand_high: u8 },
+    /// Write back dirty device L2 data before later channel work proceeds.
+    L2FlushDirty { operand_high: u8 },
+}
+
+/// Source-preserving semantic kind of one implemented Maxwell host method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxwellHostMethod {
+    LegacyMemOpA { operand_low: u32 },
+    LegacyMemOpB(MaxwellHostMemoryOperation),
+}
+
 /// Semantic kind of a source-preserving method record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellMethodDispatchKind {
     SetObject(MaxwellSetObjectTransition),
+    HostMethod(MaxwellHostMethod),
     ClassMethod,
 }
 
@@ -204,6 +232,14 @@ pub enum MaxwellMethodDispatchError {
     UnsupportedHostMethod {
         source: MaxwellMethodSource,
     },
+    InvalidHostMethodValue {
+        source: MaxwellMethodSource,
+        defined_mask: u32,
+    },
+    UnsupportedHostMemoryOperation {
+        source: MaxwellMethodSource,
+        operation: u8,
+    },
     UnboundSubchannel {
         source: MaxwellMethodSource,
     },
@@ -263,6 +299,17 @@ impl Display for MaxwellMethodDispatchError {
                     "Maxwell host method semantics are unavailable: {source}"
                 )
             }
+            Self::InvalidHostMethodValue {
+                source,
+                defined_mask,
+            } => write!(
+                formatter,
+                "Maxwell host method argument sets bits outside its verified field mask: {source} defined-mask={defined_mask:#010x}"
+            ),
+            Self::UnsupportedHostMemoryOperation { source, operation } => write!(
+                formatter,
+                "Maxwell host memory-operation semantics are unavailable: {source} operation={operation:#04x}"
+            ),
             Self::UnboundSubchannel { source } => {
                 write!(
                     formatter,
@@ -433,6 +480,12 @@ fn preflight_method(
     if method.method() == MAXWELL_SET_OBJECT_METHOD {
         return preflight_set_object(profile, source, frontend);
     }
+    if method.method() == MAXWELL_LEGACY_MEM_OP_A_METHOD {
+        return preflight_legacy_mem_op_a(profile, source, frontend);
+    }
+    if method.method() == MAXWELL_LEGACY_MEM_OP_B_METHOD {
+        return preflight_legacy_mem_op_b(profile, source);
+    }
     if method.method().0 < HOST_METHOD_LIMIT {
         return Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source });
     }
@@ -443,6 +496,65 @@ fn preflight_method(
         source,
         class,
         kind: MaxwellMethodDispatchKind::ClassMethod,
+    })
+}
+
+fn preflight_legacy_mem_op_a(
+    profile: MaxwellGpuProfile,
+    source: MaxwellMethodSource,
+    frontend: &mut MaxwellChannelFrontendState,
+) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
+    // GM20B's B06F header moved these fields to MEM_OP_C/D, but Switch's
+    // captured Nouveau stream exercises the legacy A/B compatibility aperture.
+    // The field layouts are published in NVIDIA's A16F and B06F class headers:
+    // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.126.09/src/common/sdk/nvidia/inc/class/cla16f.h
+    // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.126.09/src/common/sdk/nvidia/inc/class/clb06f.h
+    if source.argument & !MEM_OP_A_DEFINED_MASK != 0 {
+        return Err(MaxwellMethodDispatchError::InvalidHostMethodValue {
+            source,
+            defined_mask: MEM_OP_A_DEFINED_MASK,
+        });
+    }
+    let operand_low = source.argument & MEM_OP_A_DEFINED_MASK;
+    frontend.set_legacy_mem_op_a(operand_low);
+    Ok(MaxwellMethodDispatch {
+        source,
+        class: profile.classes().gpfifo(),
+        kind: MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpA {
+            operand_low,
+        }),
+    })
+}
+
+fn preflight_legacy_mem_op_b(
+    profile: MaxwellGpuProfile,
+    source: MaxwellMethodSource,
+) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
+    if source.argument & !MEM_OP_B_DEFINED_MASK != 0 {
+        return Err(MaxwellMethodDispatchError::InvalidHostMethodValue {
+            source,
+            defined_mask: MEM_OP_B_DEFINED_MASK,
+        });
+    }
+    let operation = ((source.argument & MEM_OP_B_OPERATION_MASK) >> MEM_OP_B_OPERATION_SHIFT) as u8;
+    let operation = match operation {
+        MEM_OP_B_L2_SYSMEM_INVALIDATE => MaxwellHostMemoryOperation::L2SysmemInvalidate {
+            operand_high: (source.argument & MEM_OP_B_OPERAND_HIGH_MASK) as u8,
+        },
+        MEM_OP_B_L2_FLUSH_DIRTY => MaxwellHostMemoryOperation::L2FlushDirty {
+            operand_high: (source.argument & MEM_OP_B_OPERAND_HIGH_MASK) as u8,
+        },
+        operation => {
+            return Err(MaxwellMethodDispatchError::UnsupportedHostMemoryOperation {
+                source,
+                operation,
+            });
+        }
+    };
+    Ok(MaxwellMethodDispatch {
+        source,
+        class: profile.classes().gpfifo(),
+        kind: MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(operation)),
     })
 }
 
@@ -775,6 +887,117 @@ mod tests {
                 .subchannel_binding(MaxwellPushbufferSubchannel::try_new(0).unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn captured_legacy_mem_op_b_flushes_l2_without_a_subchannel_binding() {
+        let decoded = decode(&[word(0x2001_c00b, 0), word(0x8000_0000, 1)]);
+        let mut channel = channel();
+        let dispatched = dispatch_maxwell_packet(
+            &mut channel,
+            FrontendSubmissionId::new(11),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+
+        let method = dispatched.methods()[0];
+        assert_eq!(method.class(), SWITCH_1_GM20B_PROFILE.classes().gpfifo());
+        assert_eq!(method.source().subchannel().get(), 6);
+        assert_eq!(method.source().method(), MAXWELL_LEGACY_MEM_OP_B_METHOD);
+        assert_eq!(
+            method.kind(),
+            MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
+                MaxwellHostMemoryOperation::L2FlushDirty { operand_high: 0 },
+            ))
+        );
+        assert_eq!(
+            channel
+                .frontend()
+                .subchannel_binding(method.source().subchannel()),
+            None
+        );
+    }
+
+    #[test]
+    fn captured_legacy_mem_op_b_invalidates_stale_l2_system_memory_reads() {
+        let decoded = decode(&[word(0x2001_c00b, 0), word(0x7000_0000, 1)]);
+        let mut channel = channel();
+        let dispatched = dispatch_maxwell_packet(
+            &mut channel,
+            FrontendSubmissionId::new(11),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+
+        let method = dispatched.methods()[0];
+        assert_eq!(method.source().subchannel().get(), 6);
+        assert_eq!(method.source().method(), MAXWELL_LEGACY_MEM_OP_B_METHOD);
+        assert_eq!(
+            method.kind(),
+            MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
+                MaxwellHostMemoryOperation::L2SysmemInvalidate { operand_high: 0 },
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_mem_op_a_and_b_commit_atomically_and_preserve_operands() {
+        let decoded = decode(&[
+            word(header(1, 0x28 / 4, 6, 2), 0),
+            word(0x1234_5678, 1),
+            word(0x8000_00ab, 2),
+        ]);
+        let mut channel = channel();
+        let dispatched = dispatch_maxwell_packet(
+            &mut channel,
+            FrontendSubmissionId::new(11),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+
+        assert_eq!(channel.frontend().legacy_mem_op_a(), Some(0x1234_5678));
+        assert_eq!(
+            dispatched.methods()[0].kind(),
+            MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpA {
+                operand_low: 0x1234_5678,
+            })
+        );
+        assert_eq!(
+            dispatched.methods()[1].kind(),
+            MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::LegacyMemOpB(
+                MaxwellHostMemoryOperation::L2FlushDirty { operand_high: 0xab },
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_or_unsupported_legacy_mem_ops_reject_the_complete_packet() {
+        let invalid = decode(&[
+            word(header(1, 0x28 / 4, 6, 2), 0),
+            word(0x1234_5678, 1),
+            word(0x8000_0100, 2),
+        ]);
+        let mut channel = channel();
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &invalid.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::InvalidHostMethodValue { source, .. })
+                if source.location() == location(2)
+        ));
+        assert_eq!(channel.frontend().legacy_mem_op_a(), None);
+
+        let unsupported = decode(&[word(header(1, 0x2c / 4, 6, 1), 0), word(0x2800_0000, 1)]);
+        assert!(matches!(
+            dispatch_maxwell_packet(
+                &mut channel,
+                FrontendSubmissionId::new(11),
+                &unsupported.packets()[0]
+            ),
+            Err(MaxwellMethodDispatchError::UnsupportedHostMemoryOperation { operation: 5, .. })
+        ));
     }
 
     #[test]

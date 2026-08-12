@@ -20,7 +20,7 @@ pub use compute::{
     MaxwellComputeRegisterOrigin, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
     MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
-    lower_maxwell_compute_synchronization,
+    MaxwellShaderCacheInvalidation, lower_maxwell_compute_synchronization,
 };
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
@@ -86,6 +86,7 @@ pub use threed::{
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
     MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
     MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
+    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureDataCacheInvalidation,
     MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
     MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
@@ -119,9 +120,9 @@ use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
 use crate::{
     MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellDecodedPushbuffer, MaxwellGpuChannel,
-    MaxwellMethodDispatch, MaxwellMethodDispatchError, MaxwellMethodDispatchKind,
-    MaxwellMethodSource, MaxwellPacketDispatch, MaxwellShaderProgramHeaderVersionRange,
-    preflight_maxwell_packet,
+    MaxwellHostMemoryOperation, MaxwellHostMethod, MaxwellMethodDispatch,
+    MaxwellMethodDispatchError, MaxwellMethodDispatchKind, MaxwellMethodSource,
+    MaxwellPacketDispatch, MaxwellShaderProgramHeaderVersionRange, preflight_maxwell_packet,
 };
 
 /// Execution layer required by a known method whose semantics are unavailable.
@@ -200,6 +201,10 @@ pub enum MaxwellEngineMethodEffect {
         requested: MaxwellShaderProgramHeaderVersionRange,
         supported: MaxwellShaderProgramHeaderVersionRange,
     },
+    HostMemoryOperandLow {
+        operand_low: u32,
+    },
+    HostSynchronization(MaxwellHostMemoryOperation),
     TwoDState(MaxwellTwoDStateWrite),
     ComputeState(MaxwellComputeStateWrite),
     ComputeTrigger(MaxwellComputeOperationTrigger),
@@ -231,11 +236,31 @@ pub enum MaxwellEngineMethodEffect {
 /// One execution-relevant effect in exact pushbuffer order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellEngineOperation {
+    HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(Box<MaxwellThreeDTriggeredOperation>),
     ThreeDSynchronization(Box<MaxwellThreeDSynchronizationOperation>),
+}
+
+/// One validated host cache operation at its exact pushbuffer source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellHostSynchronizationOperation {
+    source: MaxwellMethodSource,
+    operation: MaxwellHostMemoryOperation,
+}
+
+impl MaxwellHostSynchronizationOperation {
+    #[must_use]
+    pub const fn source(self) -> MaxwellMethodSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn operation(self) -> MaxwellHostMemoryOperation {
+        self.operation
+    }
 }
 
 /// One named, validated class method ready for an atomic packet commit.
@@ -592,6 +617,23 @@ pub fn preflight_maxwell_engine_packet(
     let mut method_index = 0;
     while method_index < binding.methods().len() {
         let method = binding.methods()[method_index];
+        if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
+            let method = preflight_host_method(method, host);
+            if let MaxwellEngineMethodEffect::HostSynchronization(operation) = method.effect() {
+                ordered_operations
+                    .try_reserve(1)
+                    .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
+                ordered_operations.push(MaxwellEngineOperation::HostSynchronization(
+                    MaxwellHostSynchronizationOperation {
+                        source: method.method().source(),
+                        operation,
+                    },
+                ));
+            }
+            methods.push(method);
+            method_index += 1;
+            continue;
+        }
         if method.kind() == MaxwellMethodDispatchKind::ClassMethod
             && method.class() == threed::CLASS
             && threed::is_mme_aperture(method.source().method())
@@ -745,6 +787,34 @@ pub fn preflight_maxwell_engine_packet(
         synchronization_operations: synchronization_operations.into_boxed_slice(),
         operations: operations.into_boxed_slice(),
     })
+}
+
+fn preflight_host_method(
+    method: MaxwellMethodDispatch,
+    host: MaxwellHostMethod,
+) -> MaxwellEngineMethodDispatch {
+    match host {
+        MaxwellHostMethod::LegacyMemOpA { operand_low } => MaxwellEngineMethodDispatch::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A(legacy-host-compatibility)",
+                method.source().method(),
+                "MEM_OP_A",
+            ),
+            MaxwellEngineMethodEffect::HostMemoryOperandLow { operand_low },
+        ),
+        MaxwellHostMethod::LegacyMemOpB(operation) => MaxwellEngineMethodDispatch::new(
+            method,
+            MaxwellEngineMethodMetadata::new(
+                method.class(),
+                "MAXWELL_CHANNEL_GPFIFO_A(legacy-host-compatibility)",
+                method.source().method(),
+                "MEM_OP_B",
+            ),
+            MaxwellEngineMethodEffect::HostSynchronization(operation),
+        ),
+    }
 }
 
 /// Commits binding and engine state together after revalidating both snapshots.

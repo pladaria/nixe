@@ -52,6 +52,7 @@ pub use engines::{
     MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation, MaxwellEngineCapability,
     MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
     MaxwellEngineMethodMetadata, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
+    MaxwellHostSynchronizationOperation, MaxwellShaderCacheInvalidation,
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAttachmentReadiness, MaxwellThreeDAttributeDefaultVector,
     MaxwellThreeDAttributeDefaults, MaxwellThreeDBegin, MaxwellThreeDBindGroupState,
@@ -108,6 +109,7 @@ pub use engines::{
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
     MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
     MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
+    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureDataCacheInvalidation,
     MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders, MaxwellThreeDTriggeredOperation,
     MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
@@ -159,10 +161,11 @@ pub use profile::{
     ShaderVersion,
 };
 pub use pushbuffer::dispatch::{
-    MAXWELL_SET_OBJECT_METHOD, MaxwellMethodDispatch, MaxwellMethodDispatchError,
-    MaxwellMethodDispatchKind, MaxwellMethodSource, MaxwellPacketDispatch,
-    MaxwellSetObjectTransition, commit_maxwell_packet, dispatch_maxwell_packet,
-    dispatch_maxwell_pushbuffer, preflight_maxwell_packet,
+    MAXWELL_LEGACY_MEM_OP_A_METHOD, MAXWELL_LEGACY_MEM_OP_B_METHOD, MAXWELL_SET_OBJECT_METHOD,
+    MaxwellHostMemoryOperation, MaxwellHostMethod, MaxwellMethodDispatch,
+    MaxwellMethodDispatchError, MaxwellMethodDispatchKind, MaxwellMethodSource,
+    MaxwellPacketDispatch, MaxwellSetObjectTransition, commit_maxwell_packet,
+    dispatch_maxwell_packet, dispatch_maxwell_pushbuffer, preflight_maxwell_packet,
 };
 pub use pushbuffer::packet::{
     MaxwellDecodedMethod, MaxwellDecodedMethodPacket, MaxwellDecodedPacket,

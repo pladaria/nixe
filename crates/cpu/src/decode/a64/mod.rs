@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0085 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0094 => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -205,6 +205,7 @@ mod tests {
             (0x6e03_07be, "simd-insert-element"),
             (0x4e03_1d28, "simd-insert-general"),
             (0x6f00_05fa, "simd-modified-immediate"),
+            (0x4f03_f61e, "simd-floating-point-immediate"),
             (0xad01_0060, "fp-simd-load-store-pair"),
             (0x4e20_8400, "simd-integer"),
             (0x4e32_be31, "simd-add-pairwise"),
@@ -213,6 +214,11 @@ mod tests {
             (0x4e20_9823, "simd-compare-zero-equal"),
             (0x4e21_dbfc, "simd-signed-int-to-float"),
             (0x6e21_d928, "simd-unsigned-int-to-float"),
+            (0x7e21_d9ad, "simd-scalar-unsigned-int-to-float"),
+            (0x7f60_07fe, "simd-scalar-shift-right-immediate"),
+            (0x2f0f_0420, "simd-vector-shift-right-immediate"),
+            (0x0e20_5bde, "simd-count-bits"),
+            (0x0e31_bbde, "simd-add-across-vector"),
             (0x6e3e_ff9c, "simd-floating-point-divide"),
             (0x1e2e_101f, "fp-scalar-immediate"),
             (0x1e6e_1002, "fp-scalar-immediate"),
@@ -227,6 +233,8 @@ mod tests {
             (0x1e61_2800, "fp-scalar-floating-point-add"),
             (0x1e7c_0bbc, "fp-scalar-floating-point-multiply"),
             (0x1e6b_8949, "fp-scalar-floating-point-negated-multiply"),
+            (0x1e3e_cffe, "fp-scalar-floating-point-conditional-select"),
+            (0x1e20_c3fe, "fp-scalar-absolute"),
             (0x1e60_4000, "fp-scalar-move"),
             (0x1e61_2000, "fp-compare-register"),
             (0x1e7f_2010, "fp-compare-register"),
@@ -251,6 +259,8 @@ mod tests {
             (0x0ddf_1e30, "simd-load-store-single-structure-post-index"),
             (0x4e1d_3bde, "simd-permute-two-source"),
             (0x6e1f_43ff, "simd-extract"),
+            (0x0ea1_2bde, "simd-extract-narrow"),
+            (0x0e04_07ff, "simd-duplicate-element"),
         ];
         for (bits, expected) in cases {
             assert_eq!(
@@ -270,7 +280,16 @@ mod tests {
     }
 
     #[test]
-    fn scalar_fmov_immediate_half_precision_is_fp16_gated() {
+    fn duplicate_patterns_do_not_capture_unrelated_three_source_simd_operations() {
+        let profile = GuestCpuProfile::switch_1();
+        for encoding in [0x0ec4_0fbf, 0x0ed5_0556] {
+            assert_ne!(decoded_name(profile, encoding), "simd-duplicate-general");
+            assert_ne!(decoded_name(profile, encoding), "simd-duplicate-element");
+        }
+    }
+
+    #[test]
+    fn scalar_fmov_half_precision_forms_are_fp16_gated() {
         let base_profile = GuestCpuProfile::switch_1();
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0x1000),
@@ -281,12 +300,28 @@ mod tests {
             decode(&base_profile, location, 0x1eee_1000_u32.into()),
             DecodeResult::ProfileDisabled { .. }
         ));
+        assert!(matches!(
+            decode(&base_profile, location, 0x1ee0_4205_u32.into()),
+            DecodeResult::ProfileDisabled { .. }
+        ));
+        assert!(matches!(
+            decode(&base_profile, location, 0x1ee0_c0a4_u32.into()),
+            DecodeResult::ProfileDisabled { .. }
+        ));
 
         let fp16_profile = base_profile
             .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
         assert_eq!(
             decoded_name(fp16_profile, 0x1eee_1000),
             "fp-scalar-immediate-half"
+        );
+        assert_eq!(
+            decoded_name(fp16_profile, 0x1ee0_4205),
+            "fp-scalar-move-half"
+        );
+        assert_eq!(
+            decoded_name(fp16_profile, 0x1ee0_c0a4),
+            "fp-scalar-absolute-half"
         );
     }
 

@@ -12,14 +12,14 @@ use nixe_cpu::{
     state::{
         ThreadCpuState,
         a32::A32GeneralRegister,
-        a64::{A64GeneralRegister, A64Register},
+        a64::{A64GeneralRegister, A64Register, Nzcv},
     },
 };
 
 use super::{
     ArchitecturalTimer, ArchitecturalTimerSnapshot, InstructionSupport, InterpreterContext,
     InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one,
-    execute_one_with_context, instruction_support,
+    execute_one_with_context, has_semantics, instruction_support,
 };
 
 fn source(
@@ -523,6 +523,199 @@ fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
 }
 
 #[test]
+fn a64_simd_duplicate_element_covers_all_arrangements_and_captured_alias() {
+    let profile = GuestCpuProfile::switch_1();
+    let captured = InstructionEncoding::from_u32(0x0e04_07ff); // DUP V31.2S,V31.S[0]
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded DUP element, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let source_value = 0x8877_6655_4433_2211_fedc_ba98_7654_3210_u128;
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, source_value));
+    for register in [1, 3, 5, 7, 9, 11, 13] {
+        assert!(a64.set_vector(register, source_value));
+    }
+
+    execute_one(&profile, &mut state, captured).unwrap();
+    for encoding in [
+        0x0e0f_0420_u32, // DUP V0.8B,V1.B[7]
+        0x4e1f_0462,     // DUP V2.16B,V3.B[15]
+        0x0e0e_04a4,     // DUP V4.4H,V5.H[3]
+        0x4e1e_04e6,     // DUP V6.8H,V7.H[7]
+        0x0e0c_0528,     // DUP V8.2S,V9.S[1]
+        0x4e1c_056a,     // DUP V10.4S,V11.S[3]
+        0x4e18_05ac,     // DUP V12.2D,V13.D[1]
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+    }
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(31), Some(0x7654_3210_7654_3210));
+    assert_eq!(a64.vector(0), Some(0xfefe_fefe_fefe_fefe));
+    assert_eq!(a64.vector(2), Some(u128::from_le_bytes([0x88; 16])));
+    assert_eq!(a64.vector(4), Some(0xfedc_fedc_fedc_fedc));
+    assert_eq!(
+        a64.vector(6),
+        Some(0x8877_8877_8877_8877_8877_8877_8877_8877)
+    );
+    assert_eq!(a64.vector(8), Some(0xfedc_ba98_fedc_ba98));
+    assert_eq!(
+        a64.vector(10),
+        Some(0x8877_6655_8877_6655_8877_6655_8877_6655)
+    );
+    assert_eq!(
+        a64.vector(12),
+        Some(0x8877_6655_4433_2211_8877_6655_4433_2211)
+    );
+    assert_eq!(a64.pc(), 32);
+}
+
+#[test]
+fn a64_simd_scalar_and_vector_immediate_right_shifts_cover_signedness_and_widths() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, 0xaaaa_bbbb_cccc_dddd_fedc_ba98_7654_3210));
+
+    execute_one(&profile, &mut state, 0x7f60_07fe_u32.into()).unwrap(); // USHR D30,D31,#32
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(0x0000_0000_fedc_ba98));
+
+    assert!(a64.set_vector(5, u128::from(u64::MAX - 1)));
+    execute_one(&profile, &mut state, 0x5f7f_04a4_u32.into()).unwrap(); // SSHR D4,D5,#1
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(4), Some(u128::from(u64::MAX)));
+
+    let byte_lanes = 0x80ff_7f01_0204_0810_80ff_7f01_0204_0810;
+    assert!(a64.set_vector(1, byte_lanes));
+    assert!(a64.set_vector(17, byte_lanes));
+    execute_one(&profile, &mut state, 0x2f0f_0420_u32.into()).unwrap(); // USHR V0.8B,V1.8B,#1
+    execute_one(&profile, &mut state, 0x4f0f_0630_u32.into()).unwrap(); // SSHR V16.16B,V17.16B,#1
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(0), Some(0x407f_3f00_0102_0408));
+    assert_eq!(
+        a64.vector(16),
+        Some(0xc0ff_3f00_0102_0408_c0ff_3f00_0102_0408)
+    );
+
+    for (encoding, source_register, destination_register, expected) in [
+        (0x2f1f_04a4_u32, 5, 4, 0x7fff_7fff_7fff_7fff), // USHR V4.4H,V5.4H,#1
+        (0x6f10_04e6, 7, 6, 0),                         // USHR V6.8H,V7.8H,#16
+        (0x2f3f_0528, 9, 8, 0x7fff_ffff_7fff_ffff),     // USHR V8.2S,V9.2S,#1
+        (0x6f20_056a, 11, 10, 0),                       // USHR V10.4S,V11.4S,#32
+        (
+            0x6f7f_05ac,
+            13,
+            12,
+            0x7fff_ffff_ffff_ffff_7fff_ffff_ffff_ffff,
+        ), // USHR V12.2D,V13.2D,#1
+        (0x6f40_05ee, 15, 14, 0),                       // USHR V14.2D,V15.2D,#64
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(source_register, u128::MAX));
+        assert!(a64.set_vector(destination_register, u128::MAX));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(destination_register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 40);
+}
+
+#[test]
+fn a64_simd_count_bits_covers_both_vector_widths_and_captured_alias() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let source = 0xffff_ffff_ffff_ffff_ff80_7f55_0f03_0100_u128;
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(30, source));
+    assert!(a64.set_vector(3, source));
+
+    execute_one(&profile, &mut state, 0x0e20_5bde_u32.into()).unwrap(); // CNT V30.8B,V30.8B
+    execute_one(&profile, &mut state, 0x4e20_5862_u32.into()).unwrap(); // CNT V2.16B,V3.16B
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(0x0801_0704_0402_0100));
+    assert_eq!(
+        a64.vector(2),
+        Some(0x0808_0808_0808_0808_0801_0704_0402_0100)
+    );
+    assert_eq!(a64.pc(), 8);
+}
+
+#[test]
+fn a64_simd_add_across_vector_covers_every_allocated_arrangement_and_alias() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(30, 0xaaaa_bbbb_cccc_dddd_0807_0605_0403_0201));
+    assert!(a64.set_vector(3, u128::MAX));
+    assert!(a64.set_vector(
+        5,
+        u128::from(u64::MAX) << 48 | 3_u128 << 32 | 2_u128 << 16 | 1
+    ));
+    assert!(a64.set_vector(7, u128::MAX));
+    assert!(a64.set_vector(9, u128::MAX));
+
+    for encoding in [
+        0x0e31_bbde_u32, // ADDV B30,V30.8B
+        0x4e31_b862,     // ADDV B2,V3.16B
+        0x0e71_b8a4,     // ADDV H4,V5.4H
+        0x4e71_b8e6,     // ADDV H6,V7.8H
+        0x4eb1_b928,     // ADDV S8,V9.4S
+    ] {
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(36));
+    assert_eq!(a64.vector(2), Some(0xf0));
+    assert_eq!(a64.vector(4), Some(5));
+    assert_eq!(a64.vector(6), Some(0xfff8));
+    assert_eq!(a64.vector(8), Some(0xffff_fffc));
+    assert_eq!(a64.pc(), 20);
+}
+
+#[test]
 fn a64_simd_modified_immediate_expands_lanes_and_clears_inactive_bits() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
@@ -595,6 +788,48 @@ fn a64_simd_modified_immediate_covers_move_negate_merge_and_bitmask_forms() {
             "encoding={encoding:#010x}"
         );
     }
+}
+
+#[test]
+fn a64_simd_fmov_immediate_covers_two_and_four_single_lanes_and_two_double_lanes() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.set_fpcr(0x07c0_0000);
+    a64.set_fpsr(0x9f);
+
+    for (encoding, register, expected) in [
+        (
+            0x0f03_f600_u32,
+            0,
+            0x0000_0000_0000_0000_3f80_0000_3f80_0000,
+        ), // FMOV V0.2S,#1.0
+        (0x4f03_f61e, 30, 0x3f80_0000_3f80_0000_3f80_0000_3f80_0000), // FMOV V30.4S,#1.0
+        (0x6f03_f601, 1, 0x3ff0_0000_0000_0000_3ff0_0000_0000_0000),  // FMOV V1.2D,#1.0
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(register, u128::MAX));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+        assert_eq!(a64.fpcr(), 0x07c0_0000);
+        assert_eq!(a64.fpsr(), 0x9f);
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 12);
 }
 
 #[test]
@@ -944,6 +1179,94 @@ fn a64_fmov_from_general_clears_scalar_upper_bits_and_preserves_other_lane() {
 }
 
 #[test]
+fn a64_scalar_fmov_register_copies_exact_bits_for_all_precisions() {
+    let profile = GuestCpuProfile::switch_1()
+        .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
+    let captured = InstructionEncoding::from_u32(0x1e20_41c3); // FMOV S3,S14
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded scalar FMOV, got {other:?}"),
+        };
+    assert!(has_semantics(&decoded));
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(14, u128::from(0x7f80_0001_u32) | (u128::MAX << 32)));
+    assert!(a64.set_vector(3, u128::MAX));
+    assert!(a64.set_vector(
+        15,
+        u128::from(0x7ff0_0000_0000_0001_u64) | (u128::MAX << 64)
+    ));
+    assert!(a64.set_vector(4, u128::MAX));
+    assert!(a64.set_vector(16, u128::from(0x8001_u16) | (u128::MAX << 16)));
+    assert!(a64.set_vector(5, u128::MAX));
+    a64.set_fpcr(u32::MAX);
+    a64.set_fpsr(0x95);
+
+    execute_one(&profile, &mut state, captured).unwrap();
+    execute_one(&profile, &mut state, 0x1e60_41e4_u32.into()).unwrap(); // FMOV D4,D15
+    execute_one(&profile, &mut state, 0x1ee0_4205_u32.into()).unwrap(); // FMOV H5,H16
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(3), Some(u128::from(0x7f80_0001_u32)));
+    assert_eq!(a64.vector(4), Some(u128::from(0x7ff0_0000_0000_0001_u64)));
+    assert_eq!(a64.vector(5), Some(0x8001));
+    assert_eq!(a64.fpcr(), u32::MAX);
+    assert_eq!(a64.fpsr(), 0x95);
+    assert_eq!(a64.pc(), 12);
+}
+
+#[test]
+fn a64_scalar_fabs_fneg_transform_only_the_sign_bit_for_all_precisions() {
+    let profile = GuestCpuProfile::switch_1()
+        .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
+    let captured = InstructionEncoding::from_u32(0x1e20_c3fe); // FABS S30,S31
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded scalar FABS, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, u128::from(0xff80_0001_u32) | (u128::MAX << 32)));
+    assert!(a64.set_vector(9, u128::from(0x7ff0_0000_0000_0001_u64) | (u128::MAX << 64)));
+    assert!(a64.set_vector(5, u128::from(0x8001_u16) | (u128::MAX << 16)));
+    assert!(a64.set_vector(11, u128::from(0x0001_u16) | (u128::MAX << 16)));
+    a64.set_fpcr(u32::MAX);
+    a64.set_fpsr(0x95);
+
+    execute_one(&profile, &mut state, captured).unwrap();
+    execute_one(&profile, &mut state, 0x1e61_4128_u32.into()).unwrap(); // FNEG D8,D9
+    execute_one(&profile, &mut state, 0x1ee0_c0a4_u32.into()).unwrap(); // FABS H4,H5
+    execute_one(&profile, &mut state, 0x1ee1_416a_u32.into()).unwrap(); // FNEG H10,H11
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(u128::from(0x7f80_0001_u32)));
+    assert_eq!(a64.vector(8), Some(u128::from(0xfff0_0000_0000_0001_u64)));
+    assert_eq!(a64.vector(4), Some(1));
+    assert_eq!(a64.vector(10), Some(0x8001));
+    assert_eq!(a64.fpcr(), u32::MAX);
+    assert_eq!(a64.fpsr(), 0x95);
+    assert_eq!(a64.pc(), 16);
+}
+
+#[test]
 fn a64_simd_integer_add_sub_wrap_each_lane_and_clear_inactive_bits() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
@@ -1118,6 +1441,89 @@ fn a64_simd_shift_right_narrow_executes_observed_libnx_encoding() {
         a64.vector(0),
         Some((u128::from(expected) << 64) | 0x8877_6655_4433_2211_u128)
     );
+}
+
+#[test]
+fn a64_simd_extract_narrow_covers_all_lane_widths_and_upper_half_forms() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    let source = 0x8877_6655_4433_2211_fedc_ba98_7654_3210_u128;
+    assert!(a64.set_vector(1, source));
+    assert!(a64.set_vector(3, source));
+    assert!(a64.set_vector(5, source));
+
+    execute_one(&profile, &mut state, 0x0e21_2820_u32.into()).unwrap(); // XTN V0.8B,V1.8H
+    execute_one(&profile, &mut state, 0x0e61_2862_u32.into()).unwrap(); // XTN V2.4H,V3.4S
+    execute_one(&profile, &mut state, 0x0ea1_28a4_u32.into()).unwrap(); // XTN V4.2S,V5.2D
+
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(0), Some(0x7755_3311_dc98_5410));
+    assert_eq!(a64.vector(2), Some(0x6655_2211_ba98_3210));
+    assert_eq!(a64.vector(4), Some(0x4433_2211_7654_3210));
+
+    let low = 0x0123_4567_89ab_cdef_u64;
+    for register in [6, 8, 10] {
+        assert!(a64.set_vector(register, u128::from(low)));
+    }
+    assert!(a64.set_vector(7, source));
+    assert!(a64.set_vector(9, source));
+    assert!(a64.set_vector(11, source));
+
+    execute_one(&profile, &mut state, 0x4e21_28e6_u32.into()).unwrap(); // XTN2 V6.16B,V7.8H
+    execute_one(&profile, &mut state, 0x4e61_2928_u32.into()).unwrap(); // XTN2 V8.8H,V9.4S
+    execute_one(&profile, &mut state, 0x4ea1_296a_u32.into()).unwrap(); // XTN2 V10.4S,V11.2D
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a64.vector(6),
+        Some((0x7755_3311_dc98_5410_u128 << 64) | u128::from(low))
+    );
+    assert_eq!(
+        a64.vector(8),
+        Some((0x6655_2211_ba98_3210_u128 << 64) | u128::from(low))
+    );
+    assert_eq!(
+        a64.vector(10),
+        Some((0x4433_2211_7654_3210_u128 << 64) | u128::from(low))
+    );
+    assert_eq!(a64.pc(), 24);
+}
+
+#[test]
+fn a64_simd_extract_narrow_executes_captured_aliasing_encoding() {
+    let profile = GuestCpuProfile::switch_1();
+    let encoding = InstructionEncoding::from_u32(0x0ea1_2bde); // XTN V30.2S,V30.2D
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded XTN, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(30, 0x8877_6655_4433_2211_fedc_ba98_7654_3210));
+
+    execute_one(&profile, &mut state, encoding).unwrap();
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(0x4433_2211_7654_3210));
+    assert_eq!(a64.pc(), 4);
 }
 
 #[test]
@@ -1580,6 +1986,68 @@ fn a64_simd_integer_to_float_trap_boundary_is_atomic_and_interpreter_only() {
     };
     assert_eq!(a64.vector(28), Some(u128::MAX));
     assert_eq!(a64.fpsr(), 0x2);
+    assert_eq!(a64.pc(), 0);
+}
+
+#[test]
+fn a64_scalar_simd_integer_to_float_covers_signed_unsigned_and_captured_alias() {
+    let profile = GuestCpuProfile::switch_1();
+    let captured = InstructionEncoding::from_u32(0x7e21_d9ad); // UCVTF S13,S13
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded scalar SIMD UCVTF, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(13, u128::from(16_777_217_u32) | (u128::MAX << 32)));
+    assert!(a64.set_vector(5, u128::from((-3_i64) as u64) | (u128::MAX << 64)));
+    assert!(a64.set_vector(4, u128::MAX));
+    a64.set_fpsr(1 << 1);
+
+    execute_one(&profile, &mut state, captured).unwrap();
+    execute_one(&profile, &mut state, 0x5e61_d8a4_u32.into()).unwrap(); // SCVTF D4,D5
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(13), Some(u128::from(0x4b80_0000_u32)));
+    assert_eq!(a64.vector(4), Some(u128::from((-3.0_f64).to_bits())));
+    assert_eq!(a64.fpsr(), (1 << 1) | (1 << 4));
+    assert_eq!(a64.pc(), 8);
+}
+
+#[test]
+fn a64_scalar_simd_integer_to_float_enabled_inexact_exception_is_atomic() {
+    let profile = GuestCpuProfile::switch_1();
+    let encoding = InstructionEncoding::from_u32(0x7e21_d9ad); // UCVTF S13,S13
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    let original = u128::from(16_777_217_u32) | (u128::MAX << 32);
+    assert!(a64.set_vector(13, original));
+    a64.set_fpcr(1 << 12); // IXE
+    a64.set_fpsr(0x82);
+
+    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
+    assert!(matches!(
+        error,
+        InterpreterError::UnsupportedInstruction { .. }
+    ));
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(13), Some(original));
+    assert_eq!(a64.fpsr(), 0x82);
     assert_eq!(a64.pc(), 0);
 }
 
@@ -2641,6 +3109,54 @@ fn a64_scalar_fmul_enabled_invalid_exception_is_atomic_and_interpreter_only() {
     assert_eq!(a64.vector(0), Some(u128::MAX));
     assert_eq!(a64.fpsr(), 0x80);
     assert_eq!(a64.pc(), 0);
+}
+
+#[test]
+fn a64_scalar_fcsel_selects_exact_single_and_double_bits() {
+    let profile = GuestCpuProfile::switch_1();
+    let captured = InstructionEncoding::from_u32(0x1e3e_cffe); // FCSEL S30,S31,S30,GT
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded scalar FCSEL, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    let single_false = 0x7f80_0001_u32; // Signaling NaN payload must be copied unchanged.
+    assert!(a64.set_vector(31, u128::from(0x0123_4567_u32) | (u128::MAX << 32)));
+    assert!(a64.set_vector(30, u128::from(single_false) | (u128::MAX << 32)));
+    a64.set_nzcv(Nzcv::from_bits(0x6000_0000)); // GT is false because Z is set.
+    a64.set_fpcr(u32::MAX);
+    a64.set_fpsr(0x95);
+
+    execute_one(&profile, &mut state, captured).unwrap();
+
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(u128::from(single_false)));
+    assert!(a64.set_vector(4, u128::from(0x8000_0000_0000_0000_u64)));
+    assert!(a64.set_vector(5, u128::from(0x7ff0_0000_0000_0001_u64)));
+    assert!(a64.set_vector(3, u128::MAX));
+    a64.set_nzcv(Nzcv::from_bits(Nzcv::Z));
+
+    execute_one(&profile, &mut state, 0x1e65_0c83_u32.into()).unwrap(); // FCSEL D3,D4,D5,EQ
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(3), Some(u128::from(0x8000_0000_0000_0000_u64)));
+    assert_eq!(a64.fpcr(), u32::MAX);
+    assert_eq!(a64.fpsr(), 0x95);
+    assert_eq!(a64.pc(), 8);
 }
 
 #[test]
