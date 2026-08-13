@@ -1984,27 +1984,44 @@ messages, typed failures, or the produced frame hash/capture.
 Purpose: connect rendering, ownership, composition, and presentation without
 collapsing their separate timelines.
 
-- [ ] **TRI-220** Resolve queued `NvGraphicBuffer` metadata to an image view over
+- [x] **TRI-220** Resolve queued `NvGraphicBuffer` metadata to an image view over
       the correct canonical `nvmap` backing.
-- [ ] **TRI-221** Preserve dimensions, format, planes, pitch, kind, transform,
+- [x] **TRI-221** Preserve dimensions, format, planes, pitch, kind, transform,
       crop, usage, and slot ownership from producer registration through
       consumption.
-- [ ] **TRI-222** Associate queue operations with acquire and release fences
+- [x] **TRI-222** Associate queue operations with acquire and release fences
       backed by the guest GPU timeline.
-- [ ] **TRI-223** Prevent the compositor from reading a render target before its
+- [x] **TRI-223** Prevent the compositor from reading a render target before its
       producing fence and visibility transition complete.
-- [ ] **TRI-224** Prevent the producer from reusing a slot before consumer
+- [x] **TRI-224** Prevent the producer from reusing a slot before consumer
       release.
-- [ ] **TRI-225** Convert or copy a completed guest image to the existing
+- [x] **TRI-225** Convert or copy a completed guest image to the existing
       host-independent `Frame` representation as the initial correct
       presentation path.
-- [ ] **TRI-226** Keep composition and VI VSync independent from GPU completion
+- [x] **TRI-226** Keep composition and VI VSync independent from GPU completion
       and host-window VSync.
-- [ ] **TRI-227** Preserve the existing software-framebuffer path and ensure CPU
+- [x] **TRI-227** Preserve the existing software-framebuffer path and ensure CPU
       and GPU producers use the same BufferQueue ownership rules.
-- [ ] **TRI-228** Add headless tests for render completion before/after VSync,
+- [x] **TRI-228** Add headless tests for render completion before/after VSync,
       delayed fences, slot reuse, transforms, and teardown with queued work.
-- [ ] **TRI-229** Add frame hash or image assertions for the synthetic triangle.
+- [x] **TRI-229** Add frame hash or image assertions for the synthetic triangle.
+
+T12 now retains the complete registered `NvGraphicBuffer` description and the
+flattened `BqBufferInput` through a transactional BufferQueue reservation. A
+queued slot resolves to an image view over the exported object's canonical
+`nvmap` backing, waits for every known acquire-fence point, and remains
+consumer-owned until a later guest VI boundary composes it. VI refresh
+continues independently while an image is blocked. Composition converts the
+verified pitch or generic 16Bx2 block-linear Android/libnx formats to the
+host-independent XRGB `Frame`, applies crop and transform, publishes through
+the existing mailbox, and only then returns an empty completed release fence
+with the slot. CPU-written and GPU-written buffers therefore share one queue
+and composition path. The accelerated backend now detiles uploads and tiles
+completed image writeback, so a generic block-linear Maxwell color target is
+visible in the same canonical bytes consumed by VI. Focused headless coverage
+checks delayed completion, independent VSync, ownership rollback and release,
+multi-plane metadata retention, crop/rotation, teardown, block-linear
+round-trips, triangle pixels, and a stable frame-content hash.
 
 Exit criterion: a GPU-produced render target travels through the real guest
 queue and composition path and becomes a host-ready frame only after correct

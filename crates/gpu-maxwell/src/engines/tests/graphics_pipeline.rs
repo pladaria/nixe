@@ -225,7 +225,7 @@ fn invalid_color_compression_values_are_rejected_atomically() {
 }
 
 #[test]
-fn compressed_color_full_clear_materializes_without_importing_guest_bytes() {
+fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes() {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
@@ -342,7 +342,7 @@ fn compressed_color_full_clear_materializes_without_importing_guest_bytes() {
     .unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
         creation,
-        nixe_gpu::BackendResourceCreateInfo::Image { view: None, .. }
+        nixe_gpu::BackendResourceCreateInfo::Image { view: Some(_), .. }
     )));
     assert!(matches!(
         plan.submission().operations()[0].command(),

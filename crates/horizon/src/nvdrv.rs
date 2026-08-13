@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::NeutralBackendRuntime;
+use nixe_gpu::{GuestTimelinePoint, NeutralBackendRuntime};
 
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
@@ -595,6 +595,35 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvmap
             .object_by_exported_id(id)
+    }
+
+    /// Samples an existing guest GPU timeline point for BufferQueue acquire
+    /// fences. Unknown syncpoints remain distinct from unreached points.
+    #[must_use]
+    pub(crate) fn guest_timeline_point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvhost_control
+            .point_reached(point)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_timeline(&self, id: nixe_gpu::GuestSyncpointId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvhost_control
+            .install_test_timeline(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_test_timeline(&self, id: nixe_gpu::GuestSyncpointId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nvhost_control
+            .advance_test_timeline(id);
     }
 
     pub(crate) fn teardown(&self) -> NvDrvTeardownReport {

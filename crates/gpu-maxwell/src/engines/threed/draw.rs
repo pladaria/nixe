@@ -2130,7 +2130,10 @@ fn prepare_resources(
                 creations.push(BackendResourceCreateInfo::Image {
                     id,
                     description: value.description(),
-                    view: (!value.guest_layout().requires_materialization()).then_some(view),
+                    view: value
+                        .guest_layout()
+                        .has_direct_canonical_representation()
+                        .then_some(view),
                 });
                 ResourceDependency::Image(id)
             }

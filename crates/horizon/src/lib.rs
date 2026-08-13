@@ -17,7 +17,9 @@ mod scheduler_profile;
 mod svc;
 mod svc_dispatch;
 
-pub use graphics::{GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem};
+pub use graphics::{
+    FramebufferError, GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
+};
 pub use graphics_event::GraphicsEventSource;
 pub use hid::HidSystem;
 pub use ipc::{

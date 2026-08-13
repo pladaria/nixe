@@ -2050,29 +2050,9 @@ fn dispatch_binder_relay(
                 }
             );
             write_descriptor_bytes(process, output, &transaction.reply)?;
-            if let Some((slot, buffer)) = transaction.queued {
-                let object = video
-                    .nvdrv()
-                    .nvmap_object_by_id(crate::NvMapExportedId::new(buffer.nvmap_id))
-                    .ok_or(IpcWireError::Malformed(
-                        "queued graphic buffer references an unknown nvmap ID",
-                    ))?;
-                if buffer.plane_size == 0
-                    || buffer.plane_size > u64::from(buffer.total_size)
-                    || u64::from(buffer.offset)
-                        .checked_add(buffer.plane_size)
-                        .is_none_or(|end| end > u64::from(object.size()))
-                {
-                    return Err(IpcWireError::Malformed(
-                        "queued graphic-buffer plane exceeds its nvmap allocation",
-                    ));
-                }
-                let view = object
-                    .image_view(buffer.nvmap_view_metadata())
-                    .map_err(map_nvmap_view_error)?;
-                let bytes = view.read_plane(0).map_err(map_nvmap_view_error)?;
+            if let Some(request) = transaction.queued {
                 video
-                    .queue_software_frame(binder_id, slot, &buffer, &bytes)
+                    .queue_graphic_buffer(binder_id, request)
                     .map_err(|error| match error {
                         crate::graphics::FramebufferError::Malformed(reason) => {
                             IpcWireError::Malformed(reason)
@@ -2085,6 +2065,15 @@ fn dispatch_binder_relay(
                                     detail,
                                 },
                             )
+                        }
+                        crate::graphics::FramebufferError::NvMap(
+                            crate::NvMapViewError::ResourceExhausted,
+                        ) => IpcWireError::ResourceExhausted,
+                        crate::graphics::FramebufferError::NvMap(
+                            crate::NvMapViewError::Backing(error),
+                        ) => IpcWireError::CanonicalBacking(error),
+                        crate::graphics::FramebufferError::NvMap(_) => {
+                            IpcWireError::Malformed("queued graphic-buffer image view is invalid")
                         }
                     })?;
             }
@@ -2136,28 +2125,6 @@ fn dispatch_binder_relay(
             ))
         }
         command_id => unsupported_service_command("IHOSBinderDriver", command_id),
-    }
-}
-
-fn map_nvmap_view_error(error: crate::NvMapViewError) -> IpcWireError {
-    match error {
-        crate::NvMapViewError::ResourceExhausted => IpcWireError::ResourceExhausted,
-        crate::NvMapViewError::Backing(error) => IpcWireError::CanonicalBacking(error),
-        crate::NvMapViewError::UnallocatedObject => {
-            IpcWireError::Malformed("queued nvmap object has no canonical backing")
-        }
-        crate::NvMapViewError::MissingPlanes => {
-            IpcWireError::Malformed("queued graphic buffer has no planes")
-        }
-        crate::NvMapViewError::UnknownPlane => {
-            IpcWireError::Malformed("queued graphic-buffer plane does not exist")
-        }
-        crate::NvMapViewError::PlaneOutsideObject => {
-            IpcWireError::Malformed("queued graphic-buffer plane exceeds its nvmap object")
-        }
-        crate::NvMapViewError::RangeOverflow => {
-            IpcWireError::Malformed("queued graphic-buffer plane range overflows")
-        }
     }
 }
 

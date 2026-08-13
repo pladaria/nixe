@@ -74,8 +74,9 @@ enum PendingWriteback {
         staging: Buffer,
         backing: BackingView,
         host_row_pitch: u32,
-        canonical_row_pitch: u64,
-        width_bytes: usize,
+        canonical_layout: ImageMemoryLayout,
+        bytes_per_texel: usize,
+        width: u32,
         height: u32,
         depth_or_layers: u32,
     },
@@ -230,23 +231,41 @@ impl WgpuBackendDriver {
             return Ok(());
         };
         for binding in view.bindings() {
-            let ImageMemoryLayout::PitchLinear {
-                row_pitch,
-                layer_stride,
-            } = binding.layout()
-            else {
-                return Err(unsupported("block-linear image upload"));
-            };
             let subresources = binding.subresources();
             let extent = description
                 .mip_extent(subresources.mip_level)
                 .ok_or_else(|| unsupported("invalid image upload mip"))?;
-            let mut bytes = vec![0; usize_from_u64(binding.backing().size(), "image upload size")?];
+            let mut canonical =
+                vec![0; usize_from_u64(binding.backing().size(), "image upload size")?];
             binding
                 .backing()
                 .range()
-                .read(0, &mut bytes)
+                .read(0, &mut canonical)
                 .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+            let bytes_per_texel = usize::from(
+                description
+                    .format()
+                    .plane_bytes_per_texel(subresources.plane)
+                    .ok_or_else(|| unsupported("image plane format"))?,
+            );
+            let host_row_pitch = align_u32(
+                extent
+                    .width
+                    .checked_mul(u32::try_from(bytes_per_texel).unwrap())
+                    .ok_or_else(|| unsupported("image upload row size"))?,
+                wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+            )?;
+            let bytes = linearize_canonical_image(
+                &canonical,
+                binding.layout(),
+                ImageCopyShape {
+                    width: extent.width,
+                    height: extent.height,
+                    layers: u32::from(subresources.layer_count),
+                    bytes_per_texel,
+                    host_row_pitch,
+                },
+            )?;
             self.queue.write_texture(
                 TexelCopyTextureInfo {
                     texture,
@@ -261,8 +280,8 @@ impl WgpuBackendDriver {
                 &bytes,
                 TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(u32_from_u64(row_pitch, "image row pitch")?),
-                    rows_per_image: Some(rows_per_image(extent, row_pitch, layer_stride)?),
+                    bytes_per_row: Some(host_row_pitch),
+                    rows_per_image: Some(extent.height),
                 },
                 Extent3d {
                     width: extent.width,
@@ -866,9 +885,6 @@ impl WgpuBackendDriver {
         }
         let binding = &view.bindings()[0];
         let subresources = binding.subresources();
-        let ImageMemoryLayout::PitchLinear { row_pitch, .. } = binding.layout() else {
-            return Err(unsupported("block-linear image writeback"));
-        };
         let extent = description
             .mip_extent(subresources.mip_level)
             .ok_or_else(|| unsupported("invalid image writeback mip"))?;
@@ -926,8 +942,9 @@ impl WgpuBackendDriver {
             staging,
             backing: binding.backing().clone(),
             host_row_pitch,
-            canonical_row_pitch: row_pitch,
-            width_bytes,
+            canonical_layout: binding.layout(),
+            bytes_per_texel,
+            width: extent.width,
             height: extent.height,
             depth_or_layers: layers,
         });
@@ -965,8 +982,9 @@ impl WgpuBackendDriver {
                 PendingWriteback::Image {
                     backing,
                     host_row_pitch,
-                    canonical_row_pitch,
-                    width_bytes,
+                    canonical_layout,
+                    bytes_per_texel,
+                    width,
                     height,
                     depth_or_layers,
                     ..
@@ -977,20 +995,18 @@ impl WgpuBackendDriver {
                         .range()
                         .read(0, &mut canonical)
                         .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-                    for layer in 0..*depth_or_layers {
-                        for row in 0..*height {
-                            let source = usize::try_from(
-                                u64::from(layer * *height + row) * u64::from(*host_row_pitch),
-                            )
-                            .map_err(|_| unsupported("image source offset"))?;
-                            let destination = usize::try_from(
-                                u64::from(layer * *height + row) * *canonical_row_pitch,
-                            )
-                            .map_err(|_| unsupported("image destination offset"))?;
-                            canonical[destination..destination + *width_bytes]
-                                .copy_from_slice(&mapped[source..source + *width_bytes]);
-                        }
-                    }
+                    write_linear_image_to_canonical(
+                        &mapped,
+                        &mut canonical,
+                        *canonical_layout,
+                        ImageCopyShape {
+                            width: *width,
+                            height: *height,
+                            layers: *depth_or_layers,
+                            bytes_per_texel: *bytes_per_texel,
+                            host_row_pitch: *host_row_pitch,
+                        },
+                    )?;
                     self.visibility
                         .write_backing(backing, &canonical)
                         .map_err(|error| BackendDriverError::failure(error.to_string()))?;
@@ -1457,18 +1473,140 @@ fn dependency_handle(
     })
 }
 
-fn rows_per_image(
-    extent: nixe_gpu::ImageExtent,
-    row_pitch: u64,
-    layer_stride: u64,
-) -> Result<u32, BackendDriverError> {
-    let rows = layer_stride
-        .checked_div(row_pitch)
-        .ok_or_else(|| unsupported("zero image row pitch"))?;
-    if rows < u64::from(extent.height) {
-        return Err(unsupported("image layer stride"));
+#[derive(Clone, Copy)]
+struct ImageCopyShape {
+    width: u32,
+    height: u32,
+    layers: u32,
+    bytes_per_texel: usize,
+    host_row_pitch: u32,
+}
+
+fn linearize_canonical_image(
+    canonical: &[u8],
+    layout: ImageMemoryLayout,
+    shape: ImageCopyShape,
+) -> Result<Vec<u8>, BackendDriverError> {
+    let output_size = u64::from(shape.host_row_pitch)
+        .checked_mul(u64::from(shape.height))
+        .and_then(|size| size.checked_mul(u64::from(shape.layers)))
+        .ok_or_else(|| unsupported("image upload size overflow"))?;
+    let mut output = vec![0; usize_from_u64(output_size, "image upload size")?];
+    copy_image_layout(canonical, &mut output, layout, shape, false)?;
+    Ok(output)
+}
+
+fn write_linear_image_to_canonical(
+    linear: &[u8],
+    canonical: &mut [u8],
+    layout: ImageMemoryLayout,
+    shape: ImageCopyShape,
+) -> Result<(), BackendDriverError> {
+    copy_image_layout(linear, canonical, layout, shape, true)
+}
+
+fn copy_image_layout(
+    source: &[u8],
+    destination: &mut [u8],
+    layout: ImageMemoryLayout,
+    shape: ImageCopyShape,
+    to_canonical: bool,
+) -> Result<(), BackendDriverError> {
+    for layer in 0..shape.layers {
+        for y in 0..shape.height {
+            for x in 0..shape.width {
+                let linear = usize::try_from(
+                    u64::from(layer * shape.height + y) * u64::from(shape.host_row_pitch)
+                        + u64::from(x)
+                            * u64::try_from(shape.bytes_per_texel)
+                                .map_err(|_| unsupported("image texel size"))?,
+                )
+                .map_err(|_| unsupported("linear image offset"))?;
+                let canonical = canonical_texel_offset(
+                    layout,
+                    shape.width,
+                    layer,
+                    x,
+                    y,
+                    shape.bytes_per_texel,
+                )?;
+                let (from, to) = if to_canonical {
+                    (
+                        source
+                            .get(linear..linear + shape.bytes_per_texel)
+                            .ok_or_else(|| unsupported("linear image source exceeds backing"))?,
+                        canonical,
+                    )
+                } else {
+                    (
+                        source
+                            .get(canonical..canonical + shape.bytes_per_texel)
+                            .ok_or_else(|| unsupported("canonical image source exceeds backing"))?,
+                        linear,
+                    )
+                };
+                destination
+                    .get_mut(to..to + shape.bytes_per_texel)
+                    .ok_or_else(|| unsupported("image destination exceeds backing"))?
+                    .copy_from_slice(from);
+            }
+        }
     }
-    u32_from_u64(rows, "image rows per layer")
+    Ok(())
+}
+
+fn canonical_texel_offset(
+    layout: ImageMemoryLayout,
+    width: u32,
+    layer: u32,
+    x: u32,
+    y: u32,
+    bytes_per_texel: usize,
+) -> Result<usize, BackendDriverError> {
+    let bytes_per_texel =
+        u64::try_from(bytes_per_texel).map_err(|_| unsupported("image texel size"))?;
+    let byte_x = u64::from(x)
+        .checked_mul(bytes_per_texel)
+        .ok_or_else(|| unsupported("image X offset"))?;
+    let offset = match layout {
+        ImageMemoryLayout::PitchLinear {
+            row_pitch,
+            layer_stride,
+        } => u64::from(layer) * layer_stride + u64::from(y) * row_pitch + byte_x,
+        ImageMemoryLayout::BlockLinear(blocks) => {
+            if blocks.block_width_log2 != 0 || blocks.block_depth_log2 != 0 {
+                return Err(unsupported("wide or deep block-linear image layout"));
+            }
+            // Tegra's generic 16Bx2 GOB addressing, also used by pinned libnx
+            // framebuffer conversion:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/framebuffer.c
+            let row_pitch = align_u64(
+                u64::from(width)
+                    .checked_mul(bytes_per_texel)
+                    .ok_or_else(|| unsupported("block-linear row size"))?,
+                64,
+            )?;
+            let width_in_gobs = row_pitch / 64;
+            let block_height_gobs = 1_u64 << blocks.block_height_log2;
+            u64::from(layer) * blocks.layer_stride
+                + (u64::from(y) / (8 * block_height_gobs)) * 512 * block_height_gobs * width_in_gobs
+                + (byte_x / 64) * 512 * block_height_gobs
+                + ((u64::from(y) % (8 * block_height_gobs)) / 8) * 512
+                + ((byte_x % 64) / 32) * 256
+                + ((u64::from(y) % 8) / 2) * 64
+                + ((byte_x % 32) / 16) * 32
+                + (u64::from(y) % 2) * 16
+                + byte_x % 16
+        }
+    };
+    usize_from_u64(offset, "canonical image offset")
+}
+
+fn align_u64(value: u64, alignment: u64) -> Result<u64, BackendDriverError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or_else(|| unsupported("aligned image size overflow"))
 }
 
 fn align_u32(value: u32, alignment: u32) -> Result<u32, BackendDriverError> {
@@ -1480,10 +1618,6 @@ fn align_u32(value: u32, alignment: u32) -> Result<u32, BackendDriverError> {
 
 fn usize_from_u64(value: u64, label: &str) -> Result<usize, BackendDriverError> {
     usize::try_from(value).map_err(|_| unsupported(label))
-}
-
-fn u32_from_u64(value: u64, label: &str) -> Result<u32, BackendDriverError> {
-    u32::try_from(value).map_err(|_| unsupported(label))
 }
 
 fn filter_mode(mode: nixe_gpu::FilterMode) -> wgpu::FilterMode {
@@ -1525,9 +1659,12 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 
 #[cfg(test)]
 mod tests {
-    use nixe_gpu::ViewportTransform;
+    use nixe_gpu::{BlockLinearLayout, ImageMemoryLayout, ViewportTransform};
 
-    use super::{WebGpuViewport, webgpu_viewport};
+    use super::{
+        ImageCopyShape, WebGpuViewport, linearize_canonical_image, webgpu_viewport,
+        write_linear_image_to_canonical,
+    };
 
     #[test]
     fn maxwell_negative_y_viewport_maps_exactly_to_webgpu_top_left_coordinates() {
@@ -1553,5 +1690,71 @@ mod tests {
 
         assert!(webgpu_viewport(flipped_x).is_err());
         assert!(webgpu_viewport(flipped_y).is_err());
+    }
+
+    #[test]
+    fn block_linear_image_round_trips_through_host_rows() {
+        let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            layer_stride: 512,
+        });
+        let mut host = vec![0_u8; 256 * 8];
+        for y in 0..8_usize {
+            for x in 0..8_usize {
+                let offset = y * 256 + x * 4;
+                host[offset..offset + 4].copy_from_slice(&[
+                    u8::try_from(x).unwrap(),
+                    u8::try_from(y).unwrap(),
+                    0x5a,
+                    0xff,
+                ]);
+            }
+        }
+        let mut canonical = vec![0_u8; 512];
+        let shape = ImageCopyShape {
+            width: 8,
+            height: 8,
+            layers: 1,
+            bytes_per_texel: 4,
+            host_row_pitch: 256,
+        };
+        write_linear_image_to_canonical(&host, &mut canonical, layout, shape).unwrap();
+
+        assert_eq!(
+            linearize_canonical_image(&canonical, layout, shape).unwrap(),
+            host
+        );
+    }
+
+    #[test]
+    fn pitch_image_writeback_preserves_canonical_row_padding() {
+        let layout = ImageMemoryLayout::PitchLinear {
+            row_pitch: 16,
+            layer_stride: 32,
+        };
+        let host = [
+            1_u8, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        let mut padded_host = vec![0_u8; 256 * 2];
+        padded_host[..8].copy_from_slice(&host[..8]);
+        padded_host[256..264].copy_from_slice(&host[16..24]);
+        let mut canonical = vec![0xaa_u8; 32];
+        write_linear_image_to_canonical(
+            &padded_host,
+            &mut canonical,
+            layout,
+            ImageCopyShape {
+                width: 2,
+                height: 2,
+                layers: 1,
+                bytes_per_texel: 4,
+                host_row_pitch: 256,
+            },
+        )
+        .unwrap();
+        assert_eq!(&canonical[..8], &host[..8]);
+        assert_eq!(&canonical[16..24], &host[16..24]);
     }
 }

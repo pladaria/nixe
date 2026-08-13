@@ -84,6 +84,28 @@ impl Frame {
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
     }
+
+    /// Returns a stable, host-independent content fingerprint for headless
+    /// presentation assertions. Sequence is intentionally excluded so equal
+    /// images produced on different VSyncs compare equal.
+    #[must_use]
+    pub fn content_hash64(&self) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET_BASIS;
+        for byte in self
+            .width
+            .to_le_bytes()
+            .into_iter()
+            .chain(self.height.to_le_bytes())
+            .chain([0])
+            .chain(self.pixels.iter().flat_map(|pixel| pixel.to_le_bytes()))
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
 }
 
 /// Invalid host-ready frame description.
@@ -335,6 +357,16 @@ mod tests {
                 actual: 3
             })
         );
+    }
+
+    #[test]
+    fn content_hash_is_stable_across_frame_sequences() {
+        let first = Frame::new_xrgb8888(2, 1, 1, vec![0x112233, 0x445566]).unwrap();
+        let second = Frame::new_xrgb8888(2, 1, 99, vec![0x112233, 0x445566]).unwrap();
+        let changed = Frame::new_xrgb8888(2, 1, 1, vec![0x112233, 0x445567]).unwrap();
+
+        assert_eq!(first.content_hash64(), second.content_hash64());
+        assert_ne!(first.content_hash64(), changed.content_hash64());
     }
 
     #[test]

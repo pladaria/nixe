@@ -174,6 +174,15 @@ impl MaxwellThreeDPreservedImageLayout {
     pub const fn requires_materialization(self) -> bool {
         self.compression_enabled
     }
+
+    /// Returns whether the canonical mapping itself uses the generic
+    /// uncompressed block-linear kind. Maxwell may keep compression enabled as
+    /// pipeline state while the selected surface PTE still requires ordinary
+    /// 16Bx2 bytes. That representation can be written back directly.
+    #[must_use]
+    pub const fn has_direct_canonical_representation(self) -> bool {
+        !self.compression_enabled || self.pte_kind == MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+    }
 }
 
 /// Image interpretation published only after complete snapshot validation.
@@ -1326,3 +1335,43 @@ impl Display for MaxwellThreeDResourceError {
 }
 
 impl std::error::Error for MaxwellThreeDResourceError {}
+
+#[cfg(test)]
+mod tests {
+    use nixe_gpu::{BlockLinearLayout, ImageMemoryLayout};
+
+    use super::{MAXWELL_GENERIC_BLOCK_LINEAR_KIND, MaxwellThreeDPreservedImageLayout};
+
+    #[test]
+    fn generic_block_linear_color_bytes_remain_direct_when_compression_state_is_enabled() {
+        let layout = MaxwellThreeDPreservedImageLayout {
+            layout: ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                block_width_log2: 0,
+                block_height_log2: 4,
+                block_depth_log2: 0,
+                layer_stride: 0x20_0000,
+            }),
+            pte_kind: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+            compression_enabled: true,
+        };
+
+        assert!(layout.requires_materialization());
+        assert!(layout.has_direct_canonical_representation());
+    }
+
+    #[test]
+    fn compressed_depth_kind_still_requires_a_materialization_boundary() {
+        let layout = MaxwellThreeDPreservedImageLayout {
+            layout: ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                block_width_log2: 0,
+                block_height_log2: 4,
+                block_depth_log2: 0,
+                layer_stride: 0x20_0000,
+            }),
+            pte_kind: 0x17,
+            compression_enabled: true,
+        };
+
+        assert!(!layout.has_direct_canonical_representation());
+    }
+}
