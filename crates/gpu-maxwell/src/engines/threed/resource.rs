@@ -789,6 +789,7 @@ impl<'a> ResourceBuilder<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn image(
         &mut self,
         role: MaxwellThreeDResourceRole,

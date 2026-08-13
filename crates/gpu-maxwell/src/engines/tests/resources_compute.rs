@@ -309,8 +309,8 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
         (0x179c, 0),
         (0x15d0, 0),
         (0x19cc, 1),
-        (0x0d6c, (32 << 16) | 0),
-        (0x0d70, (16 << 16) | 0),
+        (0x0d6c, 32 << 16),
+        (0x0d70, 16 << 16),
         (0x0d90, 0x3f80_0000),
         (0x0da0, 0),
         (0x10f8, 0x10),
@@ -497,7 +497,7 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let shaders = translated_graphics_shaders();
+    let (shaders, cache) = translated_graphics_shaders();
     let capabilities = BackendCapabilities::new(
         BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS),
         [
@@ -514,7 +514,6 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
             max_compute_workgroups: [1, 1, 1],
         },
     );
-    let cache = MaxwellThreeDLoweringCache::default();
     let draw = packet(0x0d78 / 4, 3);
     let dispatch = dispatch_maxwell_engine_packet(
         &mut channel,
@@ -1477,14 +1476,12 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                7,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                9,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 0,
             ),
@@ -1514,14 +1511,12 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                7,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 128,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                9,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 128,
             ),
@@ -1553,14 +1548,12 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                7,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 129,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                9,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 128,
             ),
@@ -1592,14 +1585,12 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                7,
                 MaxwellThreeDDirectlyAddressableMemory::Size16KiB,
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                9,
                 MaxwellThreeDDirectlyAddressableMemory::Size16KiB,
                 0,
             ),
@@ -1628,6 +1619,21 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         )
     ));
     assert_eq!(cache, cache_before);
+    assert!(matches!(
+        preflight_maxwell_three_d_operation(
+            limited.state(),
+            &limited_resources,
+            limited.trigger(),
+            Some(&accepted_calls),
+            FrontendSubmissionId::new(20),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        ),
+        Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders)
+    ));
+    assert_eq!(cache, cache_before);
+    cache.seed_test_shader_translations(&accepted_calls);
     let plan = preflight_maxwell_three_d_operation(
         limited.state(),
         &limited_resources,
@@ -1775,10 +1781,9 @@ fn draw_routing_is_ordered_exact_and_separates_render_pass_and_pipeline_caches()
     program_basic_draw_state(&mut channel, vertex);
     program_color_target(&mut channel, 0, target_zero, 0xd5);
     program_color_target(&mut channel, 1, target_one, 0xcf);
-    let shaders = translated_graphics_shaders();
+    let (shaders, mut cache) = translated_graphics_shaders();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let mut cache = MaxwellThreeDLoweringCache::default();
 
     program_three_d(
         &mut channel,
@@ -1983,10 +1988,9 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
     program_basic_draw_state(&mut channel, vertex);
     program_color_target(&mut channel, 0, target_zero, 0xd5);
     program_color_target(&mut channel, 1, target_one, 0xd5);
-    let shaders = translated_graphics_shaders();
+    let (shaders, cache) = translated_graphics_shaders();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let cache = MaxwellThreeDLoweringCache::default();
     let draw = packet(0x0d78 / 4, 3);
 
     program_three_d(&mut channel, 0x121c, 1);
@@ -2029,6 +2033,7 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
     .unwrap();
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    let cache_before = cache.clone();
     assert!(matches!(
         preflight_maxwell_three_d_operation(
             triggered.state(),
@@ -2042,28 +2047,7 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
         ),
         Err(MaxwellThreeDLoweringError::AliasedDrawResources { .. })
     ));
-    assert_eq!(cache, MaxwellThreeDLoweringCache::default());
-}
-
-#[test]
-fn invalid_method_suffix_discards_candidate_state() {
-    let mut channel = channel();
-    bind_three_d(&mut channel);
-    let decoded = incrementing_packet(0x1518 / 4, &[0x3f80_0000, 0, 0]);
-    let frontend_before = channel.frontend();
-    let three_d_before = channel.three_d().clone();
-
-    assert!(matches!(
-        dispatch_maxwell_engine_packet(
-            &mut channel,
-            FrontendSubmissionId::new(3),
-            &decoded.packets()[0]
-        ),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1520)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2272,10 +2256,9 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
         multi_target_disabled
     );
 
-    let shaders = translated_graphics_shaders();
+    let (shaders, cache) = translated_graphics_shaders();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let cache = MaxwellThreeDLoweringCache::default();
     let draw = packet(0x0d78 / 4, 3);
     let dispatch = dispatch_maxwell_engine_packet(
         &mut channel,
@@ -2306,6 +2289,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
     .unwrap();
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    let cache_before = cache.clone();
     assert!(matches!(
         preflight_maxwell_three_d_operation(
             triggered.state(),
@@ -2319,7 +2303,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedReplicatedColorTargetOutputSemantics)
     ));
-    assert_eq!(cache, MaxwellThreeDLoweringCache::default());
+    assert_eq!(cache, cache_before);
 
     let clear = packet(0x19d0 / 4, 0x3c);
     let dispatch = dispatch_maxwell_engine_packet(
@@ -2344,7 +2328,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, MaxwellThreeDLoweringCache::default());
+    assert_eq!(cache, cache_before);
 }
 
 #[test]

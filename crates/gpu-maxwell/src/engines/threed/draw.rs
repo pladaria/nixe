@@ -15,11 +15,12 @@ use nixe_gpu::{
     GpuOperation, ImageId, ImageOrigin, ImageRegion, ImageSubresourceRange, ImageView,
     OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
     PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId, RenderPassOperation,
-    ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, ShaderId, ShaderStage,
-    ViewportTransform,
+    ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, ShaderDescription,
+    ShaderId, ShaderStage, ViewportTransform,
 };
 
 use crate::MaxwellMethodSource;
+use crate::shader::{MaxwellShaderTranslationKey, MaxwellTranslatedShaderProgram};
 
 use super::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDBegin,
@@ -85,24 +86,21 @@ impl MaxwellThreeDOperationTrigger {
 pub struct MaxwellThreeDTranslatedShader {
     stage: ShaderStage,
     shader: ShaderId,
-    translation_generation: u64,
     directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
     maximum_api_visible_calls: u16,
 }
 
 impl MaxwellThreeDTranslatedShader {
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         stage: ShaderStage,
         shader: ShaderId,
-        translation_generation: u64,
         directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
         maximum_api_visible_calls: u16,
     ) -> Self {
         Self {
             stage,
             shader,
-            translation_generation,
             directly_addressable_memory,
             maximum_api_visible_calls,
         }
@@ -115,11 +113,6 @@ impl MaxwellThreeDTranslatedShader {
     pub const fn shader(self) -> ShaderId {
         self.shader
     }
-    #[must_use]
-    pub const fn translation_generation(self) -> u64 {
-        self.translation_generation
-    }
-
     /// Guest shader-memory configuration for which T10 produced this shader.
     /// This is never inferred from host cache topology.
     #[must_use]
@@ -172,7 +165,7 @@ pub struct MaxwellThreeDTranslatedShaders {
 }
 
 impl MaxwellThreeDTranslatedShaders {
-    pub fn new(
+    pub(crate) fn new(
         shaders: Vec<MaxwellThreeDTranslatedShader>,
         resources: Vec<MaxwellThreeDShaderResourceUse>,
     ) -> Result<Self, MaxwellThreeDLoweringError> {
@@ -293,6 +286,14 @@ struct DescriptorRecord {
     id: DescriptorTableId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShaderTranslationRecord {
+    key: Option<MaxwellShaderTranslationKey>,
+    id: ShaderId,
+    module: nixe_gpu::ShaderBackendModule,
+    published: bool,
+}
+
 /// Frontend-owned derived identity cache. It contains no backend handles and
 /// changes only through [`MaxwellThreeDLoweringPlan::commit_cache`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,6 +308,8 @@ pub struct MaxwellThreeDLoweringCache {
     pipelines: Vec<PipelineRecord>,
     render_passes: Vec<RenderPassRecord>,
     descriptors: Vec<DescriptorRecord>,
+    shader_translations: Vec<ShaderTranslationRecord>,
+    retired_shader_resources: Vec<ResourceDependency>,
     accesses: Vec<(AccessTarget, AccessScope)>,
 }
 
@@ -320,6 +323,8 @@ impl Default for MaxwellThreeDLoweringCache {
             pipelines: Vec::new(),
             render_passes: Vec::new(),
             descriptors: Vec::new(),
+            shader_translations: Vec::new(),
+            retired_shader_resources: Vec::new(),
             accesses: Vec::new(),
         }
     }
@@ -337,6 +342,114 @@ impl MaxwellThreeDLoweringCache {
     #[must_use]
     pub fn pipeline_count(&self) -> usize {
         self.pipelines.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shader_translation_count(&self) -> usize {
+        self.shader_translations.len()
+    }
+
+    /// Resolves immutable T10 products to stable logical shader identities.
+    pub(crate) fn stage_shader_translations(
+        &mut self,
+        programs: &[MaxwellTranslatedShaderProgram],
+        directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
+    ) -> Result<MaxwellThreeDTranslatedShaders, MaxwellThreeDLoweringError> {
+        let mut shaders = Vec::with_capacity(programs.len());
+        for program in programs {
+            let id = if let Some(record) = self
+                .shader_translations
+                .iter()
+                .find(|record| record.key.as_ref() == Some(program.key()))
+            {
+                record.id
+            } else {
+                let mut retired_ids = Vec::new();
+                self.shader_translations.retain(|record| {
+                    let replaced = record
+                        .key
+                        .as_ref()
+                        .is_some_and(|key| key.same_program_binding(program.key()));
+                    if replaced && record.published {
+                        retired_ids.push(record.id);
+                    }
+                    !replaced
+                });
+                if !retired_ids.is_empty() {
+                    let mut retired_pipelines = Vec::new();
+                    self.pipelines.retain(|record| {
+                        let replaced = record
+                            .key
+                            .shaders
+                            .shaders()
+                            .iter()
+                            .any(|shader| retired_ids.contains(&shader.shader()));
+                        if replaced {
+                            retired_pipelines.push(record.id);
+                        }
+                        !replaced
+                    });
+                    self.retired_shader_resources.extend(
+                        retired_pipelines
+                            .into_iter()
+                            .map(ResourceDependency::Pipeline),
+                    );
+                    self.retired_shader_resources
+                        .extend(retired_ids.into_iter().map(ResourceDependency::Shader));
+                }
+                let id = ShaderId::new(take_identity(self)?);
+                self.shader_translations.push(ShaderTranslationRecord {
+                    key: Some(program.key().clone()),
+                    id,
+                    module: program.module().clone(),
+                    published: false,
+                });
+                id
+            };
+            shaders.push(MaxwellThreeDTranslatedShader::new(
+                program.stage(),
+                id,
+                directly_addressable_memory,
+                program.maximum_api_visible_calls(),
+            ));
+        }
+        MaxwellThreeDTranslatedShaders::new(shaders, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_test_shader_translations(
+        &mut self,
+        shaders: &MaxwellThreeDTranslatedShaders,
+    ) {
+        for shader in shaders.shaders() {
+            if self
+                .shader_translations
+                .iter()
+                .any(|record| record.id == shader.shader())
+            {
+                continue;
+            }
+            let ir = nixe_gpu::VerifiedShaderIr::verify(nixe_gpu::ShaderIr::new(
+                shader.stage(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![nixe_gpu::ShaderInstruction::new(
+                    nixe_gpu::ShaderSourceLocation::new(0),
+                    nixe_gpu::ShaderPredicate::Always,
+                    nixe_gpu::ShaderOperation::Exit,
+                )],
+            ))
+            .expect("synthetic unit-test shader is valid");
+            let module =
+                nixe_gpu::lower_shader_ir_to_wgsl(&ir).expect("synthetic unit-test shader lowers");
+            self.shader_translations.push(ShaderTranslationRecord {
+                key: None,
+                id: shader.shader(),
+                module,
+                published: false,
+            });
+        }
     }
 }
 
@@ -1030,7 +1143,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     )?;
     let mut candidate = cache.clone();
     let mut creations = Vec::new();
-    let mut invalidations = Vec::new();
+    let mut invalidations = std::mem::take(&mut candidate.retired_shader_resources);
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
@@ -2241,6 +2354,26 @@ fn lower_draw(
         return Err(MaxwellThreeDLoweringError::EmptyDraw);
     }
     validate_shader_stages(state, shaders)?;
+    for translated in &shaders.shaders {
+        let record = cache
+            .shader_translations
+            .iter_mut()
+            .find(|record| record.id == translated.shader)
+            .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+        if record.module.stage() != translated.stage {
+            return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders);
+        }
+        if !record.published {
+            creations.push(BackendResourceCreateInfo::Shader {
+                id: record.id,
+                description: ShaderDescription {
+                    stage: translated.stage,
+                },
+                module: record.module.clone(),
+            });
+            record.published = true;
+        }
+    }
     let topology = primitive_topology(
         state
             .vertex_input()

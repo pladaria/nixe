@@ -12,6 +12,7 @@ mod command;
 mod completion;
 mod diagnostics;
 mod resource;
+mod shader;
 mod submission;
 mod synchronization;
 mod view;
@@ -58,6 +59,16 @@ pub use resource::{
     QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription, RenderPassDescription,
     RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription, SamplerId,
     ShaderDescription, ShaderId, ShaderStage,
+};
+pub use shader::{
+    ShaderBackendLanguage, ShaderBackendLoweringError, ShaderBackendModule,
+    ShaderBackendSourceMapEntry, ShaderEvaluationError, ShaderEvaluationInputs,
+    ShaderEvaluationResult, ShaderFloatControl, ShaderInstruction, ShaderInterfaceElement,
+    ShaderInterpolation, ShaderIoLocation, ShaderIr, ShaderIrConstructionError, ShaderNanMode,
+    ShaderOperation, ShaderPredicate, ShaderReciprocalAccuracy, ShaderRegister,
+    ShaderResourceAccess, ShaderResourceKind, ShaderRoundingMode, ShaderScalarType,
+    ShaderSourceLocation, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
+    lower_shader_ir_to_wgsl,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, HostCompletion,
