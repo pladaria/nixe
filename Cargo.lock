@@ -955,12 +955,15 @@ dependencies = [
  "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",
+ "nixe-gpu",
+ "nixe-gpu-wgpu",
  "nixe-horizon",
  "nixe-input",
  "nixe-loader-content",
  "nixe-loader-executable",
  "nixe-loader-storage",
  "nixe-loader-title",
+ "nixe-memory",
  "nixe-runtime",
  "nixe-scheduler",
  "nixe-video",
@@ -1037,6 +1040,16 @@ dependencies = [
  "naga",
  "nixe-gpu",
  "nixe-memory",
+]
+
+[[package]]
+name = "nixe-gpu-wgpu"
+version = "0.1.0"
+dependencies = [
+ "nixe-gpu",
+ "nixe-memory",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

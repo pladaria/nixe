@@ -1409,12 +1409,13 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     for (method, argument) in [
-        (0x1c00, 0x1010),
+        (0x1c00, 0x1018),
         (0x1c04, (vertex >> 32) as u32),
         (0x1c08, vertex as u32),
         (0x1f00, (vertex >> 32) as u32),
         (0x1f04, (vertex + 0xff) as u32),
-        (0x1160, 0x3820_0000),
+        (0x1160, 0x3840_0000),
+        (0x1164, 0x3840_0600),
         (0x0d74, 0),
         (0x1618, 4),
         (0x1970, 4),
@@ -1662,6 +1663,25 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     let GpuCommand::Draw(draw) = commands[1] else {
         panic!("middle neutral command must be the draw");
     };
+    assert_eq!(draw.vertex_buffers.len(), 1);
+    assert_eq!(draw.vertex_buffers[0].array_stride, 24);
+    assert_eq!(draw.vertex_buffers[0].attributes.len(), 2);
+    assert_eq!(
+        draw.vertex_buffers[0].attributes[0],
+        nixe_gpu::VertexAttribute {
+            format: nixe_gpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        }
+    );
+    assert_eq!(
+        draw.vertex_buffers[0].attributes[1],
+        nixe_gpu::VertexAttribute {
+            format: nixe_gpu::VertexFormat::Float32x3,
+            offset: 12,
+            shader_location: 1,
+        }
+    );
     let viewport = draw
         .viewport_transform
         .expect("enabled Maxwell viewport transform must reach the neutral draw");

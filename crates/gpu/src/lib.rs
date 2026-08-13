@@ -12,6 +12,7 @@ mod command;
 mod completion;
 mod diagnostics;
 mod resource;
+mod runtime;
 mod shader;
 mod submission;
 mod synchronization;
@@ -40,7 +41,7 @@ pub use command::{
     ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DispatchOperation,
     DrawArguments, DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    ViewportTransform,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,
@@ -59,6 +60,10 @@ pub use resource::{
     QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription, RenderPassDescription,
     RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription, SamplerId,
     ShaderDescription, ShaderId, ShaderStage,
+};
+pub use runtime::{
+    BackendExecutionCompletion, BackendRuntimeError, NeutralBackendRuntime,
+    SynchronousBackendRuntime,
 };
 pub use shader::{
     ShaderBackendLanguage, ShaderBackendLoweringError, ShaderBackendModule,

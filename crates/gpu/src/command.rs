@@ -1,6 +1,9 @@
 //! Immutable backend-independent GPU operations and submission ordering.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::BTreeSet,
+    fmt::{Display, Formatter},
+};
 
 use crate::{
     AccessMode, AccessScope, AccessTarget, BackendFeatures, BufferId, BufferRange,
@@ -261,13 +264,134 @@ impl DrawArguments {
 }
 
 /// One fully specified direct draw dependency set.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VertexStepMode {
+    Vertex,
+    Instance,
+}
+
+/// Exact host-independent storage format of one vertex attribute.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VertexFormat {
+    Uint8x2,
+    Uint8x4,
+    Sint8x2,
+    Sint8x4,
+    Unorm8x2,
+    Unorm8x4,
+    Snorm8x2,
+    Snorm8x4,
+    Uint16x2,
+    Uint16x4,
+    Sint16x2,
+    Sint16x4,
+    Unorm16x2,
+    Unorm16x4,
+    Snorm16x2,
+    Snorm16x4,
+    Float16x2,
+    Float16x4,
+    Float32,
+    Float32x2,
+    Float32x3,
+    Float32x4,
+    Uint32,
+    Uint32x2,
+    Uint32x3,
+    Uint32x4,
+    Sint32,
+    Sint32x2,
+    Sint32x3,
+    Sint32x4,
+    Unorm10_10_10_2,
+}
+
+impl VertexFormat {
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        match self {
+            Self::Uint8x2 | Self::Sint8x2 | Self::Unorm8x2 | Self::Snorm8x2 => 2,
+            Self::Uint8x4
+            | Self::Sint8x4
+            | Self::Unorm8x4
+            | Self::Snorm8x4
+            | Self::Uint16x2
+            | Self::Sint16x2
+            | Self::Unorm16x2
+            | Self::Snorm16x2
+            | Self::Float16x2
+            | Self::Float32
+            | Self::Uint32
+            | Self::Sint32
+            | Self::Unorm10_10_10_2 => 4,
+            Self::Uint16x4
+            | Self::Sint16x4
+            | Self::Unorm16x4
+            | Self::Snorm16x4
+            | Self::Float16x4
+            | Self::Float32x2
+            | Self::Uint32x2
+            | Self::Sint32x2 => 8,
+            Self::Float32x3 | Self::Uint32x3 | Self::Sint32x3 => 12,
+            Self::Float32x4 | Self::Uint32x4 | Self::Sint32x4 => 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VertexAttribute {
+    pub format: VertexFormat,
+    pub offset: u64,
+    pub shader_location: u32,
+}
+
+/// One bound vertex stream and the interpretation required by the shader.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct VertexBufferLayout {
+    pub buffer: BufferRegion,
+    pub array_stride: u64,
+    pub step_mode: VertexStepMode,
+    pub attributes: Box<[VertexAttribute]>,
+}
+
+impl VertexBufferLayout {
+    pub fn new(
+        buffer: BufferRegion,
+        array_stride: u64,
+        step_mode: VertexStepMode,
+        attributes: Vec<VertexAttribute>,
+    ) -> Result<Self, CommandDescriptionError> {
+        if array_stride == 0 {
+            return Err(CommandDescriptionError::EmptyVertexStride);
+        }
+        if attributes.is_empty() {
+            return Err(CommandDescriptionError::EmptyVertexAttributes);
+        }
+        for attribute in &attributes {
+            let end = attribute
+                .offset
+                .checked_add(attribute.format.size())
+                .ok_or(CommandDescriptionError::VertexAttributeOverflow)?;
+            if end > array_stride {
+                return Err(CommandDescriptionError::VertexAttributeExceedsStride);
+            }
+        }
+        Ok(Self {
+            buffer,
+            array_stride,
+            step_mode,
+            attributes: attributes.into_boxed_slice(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrawOperation {
     pub pipeline: PipelineId,
     pub render_pass: RenderPassId,
     pub topology: PrimitiveTopology,
     pub descriptor_tables: Box<[DescriptorTableId]>,
-    pub vertex_buffers: Box<[BufferRegion]>,
+    pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
     pub arguments: DrawArguments,
@@ -280,7 +404,7 @@ impl DrawOperation {
         render_pass: RenderPassId,
         topology: PrimitiveTopology,
         descriptor_tables: Vec<DescriptorTableId>,
-        vertex_buffers: Vec<BufferRegion>,
+        vertex_buffers: Vec<VertexBufferLayout>,
         index_buffer: Option<(BufferRegion, IndexType)>,
         arguments: DrawArguments,
     ) -> Result<Self, CommandDescriptionError> {
@@ -289,6 +413,14 @@ impl DrawOperation {
         }
         if arguments.is_indexed() != index_buffer.is_some() {
             return Err(CommandDescriptionError::IndexBufferMismatch);
+        }
+        let mut shader_locations = BTreeSet::new();
+        for layout in &vertex_buffers {
+            for attribute in &layout.attributes {
+                if !shader_locations.insert(attribute.shader_location) {
+                    return Err(CommandDescriptionError::DuplicateVertexShaderLocation);
+                }
+            }
         }
         Ok(Self {
             pipeline,
@@ -773,6 +905,11 @@ pub enum CommandDescriptionError {
     EmptyViewport,
     EmptyDraw,
     IndexBufferMismatch,
+    EmptyVertexStride,
+    EmptyVertexAttributes,
+    VertexAttributeOverflow,
+    VertexAttributeExceedsStride,
+    DuplicateVertexShaderLocation,
     EmptyDispatch,
     EmptyBarrier,
     AttachmentKindMismatch,
@@ -801,6 +938,19 @@ impl Display for CommandDescriptionError {
             Self::EmptyDraw => formatter.write_str("draw has no vertices, indices, or instances"),
             Self::IndexBufferMismatch => {
                 formatter.write_str("draw arguments and index-buffer presence disagree")
+            }
+            Self::EmptyVertexStride => formatter.write_str("vertex buffer stride is zero"),
+            Self::EmptyVertexAttributes => {
+                formatter.write_str("vertex buffer layout has no attributes")
+            }
+            Self::VertexAttributeOverflow => {
+                formatter.write_str("vertex attribute byte range overflows")
+            }
+            Self::VertexAttributeExceedsStride => {
+                formatter.write_str("vertex attribute exceeds its buffer stride")
+            }
+            Self::DuplicateVertexShaderLocation => {
+                formatter.write_str("draw has duplicate vertex shader locations")
             }
             Self::EmptyDispatch => formatter.write_str("dispatch has a zero workgroup dimension"),
             Self::EmptyBarrier => formatter.write_str("barrier has no resource transitions"),
@@ -883,9 +1033,9 @@ fn draw_accesses(draw: &DrawOperation) -> Vec<ResourceAccess> {
     let mut accesses = draw
         .vertex_buffers
         .iter()
-        .map(|buffer| {
+        .map(|layout| {
             ResourceAccess::new(
-                buffer.target(),
+                layout.buffer.target(),
                 scope(
                     PipelineStages::VERTEX_INPUT,
                     AccessMode::Read,
@@ -1268,6 +1418,89 @@ mod tests {
                 vec![copy]
             ),
             Err(CommandDescriptionError::DuplicateSubmissionDependency)
+        );
+    }
+
+    #[test]
+    fn vertex_layout_preserves_interleaved_attributes_and_rejects_cross_stride_reads() {
+        let layout = VertexBufferLayout::new(
+            buffer(1, 0, 72),
+            24,
+            VertexStepMode::Vertex,
+            vec![
+                VertexAttribute {
+                    format: VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                VertexAttribute {
+                    format: VertexFormat::Float32x3,
+                    offset: 12,
+                    shader_location: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(layout.array_stride, 24);
+        assert_eq!(layout.attributes.len(), 2);
+        assert_eq!(layout.attributes[1].offset, 12);
+        assert_eq!(
+            VertexBufferLayout::new(
+                buffer(1, 0, 72),
+                16,
+                VertexStepMode::Vertex,
+                vec![VertexAttribute {
+                    format: VertexFormat::Float32x3,
+                    offset: 8,
+                    shader_location: 0,
+                }],
+            ),
+            Err(CommandDescriptionError::VertexAttributeExceedsStride)
+        );
+    }
+
+    #[test]
+    fn draw_rejects_duplicate_vertex_shader_locations() {
+        let first = VertexBufferLayout::new(
+            buffer(1, 0, 16),
+            16,
+            VertexStepMode::Vertex,
+            vec![VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 0,
+            }],
+        )
+        .unwrap();
+        let second = VertexBufferLayout::new(
+            buffer(2, 0, 16),
+            16,
+            VertexStepMode::Vertex,
+            vec![VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 0,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            DrawOperation::new(
+                PipelineId::new(1),
+                RenderPassId::new(1),
+                PrimitiveTopology::Points,
+                vec![],
+                vec![first, second],
+                None,
+                DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 1,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            ),
+            Err(CommandDescriptionError::DuplicateVertexShaderLocation)
         );
     }
 }
