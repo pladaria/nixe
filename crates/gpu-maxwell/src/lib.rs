@@ -200,6 +200,5 @@ pub use scheduler::{
     MaxwellSubmissionOrderingStage,
 };
 pub use shader::{
-    MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT, MaxwellShaderProgramHeader,
-    MaxwellShaderTranslationError,
+    MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT, MaxwellShaderTranslationError,
 };

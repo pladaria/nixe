@@ -18,7 +18,7 @@ use crate::{
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
     resolve_maxwell_three_d_resources,
-    shader::{MaxwellStagedShaderWrite, preflight_maxwell_shader_translation},
+    shader::{MaxwellStagedShaderWrite, translate_maxwell_shader_programs},
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
@@ -295,12 +295,46 @@ pub fn preflight_maxwell_submission_execution(
                     operation.trigger(),
                     crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
                 ) {
-                    preflight_maxwell_shader_translation(
+                    let programs = translate_maxwell_shader_programs(
                         operation.state(),
                         address_space,
                         &staged_shader_writes,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
+                    let directly_addressable_memory = operation
+                        .state()
+                        .shader_execution()
+                        .l1_configuration()
+                        .value()
+                        .copied()
+                        .ok_or(MaxwellSubmissionExecutionError::ShaderTranslation(
+                            MaxwellShaderTranslationError::IncompletePipelineBinding {
+                                pipeline: 0,
+                                field: "SET_L1_CONFIGURATION",
+                            },
+                        ))?;
+                    let translated = staged_cache
+                        .stage_shader_translations(&programs, directly_addressable_memory)
+                        .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
+                    let resources =
+                        resolve_maxwell_three_d_resources(operation.state(), address_space)
+                            .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                    let plan = preflight_maxwell_three_d_operation_unnegotiated(
+                        operation.state(),
+                        &resources,
+                        operation.trigger(),
+                        Some(&translated),
+                        frontend,
+                        predecessors.clone(),
+                        &staged_cache,
+                    )
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
+                    let work = plan
+                        .stage_cache(&mut staged_cache)
+                        .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
+                    steps.push(MaxwellSubmissionExecutionStep::ThreeD(work));
+                    prior_work_pending = true;
+                    continue;
                 }
                 let resources = resolve_maxwell_three_d_resources(operation.state(), address_space)
                     .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;

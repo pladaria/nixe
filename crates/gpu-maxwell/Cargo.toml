@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 nixe-gpu.workspace = true
 nixe-memory.workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }

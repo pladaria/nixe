@@ -2816,7 +2816,7 @@ fn invalid_blend_controls_and_packet_suffix_are_rejected_atomically() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x1140 / 4, &[0, 0, 0]);
+    let decoded = incrementing_packet(0x1140 / 4, &[0, 0, 0, 0]);
     assert!(matches!(
         dispatch_maxwell_engine_packet(
             &mut channel,
@@ -2824,7 +2824,7 @@ fn invalid_blend_controls_and_packet_suffix_are_rejected_atomically() {
             &decoded.packets()[0]
         ),
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1148)
+            if source.method() == GpuMethodId(0x114c)
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
@@ -5454,10 +5454,9 @@ fn coverage_line_and_vertex_array_restart_selectors_separate_pipeline_identity()
     program_basic_draw_state(&mut channel, vertex);
     program_color_target(&mut channel, 0, target, 0xd5);
     program_three_d(&mut channel, 0x121c, 1);
-    let shaders = translated_graphics_shaders();
+    let (shaders, mut cache) = translated_graphics_shaders();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let mut cache = MaxwellThreeDLoweringCache::default();
     let draw = packet(0x0d78 / 4, 3);
 
     let dispatch = dispatch_maxwell_engine_packet(
@@ -5608,10 +5607,9 @@ fn disabled_blend_pipeline_identity_tracks_only_effective_active_selectors() {
     program_basic_draw_state(&mut channel, vertex);
     program_color_target(&mut channel, 0, target, 0xd5);
     program_three_d(&mut channel, 0x121c, 1);
-    let shaders = translated_graphics_shaders();
+    let (shaders, mut cache) = translated_graphics_shaders();
     let capabilities =
         lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
-    let mut cache = MaxwellThreeDLoweringCache::default();
     let draw = packet(0x0d78 / 4, 3);
 
     let dispatch = dispatch_maxwell_engine_packet(

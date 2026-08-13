@@ -1017,6 +1017,7 @@ dependencies = [
 name = "nixe-gpu"
 version = "0.1.0"
 dependencies = [
+ "naga",
  "nixe-memory",
 ]
 
@@ -1033,6 +1034,7 @@ dependencies = [
 name = "nixe-gpu-maxwell"
 version = "0.1.0"
 dependencies = [
+ "naga",
  "nixe-gpu",
  "nixe-memory",
 ]

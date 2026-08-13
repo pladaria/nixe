@@ -28,7 +28,8 @@ Thumbs.db
 /roms/*
 !/roms/homebrew/
 !/roms/homebrew/**
-/notes/
+/notes/*
+!/notes/triangle.md
 /keys/
 /cache/
 /storage/

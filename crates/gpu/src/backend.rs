@@ -14,7 +14,8 @@ use crate::{
     DescriptorTableDescription, DescriptorTableId, FrontendSubmissionId, GpuAllocationDescription,
     GpuAllocationId, ImageDescription, ImageId, ImageView, ImageViewError, OperationSubmission,
     PipelineDescription, PipelineId, QueryPoolDescription, QueryPoolId, RenderPassDescription,
-    RenderPassId, ResourceDependency, SamplerDescription, SamplerId, ShaderDescription, ShaderId,
+    RenderPassId, ResourceDependency, SamplerDescription, SamplerId, ShaderBackendModule,
+    ShaderDescription, ShaderId, ShaderStage,
 };
 
 /// Semantic kind carried by every backend resource handle.
@@ -89,9 +90,9 @@ impl Display for BackendResourceHandle {
 
 /// Complete immutable input used to create one backend resource.
 ///
-/// Logical descriptions remain separate from optional backing views. Later
-/// shader-IR and descriptor-content types can extend their respective variants
-/// without exposing a host object here.
+/// Logical descriptions remain separate from optional backing views. Shader
+/// modules are backend-language source produced from verified neutral IR, never
+/// guest ISA bytes or host handles.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BackendResourceCreateInfo {
     Allocation {
@@ -115,6 +116,7 @@ pub enum BackendResourceCreateInfo {
     Shader {
         id: ShaderId,
         description: ShaderDescription,
+        module: ShaderBackendModule,
     },
     Pipeline {
         id: PipelineId,
@@ -676,6 +678,18 @@ impl<D: BackendDriver> Backend<D> {
                     self.validate_backing_view(binding.backing())?;
                 }
             }
+            BackendResourceCreateInfo::Shader {
+                description,
+                module,
+                ..
+            } if description.stage != module.stage() => {
+                return Err(BackendError::InvalidResource(
+                    BackendResourceValidationError::ShaderStageMismatch {
+                        description: description.stage,
+                        module: module.stage(),
+                    },
+                ));
+            }
             _ => {}
         }
         Ok(())
@@ -943,6 +957,10 @@ pub enum BackendResourceValidationError {
     LogicalIdentityMismatch,
     BufferView(BufferViewError),
     ImageView(ImageViewError),
+    ShaderStageMismatch {
+        description: ShaderStage,
+        module: ShaderStage,
+    },
     BackingRangeOverflow,
     BackingOutOfBounds {
         allocation: GpuAllocationId,
@@ -961,6 +979,13 @@ impl Display for BackendResourceValidationError {
             ),
             Self::BufferView(error) => write!(formatter, "invalid backend buffer view: {error}"),
             Self::ImageView(error) => write!(formatter, "invalid backend image view: {error}"),
+            Self::ShaderStageMismatch {
+                description,
+                module,
+            } => write!(
+                formatter,
+                "backend shader description stage {description:?} contradicts module stage {module:?}"
+            ),
             Self::BackingRangeOverflow => {
                 formatter.write_str("backend resource backing range overflows")
             }
@@ -989,7 +1014,8 @@ mod tests {
     use super::*;
     use crate::{
         BackendFeatures, BackendLimits, BufferRange, BufferRegion, CopyOperation, GpuCommand,
-        GpuOperation,
+        GpuOperation, ShaderInstruction, ShaderIr, ShaderOperation, ShaderPredicate,
+        ShaderSourceLocation, VerifiedShaderIr, lower_shader_ir_to_wgsl,
     };
 
     #[derive(Default)]
@@ -1114,6 +1140,40 @@ mod tests {
         );
         OperationSubmission::new(FrontendSubmissionId::new(id), Vec::new(), vec![operation])
             .unwrap()
+    }
+
+    #[test]
+    fn shader_description_cannot_contradict_verified_module_stage() {
+        let ir = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ShaderInstruction::new(
+                ShaderSourceLocation::new(0),
+                ShaderPredicate::Always,
+                ShaderOperation::Exit,
+            )],
+        ))
+        .unwrap();
+        let module = lower_shader_ir_to_wgsl(&ir).unwrap();
+        let mut backend = backend(1);
+        assert_eq!(
+            backend.create_resource(BackendResourceCreateInfo::Shader {
+                id: ShaderId::new(1),
+                description: ShaderDescription {
+                    stage: ShaderStage::Fragment,
+                },
+                module,
+            }),
+            Err(BackendError::InvalidResource(
+                BackendResourceValidationError::ShaderStageMismatch {
+                    description: ShaderStage::Fragment,
+                    module: ShaderStage::Vertex,
+                }
+            ))
+        );
+        assert!(backend.driver().creates.is_empty());
     }
 
     #[test]

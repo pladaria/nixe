@@ -267,27 +267,28 @@ fn program_basic_draw_state(channel: &mut MaxwellGpuChannel, vertex: u64) {
     }
 }
 
-fn translated_graphics_shaders() -> MaxwellThreeDTranslatedShaders {
-    MaxwellThreeDTranslatedShaders::new(
+fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThreeDLoweringCache) {
+    let shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                7,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                9,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
                 0,
             ),
         ],
         Vec::new(),
     )
-    .unwrap()
+    .unwrap();
+    let mut cache = MaxwellThreeDLoweringCache::default();
+    cache.seed_test_shader_translations(&shaders);
+    (shaders, cache)
 }
 
 mod graphics_pipeline;
