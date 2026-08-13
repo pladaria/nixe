@@ -2,8 +2,8 @@ use std::fmt::{Display, Formatter, Write};
 
 use nixe_gpu::GraphicsGapKind;
 use nixe_gpu_maxwell::{
-    MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError, MaxwellScheduleError,
-    MaxwellSoftwareInitializationError, MaxwellUnsupportedGpfifoSubmission,
+    MaxwellBackendExecutionError, MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError,
+    MaxwellScheduleError, MaxwellSoftwareInitializationError, MaxwellUnsupportedGpfifoSubmission,
 };
 use nixe_memory::CanonicalRangeTranslationError;
 
@@ -26,6 +26,7 @@ pub enum NvDrvValidationReason {
     GpfifoMemoryResolutionFailed,
     GpfifoSchedulingUnavailable,
     MaxwellPacketSemanticsUnavailable,
+    NeutralBackendExecutionFailed,
 }
 
 impl Display for NvDrvValidationReason {
@@ -42,6 +43,7 @@ impl Display for NvDrvValidationReason {
             Self::GpfifoMemoryResolutionFailed => "gpfifo-memory-resolution-failed",
             Self::GpfifoSchedulingUnavailable => "gpfifo-scheduling-unavailable",
             Self::MaxwellPacketSemanticsUnavailable => "maxwell-packet-semantics-unavailable",
+            Self::NeutralBackendExecutionFailed => "neutral-backend-execution-failed",
         })
     }
 }
@@ -132,6 +134,11 @@ pub enum UnsupportedNvDrvOperation {
         boundary: Box<MaxwellFrontendDispatchBoundary>,
         error: Box<MaxwellSoftwareInitializationError>,
     },
+    ScheduledGpfifoBackendExecution {
+        context: NvDrvErrorContext,
+        boundary: Box<MaxwellFrontendDispatchBoundary>,
+        error: Box<MaxwellBackendExecutionError>,
+    },
     CanonicalMemory {
         context: NvDrvErrorContext,
         fault: CanonicalRangeTranslationError,
@@ -152,9 +159,9 @@ impl UnsupportedNvDrvOperation {
             | Self::GpfifoMemory { .. }
             | Self::GpfifoScheduling { .. }
             | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
-            Self::ScheduledGpfifoSubmission { .. } | Self::ScheduledGpfifoExecution { .. } => {
-                GraphicsGapKind::GpuPacket
-            }
+            Self::ScheduledGpfifoSubmission { .. }
+            | Self::ScheduledGpfifoExecution { .. }
+            | Self::ScheduledGpfifoBackendExecution { .. } => GraphicsGapKind::GpuPacket,
         }
     }
 }
@@ -233,6 +240,20 @@ impl Display for UnsupportedNvDrvOperation {
             } => write!(
                 formatter,
                 "validated GPFIFO work cannot execute through the immediate Maxwell initialization path: device={} request={:#010x} fd={} reason={} detail=[{}] dispatch=[{}]",
+                context.device().path(),
+                context.request(),
+                context.fd(),
+                context.reason(),
+                error,
+                boundary
+            ),
+            Self::ScheduledGpfifoBackendExecution {
+                context,
+                boundary,
+                error,
+            } => write!(
+                formatter,
+                "validated GPFIFO work reached the neutral backend but execution failed: device={} request={:#010x} fd={} reason={} detail=[{}] dispatch=[{}]",
                 context.device().path(),
                 context.request(),
                 context.fd(),

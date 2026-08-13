@@ -13,6 +13,8 @@ use nixe_config::{
 };
 use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
+use nixe_gpu::BackendInstanceId;
+use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
     HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
     UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
@@ -20,6 +22,7 @@ use nixe_horizon::{
 use nixe_input::{
     ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
 };
+use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
@@ -192,7 +195,19 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
     );
-    let video_system = VideoSystem::new(mailbox);
+    let gpu_backend = initialize_backend(
+        BackendInstanceId::new(1),
+        NonCpuDeviceId::new(1),
+        WgpuBackendConfiguration::default(),
+    )
+    .map_err(|error| format!("cannot initialize accelerated GPU backend: {error}"))?;
+    log::info!(
+        "GPU backend initialized: api={:?} adapter={} driver={}",
+        gpu_backend.adapter.backend,
+        gpu_backend.adapter.name,
+        gpu_backend.adapter.driver
+    );
+    let video_system = VideoSystem::with_gpu_backend(mailbox, gpu_backend.into_runtime());
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
 
     let Some(frontend) = frontend else {

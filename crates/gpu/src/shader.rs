@@ -843,14 +843,20 @@ pub fn lower_shader_ir_to_wgsl(
     let input_groups = interface_groups(&ir.inputs)?;
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
-    emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
+    if !input_groups.is_empty() {
+        emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
+    }
     emit_interface_struct(&mut source, "ShaderOutput", ir.stage, false, &output_groups)?;
     source.push_str(match ir.stage {
         ShaderStage::Vertex => "@vertex\n",
         ShaderStage::Fragment => "@fragment\n",
         _ => unreachable!(),
     });
-    source.push_str("fn main(input: ShaderInput) -> ShaderOutput {\n");
+    if input_groups.is_empty() {
+        source.push_str("fn main() -> ShaderOutput {\n");
+    } else {
+        source.push_str("fn main(input: ShaderInput) -> ShaderOutput {\n");
+    }
     source.push_str("  var registers: array<u32, 256>;\n");
     source.push_str("  var output: ShaderOutput;\n");
     let mut source_map = Vec::new();

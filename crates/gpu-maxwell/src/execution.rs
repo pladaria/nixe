@@ -3,8 +3,10 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{
-    CacheMaintenanceOperation, CapabilityRequirements, FrontendSubmissionId, GpuCommand,
-    GpuOperation, GuestTimelinePoint, ReservedTimelinePoint,
+    BackendExecutionCompletion, BackendResourceCreateInfo, BackendRuntimeError,
+    CacheMaintenanceOperation, CapabilityRequirements, CommandDescriptionError,
+    FrontendSubmissionId, GpuCommand, GpuOperation, GuestTimelinePoint, NeutralBackendRuntime,
+    OperationSubmission, ReservedTimelinePoint, ResourceDependency,
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
@@ -55,12 +57,24 @@ pub enum MaxwellSubmissionExecutionStep {
 /// reservation remains owned by the scheduled dispatch until backend work and
 /// memory visibility have completed.
 pub struct MaxwellSubmissionExecutionPlan {
+    frontend: FrontendSubmissionId,
+    predecessors: Box<[FrontendSubmissionId]>,
     steps: Box<[MaxwellSubmissionExecutionStep]>,
     staged_cache: MaxwellThreeDLoweringCache,
     completion: Option<GuestTimelinePoint>,
 }
 
 impl MaxwellSubmissionExecutionPlan {
+    #[must_use]
+    pub const fn frontend(&self) -> FrontendSubmissionId {
+        self.frontend
+    }
+
+    #[must_use]
+    pub fn predecessors(&self) -> &[FrontendSubmissionId] {
+        &self.predecessors
+    }
+
     #[must_use]
     pub fn steps(&self) -> &[MaxwellSubmissionExecutionStep] {
         &self.steps
@@ -75,6 +89,15 @@ impl MaxwellSubmissionExecutionPlan {
     pub const fn completion(&self) -> Option<GuestTimelinePoint> {
         self.completion
     }
+
+    /// Returns whether this plan contains work which must cross a neutral GPU
+    /// backend instead of the canonical-memory initialization executor.
+    #[must_use]
+    pub fn requires_backend(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, MaxwellSubmissionExecutionStep::ThreeD(_)))
+    }
 }
 
 /// Successful immediate software execution of an initialization submission.
@@ -82,6 +105,52 @@ pub struct MaxwellSoftwareInitializationCompletion {
     staged_cache: MaxwellThreeDLoweringCache,
     completion: Option<GuestTimelinePoint>,
 }
+
+/// Successful serialized execution of a complete Maxwell submission.
+pub struct MaxwellBackendExecutionCompletion {
+    staged_cache: MaxwellThreeDLoweringCache,
+    completion: Option<GuestTimelinePoint>,
+    backend: BackendExecutionCompletion,
+}
+
+impl MaxwellBackendExecutionCompletion {
+    #[must_use]
+    pub const fn staged_cache(&self) -> &MaxwellThreeDLoweringCache {
+        &self.staged_cache
+    }
+
+    #[must_use]
+    pub const fn completion(&self) -> Option<GuestTimelinePoint> {
+        self.completion
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> BackendExecutionCompletion {
+        self.backend
+    }
+}
+
+/// Failure before guest completion publication at the Maxwell/backend bridge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaxwellBackendExecutionError {
+    Software(Box<MaxwellSoftwareInitializationError>),
+    InvalidSubmission(CommandDescriptionError),
+    Backend(BackendRuntimeError),
+}
+
+impl Display for MaxwellBackendExecutionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Software(error) => Display::fmt(error, formatter),
+            Self::InvalidSubmission(error) => {
+                write!(formatter, "neutral Maxwell submission is invalid: {error}")
+            }
+            Self::Backend(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for MaxwellBackendExecutionError {}
 
 impl MaxwellSoftwareInitializationCompletion {
     #[must_use]
@@ -413,6 +482,8 @@ pub fn preflight_maxwell_submission_execution(
     }
 
     Ok(MaxwellSubmissionExecutionPlan {
+        frontend,
+        predecessors: predecessors.into_boxed_slice(),
         steps: steps.into_boxed_slice(),
         staged_cache,
         completion: completion.map(ReservedTimelinePoint::point),
@@ -592,6 +663,160 @@ pub fn execute_maxwell_software_initialization(
         staged_cache: plan.staged_cache,
         completion: plan.completion,
     })
+}
+
+/// Executes one preflighted submission through the selected neutral backend.
+///
+/// Command-processor inline writes are committed before host GPU consumption;
+/// report-semaphore writes are committed only after host completion and GPU
+/// write visibility. The caller still owns guest timeline publication and may
+/// advance it only after this function succeeds.
+pub fn execute_maxwell_backend_submission(
+    plan: MaxwellSubmissionExecutionPlan,
+    address_space: &MaxwellGpuAddressSpace,
+    backend: &mut dyn NeutralBackendRuntime,
+) -> Result<MaxwellBackendExecutionCompletion, MaxwellBackendExecutionError> {
+    let mut pre_writes = CanonicalWriteBatch::new();
+    let mut post_writes = CanonicalWriteBatch::new();
+    let mut pre_write_source = None;
+    let mut post_write_source = None;
+    let mut creations = Vec::<BackendResourceCreateInfo>::new();
+    let mut invalidations = Vec::<ResourceDependency>::new();
+    let mut operations = Vec::<GpuOperation>::new();
+
+    for step in &plan.steps {
+        match step {
+            MaxwellSubmissionExecutionStep::HostSynchronization { operation, .. } => {
+                operations.push(operation.clone());
+            }
+            MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut pre_writes,
+                )
+                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                pre_write_source = Some(upload.source());
+            }
+            MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut pre_writes,
+                )
+                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                pre_write_source = Some(upload.source());
+            }
+            MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut pre_writes,
+                )
+                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                pre_write_source = Some(upload.source());
+            }
+            MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    release.payload().to_le_bytes(),
+                    release.source(),
+                    &mut post_writes,
+                )
+                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                post_write_source = Some(release.source());
+            }
+            MaxwellSubmissionExecutionStep::ThreeD(work) => {
+                creations.extend_from_slice(work.resource_creations());
+                invalidations.extend_from_slice(work.resource_invalidations());
+                operations.extend_from_slice(work.submission().operations());
+            }
+            MaxwellSubmissionExecutionStep::ComputeSynchronization(plan) => match plan {
+                MaxwellComputeSynchronizationPlan::WaitForIdle { .. } => {}
+                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches } => {
+                    operations.push(cache_maintenance_operation(
+                        CacheMaintenanceOperation::InvalidateShaderCaches {
+                            instruction: caches.instruction(),
+                            global_data: caches.global_data(),
+                            constant: caches.constant(),
+                        },
+                    ));
+                }
+            },
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan) => match plan {
+                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
+                    maintenance, ..
+                }
+                | MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
+                    maintenance,
+                    ..
+                }
+                | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi {
+                    maintenance,
+                    ..
+                }
+                | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
+                    maintenance, ..
+                } => operations.push(cache_maintenance_operation(*maintenance)),
+                MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
+                    operations.push(cache_maintenance_operation(
+                        CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+                    ));
+                }
+                MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. } => {}
+                MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_) => {
+                    return Err(MaxwellBackendExecutionError::Software(Box::new(
+                        MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan,
+                    )));
+                }
+            },
+        }
+    }
+
+    commit_inline_batch(pre_writes, pre_write_source)
+        .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+    let submission =
+        OperationSubmission::new(plan.frontend, plan.predecessors.to_vec(), operations)
+            .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
+    let completion = backend
+        .execute(&creations, &invalidations, &submission)
+        .map_err(MaxwellBackendExecutionError::Backend)?;
+    commit_inline_batch(post_writes, post_write_source)
+        .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+
+    Ok(MaxwellBackendExecutionCompletion {
+        staged_cache: plan.staged_cache,
+        completion: plan.completion,
+        backend: completion,
+    })
+}
+
+fn cache_maintenance_operation(maintenance: CacheMaintenanceOperation) -> GpuOperation {
+    GpuOperation::new(
+        GpuCommand::CacheMaintenance(maintenance),
+        [],
+        [],
+        CapabilityRequirements::none(),
+    )
+}
+
+fn commit_inline_batch(
+    writes: CanonicalWriteBatch,
+    source: Option<MaxwellMethodSource>,
+) -> Result<(), MaxwellSoftwareInitializationError> {
+    writes
+        .commit()
+        .map_err(|error| MaxwellSoftwareInitializationError::InlineWrite {
+            source: source.expect("a non-empty canonical write batch has an inline source"),
+            error,
+        })
 }
 
 fn stage_inline_write(

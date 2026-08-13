@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use nixe_gpu::NeutralBackendRuntime;
+
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
     MaxwellGpuChannel, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
@@ -74,6 +76,18 @@ struct NvDrvClientState {
     nvhost_control: NvHostControl,
     nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
+    gpu_backend: Option<NvDrvGpuBackend>,
+}
+
+struct NvDrvGpuBackend(Box<dyn NeutralBackendRuntime>);
+
+impl std::fmt::Debug for NvDrvGpuBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NvDrvGpuBackend")
+            .field("capabilities", self.0.capabilities())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -109,6 +123,15 @@ impl Default for NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_backend(None)
+    }
+
+    #[must_use]
+    pub fn with_gpu_backend(backend: Box<dyn NeutralBackendRuntime>) -> Self {
+        Self::new_with_backend(Some(NvDrvGpuBackend(backend)))
+    }
+
+    fn new_with_backend(gpu_backend: Option<NvDrvGpuBackend>) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
@@ -125,6 +148,7 @@ impl NvDrvSession {
                 nvhost_control: NvHostControl::default(),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
+                gpu_backend,
             })),
         }
     }
@@ -390,6 +414,7 @@ impl NvDrvSession {
                     nvhost_control,
                     devices,
                     gpu_address_spaces,
+                    gpu_backend,
                     ..
                 } = &mut *state;
                 nvhost_gpu
@@ -398,6 +423,10 @@ impl NvDrvSession {
                             control: nvhost_control,
                             devices,
                             address_spaces: gpu_address_spaces,
+                            backend: match gpu_backend.as_mut() {
+                                Some(backend) => Some(backend.0.as_mut()),
+                                None => None,
+                            },
                         },
                         descriptor,
                         request,
@@ -584,6 +613,11 @@ impl NvDrvSession {
             state.nvhost_control.release_channel_syncpoint(syncpoint);
         }
         state.nvhost_control.clear();
+        if let Some(mut backend) = state.gpu_backend.take()
+            && let Err(error) = backend.0.teardown()
+        {
+            log::warn!("neutral GPU backend teardown failed: {error}");
+        }
         state.initialized = false;
         state.client_identity = None;
         report

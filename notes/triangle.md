@@ -1913,33 +1913,64 @@ linking, and the first real draw submission.
 Purpose: execute neutral operations on a host GPU without making the host API
 part of the guest contract.
 
-- [ ] **TRI-200** Define backend initialization and immutable capability
+- [x] **TRI-200** Define backend initialization and immutable capability
       reporting independently from the Switch 1 GPU profile.
-- [ ] **TRI-201** Implement resource creation, destruction, views, samplers,
+- [x] **TRI-201** Implement resource creation, destruction, views, samplers,
       shader modules, pipelines, command recording, submission, and completion
       using `wgpu`.
-- [ ] **TRI-202** Keep Vulkan as the first enabled backend while avoiding
+- [x] **TRI-202** Keep Vulkan as the first enabled backend while avoiding
       Vulkan-specific types in neutral or Switch-specific crates.
-- [ ] **TRI-203** Leave an explicit backend selection path for Metal and other
+- [x] **TRI-203** Leave an explicit backend selection path for Metal and other
       `wgpu` backends; do not claim macOS support while only Vulkan is enabled.
-- [ ] **TRI-204** Implement a conservative canonical-host-memory plus staging
+- [x] **TRI-204** Implement a conservative canonical-host-memory plus staging
       or device-local-mirror policy.
-- [ ] **TRI-205** Upload CPU-newer input ranges before backend consumption.
-- [ ] **TRI-206** Mark GPU-written ranges and make required downloads or
+- [x] **TRI-205** Upload CPU-newer input ranges before backend consumption.
+- [x] **TRI-206** Mark GPU-written ranges and make required downloads or
       invalidations occur before guest CPU visibility.
-- [ ] **TRI-207** Serialize initial submissions if needed for correctness, while
+- [x] **TRI-207** Serialize initial submissions if needed for correctness, while
       retaining explicit submission and dependency objects.
-- [ ] **TRI-208** Translate neutral access declarations into backend resource
+- [x] **TRI-208** Translate neutral access declarations into backend resource
       usages, command ordering, and barriers.
-- [ ] **TRI-209** Implement backend completion tokens without equating them to
+- [x] **TRI-209** Implement backend completion tokens without equating them to
       guest syncpoints until visibility work is complete.
-- [ ] **TRI-210** Handle unsupported formats or operations with typed backend
+- [x] **TRI-210** Handle unsupported formats or operations with typed backend
       capability errors; never substitute a semantically different format
       silently.
-- [ ] **TRI-211** Handle host device loss as a typed emulator failure with
+- [x] **TRI-211** Handle host device loss as a typed emulator failure with
       deterministic guest resource teardown.
-- [ ] **TRI-212** Compare accelerated clear/draw results against deterministic
+- [x] **TRI-212** Compare accelerated clear/draw results against deterministic
       headless or reference results with tolerances defined by guest semantics.
+- [x] **TRI-213** Connect the application-selected neutral backend to the real
+      `nvdrv` Maxwell submission path, including canonical visibility, host
+      completion, guest syncpoint ordering, and deterministic teardown.
+- [x] **TRI-214** Preserve validated Maxwell vertex stream strides, attribute
+      offsets, numeric formats, shader locations, and step modes in the neutral
+      draw contract, then bind those exact layouts and ranges in `wgpu`.
+- [x] **TRI-215** Convert the normal Maxwell positive-X/negative-Y viewport
+      transform exactly into WebGPU's positive dimensions and top-left
+      framebuffer convention, retaining typed failures for unsupported axis or
+      reversed-depth mappings.
+
+Implementation checkpoint: `nixe-gpu-wgpu` owns host selection, immutable
+adapter capabilities, `wgpu` objects, serialized command execution, staging,
+page mirrors, readback, and device-loss observation. The neutral and Maxwell
+crates remain host-API-free. The first accelerated subset covers exact buffer
+clear/copy and attachment clear/draw semantics used by the synthetic exit
+workload. Operation forms whose neutral metadata is not yet sufficient for an
+exact host representation remain typed failures rather than approximations.
+The CLI composition root now creates the accelerated backend in both headless
+and windowed modes and injects only an object-safe neutral runtime into
+Horizon. Real Maxwell plans retain staged frontend state until resource
+creation, host submission, readback, and canonical visibility succeed; only
+then may Horizon publish the reserved guest syncpoint.
+The first external T11 run exposed the previously missing vertex-input
+boundary. Neutral draws now reject invalid or duplicate locations, Maxwell
+lowers only formats with an exact host representation, and the accelerated
+acceptance draw exercises the demo's interleaved `float3` position/color
+layout (24-byte stride, offsets 0 and 12).
+The following external run reached dynamic viewport encoding. The backend now
+uses WebGPU's inherent NDC-to-top-left Y inversion to preserve Maxwell's
+negative Y scale, and the accelerated acceptance draw covers that exact path.
 
 Exit criterion: synthetic buffers, shaders, clears, and draws execute through
 the neutral interface on the accelerated backend, and completion makes the

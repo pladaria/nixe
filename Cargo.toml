@@ -9,6 +9,7 @@ members = [
     "crates/gpu",
     "crates/gpu-headless",
     "crates/gpu-maxwell",
+    "crates/gpu-wgpu",
     "crates/horizon",
     "crates/input",
     "crates/loader/content",
@@ -59,6 +60,7 @@ nixe-cpu-engine-testkit = { path = "crates/cpu-engine-testkit" }
 nixe-gpu = { path = "crates/gpu" }
 nixe-gpu-headless = { path = "crates/gpu-headless" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }
+nixe-gpu-wgpu = { path = "crates/gpu-wgpu" }
 nixe-horizon = { path = "crates/horizon" }
 nixe-input = { path = "crates/input" }
 nixe-loader-content = { path = "crates/loader/content" }

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nixe_gpu::NeutralBackendRuntime;
 use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, Frame, FrameMailbox};
 
@@ -189,6 +190,23 @@ impl Default for VideoSystem {
 impl VideoSystem {
     #[must_use]
     pub fn new(mailbox: FrameMailbox) -> Self {
+        Self::new_with_gpu_backend(mailbox, None)
+    }
+
+    /// Constructs the process graphics system with a composition-root-selected
+    /// neutral GPU backend. Horizon never observes its concrete host API.
+    #[must_use]
+    pub fn with_gpu_backend(
+        mailbox: FrameMailbox,
+        backend: Box<dyn NeutralBackendRuntime>,
+    ) -> Self {
+        Self::new_with_gpu_backend(mailbox, Some(backend))
+    }
+
+    fn new_with_gpu_backend(
+        mailbox: FrameMailbox,
+        backend: Option<Box<dyn NeutralBackendRuntime>>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(VideoState {
                 next_layer_id: 1,
@@ -198,7 +216,7 @@ impl VideoSystem {
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 mailbox,
-                nvdrv: NvDrvSession::new(),
+                nvdrv: backend.map_or_else(NvDrvSession::new, NvDrvSession::with_gpu_backend),
                 next_frame_sequence: 1,
                 pending_frames: VecDeque::new(),
             })),

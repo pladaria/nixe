@@ -16,7 +16,8 @@ use nixe_gpu::{
     OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
     PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId, RenderPassOperation,
     ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, ShaderDescription,
-    ShaderId, ShaderStage, ViewportTransform,
+    ShaderId, ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+    ViewportTransform,
 };
 
 use crate::MaxwellMethodSource;
@@ -36,8 +37,8 @@ use super::{
     MaxwellThreeDRenderTargetLayer, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
     MaxwellThreeDResourceRole, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData,
     MaxwellThreeDShadeMode, MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage,
-    MaxwellThreeDState, MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportPixelCenter,
-    MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDState, MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
+    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
 };
 
 #[derive(Clone, Debug)]
@@ -2393,7 +2394,31 @@ fn lower_draw(
 
     let mut vertex_buffers = Vec::new();
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
-        if !stream.format().value().is_some_and(|value| value.enabled()) {
+        let Some(stream_format) = stream.format().value().filter(|value| value.enabled()) else {
+            continue;
+        };
+        let attributes = state
+            .vertex_input()
+            .attributes()
+            .iter()
+            .enumerate()
+            .filter_map(|(location, attribute)| {
+                attribute
+                    .value()
+                    .filter(|attribute| {
+                        attribute.enabled() && usize::from(attribute.stream()) == index
+                    })
+                    .map(|attribute| (location, *attribute))
+            })
+            .map(|(location, attribute)| {
+                Ok(VertexAttribute {
+                    format: neutral_vertex_format(location as u8, attribute)?,
+                    offset: u64::from(attribute.offset()),
+                    shader_location: location as u32,
+                })
+            })
+            .collect::<Result<Vec<_>, MaxwellThreeDLoweringError>>()?;
+        if attributes.is_empty() {
             continue;
         }
         let resource = resource_index(
@@ -2401,14 +2426,37 @@ fn lower_draw(
             MaxwellThreeDResourceRole::VertexStream(index as u8),
         )?;
         let buffer = resolved_buffer(resources, resource)?;
-        vertex_buffers.push(BufferRegion {
+        let region = BufferRegion {
             buffer: buffer_dependency(binding_at(resources, bindings, resource)?)?,
             range: BufferRange::new(0, buffer.description().size()).map_err(|_| {
                 MaxwellThreeDLoweringError::InvalidResolvedView {
                     role: buffer.role(),
                 }
             })?,
-        });
+        };
+        let instanced = stream.instanced().value().copied().unwrap_or(false);
+        let frequency = stream.frequency().value().copied().unwrap_or(1);
+        if instanced && frequency != 1 {
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedVertexInstanceDivisor {
+                    stream: index as u8,
+                    divisor: frequency,
+                },
+            );
+        }
+        vertex_buffers.push(
+            VertexBufferLayout::new(
+                region,
+                u64::from(stream_format.stride()),
+                if instanced {
+                    VertexStepMode::Instance
+                } else {
+                    VertexStepMode::Vertex
+                },
+                attributes,
+            )
+            .map_err(MaxwellThreeDLoweringError::Command)?,
+        );
     }
     if vertex_buffers.is_empty() {
         return Err(MaxwellThreeDLoweringError::IncompleteDraw("vertex stream"));
@@ -2713,6 +2761,81 @@ fn primitive_topology(
     }
 }
 
+fn neutral_vertex_format(
+    attribute: u8,
+    format: super::MaxwellThreeDVertexAttributeFormat,
+) -> Result<VertexFormat, MaxwellThreeDLoweringError> {
+    let widths = format
+        .component_widths()
+        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_VERTEX_ATTRIBUTE_A",
+        ))?;
+    let numerical = format
+        .numerical_type()
+        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_VERTEX_ATTRIBUTE_A",
+        ))?;
+    if format.swap_red_blue() {
+        return Err(
+            MaxwellThreeDLoweringError::UnsupportedVertexAttributeFormat {
+                attribute,
+                component_widths: widths,
+                numerical_type: numerical,
+                swap_red_blue: true,
+            },
+        );
+    }
+
+    // Maxwell field values are pinned to NVIDIA's public class header:
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9097.h#L1021-L1055
+    let vertex = match (widths.raw(), numerical) {
+        (0x01, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x4,
+        (0x02, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x3,
+        (0x04, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x2,
+        (0x12, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32,
+        (0x03, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float16x4,
+        (0x0f, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float16x2,
+        (0x01, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint32x4,
+        (0x02, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint32x3,
+        (0x04, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint32x2,
+        (0x12, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint32,
+        (0x01, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint32x4,
+        (0x02, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint32x3,
+        (0x04, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint32x2,
+        (0x12, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint32,
+        (0x03, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint16x4,
+        (0x0f, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint16x2,
+        (0x03, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint16x4,
+        (0x0f, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint16x2,
+        (0x03, MaxwellThreeDVertexNumericalType::SignedNormalized) => VertexFormat::Snorm16x4,
+        (0x0f, MaxwellThreeDVertexNumericalType::SignedNormalized) => VertexFormat::Snorm16x2,
+        (0x03, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => VertexFormat::Unorm16x4,
+        (0x0f, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => VertexFormat::Unorm16x2,
+        (0x0a, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint8x4,
+        (0x18, MaxwellThreeDVertexNumericalType::SignedInteger) => VertexFormat::Sint8x2,
+        (0x0a, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint8x4,
+        (0x18, MaxwellThreeDVertexNumericalType::UnsignedInteger) => VertexFormat::Uint8x2,
+        (0x0a, MaxwellThreeDVertexNumericalType::SignedNormalized) => VertexFormat::Snorm8x4,
+        (0x18, MaxwellThreeDVertexNumericalType::SignedNormalized) => VertexFormat::Snorm8x2,
+        (0x0a, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => VertexFormat::Unorm8x4,
+        (0x18, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => VertexFormat::Unorm8x2,
+        (0x30, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => {
+            VertexFormat::Unorm10_10_10_2
+        }
+        _ => {
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedVertexAttributeFormat {
+                    attribute,
+                    component_widths: widths,
+                    numerical_type: numerical,
+                    swap_red_blue: false,
+                },
+            );
+        }
+    };
+    Ok(vertex)
+}
+
 fn attachment_records(
     resources: &MaxwellThreeDResolvedResources,
     bindings: &[Option<ResourceDependency>],
@@ -2948,6 +3071,16 @@ pub enum MaxwellThreeDLoweringError {
         topology: u8,
         vertex_count: u32,
     },
+    UnsupportedVertexAttributeFormat {
+        attribute: u8,
+        component_widths: super::MaxwellThreeDVertexComponentWidths,
+        numerical_type: super::MaxwellThreeDVertexNumericalType,
+        swap_red_blue: bool,
+    },
+    UnsupportedVertexInstanceDivisor {
+        stream: u8,
+        divisor: u32,
+    },
     InvalidPatchSize(MaxwellThreeDPatchSize),
     UnsupportedPatchSemantics(MaxwellThreeDPatchSize),
     UnsupportedPointSpriteCoordinatesSemantics(MaxwellThreeDPointSpriteSelect),
@@ -3171,6 +3304,20 @@ impl Display for MaxwellThreeDLoweringError {
             } => write!(
                 formatter,
                 "MAXWELL_B enabled vertex-array primitive restart may change primitive segmentation: topology={topology:#x} vertex-count={vertex_count}"
+            ),
+            Self::UnsupportedVertexAttributeFormat {
+                attribute,
+                component_widths,
+                numerical_type,
+                swap_red_blue,
+            } => write!(
+                formatter,
+                "MAXWELL_B vertex attribute has no exact neutral format: attribute={attribute} component-widths=0x{:02x} numerical-type={numerical_type:?} swap-red-blue={swap_red_blue}",
+                component_widths.raw()
+            ),
+            Self::UnsupportedVertexInstanceDivisor { stream, divisor } => write!(
+                formatter,
+                "MAXWELL_B vertex stream instance divisor is not representable: stream={stream} divisor={divisor}"
             ),
             Self::InvalidPatchSize(size) => write!(
                 formatter,
@@ -3431,7 +3578,13 @@ const fn vertex_array_restart_is_neutral(topology: u8, vertex_count: u32) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{depth_stencil_attachment_required, vertex_array_restart_is_neutral};
+    use nixe_gpu::VertexFormat;
+
+    use crate::MaxwellThreeDVertexAttributeFormat;
+
+    use super::{
+        depth_stencil_attachment_required, neutral_vertex_format, vertex_array_restart_is_neutral,
+    };
 
     #[test]
     fn depth_stencil_attachment_is_omitted_only_when_both_tests_are_explicitly_disabled() {
@@ -3463,5 +3616,19 @@ mod tests {
         assert!(!vertex_array_restart_is_neutral(3, 4));
         assert!(!vertex_array_restart_is_neutral(5, 6));
         assert!(!vertex_array_restart_is_neutral(6, 6));
+    }
+
+    #[test]
+    fn simple_triangle_float3_attributes_lower_to_exact_neutral_formats() {
+        let position = MaxwellThreeDVertexAttributeFormat::parse(0x3840_0000).unwrap();
+        let color = MaxwellThreeDVertexAttributeFormat::parse(0x3840_0600).unwrap();
+
+        assert_eq!(
+            neutral_vertex_format(0, position),
+            Ok(VertexFormat::Float32x3)
+        );
+        assert_eq!(neutral_vertex_format(1, color), Ok(VertexFormat::Float32x3));
+        assert_eq!(position.offset(), 0);
+        assert_eq!(color.offset(), 12);
     }
 }
