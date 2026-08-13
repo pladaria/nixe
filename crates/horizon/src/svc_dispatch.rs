@@ -497,7 +497,7 @@ impl HorizonSvcDispatcher {
     }
 
     /// Advances the guest display clock and signals VI VSync when due.
-    pub fn advance_video(&self, elapsed: Duration) -> u64 {
+    pub fn advance_video(&self, elapsed: Duration) -> Result<u64, crate::FramebufferError> {
         self.video_system.advance(elapsed)
     }
 

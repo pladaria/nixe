@@ -320,6 +320,35 @@ impl NvHostControl {
         Ok(self.timeline(descriptor, id)?.has_reached(point.value()))
     }
 
+    /// Samples a BufferQueue fence without creating or advancing a timeline.
+    pub(super) fn point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
+        self.timelines
+            .get(&point.syncpoint())
+            .map(|timeline| timeline.has_reached(point.value()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_timeline(&mut self, id: GuestSyncpointId) {
+        self.timelines.insert(
+            id,
+            GuestTimeline::new(
+                id,
+                TimelineInstanceId::new(1),
+                TimelineOwnerId::new(1),
+                GuestSyncpointValue::new(0),
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_test_timeline(&mut self, id: GuestSyncpointId) {
+        self.timelines
+            .get_mut(&id)
+            .expect("test timeline must exist")
+            .increment_immediate(TimelineOwnerId::new(1))
+            .expect("test timeline increment must be valid");
+    }
+
     /// Reserves channel completion without publishing guest-visible progress.
     pub(super) fn reserve_channel_submission(
         &mut self,

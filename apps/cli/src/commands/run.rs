@@ -513,7 +513,9 @@ fn execute(
             return Ok(execution_summary(instructions, &dispatcher, rejected.len()));
         }
         let elapsed = execution_started.elapsed();
-        dispatcher.advance_video(elapsed);
+        dispatcher
+            .advance_video(elapsed)
+            .map_err(|error| error.to_string())?;
         if elapsed >= next_input_poll {
             let profiled = input
                 .read_profiled_input()

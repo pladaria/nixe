@@ -388,7 +388,7 @@ fn libnx_hello_world_publishes_a_software_frame() {
 
     while mailbox.statistics().published == 0 {
         elapsed += Duration::from_millis(1);
-        dispatcher.advance_video(elapsed);
+        dispatcher.advance_video(elapsed).unwrap();
         let report = process.run_slice(4_096).unwrap();
         executed += report.instructions_executed;
         assert!(
