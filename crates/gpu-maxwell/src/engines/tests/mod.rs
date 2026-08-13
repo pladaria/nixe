@@ -152,6 +152,12 @@ fn bind_compute(channel: &mut MaxwellGpuChannel) {
         .unwrap();
 }
 
+fn bind_inline_to_memory(channel: &mut MaxwellGpuChannel) {
+    let decoded = packet_on_subchannel(2, 0, inline_to_memory::CLASS.0);
+    dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
+        .unwrap();
+}
+
 fn bind_three_d(channel: &mut MaxwellGpuChannel) {
     let decoded = packet(0, threed::CLASS.0);
     dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
@@ -269,12 +275,14 @@ fn translated_graphics_shaders() -> MaxwellThreeDTranslatedShaders {
                 ShaderId::new(1),
                 7,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+                0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
                 9,
                 MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+                0,
             ),
         ],
         Vec::new(),

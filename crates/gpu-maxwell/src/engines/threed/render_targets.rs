@@ -6,6 +6,41 @@ use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_COLOR_TARGET_COUNT: usize = 8;
 
+/// Whether the viewport index offsets the selected render-target index.
+///
+/// This is layered/multiview routing rather than a change to the attachment's
+/// memory layout. The enabled path remains an explicit lowering boundary until
+/// the neutral draw contract carries the viewport-derived target index.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1927-L1930>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDRenderTargetIndexOffset {
+    Disabled = 0,
+    ByViewportIndex = 1,
+}
+
+impl MaxwellThreeDRenderTargetIndexOffset {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::ByViewportIndex),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        matches!(self, Self::ByViewportIndex)
+    }
+}
+
 /// Source of the render-target layer selected for rasterized primitives.
 ///
 /// The public `MAXWELL_B` class header defines the fixed layer and selector
@@ -200,6 +235,33 @@ impl MaxwellThreeDZCompressionMode {
         match raw {
             0 => Some(Self::Disabled),
             1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Number of depth/stencil targets selected for raster operations.
+///
+/// Maxwell exposes a one-bit target count: zero selects no Z target and one
+/// selects the single configured depth/stencil target.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2748-L2749>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDDepthTargetCount {
+    None = 0,
+    One = 1,
+}
+
+impl MaxwellThreeDDepthTargetCount {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::None),
+            1 => Some(Self::One),
             _ => None,
         }
     }
@@ -455,6 +517,7 @@ pub struct MaxwellThreeDDepthStencilTargetState {
     third_dimension: MaxwellThreeDRegister<u16>,
     kind: MaxwellThreeDRegister<MaxwellThreeDImageKind>,
     array_pitch: MaxwellThreeDRegister<u32>,
+    layer: MaxwellThreeDRegister<u16>,
     compression: MaxwellThreeDRegister<MaxwellThreeDZCompressionMode>,
 }
 
@@ -494,6 +557,10 @@ impl MaxwellThreeDDepthStencilTargetState {
     #[must_use]
     pub const fn array_pitch(&self) -> &MaxwellThreeDRegister<u32> {
         &self.array_pitch
+    }
+    #[must_use]
+    pub const fn layer(&self) -> &MaxwellThreeDRegister<u16> {
+        &self.layer
     }
     #[must_use]
     pub const fn compression(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCompressionMode> {
@@ -660,6 +727,8 @@ pub struct MaxwellThreeDRenderTargetState {
     color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
     separate_fragment_data: MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData>,
     render_target_layer: MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer>,
+    render_target_index_offset: MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset>,
+    depth_target_count: MaxwellThreeDRegister<MaxwellThreeDDepthTargetCount>,
     depth_stencil: MaxwellThreeDDepthStencilTargetState,
     clear: MaxwellThreeDClearState,
 }
@@ -686,6 +755,18 @@ impl MaxwellThreeDRenderTargetState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer> {
         &self.render_target_layer
+    }
+    #[must_use]
+    pub const fn render_target_index_offset(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset> {
+        &self.render_target_index_offset
+    }
+    #[must_use]
+    pub const fn depth_target_count(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDDepthTargetCount> {
+        &self.depth_target_count
     }
     #[must_use]
     pub const fn depth_stencil(&self) -> &MaxwellThreeDDepthStencilTargetState {
@@ -756,6 +837,13 @@ impl MaxwellThreeDRenderTargetState {
             MaxwellThreeDRenderTargetWrite::RenderTargetLayer { value, .. } => {
                 self.render_target_layer = MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset { value, .. } => {
+                self.render_target_index_offset =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::DepthTargetCount { value, .. } => {
+                self.depth_target_count = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDRenderTargetWrite::DepthAddressUpper { value, .. } => {
                 self.depth_stencil.address_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -784,6 +872,9 @@ impl MaxwellThreeDRenderTargetState {
             MaxwellThreeDRenderTargetWrite::DepthArrayPitch { value, .. } => {
                 self.depth_stencil.array_pitch =
                     MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::DepthLayer { value, .. } => {
+                self.depth_stencil.layer = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDRenderTargetWrite::DepthCompression { value, .. } => {
                 self.depth_stencil.compression =
@@ -882,6 +973,14 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: MaxwellThreeDRenderTargetLayer,
         source: MaxwellMethodSource,
     },
+    RenderTargetIndexOffset {
+        value: MaxwellThreeDRenderTargetIndexOffset,
+        source: MaxwellMethodSource,
+    },
+    DepthTargetCount {
+        value: MaxwellThreeDDepthTargetCount,
+        source: MaxwellMethodSource,
+    },
     DepthAddressUpper {
         value: u8,
         source: MaxwellMethodSource,
@@ -913,6 +1012,10 @@ pub enum MaxwellThreeDRenderTargetWrite {
     },
     DepthArrayPitch {
         value: u32,
+        source: MaxwellMethodSource,
+    },
+    DepthLayer {
+        value: u16,
         source: MaxwellMethodSource,
     },
     DepthCompression {
@@ -966,6 +1069,8 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::ColorTargetSelection { source, .. }
             | Self::SeparateFragmentData { source, .. }
             | Self::RenderTargetLayer { source, .. }
+            | Self::RenderTargetIndexOffset { source, .. }
+            | Self::DepthTargetCount { source, .. }
             | Self::DepthAddressUpper { source, .. }
             | Self::DepthAddressLower { source, .. }
             | Self::DepthFormat { source, .. }
@@ -974,6 +1079,7 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::DepthHeight { source, .. }
             | Self::DepthThirdDimension { source, .. }
             | Self::DepthArrayPitch { source, .. }
+            | Self::DepthLayer { source, .. }
             | Self::DepthCompression { source, .. }
             | Self::ClearColor { source, .. }
             | Self::ClearDepth { source, .. }

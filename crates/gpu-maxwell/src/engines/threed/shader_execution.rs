@@ -8,6 +8,91 @@ use crate::MaxwellMethodSource;
 
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
+/// Maxwell SPM resource fractions requested for each hardware subtile.
+///
+/// These fields are performance policy for Maxwell's internal work
+/// distribution. They are retained for diagnostics and replay, but are not a
+/// semantic host-pipeline dependency.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L495-L499>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDSubtilingPerfKnobA {
+    register_file: u8,
+    pixel_output_buffer: u8,
+    triangle_ram: u8,
+    max_quads: u8,
+}
+
+impl MaxwellThreeDSubtilingPerfKnobA {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            register_file: raw as u8,
+            pixel_output_buffer: (raw >> 8) as u8,
+            triangle_ram: (raw >> 16) as u8,
+            max_quads: (raw >> 24) as u8,
+        }
+    }
+
+    #[must_use]
+    pub const fn register_file(self) -> u8 {
+        self.register_file
+    }
+
+    #[must_use]
+    pub const fn pixel_output_buffer(self) -> u8 {
+        self.pixel_output_buffer
+    }
+
+    #[must_use]
+    pub const fn triangle_ram(self) -> u8 {
+        self.triangle_ram
+    }
+
+    #[must_use]
+    pub const fn max_quads(self) -> u8 {
+        self.max_quads
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.register_file as u32
+            | (self.pixel_output_buffer as u32) << 8
+            | (self.triangle_ram as u32) << 16
+            | (self.max_quads as u32) << 24
+    }
+}
+
+/// Maxwell maximum-primitive fraction requested for each hardware subtile.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L501-L502>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDSubtilingPerfKnobB(u8);
+
+impl MaxwellThreeDSubtilingPerfKnobB {
+    #[must_use]
+    pub const fn new(raw: u32) -> Option<Self> {
+        if raw <= u8::MAX as u32 {
+            Some(Self(raw as u8))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn max_primitives(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0 as u32
+    }
+}
+
 /// Largest byte count representable by
 /// `SET_SHADER_LOCAL_MEMORY_E.DEFAULT_SIZE_PER_WARP`.
 pub const MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX: u32 = 0x03ff_ffff;
@@ -166,8 +251,9 @@ impl MaxwellThreeDDirectlyAddressableMemory {
 ///
 /// The numeric method encodings are selectors, not literal call counts: for
 /// example, encoding eight selects a limit of 128 visible calls. NVIDIA's
-/// public class header also defines `NoCheck` explicitly, so only that value
-/// can be represented as having no limiting execution effect.
+/// public class header also defines `NoCheck` explicitly. Finite selectors are
+/// checked later against conservative call-use evidence emitted by T10 rather
+/// than being treated as host scheduling hints.
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L871-L885>
@@ -234,8 +320,9 @@ pub const MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX: u32 = 0x3f;
 /// Source-preserving six-bit `COUNTER_BIT` field.
 ///
 /// NVIDIA's public class header defines the field width but does not document
-/// a time unit, duration formula, or watchdog behavior. Those semantics must
-/// remain outside this value type until independently verified.
+/// a time unit, duration formula, or watchdog behavior. Neutral lowering keeps
+/// this guest execution-policy value for diagnostics but does not derive a host
+/// deadline from it; host watchdog and device-loss handling remain independent.
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1079-L1090>
@@ -267,6 +354,14 @@ impl MaxwellThreeDSmTimeoutCounterBit {
 /// One validated shader-execution register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderExecutionStateWrite {
+    SubtilingPerfKnobA {
+        value: MaxwellThreeDSubtilingPerfKnobA,
+        source: MaxwellMethodSource,
+    },
+    SubtilingPerfKnobB {
+        value: MaxwellThreeDSubtilingPerfKnobB,
+        source: MaxwellMethodSource,
+    },
     L1Configuration {
         value: MaxwellThreeDDirectlyAddressableMemory,
         source: MaxwellMethodSource,
@@ -308,6 +403,8 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
+    subtiling_perf_knob_a: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA>,
+    subtiling_perf_knob_b: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB>,
     l1_configuration: MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory>,
     visible_call_limit: MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit>,
     sm_timeout_counter_bit: MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit>,
@@ -315,6 +412,20 @@ pub struct MaxwellThreeDShaderExecutionState {
 }
 
 impl MaxwellThreeDShaderExecutionState {
+    #[must_use]
+    pub const fn subtiling_perf_knob_a(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA> {
+        &self.subtiling_perf_knob_a
+    }
+
+    #[must_use]
+    pub const fn subtiling_perf_knob_b(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB> {
+        &self.subtiling_perf_knob_b
+    }
+
     #[must_use]
     pub const fn l1_configuration(
         &self,
@@ -348,6 +459,14 @@ impl MaxwellThreeDShaderExecutionState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
+            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source } => {
+                self.subtiling_perf_knob_a =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source } => {
+                self.subtiling_perf_knob_b =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source } => {
                 self.l1_configuration =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);

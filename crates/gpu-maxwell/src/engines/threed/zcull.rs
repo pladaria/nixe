@@ -10,6 +10,85 @@ use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
 
+/// Early depth/stencil rejection domains enabled on Maxwell.
+///
+/// Z-cull is an implementation optimization: a backend may retain this state
+/// while using its ordinary depth/stencil path without changing rendering.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3453-L3459>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullEnable {
+    depth: bool,
+    stencil: bool,
+}
+
+impl MaxwellThreeDZCullEnable {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x11 != 0 {
+            return None;
+        }
+        Some(Self {
+            depth: raw & 1 != 0,
+            stencil: raw & 0x10 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn depth(self) -> bool {
+        self.depth
+    }
+
+    #[must_use]
+    pub const fn stencil(self) -> bool {
+        self.stencil
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.depth as u32 | (self.stencil as u32) << 4
+    }
+}
+
+/// Whether either Z-cull depth bound is treated as unbounded.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3461-L3467>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullBounds {
+    minimum_unbounded: bool,
+    maximum_unbounded: bool,
+}
+
+impl MaxwellThreeDZCullBounds {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x11 != 0 {
+            return None;
+        }
+        Some(Self {
+            minimum_unbounded: raw & 1 != 0,
+            maximum_unbounded: raw & 0x10 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn minimum_unbounded(self) -> bool {
+        self.minimum_unbounded
+    }
+
+    #[must_use]
+    pub const fn maximum_unbounded(self) -> bool {
+        self.maximum_unbounded
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.minimum_unbounded as u32 | (self.maximum_unbounded as u32) << 4
+    }
+}
+
 /// Identifier selected for later Z-cull work.
 ///
 /// NVIDIA publishes `SET_ACTIVE_ZCULL_REGION` and its six-bit `ID` field in
@@ -44,6 +123,11 @@ impl MaxwellThreeDZCullRegionId {
 
 /// Whether later 3D work accumulates Z-cull statistics.
 ///
+/// This is source-preserving instrumentation policy rather than raster output
+/// state. Neutral draws may proceed without accumulating counters; a future
+/// guest-visible counter query must provide verified accumulation and reporting
+/// semantics instead of synthesizing results from this enable bit.
+///
 /// NVIDIA publishes `SET_ZCULL_STATS`, its one-bit `ENABLE` field, and both
 /// boolean encodings in the pinned public class header:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2699-L2710>
@@ -72,6 +156,14 @@ impl MaxwellThreeDZCullStatsEnable {
 /// One validated Z-cull register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDZCullStateWrite {
+    Enable {
+        value: MaxwellThreeDZCullEnable,
+        source: MaxwellMethodSource,
+    },
+    Bounds {
+        value: MaxwellThreeDZCullBounds,
+        source: MaxwellMethodSource,
+    },
     ActiveRegion {
         value: MaxwellThreeDZCullRegionId,
         source: MaxwellMethodSource,
@@ -85,11 +177,23 @@ pub enum MaxwellThreeDZCullStateWrite {
 /// Persistent Z-cull configuration on one `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDZCullState {
+    enable: MaxwellThreeDRegister<MaxwellThreeDZCullEnable>,
+    bounds: MaxwellThreeDRegister<MaxwellThreeDZCullBounds>,
     active_region: MaxwellThreeDRegister<MaxwellThreeDZCullRegionId>,
     stats_enable: MaxwellThreeDRegister<MaxwellThreeDZCullStatsEnable>,
 }
 
 impl MaxwellThreeDZCullState {
+    #[must_use]
+    pub const fn enable(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullEnable> {
+        &self.enable
+    }
+
+    #[must_use]
+    pub const fn bounds(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullBounds> {
+        &self.bounds
+    }
+
     #[must_use]
     pub const fn active_region(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullRegionId> {
         &self.active_region
@@ -102,6 +206,12 @@ impl MaxwellThreeDZCullState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDZCullStateWrite) {
         match write {
+            MaxwellThreeDZCullStateWrite::Enable { value, source } => {
+                self.enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDZCullStateWrite::Bounds { value, source } => {
+                self.bounds = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDZCullStateWrite::ActiveRegion { value, source } => {
                 self.active_region = MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }

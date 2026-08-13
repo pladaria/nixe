@@ -597,6 +597,8 @@ pub struct MaxwellThreeDPrimitiveState {
     restart_index: MaxwellThreeDRegister<u32>,
     vertex_array_start: MaxwellThreeDRegister<u32>,
     begin: MaxwellThreeDRegister<MaxwellThreeDBegin>,
+    end: MaxwellThreeDRegister<bool>,
+    open: bool,
 }
 
 impl MaxwellThreeDPrimitiveState {
@@ -641,6 +643,23 @@ impl MaxwellThreeDPrimitiveState {
     #[must_use]
     pub const fn begin(&self) -> &MaxwellThreeDRegister<MaxwellThreeDBegin> {
         &self.begin
+    }
+
+    /// Last validated `END` write, retained independently from the preceding
+    /// `BEGIN` so diagnostics can reconstruct the primitive sequence.
+    #[must_use]
+    pub const fn end(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.end
+    }
+
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    #[must_use]
+    pub const fn active_begin(&self) -> Option<&MaxwellThreeDBegin> {
+        if self.open { self.begin.value() } else { None }
     }
 }
 
@@ -754,11 +773,12 @@ impl MaxwellThreeDVertexInputState {
         dependencies.push(self.primitive.vertex_array_restart_enabled.raw());
         dependencies.push(self.primitive.restart_enabled.raw());
         dependencies.push(self.primitive.restart_index.raw());
-        dependencies.push(self.primitive.begin.raw());
+        if self.primitive.is_open() {
+            dependencies.push(self.primitive.begin.raw());
+        }
         if self
             .primitive
-            .begin
-            .value()
+            .active_begin()
             .is_some_and(|begin| begin.topology() == 14)
         {
             dependencies.push(self.primitive.patch_size.raw());
@@ -856,7 +876,12 @@ impl MaxwellThreeDVertexInputState {
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::Begin { value, .. } => {
-                self.primitive.begin = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.begin = MaxwellThreeDRegister::programmed(raw, value, source);
+                self.primitive.open = true;
+            }
+            MaxwellThreeDVertexInputWrite::End { value, .. } => {
+                self.primitive.end = MaxwellThreeDRegister::programmed(raw, value, source);
+                self.primitive.open = false;
             }
             MaxwellThreeDVertexInputWrite::AttributeDefaults { value, .. } => {
                 self.assembly.attribute_defaults =
@@ -980,6 +1005,10 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: MaxwellThreeDBegin,
         source: MaxwellMethodSource,
     },
+    End {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
     AttributeDefaults {
         value: MaxwellThreeDAttributeDefaults,
         source: MaxwellMethodSource,
@@ -1024,6 +1053,7 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::PrimitiveRestartIndex { source, .. }
             | Self::VertexArrayStart { source, .. }
             | Self::Begin { source, .. }
+            | Self::End { source, .. }
             | Self::AttributeDefaults { source, .. }
             | Self::VertexIdUsesArrayStart { source, .. }
             | Self::StreamSubstituteAddressUpper { source, .. }

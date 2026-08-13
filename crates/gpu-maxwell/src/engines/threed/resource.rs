@@ -37,6 +37,11 @@ use super::{
 const MAXWELL_PITCH_KIND: u8 = 0x00;
 const MAXWELL_PITCH_NO_SWIZZLE_KIND: u8 = 0xfd;
 const MAXWELL_GENERIC_BLOCK_LINEAR_KIND: u8 = 0xfe;
+// Public Switch kind table names 0x17 as S8Z24_2CZ; deko3d selects it for
+// compressed, single-sample S8Z24 depth images.
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L35-L45
+// https://github.com/devkitPro/deko3d/blob/6ee80db52aac0168303fc2f6417232997e464999/source/maxwell/image_formats.cpp#L35-L47
+const MAXWELL_S8Z24_2CZ_KIND: u8 = 0x17;
 const MAXWELL_DESCRIPTOR_SIZE: u64 = 32;
 
 /// Frontend role of one completely resolved resource.
@@ -144,6 +149,14 @@ impl MaxwellThreeDResolvedBuffer {
 pub struct MaxwellThreeDPreservedImageLayout {
     layout: ImageMemoryLayout,
     pte_kind: u8,
+    compression_enabled: bool,
+}
+
+/// Original Maxwell texel encoding retained independently of neutral component semantics.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDGuestImageFormat {
+    Color(MaxwellThreeDColorTargetFormat),
+    DepthStencil(MaxwellThreeDDepthStencilFormat),
 }
 
 impl MaxwellThreeDPreservedImageLayout {
@@ -154,6 +167,12 @@ impl MaxwellThreeDPreservedImageLayout {
     #[must_use]
     pub const fn pte_kind(self) -> u8 {
         self.pte_kind
+    }
+
+    /// Returns whether guest bytes require Maxwell compression materialization.
+    #[must_use]
+    pub const fn requires_materialization(self) -> bool {
+        self.compression_enabled
     }
 }
 
@@ -168,6 +187,7 @@ pub struct MaxwellThreeDResolvedImage {
     source: MaxwellResolvedRange,
     mappings: Box<[MaxwellThreeDMappingReference]>,
     guest_layout: MaxwellThreeDPreservedImageLayout,
+    guest_format: MaxwellThreeDGuestImageFormat,
 }
 
 impl MaxwellThreeDResolvedImage {
@@ -202,6 +222,11 @@ impl MaxwellThreeDResolvedImage {
     #[must_use]
     pub const fn guest_layout(&self) -> MaxwellThreeDPreservedImageLayout {
         self.guest_layout
+    }
+
+    #[must_use]
+    pub const fn guest_format(&self) -> MaxwellThreeDGuestImageFormat {
+        self.guest_format
     }
 }
 
@@ -477,7 +502,9 @@ pub fn resolve_maxwell_three_d_resources(
             }
         }
     }
-    if depth_is_programmed(state.render_targets().depth_stencil()) {
+    let depth_explicitly_unselected = state.render_targets().depth_target_count().value()
+        == Some(&super::MaxwellThreeDDepthTargetCount::None);
+    if !depth_explicitly_unselected && depth_is_programmed(state.render_targets().depth_stencil()) {
         builder.depth_target(state.render_targets().depth_stencil())?;
     }
 
@@ -606,16 +633,24 @@ impl<'a> ResourceBuilder<'a> {
             .kind()
             .value()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let format = match target.format().value().copied() {
-            Some(MaxwellThreeDColorTargetFormat::Color(0xcf)) => ImageFormat::Bgra8Unorm,
-            Some(MaxwellThreeDColorTargetFormat::Color(0xd5)) => ImageFormat::Rgba8Unorm,
-            Some(format) => {
+        let guest_format = target
+            .format()
+            .value()
+            .copied()
+            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        // NVIDIA names both packed encodings separately, while their logical
+        // components are the same 24-bit depth plus 8-bit stencil pair. Keep
+        // `guest_format` so later layout conversion can distinguish packing.
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L947-L974
+        let format = match guest_format {
+            MaxwellThreeDColorTargetFormat::Color(0xcf) => ImageFormat::Bgra8Unorm,
+            MaxwellThreeDColorTargetFormat::Color(0xd5) => ImageFormat::Rgba8Unorm,
+            format => {
                 return Err(MaxwellThreeDResourceError::UnsupportedColorFormat {
                     role,
                     format: format.raw(),
                 });
             }
-            None => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
         };
         let (dimension, depth, layers, selected_layer) = match kind {
             MaxwellThreeDImageKind::Array => {
@@ -654,6 +689,9 @@ impl<'a> ResourceBuilder<'a> {
                 .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
             target.array_pitch().value().copied(),
             selected_layer,
+            MaxwellThreeDGuestImageFormat::Color(guest_format),
+            target.compression().value()
+                == Some(&super::MaxwellThreeDColorCompressionMode::Enabled),
         )
     }
 
@@ -667,22 +705,24 @@ impl<'a> ResourceBuilder<'a> {
             target.address_lower().value(),
         )
         .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let format = match target.format().value() {
-            Some(MaxwellThreeDDepthStencilFormat::Z16) => ImageFormat::Depth16Unorm,
-            Some(MaxwellThreeDDepthStencilFormat::Z24Stencil8) => {
-                ImageFormat::Depth24UnormStencil8Uint
-            }
-            Some(MaxwellThreeDDepthStencilFormat::ZFloat32) => ImageFormat::Depth32Float,
-            Some(MaxwellThreeDDepthStencilFormat::ZFloat32X24Stencil8) => {
+        let guest_format = *target
+            .format()
+            .value()
+            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let format = match guest_format {
+            MaxwellThreeDDepthStencilFormat::Z16 => ImageFormat::Depth16Unorm,
+            MaxwellThreeDDepthStencilFormat::Z24Stencil8
+            | MaxwellThreeDDepthStencilFormat::Stencil8Z24 => ImageFormat::Depth24UnormStencil8Uint,
+            MaxwellThreeDDepthStencilFormat::ZFloat32 => ImageFormat::Depth32Float,
+            MaxwellThreeDDepthStencilFormat::ZFloat32X24Stencil8 => {
                 ImageFormat::Depth32FloatStencil8Uint
             }
-            Some(format) => {
+            format => {
                 return Err(MaxwellThreeDResourceError::UnsupportedDepthFormat {
                     role,
-                    format: *format as u32,
+                    format: format as u32,
                 });
             }
-            None => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
         };
         let width = *target
             .width()
@@ -702,14 +742,25 @@ impl<'a> ResourceBuilder<'a> {
             .kind()
             .value()
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let (dimension, depth, layers) = match kind {
-            MaxwellThreeDImageKind::Array => (
-                ImageDimension::Two,
-                1,
-                u16::try_from(third)
-                    .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?,
-            ),
-            MaxwellThreeDImageKind::ThreeDimensional => (ImageDimension::Three, third, 1),
+        let (dimension, depth, layers, selected_layer) = match kind {
+            MaxwellThreeDImageKind::Array => {
+                let layers = u16::try_from(third)
+                    .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+                let layer = *target
+                    .layer()
+                    .value()
+                    .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+                if layer >= layers {
+                    return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+                }
+                (ImageDimension::Two, 1, layers, layer)
+            }
+            MaxwellThreeDImageKind::ThreeDimensional => {
+                if target.layer().value().is_some_and(|layer| *layer != 0) {
+                    return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+                }
+                (ImageDimension::Three, third, 1, 0)
+            }
         };
         let description = image_description(MaxwellImageDescriptionRequest {
             dimension,
@@ -732,7 +783,9 @@ impl<'a> ResourceBuilder<'a> {
                 .value()
                 .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
             target.array_pitch().value().copied(),
-            0,
+            selected_layer,
+            MaxwellThreeDGuestImageFormat::DepthStencil(guest_format),
+            target.compression().value() == Some(&super::MaxwellThreeDZCompressionMode::Enabled),
         )
     }
 
@@ -744,6 +797,8 @@ impl<'a> ResourceBuilder<'a> {
         layout: MaxwellThreeDImageLayout,
         array_pitch: Option<u32>,
         selected_layer: u16,
+        guest_format: MaxwellThreeDGuestImageFormat,
+        compression_enabled: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         match self
             .sample_mode
@@ -796,6 +851,15 @@ impl<'a> ResourceBuilder<'a> {
                     .filter(|value| *value != 0)
                     .map(u64::from)
                     .unwrap_or(minimum);
+                let expected_kind = if compression_enabled
+                    && guest_format
+                        == MaxwellThreeDGuestImageFormat::DepthStencil(
+                            MaxwellThreeDDepthStencilFormat::Stencil8Z24,
+                        ) {
+                    MAXWELL_S8Z24_2CZ_KIND
+                } else {
+                    MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+                };
                 (
                     ImageMemoryLayout::BlockLinear(BlockLinearLayout {
                         block_width_log2: 0,
@@ -804,7 +868,7 @@ impl<'a> ResourceBuilder<'a> {
                         layer_stride: stride,
                     }),
                     stride,
-                    MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                    expected_kind,
                 )
             }
         };
@@ -820,13 +884,7 @@ impl<'a> ResourceBuilder<'a> {
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
         let resolved_address =
             MaxwellThreeDUnresolvedAddress::new((address_value >> 32) as u8, address_value as u32);
-        let layer_count = if description.dimension() == ImageDimension::Three {
-            1
-        } else if selected_layer == 0 && description.kind() == ImageKind::DepthStencil {
-            description.array_layers()
-        } else {
-            1
-        };
+        let layer_count = 1;
         let size = layer_stride
             .checked_mul(u64::from(layer_count))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
@@ -839,7 +897,7 @@ impl<'a> ResourceBuilder<'a> {
             .kind();
         if source.segments().iter().any(|segment| {
             segment.mapping().kind() != actual_kind
-                || !layout_accepts_kind(layout, segment.mapping().kind())
+                || !image_kind_matches(layout, expected_kind, segment.mapping().kind())
         }) {
             return Err(MaxwellThreeDResourceError::UnsupportedKind {
                 role,
@@ -892,7 +950,9 @@ impl<'a> ResourceBuilder<'a> {
                 guest_layout: MaxwellThreeDPreservedImageLayout {
                     layout: neutral_layout,
                     pte_kind: actual_kind,
+                    compression_enabled,
                 },
+                guest_format,
             },
         ));
         Ok(())
@@ -1045,12 +1105,12 @@ fn align_up(
         .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })
 }
 
-fn layout_accepts_kind(layout: MaxwellThreeDImageLayout, kind: u8) -> bool {
+const fn image_kind_matches(layout: MaxwellThreeDImageLayout, expected: u8, actual: u8) -> bool {
     match layout {
         MaxwellThreeDImageLayout::PitchLinear => {
-            matches!(kind, MAXWELL_PITCH_KIND | MAXWELL_PITCH_NO_SWIZZLE_KIND)
+            matches!(actual, MAXWELL_PITCH_KIND | MAXWELL_PITCH_NO_SWIZZLE_KIND)
         }
-        MaxwellThreeDImageLayout::BlockLinear { .. } => kind == MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+        MaxwellThreeDImageLayout::BlockLinear { .. } => actual == expected,
     }
 }
 
@@ -1111,7 +1171,11 @@ fn contradictory_image_alias(
         (
             MaxwellThreeDResolvedResource::Image(first),
             MaxwellThreeDResolvedResource::Image(second),
-        ) => first.description != second.description || first.guest_layout != second.guest_layout,
+        ) => {
+            first.description != second.description
+                || first.guest_layout != second.guest_layout
+                || first.guest_format != second.guest_format
+        }
         _ => false,
     }
 }

@@ -5,6 +5,7 @@
 //! mappings, scheduler state, or host-backend objects.
 
 mod compute;
+mod inline_to_memory;
 mod threed;
 mod twod;
 
@@ -22,17 +23,26 @@ pub use compute::{
     MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
     MaxwellShaderCacheInvalidation, lower_maxwell_compute_synchronization,
 };
+pub use inline_to_memory::{
+    MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
+    MaxwellInlineToMemoryPendingTransfer, MaxwellInlineToMemoryRegister,
+    MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
+    MaxwellInlineToMemoryStateWrite, MaxwellInlineToMemoryUpload,
+};
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
-    MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_SCISSOR_COUNT,
-    MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS, MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES,
-    MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT, MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT,
-    MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
+    MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT,
+    MAXWELL_SAMPLE_LOCATION_GROUP_COUNT, MAXWELL_SAMPLE_LOCATIONS_PER_GROUP, MAXWELL_SCISSOR_COUNT,
+    MAXWELL_TESSELLATION_LOD_COUNT, MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS,
+    MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES, MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT,
+    MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT, MAXWELL_THREE_D_PRIMITIVE_AREA_MAX,
+    MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
-    MaxwellThreeDAttachmentReadiness, MaxwellThreeDAttributeDefaultVector,
-    MaxwellThreeDAttributeDefaults, MaxwellThreeDBegin, MaxwellThreeDBindGroupState,
+    MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDAttachmentReadiness,
+    MaxwellThreeDAttributeDefaultVector, MaxwellThreeDAttributeDefaults,
+    MaxwellThreeDAttributePointSize, MaxwellThreeDBegin, MaxwellThreeDBindGroupState,
     MaxwellThreeDBlendControlState, MaxwellThreeDBlendEnableCommon, MaxwellThreeDBlendFactor,
     MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendOp,
     MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
@@ -45,49 +55,61 @@ pub use threed::{
     MaxwellThreeDColorReductionThresholdsUnorm10, MaxwellThreeDColorReductionThresholdsUnorm16,
     MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
     MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp,
-    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConstantBufferBinding,
-    MaxwellThreeDConstantBufferLoadState, MaxwellThreeDConstantBufferSelectorState,
-    MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable,
-    MaxwellThreeDCullFace, MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
-    MaxwellThreeDDescriptorPoolState, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag,
+    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
+    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
+    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDCoverageState,
+    MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace,
+    MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
+    MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDDirtySubresource,
+    MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag, MaxwellThreeDFillViaTriangleMode,
     MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
-    MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace, MaxwellThreeDImageKind,
-    MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState, MaxwellThreeDIndexElementSize,
-    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDL2CacheEvictionPolicy,
-    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDLoweredWork,
+    MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace, MaxwellThreeDGuestImageFormat,
+    MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
+    MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState,
+    MaxwellThreeDIndexElementSize, MaxwellThreeDInlineConstantBufferUpload,
+    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDLineState, MaxwellThreeDLineStateWrite,
+    MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp, MaxwellThreeDLoweredWork,
     MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, MaxwellThreeDLoweringPlan,
     MaxwellThreeDMappingReference, MaxwellThreeDMmeExecutionError, MaxwellThreeDMmeExecutionReport,
     MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam,
     MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
     MaxwellThreeDOperationTrigger, MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState,
+    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderSaturate,
     MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize, MaxwellThreeDPointSpriteOrigin,
     MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonMode,
     MaxwellThreeDPreservedImageLayout, MaxwellThreeDPrimitiveCircularBufferThrottle,
     MaxwellThreeDPrimitiveState, MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState,
-    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDRasterBoundingBox,
-    MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState, MaxwellThreeDRawValue,
-    MaxwellThreeDRectangle, MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin,
-    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableState,
-    MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetLayer,
-    MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDRenderTargetWrite, MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage,
-    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceAccess,
-    MaxwellThreeDResourceAlias, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
-    MaxwellThreeDRopL2CacheRequest, MaxwellThreeDRopL2CacheState,
-    MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
+    MaxwellThreeDProvokingVertex, MaxwellThreeDPsOutputSampleMaskUsage,
+    MaxwellThreeDRasterBoundingBox, MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState,
+    MaxwellThreeDRawValue, MaxwellThreeDRectangle, MaxwellThreeDRegister,
+    MaxwellThreeDRegisterOrigin, MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetIndexOffset,
+    MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
+    MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
+    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreRelease,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
+    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDResolvedBuffer,
+    MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
+    MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias, MaxwellThreeDResourceError,
+    MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest, MaxwellThreeDRopL2CacheState,
+    MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleLocation,
+    MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
     MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderStage, MaxwellThreeDSmTimeoutCounterBit,
-    MaxwellThreeDState, MaxwellThreeDStateWrite, MaxwellThreeDStencilOp,
-    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
-    MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
-    MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
-    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureDataCacheInvalidation,
-    MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
+    MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDShaderLocalMemoryPerWarpSize,
+    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderStage,
+    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStateWrite,
+    MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDSurfaceClipAxis, MaxwellThreeDSynchronizationError,
+    MaxwellThreeDSynchronizationOperation, MaxwellThreeDSynchronizationPlan,
+    MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
+    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTessellationLod,
+    MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
+    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
     MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
     MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
@@ -95,10 +117,12 @@ pub use threed::{
     MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
     MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
     MaxwellThreeDVertexStreamSubstituteState, MaxwellThreeDViewportClipControl,
+    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportPixelCenter,
     MaxwellThreeDViewportScaleOffsetEnable, MaxwellThreeDViewportState,
-    MaxwellThreeDViewportTransformState, MaxwellThreeDViewportZClipRange,
-    MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
-    MaxwellThreeDZCompressionMode, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullState,
+    MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
+    MaxwellThreeDViewportZClipRange, MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState,
+    MaxwellThreeDWindowClipType, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullBounds,
+    MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullState,
     MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation,
     preflight_maxwell_three_d_operation_unnegotiated, resolve_maxwell_three_d_resources,
@@ -212,6 +236,11 @@ pub enum MaxwellEngineMethodEffect {
         state: MaxwellComputeStateWrite,
         upload: MaxwellComputeInlineToMemoryUpload,
     },
+    InlineToMemoryState(MaxwellInlineToMemoryStateWrite),
+    InlineToMemoryStateAndUpload {
+        state: MaxwellInlineToMemoryStateWrite,
+        upload: MaxwellInlineToMemoryUpload,
+    },
     ThreeDState(MaxwellThreeDStateWrite),
     ThreeDTrigger(MaxwellThreeDOperationTrigger),
     ThreeDSynchronizationTrigger(MaxwellThreeDSynchronizationTrigger),
@@ -238,6 +267,7 @@ pub enum MaxwellEngineMethodEffect {
 pub enum MaxwellEngineOperation {
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
+    InlineToMemory(MaxwellInlineToMemoryUpload),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(Box<MaxwellThreeDTriggeredOperation>),
@@ -306,6 +336,8 @@ pub struct MaxwellEnginePacketDispatch {
     binding: MaxwellPacketDispatch,
     compute_before: MaxwellComputeState,
     compute_after: MaxwellComputeState,
+    inline_to_memory_before: MaxwellInlineToMemoryState,
+    inline_to_memory_after: MaxwellInlineToMemoryState,
     two_d_before: MaxwellTwoDState,
     two_d_after: MaxwellTwoDState,
     three_d_before: MaxwellThreeDState,
@@ -360,6 +392,16 @@ impl MaxwellEnginePacketDispatch {
     #[must_use]
     pub const fn compute_after(&self) -> &MaxwellComputeState {
         &self.compute_after
+    }
+
+    #[must_use]
+    pub const fn inline_to_memory_before(&self) -> &MaxwellInlineToMemoryState {
+        &self.inline_to_memory_before
+    }
+
+    #[must_use]
+    pub const fn inline_to_memory_after(&self) -> &MaxwellInlineToMemoryState {
+        &self.inline_to_memory_after
     }
 
     #[must_use]
@@ -433,6 +475,11 @@ pub enum MaxwellEngineDispatchError {
         reason: &'static str,
     },
     InvalidComputeMethodEncoding {
+        source: MaxwellMethodSource,
+        method_name: &'static str,
+        reason: &'static str,
+    },
+    InvalidInlineToMemoryMethodEncoding {
         source: MaxwellMethodSource,
         method_name: &'static str,
         reason: &'static str,
@@ -531,6 +578,14 @@ impl Display for MaxwellEngineDispatchError {
                 formatter,
                 "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_COMPUTE_B method-name={method_name} reason={reason}"
             ),
+            Self::InvalidInlineToMemoryMethodEncoding {
+                source,
+                method_name,
+                reason,
+            } => write!(
+                formatter,
+                "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_INLINE_TO_MEMORY_A method-name={method_name} reason={reason}"
+            ),
             Self::MmeRamLoad { source, ram, error } => write!(
                 formatter,
                 "MAXWELL_B MME RAM load exceeds implemented host coverage: {source} ram={ram:?} error={error:?}"
@@ -601,6 +656,8 @@ pub fn preflight_maxwell_engine_packet(
     let binding = preflight_maxwell_packet(channel, submission, packet)?;
     let compute_before = channel.compute().clone();
     let mut compute_after = compute_before.clone();
+    let inline_to_memory_before = channel.inline_to_memory().clone();
+    let mut inline_to_memory_after = inline_to_memory_before.clone();
     let two_d_before = channel.two_d().clone();
     let mut two_d_after = two_d_before.clone();
     let three_d_before = channel.three_d().clone();
@@ -687,6 +744,7 @@ pub fn preflight_maxwell_engine_packet(
                 channel,
                 method,
                 &mut compute_after,
+                &mut inline_to_memory_after,
                 &mut two_d_after,
                 &mut three_d_after,
             )?;
@@ -707,6 +765,9 @@ pub fn preflight_maxwell_engine_packet(
                 MaxwellEngineMethodEffect::ComputeStateAndInlineToMemoryUpload {
                     upload, ..
                 } => Some(MaxwellEngineOperation::ComputeInlineToMemory(upload)),
+                MaxwellEngineMethodEffect::InlineToMemoryStateAndUpload { upload, .. } => {
+                    Some(MaxwellEngineOperation::InlineToMemory(upload))
+                }
                 MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
                     upload,
                     ..
@@ -777,6 +838,8 @@ pub fn preflight_maxwell_engine_packet(
         binding,
         compute_before,
         compute_after,
+        inline_to_memory_before,
+        inline_to_memory_after,
         two_d_before,
         two_d_after,
         three_d_before,
@@ -831,6 +894,7 @@ pub fn commit_maxwell_engine_packet(
         .into());
     }
     if channel.compute() != &dispatch.compute_before
+        || channel.inline_to_memory() != &dispatch.inline_to_memory_before
         || channel.two_d() != &dispatch.two_d_before
         || channel.three_d() != &dispatch.three_d_before
     {
@@ -840,6 +904,7 @@ pub fn commit_maxwell_engine_packet(
     }
     channel.replace_frontend(dispatch.binding.frontend_after());
     channel.replace_compute(dispatch.compute_after.clone());
+    channel.replace_inline_to_memory(dispatch.inline_to_memory_after.clone());
     channel.replace_two_d(dispatch.two_d_after.clone());
     channel.replace_three_d(dispatch.three_d_after.clone());
     Ok(())
@@ -876,6 +941,7 @@ fn preflight_class_method(
     channel: &MaxwellGpuChannel,
     method: MaxwellMethodDispatch,
     compute: &mut MaxwellComputeState,
+    inline_to_memory: &mut MaxwellInlineToMemoryState,
     two_d: &mut MaxwellTwoDState,
     three_d: &mut MaxwellThreeDState,
 ) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
@@ -883,6 +949,9 @@ fn preflight_class_method(
     let class = method.class();
     if class == compute::CLASS {
         return compute::preflight(class, method, compute);
+    }
+    if class == inline_to_memory::CLASS {
+        return inline_to_memory::preflight(method, inline_to_memory);
     }
     if class == threed::CLASS {
         return threed::preflight(channel.profile(), method, three_d);
@@ -893,8 +962,6 @@ fn preflight_class_method(
 
     let class_name = if class == classes.dma_copy() {
         Some("MAXWELL_DMA_COPY_A")
-    } else if class == classes.inline_to_memory() {
-        Some("MAXWELL_INLINE_TO_MEMORY_A")
     } else if class == classes.gpfifo() {
         Some("MAXWELL_CHANNEL_GPFIFO_A")
     } else {

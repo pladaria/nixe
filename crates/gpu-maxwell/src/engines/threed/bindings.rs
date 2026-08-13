@@ -13,6 +13,40 @@ use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
 pub const MAXWELL_BIND_GROUP_COUNT: usize = 8;
 pub const MAXWELL_CONSTANT_BUFFER_SLOT_COUNT: usize = 32;
+pub const MAXWELL_TESSELLATION_LOD_COUNT: usize = 6;
+
+/// One of the six default tessellation level registers.
+///
+/// NVIDIA publishes each full-width value in its pinned public `MAXWELL_B`
+/// class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L450-L466>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum MaxwellThreeDTessellationLod {
+    OuterU0OrDensity = 0,
+    OuterV0OrDetail = 1,
+    OuterU1OrW0 = 2,
+    OuterV1 = 3,
+    InnerU = 4,
+    InnerV = 5,
+}
+
+impl MaxwellThreeDTessellationLod {
+    pub(super) const fn from_index(index: u8) -> Self {
+        match index {
+            0 => Self::OuterU0OrDensity,
+            1 => Self::OuterV0OrDetail,
+            2 => Self::OuterU1OrW0,
+            3 => Self::OuterV1,
+            4 => Self::InnerU,
+            _ => Self::InnerV,
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
 
 /// Source-preserving base address of the Maxwell shader-program region.
 ///
@@ -77,6 +111,8 @@ impl MaxwellThreeDShaderStage {
 pub struct MaxwellThreeDPipelineBindingState {
     enabled: MaxwellThreeDRegister<bool>,
     stage: MaxwellThreeDRegister<MaxwellThreeDShaderStage>,
+    program_offset: MaxwellThreeDRegister<u32>,
+    register_count: MaxwellThreeDRegister<u8>,
     group: MaxwellThreeDRegister<u8>,
 }
 
@@ -91,6 +127,8 @@ impl Default for MaxwellThreeDPipelineBindingState {
                 MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
                 Some(MaxwellThreeDShaderStage::VertexCullBeforeFetch),
             ),
+            program_offset: MaxwellThreeDRegister::default(),
+            register_count: MaxwellThreeDRegister::default(),
             group: MaxwellThreeDRegister::default(),
         }
     }
@@ -104,6 +142,14 @@ impl MaxwellThreeDPipelineBindingState {
     #[must_use]
     pub const fn stage(&self) -> &MaxwellThreeDRegister<MaxwellThreeDShaderStage> {
         &self.stage
+    }
+    #[must_use]
+    pub const fn program_offset(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.program_offset
+    }
+    #[must_use]
+    pub const fn register_count(&self) -> &MaxwellThreeDRegister<u8> {
+        &self.register_count
     }
     #[must_use]
     pub const fn group(&self) -> &MaxwellThreeDRegister<u8> {
@@ -314,6 +360,7 @@ pub struct MaxwellThreeDShaderBindingState {
     sampler_binding: MaxwellThreeDRegister<MaxwellThreeDSamplerBindingMode>,
     maxwell_texture_headers: MaxwellThreeDRegister<bool>,
     bindless_texture_constant_buffer_slot: MaxwellThreeDRegister<u8>,
+    tessellation_lod: [MaxwellThreeDRegister<u32>; MAXWELL_TESSELLATION_LOD_COUNT],
 }
 
 impl Default for MaxwellThreeDShaderBindingState {
@@ -331,6 +378,7 @@ impl Default for MaxwellThreeDShaderBindingState {
             sampler_binding: MaxwellThreeDRegister::default(),
             maxwell_texture_headers: MaxwellThreeDRegister::default(),
             bindless_texture_constant_buffer_slot: MaxwellThreeDRegister::default(),
+            tessellation_lod: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
         }
     }
 }
@@ -385,6 +433,13 @@ impl MaxwellThreeDShaderBindingState {
     pub const fn bindless_texture_constant_buffer_slot(&self) -> &MaxwellThreeDRegister<u8> {
         &self.bindless_texture_constant_buffer_slot
     }
+    #[must_use]
+    pub const fn tessellation_lod(
+        &self,
+        level: MaxwellThreeDTessellationLod,
+    ) -> &MaxwellThreeDRegister<u32> {
+        &self.tessellation_lod[level.index()]
+    }
 
     /// Stages whose enabled pipeline slot selects this binding group.
     #[must_use]
@@ -414,7 +469,23 @@ impl MaxwellThreeDShaderBindingState {
         for pipeline in &self.pipeline {
             dependencies.push(pipeline.enabled.raw());
             dependencies.push(pipeline.stage.raw());
+            if pipeline.enabled.value() == Some(&true) {
+                dependencies.push(pipeline.program_offset.raw());
+                dependencies.push(pipeline.register_count.raw());
+            }
             dependencies.push(pipeline.group.raw());
+        }
+        if self.pipeline.iter().any(|pipeline| {
+            pipeline.enabled.value() == Some(&true)
+                && matches!(
+                    pipeline.stage.value(),
+                    Some(
+                        MaxwellThreeDShaderStage::TessellationInit
+                            | MaxwellThreeDShaderStage::Tessellation
+                    )
+                )
+        }) {
+            dependencies.extend(self.tessellation_lod.iter().map(MaxwellThreeDRegister::raw));
         }
         dependencies.push(self.sampler_binding.raw());
         dependencies.push(self.maxwell_texture_headers.raw());
@@ -443,6 +514,18 @@ impl MaxwellThreeDShaderBindingState {
                     MaxwellThreeDRegister::programmed(raw, enabled, source);
                 self.pipeline[pipeline as usize].stage =
                     MaxwellThreeDRegister::programmed(raw, stage, source);
+            }
+            MaxwellThreeDShaderBindingWrite::PipelineProgram {
+                pipeline, offset, ..
+            } => {
+                self.pipeline[pipeline as usize].program_offset =
+                    MaxwellThreeDRegister::programmed(raw, offset, source)
+            }
+            MaxwellThreeDShaderBindingWrite::PipelineRegisterCount {
+                pipeline, count, ..
+            } => {
+                self.pipeline[pipeline as usize].register_count =
+                    MaxwellThreeDRegister::programmed(raw, count, source)
             }
             MaxwellThreeDShaderBindingWrite::PipelineGroup {
                 pipeline, group, ..
@@ -518,6 +601,10 @@ impl MaxwellThreeDShaderBindingState {
                 self.bindless_texture_constant_buffer_slot =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDShaderBindingWrite::TessellationLod { level, value, .. } => {
+                self.tessellation_lod[level.index()] =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
         }
     }
 }
@@ -536,6 +623,16 @@ pub enum MaxwellThreeDShaderBindingWrite {
         pipeline: u8,
         enabled: bool,
         stage: MaxwellThreeDShaderStage,
+        source: MaxwellMethodSource,
+    },
+    PipelineProgram {
+        pipeline: u8,
+        offset: u32,
+        source: MaxwellMethodSource,
+    },
+    PipelineRegisterCount {
+        pipeline: u8,
+        count: u8,
         source: MaxwellMethodSource,
     },
     PipelineGroup {
@@ -608,6 +705,11 @@ pub enum MaxwellThreeDShaderBindingWrite {
         value: u8,
         source: MaxwellMethodSource,
     },
+    TessellationLod {
+        level: MaxwellThreeDTessellationLod,
+        value: u32,
+        source: MaxwellMethodSource,
+    },
 }
 
 impl MaxwellThreeDShaderBindingWrite {
@@ -616,6 +718,8 @@ impl MaxwellThreeDShaderBindingWrite {
             Self::ProgramRegionAddressUpper { source, .. }
             | Self::ProgramRegionAddressLower { source, .. }
             | Self::PipelineShader { source, .. }
+            | Self::PipelineProgram { source, .. }
+            | Self::PipelineRegisterCount { source, .. }
             | Self::PipelineGroup { source, .. }
             | Self::SelectorSize { source, .. }
             | Self::SelectorAddressUpper { source, .. }
@@ -631,7 +735,8 @@ impl MaxwellThreeDShaderBindingWrite {
             | Self::SamplerMaximumIndex { source, .. }
             | Self::SamplerBinding { source, .. }
             | Self::MaxwellTextureHeaders { source, .. }
-            | Self::BindlessTextureSlot { source, .. } => source,
+            | Self::BindlessTextureSlot { source, .. }
+            | Self::TessellationLod { source, .. } => source,
         }
     }
     pub(super) const fn raw(self) -> u32 {
