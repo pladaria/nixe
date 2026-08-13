@@ -18,12 +18,16 @@ use super::{
     MaxwellThreeDFixedFunctionWrite, MaxwellThreeDLineState, MaxwellThreeDLineStateWrite,
     MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite, MaxwellThreeDPolygonMode,
     MaxwellThreeDRenderEnableState, MaxwellThreeDRenderEnableStateWrite,
-    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite, MaxwellThreeDRopL2CacheState,
-    MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDShaderBindingState,
-    MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDVertexInputState,
-    MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
+    MaxwellThreeDRopL2CacheState, MaxwellThreeDRopL2CacheStateWrite,
+    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
+    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
+    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState,
+    MaxwellThreeDZCullStateWrite,
 };
+
+pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
 
 /// Byte-addressed polygon-mode registers read by the Switch graphics macros.
 pub(super) const MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD: u32 = 0x0dac;
@@ -144,6 +148,45 @@ impl MaxwellThreeDPointSize {
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
+    }
+}
+
+/// Selects a shader-output slot as the source of rasterized point size.
+///
+/// NVIDIA publishes the enable bit and eight-bit slot in the pinned
+/// `MAXWELL_B` class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3340-L3344>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDAttributePointSize {
+    enabled: bool,
+    slot: u8,
+}
+
+impl MaxwellThreeDAttributePointSize {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x0ff1 == 0 {
+            Some(Self {
+                enabled: raw & 1 != 0,
+                slot: ((raw >> 4) & 0xff) as u8,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.enabled as u32 | ((self.slot as u32) << 4)
     }
 }
 
@@ -365,15 +408,79 @@ impl MaxwellThreeDRasterBoundingBox {
     }
 }
 
+/// Selects the specialized triangle-based fill path.
+///
+/// NVIDIA publishes all three encodings in its pinned public `MAXWELL_B`
+/// class header. The frontend retains the selection without pretending that
+/// the neutral backend can reproduce either effective mode.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1822-L1826>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDFillViaTriangleMode {
+    Disabled = 0,
+    FillAll = 1,
+    FillBoundingBox = 2,
+}
+
+impl MaxwellThreeDFillViaTriangleMode {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::FillAll),
+            2 => Some(Self::FillBoundingBox),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Enables conservative rasterization for covered primitives.
+///
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1837-L1840>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDConservativeRasterEnable {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDConservativeRasterEnable {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Raw rasterization registers whose derived combinations are validated later.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDRasterState {
     point_size: MaxwellThreeDRegister<MaxwellThreeDPointSize>,
+    attribute_point_size: MaxwellThreeDRegister<MaxwellThreeDAttributePointSize>,
+    point_sprite_enable: MaxwellThreeDRegister<bool>,
+    anti_aliased_point_enable: MaxwellThreeDRegister<bool>,
     point_sprite_select: MaxwellThreeDRegister<MaxwellThreeDPointSpriteSelect>,
     point_center_mode: MaxwellThreeDRegister<MaxwellThreeDPointCenterMode>,
     edge_flag: MaxwellThreeDRegister<MaxwellThreeDEdgeFlag>,
     alpha_fraction: MaxwellThreeDRegister<MaxwellThreeDAlphaFraction>,
     bounding_box: MaxwellThreeDRegister<MaxwellThreeDRasterBoundingBox>,
+    fill_via_triangle: MaxwellThreeDRegister<MaxwellThreeDFillViaTriangleMode>,
+    conservative_raster: MaxwellThreeDRegister<MaxwellThreeDConservativeRasterEnable>,
+    polygon_smooth_enable: MaxwellThreeDRegister<bool>,
+    polygon_stipple_enable: MaxwellThreeDRegister<bool>,
+    polygon_stipple_pattern:
+        [MaxwellThreeDRegister<u32>; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT],
 }
 
 impl MaxwellThreeDRasterState {
@@ -381,6 +488,24 @@ impl MaxwellThreeDRasterState {
     pub const fn new() -> Self {
         Self {
             point_size: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            attribute_point_size: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            point_sprite_enable: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            anti_aliased_point_enable: MaxwellThreeDRegister {
                 origin: MaxwellThreeDRegisterOrigin::Unset,
                 raw: None,
                 value: None,
@@ -416,12 +541,61 @@ impl MaxwellThreeDRasterState {
                 value: None,
                 source: None,
             },
+            fill_via_triangle: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            conservative_raster: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            polygon_smooth_enable: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            polygon_stipple_enable: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
+            polygon_stipple_pattern: [const {
+                MaxwellThreeDRegister {
+                    origin: MaxwellThreeDRegisterOrigin::Unset,
+                    raw: None,
+                    value: None,
+                    source: None,
+                }
+            }; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT],
         }
     }
 
     #[must_use]
     pub const fn point_size(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPointSize> {
         &self.point_size
+    }
+
+    #[must_use]
+    pub const fn attribute_point_size(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDAttributePointSize> {
+        &self.attribute_point_size
+    }
+
+    #[must_use]
+    pub const fn point_sprite_enable(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.point_sprite_enable
+    }
+
+    #[must_use]
+    pub const fn anti_aliased_point_enable(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.anti_aliased_point_enable
     }
 
     #[must_use]
@@ -450,6 +624,37 @@ impl MaxwellThreeDRasterState {
     pub const fn bounding_box(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRasterBoundingBox> {
         &self.bounding_box
     }
+
+    #[must_use]
+    pub const fn fill_via_triangle(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDFillViaTriangleMode> {
+        &self.fill_via_triangle
+    }
+
+    #[must_use]
+    pub const fn conservative_raster(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDConservativeRasterEnable> {
+        &self.conservative_raster
+    }
+
+    #[must_use]
+    pub const fn polygon_smooth_enable(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.polygon_smooth_enable
+    }
+
+    #[must_use]
+    pub const fn polygon_stipple_enable(&self) -> &MaxwellThreeDRegister<bool> {
+        &self.polygon_stipple_enable
+    }
+
+    #[must_use]
+    pub const fn polygon_stipple_pattern(
+        &self,
+    ) -> &[MaxwellThreeDRegister<u32>; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT] {
+        &self.polygon_stipple_pattern
+    }
 }
 
 /// Clip-space Z range selected before viewport transformation.
@@ -458,6 +663,34 @@ impl MaxwellThreeDRasterState {
 pub enum MaxwellThreeDViewportZClipRange {
     NegativeWToPositiveW = 0,
     ZeroToPositiveW = 1,
+}
+
+/// Pixel-center convention applied by viewport rasterization.
+///
+/// NVIDIA publishes both encodings in its pinned public `MAXWELL_B` class
+/// header. Half-integer centers match the neutral pipeline convention;
+/// integer centers require an explicit lowering path.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3362-L3365>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDViewportPixelCenter {
+    HalfIntegers = 0,
+    Integers = 1,
+}
+
+impl MaxwellThreeDViewportPixelCenter {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::HalfIntegers),
+            1 => Some(Self::Integers),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
 }
 
 impl MaxwellThreeDViewportZClipRange {
@@ -479,6 +712,7 @@ impl MaxwellThreeDViewportZClipRange {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDViewportState {
     z_clip_range: MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange>,
+    pixel_center: MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter>,
 }
 
 impl MaxwellThreeDViewportState {
@@ -491,12 +725,23 @@ impl MaxwellThreeDViewportState {
                 value: None,
                 source: None,
             },
+            pixel_center: MaxwellThreeDRegister {
+                origin: MaxwellThreeDRegisterOrigin::Unset,
+                raw: None,
+                value: None,
+                source: None,
+            },
         }
     }
 
     #[must_use]
     pub const fn z_clip_range(&self) -> &MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange> {
         &self.z_clip_range
+    }
+
+    #[must_use]
+    pub const fn pixel_center(&self) -> &MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter> {
+        &self.pixel_center
     }
 }
 
@@ -517,6 +762,7 @@ pub struct MaxwellThreeDState {
     line: MaxwellThreeDLineState,
     zcull: MaxwellThreeDZCullState,
     rop_l2_cache: MaxwellThreeDRopL2CacheState,
+    report_semaphore: MaxwellThreeDReportSemaphoreState,
     mme: MaxwellThreeDMmeState,
 }
 
@@ -561,6 +807,7 @@ impl Default for MaxwellThreeDState {
             line: Default::default(),
             zcull: Default::default(),
             rop_l2_cache: Default::default(),
+            report_semaphore: Default::default(),
             mme: Default::default(),
         }
     }
@@ -638,6 +885,11 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
+    pub const fn report_semaphore(&self) -> &MaxwellThreeDReportSemaphoreState {
+        &self.report_semaphore
+    }
+
+    #[must_use]
     pub const fn mme(&self) -> &MaxwellThreeDMmeState {
         &self.mme
     }
@@ -668,14 +920,23 @@ impl MaxwellThreeDState {
             self.shader_execution
                 .append_shader_pipeline_dependencies(&mut dependencies);
         }
-        dependencies.push(self.raster.point_size.raw());
         if self
             .vertex_input
             .primitive()
-            .begin()
-            .value()
+            .active_begin()
             .is_some_and(|begin| begin.topology() == 0)
         {
+            dependencies.push(self.raster.attribute_point_size.raw());
+            if !self
+                .raster
+                .attribute_point_size
+                .value()
+                .is_some_and(|value| value.enabled())
+            {
+                dependencies.push(self.raster.point_size.raw());
+            }
+            dependencies.push(self.raster.point_sprite_enable.raw());
+            dependencies.push(self.raster.anti_aliased_point_enable.raw());
             if self
                 .raster
                 .point_sprite_select
@@ -689,9 +950,30 @@ impl MaxwellThreeDState {
         if self.edge_flag_affects_draw() {
             dependencies.push(self.raster.edge_flag.raw());
         }
+        if self
+            .vertex_input
+            .primitive()
+            .active_begin()
+            .is_some_and(|begin| matches!(begin.topology(), 4..=6))
+        {
+            dependencies.push(self.raster.polygon_smooth_enable.raw());
+            dependencies.push(self.raster.polygon_stipple_enable.raw());
+            if self.raster.polygon_stipple_enable.value() == Some(&true) {
+                dependencies.extend(
+                    self.raster
+                        .polygon_stipple_pattern
+                        .iter()
+                        .map(MaxwellThreeDRegister::raw),
+                );
+            }
+        }
         dependencies.push(self.raster.alpha_fraction.raw());
+        dependencies.push(self.raster.fill_via_triangle.raw());
+        dependencies.push(self.raster.conservative_raster.raw());
         dependencies.push(self.viewport.z_clip_range.raw());
+        dependencies.push(self.viewport.pixel_center.raw());
         dependencies.push(self.render_targets.color_target_selection().raw());
+        dependencies.push(self.render_targets.depth_target_count().raw());
         if self
             .render_targets
             .render_target_layer()
@@ -700,10 +982,25 @@ impl MaxwellThreeDState {
         {
             dependencies.push(self.render_targets.render_target_layer().raw());
         }
+        if self
+            .render_targets
+            .render_target_index_offset()
+            .value()
+            .is_some_and(|value| value.enabled())
+        {
+            dependencies.push(self.render_targets.render_target_index_offset().raw());
+        }
         if active_color_targets.len() > 1 {
             dependencies.push(self.render_targets.separate_fragment_data().raw());
         }
         dependencies.push(self.coverage.csaa_enable().raw());
+        dependencies.push(self.coverage.hybrid_anti_alias_control().raw());
+        dependencies.extend(
+            self.coverage
+                .sample_locations()
+                .iter()
+                .map(MaxwellThreeDRegister::raw),
+        );
         if self
             .coverage
             .ps_output_sample_mask_usage()
@@ -713,7 +1010,7 @@ impl MaxwellThreeDState {
         {
             dependencies.push(self.coverage.ps_output_sample_mask_usage().raw());
         }
-        dependencies.push(self.line.aliased_line_width_enable().raw());
+        self.line.append_pipeline_dependencies(&mut dependencies);
         dependencies.into_boxed_slice()
     }
 
@@ -734,8 +1031,7 @@ impl MaxwellThreeDState {
         let polygon_topology = self
             .vertex_input
             .primitive()
-            .begin()
-            .value()
+            .active_begin()
             .is_some_and(|begin| matches!(begin.topology(), 4..=6));
         let non_fill_polygon_mode = [
             MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
@@ -761,6 +1057,18 @@ impl MaxwellThreeDState {
                 self.raster.point_size =
                     MaxwellThreeDRegister::programmed(value.bits(), value, source);
             }
+            MaxwellThreeDStateWrite::AttributePointSize { value, source } => {
+                self.raster.attribute_point_size =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDStateWrite::PointSpriteEnable { value, source } => {
+                self.raster.point_sprite_enable =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source } => {
+                self.raster.anti_aliased_point_enable =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
             MaxwellThreeDStateWrite::PointSpriteSelect { value, source } => {
                 self.raster.point_sprite_select =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
@@ -781,8 +1089,36 @@ impl MaxwellThreeDState {
                 self.raster.bounding_box =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
+            MaxwellThreeDStateWrite::FillViaTriangle { value, source } => {
+                self.raster.fill_via_triangle =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDStateWrite::ConservativeRaster { value, source } => {
+                self.raster.conservative_raster =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source } => {
+                self.raster.polygon_smooth_enable =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDStateWrite::PolygonStippleEnable { value, source } => {
+                self.raster.polygon_stipple_enable =
+                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            }
+            MaxwellThreeDStateWrite::PolygonStipplePattern {
+                word,
+                value,
+                source,
+            } => {
+                self.raster.polygon_stipple_pattern[word as usize] =
+                    MaxwellThreeDRegister::programmed(value, value, source);
+            }
             MaxwellThreeDStateWrite::ViewportZClip { value, source } => {
                 self.viewport.z_clip_range =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDStateWrite::ViewportPixelCenter { value, source } => {
+                self.viewport.pixel_center =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::RenderTarget(write) => self.render_targets.apply(write),
@@ -796,6 +1132,7 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::Line(write) => self.line.apply(write),
             MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
             MaxwellThreeDStateWrite::RopL2Cache(write) => self.rop_l2_cache.apply(write),
+            MaxwellThreeDStateWrite::ReportSemaphore(write) => self.report_semaphore.apply(write),
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
     }
@@ -980,6 +1317,18 @@ pub enum MaxwellThreeDStateWrite {
         value: MaxwellThreeDPointSize,
         source: MaxwellMethodSource,
     },
+    AttributePointSize {
+        value: MaxwellThreeDAttributePointSize,
+        source: MaxwellMethodSource,
+    },
+    PointSpriteEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
+    AntiAliasedPointEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
     PointSpriteSelect {
         value: MaxwellThreeDPointSpriteSelect,
         source: MaxwellMethodSource,
@@ -1000,8 +1349,33 @@ pub enum MaxwellThreeDStateWrite {
         value: MaxwellThreeDRasterBoundingBox,
         source: MaxwellMethodSource,
     },
+    FillViaTriangle {
+        value: MaxwellThreeDFillViaTriangleMode,
+        source: MaxwellMethodSource,
+    },
+    ConservativeRaster {
+        value: MaxwellThreeDConservativeRasterEnable,
+        source: MaxwellMethodSource,
+    },
+    PolygonSmoothEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
+    PolygonStippleEnable {
+        value: bool,
+        source: MaxwellMethodSource,
+    },
+    PolygonStipplePattern {
+        word: u8,
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     ViewportZClip {
         value: MaxwellThreeDViewportZClipRange,
+        source: MaxwellMethodSource,
+    },
+    ViewportPixelCenter {
+        value: MaxwellThreeDViewportPixelCenter,
         source: MaxwellMethodSource,
     },
     RenderTarget(MaxwellThreeDRenderTargetWrite),
@@ -1015,5 +1389,6 @@ pub enum MaxwellThreeDStateWrite {
     Line(MaxwellThreeDLineStateWrite),
     ZCull(MaxwellThreeDZCullStateWrite),
     RopL2Cache(MaxwellThreeDRopL2CacheStateWrite),
+    ReportSemaphore(MaxwellThreeDReportSemaphoreStateWrite),
     Mme(MaxwellThreeDMmeStateWrite),
 }

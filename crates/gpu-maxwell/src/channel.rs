@@ -11,7 +11,7 @@ use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 
 use crate::{
     GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellGpuProfile,
-    MaxwellPushbufferSubchannel, MaxwellThreeDState, MaxwellTwoDState,
+    MaxwellInlineToMemoryState, MaxwellPushbufferSubchannel, MaxwellThreeDState, MaxwellTwoDState,
 };
 
 /// Stable identity of one Maxwell channel lifetime.
@@ -279,6 +279,7 @@ pub struct MaxwellGpuChannel {
     syncpoint: Option<GuestSyncpointId>,
     frontend: MaxwellChannelFrontendState,
     compute: MaxwellComputeState,
+    inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
     three_d: MaxwellThreeDState,
     priority: MaxwellChannelPriority,
@@ -311,6 +312,7 @@ impl MaxwellGpuChannel {
                 subchannel_bindings: [None; 8],
             },
             compute: MaxwellComputeState::new(),
+            inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
             three_d: MaxwellThreeDState::new(),
             priority: MaxwellChannelPriority::Medium,
@@ -372,6 +374,16 @@ impl MaxwellGpuChannel {
 
     pub(crate) fn replace_compute(&mut self, compute: MaxwellComputeState) {
         self.compute = compute;
+    }
+
+    /// Returns the channel-owned `MAXWELL_INLINE_TO_MEMORY_A` state.
+    #[must_use]
+    pub const fn inline_to_memory(&self) -> &MaxwellInlineToMemoryState {
+        &self.inline_to_memory
+    }
+
+    pub(crate) fn replace_inline_to_memory(&mut self, state: MaxwellInlineToMemoryState) {
+        self.inline_to_memory = state;
     }
 
     /// Returns an immutable snapshot of channel-owned `FERMI_TWOD_A` state.

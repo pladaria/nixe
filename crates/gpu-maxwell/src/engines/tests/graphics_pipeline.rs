@@ -92,7 +92,7 @@ fn invalid_z_compression_values_are_rejected_atomically() {
 }
 
 #[test]
-fn enabled_z_compression_stops_only_operations_that_consume_depth() {
+fn enabled_z_compression_without_a_depth_target_does_not_block_draw_preflight() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let compression = packet(0x19cc / 4, 1);
@@ -123,29 +123,6 @@ fn enabled_z_compression_stops_only_operations_that_consume_depth() {
             &cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
-    ));
-    assert_eq!(cache, cache_before);
-
-    let clear = packet(0x19d0 / 4, 3);
-    let clear_dispatch = dispatch_maxwell_engine_packet(
-        &mut channel,
-        FrontendSubmissionId::new(3),
-        &clear.packets()[0],
-    )
-    .unwrap();
-    let triggered = &clear_dispatch.operations()[0];
-    assert!(matches!(
-        preflight_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
-        ),
-        Err(MaxwellThreeDLoweringError::UnsupportedZCompressionSemantics)
     ));
     assert_eq!(cache, cache_before);
 }
@@ -248,7 +225,7 @@ fn invalid_color_compression_values_are_rejected_atomically() {
 }
 
 #[test]
-fn color_compression_execution_is_target_specific_and_typed() {
+fn compressed_color_full_clear_materializes_without_importing_guest_bytes() {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
@@ -277,6 +254,13 @@ fn color_compression_execution_is_target_specific_and_typed() {
         (0x121c, 1),
         (0x12e4, 0),
         (0x135c, 0),
+        (0x0d6c, (32 << 16) | 0),
+        (0x0d70, (16 << 16) | 0),
+        (0x0d80, 0x3f80_0000),
+        (0x0d84, 0x3f00_0000),
+        (0x0d88, 0),
+        (0x0d8c, 0x3f80_0000),
+        (0x10f8, 0x10),
     ] {
         program_three_d(&mut channel, method, argument);
     }
@@ -287,7 +271,7 @@ fn color_compression_execution_is_target_specific_and_typed() {
             .iter()
             .any(|resource| { resource.role() == MaxwellThreeDResourceRole::ColorTarget(0) })
     );
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let cache_before = cache.clone();
 
     let draw_source = channel.three_d().render_targets().color()[0]
@@ -308,7 +292,7 @@ fn color_compression_execution_is_target_specific_and_typed() {
             &lowering_capabilities(BackendFeatures::empty()),
             &cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedColorCompressionSemantics { target: 0 })
+        Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
     ));
     assert_eq!(cache, cache_before);
 
@@ -331,9 +315,60 @@ fn color_compression_execution_is_target_specific_and_typed() {
             &lowering_capabilities(BackendFeatures::empty()),
             &cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedColorCompressionSemantics { target: 0 })
+        Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
     ));
     assert_eq!(cache, cache_before);
+
+    program_three_d(&mut channel, 0x10f8, 0);
+    let full_clear = packet(0x19d0 / 4, 0x3c);
+    let full_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &full_clear.packets()[0],
+    )
+    .unwrap();
+    let full = &full_dispatch.operations()[0];
+    let full_resources = resolve_maxwell_three_d_resources(full.state(), &address_space).unwrap();
+    let plan = preflight_maxwell_three_d_operation(
+        full.state(),
+        &full_resources,
+        full.trigger(),
+        None,
+        FrontendSubmissionId::new(12),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+    assert!(plan.resource_creations().iter().any(|creation| matches!(
+        creation,
+        nixe_gpu::BackendResourceCreateInfo::Image { view: None, .. }
+    )));
+    assert!(matches!(
+        plan.submission().operations()[0].command(),
+        GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
+            value: nixe_gpu::ClearValue::Color(_),
+            ..
+        })
+    ));
+    plan.commit_cache(&mut cache).unwrap();
+
+    let partial_after_materialization = preflight_maxwell_three_d_operation(
+        triggered.state(),
+        &resources,
+        triggered.trigger(),
+        None,
+        FrontendSubmissionId::new(13),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+    assert!(
+        partial_after_materialization
+            .resource_creations()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1569,7 +1604,7 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
 }
 
 #[test]
-fn viewport_scale_offset_dependencies_and_draw_error_follow_enable_only() {
+fn viewport_scale_offset_dependencies_and_draw_validation_follow_enable_only() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
@@ -1613,7 +1648,16 @@ fn viewport_scale_offset_dependencies_and_draw_error_follow_enable_only() {
     program_three_d(&mut channel, 0x192c, 1);
     let dependencies_enabled = channel.three_d().pipeline_dependencies(&[]);
     assert_ne!(dependencies_enabled, dependencies_disabled);
-    program_three_d(&mut channel, 0x0a00, 3.0_f32.to_bits());
+    for (method, value) in [
+        (0x0a00, 3.0_f32),
+        (0x0a04, -4.0_f32),
+        (0x0a08, 0.5_f32),
+        (0x0a0c, 2.0_f32),
+        (0x0a10, 4.0_f32),
+        (0x0a14, 0.5_f32),
+    ] {
+        program_three_d(&mut channel, method, value.to_bits());
+    }
     assert_ne!(
         channel.three_d().pipeline_dependencies(&[]),
         dependencies_enabled
@@ -1639,7 +1683,7 @@ fn viewport_scale_offset_dependencies_and_draw_error_follow_enable_only() {
             &capabilities,
             &cache,
         ),
-        Err(MaxwellThreeDLoweringError::UnsupportedViewportScaleOffsetSemantics)
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     let clear = packet(0x19d0 / 4, 0x3c);
@@ -2524,6 +2568,90 @@ fn vertex_stream_attributes_and_begin_state_remain_unresolved_and_typed() {
 }
 
 #[test]
+fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+
+    program_three_d(&mut channel, 0x1618, 4);
+    let primitive = channel.three_d().vertex_input().primitive();
+    assert!(primitive.is_open());
+    assert_eq!(primitive.active_begin().unwrap().topology(), 4);
+    let begin_source = primitive.begin().source().unwrap();
+    let open_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    assert_ne!(open_dependencies, dependencies_before);
+
+    let decoded = packet(0x1614 / 4, 0);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    let source = dispatch.methods()[0].method().source();
+    assert_eq!(dispatch.methods()[0].metadata().method_name(), "END");
+    assert_eq!(
+        dispatch.methods()[0].effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
+            MaxwellThreeDVertexInputWrite::End {
+                value: false,
+                source,
+            }
+        ))
+    );
+    assert!(dispatch.operations().is_empty());
+
+    let primitive = channel.three_d().vertex_input().primitive();
+    assert!(!primitive.is_open());
+    assert_eq!(primitive.active_begin(), None);
+    assert_eq!(primitive.begin().value().unwrap().topology(), 4);
+    assert_eq!(primitive.begin().source(), Some(begin_source));
+    assert_eq!(
+        primitive.end().origin(),
+        MaxwellThreeDRegisterOrigin::Programmed
+    );
+    assert_eq!(primitive.end().raw(), Some(0));
+    assert_eq!(primitive.end().value(), Some(&false));
+    assert_eq!(primitive.end().source(), Some(source));
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
+
+    let frontend_before = channel.frontend();
+    let two_d_before = channel.two_d().clone();
+    let three_d_before = channel.three_d().clone();
+    let decoded = incrementing_packet(0x1610 / 4, &[0, 2]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+            source,
+            method_name: "END",
+            ..
+        }) if source.method() == GpuMethodId(0x1614) && source.argument() == 2
+    ));
+    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.two_d(), &two_d_before);
+    assert_eq!(channel.three_d(), &three_d_before);
+
+    let decoded = incrementing_packet(0x1614 / 4, &[1, 5]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    let primitive = channel.three_d().vertex_input().primitive();
+    assert!(primitive.is_open());
+    assert_eq!(primitive.end().value(), Some(&true));
+    assert_eq!(primitive.active_begin().unwrap().topology(), 5);
+}
+
+#[test]
 fn malformed_vertex_suffix_and_index_relationships_reject_atomically() {
     let mut channel = channel();
     bind_three_d(&mut channel);
@@ -2916,4 +3044,268 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
     assert_eq!(cache, cache_before);
+}
+
+#[test]
+fn pipeline_program_offsets_and_register_counts_are_indexed_and_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
+        let program_method = 0x2004 + pipeline as u32 * 0x40;
+        let count_method = 0x200c + pipeline as u32 * 0x40;
+        let offset = 0x1000 + pipeline as u32 * 0x80;
+        let count = 4 + pipeline as u32;
+
+        let program = packet(program_method / 4, offset);
+        let program_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &program.packets()[0],
+        )
+        .unwrap();
+        let program_source = program_dispatch.methods()[0].method().source();
+        assert_eq!(
+            program_dispatch.methods()[0].metadata().method_name(),
+            "SET_PIPELINE_PROGRAM"
+        );
+        assert_eq!(
+            program_dispatch.methods()[0].effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
+                MaxwellThreeDShaderBindingWrite::PipelineProgram {
+                    pipeline: pipeline as u8,
+                    offset,
+                    source: program_source,
+                }
+            ))
+        );
+
+        let count_packet = packet(count_method / 4, count);
+        let count_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &count_packet.packets()[0],
+        )
+        .unwrap();
+        let count_source = count_dispatch.methods()[0].method().source();
+        assert_eq!(
+            count_dispatch.methods()[0].metadata().method_name(),
+            "SET_PIPELINE_REGISTER_COUNT"
+        );
+
+        let binding = &channel.three_d().shader_bindings().pipeline()[pipeline];
+        assert_eq!(binding.program_offset().raw(), Some(offset));
+        assert_eq!(binding.program_offset().value(), Some(&offset));
+        assert_eq!(binding.program_offset().source(), Some(program_source));
+        assert_eq!(binding.register_count().raw(), Some(count));
+        assert_eq!(binding.register_count().value(), Some(&(count as u8)));
+        assert_eq!(binding.register_count().source(), Some(count_source));
+    }
+
+    for argument in [0x100, 0x1ff, u32::MAX] {
+        let before = channel.clone();
+        let invalid = packet(0x200c / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &invalid.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_PIPELINE_REGISTER_COUNT",
+                ..
+            }) if source.argument() == argument
+        ));
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
+fn program_offset_and_register_count_dependencies_require_an_enabled_slot() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let reset_dependencies = channel.three_d().pipeline_dependencies(&[]);
+
+    program_three_d(&mut channel, 0x2044, 0x7f730);
+    program_three_d(&mut channel, 0x204c, 4);
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        reset_dependencies
+    );
+
+    program_three_d(&mut channel, 0x2040, 0x11);
+    let enabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    assert_ne!(enabled_dependencies, reset_dependencies);
+
+    program_three_d(&mut channel, 0x2044, 0x7f830);
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        enabled_dependencies
+    );
+    let offset_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    program_three_d(&mut channel, 0x204c, 5);
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        offset_dependencies
+    );
+
+    program_three_d(&mut channel, 0x2040, 0x10);
+    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    program_three_d(&mut channel, 0x2044, 0x7f930);
+    program_three_d(&mut channel, 0x204c, 6);
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        disabled_dependencies
+    );
+}
+
+#[test]
+fn tessellation_lod_family_is_source_preserving_and_stage_conditional() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let levels = [
+        MaxwellThreeDTessellationLod::OuterU0OrDensity,
+        MaxwellThreeDTessellationLod::OuterV0OrDetail,
+        MaxwellThreeDTessellationLod::OuterU1OrW0,
+        MaxwellThreeDTessellationLod::OuterV1,
+        MaxwellThreeDTessellationLod::InnerU,
+        MaxwellThreeDTessellationLod::InnerV,
+    ];
+    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
+
+    for (index, level) in levels.into_iter().enumerate() {
+        let method = 0x0324 + index as u32 * 4;
+        let argument = if index == 5 {
+            u32::MAX
+        } else {
+            0x3f80_0000 + index as u32
+        };
+        let decoded = packet(method / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let source = dispatch.methods()[0].method().source();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_TESSELLATION_LOD"
+        );
+        assert_eq!(
+            dispatch.methods()[0].effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
+                MaxwellThreeDShaderBindingWrite::TessellationLod {
+                    level,
+                    value: argument,
+                    source,
+                }
+            ))
+        );
+        let register = channel.three_d().shader_bindings().tessellation_lod(level);
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value(), Some(&argument));
+        assert_eq!(register.source(), Some(source));
+    }
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        inactive_dependencies
+    );
+
+    program_three_d(&mut channel, 0x2080, 0x21);
+    let tessellation_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    assert_ne!(tessellation_dependencies, inactive_dependencies);
+    program_three_d(&mut channel, 0x0324, 0x4000_0000);
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        tessellation_dependencies
+    );
+
+    program_three_d(&mut channel, 0x2080, 0x20);
+    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    program_three_d(&mut channel, 0x0324, 0x4040_0000);
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        disabled_dependencies
+    );
+}
+
+#[test]
+fn render_target_index_offset_is_typed_source_preserving_and_conditionally_dependent() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let two_d_before = channel.two_d().clone();
+    let neutral_dependencies = channel.three_d().pipeline_dependencies(&[0]);
+
+    for (argument, expected, enabled) in [
+        (0, MaxwellThreeDRenderTargetIndexOffset::Disabled, false),
+        (
+            1,
+            MaxwellThreeDRenderTargetIndexOffset::ByViewportIndex,
+            true,
+        ),
+    ] {
+        let decoded = packet(0x11f0 / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let method = dispatch.methods()[0];
+        let source = method.method().source();
+        let register = channel
+            .three_d()
+            .render_targets()
+            .render_target_index_offset();
+
+        assert_eq!(
+            method.metadata().method_name(),
+            "SET_OFFSET_RENDER_TARGET_INDEX"
+        );
+        assert_eq!(
+            method.effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
+                MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset {
+                    value: expected,
+                    source,
+                }
+            ))
+        );
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(expected.raw(), argument);
+        assert_eq!(expected.enabled(), enabled);
+        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value().copied(), Some(expected));
+        assert_eq!(register.source(), Some(source));
+        assert_eq!(
+            channel.three_d().pipeline_dependencies(&[0]) == neutral_dependencies,
+            !enabled
+        );
+        assert_eq!(channel.two_d(), &two_d_before);
+    }
+
+    for argument in [2, 3, 0x8000_0000, u32::MAX] {
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = packet(0x11f0 / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_OFFSET_RENDER_TARGET_INDEX",
+                ..
+            }) if source.argument() == argument
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
 }

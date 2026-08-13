@@ -39,6 +39,7 @@ pub use command::{
     ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DispatchOperation,
     DrawArguments, DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
+    ViewportTransform,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,

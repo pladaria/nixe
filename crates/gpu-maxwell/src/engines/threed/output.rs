@@ -60,6 +60,96 @@ pub enum MaxwellThreeDShadeMode {
     Smooth = 0x1d01,
 }
 
+/// Vertex whose `flat` outputs supply the value for an entire primitive.
+///
+/// NVIDIA publishes the selector and its two encodings in the pinned
+/// `MAXWELL_B` class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3123-L3126>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDProvokingVertex {
+    First = 0,
+    Last = 1,
+}
+
+impl MaxwellThreeDProvokingVertex {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::First),
+            1 => Some(Self::Last),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Clamp interval selected for one saturated pixel-shader output.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDPixelShaderClampRange {
+    ZeroToOne,
+    MinusOneToOne,
+}
+
+/// Saturation controls for all eight pixel-shader color outputs.
+///
+/// Each nibble carries an enable bit and a signed-range bit, as published in
+/// NVIDIA's pinned `MAXWELL_B` class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2549-L2597>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDPixelShaderSaturate(u32);
+
+impl MaxwellThreeDPixelShaderSaturate {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x3333_3333 == 0 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn output_enabled(self, output: u8) -> Option<bool> {
+        if output < 8 {
+            Some(self.0 & (1 << (u32::from(output) * 4)) != 0)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn clamp_range(self, output: u8) -> Option<MaxwellThreeDPixelShaderClampRange> {
+        if output >= 8 {
+            return None;
+        }
+        if self.0 & (2 << (u32::from(output) * 4)) == 0 {
+            Some(MaxwellThreeDPixelShaderClampRange::ZeroToOne)
+        } else {
+            Some(MaxwellThreeDPixelShaderClampRange::MinusOneToOne)
+        }
+    }
+
+    #[must_use]
+    pub fn first_enabled_output(self) -> Option<u8> {
+        let mut output = 0;
+        while output < 8 {
+            if self.output_enabled(output) == Some(true) {
+                return Some(output);
+            }
+            output += 1;
+        }
+        None
+    }
+}
+
 /// Combination rule applied to the programmed window-clip rectangles.
 ///
 /// NVIDIA publishes all three encodings in the pinned public class header:
@@ -221,6 +311,60 @@ pub enum MaxwellThreeDBlendOp {
     ReverseSubtract,
     Min,
     Max,
+}
+
+/// Bitwise operation applied between fragment and color-target values.
+///
+/// All sixteen encodings are published in NVIDIA's pinned `MAXWELL_B` header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3521-L3543>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDLogicOp {
+    Clear = 0x1500,
+    And = 0x1501,
+    AndReverse = 0x1502,
+    Copy = 0x1503,
+    AndInverted = 0x1504,
+    Noop = 0x1505,
+    Xor = 0x1506,
+    Or = 0x1507,
+    Nor = 0x1508,
+    Equiv = 0x1509,
+    Invert = 0x150a,
+    OrReverse = 0x150b,
+    CopyInverted = 0x150c,
+    OrInverted = 0x150d,
+    Nand = 0x150e,
+    Set = 0x150f,
+}
+
+impl MaxwellThreeDLogicOp {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0x1500 => Self::Clear,
+            0x1501 => Self::And,
+            0x1502 => Self::AndReverse,
+            0x1503 => Self::Copy,
+            0x1504 => Self::AndInverted,
+            0x1505 => Self::Noop,
+            0x1506 => Self::Xor,
+            0x1507 => Self::Or,
+            0x1508 => Self::Nor,
+            0x1509 => Self::Equiv,
+            0x150a => Self::Invert,
+            0x150b => Self::OrReverse,
+            0x150c => Self::CopyInverted,
+            0x150d => Self::OrInverted,
+            0x150e => Self::Nand,
+            0x150f => Self::Set,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
 }
 
 /// Whether the common blend state is active for later color-target draws.
@@ -406,6 +550,13 @@ impl MaxwellThreeDSampleMode {
     }
 }
 
+/// Per-component color-write mask for one render target.
+///
+/// NVIDIA's public `MAXWELL_B` header exposes eight masks and a separate
+/// `SET_SINGLE_CT_WRITE_CONTROL` selector. Keeping both pieces of state lets
+/// draw validation select the effective mask without discarding guest intent.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1266-L1269>
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3580-L3592>
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDColorMask {
     pub red: bool,
@@ -424,6 +575,19 @@ impl MaxwellThreeDColorMask {
             blue: raw & 0x100 != 0,
             alpha: raw & 0x1000 != 0,
         })
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.red as u32
+            | ((self.green as u32) << 4)
+            | ((self.blue as u32) << 8)
+            | ((self.alpha as u32) << 12)
+    }
+
+    #[must_use]
+    pub const fn all_enabled(self) -> bool {
+        self.red && self.green && self.blue && self.alpha
     }
 }
 
@@ -537,10 +701,20 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     WindowClipType,
     ClipIdTestEnable,
     DepthBoundsMax,
+    LogicOpEnable,
+    LogicOpFunction,
+    SingleColorTargetWriteControl,
+    AlphaTestEnable,
+    AlphaTestReference,
+    AlphaTestFunction,
+    ProvokingVertex,
+    TwoSidedLightEnable,
+    ColorClampEnable,
+    PixelShaderSaturate,
 }
 
 impl MaxwellThreeDFixedFunctionRegister {
-    const COUNT: usize = Self::DepthBoundsMax as usize + 1;
+    const COUNT: usize = Self::PixelShaderSaturate as usize + 1;
     const fn index(self) -> usize {
         self as usize
     }
@@ -557,6 +731,9 @@ pub enum MaxwellThreeDFixedFunctionValue {
     StencilOp(MaxwellThreeDStencilOp),
     BlendOp(MaxwellThreeDBlendOp),
     BlendFactor(MaxwellThreeDBlendFactor),
+    LogicOp(MaxwellThreeDLogicOp),
+    ProvokingVertex(MaxwellThreeDProvokingVertex),
+    PixelShaderSaturate(MaxwellThreeDPixelShaderSaturate),
     FloatBits(MaxwellThreeDRawValue),
     SampleMode(MaxwellThreeDSampleMode),
     Mask(u32),
@@ -570,6 +747,36 @@ pub enum MaxwellThreeDFixedFunctionValue {
     },
 }
 
+/// One axis of the global surface clip, encoded as origin plus extent.
+///
+/// Unlike viewport, scissor, and window-clip rectangles, these registers use
+/// an origin and size rather than minimum and maximum coordinates.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDSurfaceClipAxis {
+    origin: u16,
+    extent: u16,
+}
+
+impl MaxwellThreeDSurfaceClipAxis {
+    pub(super) const fn parse(raw: u32) -> Self {
+        Self {
+            origin: raw as u16,
+            extent: (raw >> 16) as u16,
+        }
+    }
+
+    #[must_use]
+    pub const fn origin(self) -> u16 {
+        self.origin
+    }
+
+    #[must_use]
+    pub const fn extent(self) -> u16 {
+        self.extent
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDViewportTransformState {
     scale: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
@@ -578,7 +785,90 @@ pub struct MaxwellThreeDViewportTransformState {
     clip_vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
     clip_min_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
     clip_max_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
+    coordinate_swizzle: MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle>,
 }
+
+/// One signed source component selected by viewport coordinate swizzling.
+///
+/// NVIDIA publishes the same three-bit selector for each output component in
+/// its pinned public `MAXWELL_B` class header.
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L799-L835>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDViewportSwizzleComponent {
+    PositiveX = 0,
+    NegativeX = 1,
+    PositiveY = 2,
+    NegativeY = 3,
+    PositiveZ = 4,
+    NegativeZ = 5,
+    PositiveW = 6,
+    NegativeW = 7,
+}
+
+impl MaxwellThreeDViewportSwizzleComponent {
+    const fn parse(raw: u32) -> Self {
+        match raw & 7 {
+            0 => Self::PositiveX,
+            1 => Self::NegativeX,
+            2 => Self::PositiveY,
+            3 => Self::NegativeY,
+            4 => Self::PositiveZ,
+            5 => Self::NegativeZ,
+            6 => Self::PositiveW,
+            _ => Self::NegativeW,
+        }
+    }
+}
+
+/// Signed component mapping applied before one viewport transform.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDViewportCoordinateSwizzle {
+    components: [MaxwellThreeDViewportSwizzleComponent; 4],
+}
+
+impl MaxwellThreeDViewportCoordinateSwizzle {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x7777 != 0 {
+            return None;
+        }
+        Some(Self {
+            components: [
+                MaxwellThreeDViewportSwizzleComponent::parse(raw),
+                MaxwellThreeDViewportSwizzleComponent::parse(raw >> 4),
+                MaxwellThreeDViewportSwizzleComponent::parse(raw >> 8),
+                MaxwellThreeDViewportSwizzleComponent::parse(raw >> 12),
+            ],
+        })
+    }
+
+    #[must_use]
+    pub const fn components(self) -> [MaxwellThreeDViewportSwizzleComponent; 4] {
+        self.components
+    }
+
+    #[must_use]
+    pub const fn is_identity(self) -> bool {
+        matches!(
+            self.components,
+            [
+                MaxwellThreeDViewportSwizzleComponent::PositiveX,
+                MaxwellThreeDViewportSwizzleComponent::PositiveY,
+                MaxwellThreeDViewportSwizzleComponent::PositiveZ,
+                MaxwellThreeDViewportSwizzleComponent::PositiveW,
+            ]
+        )
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.components[0] as u32
+            | ((self.components[1] as u32) << 4)
+            | ((self.components[2] as u32) << 8)
+            | ((self.components[3] as u32) << 12)
+    }
+}
+
 impl MaxwellThreeDViewportTransformState {
     #[must_use]
     pub const fn scale(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3] {
@@ -603,6 +893,12 @@ impl MaxwellThreeDViewportTransformState {
     #[must_use]
     pub const fn clip_max_z(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
         &self.clip_max_z
+    }
+    #[must_use]
+    pub const fn coordinate_swizzle(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle> {
+        &self.coordinate_swizzle
     }
 }
 
@@ -652,6 +948,8 @@ impl MaxwellThreeDScissorState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDFixedFunctionState {
+    surface_clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis>,
+    surface_clip_vertical: MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis>,
     viewport: [MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT],
     scissor: [MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT],
     window_clip: [MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT],
@@ -674,6 +972,8 @@ impl Default for MaxwellThreeDFixedFunctionState {
                 MaxwellThreeDRegister::verified_reset(MAXWELL_THREE_D_POLYGON_MODE_RESET, None);
         }
         Self {
+            surface_clip_horizontal: Default::default(),
+            surface_clip_vertical: Default::default(),
             viewport: std::array::from_fn(|_| Default::default()),
             scissor: std::array::from_fn(|_| Default::default()),
             window_clip: std::array::from_fn(|_| Default::default()),
@@ -687,6 +987,20 @@ impl Default for MaxwellThreeDFixedFunctionState {
     }
 }
 impl MaxwellThreeDFixedFunctionState {
+    #[must_use]
+    pub const fn surface_clip_horizontal(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis> {
+        &self.surface_clip_horizontal
+    }
+
+    #[must_use]
+    pub const fn surface_clip_vertical(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDSurfaceClipAxis> {
+        &self.surface_clip_vertical
+    }
+
     #[must_use]
     pub const fn viewport(&self) -> &[MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT] {
         &self.viewport
@@ -736,6 +1050,8 @@ impl MaxwellThreeDFixedFunctionState {
         dependencies: &mut Vec<Option<u32>>,
         active_color_targets: &[u8],
     ) {
+        dependencies.push(self.surface_clip_horizontal.raw());
+        dependencies.push(self.surface_clip_vertical.raw());
         let viewport_scale_offset_enable =
             self.register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable);
         let scale_offset_may_be_effective = viewport_scale_offset_enable.value()
@@ -751,6 +1067,7 @@ impl MaxwellThreeDFixedFunctionState {
             dependencies.push(viewport.clip_vertical.raw());
             dependencies.push(viewport.clip_min_z.raw());
             dependencies.push(viewport.clip_max_z.raw());
+            dependencies.push(viewport.coordinate_swizzle.raw());
         }
         for scissor in &self.scissor {
             dependencies.push(scissor.enable.raw());
@@ -775,6 +1092,7 @@ impl MaxwellThreeDFixedFunctionState {
             MaxwellThreeDFixedFunctionRegister::BlendConstantBlue,
             MaxwellThreeDFixedFunctionRegister::BlendConstantAlpha,
             MaxwellThreeDFixedFunctionRegister::WindowClipType,
+            MaxwellThreeDFixedFunctionRegister::LogicOpFunction,
         ];
         dependencies.extend(
             self.registers
@@ -822,13 +1140,62 @@ impl MaxwellThreeDFixedFunctionState {
             dependencies.push(self.blend_controls.per_format_enable.raw());
             dependencies.push(self.blend_controls.zero_times_anything_is_zero.raw());
         }
-        dependencies.extend(self.color_mask.iter().map(MaxwellThreeDRegister::raw));
+        if self
+            .register(MaxwellThreeDFixedFunctionRegister::LogicOpEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+        {
+            dependencies.push(
+                self.register(MaxwellThreeDFixedFunctionRegister::LogicOpFunction)
+                    .raw(),
+            );
+        }
+        if self
+            .register(MaxwellThreeDFixedFunctionRegister::AlphaTestEnable)
+            .value()
+            == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
+        {
+            dependencies.push(
+                self.register(MaxwellThreeDFixedFunctionRegister::AlphaTestReference)
+                    .raw(),
+            );
+            dependencies.push(
+                self.register(MaxwellThreeDFixedFunctionRegister::AlphaTestFunction)
+                    .raw(),
+            );
+        }
+        match self
+            .register(MaxwellThreeDFixedFunctionRegister::SingleColorTargetWriteControl)
+            .value()
+        {
+            Some(MaxwellThreeDFixedFunctionValue::Boolean(true)) => {
+                dependencies.push(self.color_mask[0].raw());
+            }
+            Some(MaxwellThreeDFixedFunctionValue::Boolean(false)) => {
+                dependencies.extend(
+                    active_color_targets
+                        .iter()
+                        .map(|target| self.color_mask[*target as usize].raw()),
+                );
+            }
+            _ => dependencies.extend(self.color_mask.iter().map(MaxwellThreeDRegister::raw)),
+        }
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDFixedFunctionWrite) {
         let source = write.source();
         let raw = source.argument();
         match write {
+            MaxwellThreeDFixedFunctionWrite::SurfaceClip {
+                vertical, value, ..
+            } => {
+                let register = if vertical {
+                    &mut self.surface_clip_vertical
+                } else {
+                    &mut self.surface_clip_horizontal
+                };
+                *register = MaxwellThreeDRegister::programmed(raw, value, source);
+            }
             MaxwellThreeDFixedFunctionWrite::ViewportFloat {
                 viewport,
                 field,
@@ -875,6 +1242,12 @@ impl MaxwellThreeDFixedFunctionState {
                     self.viewport[viewport as usize].clip_min_z =
                         MaxwellThreeDRegister::programmed(raw, value, source)
                 }
+            }
+            MaxwellThreeDFixedFunctionWrite::ViewportCoordinateSwizzle {
+                viewport, value, ..
+            } => {
+                self.viewport[viewport as usize].coordinate_swizzle =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDFixedFunctionWrite::ScissorEnable { scissor, value, .. } => {
                 self.scissor[scissor as usize].enable =
@@ -952,6 +1325,11 @@ impl MaxwellThreeDFixedFunctionState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDFixedFunctionWrite {
+    SurfaceClip {
+        vertical: bool,
+        value: MaxwellThreeDSurfaceClipAxis,
+        source: MaxwellMethodSource,
+    },
     ViewportFloat {
         viewport: u8,
         field: u8,
@@ -968,6 +1346,11 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         viewport: u8,
         maximum: bool,
         value: MaxwellThreeDRawValue,
+        source: MaxwellMethodSource,
+    },
+    ViewportCoordinateSwizzle {
+        viewport: u8,
+        value: MaxwellThreeDViewportCoordinateSwizzle,
         source: MaxwellMethodSource,
     },
     ScissorEnable {
@@ -1028,9 +1411,11 @@ pub enum MaxwellThreeDFixedFunctionWrite {
 impl MaxwellThreeDFixedFunctionWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::ViewportFloat { source, .. }
+            Self::SurfaceClip { source, .. }
+            | Self::ViewportFloat { source, .. }
             | Self::ViewportRectangle { source, .. }
             | Self::ViewportDepth { source, .. }
+            | Self::ViewportCoordinateSwizzle { source, .. }
             | Self::ScissorEnable { source, .. }
             | Self::ScissorRectangle { source, .. }
             | Self::WindowClipRectangle { source, .. }

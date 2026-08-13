@@ -199,6 +199,46 @@ pub enum DrawArguments {
     },
 }
 
+/// Backend-independent affine transform from normalized device coordinates to
+/// framebuffer coordinates: `window = ndc * scale + offset`.
+///
+/// IEEE-754 bit patterns are retained so negative viewport axes and exact guest
+/// state survive frontend lowering without relying on one host API convention.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ViewportTransform {
+    scale: [u32; 3],
+    offset: [u32; 3],
+}
+
+impl ViewportTransform {
+    pub fn new(scale: [f32; 3], offset: [f32; 3]) -> Result<Self, CommandDescriptionError> {
+        if scale
+            .into_iter()
+            .chain(offset)
+            .any(|value| !value.is_finite())
+        {
+            return Err(CommandDescriptionError::NonFiniteViewportTransform);
+        }
+        if scale[0] == 0.0 || scale[1] == 0.0 {
+            return Err(CommandDescriptionError::EmptyViewport);
+        }
+        Ok(Self {
+            scale: scale.map(f32::to_bits),
+            offset: offset.map(f32::to_bits),
+        })
+    }
+
+    #[must_use]
+    pub fn scale(self) -> [f32; 3] {
+        self.scale.map(f32::from_bits)
+    }
+
+    #[must_use]
+    pub fn offset(self) -> [f32; 3] {
+        self.offset.map(f32::from_bits)
+    }
+}
+
 impl DrawArguments {
     const fn is_empty(self) -> bool {
         match self {
@@ -229,6 +269,7 @@ pub struct DrawOperation {
     pub descriptor_tables: Box<[DescriptorTableId]>,
     pub vertex_buffers: Box<[BufferRegion]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
+    pub viewport_transform: Option<ViewportTransform>,
     pub arguments: DrawArguments,
 }
 
@@ -256,8 +297,15 @@ impl DrawOperation {
             descriptor_tables: descriptor_tables.into_boxed_slice(),
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
+            viewport_transform: None,
             arguments,
         })
+    }
+
+    #[must_use]
+    pub fn with_viewport_transform(mut self, viewport_transform: ViewportTransform) -> Self {
+        self.viewport_transform = Some(viewport_transform);
+        self
     }
 }
 
@@ -301,6 +349,10 @@ pub enum CacheMaintenanceOperation {
     InvalidateDeviceReadCaches,
     /// Discard cached texture fetches so later sampling observes current data.
     InvalidateTextureReadCaches,
+    /// Discard cached texture descriptors so later fetches observe current headers.
+    InvalidateTextureHeaderCaches,
+    /// Discard cached sampler descriptors so later sampling observes current state.
+    InvalidateSamplerCaches,
     /// Discard selected shader-side caches without implying an idle wait.
     InvalidateShaderCaches {
         instruction: bool,
@@ -717,6 +769,8 @@ pub enum CommandDescriptionError {
     CopySizeMismatch,
     ClearValueMismatch,
     NonFiniteClearValue,
+    NonFiniteViewportTransform,
+    EmptyViewport,
     EmptyDraw,
     IndexBufferMismatch,
     EmptyDispatch,
@@ -740,6 +794,10 @@ impl Display for CommandDescriptionError {
                 formatter.write_str("clear value does not match its resource kind")
             }
             Self::NonFiniteClearValue => formatter.write_str("clear value is not finite"),
+            Self::NonFiniteViewportTransform => {
+                formatter.write_str("viewport transform contains a non-finite component")
+            }
+            Self::EmptyViewport => formatter.write_str("viewport transform has an empty axis"),
             Self::EmptyDraw => formatter.write_str("draw has no vertices, indices, or instances"),
             Self::IndexBufferMismatch => {
                 formatter.write_str("draw arguments and index-buffer presence disagree")
@@ -1025,6 +1083,21 @@ mod tests {
     }
 
     #[test]
+    fn viewport_transform_preserves_negative_axes_and_rejects_invalid_values() {
+        let viewport = ViewportTransform::new([640.0, -360.0, 0.5], [640.0, 360.0, 0.5]).unwrap();
+        assert_eq!(viewport.scale(), [640.0, -360.0, 0.5]);
+        assert_eq!(viewport.offset(), [640.0, 360.0, 0.5]);
+        assert_eq!(
+            ViewportTransform::new([0.0, 1.0, 1.0], [0.0; 3]),
+            Err(CommandDescriptionError::EmptyViewport)
+        );
+        assert_eq!(
+            ViewportTransform::new([1.0, f32::NAN, 1.0], [0.0; 3]),
+            Err(CommandDescriptionError::NonFiniteViewportTransform)
+        );
+    }
+
+    #[test]
     fn render_pass_validates_all_attachments_before_construction() {
         let color = RenderAttachment {
             image: ImageId::new(1),
@@ -1146,6 +1219,8 @@ mod tests {
             CacheMaintenanceOperation::FlushDirtyDeviceWrites,
             CacheMaintenanceOperation::InvalidateDeviceReadCaches,
             CacheMaintenanceOperation::InvalidateTextureReadCaches,
+            CacheMaintenanceOperation::InvalidateTextureHeaderCaches,
+            CacheMaintenanceOperation::InvalidateSamplerCaches,
             CacheMaintenanceOperation::InvalidateShaderCaches {
                 instruction: true,
                 global_data: true,

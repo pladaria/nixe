@@ -11,12 +11,14 @@ use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissio
 use crate::{
     MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellEngineOperation,
     MaxwellEnginePacketDispatch, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
-    MaxwellHostMemoryOperation, MaxwellMethodSource, MaxwellResolvedRange,
-    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
-    MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
+    MaxwellHostMemoryOperation, MaxwellInlineToMemoryUpload, MaxwellMethodSource,
+    MaxwellResolvedRange, MaxwellShaderTranslationError, MaxwellThreeDInlineConstantBufferUpload,
+    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
+    MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
     resolve_maxwell_three_d_resources,
+    shader::{MaxwellStagedShaderWrite, preflight_maxwell_shader_translation},
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
@@ -30,9 +32,17 @@ pub enum MaxwellSubmissionExecutionStep {
         upload: MaxwellComputeInlineToMemoryUpload,
         target: MaxwellResolvedRange,
     },
+    InlineToMemory {
+        upload: MaxwellInlineToMemoryUpload,
+        target: MaxwellResolvedRange,
+    },
     ComputeSynchronization(MaxwellComputeSynchronizationPlan),
     ThreeDInlineConstantBuffer {
         upload: MaxwellThreeDInlineConstantBufferUpload,
+        target: MaxwellResolvedRange,
+    },
+    ThreeDReportSemaphoreRelease {
+        release: crate::MaxwellThreeDReportSemaphoreRelease,
         target: MaxwellResolvedRange,
     },
     ThreeD(MaxwellThreeDLoweredWork),
@@ -92,6 +102,7 @@ pub enum MaxwellSoftwareInitializationError {
     OperationAfterCompletionSignal,
     InconsistentHostSynchronizationPlan,
     InconsistentWaitForIdlePlan,
+    InconsistentReportSemaphorePlan,
     StaleInlineTarget {
         source: MaxwellMethodSource,
         error: MaxwellGpuAccessError,
@@ -117,6 +128,9 @@ impl Display for MaxwellSoftwareInitializationError {
             Self::InconsistentWaitForIdlePlan => formatter.write_str(
                 "submission WAIT_FOR_IDLE plan does not match its ordered execution prefix",
             ),
+            Self::InconsistentReportSemaphorePlan => formatter.write_str(
+                "submission report-semaphore release does not match its ordered execution prefix",
+            ),
             Self::StaleInlineTarget { source, error } => {
                 write!(formatter, "inline upload target changed before execution: {source}: {error}")
             }
@@ -138,6 +152,7 @@ pub enum MaxwellSubmissionExecutionError {
     },
     ThreeDResource(MaxwellThreeDResourceError),
     ThreeDLowering(MaxwellThreeDLoweringError),
+    ShaderTranslation(MaxwellShaderTranslationError),
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
     MissingCompletionSignal {
         reserved: GuestTimelinePoint,
@@ -158,6 +173,7 @@ impl Display for MaxwellSubmissionExecutionError {
             }
             Self::ThreeDResource(error) => Display::fmt(error, formatter),
             Self::ThreeDLowering(error) => Display::fmt(error, formatter),
+            Self::ShaderTranslation(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
             Self::MissingCompletionSignal { reserved } => write!(
                 formatter,
@@ -190,6 +206,7 @@ pub fn preflight_maxwell_submission_execution(
     let mut steps = Vec::new();
     let mut prior_work_pending = false;
     let mut completion_signal_count = 0_u8;
+    let mut staged_shader_writes = Vec::new();
 
     for operation in packets
         .iter()
@@ -222,7 +239,28 @@ pub fn preflight_maxwell_submission_execution(
                     upload.offset(),
                     upload.source(),
                 )?;
+                staged_shader_writes.push(MaxwellStagedShaderWrite::new(
+                    target.offset().get(),
+                    upload.value(),
+                ));
                 steps.push(MaxwellSubmissionExecutionStep::ComputeInlineToMemory {
+                    upload: *upload,
+                    target,
+                });
+                prior_work_pending = true;
+            }
+            MaxwellEngineOperation::InlineToMemory(upload) => {
+                let target = resolve_inline_target(
+                    address_space,
+                    upload.address().get(),
+                    upload.offset(),
+                    upload.source(),
+                )?;
+                staged_shader_writes.push(MaxwellStagedShaderWrite::new(
+                    target.offset().get(),
+                    upload.value(),
+                ));
+                steps.push(MaxwellSubmissionExecutionStep::InlineToMemory {
                     upload: *upload,
                     target,
                 });
@@ -242,6 +280,10 @@ pub fn preflight_maxwell_submission_execution(
                     upload.offset(),
                     upload.source(),
                 )?;
+                staged_shader_writes.push(MaxwellStagedShaderWrite::new(
+                    target.offset().get(),
+                    upload.value(),
+                ));
                 steps.push(MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
                     upload: *upload,
                     target,
@@ -249,6 +291,17 @@ pub fn preflight_maxwell_submission_execution(
                 prior_work_pending = true;
             }
             MaxwellEngineOperation::ThreeD(operation) => {
+                if matches!(
+                    operation.trigger(),
+                    crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+                ) {
+                    preflight_maxwell_shader_translation(
+                        operation.state(),
+                        address_space,
+                        &staged_shader_writes,
+                    )
+                    .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
+                }
                 let resources = resolve_maxwell_three_d_resources(operation.state(), address_space)
                     .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                 let plan = preflight_maxwell_three_d_operation_unnegotiated(
@@ -268,8 +321,12 @@ pub fn preflight_maxwell_submission_execution(
                 prior_work_pending = true;
             }
             MaxwellEngineOperation::ThreeDSynchronization(operation) => {
-                let plan = lower_maxwell_three_d_synchronization(operation, completion)
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
+                let plan = lower_maxwell_three_d_synchronization(
+                    operation,
+                    completion,
+                    prior_work_pending,
+                )
+                .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
                 if let MaxwellThreeDSynchronizationPlan::IncrementSyncpoint {
                     completion: reserved,
                     ..
@@ -284,10 +341,28 @@ pub fn preflight_maxwell_submission_execution(
                 }
                 let drains_prior_work = matches!(
                     plan,
-                    MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+                    MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
+                        | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+                        | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
+                        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_)
                         | MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
                 );
-                steps.push(MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan));
+                if let MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(release) = plan {
+                    let target = resolve_inline_target(
+                        address_space,
+                        release.address().get(),
+                        0,
+                        release.source(),
+                    )?;
+                    steps.push(
+                        MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
+                            release,
+                            target,
+                        },
+                    );
+                } else {
+                    steps.push(MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan));
+                }
                 if drains_prior_work {
                     prior_work_pending = false;
                 }
@@ -354,6 +429,16 @@ pub fn execute_maxwell_software_initialization(
                 )?;
                 prior_work_pending = true;
             }
+            MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
+                stage_inline_write(
+                    address_space,
+                    target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut writes,
+                )?;
+                prior_work_pending = true;
+            }
             MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
                 stage_inline_write(
                     address_space,
@@ -363,6 +448,21 @@ pub fn execute_maxwell_software_initialization(
                     &mut writes,
                 )?;
                 prior_work_pending = true;
+            }
+            MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
+                if release.prior_work_pending() != prior_work_pending {
+                    return Err(
+                        MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan,
+                    );
+                }
+                stage_inline_write(
+                    address_space,
+                    target,
+                    release.payload().to_le_bytes(),
+                    release.source(),
+                    &mut writes,
+                )?;
+                prior_work_pending = false;
             }
             MaxwellSubmissionExecutionStep::ComputeSynchronization(
                 MaxwellComputeSynchronizationPlan::WaitForIdle {
@@ -381,8 +481,30 @@ pub fn execute_maxwell_software_initialization(
                 MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
             ) => {}
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi { .. },
+                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
+                    prior_work_pending: planned,
+                    ..
+                },
+            ) => {
+                if *planned != prior_work_pending {
+                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
+                }
+                prior_work_pending = false;
+            }
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { .. },
             ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
+                    prior_work_pending: planned,
+                    ..
+                },
+            ) => {
+                if *planned != prior_work_pending {
+                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
+                }
+                prior_work_pending = false;
+            }
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. },
             ) => {
@@ -393,6 +515,11 @@ pub fn execute_maxwell_software_initialization(
             ) => {
                 prior_work_pending = false;
                 completion_seen = true;
+            }
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_),
+            ) => {
+                return Err(MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan);
             }
             MaxwellSubmissionExecutionStep::ThreeD(_) => {
                 return Err(MaxwellSoftwareInitializationError::UnsupportedThreeDWork);
@@ -411,9 +538,16 @@ pub fn execute_maxwell_software_initialization(
                     MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, .. } => {
                         Some(upload.source())
                     }
+                    MaxwellSubmissionExecutionStep::InlineToMemory { upload, .. } => {
+                        Some(upload.source())
+                    }
                     MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
                         upload, ..
                     } => Some(upload.source()),
+                    MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
+                        release,
+                        ..
+                    } => Some(release.source()),
                     _ => None,
                 })
                 .expect("a non-empty canonical write batch has an inline source"),
@@ -553,6 +687,25 @@ mod tests {
         decode_maxwell_pushbuffer(words).unwrap()
     }
 
+    fn non_incrementing_packet(
+        subchannel: u32,
+        method_dword: u32,
+        arguments: &[u32],
+    ) -> crate::MaxwellDecodedPushbuffer {
+        let mut words = Vec::with_capacity(arguments.len() + 1);
+        words.push(Ok(MaxwellPushbufferWord::new(
+            (3 << 29) | ((arguments.len() as u32) << 16) | (subchannel << 13) | method_dword,
+            location(0),
+        )));
+        words.extend(arguments.iter().enumerate().map(|(index, argument)| {
+            Ok(MaxwellPushbufferWord::new(
+                *argument,
+                location(index as u32 + 1),
+            ))
+        }));
+        decode_maxwell_pushbuffer(words).unwrap()
+    }
+
     fn location(word_offset: u32) -> MaxwellGpfifoSourceLocation {
         MaxwellGpfifoSourceLocation {
             channel: MaxwellChannelId::new(1),
@@ -600,6 +753,81 @@ mod tests {
         assert!(plan.steps().is_empty());
         assert_eq!(plan.completion(), None);
         assert_eq!(plan.staged_cache().revision(), 0);
+    }
+
+    #[test]
+    fn captured_three_d_report_semaphore_release_writes_payload_after_prior_work() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mut address_space = address_space();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset().get();
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        let release = packet(
+            0,
+            0x1b00 / 4,
+            &[
+                (address >> 32) as u32,
+                address as u32,
+                0xcafe_babe,
+                0x1000_f010,
+            ],
+        );
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &release.packets()[0],
+        )
+        .unwrap();
+        let plan = preflight_maxwell_submission_execution(
+            &[dispatch],
+            &address_space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.steps(),
+            [MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
+                release,
+                target,
+            }] if release.address().get() == address
+                && release.payload() == 0xcafe_babe
+                && !release.prior_work_pending()
+                && target.offset().get() == address
+        ));
+
+        execute_maxwell_software_initialization(plan, &address_space).unwrap();
+        let mut bytes = [0_u8; 4];
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes), 0xcafe_babe);
     }
 
     #[test]
@@ -803,7 +1031,7 @@ mod tests {
                     ..
                 },
                 MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::InvalidateTextureDataCacheNoWfi {
+                    MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi {
                         request: texture_request,
                         maintenance: CacheMaintenanceOperation::InvalidateTextureReadCaches,
                     }
@@ -838,6 +1066,7 @@ mod tests {
                     )
                 )
                 && texture_request.lines() == crate::MaxwellThreeDTextureCacheLines::All
+                && texture_request.target() == crate::MaxwellThreeDTextureCacheTarget::Data
                 && texture_request.tag() == 0
                 && caches.instruction()
                 && caches.global_data()
@@ -852,5 +1081,121 @@ mod tests {
         assert_eq!(completion.completion(), None);
         allocation.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, 0xfeed_beef_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn standalone_inline_to_memory_words_are_preflighted_and_committed_atomically() {
+        let mut address_space = address_space();
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset().get();
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(
+            2,
+            0,
+            &[SWITCH_1_GM20B_PROFILE.classes().inline_to_memory().0],
+        );
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        for setup in [
+            packet(2, 0x0180 / 4, &[8, 1]),
+            packet(2, 0x0188 / 4, &[(address >> 32) as u32, address as u32, 8]),
+            packet(2, 0x01b0 / 4, &[0x1001]),
+        ] {
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(2),
+                &setup.packets()[0],
+            )
+            .unwrap();
+        }
+        let data = non_incrementing_packet(2, 0x01b4 / 4, &[0x1122_3344, 0x5566_7788]);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &data.packets()[0],
+        )
+        .unwrap();
+        let bind_three_d = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind_three_d.packets()[0],
+        )
+        .unwrap();
+        let invalidate = packet(0, 0x1330 / 4, &[0]);
+        let invalidate_dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &invalidate.packets()[0],
+        )
+        .unwrap();
+        let plan = preflight_maxwell_submission_execution(
+            &[dispatch, invalidate_dispatch],
+            &address_space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.steps(),
+            [
+                MaxwellSubmissionExecutionStep::InlineToMemory {
+                    upload: first,
+                    target: first_target,
+                },
+                MaxwellSubmissionExecutionStep::InlineToMemory {
+                    upload: second,
+                    target: second_target,
+                },
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
+                        request,
+                        maintenance: CacheMaintenanceOperation::InvalidateSamplerCaches,
+                        prior_work_pending: true,
+                    }
+                ),
+            ] if first.value() == 0x1122_3344
+                && first.offset() == 0
+                && first_target.offset().get() == address
+                && second.value() == 0x5566_7788
+                && second.offset() == 4
+                && second_target.offset().get() == address + 4
+                && request.target() == crate::MaxwellThreeDTextureCacheTarget::Sampler
+                && request.lines() == crate::MaxwellThreeDTextureCacheLines::All
+                && request.tag() == 0
+        ));
+
+        let mut bytes = [0xff; 8];
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 8]);
+        execute_maxwell_software_initialization(plan, &address_space).unwrap();
+        allocation.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
     }
 }
