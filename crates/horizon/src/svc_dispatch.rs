@@ -355,6 +355,7 @@ pub struct HorizonSvcDispatcher {
     unknown_calls: u64,
     initial_operation_mode: crate::OperationMode,
     time_environment: crate::TimeEnvironment,
+    settings_environment: crate::SettingsEnvironment,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
@@ -474,12 +475,29 @@ impl HorizonSvcDispatcher {
         time_environment: crate::TimeEnvironment,
         video_system: crate::VideoSystem,
     ) -> Self {
+        Self::new_with_video_and_settings(
+            initial_operation_mode,
+            time_environment,
+            crate::SettingsEnvironment::default(),
+            video_system,
+        )
+    }
+
+    /// Creates a dispatcher with explicit guest locale and display systems.
+    #[must_use]
+    pub fn new_with_video_and_settings(
+        initial_operation_mode: crate::OperationMode,
+        time_environment: crate::TimeEnvironment,
+        settings_environment: crate::SettingsEnvironment,
+        video_system: crate::VideoSystem,
+    ) -> Self {
         let virtual_clock = time_environment.clock();
         Self {
             observed: BTreeMap::new(),
             unknown_calls: 0,
             initial_operation_mode,
             time_environment,
+            settings_environment,
             video_system,
             hid_system: crate::HidSystem::new(),
             named_ports: BTreeMap::new(),

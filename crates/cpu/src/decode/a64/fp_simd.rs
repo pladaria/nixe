@@ -368,6 +368,19 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD_FP16,
     ),
+    // Arm A64 FSQRT (scalar), base single/double precision forms. Optional
+    // half precision remains independently feature-gated. Arm ARM DDI 0602
+    // (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FSQRT--Floating-point-Square-Root--scalar--
+    pattern(
+        "fp-scalar-square-root",
+        0xffbf_fc00,
+        0x1e21_c000,
+        0x0000_0098,
+        208,
+        &[],
+        SIMD,
+    ),
     pattern(
         "fp-compare-register",
         0xffa0_fc0f,
@@ -508,6 +521,30 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0f00_0400,
         0x0000_0092,
         202,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 SSHL/USHL use the signed low byte of each shift-count lane to
+    // select a left (non-negative) or right (negative) shift independently.
+    // The data interpretation only differs for right shifts. Arm ARM DDI 0602
+    // (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHL--vector---Signed-Shift-Left--register--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHL--vector---Unsigned-Shift-Left--register--
+    pattern(
+        "simd-signed-shift-left-register",
+        0xbf20_fc00,
+        0x0e20_4400,
+        0x0000_0095,
+        206,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-unsigned-shift-left-register",
+        0xbf20_fc00,
+        0x2e20_4400,
+        0x0000_0096,
+        206,
         &[],
         SIMD,
     ),
@@ -749,6 +786,22 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x1e20_8800,
         0x0000_007c,
         169,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FMADD/FMSUB/FNMADD/FNMSUB (scalar), base single/double
+    // precision forms. These are fused operations: the product and addend are
+    // rounded only once. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMADD--Floating-point-fused-Multiply-Add-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMSUB--Floating-point-fused-Multiply-Subtract-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMADD--Floating-point-Negated-fused-Multiply-Add-
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMSUB--Floating-point-Negated-fused-Multiply-Subtract-
+    pattern(
+        "fp-scalar-fused-multiply-add",
+        0xff80_0000,
+        0x1f00_0000,
+        0x0000_0097,
+        207,
         &[],
         SIMD,
     ),
@@ -1047,6 +1100,7 @@ pub struct Operands {
     pub rd: u8,
     pub rn: u8,
     pub rm: u8,
+    pub ra: u8,
     pub size: u8,
     pub opc: u8,
     pub option: u8,
@@ -1082,6 +1136,7 @@ pub struct Operands {
     pub float_round_operation: Option<FloatRoundOperation>,
     pub float_add_operation: Option<FloatAddOperation>,
     pub float_multiply_operation: Option<FloatMultiplyOperation>,
+    pub float_fused_multiply_operation: Option<FloatFusedMultiplyOperation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1165,6 +1220,14 @@ pub enum FloatMultiplyOperation {
     NegatedMultiply,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FloatFusedMultiplyOperation {
+    MultiplyAdd,
+    MultiplySubtract,
+    NegatedMultiplyAdd,
+    NegatedMultiplySubtract,
+}
+
 macro_rules! instructions {
     ($($variant:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1219,6 +1282,8 @@ instructions!(
     ShiftRightNarrow,
     ScalarShiftRightImmediate,
     VectorShiftRightImmediate,
+    VectorSignedShiftRegister,
+    VectorUnsignedShiftRegister,
     CountBits,
     AddAcrossVector,
     ExtractNarrow,
@@ -1234,6 +1299,8 @@ instructions!(
     ScalarFloatRound,
     ScalarFloatAdd,
     ScalarFloatMultiply,
+    ScalarFloatFusedMultiplyAdd,
+    ScalarFloatSquareRoot,
     ScalarFloatConditionalSelect,
 );
 
@@ -1242,6 +1309,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         rd: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
         rm: ((bits >> 16) & 0x1f) as u8,
+        ra: ((bits >> 10) & 0x1f) as u8,
         size: (bits >> 30) as u8,
         opc: ((bits >> 22) & 3) as u8,
         option: ((bits >> 13) & 7) as u8,
@@ -1311,6 +1379,15 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
             0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
             _ => None,
         },
+        float_fused_multiply_operation: (semantic_id == 0x0000_0097).then(|| {
+            match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
+                0 => FloatFusedMultiplyOperation::MultiplyAdd,
+                1 => FloatFusedMultiplyOperation::MultiplySubtract,
+                2 => FloatFusedMultiplyOperation::NegatedMultiplyAdd,
+                3 => FloatFusedMultiplyOperation::NegatedMultiplySubtract,
+                _ => unreachable!(),
+            }
+        }),
     };
     match semantic_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
@@ -1355,6 +1432,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0065 => Instruction::ShiftRightNarrow(operands),
         0x0000_0091 => Instruction::ScalarShiftRightImmediate(operands),
         0x0000_0092 => Instruction::VectorShiftRightImmediate(operands),
+        0x0000_0095 => Instruction::VectorSignedShiftRegister(operands),
+        0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),
         0x0000_0094 => Instruction::AddAcrossVector(operands),
         0x0000_0088 => Instruction::ExtractNarrow(operands),
@@ -1371,6 +1450,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0072..=0x0000_0078 => Instruction::ScalarFloatRound(operands),
         0x0000_0079..=0x0000_007a => Instruction::ScalarFloatAdd(operands),
         0x0000_007b..=0x0000_007c => Instruction::ScalarFloatMultiply(operands),
+        0x0000_0097 => Instruction::ScalarFloatFusedMultiplyAdd(operands),
+        0x0000_0098 => Instruction::ScalarFloatSquareRoot(operands),
         0x0000_0087 => Instruction::ScalarFloatConditionalSelect(operands),
         _ => unreachable!("FP/SIMD semantic ID was routed to the wrong family"),
     }

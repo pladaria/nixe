@@ -292,6 +292,40 @@ fn qemu_a64_matches_every_register_semantic_family() {
     if filter.matches(0x94, "simd-add-across-vector") {
         cases.push((0x0e31_bbde, "ADDV B30,V30.8B (captured)"));
     }
+    if filter.matches(0x95, "simd-signed-shift-left-register") {
+        cases.extend([
+            (0x0e22_4420, "SSHL V0.8B,V1.8B,V2.8B"),
+            (0x0e62_4420, "SSHL V0.4H,V1.4H,V2.4H"),
+            (0x0ebd_47fd, "SSHL V29.2S,V31.2S,V29.2S (captured)"),
+            (0x4ee2_4420, "SSHL V0.2D,V1.2D,V2.2D"),
+        ]);
+    }
+    if filter.matches(0x96, "simd-unsigned-shift-left-register") {
+        cases.extend([
+            (0x2e22_4420, "USHL V0.8B,V1.8B,V2.8B"),
+            (0x2e62_4420, "USHL V0.4H,V1.4H,V2.4H"),
+            (0x2ea2_4420, "USHL V0.2S,V1.2S,V2.2S"),
+            (0x6ee2_4420, "USHL V0.2D,V1.2D,V2.2D"),
+        ]);
+    }
+    if filter.matches(0x97, "fp-scalar-fused-multiply-add") {
+        cases.extend([
+            (0x1f02_0c20, "FMADD S0,S1,S2,S3"),
+            (0x1f02_8c20, "FMSUB S0,S1,S2,S3"),
+            (0x1f22_0c20, "FNMADD S0,S1,S2,S3"),
+            (0x1f22_8c20, "FNMSUB S0,S1,S2,S3"),
+            (0x1f40_7bbe, "FMADD D30,D29,D0,D30 (captured)"),
+            (0x1f42_8c20, "FMSUB D0,D1,D2,D3"),
+            (0x1f62_0c20, "FNMADD D0,D1,D2,D3"),
+            (0x1f62_8c20, "FNMSUB D0,D1,D2,D3"),
+        ]);
+    }
+    if filter.matches(0x98, "fp-scalar-square-root") {
+        cases.extend([
+            (0x1e21_c3de, "FSQRT S30,S30 (captured)"),
+            (0x1e61_c020, "FSQRT D0,D1"),
+        ]);
+    }
 
     if filter.is_active() {
         assert!(
@@ -394,10 +428,11 @@ fn register_semantic_id(id: u32) -> bool {
             | 0x0000_0020..=0x0000_0021
             | 0x0000_0030..=0x0000_0032
             | 0x0000_0035..=0x0000_003f
+            | 0x0000_0098
             | 0x0000_0048
             | 0x0000_004a..=0x0000_004b
             | 0x0000_004e..=0x0000_0061
-            | 0x0000_0064..=0x0000_0094
+            | 0x0000_0064..=0x0000_0097
     )
 }
 
@@ -557,11 +592,14 @@ fn compare_a64_register_case(
             }
             A64Instruction::FpSimd(instruction) => {
                 let fields = instruction.operands();
-                (
-                    vec![fields.rd, fields.rn, fields.rm],
-                    vec![fields.rd, fields.rn, fields.rm],
-                    fields.rd,
-                )
+                let mut vectors = vec![fields.rd, fields.rn, fields.rm];
+                if matches!(
+                    instruction,
+                    nixe_cpu::decode::a64::fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_)
+                ) {
+                    vectors.push(fields.ra);
+                }
+                (vec![fields.rd, fields.rn, fields.rm], vectors, fields.rd)
             }
             A64Instruction::RecognizedFallback { .. } => {
                 let rd = (encoding & 0x1f) as u8;

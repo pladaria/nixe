@@ -10,8 +10,9 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 
 use crate::{
-    GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellGpuProfile,
-    MaxwellInlineToMemoryState, MaxwellPushbufferSubchannel, MaxwellThreeDState, MaxwellTwoDState,
+    GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellDmaCopyState,
+    MaxwellGpuProfile, MaxwellInlineToMemoryState, MaxwellPushbufferSubchannel, MaxwellThreeDState,
+    MaxwellTwoDState,
 };
 
 /// Stable identity of one Maxwell channel lifetime.
@@ -279,6 +280,7 @@ pub struct MaxwellGpuChannel {
     syncpoint: Option<GuestSyncpointId>,
     frontend: MaxwellChannelFrontendState,
     compute: MaxwellComputeState,
+    dma_copy: MaxwellDmaCopyState,
     inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
     three_d: MaxwellThreeDState,
@@ -312,6 +314,7 @@ impl MaxwellGpuChannel {
                 subchannel_bindings: [None; 8],
             },
             compute: MaxwellComputeState::new(),
+            dma_copy: MaxwellDmaCopyState::new(),
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
             three_d: MaxwellThreeDState::new(),
@@ -374,6 +377,16 @@ impl MaxwellGpuChannel {
 
     pub(crate) fn replace_compute(&mut self, compute: MaxwellComputeState) {
         self.compute = compute;
+    }
+
+    /// Returns the channel-owned `MAXWELL_DMA_COPY_A` state.
+    #[must_use]
+    pub const fn dma_copy(&self) -> &MaxwellDmaCopyState {
+        &self.dma_copy
+    }
+
+    pub(crate) fn replace_dma_copy(&mut self, dma_copy: MaxwellDmaCopyState) {
+        self.dma_copy = dma_copy;
     }
 
     /// Returns the channel-owned `MAXWELL_INLINE_TO_MEMORY_A` state.

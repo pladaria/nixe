@@ -141,6 +141,7 @@ impl HorizonSvcDispatcher {
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
                 hid: &self.hid_system,
+                settings: &self.settings_environment,
                 caller_thread_id,
             },
         ) {
@@ -221,6 +222,7 @@ impl HorizonSvcDispatcher {
             crate::ipc_wire::HostSystems {
                 video: &self.video_system,
                 hid: &self.hid_system,
+                settings: &self.settings_environment,
                 caller_thread_id,
             },
         ) {

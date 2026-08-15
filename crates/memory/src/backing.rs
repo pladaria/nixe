@@ -578,6 +578,81 @@ impl CanonicalWriteBatch {
         self.pages.is_empty()
     }
 
+    /// Reads canonical bytes with this transaction's earlier writes overlaid.
+    ///
+    /// Ordered device operations can therefore consume preceding writes while
+    /// the complete batch remains unpublished and atomically discardable.
+    pub fn read_staged(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), CanonicalWriteBatchError> {
+        let size =
+            u64::try_from(output.len()).map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+        if end > range.size() {
+            return Err(CanonicalWriteBatchError::OutOfBounds {
+                offset,
+                size,
+                range_size: range.size(),
+            });
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+
+        let mut logical_start = 0_u64;
+        let mut copied = 0_usize;
+        for segment in range.segments() {
+            let logical_end = logical_start
+                .checked_add(segment.size())
+                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+            let read_start = offset.max(logical_start);
+            let read_end = end.min(logical_end);
+            if read_start < read_end {
+                if !segment.permissions().contains(MemoryPermissions::READ) {
+                    return Err(CanonicalWriteBatchError::PermissionDenied {
+                        page: segment.page(),
+                        available: segment.permissions(),
+                    });
+                }
+                let within_segment = read_start - logical_start;
+                let page_offset = segment
+                    .offset()
+                    .checked_add(within_segment)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                let page_offset = usize::try_from(page_offset)
+                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                let count = usize::try_from(read_end - read_start)
+                    .map_err(|_| CanonicalWriteBatchError::RangeOverflow)?;
+                let copied_end = copied
+                    .checked_add(count)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                if let Some(pending) = self.pages.get(&segment.page()) {
+                    output[copied..copied_end]
+                        .copy_from_slice(&pending.bytes[page_offset..page_offset + count]);
+                } else {
+                    segment
+                        .backing()
+                        .read(page_offset, &mut output[copied..copied_end])
+                        .map_err(CanonicalWriteBatchError::Page)?;
+                }
+                copied = copied_end;
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        if copied != output.len() {
+            return Err(CanonicalWriteBatchError::IncompleteRange);
+        }
+        Ok(())
+    }
+
     /// Stages one checked logical write. Discard the batch if this fails.
     pub fn stage(
         &mut self,
@@ -1397,5 +1472,22 @@ mod tests {
         allocation.read(0x1000, &mut second).unwrap();
         assert_eq!(first, [0]);
         assert_eq!(second, [0x55]);
+    }
+
+    #[test]
+    fn canonical_write_batch_reads_earlier_staged_bytes_without_publishing_them() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0x0ffe, &[1, 2, 3, 4]).unwrap();
+
+        let mut staged = [0xff; 6];
+        batch.read_staged(&range, 0x0ffd, &mut staged).unwrap();
+        assert_eq!(staged, [0, 1, 2, 3, 4, 0]);
+        let mut canonical = [0xff; 4];
+        allocation.read(0x0ffe, &mut canonical).unwrap();
+        assert_eq!(canonical, [0; 4]);
     }
 }

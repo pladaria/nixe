@@ -68,11 +68,12 @@ pub use runtime::{
 pub use shader::{
     ShaderBackendLanguage, ShaderBackendLoweringError, ShaderBackendModule,
     ShaderBackendSourceMapEntry, ShaderEvaluationError, ShaderEvaluationInputs,
-    ShaderEvaluationResult, ShaderFloatControl, ShaderInstruction, ShaderInterfaceElement,
-    ShaderInterpolation, ShaderIoLocation, ShaderIr, ShaderIrConstructionError, ShaderNanMode,
-    ShaderOperation, ShaderPredicate, ShaderReciprocalAccuracy, ShaderRegister,
-    ShaderResourceAccess, ShaderResourceKind, ShaderRoundingMode, ShaderScalarType,
-    ShaderSourceLocation, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
+    ShaderEvaluationResult, ShaderFloatComparison, ShaderFloatControl, ShaderInstruction,
+    ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
+    ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
+    ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
+    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
+    ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
     lower_shader_ir_to_wgsl,
 };
 pub use submission::{

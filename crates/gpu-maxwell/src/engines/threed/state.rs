@@ -52,6 +52,14 @@ pub(super) const MAXWELL_THREE_D_POLYGON_MODE_RESET: u32 = 0;
 /// disabled, with the zero-valued `VERTEX_CULL_BEFORE_FETCH` type field.
 pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_RESET: u32 = 0;
 
+/// Reset binding group for every pipeline slot.
+///
+/// The pinned zero-initialized Maxwell register-file implementations cited
+/// above cover `SET_PIPELINE_BINDING` as well as the pipeline header. Group
+/// zero is a valid typed value and is observable when a guest relies on reset
+/// state rather than redundantly programming the method.
+pub(super) const MAXWELL_THREE_D_PIPELINE_BINDING_RESET: u32 = 0;
+
 /// How a modeled Maxwell register acquired its current value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDRegisterOrigin {
@@ -789,6 +797,13 @@ impl Default for MaxwellThreeDState {
                 MaxwellThreeDRegister::verified_reset(
                     MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
                     Some(MAXWELL_THREE_D_PIPELINE_SHADER_RESET),
+                ),
+            );
+            raw_registers.insert(
+                method + 0x10,
+                MaxwellThreeDRegister::verified_reset(
+                    MAXWELL_THREE_D_PIPELINE_BINDING_RESET,
+                    Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET),
                 ),
             );
         }

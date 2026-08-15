@@ -61,6 +61,33 @@ pub enum ShaderPredicate {
     Register { register: u8, inverted: bool },
 }
 
+/// Boolean comparison used by backend-neutral floating-point predicate writes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderFloatComparison {
+    OrderedLess,
+    OrderedEqual,
+    OrderedLessOrEqual,
+    OrderedGreater,
+    OrderedNotEqual,
+    OrderedGreaterOrEqual,
+    IsNumber,
+    IsNan,
+    UnorderedLess,
+    UnorderedEqual,
+    UnorderedLessOrEqual,
+    UnorderedGreater,
+    UnorderedNotEqual,
+    UnorderedGreaterOrEqual,
+}
+
+/// Boolean operation combining a comparison with an existing predicate.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderPredicateSetOperation {
+    And,
+    Or,
+    Xor,
+}
+
 /// Semantic stage-interface location independent from a host shader language.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ShaderIoLocation {
@@ -162,13 +189,23 @@ pub enum ShaderNanMode {
     Canonicalize,
 }
 
-/// Accuracy contract carried by reciprocal operations.
+/// Accuracy contract carried by guest scalar math operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ShaderReciprocalAccuracy {
+pub enum ShaderMathAccuracy {
     /// IEEE operation rounded according to the accompanying float control.
     Exact,
     /// Guest hardware permits an implementation-defined approximation.
     Approximate,
+}
+
+/// Backend-neutral scalar special function selected by a guest math unit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderSpecialFunction {
+    Cosine,
+    Sine,
+    Exp2,
+    Log2,
+    SquareRoot,
 }
 
 /// Descriptor-like resource class visible to one shader.
@@ -188,6 +225,38 @@ pub struct ShaderResourceAccess {
     kind: ShaderResourceKind,
     readable: bool,
     writable: bool,
+}
+
+/// One selected component produced by a neutral texture sample.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ShaderTextureSampleOutput {
+    destination: ShaderRegister,
+    component: u8,
+}
+
+impl ShaderTextureSampleOutput {
+    pub fn new(
+        destination: ShaderRegister,
+        component: u8,
+    ) -> Result<Self, ShaderIrConstructionError> {
+        if component > 3 {
+            return Err(ShaderIrConstructionError::InvalidTextureComponent { component });
+        }
+        Ok(Self {
+            destination,
+            component,
+        })
+    }
+
+    #[must_use]
+    pub const fn destination(self) -> ShaderRegister {
+        self.destination
+    }
+
+    #[must_use]
+    pub const fn component(self) -> u8 {
+        self.component
+    }
 }
 
 impl ShaderResourceAccess {
@@ -291,6 +360,19 @@ pub enum ShaderOperation {
         bits: u32,
         scalar_type: ShaderScalarType,
     },
+    Move32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        scalar_type: ShaderScalarType,
+    },
+    FloatAbsolute32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+    },
+    FloatNegate32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+    },
     LoadInput {
         destinations: Box<[ShaderRegister]>,
         location: ShaderIoLocation,
@@ -310,11 +392,54 @@ pub enum ShaderOperation {
         scalar_type: ShaderScalarType,
         float_control: ShaderFloatControl,
     },
+    Add32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        scalar_type: ShaderScalarType,
+        float_control: ShaderFloatControl,
+    },
+    FloatMinMax32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        minimum: ShaderPredicate,
+        float_control: ShaderFloatControl,
+    },
+    FusedMultiplyAdd32 {
+        destination: ShaderRegister,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        addend: ShaderRegister,
+        float_control: ShaderFloatControl,
+    },
     Reciprocal32 {
         destination: ShaderRegister,
         source: ShaderRegister,
-        accuracy: ShaderReciprocalAccuracy,
+        accuracy: ShaderMathAccuracy,
         float_control: ShaderFloatControl,
+    },
+    ReciprocalSqrt32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        accuracy: ShaderMathAccuracy,
+        float_control: ShaderFloatControl,
+    },
+    SpecialFunction32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        function: ShaderSpecialFunction,
+        accuracy: ShaderMathAccuracy,
+        float_control: ShaderFloatControl,
+    },
+    SetPredicateFloat32 {
+        destination: u8,
+        left: ShaderRegister,
+        right: ShaderRegister,
+        comparison: ShaderFloatComparison,
+        accumulator: ShaderPredicate,
+        set_operation: ShaderPredicateSetOperation,
+        flush_denormals_to_zero: bool,
     },
     InterpolateInput {
         destination: ShaderRegister,
@@ -328,6 +453,12 @@ pub enum ShaderOperation {
         binding: u8,
         byte_offset: u32,
         scalar_type: ShaderScalarType,
+    },
+    SampleTexture2D {
+        outputs: Box<[ShaderTextureSampleOutput]>,
+        coordinates: [ShaderRegister; 2],
+        image_binding: u8,
+        sampler_binding: u8,
     },
     Branch {
         target: ShaderSourceLocation,
@@ -437,6 +568,9 @@ pub enum ShaderIrConstructionError {
     EmptyResourceAccess {
         binding: u8,
     },
+    InvalidTextureComponent {
+        component: u8,
+    },
 }
 
 /// Shader IR whose control flow, data flow, interfaces, and resources passed
@@ -511,9 +645,10 @@ pub enum ShaderEvaluationError {
         byte_offset: u32,
     },
     UndefinedRegister(ShaderRegister),
-    UnsupportedPredicateRegister(u8),
+    UndefinedPredicate(u8),
     UnsupportedRoundingMode(ShaderRoundingMode),
     ApproximateOperation(ShaderSourceLocation),
+    TextureSampling(ShaderSourceLocation),
     StepLimitExceeded,
     MissingExit,
 }
@@ -540,6 +675,7 @@ pub fn evaluate_shader_ir(
         .map(|(index, instruction)| (instruction.source, index))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut registers = vec![None; 256];
+    let mut predicates = [None; 7];
     let mut result = ShaderEvaluationResult::default();
     let mut pc = 0_usize;
     let mut steps = 0_usize;
@@ -549,14 +685,8 @@ pub fn evaluate_shader_ir(
         }
         steps += 1;
         pc += 1;
-        match instruction.predicate {
-            ShaderPredicate::Never => continue,
-            ShaderPredicate::Register { register, .. } => {
-                return Err(ShaderEvaluationError::UnsupportedPredicateRegister(
-                    register,
-                ));
-            }
-            ShaderPredicate::Always => {}
+        if !evaluate_shader_predicate(instruction.predicate, &predicates)? {
+            continue;
         }
         match instruction.operation() {
             ShaderOperation::Undefined32 { destination } => {
@@ -565,6 +695,27 @@ pub fn evaluate_shader_ir(
             ShaderOperation::MoveImmediate32 {
                 destination, bits, ..
             } => registers[destination.index() as usize] = Some(*bits),
+            ShaderOperation::Move32 {
+                destination,
+                source,
+                ..
+            } => {
+                registers[destination.index() as usize] = Some(register_bits(&registers, *source)?);
+            }
+            ShaderOperation::FloatAbsolute32 {
+                destination,
+                source,
+            } => {
+                registers[destination.index() as usize] =
+                    Some(register_bits(&registers, *source)? & 0x7fff_ffff);
+            }
+            ShaderOperation::FloatNegate32 {
+                destination,
+                source,
+            } => {
+                registers[destination.index() as usize] =
+                    Some(register_bits(&registers, *source)? ^ 0x8000_0000);
+            }
             ShaderOperation::LoadInput {
                 destinations,
                 location,
@@ -619,13 +770,69 @@ pub fn evaluate_shader_ir(
                 };
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::Add32 {
+                destination,
+                left,
+                right,
+                scalar_type,
+                float_control,
+            } => {
+                let left = register_bits(&registers, *left)?;
+                let right = register_bits(&registers, *right)?;
+                let value = match scalar_type {
+                    ShaderScalarType::Float32 => {
+                        evaluate_float_binary(left, right, *float_control, |a, b| a + b)?
+                    }
+                    ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
+                        left.wrapping_add(right)
+                    }
+                    _ => unreachable!("Add32 only admits 32-bit scalar types"),
+                };
+                registers[destination.index() as usize] = Some(value);
+            }
+            ShaderOperation::FloatMinMax32 {
+                destination,
+                left,
+                right,
+                minimum,
+                float_control,
+            } => {
+                let minimum = evaluate_shader_predicate(*minimum, &predicates)?;
+                let value = evaluate_float_binary(
+                    register_bits(&registers, *left)?,
+                    register_bits(&registers, *right)?,
+                    *float_control,
+                    |left, right| {
+                        if minimum {
+                            left.min(right)
+                        } else {
+                            left.max(right)
+                        }
+                    },
+                )?;
+                registers[destination.index() as usize] = Some(value);
+            }
+            ShaderOperation::FusedMultiplyAdd32 {
+                destination,
+                left,
+                right,
+                addend,
+                float_control,
+            } => {
+                let left = register_bits(&registers, *left)?;
+                let right = register_bits(&registers, *right)?;
+                let addend = register_bits(&registers, *addend)?;
+                let value =
+                    evaluate_float_ternary(left, right, addend, *float_control, f32::mul_add)?;
+                registers[destination.index() as usize] = Some(value);
+            }
             ShaderOperation::Reciprocal32 {
                 destination,
                 source,
                 accuracy,
                 float_control,
             } => {
-                if *accuracy == ShaderReciprocalAccuracy::Approximate {
+                if *accuracy == ShaderMathAccuracy::Approximate {
                     return Err(ShaderEvaluationError::ApproximateOperation(
                         instruction.source,
                     ));
@@ -633,6 +840,71 @@ pub fn evaluate_shader_ir(
                 let source = register_bits(&registers, *source)?;
                 let value = evaluate_float_unary(source, *float_control, |value| value.recip())?;
                 registers[destination.index() as usize] = Some(value);
+            }
+            ShaderOperation::ReciprocalSqrt32 {
+                destination,
+                source,
+                accuracy,
+                float_control,
+            } => {
+                if *accuracy == ShaderMathAccuracy::Approximate {
+                    return Err(ShaderEvaluationError::ApproximateOperation(
+                        instruction.source,
+                    ));
+                }
+                let source = register_bits(&registers, *source)?;
+                let value =
+                    evaluate_float_unary(source, *float_control, |value| value.sqrt().recip())?;
+                registers[destination.index() as usize] = Some(value);
+            }
+            ShaderOperation::SpecialFunction32 {
+                destination,
+                source,
+                function,
+                accuracy,
+                float_control,
+            } => {
+                if *accuracy == ShaderMathAccuracy::Approximate {
+                    return Err(ShaderEvaluationError::ApproximateOperation(
+                        instruction.source,
+                    ));
+                }
+                let source = register_bits(&registers, *source)?;
+                let value = evaluate_float_unary(source, *float_control, |value| match function {
+                    ShaderSpecialFunction::Cosine => value.cos(),
+                    ShaderSpecialFunction::Sine => value.sin(),
+                    ShaderSpecialFunction::Exp2 => value.exp2(),
+                    ShaderSpecialFunction::Log2 => value.log2(),
+                    ShaderSpecialFunction::SquareRoot => value.sqrt(),
+                })?;
+                registers[destination.index() as usize] = Some(value);
+            }
+            ShaderOperation::SetPredicateFloat32 {
+                destination,
+                left,
+                right,
+                comparison,
+                accumulator,
+                set_operation,
+                flush_denormals_to_zero,
+            } => {
+                let mut left = register_bits(&registers, *left)?;
+                let mut right = register_bits(&registers, *right)?;
+                if *flush_denormals_to_zero {
+                    left = flush_denormal_bits(left);
+                    right = flush_denormal_bits(right);
+                }
+                let compared = evaluate_float_comparison(
+                    f32::from_bits(left),
+                    f32::from_bits(right),
+                    *comparison,
+                );
+                let accumulated = evaluate_shader_predicate(*accumulator, &predicates)?;
+                predicates[usize::from(*destination)] = Some(match set_operation {
+                    ShaderPredicateSetOperation::And => compared && accumulated,
+                    ShaderPredicateSetOperation::Or => compared || accumulated,
+                    ShaderPredicateSetOperation::Xor => compared ^ accumulated,
+                });
             }
             ShaderOperation::InterpolateInput {
                 destination,
@@ -676,6 +948,9 @@ pub fn evaluate_shader_ir(
                         })?,
                 );
             }
+            ShaderOperation::SampleTexture2D { .. } => {
+                return Err(ShaderEvaluationError::TextureSampling(instruction.source));
+            }
             ShaderOperation::Branch { target } => {
                 pc = targets[target];
             }
@@ -683,6 +958,41 @@ pub fn evaluate_shader_ir(
         }
     }
     Err(ShaderEvaluationError::MissingExit)
+}
+
+fn evaluate_shader_predicate(
+    predicate: ShaderPredicate,
+    predicates: &[Option<bool>; 7],
+) -> Result<bool, ShaderEvaluationError> {
+    match predicate {
+        ShaderPredicate::Always => Ok(true),
+        ShaderPredicate::Never => Ok(false),
+        ShaderPredicate::Register { register, inverted } => predicates
+            .get(usize::from(register))
+            .and_then(|value| *value)
+            .map(|value| value ^ inverted)
+            .ok_or(ShaderEvaluationError::UndefinedPredicate(register)),
+    }
+}
+
+fn evaluate_float_comparison(left: f32, right: f32, comparison: ShaderFloatComparison) -> bool {
+    let unordered = left.is_nan() || right.is_nan();
+    match comparison {
+        ShaderFloatComparison::OrderedLess => !unordered && left < right,
+        ShaderFloatComparison::OrderedEqual => !unordered && left == right,
+        ShaderFloatComparison::OrderedLessOrEqual => !unordered && left <= right,
+        ShaderFloatComparison::OrderedGreater => !unordered && left > right,
+        ShaderFloatComparison::OrderedNotEqual => !unordered && left != right,
+        ShaderFloatComparison::OrderedGreaterOrEqual => !unordered && left >= right,
+        ShaderFloatComparison::IsNumber => !unordered,
+        ShaderFloatComparison::IsNan => unordered,
+        ShaderFloatComparison::UnorderedLess => unordered || left < right,
+        ShaderFloatComparison::UnorderedEqual => unordered || left == right,
+        ShaderFloatComparison::UnorderedLessOrEqual => unordered || left <= right,
+        ShaderFloatComparison::UnorderedGreater => unordered || left > right,
+        ShaderFloatComparison::UnorderedNotEqual => unordered || left != right,
+        ShaderFloatComparison::UnorderedGreaterOrEqual => unordered || left >= right,
+    }
 }
 
 fn register_bits(
@@ -726,6 +1036,34 @@ fn evaluate_float_unary(
     }
     let result = operation(f32::from_bits(source));
     finish_float(result.to_bits(), control)
+}
+
+fn evaluate_float_ternary(
+    mut left: u32,
+    mut right: u32,
+    mut addend: u32,
+    control: ShaderFloatControl,
+    operation: impl FnOnce(f32, f32, f32) -> f32,
+) -> Result<u32, ShaderEvaluationError> {
+    if control.rounding != ShaderRoundingMode::NearestEven {
+        return Err(ShaderEvaluationError::UnsupportedRoundingMode(
+            control.rounding,
+        ));
+    }
+    if control.denormals_are_zero {
+        left = flush_denormal_bits(left);
+        right = flush_denormal_bits(right);
+        addend = flush_denormal_bits(addend);
+    }
+    finish_float(
+        operation(
+            f32::from_bits(left),
+            f32::from_bits(right),
+            f32::from_bits(addend),
+        )
+        .to_bits(),
+        control,
+    )
 }
 
 fn finish_float(mut bits: u32, control: ShaderFloatControl) -> Result<u32, ShaderEvaluationError> {
@@ -811,7 +1149,6 @@ pub enum ShaderBackendLoweringError {
     UnsupportedStage(ShaderStage),
     UnsupportedInterface(ShaderIoLocation),
     InconsistentInterfaceType(ShaderIoLocation),
-    PredicateRegister(u8),
     ControlFlow(ShaderSourceLocation),
     ResourceAccess(ShaderSourceLocation),
     NumericControl(ShaderSourceLocation),
@@ -843,6 +1180,13 @@ pub fn lower_shader_ir_to_wgsl(
     let input_groups = interface_groups(&ir.inputs)?;
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
+    emit_wgsl_resources(&mut source, ir)?;
+    source.push_str(
+        "fn nixe_flush_denormal(bits: u32) -> u32 {\n\
+           let magnitude = bits & 0x7fffffffu;\n\
+           return select(bits, bits & 0x80000000u, magnitude > 0u && magnitude < 0x00800000u);\n\
+         }\n\n",
+    );
     if !input_groups.is_empty() {
         emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
     }
@@ -858,8 +1202,23 @@ pub fn lower_shader_ir_to_wgsl(
         source.push_str("fn main(input: ShaderInput) -> ShaderOutput {\n");
     }
     source.push_str("  var registers: array<u32, 256>;\n");
+    source.push_str("  var predicates: array<bool, 7>;\n");
     source.push_str("  var output: ShaderOutput;\n");
     let mut source_map = Vec::new();
+    if ir
+        .instructions
+        .iter()
+        .any(|instruction| matches!(instruction.operation, ShaderOperation::Branch { .. }))
+    {
+        emit_wgsl_control_flow(&mut source, ir, &mut source_map)?;
+        source.push_str("}\n");
+        return Ok(ShaderBackendModule {
+            stage: ir.stage,
+            language: ShaderBackendLanguage::Wgsl,
+            source: source.into_boxed_str(),
+            source_map: source_map.into_boxed_slice(),
+        });
+    }
     for instruction in &ir.instructions {
         let line = source.lines().count() as u32 + 1;
         source_map.push(ShaderBackendSourceMapEntry {
@@ -870,14 +1229,21 @@ pub fn lower_shader_ir_to_wgsl(
             "  // Maxwell code byte offset 0x{:x}\n",
             instruction.source.byte_offset()
         ));
-        match instruction.predicate {
+        let conditional = match instruction.predicate {
             ShaderPredicate::Never => continue,
-            ShaderPredicate::Register { register, .. } => {
-                return Err(ShaderBackendLoweringError::PredicateRegister(register));
+            ShaderPredicate::Register { register, inverted } => {
+                source.push_str(&format!(
+                    "  if ({}predicates[{register}]) {{\n",
+                    if inverted { "!" } else { "" }
+                ));
+                true
             }
-            ShaderPredicate::Always => {}
-        }
+            ShaderPredicate::Always => false,
+        };
         emit_wgsl_operation(&mut source, instruction)?;
+        if conditional {
+            source.push_str("  }\n");
+        }
     }
     source.push_str("}\n");
     Ok(ShaderBackendModule {
@@ -886,6 +1252,223 @@ pub fn lower_shader_ir_to_wgsl(
         source: source.into_boxed_str(),
         source_map: source_map.into_boxed_slice(),
     })
+}
+
+fn emit_wgsl_control_flow(
+    source: &mut String,
+    ir: &ShaderIr,
+    source_map: &mut Vec<ShaderBackendSourceMapEntry>,
+) -> Result<(), ShaderBackendLoweringError> {
+    let locations = ir
+        .instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.source, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut leaders = BTreeSet::from([0_usize]);
+    for (index, instruction) in ir.instructions.iter().enumerate() {
+        if let ShaderOperation::Branch { target } = instruction.operation {
+            leaders.insert(locations[&target]);
+            if index + 1 < ir.instructions.len() {
+                leaders.insert(index + 1);
+            }
+        } else if matches!(instruction.operation, ShaderOperation::Exit)
+            && index + 1 < ir.instructions.len()
+        {
+            leaders.insert(index + 1);
+        }
+    }
+    let leaders = leaders.into_iter().collect::<Vec<_>>();
+    let mut instruction_blocks = vec![0_usize; ir.instructions.len()];
+    for (block, start) in leaders.iter().copied().enumerate() {
+        let end = leaders
+            .get(block + 1)
+            .copied()
+            .unwrap_or(ir.instructions.len());
+        instruction_blocks[start..end].fill(block);
+    }
+
+    source.push_str("  var nixe_block = 0u;\n");
+    source.push_str("  loop {\n");
+    source.push_str("    switch nixe_block {\n");
+    for (block, start) in leaders.iter().copied().enumerate() {
+        let end = leaders
+            .get(block + 1)
+            .copied()
+            .unwrap_or(ir.instructions.len());
+        source.push_str(&format!("      case {block}u: {{\n"));
+        let mut terminated = false;
+        for (index, instruction) in ir.instructions[start..end].iter().enumerate() {
+            let instruction_index = start + index;
+            let line = source.lines().count() as u32 + 1;
+            source_map.push(ShaderBackendSourceMapEntry {
+                backend_line: line,
+                source: instruction.source,
+            });
+            source.push_str(&format!(
+                "        // Maxwell code byte offset 0x{:x}\n",
+                instruction.source.byte_offset()
+            ));
+            match instruction.operation() {
+                ShaderOperation::Branch { target } => {
+                    let target_block = instruction_blocks[locations[target]];
+                    let fallthrough = instruction_blocks.get(instruction_index + 1).copied();
+                    emit_wgsl_block_transfer(
+                        source,
+                        instruction.predicate,
+                        target_block,
+                        fallthrough,
+                    );
+                    terminated = true;
+                }
+                ShaderOperation::Exit => {
+                    emit_wgsl_block_exit(
+                        source,
+                        instruction.predicate,
+                        instruction_blocks.get(instruction_index + 1).copied(),
+                    );
+                    terminated = true;
+                }
+                _ => emit_wgsl_nested_operation(source, instruction)?,
+            }
+        }
+        if !terminated {
+            if let Some(next) = leaders.get(block + 1) {
+                source.push_str(&format!(
+                    "        nixe_block = {}u;\n        continue;\n",
+                    instruction_blocks[*next]
+                ));
+            } else {
+                source.push_str("        return output;\n");
+            }
+        }
+        source.push_str("      }\n");
+    }
+    source.push_str("      default: { return output; }\n");
+    source.push_str("    }\n");
+    source.push_str("  }\n");
+    source.push_str("  return output;\n");
+    Ok(())
+}
+
+fn emit_wgsl_nested_operation(
+    source: &mut String,
+    instruction: &ShaderInstruction,
+) -> Result<(), ShaderBackendLoweringError> {
+    if instruction.predicate == ShaderPredicate::Never {
+        return Ok(());
+    }
+    let conditional =
+        if let ShaderPredicate::Register { register, inverted } = instruction.predicate {
+            source.push_str(&format!(
+                "        if ({}predicates[{register}]) {{\n",
+                if inverted { "!" } else { "" }
+            ));
+            true
+        } else {
+            false
+        };
+    let mut operation = String::new();
+    emit_wgsl_operation(&mut operation, instruction)?;
+    for line in operation.lines() {
+        source.push_str("      ");
+        source.push_str(line);
+        source.push('\n');
+    }
+    if conditional {
+        source.push_str("        }\n");
+    }
+    Ok(())
+}
+
+fn emit_wgsl_block_transfer(
+    source: &mut String,
+    predicate: ShaderPredicate,
+    target: usize,
+    fallthrough: Option<usize>,
+) {
+    match predicate {
+        ShaderPredicate::Always => source.push_str(&format!(
+            "        nixe_block = {target}u;\n        continue;\n"
+        )),
+        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough),
+        ShaderPredicate::Register { .. } => {
+            let condition = wgsl_predicate_expression(predicate);
+            source.push_str(&format!(
+                "        if ({condition}) {{\n          nixe_block = {target}u;\n        }} else {{\n"
+            ));
+            if let Some(fallthrough) = fallthrough {
+                source.push_str(&format!("          nixe_block = {fallthrough}u;\n"));
+            } else {
+                source.push_str("          return output;\n");
+            }
+            source.push_str("        }\n        continue;\n");
+        }
+    }
+}
+
+fn emit_wgsl_block_exit(
+    source: &mut String,
+    predicate: ShaderPredicate,
+    fallthrough: Option<usize>,
+) {
+    match predicate {
+        ShaderPredicate::Always => source.push_str("        return output;\n"),
+        ShaderPredicate::Never => emit_wgsl_fallthrough(source, fallthrough),
+        ShaderPredicate::Register { .. } => {
+            let condition = wgsl_predicate_expression(predicate);
+            source.push_str(&format!(
+                "        if ({condition}) {{\n          return output;\n        }}\n"
+            ));
+            emit_wgsl_fallthrough(source, fallthrough);
+        }
+    }
+}
+
+fn emit_wgsl_fallthrough(source: &mut String, fallthrough: Option<usize>) {
+    if let Some(fallthrough) = fallthrough {
+        source.push_str(&format!(
+            "        nixe_block = {fallthrough}u;\n        continue;\n"
+        ));
+    } else {
+        source.push_str("        return output;\n");
+    }
+}
+
+fn emit_wgsl_resources(
+    source: &mut String,
+    ir: &ShaderIr,
+) -> Result<(), ShaderBackendLoweringError> {
+    for resource in &ir.resources {
+        if !resource.readable || resource.writable {
+            return Err(ShaderBackendLoweringError::ResourceAccess(
+                ir.instructions[0].source,
+            ));
+        }
+        match resource.kind {
+            ShaderResourceKind::ConstantBuffer => source.push_str(&format!(
+                "@group(0) @binding({}) var<storage, read> constant_buffer_{}: array<u32>;\n",
+                resource.binding, resource.binding
+            )),
+            ShaderResourceKind::SampledImage => source.push_str(&format!(
+                "@group(0) @binding({}) var sampled_image_{}: texture_2d<f32>;\n",
+                resource.binding, resource.binding
+            )),
+            ShaderResourceKind::Sampler => source.push_str(&format!(
+                "@group(0) @binding({}) var sampler_{}: sampler;\n",
+                resource.binding, resource.binding
+            )),
+            ShaderResourceKind::StorageBuffer | ShaderResourceKind::StorageImage => {
+                return Err(ShaderBackendLoweringError::ResourceAccess(
+                    ir.instructions[0].source,
+                ));
+            }
+        }
+    }
+    if !ir.resources.is_empty() {
+        source.push('\n');
+    }
+    Ok(())
 }
 
 fn interface_groups(
@@ -1011,6 +1594,31 @@ fn emit_wgsl_operation(
             "  registers[{}] = 0x{bits:08x}u;\n",
             destination.index()
         )),
+        ShaderOperation::Move32 {
+            destination,
+            source: operand,
+            ..
+        } => source.push_str(&format!(
+            "  registers[{}] = registers[{}];\n",
+            destination.index(),
+            operand.index()
+        )),
+        ShaderOperation::FloatAbsolute32 {
+            destination,
+            source: operand,
+        } => source.push_str(&format!(
+            "  registers[{}] = registers[{}] & 0x7fffffffu;\n",
+            destination.index(),
+            operand.index()
+        )),
+        ShaderOperation::FloatNegate32 {
+            destination,
+            source: operand,
+        } => source.push_str(&format!(
+            "  registers[{}] = registers[{}] ^ 0x80000000u;\n",
+            destination.index(),
+            operand.index()
+        )),
         ShaderOperation::LoadInput {
             destinations,
             location,
@@ -1054,13 +1662,13 @@ fn emit_wgsl_operation(
             scalar_type,
             float_control,
         } => {
-            require_precise_float(instruction.source, *float_control)?;
             let expression = match scalar_type {
-                ShaderScalarType::Float32 => format!(
-                    "bitcast<u32>(bitcast<f32>(registers[{}]) * bitcast<f32>(registers[{}]))",
+                ShaderScalarType::Float32 => wgsl_float_multiply_expression(
+                    instruction.source,
                     left.index(),
-                    right.index()
-                ),
+                    right.index(),
+                    *float_control,
+                )?,
                 ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
                     format!("registers[{}] * registers[{}]", left.index(), right.index())
                 }
@@ -1070,6 +1678,72 @@ fn emit_wgsl_operation(
                     ));
                 }
             };
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::Add32 {
+            destination,
+            left,
+            right,
+            scalar_type,
+            float_control,
+        } => {
+            let expression = match scalar_type {
+                ShaderScalarType::Float32 => wgsl_float_add_expression(
+                    instruction.source,
+                    left.index(),
+                    right.index(),
+                    *float_control,
+                )?,
+                ShaderScalarType::Unsigned32 | ShaderScalarType::Signed32 => {
+                    format!("registers[{}] + registers[{}]", left.index(), right.index())
+                }
+                _ => {
+                    return Err(ShaderBackendLoweringError::NumericControl(
+                        instruction.source,
+                    ));
+                }
+            };
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::FloatMinMax32 {
+            destination,
+            left,
+            right,
+            minimum,
+            float_control,
+        } => {
+            let expression = wgsl_float_min_max_expression(
+                instruction.source,
+                left.index(),
+                right.index(),
+                *minimum,
+                *float_control,
+            )?;
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::FusedMultiplyAdd32 {
+            destination,
+            left,
+            right,
+            addend,
+            float_control,
+        } => {
+            let expression = wgsl_float_fma_expression(
+                instruction.source,
+                left.index(),
+                right.index(),
+                addend.index(),
+                *float_control,
+            )?;
             source.push_str(&format!(
                 "  registers[{}] = {expression};\n",
                 destination.index()
@@ -1086,6 +1760,110 @@ fn emit_wgsl_operation(
                 "  registers[{}] = bitcast<u32>(1.0 / bitcast<f32>(registers[{}]));\n",
                 destination.index(),
                 operand.index()
+            ));
+        }
+        ShaderOperation::ReciprocalSqrt32 {
+            destination,
+            source: operand,
+            float_control,
+            ..
+        } => {
+            require_precise_float(instruction.source, *float_control)?;
+            source.push_str(&format!(
+                "  registers[{}] = bitcast<u32>(inverseSqrt(bitcast<f32>(registers[{}])));\n",
+                destination.index(),
+                operand.index()
+            ));
+        }
+        ShaderOperation::SpecialFunction32 {
+            destination,
+            source: operand,
+            function,
+            float_control,
+            ..
+        } => {
+            require_precise_float(instruction.source, *float_control)?;
+            let function = match function {
+                ShaderSpecialFunction::Cosine => "cos",
+                ShaderSpecialFunction::Sine => "sin",
+                ShaderSpecialFunction::Exp2 => "exp2",
+                ShaderSpecialFunction::Log2 => "log2",
+                ShaderSpecialFunction::SquareRoot => "sqrt",
+            };
+            source.push_str(&format!(
+                "  registers[{}] = bitcast<u32>({function}(bitcast<f32>(registers[{}])));\n",
+                destination.index(),
+                operand.index()
+            ));
+        }
+        ShaderOperation::SetPredicateFloat32 {
+            destination,
+            left,
+            right,
+            comparison,
+            accumulator,
+            set_operation,
+            flush_denormals_to_zero,
+        } => {
+            let operand = |register: ShaderRegister| {
+                let bits = format!("registers[{}]", register.index());
+                if *flush_denormals_to_zero {
+                    format!("bitcast<f32>(nixe_flush_denormal({bits}))")
+                } else {
+                    format!("bitcast<f32>({bits})")
+                }
+            };
+            let left = operand(*left);
+            let right = operand(*right);
+            // WGSL has no scalar isNan builtin; IEEE NaN is the only value
+            // which compares unequal to itself.
+            let unordered = format!("(({left} != {left}) || ({right} != {right}))");
+            let compared = match comparison {
+                ShaderFloatComparison::OrderedLess => format!("(!{unordered} && {left} < {right})"),
+                ShaderFloatComparison::OrderedEqual => {
+                    format!("(!{unordered} && {left} == {right})")
+                }
+                ShaderFloatComparison::OrderedLessOrEqual => {
+                    format!("(!{unordered} && {left} <= {right})")
+                }
+                ShaderFloatComparison::OrderedGreater => {
+                    format!("(!{unordered} && {left} > {right})")
+                }
+                ShaderFloatComparison::OrderedNotEqual => {
+                    format!("(!{unordered} && {left} != {right})")
+                }
+                ShaderFloatComparison::OrderedGreaterOrEqual => {
+                    format!("(!{unordered} && {left} >= {right})")
+                }
+                ShaderFloatComparison::IsNumber => format!("!{unordered}"),
+                ShaderFloatComparison::IsNan => unordered,
+                ShaderFloatComparison::UnorderedLess => {
+                    format!("({unordered} || {left} < {right})")
+                }
+                ShaderFloatComparison::UnorderedEqual => {
+                    format!("({unordered} || {left} == {right})")
+                }
+                ShaderFloatComparison::UnorderedLessOrEqual => {
+                    format!("({unordered} || {left} <= {right})")
+                }
+                ShaderFloatComparison::UnorderedGreater => {
+                    format!("({unordered} || {left} > {right})")
+                }
+                ShaderFloatComparison::UnorderedNotEqual => {
+                    format!("({unordered} || {left} != {right})")
+                }
+                ShaderFloatComparison::UnorderedGreaterOrEqual => {
+                    format!("({unordered} || {left} >= {right})")
+                }
+            };
+            let accumulator = wgsl_predicate_expression(*accumulator);
+            let operator = match set_operation {
+                ShaderPredicateSetOperation::And => "&&",
+                ShaderPredicateSetOperation::Or => "||",
+                ShaderPredicateSetOperation::Xor => "!=",
+            };
+            source.push_str(&format!(
+                "  predicates[{destination}] = ({compared}) {operator} ({accumulator});\n"
             ));
         }
         ShaderOperation::InterpolateInput {
@@ -1108,10 +1886,36 @@ fn emit_wgsl_operation(
                 destination.index()
             ));
         }
-        ShaderOperation::LoadConstantBuffer32 { .. } => {
-            return Err(ShaderBackendLoweringError::ResourceAccess(
-                instruction.source,
+        ShaderOperation::LoadConstantBuffer32 {
+            destination,
+            binding,
+            byte_offset,
+            ..
+        } => source.push_str(&format!(
+            "  registers[{}] = constant_buffer_{}[{}u];\n",
+            destination.index(),
+            binding,
+            byte_offset / 4
+        )),
+        ShaderOperation::SampleTexture2D {
+            outputs,
+            coordinates,
+            image_binding,
+            sampler_binding,
+        } => {
+            let sample = format!("nixe_sample_{:x}", instruction.source.byte_offset());
+            source.push_str(&format!(
+                "  let {sample} = textureSample(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])));\n",
+                coordinates[0].index(),
+                coordinates[1].index(),
             ));
+            for output in outputs {
+                source.push_str(&format!(
+                    "  registers[{}] = bitcast<u32>({sample}{});\n",
+                    output.destination().index(),
+                    wgsl_component(output.component()),
+                ));
+            }
         }
         ShaderOperation::Branch { .. } => {
             return Err(ShaderBackendLoweringError::ControlFlow(instruction.source));
@@ -1119,6 +1923,145 @@ fn emit_wgsl_operation(
         ShaderOperation::Exit => source.push_str("  return output;\n"),
     }
     Ok(())
+}
+
+fn wgsl_predicate_expression(predicate: ShaderPredicate) -> String {
+    match predicate {
+        ShaderPredicate::Always => "true".to_owned(),
+        ShaderPredicate::Never => "false".to_owned(),
+        ShaderPredicate::Register { register, inverted } => {
+            format!("{}predicates[{register}]", if inverted { "!" } else { "" })
+        }
+    }
+}
+
+fn wgsl_float_multiply_expression(
+    source: ShaderSourceLocation,
+    left: u16,
+    right: u16,
+    control: ShaderFloatControl,
+) -> Result<String, ShaderBackendLoweringError> {
+    if control.rounding() != ShaderRoundingMode::NearestEven
+        || control.nan_mode() != ShaderNanMode::Propagate
+        || control.saturate()
+    {
+        return Err(ShaderBackendLoweringError::NumericControl(source));
+    }
+    let operand = |register: u16| {
+        if control.denormals_are_zero() {
+            format!("nixe_flush_denormal(registers[{register}])")
+        } else {
+            format!("registers[{register}]")
+        }
+    };
+    let result = format!(
+        "bitcast<u32>(bitcast<f32>({}) * bitcast<f32>({}))",
+        operand(left),
+        operand(right)
+    );
+    Ok(if control.flush_denormals_to_zero() {
+        format!("nixe_flush_denormal({result})")
+    } else {
+        result
+    })
+}
+
+fn wgsl_float_add_expression(
+    source: ShaderSourceLocation,
+    left: u16,
+    right: u16,
+    control: ShaderFloatControl,
+) -> Result<String, ShaderBackendLoweringError> {
+    if control.rounding() != ShaderRoundingMode::NearestEven
+        || control.nan_mode() != ShaderNanMode::Propagate
+        || control.saturate()
+    {
+        return Err(ShaderBackendLoweringError::NumericControl(source));
+    }
+    let operand = |register: u16| {
+        if control.denormals_are_zero() {
+            format!("nixe_flush_denormal(registers[{register}])")
+        } else {
+            format!("registers[{register}]")
+        }
+    };
+    let result = format!(
+        "bitcast<u32>(bitcast<f32>({}) + bitcast<f32>({}))",
+        operand(left),
+        operand(right)
+    );
+    Ok(if control.flush_denormals_to_zero() {
+        format!("nixe_flush_denormal({result})")
+    } else {
+        result
+    })
+}
+
+fn wgsl_float_min_max_expression(
+    source: ShaderSourceLocation,
+    left: u16,
+    right: u16,
+    minimum: ShaderPredicate,
+    control: ShaderFloatControl,
+) -> Result<String, ShaderBackendLoweringError> {
+    if control.rounding() != ShaderRoundingMode::NearestEven
+        || control.nan_mode() != ShaderNanMode::Propagate
+        || control.saturate()
+    {
+        return Err(ShaderBackendLoweringError::NumericControl(source));
+    }
+    let operand = |register: u16| {
+        if control.denormals_are_zero() {
+            format!("nixe_flush_denormal(registers[{register}])")
+        } else {
+            format!("registers[{register}]")
+        }
+    };
+    let left = format!("bitcast<f32>({})", operand(left));
+    let right = format!("bitcast<f32>({})", operand(right));
+    let selected = format!(
+        "select(max({left}, {right}), min({left}, {right}), {})",
+        wgsl_predicate_expression(minimum)
+    );
+    let result = format!("bitcast<u32>({selected})");
+    Ok(if control.flush_denormals_to_zero() {
+        format!("nixe_flush_denormal({result})")
+    } else {
+        result
+    })
+}
+
+fn wgsl_float_fma_expression(
+    source: ShaderSourceLocation,
+    left: u16,
+    right: u16,
+    addend: u16,
+    control: ShaderFloatControl,
+) -> Result<String, ShaderBackendLoweringError> {
+    if control.rounding() != ShaderRoundingMode::NearestEven
+        || control.nan_mode() != ShaderNanMode::Propagate
+        || control.saturate()
+    {
+        return Err(ShaderBackendLoweringError::NumericControl(source));
+    }
+    let operand = |register: u16| {
+        if control.denormals_are_zero() {
+            format!("nixe_flush_denormal(registers[{register}])")
+        } else {
+            format!("registers[{register}]")
+        }
+    };
+    let result = format!(
+        "bitcast<u32>(fma(bitcast<f32>({}), bitcast<f32>({}), bitcast<f32>({})))",
+        operand(left),
+        operand(right),
+        operand(addend)
+    );
+    Ok(if control.flush_denormals_to_zero() {
+        format!("nixe_flush_denormal({result})")
+    } else {
+        result
+    })
 }
 
 fn require_precise_float(
@@ -1182,7 +2125,11 @@ pub enum ShaderVerificationError {
         source: ShaderSourceLocation,
         register: ShaderRegister,
     },
-    UnsupportedPredicate {
+    UndefinedPredicate {
+        source: ShaderSourceLocation,
+        register: u8,
+    },
+    InvalidPredicateRegister {
         source: ShaderSourceLocation,
         register: u8,
     },
@@ -1195,6 +2142,9 @@ pub enum ShaderVerificationError {
     UndeclaredResourceAccess {
         source: ShaderSourceLocation,
         binding: u8,
+    },
+    InvalidTextureSample {
+        source: ShaderSourceLocation,
     },
     InvalidBranchTarget {
         source: ShaderSourceLocation,
@@ -1233,9 +2183,14 @@ impl Display for ShaderVerificationError {
                 register.index(),
                 source.byte_offset()
             ),
-            Self::UnsupportedPredicate { source, register } => write!(
+            Self::UndefinedPredicate { source, register } => write!(
                 formatter,
-                "shader IR uses unsupported predicate register p{register} at byte offset 0x{:x}",
+                "shader IR reads undefined predicate p{register} at byte offset 0x{:x}",
+                source.byte_offset()
+            ),
+            Self::InvalidPredicateRegister { source, register } => write!(
+                formatter,
+                "shader IR uses invalid predicate p{register} at byte offset 0x{:x}",
                 source.byte_offset()
             ),
             Self::UndeclaredInterfaceAccess {
@@ -1252,6 +2207,11 @@ impl Display for ShaderVerificationError {
             Self::UndeclaredResourceAccess { source, binding } => write!(
                 formatter,
                 "shader IR accesses undeclared resource {binding} at byte offset 0x{:x}",
+                source.byte_offset()
+            ),
+            Self::InvalidTextureSample { source } => write!(
+                formatter,
+                "shader IR has an invalid texture sample at byte offset 0x{:x}",
                 source.byte_offset()
             ),
             Self::InvalidBranchTarget { source, target } => write!(
@@ -1322,8 +2282,8 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
         .enumerate()
         .map(|(index, instruction)| (instruction.source, index))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut incoming = vec![None::<BTreeSet<ShaderRegister>>; ir.instructions.len()];
-    incoming[0] = Some(BTreeSet::new());
+    let mut incoming = vec![None::<ShaderDefinitions>; ir.instructions.len()];
+    incoming[0] = Some(ShaderDefinitions::default());
     let mut work = std::collections::VecDeque::from([0_usize]);
     let mut has_reachable_exit = false;
     while let Some(index) = work.pop_front() {
@@ -1331,6 +2291,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
         let mut definitions = incoming[index]
             .clone()
             .expect("queued instruction has incoming definitions");
+        let conditional = matches!(instruction.predicate, ShaderPredicate::Register { .. });
         match instruction.predicate {
             ShaderPredicate::Never => {
                 enqueue_shader_successor(
@@ -1342,24 +2303,31 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 continue;
             }
             ShaderPredicate::Register { register, .. } => {
-                return Err(ShaderVerificationError::UnsupportedPredicate {
-                    source: instruction.source,
-                    register,
-                });
+                validate_predicate_register(instruction.source, register)?;
+                require_predicate_definition(instruction.source, register, &definitions.predicates)?
             }
             ShaderPredicate::Always => {}
         }
         match &instruction.operation {
             ShaderOperation::Undefined32 { destination }
             | ShaderOperation::MoveImmediate32 { destination, .. }
+            | ShaderOperation::Move32 { destination, .. }
+            | ShaderOperation::FloatAbsolute32 { destination, .. }
+            | ShaderOperation::FloatNegate32 { destination, .. }
             | ShaderOperation::LoadConstantBuffer32 { destination, .. }
             | ShaderOperation::Reciprocal32 { destination, .. }
+            | ShaderOperation::ReciprocalSqrt32 { destination, .. }
+            | ShaderOperation::SpecialFunction32 { destination, .. }
             | ShaderOperation::Multiply32 { destination, .. }
+            | ShaderOperation::Add32 { destination, .. }
+            | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
             | ShaderOperation::InterpolateInput { destination, .. } => {
                 for source in operation_sources(&instruction.operation) {
-                    require_definition(instruction.source, source, &definitions)?;
+                    require_definition(instruction.source, source, &definitions.registers)?;
                 }
-                definitions.insert(*destination);
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
             }
             ShaderOperation::LoadInput {
                 destinations,
@@ -1375,7 +2343,9 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     *first_component,
                     destinations.len(),
                 )?;
-                definitions.extend(destinations.iter().copied());
+                if !conditional {
+                    definitions.registers.extend(destinations.iter().copied());
+                }
             }
             ShaderOperation::StoreOutput {
                 sources,
@@ -1392,7 +2362,98 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     sources.len(),
                 )?;
                 for source in sources.iter().copied() {
-                    require_definition(instruction.source, source, &definitions)?;
+                    require_definition(instruction.source, source, &definitions.registers)?;
+                }
+            }
+            ShaderOperation::FloatMinMax32 {
+                destination,
+                minimum,
+                ..
+            } => {
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(instruction.source, source, &definitions.registers)?;
+                }
+                if let ShaderPredicate::Register { register, .. } = minimum {
+                    validate_predicate_register(instruction.source, *register)?;
+                    require_predicate_definition(
+                        instruction.source,
+                        *register,
+                        &definitions.predicates,
+                    )?;
+                }
+                if !conditional {
+                    definitions.registers.insert(*destination);
+                }
+            }
+            ShaderOperation::SetPredicateFloat32 {
+                destination,
+                accumulator,
+                ..
+            } => {
+                validate_predicate_register(instruction.source, *destination)?;
+                for source in operation_sources(&instruction.operation) {
+                    require_definition(instruction.source, source, &definitions.registers)?;
+                }
+                if let ShaderPredicate::Register { register, .. } = accumulator {
+                    validate_predicate_register(instruction.source, *register)?;
+                    require_predicate_definition(
+                        instruction.source,
+                        *register,
+                        &definitions.predicates,
+                    )?;
+                }
+                if !conditional {
+                    definitions.predicates.insert(*destination);
+                }
+            }
+            ShaderOperation::SampleTexture2D {
+                outputs,
+                coordinates,
+                image_binding,
+                sampler_binding,
+            } => {
+                for coordinate in coordinates {
+                    require_definition(instruction.source, *coordinate, &definitions.registers)?;
+                }
+                let valid_outputs = !outputs.is_empty()
+                    && outputs.len() <= 4
+                    && outputs
+                        .iter()
+                        .map(|output| output.component())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == outputs.len()
+                    && outputs
+                        .iter()
+                        .map(|output| output.destination())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == outputs.len();
+                if ir.stage != ShaderStage::Fragment || !valid_outputs {
+                    return Err(ShaderVerificationError::InvalidTextureSample {
+                        source: instruction.source,
+                    });
+                }
+                for (binding, kind) in [
+                    (*image_binding, ShaderResourceKind::SampledImage),
+                    (*sampler_binding, ShaderResourceKind::Sampler),
+                ] {
+                    if !ir.resources.iter().any(|resource| {
+                        resource.binding == binding
+                            && resource.kind == kind
+                            && resource.readable
+                            && !resource.writable
+                    }) {
+                        return Err(ShaderVerificationError::UndeclaredResourceAccess {
+                            source: instruction.source,
+                            binding,
+                        });
+                    }
+                }
+                if !conditional {
+                    definitions
+                        .registers
+                        .extend(outputs.iter().map(|output| output.destination()));
                 }
             }
             ShaderOperation::Branch { target } => {
@@ -1408,11 +2469,15 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                     &mut incoming,
                     &mut work,
                 )?;
-                continue;
+                if !conditional {
+                    continue;
+                }
             }
             ShaderOperation::Exit => {
                 has_reachable_exit = true;
-                continue;
+                if !conditional {
+                    continue;
+                }
             }
         }
         if let ShaderOperation::LoadConstantBuffer32 { binding, .. } = instruction.operation
@@ -1435,10 +2500,16 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ShaderDefinitions {
+    registers: BTreeSet<ShaderRegister>,
+    predicates: BTreeSet<u8>,
+}
+
 fn enqueue_shader_successor(
     successor: Option<usize>,
-    definitions: &BTreeSet<ShaderRegister>,
-    incoming: &mut [Option<BTreeSet<ShaderRegister>>],
+    definitions: &ShaderDefinitions,
+    incoming: &mut [Option<ShaderDefinitions>],
     work: &mut std::collections::VecDeque<usize>,
 ) -> Result<(), ShaderVerificationError> {
     let Some(successor) = successor.filter(|index| *index < incoming.len()) else {
@@ -1450,10 +2521,18 @@ fn enqueue_shader_successor(
             work.push_back(successor);
         }
         Some(existing) => {
-            let merged = existing
-                .intersection(definitions)
-                .copied()
-                .collect::<BTreeSet<_>>();
+            let merged = ShaderDefinitions {
+                registers: existing
+                    .registers
+                    .intersection(&definitions.registers)
+                    .copied()
+                    .collect(),
+                predicates: existing
+                    .predicates
+                    .intersection(&definitions.predicates)
+                    .copied()
+                    .collect(),
+            };
             if merged != *existing {
                 *existing = merged;
                 work.push_back(successor);
@@ -1466,12 +2545,56 @@ fn enqueue_shader_successor(
 fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
     match operation {
         ShaderOperation::Multiply32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::Move32 { source, .. } => vec![*source],
+        ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::FloatAbsolute32 { source, .. }
+        | ShaderOperation::FloatNegate32 { source, .. } => vec![*source],
+        ShaderOperation::FusedMultiplyAdd32 {
+            left,
+            right,
+            addend,
+            ..
+        } => vec![*left, *right, *addend],
         ShaderOperation::Reciprocal32 { source, .. } => vec![*source],
+        ShaderOperation::ReciprocalSqrt32 { source, .. } => vec![*source],
+        ShaderOperation::SpecialFunction32 { source, .. } => vec![*source],
+        ShaderOperation::SetPredicateFloat32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::InterpolateInput {
             perspective_reciprocal,
             ..
         } => perspective_reciprocal.iter().copied().collect(),
+        ShaderOperation::SampleTexture2D { coordinates, .. } => coordinates.to_vec(),
         _ => Vec::new(),
+    }
+}
+
+fn validate_predicate_register(
+    source: ShaderSourceLocation,
+    predicate: u8,
+) -> Result<(), ShaderVerificationError> {
+    if predicate < 7 {
+        Ok(())
+    } else {
+        Err(ShaderVerificationError::InvalidPredicateRegister {
+            source,
+            register: predicate,
+        })
+    }
+}
+
+fn require_predicate_definition(
+    source: ShaderSourceLocation,
+    predicate: u8,
+    definitions: &BTreeSet<u8>,
+) -> Result<(), ShaderVerificationError> {
+    if definitions.contains(&predicate) {
+        Ok(())
+    } else {
+        Err(ShaderVerificationError::UndefinedPredicate {
+            source,
+            register: predicate,
+        })
     }
 }
 
@@ -1699,6 +2822,277 @@ mod tests {
     }
 
     #[test]
+    fn branch_control_flow_evaluates_and_lowers_to_valid_wgsl() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Unsigned32,
+            None,
+        )
+        .unwrap();
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 1,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::SetPredicateFloat32 {
+                        destination: 0,
+                        left: ShaderRegister::new(1),
+                        right: ShaderRegister::new(1),
+                        comparison: ShaderFloatComparison::OrderedEqual,
+                        accumulator: ShaderPredicate::Always,
+                        set_operation: ShaderPredicateSetOperation::And,
+                        flush_denormals_to_zero: false,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Register {
+                        register: 0,
+                        inverted: true,
+                    },
+                    ShaderOperation::Branch {
+                        target: ShaderSourceLocation::new(48),
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 2,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(48),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(0)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(56),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+        let evaluated =
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16).unwrap();
+        assert_eq!(
+            evaluated.output_bits(ShaderIoLocation::Position, 0),
+            Some(2)
+        );
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("var nixe_block = 0u"));
+        assert!(module.source().contains("nixe_block = 2u"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn float_predicate_writes_drive_predicated_evaluation_and_wgsl() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Unsigned32,
+            None,
+        )
+        .unwrap();
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 0.0_f32.to_bits(),
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 2.0_f32.to_bits(),
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::SetPredicateFloat32 {
+                        destination: 0,
+                        left: ShaderRegister::new(0),
+                        right: ShaderRegister::new(1),
+                        comparison: ShaderFloatComparison::OrderedLess,
+                        accumulator: ShaderPredicate::Always,
+                        set_operation: ShaderPredicateSetOperation::And,
+                        flush_denormals_to_zero: true,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Register {
+                        register: 0,
+                        inverted: false,
+                    },
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(1)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let result = evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Position, 0),
+            Some(2.0_f32.to_bits())
+        );
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("predicates[0] ="));
+        assert!(module.source().contains("if (predicates[0])"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn register_moves_preserve_bits_under_predication() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Unsigned32,
+            None,
+        )
+        .unwrap();
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 0xdead_beef,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 1.0_f32.to_bits(),
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(2),
+                        bits: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Always,
+                    ShaderOperation::SetPredicateFloat32 {
+                        destination: 0,
+                        left: ShaderRegister::new(1),
+                        right: ShaderRegister::new(1),
+                        comparison: ShaderFloatComparison::OrderedEqual,
+                        accumulator: ShaderPredicate::Always,
+                        set_operation: ShaderPredicateSetOperation::And,
+                        flush_denormals_to_zero: false,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Register {
+                        register: 0,
+                        inverted: false,
+                    },
+                    ShaderOperation::Move32 {
+                        destination: ShaderRegister::new(2),
+                        source: ShaderRegister::new(0),
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(48),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(56),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let result = evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Position, 0),
+            Some(0xdead_beef)
+        );
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("registers[2] = registers[0]"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
     fn wgsl_preserves_pass_mul_w_interpolation() {
         let input = ShaderInterfaceElement::new(
             ShaderIoLocation::Generic(0),
@@ -1845,6 +3239,234 @@ mod tests {
     }
 
     #[test]
+    fn fused_multiply_add_preserves_single_rounding_in_evaluator_and_wgsl() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let left = f32::from_bits(0x3f80_0001);
+        let right = f32::from_bits(0x3f80_0001);
+        let addend = f32::from_bits(0xbf80_0002);
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![(0, left), (1, right), (2, addend)]
+                .into_iter()
+                .map(|(register, value)| {
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(8 + register * 8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(register as u16),
+                            bits: value.to_bits(),
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    )
+                })
+                .chain([
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(32),
+                        ShaderPredicate::Always,
+                        ShaderOperation::FusedMultiplyAdd32 {
+                            destination: ShaderRegister::new(3),
+                            left: ShaderRegister::new(0),
+                            right: ShaderRegister::new(1),
+                            addend: ShaderRegister::new(2),
+                            float_control: ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(40),
+                        ShaderPredicate::Always,
+                        ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(3)].into_boxed_slice(),
+                            location: ShaderIoLocation::Position,
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(48),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Exit,
+                    ),
+                ])
+                .collect(),
+        ))
+        .unwrap();
+        let evaluated =
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16).unwrap();
+        let fused = left.mul_add(right, addend);
+        assert_ne!(fused.to_bits(), (left * right + addend).to_bits());
+        assert_eq!(
+            evaluated.output_bits(ShaderIoLocation::Position, 0),
+            Some(fused.to_bits())
+        );
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("bitcast<u32>(fma("));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn float_add_flushes_a_subnormal_result_in_evaluator_and_wgsl() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let control = ShaderFloatControl::new(
+            ShaderRoundingMode::NearestEven,
+            ShaderNanMode::Propagate,
+            true,
+            false,
+            false,
+        );
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 1,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Add32 {
+                        destination: ShaderRegister::new(2),
+                        left: ShaderRegister::new(0),
+                        right: ShaderRegister::new(1),
+                        scalar_type: ShaderScalarType::Float32,
+                        float_control: control,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+        let evaluated =
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16).unwrap();
+        assert_eq!(
+            evaluated.output_bits(ShaderIoLocation::Position, 0),
+            Some(0)
+        );
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("nixe_flush_denormal(bitcast<u32>"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
+    fn float_absolute_and_negate_preserve_payload_bits() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let bits = 0xffc1_2345;
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::FloatAbsolute32 {
+                        destination: ShaderRegister::new(1),
+                        source: ShaderRegister::new(0),
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::FloatNegate32 {
+                        destination: ShaderRegister::new(2),
+                        source: ShaderRegister::new(1),
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+        let evaluated =
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16).unwrap();
+        assert_eq!(
+            evaluated.output_bits(ShaderIoLocation::Position, 0),
+            Some(bits)
+        );
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("& 0x7fffffffu"));
+        assert!(module.source().contains("^ 0x80000000u"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
     fn verified_control_flow_evaluates_only_the_selected_path() {
         let output = ShaderInterfaceElement::new(
             ShaderIoLocation::Position,
@@ -1960,14 +3582,14 @@ mod tests {
             ))
             .unwrap()
         };
-        let exact = make_shader(ShaderReciprocalAccuracy::Exact);
+        let exact = make_shader(ShaderMathAccuracy::Exact);
         let result = evaluate_shader_ir(&exact, &ShaderEvaluationInputs::default(), 16).unwrap();
         assert_eq!(
             result.output_bits(ShaderIoLocation::Position, 0),
             Some(0.0_f32.to_bits())
         );
 
-        let approximate = make_shader(ShaderReciprocalAccuracy::Approximate);
+        let approximate = make_shader(ShaderMathAccuracy::Approximate);
         assert_eq!(
             evaluate_shader_ir(&approximate, &ShaderEvaluationInputs::default(), 16),
             Err(ShaderEvaluationError::ApproximateOperation(
@@ -1986,5 +3608,346 @@ mod tests {
             finish_float(0x7fc1_2345, canonicalizing).unwrap(),
             f32::NAN.to_bits()
         );
+    }
+
+    #[test]
+    fn evaluator_distinguishes_exact_and_guest_approximate_reciprocal_sqrt() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let make_shader = |accuracy| {
+            VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Vertex,
+                Vec::new(),
+                vec![output],
+                Vec::new(),
+                vec![
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(0),
+                            bits: 4.0_f32.to_bits(),
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(16),
+                        ShaderPredicate::Always,
+                        ShaderOperation::ReciprocalSqrt32 {
+                            destination: ShaderRegister::new(1),
+                            source: ShaderRegister::new(0),
+                            accuracy,
+                            float_control: ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(24),
+                        ShaderPredicate::Always,
+                        ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(1)].into_boxed_slice(),
+                            location: ShaderIoLocation::Position,
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(32),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Exit,
+                    ),
+                ],
+            ))
+            .unwrap()
+        };
+        let exact = make_shader(ShaderMathAccuracy::Exact);
+        let result = evaluate_shader_ir(&exact, &ShaderEvaluationInputs::default(), 16).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Position, 0),
+            Some(0.5_f32.to_bits())
+        );
+        let module = lower_shader_ir_to_wgsl(&exact).unwrap();
+        assert!(module.source().contains("inverseSqrt"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+
+        let approximate = make_shader(ShaderMathAccuracy::Approximate);
+        assert_eq!(
+            evaluate_shader_ir(&approximate, &ShaderEvaluationInputs::default(), 16),
+            Err(ShaderEvaluationError::ApproximateOperation(
+                ShaderSourceLocation::new(16)
+            ))
+        );
+    }
+
+    #[test]
+    fn scalar_special_functions_evaluate_exactly_and_lower_to_valid_wgsl() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let make_shader = |function, accuracy| {
+            VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Vertex,
+                Vec::new(),
+                vec![output],
+                Vec::new(),
+                vec![
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(0),
+                            bits: 4.0_f32.to_bits(),
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(16),
+                        ShaderPredicate::Always,
+                        ShaderOperation::SpecialFunction32 {
+                            destination: ShaderRegister::new(1),
+                            source: ShaderRegister::new(0),
+                            function,
+                            accuracy,
+                            float_control: ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(24),
+                        ShaderPredicate::Always,
+                        ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(1)].into_boxed_slice(),
+                            location: ShaderIoLocation::Position,
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(32),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Exit,
+                    ),
+                ],
+            ))
+            .unwrap()
+        };
+
+        let exact = make_shader(ShaderSpecialFunction::SquareRoot, ShaderMathAccuracy::Exact);
+        let result = evaluate_shader_ir(&exact, &ShaderEvaluationInputs::default(), 8).unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Position, 0),
+            Some(2.0_f32.to_bits())
+        );
+
+        for function in [
+            ShaderSpecialFunction::Cosine,
+            ShaderSpecialFunction::Sine,
+            ShaderSpecialFunction::Exp2,
+            ShaderSpecialFunction::Log2,
+            ShaderSpecialFunction::SquareRoot,
+        ] {
+            let shader = make_shader(function, ShaderMathAccuracy::Approximate);
+            assert_eq!(
+                evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8),
+                Err(ShaderEvaluationError::ApproximateOperation(
+                    ShaderSourceLocation::new(16)
+                ))
+            );
+            let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+            naga::front::wgsl::parse_str(module.source()).unwrap();
+        }
+    }
+
+    #[test]
+    fn texture_sample_2d_verifies_lowers_to_naga_and_stays_out_of_scalar_evaluator() {
+        let source = ShaderSourceLocation::new(24);
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Fragment,
+            Vec::new(),
+            (0..4)
+                .map(|component| {
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        component,
+                        ShaderScalarType::Float32,
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            vec![
+                ShaderResourceAccess::new(32, ShaderResourceKind::SampledImage, true, false)
+                    .unwrap(),
+                ShaderResourceAccess::new(33, ShaderResourceKind::Sampler, true, false).unwrap(),
+            ],
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 0.25_f32.to_bits(),
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 0.75_f32.to_bits(),
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    source,
+                    ShaderPredicate::Always,
+                    ShaderOperation::SampleTexture2D {
+                        outputs: (0..4)
+                            .map(|component| {
+                                ShaderTextureSampleOutput::new(
+                                    ShaderRegister::new(2 + u16::from(component)),
+                                    component,
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                        coordinates: [ShaderRegister::new(0), ShaderRegister::new(1)],
+                        image_binding: 32,
+                        sampler_binding: 33,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: (2..6).map(ShaderRegister::new).collect(),
+                        location: ShaderIoLocation::Color(0),
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Float32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(
+            module
+                .source()
+                .contains("textureSample(sampled_image_32, sampler_33")
+        );
+        let naga_module = naga::front::wgsl::parse_str(module.source()).unwrap();
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.validate(&naga_module).unwrap();
+        assert_eq!(
+            evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8),
+            Err(ShaderEvaluationError::TextureSampling(source))
+        );
+    }
+
+    #[test]
+    fn float_min_max_selects_minimum_or_maximum_and_lowers_to_valid_wgsl() {
+        let make_shader = |minimum| {
+            VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Vertex,
+                Vec::new(),
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Position,
+                        0,
+                        ShaderScalarType::Float32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                Vec::new(),
+                vec![
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(0),
+                            bits: (-2.0_f32).to_bits(),
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(16),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(1),
+                            bits: 3.0_f32.to_bits(),
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(24),
+                        ShaderPredicate::Always,
+                        ShaderOperation::FloatMinMax32 {
+                            destination: ShaderRegister::new(2),
+                            left: ShaderRegister::new(0),
+                            right: ShaderRegister::new(1),
+                            minimum,
+                            float_control: ShaderFloatControl::PRECISE,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(32),
+                        ShaderPredicate::Always,
+                        ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                            location: ShaderIoLocation::Position,
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Float32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(40),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Exit,
+                    ),
+                ],
+            ))
+            .unwrap()
+        };
+
+        for (minimum, expected) in [
+            (ShaderPredicate::Always, -2.0_f32),
+            (ShaderPredicate::Never, 3.0_f32),
+        ] {
+            let shader = make_shader(minimum);
+            assert_eq!(
+                evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8)
+                    .unwrap()
+                    .output_bits(ShaderIoLocation::Position, 0),
+                Some(expected.to_bits())
+            );
+            let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+            assert!(module.source().contains("select(max("));
+            let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&parsed)
+            .unwrap();
+        }
     }
 }

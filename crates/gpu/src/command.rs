@@ -98,6 +98,8 @@ impl CopyOperation {
 pub enum ClearValue {
     Buffer(u32),
     Color([f32; 4]),
+    Depth(f32),
+    Stencil(u8),
     DepthStencil { depth: f32, stencil: u8 },
 }
 
@@ -106,6 +108,8 @@ impl ClearValue {
         match self {
             Self::Buffer(_) => true,
             Self::Color(value) => value.iter().all(|component| component.is_finite()),
+            Self::Depth(depth) => depth.is_finite(),
+            Self::Stencil(_) => true,
             Self::DepthStencil { depth, .. } => depth.is_finite(),
         }
     }
@@ -145,6 +149,8 @@ impl ClearOperation {
         let value_matches = matches!(
             (kind, value),
             (ImageKind::Color, ClearValue::Color(_))
+                | (ImageKind::DepthStencil, ClearValue::Depth(_))
+                | (ImageKind::DepthStencil, ClearValue::Stencil(_))
                 | (ImageKind::DepthStencil, ClearValue::DepthStencil { .. })
         );
         if !value_matches || format.is_depth_stencil() != (kind == ImageKind::DepthStencil) {
@@ -577,6 +583,8 @@ impl RenderAttachment {
             let matches = matches!(
                 (self.kind, value),
                 (ImageKind::Color, ClearValue::Color(_))
+                    | (ImageKind::DepthStencil, ClearValue::Depth(_))
+                    | (ImageKind::DepthStencil, ClearValue::Stencil(_))
                     | (ImageKind::DepthStencil, ClearValue::DepthStencil { .. })
             );
             if !matches {
@@ -1311,6 +1319,39 @@ mod tests {
                 vec![color]
             ),
             Err(CommandDescriptionError::AttachmentDescriptionMismatch)
+        );
+    }
+
+    #[test]
+    fn depth_stencil_clear_values_preserve_independent_aspects() {
+        for value in [
+            ClearValue::Depth(0.5),
+            ClearValue::Stencil(0x7f),
+            ClearValue::DepthStencil {
+                depth: 0.5,
+                stencil: 0x7f,
+            },
+        ] {
+            assert!(
+                ClearOperation::image(
+                    image(1),
+                    ImageKind::DepthStencil,
+                    ImageFormat::Depth24UnormStencil8Uint,
+                    SampleCount::One,
+                    value,
+                )
+                .is_ok()
+            );
+        }
+        assert_eq!(
+            ClearOperation::image(
+                image(1),
+                ImageKind::DepthStencil,
+                ImageFormat::Depth24UnormStencil8Uint,
+                SampleCount::One,
+                ClearValue::Depth(f32::NAN),
+            ),
+            Err(CommandDescriptionError::NonFiniteClearValue)
         );
     }
 

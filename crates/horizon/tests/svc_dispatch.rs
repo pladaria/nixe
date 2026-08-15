@@ -2094,6 +2094,139 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
 }
 
 #[test]
+fn user_settings_service_reports_configured_language_codes_and_region() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+    ]);
+    let settings =
+        nixe_horizon::SettingsEnvironment::for_language(nixe_horizon::SystemLanguage::Spanish);
+    let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
+        OperationMode::Console,
+        nixe_horizon::TimeEnvironment::default(),
+        settings,
+        nixe_horizon::VideoSystem::default(),
+    );
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..35].copy_from_slice(b"set");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let settings_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(
+        process
+            .handles()
+            .get_as::<nixe_horizon::UserSettingsSession>(settings_handle)
+            .is_some()
+    );
+
+    let mut get_language = [0_u8; 0x100];
+    put_u32(&mut get_language, 0, 4);
+    put_u32(&mut get_language, 4, 10);
+    put_u32(&mut get_language, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &get_language);
+    state(&mut process).write_w(x(0), settings_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_bytes(&process, tls.checked_add(32).unwrap(), 8),
+        b"es\0\0\0\0\0\0"
+    );
+
+    let mut make_language = [0_u8; 0x100];
+    put_u32(&mut make_language, 0, 4);
+    put_u32(&mut make_language, 4, 11);
+    put_u32(&mut make_language, 16, 0x4943_4653);
+    put_u32(&mut make_language, 24, 2);
+    put_u32(
+        &mut make_language,
+        32,
+        nixe_horizon::SystemLanguage::BritishEnglish as u32,
+    );
+    write_guest_bytes(&process, tls, &make_language);
+    state(&mut process).write_w(x(0), settings_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_bytes(&process, tls.checked_add(32).unwrap(), 8),
+        b"en-GB\0\0\0"
+    );
+
+    let mut get_region = [0_u8; 0x100];
+    put_u32(&mut get_region, 0, 4);
+    put_u32(&mut get_region, 4, 10);
+    put_u32(&mut get_region, 16, 0x4943_4653);
+    put_u32(&mut get_region, 24, 4);
+    write_guest_bytes(&process, tls, &get_region);
+    state(&mut process).write_w(x(0), settings_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(32).unwrap()),
+        nixe_horizon::RegionCode::Europe as u32
+    );
+
+    let language_codes = name.checked_add(0x100).unwrap();
+    let mut get_available = [0_u8; 0x100];
+    put_u32(&mut get_available, 0, 4 | (1 << 24));
+    put_u32(&mut get_available, 4, 10);
+    put_receive_buffer(&mut get_available, 8, language_codes.get(), 16);
+    put_u32(&mut get_available, 32, 0x4943_4653);
+    put_u32(&mut get_available, 40, 5);
+    write_guest_bytes(&process, tls, &get_available);
+    state(&mut process).write_w(x(0), settings_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 2);
+    assert_eq!(
+        read_guest_bytes(&process, language_codes, 16),
+        [b"ja\0\0\0\0\0\0".as_slice(), b"en-US\0\0\0".as_slice()].concat()
+    );
+}
+
+#[test]
 fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
     let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21), svc(0x21)]);
     let mut dispatcher = HorizonSvcDispatcher::default();

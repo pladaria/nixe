@@ -3,9 +3,9 @@ use nixe_cpu::{
     decode::{
         DecodedOpcode,
         a64::fp_simd::{
-            BitwiseOperation, FloatAddOperation, FloatConversion, FloatMultiplyOperation,
-            FloatRoundOperation, FloatToIntegerRounding, Instruction, IntegerComparison,
-            PairwiseOperation, PermuteOperation,
+            BitwiseOperation, FloatAddOperation, FloatConversion, FloatFusedMultiplyOperation,
+            FloatMultiplyOperation, FloatRoundOperation, FloatToIntegerRounding, Instruction,
+            IntegerComparison, PairwiseOperation, PermuteOperation,
         },
     },
     ir::op::Condition,
@@ -147,6 +147,14 @@ pub(super) fn execute(
                 state,
                 fields,
                 matches!(instruction, Instruction::ScalarShiftRightImmediate(_)),
+            );
+            None
+        }
+        Instruction::VectorSignedShiftRegister(_) | Instruction::VectorUnsignedShiftRegister(_) => {
+            shift_register(
+                state,
+                fields,
+                matches!(instruction, Instruction::VectorSignedShiftRegister(_)),
             );
             None
         }
@@ -301,6 +309,30 @@ pub(super) fn execute(
                     .float_multiply_operation
                     .expect("normalized scalar floating-point multiply operation"),
             );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(super::super::unsupported(decoded));
+            }
+            assert!(state.set_vector(fields.rd, u128::from(outcome.bits)));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            None
+        }
+        Instruction::ScalarFloatFusedMultiplyAdd(_) => {
+            let outcome = scalar_float_fused_multiply_add(
+                state,
+                fields,
+                fields
+                    .float_fused_multiply_operation
+                    .expect("normalized scalar fused multiply-add operation"),
+            );
+            if fp_status_traps(outcome.status, state.fpcr()) {
+                return Err(super::super::unsupported(decoded));
+            }
+            assert!(state.set_vector(fields.rd, u128::from(outcome.bits)));
+            state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+            None
+        }
+        Instruction::ScalarFloatSquareRoot(_) => {
+            let outcome = scalar_float_square_root(state, fields);
             if fp_status_traps(outcome.status, state.fpcr()) {
                 return Err(super::super::unsupported(decoded));
             }
@@ -1624,6 +1656,320 @@ fn scalar_float_multiply(
     outcome
 }
 
+// FMADD/FMSUB/FNMADD/FNMSUB form the full product before adding the third
+// operand, then round the combined result once. The integer significands fit
+// in u128 for both Binary32 and Binary64, keeping guest rounding independent
+// of the host floating-point environment. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMADD--Floating-point-fused-Multiply-Add-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMSUB--Floating-point-fused-Multiply-Subtract-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMADD--Floating-point-Negated-fused-Multiply-Add-
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMSUB--Floating-point-Negated-fused-Multiply-Subtract-
+fn scalar_float_fused_multiply_add(
+    state: &A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    operation: FloatFusedMultiplyOperation,
+) -> FpLaneOutcome {
+    let fp_format = if fields.opc == 0 {
+        FpFormat::Binary32
+    } else {
+        FpFormat::Binary64
+    };
+    let format = BinaryFormat::new(fp_format);
+    let mask = if format.total_bits == 32 {
+        u64::from(u32::MAX)
+    } else {
+        u64::MAX
+    };
+    let mut multiplicand = DecodedFloat::new(
+        state
+            .vector(fields.rn)
+            .expect("normalized scalar FMA multiplicand") as u64
+            & mask,
+        format,
+    );
+    let mut multiplier = DecodedFloat::new(
+        state
+            .vector(fields.rm)
+            .expect("normalized scalar FMA multiplier") as u64
+            & mask,
+        format,
+    );
+    let mut addend = DecodedFloat::new(
+        state
+            .vector(fields.ra)
+            .expect("normalized scalar FMA addend") as u64
+            & mask,
+        format,
+    );
+    let negate_product = matches!(
+        operation,
+        FloatFusedMultiplyOperation::MultiplySubtract
+            | FloatFusedMultiplyOperation::NegatedMultiplyAdd
+    );
+    let negate_addend = matches!(
+        operation,
+        FloatFusedMultiplyOperation::NegatedMultiplyAdd
+            | FloatFusedMultiplyOperation::NegatedMultiplySubtract
+    );
+    if negate_addend {
+        addend.bits ^= format.sign_mask();
+        addend.sign = !addend.sign;
+    }
+
+    let control = FpAddControl::from_fpcr(state.fpcr());
+    let mut status = FpStatus::default();
+    let mut invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
+        || (multiplier.is_infinite(format) && multiplicand.is_zero());
+    if multiplicand.is_nan(format) || multiplier.is_nan(format) || addend.is_nan(format) {
+        status.invalid_operation = invalid_product
+            || multiplicand.is_signaling_nan(format)
+            || multiplier.is_signaling_nan(format)
+            || addend.is_signaling_nan(format);
+        let bits = propagate_nan_three(
+            multiplicand,
+            multiplier,
+            addend,
+            format,
+            control.default_nan,
+        );
+        return FpLaneOutcome { bits, status };
+    }
+
+    for operand in [&mut multiplicand, &mut multiplier, &mut addend] {
+        if control.flush_to_zero && operand.is_subnormal() {
+            status.input_denormal = true;
+            *operand = DecodedFloat::new(operand.bits & format.sign_mask(), format);
+        }
+    }
+    invalid_product = (multiplicand.is_infinite(format) && multiplier.is_zero())
+        || (multiplier.is_infinite(format) && multiplicand.is_zero());
+
+    if invalid_product {
+        status.invalid_operation = true;
+        return FpLaneOutcome {
+            bits: format.default_nan(),
+            status,
+        };
+    }
+
+    let product_sign = multiplicand.sign ^ multiplier.sign ^ negate_product;
+    let product_is_infinite = multiplicand.is_infinite(format) || multiplier.is_infinite(format);
+    if product_is_infinite {
+        if addend.is_infinite(format) && addend.sign != product_sign {
+            status.invalid_operation = true;
+            return FpLaneOutcome {
+                bits: format.default_nan(),
+                status,
+            };
+        }
+        return FpLaneOutcome {
+            bits: (u64::from(product_sign) << (format.total_bits - 1)) | format.exponent_mask(),
+            status,
+        };
+    }
+    if addend.is_infinite(format) {
+        return FpLaneOutcome {
+            bits: (u64::from(addend.sign) << (format.total_bits - 1)) | format.exponent_mask(),
+            status,
+        };
+    }
+
+    let product_magnitude =
+        u128::from(multiplicand.significand) * u128::from(multiplier.significand);
+    let addend_magnitude = u128::from(addend.significand);
+    if product_magnitude == 0 && addend_magnitude == 0 {
+        let sign = if product_sign == addend.sign {
+            product_sign
+        } else {
+            control.rounding == FpRoundingMode::TowardNegative
+        };
+        return FpLaneOutcome {
+            bits: u64::from(sign) << (format.total_bits - 1),
+            status,
+        };
+    }
+
+    let product_scale = multiplicand.scale + multiplier.scale;
+    let (product, aligned_addend, common_scale) = align_fused_operands(
+        product_magnitude,
+        product_scale,
+        addend_magnitude,
+        addend.scale,
+    );
+    let (negative, magnitude) = if product_sign == addend.sign {
+        (product_sign, product + aligned_addend)
+    } else if product > aligned_addend {
+        (product_sign, product - aligned_addend)
+    } else if aligned_addend > product {
+        (addend.sign, aligned_addend - product)
+    } else {
+        let sign = control.rounding == FpRoundingMode::TowardNegative;
+        return FpLaneOutcome {
+            bits: u64::from(sign) << (format.total_bits - 1),
+            status,
+        };
+    };
+    pack_float_sum(magnitude, common_scale, negative, format, control, status)
+}
+
+fn align_fused_operands(
+    product: u128,
+    product_scale: i32,
+    addend: u128,
+    addend_scale: i32,
+) -> (u128, u128, i32) {
+    let exact_scale = product_scale.min(addend_scale);
+    let product_shift = (product_scale - exact_scale) as u32;
+    let addend_shift = (addend_scale - exact_scale) as u32;
+    if shift_fits_u128(product, product_shift) && shift_fits_u128(addend, addend_shift) {
+        return (
+            product << product_shift,
+            addend << addend_shift,
+            exact_scale,
+        );
+    }
+
+    // A very large exponent separation cannot cancel. Retain the complete
+    // larger operand plus guard, round, and sticky information from the
+    // smaller operand for the final architectural rounding.
+    let maximum_scale = product_scale.max(addend_scale);
+    (
+        shift_right_jam(product << 3, (maximum_scale - product_scale) as u32),
+        shift_right_jam(addend << 3, (maximum_scale - addend_scale) as u32),
+        maximum_scale - 3,
+    )
+}
+
+fn shift_fits_u128(value: u128, distance: u32) -> bool {
+    value == 0 || (distance < 128 && distance <= value.leading_zeros())
+}
+
+fn propagate_nan_three(
+    first: DecodedFloat,
+    second: DecodedFloat,
+    third: DecodedFloat,
+    format: BinaryFormat,
+    default_nan: bool,
+) -> u64 {
+    if default_nan {
+        return format.default_nan();
+    }
+    for operand in [first, second, third] {
+        if operand.is_signaling_nan(format) {
+            return operand.bits | format.quiet_nan_bit();
+        }
+    }
+    for operand in [first, second, third] {
+        if operand.is_nan(format) {
+            return operand.bits;
+        }
+    }
+    unreachable!("FMA NaN propagation requires at least one NaN operand")
+}
+
+// FSQRT expands the source significand before taking an integer square root.
+// Three additional result bits plus a sticky remainder are sufficient for all
+// FPCR rounding modes, while avoiding host floating-point state entirely. Arm
+// ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FSQRT--Floating-point-Square-Root--scalar--
+fn scalar_float_square_root(
+    state: &A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> FpLaneOutcome {
+    let fp_format = if fields.opc == 0 {
+        FpFormat::Binary32
+    } else {
+        FpFormat::Binary64
+    };
+    let format = BinaryFormat::new(fp_format);
+    let mask = if format.total_bits == 32 {
+        u64::from(u32::MAX)
+    } else {
+        u64::MAX
+    };
+    let mut source = DecodedFloat::new(
+        state
+            .vector(fields.rn)
+            .expect("normalized scalar FSQRT source") as u64
+            & mask,
+        format,
+    );
+    let control = FpAddControl::from_fpcr(state.fpcr());
+    let mut status = FpStatus::default();
+
+    if source.is_nan(format) {
+        status.invalid_operation = source.is_signaling_nan(format);
+        return FpLaneOutcome {
+            bits: if control.default_nan {
+                format.default_nan()
+            } else {
+                source.bits | format.quiet_nan_bit()
+            },
+            status,
+        };
+    }
+    if control.flush_to_zero && source.is_subnormal() {
+        status.input_denormal = true;
+        source = DecodedFloat::new(source.bits & format.sign_mask(), format);
+    }
+    if source.is_zero() {
+        return FpLaneOutcome {
+            bits: source.bits,
+            status,
+        };
+    }
+    if source.sign {
+        status.invalid_operation = true;
+        return FpLaneOutcome {
+            bits: format.default_nan(),
+            status,
+        };
+    }
+    if source.is_infinite(format) {
+        return FpLaneOutcome {
+            bits: source.bits,
+            status,
+        };
+    }
+
+    let mut significand = u128::from(source.significand);
+    let mut scale = source.scale;
+    if scale & 1 != 0 {
+        significand <<= 1;
+        scale -= 1;
+    }
+    let source_bits = 128 - significand.leading_zeros();
+    let target_root_bits = format.fraction_bits + 4;
+    let current_root_bits = source_bits.div_ceil(2);
+    let extra_root_bits = target_root_bits - current_root_bits;
+    let radicand = significand << (extra_root_bits * 2);
+    let (mut root, remainder) = integer_square_root(radicand);
+    if remainder != 0 {
+        root |= 1;
+    }
+    pack_float_sum(
+        root,
+        scale / 2 - extra_root_bits as i32,
+        false,
+        format,
+        control,
+        status,
+    )
+}
+
+fn integer_square_root(value: u128) -> (u128, u128) {
+    debug_assert!(value != 0);
+    let bits = 128 - value.leading_zeros();
+    let mut root = 1_u128 << bits.div_ceil(2);
+    loop {
+        let next = (root + value / root) >> 1;
+        if next >= root {
+            return (root, value - root * root);
+        }
+        root = next;
+    }
+}
+
 // FCSEL copies the selected scalar bit pattern without interpreting it, so
 // NaNs, subnormals, and signed zero are preserved exactly and FPSR is unchanged.
 // Arm ARM DDI 0602 (2025-12):
@@ -2830,6 +3176,65 @@ fn shift_right_immediate(
     assert!(state.set_vector(fields.rd, result));
 }
 
+// SSHL and USHL take the signed shift distance from the low byte of the
+// corresponding Vm element. Non-negative distances shift left; negative
+// distances shift right. SSHL right shifts sign-fill while USHL right shifts
+// zero-fill. Reading both sources before writing Rd preserves overlapping
+// register behavior. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHL--vector---Signed-Shift-Left--register--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/USHL--vector---Unsigned-Shift-Left--register--
+fn shift_register(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    signed: bool,
+) {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
+    let lane_count = vector_bits / lane_bits;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let values = state
+        .vector(fields.rn)
+        .expect("normalized SSHL/USHL value source register");
+    let shifts = state
+        .vector(fields.rm)
+        .expect("normalized SSHL/USHL shift source register");
+    let mut result = 0_u128;
+    for lane in 0..lane_count {
+        let offset = lane * lane_bits;
+        let value = (values >> offset) & lane_mask;
+        let distance = ((shifts >> offset) & 0xff) as u8 as i8;
+        let shifted = shift_lane(value, distance, lane_bits, signed);
+        result |= shifted << offset;
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+fn shift_lane(value: u128, distance: i8, lane_bits: u32, signed: bool) -> u128 {
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    if distance >= 0 {
+        let distance = u32::from(distance as u8);
+        return if distance >= lane_bits {
+            0
+        } else {
+            (value << distance) & lane_mask
+        };
+    }
+
+    let distance = u32::from(distance.unsigned_abs());
+    if signed && value & (1_u128 << (lane_bits - 1)) != 0 {
+        if distance >= lane_bits {
+            lane_mask
+        } else {
+            let extended = value | !lane_mask;
+            ((extended as i128) >> distance) as u128 & lane_mask
+        }
+    } else if distance >= lane_bits {
+        0
+    } else {
+        value >> distance
+    }
+}
+
 // CNT writes the population count of each source byte into the corresponding
 // destination byte. The 8B form clears the inactive upper 64 bits.
 // Arm A64 ISA (2025):
@@ -3075,4 +3480,43 @@ fn vector_access(size: MemoryAccessSize) -> MemoryAccess {
         MemoryOrdering::Relaxed,
         MemoryAccessClass::Normal,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{align_fused_operands, integer_square_root, shift_lane};
+
+    #[test]
+    fn variable_shift_lane_handles_direction_signedness_and_extreme_distances() {
+        assert_eq!(shift_lane(0x7f, 1, 8, true), 0xfe);
+        assert_eq!(shift_lane(0x80, -1, 8, true), 0xc0);
+        assert_eq!(shift_lane(0x80, -1, 8, false), 0x40);
+        assert_eq!(shift_lane(0x81, -8, 8, true), 0xff);
+        assert_eq!(shift_lane(0x81, -8, 8, false), 0);
+        assert_eq!(shift_lane(1, 8, 8, true), 0);
+        assert_eq!(
+            shift_lane(0x8000_0000_0000_0000, -127, 64, true),
+            u64::MAX.into()
+        );
+    }
+
+    #[test]
+    fn fused_operand_alignment_preserves_exact_cancellation_bits() {
+        let product = ((1_u128 << 23) + 1) * ((1_u128 << 24) - 2);
+        let addend = 1_u128 << 23;
+        let (product, addend, scale) = align_fused_operands(product, -47, addend, -23);
+        assert_eq!(scale, -47);
+        assert_eq!(product.abs_diff(addend), 2);
+    }
+
+    #[test]
+    fn integer_square_root_returns_the_floor_and_exact_remainder() {
+        assert_eq!(integer_square_root(16), (4, 0));
+        assert_eq!(integer_square_root(17), (4, 1));
+
+        let value = (1_u128 << 111) + (1_u128 << 73) + 3;
+        let (root, remainder) = integer_square_root(value);
+        assert_eq!(root * root + remainder, value);
+        assert!(remainder < root * 2 + 1);
+    }
 }

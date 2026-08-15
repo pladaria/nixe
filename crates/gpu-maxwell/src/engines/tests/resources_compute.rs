@@ -497,9 +497,12 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let (shaders, cache) = translated_graphics_shaders();
+    let (shaders, mut cache) = translated_graphics_shaders();
     let capabilities = BackendCapabilities::new(
-        BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS),
+        BackendFeatures::DRAW
+            .union(BackendFeatures::RENDER_PASS)
+            .union(BackendFeatures::CLEAR)
+            .union(BackendFeatures::BARRIER),
         [
             ImageFormat::Rgba8Unorm,
             ImageFormat::Bgra8Unorm,
@@ -571,6 +574,85 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
             enabled.trigger(),
             Some(&shaders),
             FrontendSubmissionId::new(21),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        ),
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+    ));
+
+    // textured_cube clears the complete depth aspect but deliberately leaves
+    // stencil untouched before drawing with depth enabled and stencil
+    // disabled. Materialize only the aspect established by that clear.
+    program_three_d(&mut channel, 0x10f8, 0);
+    program_three_d(&mut channel, 0x0d90, 0x3f80_0000);
+    let depth_clear = packet(0x19d0 / 4, 1);
+    let clear_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &depth_clear.packets()[0],
+    )
+    .unwrap();
+    let clear = &clear_dispatch.operations()[0];
+    let clear_resources = resolve_maxwell_three_d_resources(clear.state(), &address_space).unwrap();
+    let clear_plan = preflight_maxwell_three_d_operation(
+        clear.state(),
+        &clear_resources,
+        clear.trigger(),
+        None,
+        FrontendSubmissionId::new(22),
+        Vec::new(),
+        &capabilities,
+        &cache,
+    )
+    .unwrap();
+    assert!(matches!(
+        clear_plan.submission().operations()[0].command(),
+        GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
+            value: nixe_gpu::ClearValue::Depth(1.0),
+            ..
+        })
+    ));
+    clear_plan.commit_cache(&mut cache).unwrap();
+
+    let depth_draw_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &draw.packets()[0],
+    )
+    .unwrap();
+    let depth_draw = &depth_draw_dispatch.operations()[0];
+    let depth_draw_resources =
+        resolve_maxwell_three_d_resources(depth_draw.state(), &address_space).unwrap();
+    preflight_maxwell_three_d_operation(
+        depth_draw.state(),
+        &depth_draw_resources,
+        depth_draw.trigger(),
+        Some(&shaders),
+        FrontendSubmissionId::new(23),
+        Vec::new(),
+        &capabilities,
+        &cache,
+    )
+    .unwrap();
+
+    program_three_d(&mut channel, 0x1380, 1);
+    let stencil_draw_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &draw.packets()[0],
+    )
+    .unwrap();
+    let stencil_draw = &stencil_draw_dispatch.operations()[0];
+    let stencil_draw_resources =
+        resolve_maxwell_three_d_resources(stencil_draw.state(), &address_space).unwrap();
+    assert!(matches!(
+        preflight_maxwell_three_d_operation(
+            stencil_draw.state(),
+            &stencil_draw_resources,
+            stencil_draw.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(24),
             Vec::new(),
             &capabilities,
             &cache,
