@@ -60,7 +60,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
-        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0094 => {
+        0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_0098 => {
             A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
@@ -219,6 +219,8 @@ mod tests {
             (0x2f0f_0420, "simd-vector-shift-right-immediate"),
             (0x0e20_5bde, "simd-count-bits"),
             (0x0e31_bbde, "simd-add-across-vector"),
+            (0x0ebd_47fd, "simd-signed-shift-left-register"),
+            (0x6ebd_47fd, "simd-unsigned-shift-left-register"),
             (0x6e3e_ff9c, "simd-floating-point-divide"),
             (0x1e2e_101f, "fp-scalar-immediate"),
             (0x1e6e_1002, "fp-scalar-immediate"),
@@ -233,8 +235,10 @@ mod tests {
             (0x1e61_2800, "fp-scalar-floating-point-add"),
             (0x1e7c_0bbc, "fp-scalar-floating-point-multiply"),
             (0x1e6b_8949, "fp-scalar-floating-point-negated-multiply"),
+            (0x1f40_7bbe, "fp-scalar-fused-multiply-add"),
             (0x1e3e_cffe, "fp-scalar-floating-point-conditional-select"),
             (0x1e20_c3fe, "fp-scalar-absolute"),
+            (0x1e21_c3de, "fp-scalar-square-root"),
             (0x1e60_4000, "fp-scalar-move"),
             (0x1e61_2000, "fp-compare-register"),
             (0x1e7f_2010, "fp-compare-register"),
@@ -269,14 +273,25 @@ mod tests {
                 "encoding={bits:#010x}"
             );
         }
-        assert_eq!(
-            decoded_name(profile, 0x1e21_c000),
-            "floating-point-fallback"
-        );
+        assert_eq!(decoded_name(profile, 0x1e21_c000), "fp-scalar-square-root");
         assert_eq!(
             decoded_name(profile, 0x1ee1_2010),
             "floating-point-fallback"
         );
+    }
+
+    #[test]
+    fn simd_register_shift_rejects_a_64_bit_lane_in_a_64_bit_vector() {
+        let profile = GuestCpuProfile::switch_1();
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            profile.id(),
+        );
+        assert!(matches!(
+            decode(&profile, location, 0x0ee2_4420_u32.into()),
+            DecodeResult::Reserved { .. }
+        ));
     }
 
     #[test]

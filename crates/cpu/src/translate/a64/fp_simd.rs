@@ -35,6 +35,8 @@ pub(super) fn lift(
         | FpSimdInstruction::IntegerCompare(_)
         | FpSimdInstruction::IntegerPairwise(_)
         | FpSimdInstruction::IntegerMinMax(_)
+        | FpSimdInstruction::VectorSignedShiftRegister(_)
+        | FpSimdInstruction::VectorUnsignedShiftRegister(_)
         | FpSimdInstruction::VectorSignedIntToFloat(_)
         | FpSimdInstruction::VectorUnsignedIntToFloat(_)
         | FpSimdInstruction::ScalarVectorSignedIntToFloat(_)
@@ -49,6 +51,8 @@ pub(super) fn lift(
         | FpSimdInstruction::ScalarFloatRound(_)
         | FpSimdInstruction::ScalarFloatAdd(_)
         | FpSimdInstruction::ScalarFloatMultiply(_)
+        | FpSimdInstruction::ScalarFloatFusedMultiplyAdd(_)
+        | FpSimdInstruction::ScalarFloatSquareRoot(_)
         | FpSimdInstruction::ScalarFloatConditionalSelect(_) => Ok(interpret(decoded)),
         FpSimdInstruction::ScalarAbsolute(_) | FpSimdInstruction::ScalarNegate(_) => {
             Ok(interpret(decoded))

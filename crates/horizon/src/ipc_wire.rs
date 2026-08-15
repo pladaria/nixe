@@ -23,10 +23,10 @@ use crate::{
     HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
     IpcResultCode, IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
     MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession,
-    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession, SteadyClockSession,
-    SystemClockKind, SystemClockSession, SystemSettingsSession, TimeEnvironment,
-    TimeServiceSession, TimeZoneServiceSession, ViObjectKind, ViServiceKind, ViSession,
-    VideoSystem,
+    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession,
+    SettingsEnvironment, SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage,
+    SystemSettingsSession, TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
+    UserSettingsSession, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
 };
 
 pub(crate) const NAMED_PORT_NAME_SIZE: usize = 12;
@@ -161,6 +161,7 @@ pub(crate) fn connect_to_named_port(
 pub(crate) struct HostSystems<'a> {
     pub video: &'a VideoSystem,
     pub hid: &'a HidSystem,
+    pub settings: &'a SettingsEnvironment,
     pub caller_thread_id: u64,
 }
 
@@ -201,6 +202,10 @@ pub(crate) fn send_sync_request_from_buffer(
         .handles()
         .get_as::<SystemSettingsSession>(handle)
         .copied();
+    let user_settings = process
+        .handles()
+        .get_as::<UserSettingsSession>(handle)
+        .cloned();
     let performance_manager = process
         .handles()
         .get_as::<PerformanceManagerSession>(handle)
@@ -244,6 +249,7 @@ pub(crate) fn send_sync_request_from_buffer(
     if manager.is_none()
         && service.is_none()
         && settings.is_none()
+        && user_settings.is_none()
         && performance_manager.is_none()
         && performance.is_none()
         && applet.is_none()
@@ -450,6 +456,8 @@ pub(crate) fn send_sync_request_from_buffer(
         )?
     } else if settings.is_some() {
         dispatch_system_settings(process, request, &hipc.receive_statics)?
+    } else if let Some(settings) = user_settings {
+        dispatch_user_settings(process, &settings, request, &hipc)?
     } else if let Some(manager) = performance_manager {
         dispatch_performance_manager(process, &manager, request)?
     } else if let Some(session) = performance {
@@ -579,13 +587,17 @@ fn dispatch_service_manager(
                 "sm:GetService requested {:?}",
                 String::from_utf8_lossy(name)
             );
-            if matches!(name, b"set:sys" | b"apm" | b"appletOE" | b"hid" | b"time:u") {
+            if matches!(
+                name,
+                b"set" | b"set:sys" | b"apm" | b"appletOE" | b"hid" | b"time:u"
+            ) {
                 return connect_system_service(
                     process,
                     request.token,
                     name,
                     initial_operation_mode,
                     time_environment,
+                    host_systems.settings,
                     host_systems.hid,
                 );
             }
@@ -761,6 +773,7 @@ fn connect_system_service(
     name: &[u8],
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
+    settings_environment: &SettingsEnvironment,
     hid_system: &HidSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     if !process.mounts().allows_service(name) {
@@ -770,6 +783,9 @@ fn connect_system_service(
         ));
     }
     let handle = match name {
+        b"set" => process
+            .handles_mut()
+            .insert(UserSettingsSession::new(settings_environment.clone())),
         b"set:sys" => process.handles_mut().insert(SystemSettingsSession::new()),
         b"apm" => process
             .handles_mut()
@@ -1628,6 +1644,157 @@ fn dispatch_system_settings(
         }
         command_id => unsupported_service_command("set:sys", command_id),
     }
+}
+
+fn dispatch_user_settings(
+    process: &ExceptionProcessContext<'_>,
+    session: &UserSettingsSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // Command IDs and descriptor variants follow the pinned libnx `set`
+    // client. Commands 1/3 are the pre-4.0 pointer-buffer forms; 5/6 are the
+    // current map-alias forms:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/set.c
+    match request.command_id {
+        0 => {
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let language = session.environment().language();
+            log::debug!("set returned current language {language:?}");
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &language.code().to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        1 | 5 => {
+            let descriptor = match request.command_id {
+                1 => match &hipc.receive_statics {
+                    ReceiveStatics::Entries(descriptors)
+                        if descriptors.len() == 1
+                            && hipc.receive_buffers.is_empty()
+                            && descriptors[0].size > 0 =>
+                    {
+                        BufferDescriptor {
+                            address: descriptors[0].address,
+                            size: u64::from(descriptors[0].size),
+                            mode: BufferMode::Normal,
+                        }
+                    }
+                    _ => {
+                        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                    }
+                },
+                5 => match hipc.receive_buffers.as_slice() {
+                    [descriptor]
+                        if descriptor.size > 0
+                            && descriptor.mode != BufferMode::Invalid
+                            && matches!(hipc.receive_statics, ReceiveStatics::None) =>
+                    {
+                        *descriptor
+                    }
+                    _ => {
+                        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                    }
+                },
+                _ => unreachable!(),
+            };
+            if !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let capacity = usize::try_from(descriptor.size / 8).unwrap_or(usize::MAX);
+            let count = capacity.min(SystemLanguage::AVAILABLE.len());
+            let mut codes = Vec::with_capacity(count * 8);
+            for language in &SystemLanguage::AVAILABLE[..count] {
+                codes.extend_from_slice(&language.code().to_le_bytes());
+            }
+            write_descriptor_bytes(process, descriptor, &codes)?;
+            let count = u32::try_from(count).expect("language table fits in a u32");
+            log::debug!("set returned {count} available language codes");
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &count.to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        2 => {
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let Some(language) = request_u32(request.data, 0).and_then(SystemLanguage::from_raw)
+            else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &language.code().to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        3 | 6 => {
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let count = u32::try_from(SystemLanguage::AVAILABLE.len())
+                .expect("language table fits in a u32");
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &count.to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        4 => {
+            if has_ipc_descriptors(hipc) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let region = session.environment().region() as u32;
+            log::debug!("set returned region {:?}", session.environment().region());
+            Ok((
+                encode_response(
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &region.to_le_bytes(),
+                    None,
+                )?,
+                None,
+            ))
+        }
+        command_id => unsupported_service_command("set", command_id),
+    }
+}
+
+fn has_ipc_descriptors(hipc: &HipcRequest<'_>) -> bool {
+    hipc.pid.is_some()
+        || !hipc.copy_handles.is_empty()
+        || !hipc.move_handles.is_empty()
+        || !hipc.send_statics.is_empty()
+        || !hipc.send_buffers.is_empty()
+        || !hipc.receive_buffers.is_empty()
+        || !hipc.exchange_buffers.is_empty()
+        || !matches!(hipc.receive_statics, ReceiveStatics::None)
 }
 
 fn dispatch_performance_manager(

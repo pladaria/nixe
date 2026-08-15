@@ -51,7 +51,7 @@ engine = "auto"
 # Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
 # selected engine provides concurrent executors, bounded safepoints, and
 # acknowledged mapping invalidation. False keeps deterministic serialization.
-parallel_vcpus = false
+parallel_vcpus = true
 
 # Use `cargo cli input` to get your controller's SDL gamepad information
 [input.profiles.switch-pro]

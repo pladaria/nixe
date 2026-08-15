@@ -2086,7 +2086,7 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
 }
 
 #[test]
-fn mme_reads_all_pipeline_shader_reset_headers_and_writes_override_one_slot() {
+fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -2116,7 +2116,25 @@ fn mme_reads_all_pipeline_shader_reset_headers_and_writes_override_one_slot() {
             Some(&MaxwellThreeDShaderStage::VertexCullBeforeFetch)
         );
         assert_eq!(binding.stage().source(), None);
-        assert_eq!(binding.group().origin(), MaxwellThreeDRegisterOrigin::Unset);
+        assert_eq!(
+            binding.group().origin(),
+            MaxwellThreeDRegisterOrigin::VerifiedReset
+        );
+        assert_eq!(binding.group().raw(), Some(0));
+        assert_eq!(binding.group().value(), Some(&0));
+        assert_eq!(binding.group().source(), None);
+
+        let raw_binding = channel
+            .three_d()
+            .raw_register(GpuMethodId(method + 0x10))
+            .unwrap();
+        assert_eq!(
+            raw_binding.origin(),
+            MaxwellThreeDRegisterOrigin::VerifiedReset
+        );
+        assert_eq!(raw_binding.raw(), Some(0));
+        assert_eq!(raw_binding.value(), Some(&0));
+        assert_eq!(raw_binding.source(), None);
     }
 
     let macro_index = 4;

@@ -7,7 +7,7 @@
 
 use crate::MaxwellMethodSource;
 
-use super::state::MAXWELL_THREE_D_PIPELINE_SHADER_RESET;
+use super::state::{MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET};
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
@@ -129,7 +129,10 @@ impl Default for MaxwellThreeDPipelineBindingState {
             ),
             program_offset: MaxwellThreeDRegister::default(),
             register_count: MaxwellThreeDRegister::default(),
-            group: MaxwellThreeDRegister::default(),
+            group: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_PIPELINE_BINDING_RESET,
+                Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET as u8),
+            ),
         }
     }
 }

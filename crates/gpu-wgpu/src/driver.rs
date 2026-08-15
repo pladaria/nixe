@@ -463,23 +463,41 @@ impl WgpuBackendDriver {
                             ..Default::default()
                         });
                     }
-                    (
-                        nixe_gpu::ImageKind::DepthStencil,
-                        ClearValue::DepthStencil { depth, stencil },
-                    ) => {
+                    (nixe_gpu::ImageKind::DepthStencil, value) => {
+                        let (depth_ops, stencil_ops) = match value {
+                            ClearValue::Depth(depth) => (
+                                Some(Operations {
+                                    load: LoadOp::Clear(*depth),
+                                    store: StoreOp::Store,
+                                }),
+                                None,
+                            ),
+                            ClearValue::Stencil(stencil) => (
+                                None,
+                                Some(Operations {
+                                    load: LoadOp::Clear(u32::from(*stencil)),
+                                    store: StoreOp::Store,
+                                }),
+                            ),
+                            ClearValue::DepthStencil { depth, stencil } => (
+                                Some(Operations {
+                                    load: LoadOp::Clear(*depth),
+                                    store: StoreOp::Store,
+                                }),
+                                Some(Operations {
+                                    load: LoadOp::Clear(u32::from(*stencil)),
+                                    store: StoreOp::Store,
+                                }),
+                            ),
+                            _ => return Err(unsupported("depth-stencil clear value")),
+                        };
                         encoder.begin_render_pass(&RenderPassDescriptor {
                             label: Some("Nixe depth-stencil clear"),
                             color_attachments: &[],
                             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                                 view: &view,
-                                depth_ops: Some(Operations {
-                                    load: LoadOp::Clear(*depth),
-                                    store: StoreOp::Store,
-                                }),
-                                stencil_ops: Some(Operations {
-                                    load: LoadOp::Clear(u32::from(*stencil)),
-                                    store: StoreOp::Store,
-                                }),
+                                depth_ops,
+                                stencil_ops,
                             }),
                             ..Default::default()
                         });
@@ -1428,21 +1446,26 @@ fn depth_operations<'a>(
     attachment: &RenderAttachment,
 ) -> Result<RenderPassDepthStencilAttachment<'a>, BackendDriverError> {
     let (depth, stencil) = match attachment.load {
-        AttachmentLoad::Load => (LoadOp::Load, LoadOp::Load),
-        AttachmentLoad::Discard => (LoadOp::Clear(1.0), LoadOp::Clear(0)),
-        AttachmentLoad::Clear(ClearValue::DepthStencil { depth, stencil }) => {
-            (LoadOp::Clear(depth), LoadOp::Clear(u32::from(stencil)))
+        AttachmentLoad::Load => (Some(LoadOp::Load), Some(LoadOp::Load)),
+        AttachmentLoad::Discard => (Some(LoadOp::Clear(1.0)), Some(LoadOp::Clear(0))),
+        AttachmentLoad::Clear(ClearValue::Depth(depth)) => (Some(LoadOp::Clear(depth)), None),
+        AttachmentLoad::Clear(ClearValue::Stencil(stencil)) => {
+            (None, Some(LoadOp::Clear(u32::from(stencil))))
         }
+        AttachmentLoad::Clear(ClearValue::DepthStencil { depth, stencil }) => (
+            Some(LoadOp::Clear(depth)),
+            Some(LoadOp::Clear(u32::from(stencil))),
+        ),
         AttachmentLoad::Clear(_) => return Err(unsupported("depth attachment clear value")),
     };
     Ok(RenderPassDepthStencilAttachment {
         view,
-        depth_ops: Some(Operations {
-            load: depth,
+        depth_ops: depth.map(|load| Operations {
+            load,
             store: store_operation(attachment.store),
         }),
-        stencil_ops: Some(Operations {
-            load: stencil,
+        stencil_ops: stencil.map(|load| Operations {
+            load,
             store: store_operation(attachment.store),
         }),
     })

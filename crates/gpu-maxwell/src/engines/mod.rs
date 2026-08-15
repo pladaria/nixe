@@ -5,6 +5,7 @@
 //! mappings, scheduler state, or host-backend objects.
 
 mod compute;
+mod dma_copy;
 mod inline_to_memory;
 mod threed;
 mod twod;
@@ -22,6 +23,11 @@ pub use compute::{
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
     MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
     MaxwellShaderCacheInvalidation, lower_maxwell_compute_synchronization,
+};
+pub use dma_copy::{
+    MaxwellDmaCopyComponentSource, MaxwellDmaCopyError, MaxwellDmaCopyMemoryLayout,
+    MaxwellDmaCopyOperation, MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName,
+    MaxwellDmaCopyRemap, MaxwellDmaCopyState, MaxwellDmaCopyStateWrite,
 };
 pub use inline_to_memory::{
     MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
@@ -232,6 +238,11 @@ pub enum MaxwellEngineMethodEffect {
     TwoDState(MaxwellTwoDStateWrite),
     ComputeState(MaxwellComputeStateWrite),
     ComputeTrigger(MaxwellComputeOperationTrigger),
+    DmaCopyState(MaxwellDmaCopyStateWrite),
+    DmaCopyStateAndLaunch {
+        write: MaxwellDmaCopyStateWrite,
+        operation: MaxwellDmaCopyOperation,
+    },
     ComputeStateAndInlineToMemoryUpload {
         state: MaxwellComputeStateWrite,
         upload: MaxwellComputeInlineToMemoryUpload,
@@ -268,6 +279,7 @@ pub enum MaxwellEngineOperation {
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
+    DmaCopy(MaxwellDmaCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(Box<MaxwellThreeDTriggeredOperation>),
@@ -336,6 +348,8 @@ pub struct MaxwellEnginePacketDispatch {
     binding: MaxwellPacketDispatch,
     compute_before: MaxwellComputeState,
     compute_after: MaxwellComputeState,
+    dma_copy_before: MaxwellDmaCopyState,
+    dma_copy_after: MaxwellDmaCopyState,
     inline_to_memory_before: MaxwellInlineToMemoryState,
     inline_to_memory_after: MaxwellInlineToMemoryState,
     two_d_before: MaxwellTwoDState,
@@ -392,6 +406,16 @@ impl MaxwellEnginePacketDispatch {
     #[must_use]
     pub const fn compute_after(&self) -> &MaxwellComputeState {
         &self.compute_after
+    }
+
+    #[must_use]
+    pub const fn dma_copy_before(&self) -> &MaxwellDmaCopyState {
+        &self.dma_copy_before
+    }
+
+    #[must_use]
+    pub const fn dma_copy_after(&self) -> &MaxwellDmaCopyState {
+        &self.dma_copy_after
     }
 
     #[must_use]
@@ -480,6 +504,11 @@ pub enum MaxwellEngineDispatchError {
         reason: &'static str,
     },
     InvalidInlineToMemoryMethodEncoding {
+        source: MaxwellMethodSource,
+        method_name: &'static str,
+        reason: &'static str,
+    },
+    InvalidDmaCopyMethodEncoding {
         source: MaxwellMethodSource,
         method_name: &'static str,
         reason: &'static str,
@@ -586,6 +615,14 @@ impl Display for MaxwellEngineDispatchError {
                 formatter,
                 "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_INLINE_TO_MEMORY_A method-name={method_name} reason={reason}"
             ),
+            Self::InvalidDmaCopyMethodEncoding {
+                source,
+                method_name,
+                reason,
+            } => write!(
+                formatter,
+                "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_DMA_COPY_A method-name={method_name} reason={reason}"
+            ),
             Self::MmeRamLoad { source, ram, error } => write!(
                 formatter,
                 "MAXWELL_B MME RAM load exceeds implemented host coverage: {source} ram={ram:?} error={error:?}"
@@ -656,6 +693,8 @@ pub fn preflight_maxwell_engine_packet(
     let binding = preflight_maxwell_packet(channel, submission, packet)?;
     let compute_before = channel.compute().clone();
     let mut compute_after = compute_before.clone();
+    let dma_copy_before = channel.dma_copy().clone();
+    let mut dma_copy_after = dma_copy_before.clone();
     let inline_to_memory_before = channel.inline_to_memory().clone();
     let mut inline_to_memory_after = inline_to_memory_before.clone();
     let two_d_before = channel.two_d().clone();
@@ -744,6 +783,7 @@ pub fn preflight_maxwell_engine_packet(
                 channel,
                 method,
                 &mut compute_after,
+                &mut dma_copy_after,
                 &mut inline_to_memory_after,
                 &mut two_d_after,
                 &mut three_d_after,
@@ -767,6 +807,9 @@ pub fn preflight_maxwell_engine_packet(
                 } => Some(MaxwellEngineOperation::ComputeInlineToMemory(upload)),
                 MaxwellEngineMethodEffect::InlineToMemoryStateAndUpload { upload, .. } => {
                     Some(MaxwellEngineOperation::InlineToMemory(upload))
+                }
+                MaxwellEngineMethodEffect::DmaCopyStateAndLaunch { operation, .. } => {
+                    Some(MaxwellEngineOperation::DmaCopy(operation))
                 }
                 MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
                     upload,
@@ -838,6 +881,8 @@ pub fn preflight_maxwell_engine_packet(
         binding,
         compute_before,
         compute_after,
+        dma_copy_before,
+        dma_copy_after,
         inline_to_memory_before,
         inline_to_memory_after,
         two_d_before,
@@ -894,6 +939,7 @@ pub fn commit_maxwell_engine_packet(
         .into());
     }
     if channel.compute() != &dispatch.compute_before
+        || channel.dma_copy() != &dispatch.dma_copy_before
         || channel.inline_to_memory() != &dispatch.inline_to_memory_before
         || channel.two_d() != &dispatch.two_d_before
         || channel.three_d() != &dispatch.three_d_before
@@ -904,6 +950,7 @@ pub fn commit_maxwell_engine_packet(
     }
     channel.replace_frontend(dispatch.binding.frontend_after());
     channel.replace_compute(dispatch.compute_after.clone());
+    channel.replace_dma_copy(dispatch.dma_copy_after.clone());
     channel.replace_inline_to_memory(dispatch.inline_to_memory_after.clone());
     channel.replace_two_d(dispatch.two_d_after.clone());
     channel.replace_three_d(dispatch.three_d_after.clone());
@@ -941,6 +988,7 @@ fn preflight_class_method(
     channel: &MaxwellGpuChannel,
     method: MaxwellMethodDispatch,
     compute: &mut MaxwellComputeState,
+    dma_copy: &mut MaxwellDmaCopyState,
     inline_to_memory: &mut MaxwellInlineToMemoryState,
     two_d: &mut MaxwellTwoDState,
     three_d: &mut MaxwellThreeDState,
@@ -949,6 +997,9 @@ fn preflight_class_method(
     let class = method.class();
     if class == compute::CLASS {
         return compute::preflight(class, method, compute);
+    }
+    if class == dma_copy::CLASS {
+        return dma_copy::preflight(method, dma_copy);
     }
     if class == inline_to_memory::CLASS {
         return inline_to_memory::preflight(method, inline_to_memory);
@@ -960,9 +1011,7 @@ fn preflight_class_method(
         return twod::preflight(method, two_d);
     }
 
-    let class_name = if class == classes.dma_copy() {
-        Some("MAXWELL_DMA_COPY_A")
-    } else if class == classes.gpfifo() {
+    let class_name = if class == classes.gpfifo() {
         Some("MAXWELL_CHANNEL_GPFIFO_A")
     } else {
         None

@@ -16,8 +16,8 @@ use nixe_gpu::{
     OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
     PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId, RenderPassOperation,
     ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, ShaderDescription,
-    ShaderId, ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
-    ViewportTransform,
+    ShaderId, ShaderResourceKind, ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexStepMode, ViewportTransform,
 };
 
 use crate::MaxwellMethodSource;
@@ -251,6 +251,31 @@ impl ViewKey {
 struct ViewRecord {
     key: ViewKey,
     dependency: ResourceDependency,
+    materialization: ViewMaterialization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewMaterialization {
+    Direct,
+    CompressedColor { color: bool },
+    CompressedDepthStencil { depth: bool, stencil: bool },
+}
+
+impl ViewMaterialization {
+    const fn supports_depth_stencil(self, depth: bool, stencil: bool) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::CompressedDepthStencil {
+                depth: materialized_depth,
+                stencil: materialized_stencil,
+            } => (!depth || materialized_depth) && (!stencil || materialized_stencil),
+            Self::CompressedColor { .. } => false,
+        }
+    }
+
+    const fn supports_color(self) -> bool {
+        matches!(self, Self::Direct | Self::CompressedColor { color: true })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,7 +382,15 @@ impl MaxwellThreeDLoweringCache {
         directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
     ) -> Result<MaxwellThreeDTranslatedShaders, MaxwellThreeDLoweringError> {
         let mut shaders = Vec::with_capacity(programs.len());
+        let mut resources: Vec<MaxwellThreeDShaderResourceUse> = Vec::new();
         for program in programs {
+            if let Some(binding) = program.texture_bindings().first() {
+                return Err(
+                    MaxwellThreeDLoweringError::TextureDescriptorMaterializationRequired {
+                        descriptor_index: binding.descriptor_index(),
+                    },
+                );
+            }
             let id = if let Some(record) = self
                 .shader_translations
                 .iter()
@@ -413,8 +446,33 @@ impl MaxwellThreeDLoweringCache {
                 directly_addressable_memory,
                 program.maximum_api_visible_calls(),
             ));
+            let stages = shader_pipeline_stages(program.stage())?;
+            for resource in program.resources() {
+                let (role, usage) = match resource.kind() {
+                    ShaderResourceKind::ConstantBuffer
+                        if resource.readable() && !resource.writable() =>
+                    {
+                        (
+                            MaxwellThreeDResourceRole::ConstantBuffer {
+                                group: program
+                                    .bind_group()
+                                    .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?,
+                                slot: resource.binding(),
+                            },
+                            ResourceUsage::StorageBuffer,
+                        )
+                    }
+                    _ => return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders),
+                };
+                if let Some(existing) = resources.iter_mut().find(|existing| existing.role == role)
+                {
+                    existing.stages = existing.stages.union(stages);
+                } else {
+                    resources.push(MaxwellThreeDShaderResourceUse::new(role, stages, usage)?);
+                }
+            }
         }
-        MaxwellThreeDTranslatedShaders::new(shaders, Vec::new())
+        MaxwellThreeDTranslatedShaders::new(shaders, resources)
     }
 
     #[cfg(test)]
@@ -1154,7 +1212,9 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     )?;
     let (commands, dirty_images) = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { source: _ } => {
-            lower_clear(state, resources, &resource_bindings)?
+            let lowered = lower_clear(state, resources, &resource_bindings)?;
+            record_clear_materialization(state, resources, &mut candidate)?;
+            lowered
         }
         MaxwellThreeDOperationTrigger::DrawVertexArray {
             source: _,
@@ -1615,26 +1675,38 @@ fn validate_compressed_depth_materialization(
     else {
         return Ok(());
     };
-    let consumes_depth = match trigger {
+    let (consumes_depth, consumes_stencil) = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { .. } => state
             .render_targets()
             .clear()
             .last_surface()
             .value()
-            .is_some_and(|surface| surface.depth() || surface.stencil()),
+            .map_or((false, false), |surface| {
+                (surface.depth(), surface.stencil())
+            }),
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
-            draw_attachments.is_some_and(|attachments| attachments.depth_stencil == Some(index))
+            if draw_attachments.is_some_and(|attachments| attachments.depth_stencil == Some(index))
+            {
+                draw_depth_stencil_aspects(state)
+            } else {
+                (false, false)
+            }
         }
     };
-    if !consumes_depth {
+    if !consumes_depth && !consumes_stencil {
         return Ok(());
     }
     let key = view_key(&resources.resources()[index]);
-    if cache.views.iter().any(|record| record.key == key) {
+    if cache.views.iter().any(|record| {
+        record.key == key
+            && record
+                .materialization
+                .supports_depth_stencil(consumes_depth, consumes_stencil)
+    }) {
         return Ok(());
     }
     if matches!(trigger, MaxwellThreeDOperationTrigger::ClearSurface { .. })
-        && depth_clear_fully_initializes(state, image)?
+        && depth_clear_fully_initializes(state, image, consumes_depth, consumes_stencil)?
     {
         return Ok(());
     }
@@ -1646,19 +1718,17 @@ fn validate_compressed_depth_materialization(
 fn depth_clear_fully_initializes(
     state: &MaxwellThreeDState,
     image: &super::MaxwellThreeDResolvedImage,
+    depth: bool,
+    stencil: bool,
 ) -> Result<bool, MaxwellThreeDLoweringError> {
-    let clear = state.render_targets().clear();
-    let surface = clear
-        .last_surface()
-        .value()
-        .ok_or(MaxwellThreeDLoweringError::IncompleteClear("CLEAR_SURFACE"))?;
-    if !(surface.depth() && surface.stencil()) {
+    if !depth && !stencil {
         return Ok(false);
     }
+    let clear = state.render_targets().clear();
     if clear
         .surface_control()
         .value()
-        .is_some_and(|control| control.respect_stencil_mask())
+        .is_some_and(|control| stencil && control.respect_stencil_mask())
     {
         return Ok(false);
     }
@@ -1688,6 +1758,55 @@ fn clear_fully_covers_image(
         && vertical.min == 0
         && u32::from(horizontal.max) == image.description().extent().width
         && u32::from(vertical.max) == image.description().extent().height)
+}
+
+fn record_clear_materialization(
+    state: &MaxwellThreeDState,
+    resources: &MaxwellThreeDResolvedResources,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    let surface = state
+        .render_targets()
+        .clear()
+        .last_surface()
+        .value()
+        .copied()
+        .ok_or(MaxwellThreeDLoweringError::IncompleteClear("CLEAR_SURFACE"))?;
+    if surface.color_mask() != 0 {
+        let index = resource_index(
+            resources,
+            MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
+        )?;
+        let key = view_key(&resources.resources()[index]);
+        let record = cache
+            .views
+            .iter_mut()
+            .find(|record| record.key == key)
+            .ok_or(MaxwellThreeDLoweringError::InvalidResolvedView {
+                role: MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
+            })?;
+        if let ViewMaterialization::CompressedColor { color } = &mut record.materialization {
+            *color = true;
+        }
+    }
+    if surface.depth() || surface.stencil() {
+        let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
+        let key = view_key(&resources.resources()[index]);
+        let record = cache
+            .views
+            .iter_mut()
+            .find(|record| record.key == key)
+            .ok_or(MaxwellThreeDLoweringError::InvalidResolvedView {
+                role: MaxwellThreeDResourceRole::DepthStencilTarget,
+            })?;
+        if let ViewMaterialization::CompressedDepthStencil { depth, stencil } =
+            &mut record.materialization
+        {
+            *depth |= surface.depth();
+            *stencil |= surface.stencil();
+        }
+    }
+    Ok(())
 }
 
 fn validate_compressed_color_materialization(
@@ -1726,7 +1845,11 @@ fn validate_compressed_color_materialization(
     let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
     let image = resolved_image(resources, index)?;
     let key = view_key(&resources.resources()[index]);
-    if cache.views.iter().any(|record| record.key == key) {
+    if cache
+        .views
+        .iter()
+        .any(|record| record.key == key && record.materialization.supports_color())
+    {
         return Ok(());
     }
     let full_clear = matches!(trigger, MaxwellThreeDOperationTrigger::ClearSurface { .. })
@@ -1883,6 +2006,13 @@ fn select_draw_attachments(
 /// fragment tests are explicitly disabled. Unknown state stays conservative:
 /// it must not silently discard a guest depth/stencil dependency.
 fn draw_depth_stencil_attachment_required(state: &MaxwellThreeDState) -> bool {
+    let (depth, stencil) = draw_depth_stencil_aspects(state);
+    depth || stencil
+}
+
+/// Returns the aspects that a draw may observe. Missing enable state remains
+/// conservative and therefore requires the corresponding guest contents.
+fn draw_depth_stencil_aspects(state: &MaxwellThreeDState) -> (bool, bool) {
     let boolean = |register| {
         state
             .fixed_function()
@@ -1893,12 +2023,13 @@ fn draw_depth_stencil_attachment_required(state: &MaxwellThreeDState) -> bool {
                 _ => None,
             })
     };
-    depth_stencil_attachment_required(
-        boolean(MaxwellThreeDFixedFunctionRegister::DepthTestEnable),
-        boolean(MaxwellThreeDFixedFunctionRegister::StencilTestEnable),
+    (
+        boolean(MaxwellThreeDFixedFunctionRegister::DepthTestEnable).unwrap_or(true),
+        boolean(MaxwellThreeDFixedFunctionRegister::StencilTestEnable).unwrap_or(true),
     )
 }
 
+#[cfg(test)]
 const fn depth_stencil_attachment_required(
     depth_test_enabled: Option<bool>,
     stencil_test_enabled: Option<bool>,
@@ -2089,6 +2220,25 @@ fn prepare_resources(
             }
         }
 
+        let materialization = match resource {
+            MaxwellThreeDResolvedResource::Buffer(_) => ViewMaterialization::Direct,
+            MaxwellThreeDResolvedResource::Image(value)
+                if !value.guest_layout().requires_materialization() =>
+            {
+                ViewMaterialization::Direct
+            }
+            MaxwellThreeDResolvedResource::Image(value)
+                if value.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+            {
+                ViewMaterialization::CompressedDepthStencil {
+                    depth: false,
+                    stencil: false,
+                }
+            }
+            MaxwellThreeDResolvedResource::Image(_) => {
+                ViewMaterialization::CompressedColor { color: false }
+            }
+        };
         let dependency = match resource {
             MaxwellThreeDResolvedResource::Buffer(value) => {
                 let id = BufferId::new(take_identity(cache)?);
@@ -2138,7 +2288,11 @@ fn prepare_resources(
                 ResourceDependency::Image(id)
             }
         };
-        cache.views.push(ViewRecord { key, dependency });
+        cache.views.push(ViewRecord {
+            key,
+            dependency,
+            materialization,
+        });
         result[*index] = Some(dependency);
     }
     Ok(result)
@@ -2298,9 +2452,6 @@ fn lower_clear(
         dirty.push(index);
     }
     if surface.depth() || surface.stencil() {
-        if !(surface.depth() && surface.stencil()) {
-            return Err(MaxwellThreeDLoweringError::PartialDepthStencilClearUnsupported);
-        }
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
         let image = resolved_image(resources, index)?;
         let image_id = image_dependency(binding_at(resources, bindings, index)?)?;
@@ -2313,23 +2464,38 @@ fn lower_clear(
             surface.array_layer(),
             rectangle,
         )?;
-        let depth = f32::from_bits(
-            clear
-                .depth()
-                .value()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteClear("depth value"))?
-                .get(),
-        );
-        let stencil = *clear
+        let depth = surface
+            .depth()
+            .then(|| {
+                clear
+                    .depth()
+                    .value()
+                    .map(|value| f32::from_bits(value.get()))
+                    .ok_or(MaxwellThreeDLoweringError::IncompleteClear("depth value"))
+            })
+            .transpose()?;
+        let stencil = surface
             .stencil()
-            .value()
-            .ok_or(MaxwellThreeDLoweringError::IncompleteClear("stencil value"))?;
+            .then(|| {
+                clear
+                    .stencil()
+                    .value()
+                    .copied()
+                    .ok_or(MaxwellThreeDLoweringError::IncompleteClear("stencil value"))
+            })
+            .transpose()?;
+        let value = match (depth, stencil) {
+            (Some(depth), None) => ClearValue::Depth(depth),
+            (None, Some(stencil)) => ClearValue::Stencil(stencil),
+            (Some(depth), Some(stencil)) => ClearValue::DepthStencil { depth, stencil },
+            (None, None) => unreachable!("depth/stencil clear branch requires one aspect"),
+        };
         let operation = ClearOperation::image(
             region,
             image.description().kind(),
             image.description().format(),
             image.description().samples(),
-            ClearValue::DepthStencil { depth, stencil },
+            value,
         )
         .map_err(MaxwellThreeDLoweringError::Command)?;
         operations.push(GpuOperation::new(
@@ -2746,6 +2912,19 @@ fn validate_shader_stages(
     Ok(())
 }
 
+fn shader_pipeline_stages(
+    stage: ShaderStage,
+) -> Result<PipelineStages, MaxwellThreeDLoweringError> {
+    match stage {
+        ShaderStage::Vertex => Ok(PipelineStages::VERTEX_SHADER),
+        ShaderStage::TessellationControl => Ok(PipelineStages::TESSELLATION_CONTROL_SHADER),
+        ShaderStage::TessellationEvaluation => Ok(PipelineStages::TESSELLATION_EVALUATION_SHADER),
+        ShaderStage::Geometry => Ok(PipelineStages::GEOMETRY_SHADER),
+        ShaderStage::Fragment => Ok(PipelineStages::FRAGMENT_SHADER),
+        ShaderStage::Compute => Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders),
+    }
+}
+
 fn primitive_topology(
     begin: MaxwellThreeDBegin,
 ) -> Result<PrimitiveTopology, MaxwellThreeDLoweringError> {
@@ -3132,6 +3311,9 @@ pub enum MaxwellThreeDLoweringError {
         target: u8,
     },
     ShaderTranslationRequired,
+    TextureDescriptorMaterializationRequired {
+        descriptor_index: u16,
+    },
     InvalidTranslatedShaders,
     TranslatedShaderStageMismatch,
     TranslatedShaderMemoryConfigurationMismatch {
@@ -3159,7 +3341,6 @@ pub enum MaxwellThreeDLoweringError {
     PartialColorClearUnsupported {
         mask: u8,
     },
-    PartialDepthStencilClearUnsupported,
     ClearOutsideAttachment,
     IncompleteDraw(&'static str),
     IncompleteBlendState {
@@ -3444,6 +3625,10 @@ impl Display for MaxwellThreeDLoweringError {
             Self::ShaderTranslationRequired => {
                 formatter.write_str("Maxwell shader translation is required before draw lowering")
             }
+            Self::TextureDescriptorMaterializationRequired { descriptor_index } => write!(
+                formatter,
+                "Maxwell texture descriptor {descriptor_index} requires image and sampler materialization before draw lowering"
+            ),
             Self::InvalidTranslatedShaders => {
                 formatter.write_str("translated shader evidence is empty, duplicated, or invalid")
             }
@@ -3493,9 +3678,6 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "partial color-channel clear is not represented yet: mask={mask:#x}"
             ),
-            Self::PartialDepthStencilClearUnsupported => {
-                formatter.write_str("a partial depth/stencil aspect clear is not represented yet")
-            }
             Self::ClearOutsideAttachment => {
                 formatter.write_str("clear rectangle or layer lies outside the resolved attachment")
             }

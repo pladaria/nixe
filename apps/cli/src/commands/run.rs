@@ -16,13 +16,14 @@ use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
-    HorizonSvcDispatcher, HorizonSvcFault, OperationMode, TimeEnvironment,
-    UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
+    HorizonSvcDispatcher, HorizonSvcFault, OperationMode, SettingsEnvironment, SystemLanguage,
+    TimeEnvironment, UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputManager, ProfiledControllerState,
     sdl::SdlInputBackend,
 };
+use nixe_loader_title::NacpLanguage;
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
     DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
@@ -192,6 +193,20 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     log::debug!("initial operation mode: {initial_operation_mode:?}");
     let time_environment = TimeEnvironment::new(virtual_clock, &config.system.time.timezone)
         .map_err(|error| format!("cannot create Horizon time environment: {error}"))?;
+    let settings_environment = SettingsEnvironment::for_language(
+        config
+            .system
+            .preferred_languages
+            .first()
+            .copied()
+            .map(system_language)
+            .unwrap_or(SystemLanguage::AmericanEnglish),
+    );
+    let horizon_environment = HorizonEnvironment {
+        operation_mode: initial_operation_mode,
+        time: time_environment,
+        settings: settings_environment,
+    };
     log::debug!(
         "virtual time: mode={clock_mode:?}, timezone={}",
         config.system.time.timezone
@@ -216,8 +231,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             coordinator,
             process,
             instruction_trace,
-            initial_operation_mode,
-            time_environment,
+            horizon_environment,
             video_system,
             gamepad_profiles,
         ));
@@ -233,8 +247,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 coordinator,
                 process,
                 instruction_trace,
-                initial_operation_mode,
-                time_environment,
+                horizon_environment,
                 video_system,
                 gamepad_profiles,
             )
@@ -259,6 +272,27 @@ fn diagnostics_policy(config: DiagnosticsConfig) -> DiagnosticsPolicy {
         },
         instruction_trace: config.instruction_trace,
         ..DiagnosticsPolicy::default()
+    }
+}
+
+const fn system_language(language: NacpLanguage) -> SystemLanguage {
+    match language {
+        NacpLanguage::AmericanEnglish => SystemLanguage::AmericanEnglish,
+        NacpLanguage::BritishEnglish => SystemLanguage::BritishEnglish,
+        NacpLanguage::Japanese => SystemLanguage::Japanese,
+        NacpLanguage::French => SystemLanguage::French,
+        NacpLanguage::German => SystemLanguage::German,
+        NacpLanguage::LatinAmericanSpanish => SystemLanguage::LatinAmericanSpanish,
+        NacpLanguage::Spanish => SystemLanguage::Spanish,
+        NacpLanguage::Italian => SystemLanguage::Italian,
+        NacpLanguage::Dutch => SystemLanguage::Dutch,
+        NacpLanguage::CanadianFrench => SystemLanguage::CanadianFrench,
+        NacpLanguage::Portuguese => SystemLanguage::Portuguese,
+        NacpLanguage::Russian => SystemLanguage::Russian,
+        NacpLanguage::Korean => SystemLanguage::Korean,
+        NacpLanguage::TraditionalChinese => SystemLanguage::TraditionalChinese,
+        NacpLanguage::SimplifiedChinese => SystemLanguage::SimplifiedChinese,
+        NacpLanguage::BrazilianPortuguese => SystemLanguage::BrazilianPortuguese,
     }
 }
 
@@ -364,12 +398,17 @@ struct WorkerResult {
     graphics_teardown: nixe_horizon::GraphicsTeardownReport,
 }
 
+struct HorizonEnvironment {
+    operation_mode: OperationMode,
+    time: TimeEnvironment,
+    settings: SettingsEnvironment,
+}
+
 fn execute_worker(
     mut coordinator: RuntimeCoordinator,
     process: RunnableProcess,
     instruction_trace: bool,
-    initial_operation_mode: OperationMode,
-    time_environment: TimeEnvironment,
+    horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     gamepad_profiles: GamepadProfiles,
 ) -> WorkerResult {
@@ -394,8 +433,7 @@ fn execute_worker(
             execute(
                 &mut scheduled,
                 instruction_trace,
-                initial_operation_mode,
-                time_environment,
+                horizon_environment,
                 execution_video,
                 &mut input,
             )
@@ -475,16 +513,16 @@ struct ScheduledProcess<'a> {
 fn execute(
     scheduled: &mut ScheduledProcess<'_>,
     print_trace: bool,
-    initial_operation_mode: OperationMode,
-    time_environment: TimeEnvironment,
+    horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     input: &mut InputManager<SdlInputBackend>,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
-    let mut dispatcher = HorizonSvcDispatcher::new_with_video(
-        initial_operation_mode,
-        time_environment,
+    let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
+        horizon_environment.operation_mode,
+        horizon_environment.time,
+        horizon_environment.settings,
         video_system,
     );
     let mut instructions = 0_u64;

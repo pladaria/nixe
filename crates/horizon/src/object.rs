@@ -217,6 +217,175 @@ impl SystemSettingsSession {
     }
 }
 
+/// Language identifiers exposed by Horizon's user settings service.
+///
+/// Discriminants follow `SetLanguage` in the pinned libnx ABI.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum SystemLanguage {
+    Japanese = 0,
+    AmericanEnglish = 1,
+    French = 2,
+    German = 3,
+    Italian = 4,
+    Spanish = 5,
+    Korean = 7,
+    Dutch = 8,
+    Portuguese = 9,
+    Russian = 10,
+    BritishEnglish = 12,
+    CanadianFrench = 13,
+    LatinAmericanSpanish = 14,
+    SimplifiedChinese = 15,
+    TraditionalChinese = 16,
+    BrazilianPortuguese = 17,
+}
+
+impl SystemLanguage {
+    pub const AVAILABLE: [Self; 16] = [
+        Self::Japanese,
+        Self::AmericanEnglish,
+        Self::French,
+        Self::German,
+        Self::Italian,
+        Self::Spanish,
+        Self::Korean,
+        Self::Dutch,
+        Self::Portuguese,
+        Self::Russian,
+        Self::BritishEnglish,
+        Self::CanadianFrench,
+        Self::LatinAmericanSpanish,
+        Self::SimplifiedChinese,
+        Self::TraditionalChinese,
+        Self::BrazilianPortuguese,
+    ];
+
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Japanese),
+            1 => Some(Self::AmericanEnglish),
+            2 => Some(Self::French),
+            3 => Some(Self::German),
+            4 => Some(Self::Italian),
+            5 => Some(Self::Spanish),
+            7 => Some(Self::Korean),
+            8 => Some(Self::Dutch),
+            9 => Some(Self::Portuguese),
+            10 => Some(Self::Russian),
+            12 => Some(Self::BritishEnglish),
+            13 => Some(Self::CanadianFrench),
+            14 => Some(Self::LatinAmericanSpanish),
+            15 => Some(Self::SimplifiedChinese),
+            16 => Some(Self::TraditionalChinese),
+            17 => Some(Self::BrazilianPortuguese),
+            _ => None,
+        }
+    }
+
+    /// Returns the null-padded, little-endian Horizon language code.
+    pub const fn code(self) -> u64 {
+        u64::from_le_bytes(match self {
+            Self::Japanese => *b"ja\0\0\0\0\0\0",
+            Self::AmericanEnglish => *b"en-US\0\0\0",
+            Self::French => *b"fr\0\0\0\0\0\0",
+            Self::German => *b"de\0\0\0\0\0\0",
+            Self::Italian => *b"it\0\0\0\0\0\0",
+            Self::Spanish => *b"es\0\0\0\0\0\0",
+            Self::Korean => *b"ko\0\0\0\0\0\0",
+            Self::Dutch => *b"nl\0\0\0\0\0\0",
+            Self::Portuguese => *b"pt\0\0\0\0\0\0",
+            Self::Russian => *b"ru\0\0\0\0\0\0",
+            Self::BritishEnglish => *b"en-GB\0\0\0",
+            Self::CanadianFrench => *b"fr-CA\0\0\0",
+            Self::LatinAmericanSpanish => *b"es-419\0\0",
+            Self::SimplifiedChinese => *b"zh-Hans\0",
+            Self::TraditionalChinese => *b"zh-Hant\0",
+            Self::BrazilianPortuguese => *b"pt-BR\0\0\0",
+        })
+    }
+}
+
+/// Region identifiers returned by Horizon's user settings service.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum RegionCode {
+    Japan = 0,
+    Usa = 1,
+    Europe = 2,
+    Australia = 3,
+    China = 4,
+    Korea = 5,
+    Taiwan = 6,
+}
+
+/// Immutable user locale exposed to guest settings clients.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsEnvironment {
+    language: SystemLanguage,
+    region: RegionCode,
+}
+
+impl SettingsEnvironment {
+    #[must_use]
+    pub const fn new(language: SystemLanguage, region: RegionCode) -> Self {
+        Self { language, region }
+    }
+
+    #[must_use]
+    pub const fn for_language(language: SystemLanguage) -> Self {
+        let region = match language {
+            SystemLanguage::Japanese => RegionCode::Japan,
+            SystemLanguage::Korean => RegionCode::Korea,
+            SystemLanguage::SimplifiedChinese => RegionCode::China,
+            SystemLanguage::TraditionalChinese => RegionCode::Taiwan,
+            SystemLanguage::AmericanEnglish
+            | SystemLanguage::LatinAmericanSpanish
+            | SystemLanguage::BrazilianPortuguese => RegionCode::Usa,
+            SystemLanguage::French
+            | SystemLanguage::German
+            | SystemLanguage::Italian
+            | SystemLanguage::Spanish
+            | SystemLanguage::Dutch
+            | SystemLanguage::Portuguese
+            | SystemLanguage::Russian
+            | SystemLanguage::BritishEnglish
+            | SystemLanguage::CanadianFrench => RegionCode::Europe,
+        };
+        Self::new(language, region)
+    }
+
+    pub(crate) const fn language(&self) -> SystemLanguage {
+        self.language
+    }
+
+    pub(crate) const fn region(&self) -> RegionCode {
+        self.region
+    }
+}
+
+impl Default for SettingsEnvironment {
+    fn default() -> Self {
+        Self::for_language(SystemLanguage::AmericanEnglish)
+    }
+}
+
+/// Client session connected to Horizon's `set` user settings service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSettingsSession {
+    environment: SettingsEnvironment,
+}
+
+impl UserSettingsSession {
+    pub(crate) const fn new(environment: SettingsEnvironment) -> Self {
+        Self { environment }
+    }
+
+    pub(crate) const fn environment(&self) -> &SettingsEnvironment {
+        &self.environment
+    }
+}
+
 /// Client session connected to Horizon's `hid` service.
 #[derive(Clone, Debug)]
 pub struct HidSession {

@@ -11,10 +11,11 @@ use nixe_gpu::{
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
 use crate::{
-    MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellEngineOperation,
-    MaxwellEnginePacketDispatch, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
-    MaxwellHostMemoryOperation, MaxwellInlineToMemoryUpload, MaxwellMethodSource,
-    MaxwellResolvedRange, MaxwellShaderTranslationError, MaxwellThreeDInlineConstantBufferUpload,
+    MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError,
+    MaxwellDmaCopyOperation, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
+    MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellHostMemoryOperation,
+    MaxwellInlineToMemoryUpload, MaxwellMethodSource, MaxwellResolvedRange,
+    MaxwellShaderTranslationError, MaxwellThreeDInlineConstantBufferUpload,
     MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
     MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
@@ -37,6 +38,11 @@ pub enum MaxwellSubmissionExecutionStep {
     InlineToMemory {
         upload: MaxwellInlineToMemoryUpload,
         target: MaxwellResolvedRange,
+    },
+    DmaCopy {
+        operation: MaxwellDmaCopyOperation,
+        source: MaxwellResolvedRange,
+        destination: MaxwellResolvedRange,
     },
     ComputeSynchronization(MaxwellComputeSynchronizationPlan),
     ThreeDInlineConstantBuffer {
@@ -180,6 +186,18 @@ pub enum MaxwellSoftwareInitializationError {
         source: MaxwellMethodSource,
         error: CanonicalWriteBatchError,
     },
+    DmaAccess {
+        source: MaxwellMethodSource,
+        error: MaxwellGpuAccessError,
+    },
+    DmaTransform {
+        source: MaxwellMethodSource,
+        error: MaxwellDmaCopyError,
+    },
+    DmaTransaction {
+        source: MaxwellMethodSource,
+        error: CanonicalWriteBatchError,
+    },
 }
 
 impl Display for MaxwellSoftwareInitializationError {
@@ -206,6 +224,15 @@ impl Display for MaxwellSoftwareInitializationError {
             Self::InlineWrite { source, error } => {
                 write!(formatter, "inline upload could not be staged atomically: {source}: {error}")
             }
+            Self::DmaAccess { source, error } => {
+                write!(formatter, "DMA copy mapping changed before execution: {source}: {error}")
+            }
+            Self::DmaTransform { source, error } => {
+                write!(formatter, "DMA copy transformation failed: {source}: {error}")
+            }
+            Self::DmaTransaction { source, error } => {
+                write!(formatter, "DMA copy transaction failed: {source}: {error}")
+            }
         }
     }
 }
@@ -216,6 +243,10 @@ impl std::error::Error for MaxwellSoftwareInitializationError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellSubmissionExecutionError {
     InlineAddress {
+        source: MaxwellMethodSource,
+        error: MaxwellGpuAccessError,
+    },
+    DmaAddress {
         source: MaxwellMethodSource,
         error: MaxwellGpuAccessError,
     },
@@ -239,6 +270,9 @@ impl Display for MaxwellSubmissionExecutionError {
                     formatter,
                     "inline upload target is invalid: {source}: {error}"
                 )
+            }
+            Self::DmaAddress { source, error } => {
+                write!(formatter, "DMA copy range is invalid: {source}: {error}")
             }
             Self::ThreeDResource(error) => Display::fmt(error, formatter),
             Self::ThreeDLowering(error) => Display::fmt(error, formatter),
@@ -332,6 +366,48 @@ pub fn preflight_maxwell_submission_execution(
                 steps.push(MaxwellSubmissionExecutionStep::InlineToMemory {
                     upload: *upload,
                     target,
+                });
+                prior_work_pending = true;
+            }
+            MaxwellEngineOperation::DmaCopy(operation) => {
+                let source_address = address_space
+                    .address(operation.source_address())
+                    .map_err(MaxwellGpuAccessError::Address)
+                    .map_err(|error| MaxwellSubmissionExecutionError::DmaAddress {
+                        source: operation.source(),
+                        error,
+                    })?;
+                let destination_address = address_space
+                    .address(operation.destination_address())
+                    .map_err(MaxwellGpuAccessError::Address)
+                    .map_err(|error| MaxwellSubmissionExecutionError::DmaAddress {
+                        source: operation.source(),
+                        error,
+                    })?;
+                let source = address_space
+                    .resolve_range(
+                        source_address,
+                        operation.source_range_size(),
+                        MemoryPermissions::READ,
+                    )
+                    .map_err(|error| MaxwellSubmissionExecutionError::DmaAddress {
+                        source: operation.source(),
+                        error,
+                    })?;
+                let destination = address_space
+                    .resolve_range(
+                        destination_address,
+                        operation.destination_range_size(),
+                        MemoryPermissions::READ_WRITE,
+                    )
+                    .map_err(|error| MaxwellSubmissionExecutionError::DmaAddress {
+                        source: operation.source(),
+                        error,
+                    })?;
+                steps.push(MaxwellSubmissionExecutionStep::DmaCopy {
+                    operation: *operation,
+                    source,
+                    destination,
                 });
                 prior_work_pending = true;
             }
@@ -501,6 +577,7 @@ pub fn execute_maxwell_software_initialization(
     address_space: &MaxwellGpuAddressSpace,
 ) -> Result<MaxwellSoftwareInitializationCompletion, MaxwellSoftwareInitializationError> {
     let mut writes = CanonicalWriteBatch::new();
+    let mut write_source = None;
     let mut prior_work_pending = false;
     let mut completion_seen = false;
 
@@ -532,6 +609,7 @@ pub fn execute_maxwell_software_initialization(
                     upload.source(),
                     &mut writes,
                 )?;
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
                 prior_work_pending = true;
             }
             MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
@@ -542,6 +620,16 @@ pub fn execute_maxwell_software_initialization(
                     upload.source(),
                     &mut writes,
                 )?;
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+                prior_work_pending = true;
+            }
+            MaxwellSubmissionExecutionStep::DmaCopy {
+                operation,
+                source,
+                destination,
+            } => {
+                stage_dma_copy(address_space, *operation, source, destination, &mut writes)?;
+                write_source = Some(CanonicalWriteSource::Dma(operation.source()));
                 prior_work_pending = true;
             }
             MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
@@ -552,6 +640,7 @@ pub fn execute_maxwell_software_initialization(
                     upload.source(),
                     &mut writes,
                 )?;
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
                 prior_work_pending = true;
             }
             MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
@@ -567,6 +656,7 @@ pub fn execute_maxwell_software_initialization(
                     release.source(),
                     &mut writes,
                 )?;
+                write_source = Some(CanonicalWriteSource::Inline(release.source()));
                 prior_work_pending = false;
             }
             MaxwellSubmissionExecutionStep::ComputeSynchronization(
@@ -632,32 +722,7 @@ pub fn execute_maxwell_software_initialization(
         }
     }
 
-    writes
-        .commit()
-        .map_err(|error| MaxwellSoftwareInitializationError::InlineWrite {
-            source: plan
-                .steps
-                .iter()
-                .rev()
-                .find_map(|step| match step {
-                    MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, .. } => {
-                        Some(upload.source())
-                    }
-                    MaxwellSubmissionExecutionStep::InlineToMemory { upload, .. } => {
-                        Some(upload.source())
-                    }
-                    MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
-                        upload, ..
-                    } => Some(upload.source()),
-                    MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
-                        release,
-                        ..
-                    } => Some(release.source()),
-                    _ => None,
-                })
-                .expect("a non-empty canonical write batch has an inline source"),
-            error,
-        })?;
+    commit_write_batch(writes, write_source)?;
 
     Ok(MaxwellSoftwareInitializationCompletion {
         staged_cache: plan.staged_cache,
@@ -698,7 +763,7 @@ pub fn execute_maxwell_backend_submission(
                     &mut pre_writes,
                 )
                 .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(upload.source());
+                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
             }
             MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
                 stage_inline_write(
@@ -709,7 +774,22 @@ pub fn execute_maxwell_backend_submission(
                     &mut pre_writes,
                 )
                 .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(upload.source());
+                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+            }
+            MaxwellSubmissionExecutionStep::DmaCopy {
+                operation,
+                source,
+                destination,
+            } => {
+                stage_dma_copy(
+                    address_space,
+                    *operation,
+                    source,
+                    destination,
+                    &mut pre_writes,
+                )
+                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                pre_write_source = Some(CanonicalWriteSource::Dma(operation.source()));
             }
             MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
                 stage_inline_write(
@@ -720,7 +800,7 @@ pub fn execute_maxwell_backend_submission(
                     &mut pre_writes,
                 )
                 .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(upload.source());
+                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
             }
             MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
                 stage_inline_write(
@@ -780,7 +860,7 @@ pub fn execute_maxwell_backend_submission(
         }
     }
 
-    commit_inline_batch(pre_writes, pre_write_source)
+    commit_write_batch(pre_writes, pre_write_source)
         .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
     let submission =
         OperationSubmission::new(plan.frontend, plan.predecessors.to_vec(), operations)
@@ -805,6 +885,148 @@ fn cache_maintenance_operation(maintenance: CacheMaintenanceOperation) -> GpuOpe
         [],
         CapabilityRequirements::none(),
     )
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalWriteSource {
+    Inline(MaxwellMethodSource),
+    Dma(MaxwellMethodSource),
+}
+
+fn commit_write_batch(
+    writes: CanonicalWriteBatch,
+    source: Option<CanonicalWriteSource>,
+) -> Result<(), MaxwellSoftwareInitializationError> {
+    writes.commit().map_err(|error| {
+        match source.expect("a non-empty canonical write batch has an ordered method source") {
+            CanonicalWriteSource::Inline(source) => {
+                MaxwellSoftwareInitializationError::InlineWrite { source, error }
+            }
+            CanonicalWriteSource::Dma(source) => {
+                MaxwellSoftwareInitializationError::DmaTransaction { source, error }
+            }
+        }
+    })
+}
+
+fn stage_dma_copy(
+    address_space: &MaxwellGpuAddressSpace,
+    operation: MaxwellDmaCopyOperation,
+    source: &MaxwellResolvedRange,
+    destination: &MaxwellResolvedRange,
+    writes: &mut CanonicalWriteBatch,
+) -> Result<(), MaxwellSoftwareInitializationError> {
+    let mut source_bytes = dma_buffer(operation.source_range_size(), operation.source())?;
+    read_dma_bytes(
+        address_space,
+        source,
+        &mut source_bytes,
+        writes,
+        operation.source(),
+    )?;
+    let mut destination_bytes = dma_buffer(operation.destination_range_size(), operation.source())?;
+    read_dma_bytes(
+        address_space,
+        destination,
+        &mut destination_bytes,
+        writes,
+        operation.source(),
+    )?;
+    operation
+        .copy_bytes(&source_bytes, &mut destination_bytes)
+        .map_err(|error| MaxwellSoftwareInitializationError::DmaTransform {
+            source: operation.source(),
+            error,
+        })?;
+
+    let mut copied = 0_usize;
+    for segment in destination.segments() {
+        let size = usize::try_from(segment.size()).map_err(|_| {
+            MaxwellSoftwareInitializationError::DmaTransform {
+                source: operation.source(),
+                error: MaxwellDmaCopyError::ArithmeticOverflow,
+            }
+        })?;
+        let end =
+            copied
+                .checked_add(size)
+                .ok_or(MaxwellSoftwareInitializationError::DmaTransform {
+                    source: operation.source(),
+                    error: MaxwellDmaCopyError::ArithmeticOverflow,
+                })?;
+        writes
+            .stage(
+                segment.mapping().backing(),
+                segment.backing_offset(),
+                &destination_bytes[copied..end],
+            )
+            .map_err(|error| MaxwellSoftwareInitializationError::DmaTransaction {
+                source: operation.source(),
+                error,
+            })?;
+        copied = end;
+    }
+    Ok(())
+}
+
+fn read_dma_bytes(
+    address_space: &MaxwellGpuAddressSpace,
+    range: &MaxwellResolvedRange,
+    output: &mut [u8],
+    writes: &CanonicalWriteBatch,
+    source: MaxwellMethodSource,
+) -> Result<(), MaxwellSoftwareInitializationError> {
+    address_space
+        .read_resolved(range, output)
+        .map_err(|error| MaxwellSoftwareInitializationError::DmaAccess { source, error })?;
+    let mut copied = 0_usize;
+    for segment in range.segments() {
+        let size = usize::try_from(segment.size()).map_err(|_| {
+            MaxwellSoftwareInitializationError::DmaTransform {
+                source,
+                error: MaxwellDmaCopyError::ArithmeticOverflow,
+            }
+        })?;
+        let end =
+            copied
+                .checked_add(size)
+                .ok_or(MaxwellSoftwareInitializationError::DmaTransform {
+                    source,
+                    error: MaxwellDmaCopyError::ArithmeticOverflow,
+                })?;
+        writes
+            .read_staged(
+                segment.mapping().backing(),
+                segment.backing_offset(),
+                &mut output[copied..end],
+            )
+            .map_err(|error| MaxwellSoftwareInitializationError::DmaTransaction {
+                source,
+                error,
+            })?;
+        copied = end;
+    }
+    Ok(())
+}
+
+fn dma_buffer(
+    size: u64,
+    source: MaxwellMethodSource,
+) -> Result<Vec<u8>, MaxwellSoftwareInitializationError> {
+    let size =
+        usize::try_from(size).map_err(|_| MaxwellSoftwareInitializationError::DmaTransform {
+            source,
+            error: MaxwellDmaCopyError::ArithmeticOverflow,
+        })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|_| {
+        MaxwellSoftwareInitializationError::DmaTransform {
+            source,
+            error: MaxwellDmaCopyError::ResourceExhausted,
+        }
+    })?;
+    bytes.resize(size, 0);
+    Ok(bytes)
 }
 
 fn commit_inline_batch(
@@ -1456,5 +1678,174 @@ mod tests {
         execute_maxwell_software_initialization(plan, &address_space).unwrap();
         allocation.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+    }
+
+    #[test]
+    fn dma_copy_converts_captured_rgba_pitch_rows_to_block_linear_storage() {
+        const TEXTURE_SIZE: usize = 256 * 256 * 4;
+        let source_allocation = CanonicalAllocation::zeroed(TEXTURE_SIZE, 0x1000).unwrap();
+        let destination_allocation = CanonicalAllocation::zeroed(TEXTURE_SIZE, 0x1000).unwrap();
+        let mut linear = vec![0_u8; TEXTURE_SIZE];
+        for y in 0..256_u32 {
+            for x in 0..256_u32 {
+                let offset = (y as usize * 256 + x as usize) * 4;
+                linear[offset..offset + 4].copy_from_slice(&[
+                    x as u8,
+                    y as u8,
+                    (x ^ y) as u8,
+                    0xff,
+                ]);
+            }
+        }
+        source_allocation.write(0, &linear).unwrap();
+
+        let mut address_space = address_space();
+        let source_mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(10),
+                backing: source_allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: TEXTURE_SIZE as u64,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let destination_mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(11),
+                backing: destination_allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: TEXTURE_SIZE as u64,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let source_address = source_mapping.offset().get();
+        let destination_address = destination_mapping.offset().get();
+
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(4, 0, &[SWITCH_1_GM20B_PROFILE.classes().dma_copy().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        for setup in [
+            packet(4, 0x0708 / 4, &[0x0330_3210]),
+            packet(4, 0x070c / 4, &[0x1040, 256, 256, 1, 0, 0]),
+            packet(
+                4,
+                0x0400 / 4,
+                &[
+                    (source_address >> 32) as u32,
+                    source_address as u32,
+                    (destination_address >> 32) as u32,
+                    destination_address as u32,
+                    0x400,
+                    0x400,
+                    256,
+                    256,
+                ],
+            ),
+        ] {
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(2),
+                &setup.packets()[0],
+            )
+            .unwrap();
+        }
+        let launch = packet(4, 0x0300 / 4, &[0x686]);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &launch.packets()[0],
+        )
+        .unwrap();
+        let plan = preflight_maxwell_submission_execution(
+            &[dispatch],
+            &address_space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.steps(),
+            [MaxwellSubmissionExecutionStep::DmaCopy { operation, .. }]
+                if operation.source_address() == source_address
+                    && operation.destination_address() == destination_address
+                    && operation.source_range_size() == TEXTURE_SIZE as u64
+                    && operation.destination_range_size() == TEXTURE_SIZE as u64
+        ));
+
+        execute_maxwell_software_initialization(plan, &address_space).unwrap();
+        let mut tiled = vec![0_u8; TEXTURE_SIZE];
+        destination_allocation.read(0, &mut tiled).unwrap();
+        for (x, y, offset) in [
+            (0_u32, 0_u32, 0_usize),
+            (4, 0, 32),
+            (0, 1, 16),
+            (0, 2, 64),
+            (8, 0, 256),
+            (0, 8, 512),
+            (16, 0, 8192),
+            (0, 128, 131072),
+        ] {
+            assert_eq!(
+                &tiled[offset..offset + 4],
+                &[x as u8, y as u8, (x ^ y) as u8, 0xff]
+            );
+        }
+    }
+
+    #[test]
+    fn dma_copy_rejects_physical_launches_without_committing_candidate_state() {
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(4, 0, &[SWITCH_1_GM20B_PROFILE.classes().dma_copy().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+        let before = channel.dma_copy().clone();
+        let launch = packet(4, 0x0300 / 4, &[0x1001]);
+        let error = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &launch.packets()[0],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::MaxwellEngineDispatchError::InvalidDmaCopyMethodEncoding {
+                method_name: "LAUNCH_DMA",
+                ..
+            }
+        ));
+        assert_eq!(channel.dma_copy(), &before);
     }
 }
