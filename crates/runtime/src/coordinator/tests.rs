@@ -74,6 +74,40 @@ fn coordinator_preserves_external_event_sequence_boundaries() {
 }
 
 #[test]
+fn bounded_external_wait_expires_without_fabricating_guest_readiness() {
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    let process_id = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let execution = coordinator.run_next(2).unwrap().unwrap();
+    let thread = execution.lease.thread;
+    coordinator.register_timed_wait(thread, None).unwrap();
+
+    assert_eq!(
+        coordinator
+            .wait_for_external_event_for(std::time::Duration::ZERO)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        coordinator.scheduler().thread(thread).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
+    assert_eq!(
+        coordinator
+            .process(process_id)
+            .unwrap()
+            .thread(thread)
+            .unwrap()
+            .lifecycle(),
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
+}
+
+#[test]
 fn one_slice_flows_through_a_scheduler_lease() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process = synthetic_process_for_coordinator(1);
@@ -964,6 +998,41 @@ fn parallel_wave_runs_distinct_threads_from_one_process() {
             .all(|execution| execution.lease.process == process_id)
     );
     assert_ne!(executions[0].lease.thread, executions[1].lease.thread);
+}
+
+#[test]
+fn parallel_wave_fast_forwards_virtual_deadlines_before_reporting_idle() {
+    let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
+    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+        two_core_profile(),
+        clock,
+        VcpuExecutionMode::Parallel,
+    )
+    .unwrap();
+    coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(VirtualCpuId::new(3)),
+                affinity: coordinator.scheduler().profile().all_cores(),
+            },
+        )
+        .unwrap();
+
+    let execution = coordinator.run_parallel_wave(2).unwrap().remove(0);
+    let thread = execution.lease.thread;
+    assert_eq!(
+        coordinator.scheduler().thread(thread).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
+    assert!(coordinator.sleep_thread(thread, 100).unwrap().is_some());
+    assert_eq!(coordinator.virtual_time_ns(), 0);
+
+    let executions = coordinator.run_parallel_wave(1).unwrap();
+    assert_eq!(coordinator.virtual_time_ns(), 100);
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].lease.thread, thread);
 }
 
 #[test]

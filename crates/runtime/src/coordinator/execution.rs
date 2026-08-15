@@ -204,79 +204,88 @@ impl RuntimeCoordinator {
         if let Some(lease) = self.in_flight.values().next().copied() {
             return Err(CoordinatorError::InFlightLease(lease));
         }
-        let idle: Vec<_> = self.scheduler.idle_vcpus().collect();
         let mut dispatch_order = Vec::new();
         let mut first_error = None;
-        for vcpu in idle {
-            let SchedulerDecision::Selected(selected) =
-                self.scheduler.apply(SchedulerCommand::Select(vcpu))?
-            else {
-                unreachable!("select commands always produce a selected decision")
-            };
-            let Some(lease) = selected else {
-                continue;
-            };
-            self.in_flight.insert(vcpu, lease);
-            self.vcpu_slots
-                .get_mut(&vcpu)
-                .expect("scheduler leases only configured vCPUs")
-                .begin(lease);
-            self.record_dispatch(lease, instruction_budget);
-            let execution = self
-                .processes
-                .get_mut(&lease.process)
-                .ok_or(CoordinatorError::UnknownProcess(lease.process))?
-                .begin_thread_execution(lease.thread, vcpu, instruction_budget)
-                .map_err(|error| CoordinatorError::Execution {
-                    process: lease.process,
-                    thread: lease.thread,
-                    error,
-                });
-            let execution = match execution {
-                Ok(execution) => execution,
-                Err(error) => {
-                    self.complete_failed_worker_lease(lease)?;
-                    first_error.get_or_insert(error);
+        loop {
+            let idle: Vec<_> = self.scheduler.idle_vcpus().collect();
+            for vcpu in idle {
+                let SchedulerDecision::Selected(selected) =
+                    self.scheduler.apply(SchedulerCommand::Select(vcpu))?
+                else {
+                    unreachable!("select commands always produce a selected decision")
+                };
+                let Some(lease) = selected else {
                     continue;
-                }
-            };
-            let executor = WorkerExecutorKey {
-                process: lease.process,
-                domain: self
+                };
+                self.in_flight.insert(vcpu, lease);
+                self.vcpu_slots
+                    .get_mut(&vcpu)
+                    .expect("scheduler leases only configured vCPUs")
+                    .begin(lease);
+                self.record_dispatch(lease, instruction_budget);
+                let execution = self
+                    .processes
+                    .get_mut(&lease.process)
+                    .ok_or(CoordinatorError::UnknownProcess(lease.process))?
+                    .begin_thread_execution(lease.thread, vcpu, instruction_budget)
+                    .map_err(|error| CoordinatorError::Execution {
+                        process: lease.process,
+                        thread: lease.thread,
+                        error,
+                    });
+                let execution = match execution {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        self.complete_failed_worker_lease(lease)?;
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+                let executor = WorkerExecutorKey {
+                    process: lease.process,
+                    domain: self
+                        .processes
+                        .get(&lease.process)
+                        .expect("the dispatched process remains registered")
+                        .engine_domain_id(),
+                };
+                let fallback = self
                     .processes
                     .get(&lease.process)
-                    .expect("the dispatched process remains registered")
-                    .engine_domain_id(),
-            };
-            let fallback = self
-                .processes
-                .get(&lease.process)
-                .and_then(RunnableProcess::fallback_engine_domain_id)
-                .map(|domain| WorkerExecutorKey {
-                    process: lease.process,
-                    domain,
-                });
-            match self.workers.dispatch(WorkerRequest {
-                lease,
-                executor,
-                fallback,
-                execution,
-            }) {
-                Ok(()) => {
-                    dispatch_order.push(lease);
+                    .and_then(RunnableProcess::fallback_engine_domain_id)
+                    .map(|domain| WorkerExecutorKey {
+                        process: lease.process,
+                        domain,
+                    });
+                match self.workers.dispatch(WorkerRequest {
+                    lease,
+                    executor,
+                    fallback,
+                    execution,
+                }) {
+                    Ok(()) => {
+                        dispatch_order.push(lease);
+                    }
+                    Err(failure) => {
+                        self.processes
+                            .get_mut(&lease.process)
+                            .expect("the dispatched process remains registered")
+                            .abort_thread_execution(
+                                lease.thread,
+                                lease.vcpu,
+                                failure.request.execution,
+                            );
+                        self.complete_failed_worker_lease(lease)?;
+                        first_error.get_or_insert(CoordinatorError::Worker(failure.failure));
+                    }
                 }
-                Err(failure) => {
-                    self.processes
-                        .get_mut(&lease.process)
-                        .expect("the dispatched process remains registered")
-                        .abort_thread_execution(
-                            lease.thread,
-                            lease.vcpu,
-                            failure.request.execution,
-                        );
-                    self.complete_failed_worker_lease(lease)?;
-                    first_error.get_or_insert(CoordinatorError::Worker(failure.failure));
-                }
+            }
+
+            if !dispatch_order.is_empty()
+                || first_error.is_some()
+                || !self.fast_forward_to_next_deadline()?
+            {
+                break;
             }
         }
 

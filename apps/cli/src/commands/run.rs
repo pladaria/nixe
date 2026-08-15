@@ -20,7 +20,8 @@ use nixe_horizon::{
     UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
 };
 use nixe_input::{
-    ControllerId, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
+    ControllerId, EmulatedButtonState, GamepadProfiles, InputManager, ProfiledControllerState,
+    sdl::SdlInputBackend,
 };
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
@@ -497,6 +498,7 @@ fn execute(
     let mut last_input_poll = Duration::ZERO;
     let mut active_input = None;
     let mut input_observed = false;
+    let mut active_buttons = EmulatedButtonState::default();
     loop {
         dispatcher.synchronize_virtual_time(coordinator.virtual_time_ns());
         coordinator
@@ -521,6 +523,20 @@ fn execute(
                 .read_profiled_input()
                 .map_err(|error| error.to_string())?;
             report_input_change(&mut active_input, &profiled, input_observed);
+            let current_buttons = profiled
+                .as_ref()
+                .map_or_else(EmulatedButtonState::default, |controller| {
+                    controller.state.buttons
+                });
+            if log::log_enabled!(log::Level::Debug) {
+                for (button, pressed) in button_transitions(active_buttons, current_buttons) {
+                    log::debug!(
+                        "emulated button {button} {}: instructions={instructions} elapsed={elapsed:?}",
+                        if pressed { "pressed" } else { "released" }
+                    );
+                }
+            }
+            active_buttons = current_buttons;
             input_observed = true;
             dispatcher
                 .advance_input(
@@ -550,8 +566,10 @@ fn execute(
         }
         .map_err(|error| error.to_string())?;
         if executions.is_empty() {
+            let host_wait =
+                host_service_wait_duration(execution_started.elapsed(), next_input_poll);
             coordinator
-                .wait_for_external_event()
+                .wait_for_external_event_for(host_wait)
                 .map_err(|error| error.to_string())?;
             continue;
         }
@@ -718,6 +736,38 @@ fn instructions_per_second(instructions: u64, elapsed: Duration) -> f64 {
     }
 }
 
+fn host_service_wait_duration(now: Duration, next_input_poll: Duration) -> Duration {
+    next_input_poll.saturating_sub(now)
+}
+
+fn button_transitions(
+    previous: EmulatedButtonState,
+    current: EmulatedButtonState,
+) -> impl Iterator<Item = (&'static str, bool)> {
+    [
+        ("A", previous.a, current.a),
+        ("B", previous.b, current.b),
+        ("X", previous.x, current.x),
+        ("Y", previous.y, current.y),
+        ("Plus", previous.plus, current.plus),
+        ("Minus", previous.minus, current.minus),
+        ("Home", previous.home, current.home),
+        ("Capture", previous.capture, current.capture),
+        ("L", previous.l, current.l),
+        ("R", previous.r, current.r),
+        ("ZL", previous.zl, current.zl),
+        ("ZR", previous.zr, current.zr),
+        ("LeftStick", previous.left_stick, current.left_stick),
+        ("RightStick", previous.right_stick, current.right_stick),
+        ("DPadUp", previous.dpad_up, current.dpad_up),
+        ("DPadDown", previous.dpad_down, current.dpad_down),
+        ("DPadLeft", previous.dpad_left, current.dpad_left),
+        ("DPadRight", previous.dpad_right, current.dpad_right),
+    ]
+    .into_iter()
+    .filter_map(|(name, previous, current)| (previous != current).then_some((name, current)))
+}
+
 fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
     let Some(exit) = exit else {
         return Err("guest execution ended without an exit record".to_owned());
@@ -820,6 +870,58 @@ mod tests {
             8_000_000.0
         );
         assert_eq!(instructions_per_second(1, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn host_service_wait_is_bounded_by_the_next_input_deadline() {
+        assert_eq!(
+            host_service_wait_duration(Duration::from_millis(7), Duration::from_millis(12)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            host_service_wait_duration(Duration::from_millis(12), Duration::from_millis(12)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            host_service_wait_duration(Duration::from_millis(13), Duration::from_millis(12)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn button_transitions_report_every_changed_emulated_button_once() {
+        let all_pressed = EmulatedButtonState {
+            a: true,
+            b: true,
+            x: true,
+            y: true,
+            plus: true,
+            minus: true,
+            home: true,
+            capture: true,
+            l: true,
+            r: true,
+            zl: true,
+            zr: true,
+            left_stick: true,
+            right_stick: true,
+            dpad_up: true,
+            dpad_down: true,
+            dpad_left: true,
+            dpad_right: true,
+        };
+
+        let pressed =
+            button_transitions(EmulatedButtonState::default(), all_pressed).collect::<Vec<_>>();
+        assert_eq!(pressed.len(), 18);
+        assert!(pressed.iter().all(|(_, state)| *state));
+        assert!(pressed.contains(&("Plus", true)));
+        assert!(pressed.contains(&("DPadRight", true)));
+        assert_eq!(button_transitions(all_pressed, all_pressed).count(), 0);
+        let released =
+            button_transitions(all_pressed, EmulatedButtonState::default()).collect::<Vec<_>>();
+        assert_eq!(released.len(), 18);
+        assert!(released.iter().all(|(_, state)| !state));
     }
 
     #[test]

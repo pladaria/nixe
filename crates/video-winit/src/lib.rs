@@ -35,6 +35,7 @@ enum FrontendEvent {
 #[derive(Clone, Debug)]
 pub struct FrontendControl {
     proxy: EventLoopProxy<FrontendEvent>,
+    worker_completion: Arc<WorkerCompletionState>,
 }
 
 impl FrontendControl {
@@ -45,7 +46,21 @@ impl FrontendControl {
 
     /// Reports that guest execution and process teardown have completed.
     pub fn worker_finished(&self) {
+        self.worker_completion.finish();
         let _ = self.proxy.send_event(FrontendEvent::WorkerFinished);
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkerCompletionState(AtomicBool);
+
+impl WorkerCompletionState {
+    fn finish(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -83,6 +98,7 @@ impl WindowFrontend {
         event_loop.set_control_flow(ControlFlow::Wait);
         let proxy = event_loop.create_proxy();
         let frame_wakeup_pending = Arc::new(AtomicBool::new(false));
+        let worker_completion = Arc::new(WorkerCompletionState::default());
         let mailbox = FrameMailbox::with_notifier(Arc::new(EventLoopFrameNotifier {
             proxy: proxy.clone(),
             pending: Arc::clone(&frame_wakeup_pending),
@@ -92,11 +108,15 @@ impl WindowFrontend {
             application: PresenterApplication {
                 mailbox,
                 stop_requested,
+                worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
                 presenter: None,
                 failure: None,
             },
-            control: FrontendControl { proxy },
+            control: FrontendControl {
+                proxy,
+                worker_completion,
+            },
         })
     }
 
@@ -363,7 +383,7 @@ impl Presenter {
     }
 
     fn redraw(&mut self) -> Result<(), WindowError> {
-        if !self.configured || self.frame_bind_group.is_none() {
+        if !self.configured {
             return Ok(());
         }
         let (surface_texture, reconfigure_after_present) = match self.surface.get_current_texture()
@@ -409,31 +429,28 @@ impl Presenter {
                 color_attachments: &attachments,
                 ..Default::default()
             });
-            let viewport = letterbox_viewport(
-                self.frame_dimensions
-                    .expect("a frame bind group has dimensions"),
-                (
-                    self.surface_configuration.width,
-                    self.surface_configuration.height,
-                ),
-            );
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(
-                0,
-                self.frame_bind_group
-                    .as_ref()
-                    .expect("the frame bind group was checked"),
-                &[],
-            );
-            pass.set_viewport(
-                viewport.x,
-                viewport.y,
-                viewport.width,
-                viewport.height,
-                0.0,
-                1.0,
-            );
-            pass.draw(0..3, 0..1);
+            if let (Some(frame_dimensions), Some(frame_bind_group)) =
+                (self.frame_dimensions, self.frame_bind_group.as_ref())
+            {
+                let viewport = letterbox_viewport(
+                    frame_dimensions,
+                    (
+                        self.surface_configuration.width,
+                        self.surface_configuration.height,
+                    ),
+                );
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, frame_bind_group, &[]);
+                pass.set_viewport(
+                    viewport.x,
+                    viewport.y,
+                    viewport.width,
+                    viewport.height,
+                    0.0,
+                    1.0,
+                );
+                pass.draw(0..3, 0..1);
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(surface_texture);
@@ -448,6 +465,7 @@ impl Presenter {
 struct PresenterApplication {
     mailbox: FrameMailbox,
     stop_requested: Arc<AtomicBool>,
+    worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
@@ -467,6 +485,10 @@ impl PresenterApplication {
 
 impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.worker_completion.is_finished() {
+            event_loop.exit();
+            return;
+        }
         if self.presenter.is_some() || self.failure.is_some() {
             return;
         }
@@ -481,9 +503,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     .map_err(WindowError::window)?,
             );
             self.presenter = Some(Presenter::new(window)?);
-            if self.mailbox.statistics().pending
-                && let Some(presenter) = &self.presenter
-            {
+            if let Some(presenter) = &self.presenter {
                 presenter.window.request_redraw();
             }
             Ok(())
@@ -549,6 +569,11 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.worker_completion.is_finished() {
+            self.presenter = None;
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
@@ -653,6 +678,16 @@ mod tests {
     }
 
     #[test]
+    fn worker_completion_is_durable_without_event_delivery() {
+        let completion = WorkerCompletionState::default();
+        assert!(!completion.is_finished());
+        completion.finish();
+        assert!(completion.is_finished());
+        completion.finish();
+        assert!(completion.is_finished());
+    }
+
+    #[test]
     fn letterbox_viewport_centres_tall_content() {
         assert_eq!(
             letterbox_viewport((1, 2), (4, 4)),
@@ -674,6 +709,28 @@ mod tests {
                 y: 0.0,
                 width: 1920.0,
                 height: 1080.0,
+            }
+        );
+    }
+
+    #[test]
+    fn letterbox_viewport_is_derived_from_each_host_resize() {
+        assert_eq!(
+            letterbox_viewport((1280, 720), (800, 800)),
+            Viewport {
+                x: 0.0,
+                y: 175.0,
+                width: 800.0,
+                height: 450.0,
+            }
+        );
+        assert_eq!(
+            letterbox_viewport((1280, 720), (2560, 720)),
+            Viewport {
+                x: 640.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 720.0,
             }
         );
     }

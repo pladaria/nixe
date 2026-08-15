@@ -2516,7 +2516,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(state.nvhost_gpu.pending_submission_count(), 0);
-            assert!(!state.nvhost_control.has_timeline(syncpoint));
+            assert!(state.nvhost_control.has_timeline(syncpoint));
         }
 
         // Recreate pending work and exercise process-wide teardown separately

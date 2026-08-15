@@ -255,7 +255,8 @@ impl NvHostControl {
         self.devices.clear();
     }
 
-    /// Allocates a process-owned channel syncpoint and its neutral timeline.
+    /// Allocates a process-owned channel syncpoint and a fresh timeline
+    /// lifetime over its persistent hardware counter value.
     ///
     /// Tegra210 exposes 192 syncpoints. Identity zero is retained for host1x
     /// conventions and channel allocation uses the remaining public range.
@@ -278,7 +279,16 @@ impl NvHostControl {
                 },
             ));
         };
-        self.ensure_timeline(descriptor, id)?;
+        let initial_value = self
+            .timelines
+            .get(&id)
+            .map(|timeline| timeline.current_point().value())
+            .unwrap_or(GuestSyncpointValue::new(0));
+        let instance = self.allocate_timeline_instance(descriptor, request)?;
+        self.timelines.insert(
+            id,
+            GuestTimeline::new(id, instance, timeline_owner(descriptor), initial_value),
+        );
         self.channel_syncpoints
             .insert(id, descriptor.owner().process_id());
         self.timelines
@@ -288,26 +298,16 @@ impl NvHostControl {
     }
 
     pub(super) fn release_channel_syncpoint(&mut self, id: GuestSyncpointId) {
-        if self.channel_syncpoints.remove(&id).is_none() {
-            return;
-        }
-        self.timelines.remove(&id);
-        self.direct_waits.retain(|_, wait| {
-            if wait.target.syncpoint() == id {
-                wait.writable.signal();
-                false
-            } else {
-                true
-            }
-        });
-        for device in self.devices.values_mut() {
-            for event in device.events.values_mut() {
-                if event.armed.is_some_and(|target| target.syncpoint() == id) {
-                    event.armed = None;
-                    event.writable.signal();
-                }
-            }
-        }
+        // Channel ownership and the hardware counter have different
+        // lifetimes. libnx closes the GPU channel independently, while fence
+        // waits continue through the process-owned nvhost-ctrl descriptor:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/gpu_channel.c#L37-L50
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/fence.c#L85-L118
+        // Retain the completed value and event registrations for those late
+        // waits. A later allocation of this numeric ID creates a fresh timeline
+        // instance at that value, discarding stale reservations without
+        // allowing them to advance the new owner.
+        self.channel_syncpoints.remove(&id);
     }
 
     /// Samples one typed GPFIFO dependency without advancing any timeline.
@@ -781,26 +781,35 @@ impl NvHostControl {
         if self.timelines.contains_key(&id) {
             return Ok(());
         }
-        let instance = self.next_timeline_instance;
-        self.next_timeline_instance = instance.checked_add(1).ok_or_else(|| {
-            NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
-                context: context(
-                    descriptor,
-                    IOCTL_SYNCPT_READ,
-                    NvDrvValidationReason::TimelineIdentityExhausted,
-                ),
-            })
-        })?;
+        let instance = self.allocate_timeline_instance(descriptor, IOCTL_SYNCPT_READ)?;
         self.timelines.insert(
             id,
             GuestTimeline::new(
                 id,
-                TimelineInstanceId::new(instance),
+                instance,
                 timeline_owner(descriptor),
                 GuestSyncpointValue::new(0),
             ),
         );
         Ok(())
+    }
+
+    fn allocate_timeline_instance(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+    ) -> Result<TimelineInstanceId, NvDrvCallError> {
+        let instance = self.next_timeline_instance;
+        self.next_timeline_instance = instance.checked_add(1).ok_or_else(|| {
+            NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                context: context(
+                    descriptor,
+                    request,
+                    NvDrvValidationReason::TimelineIdentityExhausted,
+                ),
+            })
+        })?;
+        Ok(TimelineInstanceId::new(instance))
     }
 }
 
@@ -934,6 +943,57 @@ mod tests {
             control.ioctl(descriptor(), IOCTL_SYNCPT_WAIT, &words(&[5, 1, 0])),
             Ok(NvHostCtrlIoctlOutcome::Complete(_))
         ));
+    }
+
+    #[test]
+    fn released_channel_syncpoint_preserves_completed_fences_across_reuse() {
+        let mut control = NvHostControl::default();
+        control.open(FD);
+        let allocated = control
+            .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
+            .unwrap();
+        let id = allocated.syncpoint();
+        let first_instance = control.timelines[&id].instance();
+        let reservation = control
+            .reserve_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, id, 80)
+            .unwrap();
+        control
+            .complete_immediate_channel_submission(
+                descriptor(),
+                IOCTL_SYNCPT_INCREMENT,
+                &reservation,
+                || Ok::<(), ()>(()),
+            )
+            .unwrap()
+            .unwrap();
+
+        control.release_channel_syncpoint(id);
+        assert!(!control.channel_syncpoints.contains_key(&id));
+        assert_eq!(
+            control.timelines[&id].current_point().value(),
+            GuestSyncpointValue::new(80)
+        );
+        let NvHostCtrlIoctlOutcome::Complete(wait) = control
+            .ioctl(
+                descriptor(),
+                IOCTL_SYNCPT_WAIT_EVENT,
+                &words(&[id.get(), 80, u32::MAX, 0]),
+            )
+            .unwrap()
+        else {
+            panic!("completed fence regressed after channel release")
+        };
+        assert_eq!(input_u32(&wait, 12), Ok(80));
+
+        let reused = control
+            .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
+            .unwrap();
+        assert_eq!(
+            reused,
+            GuestTimelinePoint::new(id, GuestSyncpointValue::new(80))
+        );
+        assert_ne!(control.timelines[&id].instance(), first_instance);
+        assert_eq!(control.timelines[&id].outstanding_increments(), 0);
     }
 
     #[test]
