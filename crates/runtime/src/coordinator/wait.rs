@@ -159,6 +159,21 @@ impl RuntimeCoordinator {
         Ok(report)
     }
 
+    /// Waits for external ingress only until the composition root must service
+    /// another host-owned deadline. Expiry is observable as `None` and never
+    /// manufactures guest readiness or advances virtual time.
+    pub fn wait_for_external_event_for(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<CoordinatorDrainReport>, CoordinatorError> {
+        let Some(event) = self.inbox.recv_sequenced_timeout(timeout)? else {
+            return Ok(None);
+        };
+        let mut report = CoordinatorDrainReport::default();
+        self.apply_external_event(event, &mut report)?;
+        Ok(Some(report))
+    }
+
     pub(super) fn apply_external_event(
         &mut self,
         event: crate::SequencedExternalEvent,

@@ -1925,6 +1925,86 @@ mod tests {
     }
 
     #[test]
+    fn repeated_fenced_frames_rotate_slots_and_release_every_owner() {
+        let (video, binder_id, buffer) = video_with_rgba_nvmap();
+        let syncpoint = GuestSyncpointId::new(10);
+        video.nvdrv().install_test_timeline(syncpoint);
+        {
+            let mut state = video.state.lock().unwrap();
+            let queue = state.queues.get_mut(&binder_id).unwrap();
+            for slot in [0, 1] {
+                queue.slots.insert(
+                    slot,
+                    BufferSlot {
+                        ownership: SlotOwnership::Queueing,
+                        buffer: buffer.clone(),
+                        release_fences: Box::default(),
+                    },
+                );
+            }
+        }
+
+        let mut elapsed = Duration::ZERO;
+        for (frame, slot) in [0, 1].into_iter().enumerate() {
+            let required = GuestSyncpointValue::new((frame + 1) as u32);
+            video
+                .queue_graphic_buffer(
+                    binder_id,
+                    QueuedBufferRequest {
+                        slot,
+                        buffer: buffer.clone(),
+                        input: QueueBufferInput {
+                            timestamp: frame as i64,
+                            auto_timestamp: false,
+                            crop: CropRect {
+                                left: 0,
+                                top: 0,
+                                right: 4,
+                                bottom: 4,
+                            },
+                            scaling_mode: 0,
+                            transform: 0,
+                            sticky_transform: 0,
+                            swap_interval: 1,
+                            acquire_fences: vec![NvFence {
+                                point: GuestTimelinePoint::new(syncpoint, required),
+                            }]
+                            .into_boxed_slice(),
+                        },
+                    },
+                )
+                .unwrap();
+
+            elapsed += Duration::from_millis(17);
+            assert_eq!(video.advance(elapsed).unwrap(), 1);
+            assert_eq!(video.mailbox().statistics().published, frame as u64);
+            assert_eq!(
+                video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
+                SlotOwnership::Queued
+            );
+
+            video.nvdrv().advance_test_timeline(syncpoint);
+            elapsed += Duration::from_millis(17);
+            assert_eq!(video.advance(elapsed).unwrap(), 1);
+            let published = video.mailbox().take_latest().unwrap();
+            assert_eq!((published.width(), published.height()), (4, 4));
+            assert_eq!(published.content_hash64(), 0x2e24_7804_7487_ddaf);
+            assert_eq!(
+                video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
+                SlotOwnership::Free
+            );
+        }
+
+        let statistics = video.mailbox().statistics();
+        assert_eq!(statistics.published, 2);
+        assert_eq!(statistics.consumed, 2);
+        let report = video.teardown();
+        assert_eq!(report.layers_released, 1);
+        assert_eq!(report.queues_released, 1);
+        assert_eq!(report.pending_frames_released, 0);
+    }
+
+    #[test]
     fn teardown_drops_queued_images_without_publishing_or_releasing_afterwards() {
         let (video, binder_id, buffer) = video_with_rgba_nvmap();
         {

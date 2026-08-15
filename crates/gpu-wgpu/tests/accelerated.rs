@@ -10,8 +10,8 @@ use nixe_gpu::{
     ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription, PipelineId,
     PipelineKind, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
     RenderPassDescription, RenderPassId, RenderPassOperation, ResourceDependency, SampleCount,
-    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderIoLocation,
-    ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
+    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
+    ShaderIoLocation, ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
     ShaderSourceLocation, ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute,
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
 };
@@ -320,7 +320,7 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
 }
 
 #[test]
-fn accelerated_point_draw_matches_the_reference_pixel_contract() {
+fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
     let Ok(mut initialized) = initialize_backend(
@@ -331,9 +331,12 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
-    let page = initialized_page(&[0; 4 * 4 * 4]);
+    const WIDTH: u32 = 32;
+    const HEIGHT: u32 = 32;
+    let page = initialized_page(&vec![0; (WIDTH * HEIGHT * 4) as usize]);
     let allocation = GpuAllocationId::new(2);
-    let allocation_description = GpuAllocationDescription::new(64, 4).unwrap();
+    let allocation_description =
+        GpuAllocationDescription::new(u64::from(WIDTH * HEIGHT * 4), 4).unwrap();
     initialized
         .backend
         .create_resource(BackendResourceCreateInfo::Allocation {
@@ -345,7 +348,7 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
     let image = ImageId::new(2);
     let image_description = ImageDescription::new(
         ImageDimension::Two,
-        ImageExtent::new(4, 4, 1).unwrap(),
+        ImageExtent::new(WIDTH, HEIGHT, 1).unwrap(),
         ImageFormat::Rgba8Unorm,
         ImageKind::Color,
         1,
@@ -372,8 +375,8 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
                     vec![(
                         subresources,
                         ImageMemoryLayout::PitchLinear {
-                            row_pitch: 16,
-                            layer_stride: 64,
+                            row_pitch: u64::from(WIDTH * 4),
+                            layer_stride: u64::from(WIDTH * HEIGHT * 4),
                         },
                         image_backing.clone(),
                     )],
@@ -384,12 +387,15 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         .unwrap();
 
     let mut vertex_bytes = Vec::new();
-    for component in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
+    for component in [
+        -0.5_f32, -0.5, 0.0, 1.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+        1.0,
+    ] {
         vertex_bytes.extend_from_slice(&component.to_le_bytes());
     }
     let vertex_page = initialized_page(&vertex_bytes);
     let vertex_allocation = GpuAllocationId::new(3);
-    let vertex_allocation_description = GpuAllocationDescription::new(24, 4).unwrap();
+    let vertex_allocation_description = GpuAllocationDescription::new(72, 4).unwrap();
     initialized
         .backend
         .create_resource(BackendResourceCreateInfo::Allocation {
@@ -407,11 +413,11 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         .backend
         .create_resource(BackendResourceCreateInfo::Buffer {
             id: vertex_buffer,
-            description: BufferDescription::new(24).unwrap(),
+            description: BufferDescription::new(72).unwrap(),
             view: Some(
                 BufferView::new(
                     vertex_buffer,
-                    BufferDescription::new(24).unwrap(),
+                    BufferDescription::new(72).unwrap(),
                     0,
                     vertex_backing.clone(),
                 )
@@ -429,7 +435,7 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
             description: ShaderDescription {
                 stage: ShaderStage::Vertex,
             },
-            module: constant_vertex_module(),
+            module: triangle_vertex_module(),
         })
         .unwrap();
     initialized
@@ -439,7 +445,7 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
             description: ShaderDescription {
                 stage: ShaderStage::Fragment,
             },
-            module: constant_fragment_module(),
+            module: triangle_fragment_module(),
         })
         .unwrap();
     let pipeline = PipelineId::new(1);
@@ -473,7 +479,7 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         kind: ImageKind::Color,
         format: ImageFormat::Rgba8Unorm,
         samples: SampleCount::One,
-        load: AttachmentLoad::Clear(ClearValue::Color([0.0, 0.0, 0.0, 1.0])),
+        load: AttachmentLoad::Clear(ClearValue::Color([0.2, 0.3, 0.3, 1.0])),
         store: AttachmentStore::Store,
     };
     let begin =
@@ -481,13 +487,13 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
     let draw = DrawOperation::new(
         pipeline,
         render_pass,
-        PrimitiveTopology::Points,
+        PrimitiveTopology::Triangles,
         vec![],
         vec![
             VertexBufferLayout::new(
                 BufferRegion {
                     buffer: vertex_buffer,
-                    range: BufferRange::new(0, 24).unwrap(),
+                    range: BufferRange::new(0, 72).unwrap(),
                 },
                 24,
                 VertexStepMode::Vertex,
@@ -509,13 +515,15 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         None,
         DrawArguments::NonIndexed {
             first_vertex: 0,
-            vertex_count: 1,
+            vertex_count: 3,
             first_instance: 0,
             instance_count: 1,
         },
     )
     .unwrap()
-    .with_viewport_transform(ViewportTransform::new([2.0, -2.0, 0.5], [2.0, 2.0, 0.5]).unwrap());
+    .with_viewport_transform(
+        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5]).unwrap(),
+    );
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(2),
         vec![],
@@ -553,25 +561,44 @@ fn accelerated_point_draw_matches_the_reference_pixel_contract() {
         .range()
         .complete_device_write(declaration, coordinator)
         .unwrap();
-    let mut pixels = [0_u8; 64];
+    let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     image_backing.range().read(0, &mut pixels).unwrap();
-    let red_pixels = pixels
+    let pixel = |x: u32, y: u32| {
+        let offset = ((y * WIDTH + x) * 4) as usize;
+        <[u8; 4]>::try_from(&pixels[offset..offset + 4]).unwrap()
+    };
+    let clear = pixel(0, 0);
+    assert!(clear[0].abs_diff(51) <= 1);
+    assert!(clear[1].abs_diff(77) <= 1);
+    assert!(clear[2].abs_diff(77) <= 1);
+    assert_eq!(clear[3], 255);
+    assert_eq!(pixel(WIDTH - 1, HEIGHT - 1), clear);
+
+    let top = pixel(16, 10);
+    let bottom_left = pixel(10, 22);
+    let bottom_right = pixel(22, 22);
+    assert!(top[2] > top[0] && top[2] > top[1], "top={top:?}");
+    assert!(
+        bottom_left[0] > bottom_left[1] && bottom_left[0] > bottom_left[2],
+        "bottom-left={bottom_left:?}"
+    );
+    assert!(
+        bottom_right[1] > bottom_right[0] && bottom_right[1] > bottom_right[2],
+        "bottom-right={bottom_right:?}"
+    );
+    let drawn = pixels
         .chunks_exact(4)
-        .filter(|pixel| *pixel == [255, 0, 0, 255])
+        .filter(|candidate| *candidate != clear)
         .count();
-    let black_pixels = pixels
-        .chunks_exact(4)
-        .filter(|pixel| *pixel == [0, 0, 0, 255])
-        .count();
-    assert_eq!(red_pixels, 1);
-    assert_eq!(black_pixels, 15);
+    assert!((100..=160).contains(&drawn), "drawn pixels={drawn}");
 }
 
-fn constant_vertex_module() -> nixe_gpu::ShaderBackendModule {
-    let inputs = (0..3)
-        .map(|component| {
+fn triangle_vertex_module() -> nixe_gpu::ShaderBackendModule {
+    let inputs = (0..2)
+        .flat_map(|location| (0..3).map(move |component| (location, component)))
+        .map(|(location, component)| {
             ShaderInterfaceElement::new(
-                ShaderIoLocation::Generic(0),
+                ShaderIoLocation::Generic(location),
                 component,
                 ShaderScalarType::Float32,
                 None,
@@ -580,14 +607,11 @@ fn constant_vertex_module() -> nixe_gpu::ShaderBackendModule {
         })
         .collect();
     let outputs = (0..4)
-        .map(|component| {
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Position,
-                component,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap()
+        .map(|component| (ShaderIoLocation::Position, component))
+        .chain((0..3).map(|component| (ShaderIoLocation::Generic(0), component)))
+        .map(|(location, component)| {
+            ShaderInterfaceElement::new(location, component, ShaderScalarType::Float32, None)
+                .unwrap()
         })
         .collect();
     let verified = VerifiedShaderIr::verify(ShaderIr::new(
@@ -596,88 +620,102 @@ fn constant_vertex_module() -> nixe_gpu::ShaderBackendModule {
         outputs,
         vec![],
         vec![
-            ShaderInstruction::new(
-                ShaderSourceLocation::new(8),
-                ShaderPredicate::Always,
-                ShaderOperation::LoadInput {
-                    destinations: (0..3)
-                        .map(ShaderRegister::new)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                    location: ShaderIoLocation::Generic(0),
-                    first_component: 0,
-                    scalar_type: ShaderScalarType::Float32,
-                },
-            ),
-            ShaderInstruction::new(
-                ShaderSourceLocation::new(16),
-                ShaderPredicate::Always,
-                ShaderOperation::MoveImmediate32 {
-                    destination: ShaderRegister::new(3),
-                    bits: 1.0_f32.to_bits(),
-                    scalar_type: ShaderScalarType::Float32,
-                },
-            ),
-            ShaderInstruction::new(
-                ShaderSourceLocation::new(24),
-                ShaderPredicate::Always,
-                ShaderOperation::StoreOutput {
-                    sources: (0..4)
-                        .map(ShaderRegister::new)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                    location: ShaderIoLocation::Position,
-                    first_component: 0,
-                    scalar_type: ShaderScalarType::Float32,
-                },
-            ),
-            ShaderInstruction::new(
-                ShaderSourceLocation::new(32),
-                ShaderPredicate::Always,
-                ShaderOperation::Exit,
-            ),
+            load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3),
+            move_f32(16, 3, 1.0),
+            store_output(24, 0, ShaderIoLocation::Position, 4),
+            load_input(32, 4, 0, ShaderIoLocation::Generic(1), 3),
+            store_output(40, 4, ShaderIoLocation::Generic(0), 3),
+            exit(48),
         ],
     ))
     .unwrap();
     lower_shader_ir_to_wgsl(&verified).unwrap()
 }
 
-fn constant_fragment_module() -> nixe_gpu::ShaderBackendModule {
-    constant_output_module(
+fn triangle_fragment_module() -> nixe_gpu::ShaderBackendModule {
+    let inputs = (0..3)
+        .map(|component| {
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::Generic(0),
+                component,
+                ShaderScalarType::Float32,
+                Some(ShaderInterpolation::Perspective),
+            )
+            .unwrap()
+        })
+        .collect();
+    let outputs = (0..4)
+        .map(|component| {
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::Color(0),
+                component,
+                ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let verified = VerifiedShaderIr::verify(ShaderIr::new(
         ShaderStage::Fragment,
-        ShaderIoLocation::Color(0),
-        [1.0, 0.0, 0.0, 1.0],
+        inputs,
+        outputs,
+        vec![],
+        vec![
+            load_input(8, 0, 0, ShaderIoLocation::Generic(0), 3),
+            move_f32(16, 3, 1.0),
+            store_output(24, 0, ShaderIoLocation::Color(0), 4),
+            exit(32),
+        ],
+    ))
+    .unwrap();
+    lower_shader_ir_to_wgsl(&verified).unwrap()
+}
+
+fn load_input(
+    offset: u32,
+    first_register: u16,
+    first_component: u8,
+    location: ShaderIoLocation,
+    components: u16,
+) -> ShaderInstruction {
+    ShaderInstruction::new(
+        ShaderSourceLocation::new(offset),
+        ShaderPredicate::Always,
+        ShaderOperation::LoadInput {
+            destinations: (first_register..first_register + components)
+                .map(ShaderRegister::new)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            location,
+            first_component,
+            scalar_type: ShaderScalarType::Float32,
+        },
     )
 }
 
-fn constant_output_module(
-    stage: ShaderStage,
+fn move_f32(offset: u32, destination: u16, value: f32) -> ShaderInstruction {
+    ShaderInstruction::new(
+        ShaderSourceLocation::new(offset),
+        ShaderPredicate::Always,
+        ShaderOperation::MoveImmediate32 {
+            destination: ShaderRegister::new(destination),
+            bits: value.to_bits(),
+            scalar_type: ShaderScalarType::Float32,
+        },
+    )
+}
+
+fn store_output(
+    offset: u32,
+    first_register: u16,
     location: ShaderIoLocation,
-    values: [f32; 4],
-) -> nixe_gpu::ShaderBackendModule {
-    let outputs = (0..4)
-        .map(|component| {
-            ShaderInterfaceElement::new(location, component, ShaderScalarType::Float32, None)
-                .unwrap()
-        })
-        .collect();
-    let mut instructions = Vec::new();
-    for (component, value) in values.into_iter().enumerate() {
-        instructions.push(ShaderInstruction::new(
-            ShaderSourceLocation::new(8 + component as u32 * 8),
-            ShaderPredicate::Always,
-            ShaderOperation::MoveImmediate32 {
-                destination: ShaderRegister::new(component as u16),
-                bits: value.to_bits(),
-                scalar_type: ShaderScalarType::Float32,
-            },
-        ));
-    }
-    instructions.push(ShaderInstruction::new(
-        ShaderSourceLocation::new(40),
+    components: u16,
+) -> ShaderInstruction {
+    ShaderInstruction::new(
+        ShaderSourceLocation::new(offset),
         ShaderPredicate::Always,
         ShaderOperation::StoreOutput {
-            sources: (0..4)
+            sources: (first_register..first_register + components)
                 .map(ShaderRegister::new)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -685,14 +723,13 @@ fn constant_output_module(
             first_component: 0,
             scalar_type: ShaderScalarType::Float32,
         },
-    ));
-    instructions.push(ShaderInstruction::new(
-        ShaderSourceLocation::new(48),
+    )
+}
+
+fn exit(offset: u32) -> ShaderInstruction {
+    ShaderInstruction::new(
+        ShaderSourceLocation::new(offset),
         ShaderPredicate::Always,
         ShaderOperation::Exit,
-    ));
-    let verified =
-        VerifiedShaderIr::verify(ShaderIr::new(stage, vec![], outputs, vec![], instructions))
-            .unwrap();
-    lower_shader_ir_to_wgsl(&verified).unwrap()
+    )
 }

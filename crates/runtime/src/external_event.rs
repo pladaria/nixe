@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -268,6 +270,17 @@ impl ExternalEventInbox {
             .recv()
             .map_err(|_| ExternalEventSendError::Closed)
     }
+
+    pub(crate) fn recv_sequenced_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<SequencedExternalEvent>, ExternalEventSendError> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(ExternalEventSendError::Closed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,5 +354,20 @@ mod tests {
         sender.cancel_watchers(cancelled);
         writable.signal();
         assert_eq!(inbox.try_recv_sequenced().unwrap(), None);
+    }
+
+    #[test]
+    fn bounded_receive_distinguishes_a_host_deadline_from_an_external_event() {
+        let inbox = ExternalEventInbox::bounded(1).unwrap();
+        assert_eq!(inbox.recv_sequenced_timeout(Duration::ZERO).unwrap(), None);
+
+        inbox.sender().submit(ExternalEvent::HostStop).unwrap();
+        assert_eq!(
+            inbox
+                .recv_sequenced_timeout(Duration::from_secs(1))
+                .unwrap()
+                .map(|event| event.event),
+            Some(ExternalEvent::HostStop)
+        );
     }
 }
