@@ -105,12 +105,14 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDSeparateFragmentData,
     MaxwellThreeDZCompressionMode,
 };
+pub(crate) use resource::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
 pub use resource::{
     MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDGuestImageFormat,
     MaxwellThreeDMappingReference, MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer,
     MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
-    MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias, MaxwellThreeDResourceError,
-    MaxwellThreeDResourceRole, resolve_maxwell_three_d_resources,
+    MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureReference,
+    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use rop_cache::{
     MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDRopL2CacheRequest,

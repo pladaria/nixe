@@ -11,11 +11,11 @@ use crate::{
     BackendCapabilities, BackendCapabilityError, BackendCompletionError, BackendCompletionSource,
     BackendInstanceId, BackendSubmissionToken, BufferDescription, BufferId, BufferView,
     BufferViewError, CapabilityAgreement, CapabilityRequirement, CapabilityRequirements,
-    DescriptorTableDescription, DescriptorTableId, FrontendSubmissionId, GpuAllocationDescription,
-    GpuAllocationId, ImageDescription, ImageId, ImageView, ImageViewError, OperationSubmission,
-    PipelineDescription, PipelineId, QueryPoolDescription, QueryPoolId, RenderPassDescription,
-    RenderPassId, ResourceDependency, SamplerDescription, SamplerId, ShaderBackendModule,
-    ShaderDescription, ShaderId, ShaderStage,
+    DescriptorTableBinding, DescriptorTableDescription, DescriptorTableId, FrontendSubmissionId,
+    GpuAllocationDescription, GpuAllocationId, ImageDescription, ImageId, ImageView,
+    ImageViewError, OperationSubmission, PipelineDescription, PipelineId, QueryPoolDescription,
+    QueryPoolId, RenderPassDescription, RenderPassId, ResourceDependency, SamplerDescription,
+    SamplerId, ShaderBackendModule, ShaderDescription, ShaderId, ShaderStage,
 };
 
 /// Semantic kind carried by every backend resource handle.
@@ -125,6 +125,7 @@ pub enum BackendResourceCreateInfo {
     DescriptorTable {
         id: DescriptorTableId,
         description: DescriptorTableDescription,
+        bindings: Box<[DescriptorTableBinding]>,
     },
     RenderPass {
         id: RenderPassId,
@@ -421,6 +422,11 @@ impl<D: BackendDriver> Backend<D> {
         for allocation in &backing_allocations {
             self.resolve_dependency(ResourceDependency::Allocation(*allocation))?;
         }
+        if let BackendResourceCreateInfo::DescriptorTable { bindings, .. } = &info {
+            for binding in bindings.iter() {
+                self.resolve_dependency(binding.resource)?;
+            }
+        }
 
         let (slot, generation) = next_resource_slot(&self.resources)?;
         let handle = BackendResourceHandle::new(self.instance, slot, generation, info.kind());
@@ -689,6 +695,55 @@ impl<D: BackendDriver> Backend<D> {
                         module: module.stage(),
                     },
                 ));
+            }
+            BackendResourceCreateInfo::DescriptorTable {
+                description,
+                bindings,
+                ..
+            } => {
+                if description.bindings().len() != bindings.len() {
+                    return Err(BackendError::InvalidResource(
+                        BackendResourceValidationError::DescriptorBindingCountMismatch,
+                    ));
+                }
+                for (index, binding) in bindings.iter().enumerate() {
+                    if bindings[index + 1..]
+                        .iter()
+                        .any(|other| other.binding == binding.binding)
+                    {
+                        return Err(BackendError::InvalidResource(
+                            BackendResourceValidationError::DuplicateDescriptorBinding(
+                                binding.binding,
+                            ),
+                        ));
+                    }
+                    let expected = description.bindings()[index];
+                    let valid = matches!(
+                        (expected, binding.resource),
+                        (crate::DescriptorKind::Buffer, ResourceDependency::Buffer(_))
+                            | (
+                                crate::DescriptorKind::SampledImage,
+                                ResourceDependency::Image(_)
+                            )
+                            | (
+                                crate::DescriptorKind::StorageImage,
+                                ResourceDependency::Image(_)
+                            )
+                            | (
+                                crate::DescriptorKind::Sampler,
+                                ResourceDependency::Sampler(_)
+                            )
+                    );
+                    if !valid {
+                        return Err(BackendError::InvalidResource(
+                            BackendResourceValidationError::DescriptorResourceKindMismatch {
+                                binding: binding.binding,
+                                expected,
+                                observed: dependency_kind(binding.resource),
+                            },
+                        ));
+                    }
+                }
             }
             _ => {}
         }
@@ -969,6 +1024,13 @@ pub enum BackendResourceValidationError {
         allocation_size: u64,
     },
     DescriptorBindingCountOverflow,
+    DescriptorBindingCountMismatch,
+    DuplicateDescriptorBinding(u8),
+    DescriptorResourceKindMismatch {
+        binding: u8,
+        expected: crate::DescriptorKind,
+        observed: BackendResourceKind,
+    },
 }
 
 impl Display for BackendResourceValidationError {
@@ -1001,6 +1063,20 @@ impl Display for BackendResourceValidationError {
             Self::DescriptorBindingCountOverflow => {
                 formatter.write_str("descriptor binding count is not representable")
             }
+            Self::DescriptorBindingCountMismatch => {
+                formatter.write_str("descriptor binding count contradicts its table shape")
+            }
+            Self::DuplicateDescriptorBinding(binding) => {
+                write!(formatter, "duplicate descriptor binding {binding}")
+            }
+            Self::DescriptorResourceKindMismatch {
+                binding,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "descriptor binding {binding} expects {expected:?} but names {observed:?}"
+            ),
         }
     }
 }
@@ -1097,7 +1173,7 @@ mod tests {
             [],
             BackendLimits {
                 max_color_attachments: 0,
-                max_descriptor_bindings: 0,
+                max_descriptor_bindings: 4,
                 max_compute_workgroups: [0; 3],
             },
         )
@@ -1174,6 +1250,78 @@ mod tests {
             ))
         );
         assert!(backend.driver().creates.is_empty());
+    }
+
+    #[test]
+    fn descriptor_tables_validate_explicit_binding_numbers_and_resource_kinds() {
+        let mut backend = backend(1);
+        backend.create_resource(buffer_info(1)).unwrap();
+        backend
+            .create_resource(BackendResourceCreateInfo::DescriptorTable {
+                id: DescriptorTableId::new(1),
+                description: DescriptorTableDescription::new(vec![crate::DescriptorKind::Buffer])
+                    .unwrap(),
+                bindings: vec![DescriptorTableBinding {
+                    binding: 7,
+                    resource: ResourceDependency::Buffer(BufferId::new(1)),
+                }]
+                .into_boxed_slice(),
+            })
+            .unwrap();
+
+        assert_eq!(backend.driver().creates.len(), 2);
+        assert_eq!(
+            backend.create_resource(BackendResourceCreateInfo::DescriptorTable {
+                id: DescriptorTableId::new(2),
+                description: DescriptorTableDescription::new(vec![
+                    crate::DescriptorKind::SampledImage,
+                ])
+                .unwrap(),
+                bindings: vec![DescriptorTableBinding {
+                    binding: 8,
+                    resource: ResourceDependency::Buffer(BufferId::new(1)),
+                }]
+                .into_boxed_slice(),
+            }),
+            Err(BackendError::InvalidResource(
+                BackendResourceValidationError::DescriptorResourceKindMismatch {
+                    binding: 8,
+                    expected: crate::DescriptorKind::SampledImage,
+                    observed: BackendResourceKind::Buffer,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn descriptor_tables_reject_duplicate_host_binding_numbers() {
+        let mut backend = backend(1);
+        backend.create_resource(buffer_info(1)).unwrap();
+
+        assert_eq!(
+            backend.create_resource(BackendResourceCreateInfo::DescriptorTable {
+                id: DescriptorTableId::new(1),
+                description: DescriptorTableDescription::new(vec![
+                    crate::DescriptorKind::Buffer,
+                    crate::DescriptorKind::Buffer,
+                ])
+                .unwrap(),
+                bindings: vec![
+                    DescriptorTableBinding {
+                        binding: 7,
+                        resource: ResourceDependency::Buffer(BufferId::new(1)),
+                    },
+                    DescriptorTableBinding {
+                        binding: 7,
+                        resource: ResourceDependency::Buffer(BufferId::new(1)),
+                    },
+                ]
+                .into_boxed_slice(),
+            }),
+            Err(BackendError::InvalidResource(
+                BackendResourceValidationError::DuplicateDescriptorBinding(7)
+            ))
+        );
     }
 
     #[test]

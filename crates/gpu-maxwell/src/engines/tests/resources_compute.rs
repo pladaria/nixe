@@ -558,6 +558,8 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
     assert_eq!(attachments[0].kind, nixe_gpu::ImageKind::Color);
 
     program_three_d(&mut channel, 0x12cc, 1);
+    program_three_d(&mut channel, 0x12e8, 1);
+    program_three_d(&mut channel, 0x130c, 0x201);
     let enabled_dispatch = dispatch_maxwell_engine_packet(
         &mut channel,
         FrontendSubmissionId::new(3),

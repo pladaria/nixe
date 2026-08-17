@@ -10,6 +10,7 @@ use nixe_gpu::{
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
+use crate::engines::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
 use crate::{
     MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError,
     MaxwellDmaCopyOperation, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
@@ -251,6 +252,7 @@ pub enum MaxwellSubmissionExecutionError {
         error: MaxwellGpuAccessError,
     },
     ThreeDResource(MaxwellThreeDResourceError),
+    StagedMemory(Box<MaxwellSoftwareInitializationError>),
     ThreeDLowering(MaxwellThreeDLoweringError),
     ShaderTranslation(MaxwellShaderTranslationError),
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
@@ -275,6 +277,12 @@ impl Display for MaxwellSubmissionExecutionError {
                 write!(formatter, "DMA copy range is invalid: {source}: {error}")
             }
             Self::ThreeDResource(error) => Display::fmt(error, formatter),
+            Self::StagedMemory(error) => {
+                write!(
+                    formatter,
+                    "ordered submission memory preflight failed: {error}"
+                )
+            }
             Self::ThreeDLowering(error) => Display::fmt(error, formatter),
             Self::ShaderTranslation(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
@@ -295,8 +303,9 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 /// Preflights a decoded submission in original packet and method-effect order.
 ///
 /// This function clones the frontend cache and returns the candidate. It never
-/// writes an inline payload, invokes a backend, changes scheduler state, or
-/// consumes/publishes `completion`.
+/// publishes an inline payload, invokes a backend, changes scheduler state,
+/// or consumes/publishes `completion`. Earlier writes are retained only in an
+/// atomically discardable transaction so later operations can read them.
 pub fn preflight_maxwell_submission_execution(
     packets: &[MaxwellEnginePacketDispatch],
     address_space: &MaxwellGpuAddressSpace,
@@ -310,6 +319,7 @@ pub fn preflight_maxwell_submission_execution(
     let mut prior_work_pending = false;
     let mut completion_signal_count = 0_u8;
     let mut staged_shader_writes = Vec::new();
+    let mut staged_memory_writes = CanonicalWriteBatch::new();
 
     for operation in packets
         .iter()
@@ -346,6 +356,14 @@ pub fn preflight_maxwell_submission_execution(
                     target.offset().get(),
                     upload.value(),
                 ));
+                stage_inline_write(
+                    address_space,
+                    &target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut staged_memory_writes,
+                )
+                .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
                 steps.push(MaxwellSubmissionExecutionStep::ComputeInlineToMemory {
                     upload: *upload,
                     target,
@@ -363,6 +381,14 @@ pub fn preflight_maxwell_submission_execution(
                     target.offset().get(),
                     upload.value(),
                 ));
+                stage_inline_write(
+                    address_space,
+                    &target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut staged_memory_writes,
+                )
+                .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
                 steps.push(MaxwellSubmissionExecutionStep::InlineToMemory {
                     upload: *upload,
                     target,
@@ -404,6 +430,14 @@ pub fn preflight_maxwell_submission_execution(
                         source: operation.source(),
                         error,
                     })?;
+                stage_dma_copy(
+                    address_space,
+                    *operation,
+                    &source,
+                    &destination,
+                    &mut staged_memory_writes,
+                )
+                .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
                 steps.push(MaxwellSubmissionExecutionStep::DmaCopy {
                     operation: *operation,
                     source,
@@ -429,6 +463,14 @@ pub fn preflight_maxwell_submission_execution(
                     target.offset().get(),
                     upload.value(),
                 ));
+                stage_inline_write(
+                    address_space,
+                    &target,
+                    upload.value().to_le_bytes(),
+                    upload.source(),
+                    &mut staged_memory_writes,
+                )
+                .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
                 steps.push(MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
                     upload: *upload,
                     target,
@@ -461,9 +503,18 @@ pub fn preflight_maxwell_submission_execution(
                     let translated = staged_cache
                         .stage_shader_translations(&programs, directly_addressable_memory)
                         .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
-                    let resources =
-                        resolve_maxwell_three_d_resources(operation.state(), address_space)
-                            .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                    let required_roles = translated
+                        .resources()
+                        .iter()
+                        .map(|resource| resource.role())
+                        .collect::<Vec<_>>();
+                    let resources = resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
+                        operation.state(),
+                        address_space,
+                        &required_roles,
+                        Some(&staged_memory_writes),
+                    )
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                     let plan = preflight_maxwell_three_d_operation_unnegotiated(
                         operation.state(),
                         &resources,

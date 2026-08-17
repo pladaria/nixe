@@ -116,9 +116,9 @@ pub use engines::{
     MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
     MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDResolvedBuffer,
     MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
-    MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias, MaxwellThreeDResourceError,
-    MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest, MaxwellThreeDRopL2CacheState,
-    MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleLocation,
+    MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest,
+    MaxwellThreeDRopL2CacheState, MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleLocation,
     MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
     MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
@@ -158,6 +158,7 @@ pub use engines::{
     lower_maxwell_compute_synchronization, lower_maxwell_three_d_synchronization,
     preflight_maxwell_engine_packet, preflight_maxwell_three_d_operation,
     preflight_maxwell_three_d_operation_unnegotiated, resolve_maxwell_three_d_resources,
+    resolve_maxwell_three_d_resources_for_roles,
 };
 pub use execution::{
     MaxwellBackendExecutionCompletion, MaxwellBackendExecutionError,

@@ -6,24 +6,25 @@ use std::sync::{Arc, Mutex};
 use nixe_gpu::{
     AcceptedBackendSubmission, AttachmentLoad, AttachmentStore, BackendDriver, BackendDriverError,
     BackendResourceCreateInfo, BackendResourceHandle, BackendSubmissionToken, BackingView,
-    ClearOperation, ClearValue, CopyOperation, DrawArguments, DrawOperation, GpuCommand,
-    ImageDescription, ImageDimension, ImageFormat, ImageMemoryLayout, ImageOrigin, ImageRegion,
-    ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind, PrimitiveTopology,
-    RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage, VertexBufferLayout,
-    VertexFormat, VertexStepMode, ViewportTransform,
+    ClearOperation, ClearValue, CopyOperation, DepthCompareOperation, DepthState, DrawArguments,
+    DrawOperation, GpuCommand, ImageDescription, ImageDimension, ImageFormat, ImageMemoryLayout,
+    ImageOrigin, ImageRegion, ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind,
+    PrimitiveTopology, RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage,
+    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use wgpu::{
-    Buffer, BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder,
-    CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, ErrorFilter,
-    ErrorScopeGuard, Extent3d, FragmentState, FrontFace, IndexFormat, LoadOp, MapMode,
-    MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PolygonMode,
-    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModule,
-    ShaderModuleDescriptor, ShaderSource, StencilState, StoreOp, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
-    VertexAttribute as WgpuVertexAttribute, VertexBufferLayout as WgpuVertexBufferLayout,
-    VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferDescriptor,
+    BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor,
+    CompareFunction, DepthStencilState, Device, ErrorFilter, ErrorScopeGuard, Extent3d,
+    FragmentState, FrontFace, IndexFormat, LoadOp, MapMode, MultisampleState, Operations, Origin3d,
+    PipelineCompilationOptions, PolygonMode, PrimitiveState, Queue, RenderPassColorAttachment,
+    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, StencilState,
+    StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+    TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureViewDescriptor, VertexAttribute as WgpuVertexAttribute,
+    VertexBufferLayout as WgpuVertexBufferLayout, VertexFormat as WgpuVertexFormat, VertexState,
+    VertexStepMode as WgpuVertexStepMode,
 };
 
 use crate::WgpuVisibilityCoordinator;
@@ -40,7 +41,7 @@ enum Resource {
         view: Option<nixe_gpu::ImageView>,
     },
     Sampler {
-        _sampler: wgpu::Sampler,
+        sampler: wgpu::Sampler,
     },
     Shader {
         module: ShaderModule,
@@ -50,7 +51,9 @@ enum Resource {
         description: PipelineDescription,
         render: HashMap<RenderPipelineKey, RenderPipeline>,
     },
-    DescriptorTable,
+    DescriptorTable {
+        bindings: Box<[nixe_gpu::DescriptorTableBinding]>,
+    },
     RenderPass,
     QueryPool,
 }
@@ -62,6 +65,7 @@ struct RenderPipelineKey {
     topology: PrimitiveTopology,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
+    depth_state: DepthState,
     vertex_buffers: Box<[VertexBufferLayout]>,
 }
 
@@ -551,12 +555,22 @@ impl WgpuBackendDriver {
         let depth_attachment = depth_index
             .map(|index| depth_operations(&views[index], &attachments[index]))
             .transpose()?;
+        let draw_bind_groups = operations[1..operations.len() - 1]
+            .iter()
+            .filter_map(|operation| match operation.command() {
+                GpuCommand::Draw(draw) => {
+                    Some(self.create_draw_bind_groups(dependencies, attachments, draw))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Nixe neutral render pass"),
             color_attachments: &color_attachments,
             depth_stencil_attachment: depth_attachment,
             ..Default::default()
         });
+        let mut draw_index = 0;
         for operation in &operations[1..operations.len() - 1] {
             let GpuCommand::Draw(draw) = operation.command() else {
                 continue;
@@ -573,8 +587,13 @@ impl WgpuBackendDriver {
                     buffer.slice(layout.buffer.range.offset()..layout.buffer.range.end()),
                 );
             }
-            if !draw.descriptor_tables.is_empty() {
-                return Err(unsupported("descriptor table binding"));
+            for (group, bind_group) in draw_bind_groups[draw_index].iter().enumerate() {
+                pass.set_bind_group(
+                    u32::try_from(group)
+                        .map_err(|_| unsupported("descriptor-table group overflow"))?,
+                    bind_group,
+                    &[],
+                );
             }
             if let Some(viewport) = draw.viewport_transform {
                 let viewport = webgpu_viewport(viewport)?;
@@ -627,8 +646,77 @@ impl WgpuBackendDriver {
                     );
                 }
             }
+            draw_index += 1;
         }
         Ok(())
+    }
+
+    fn create_draw_bind_groups(
+        &self,
+        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        attachments: &[RenderAttachment],
+        draw: &DrawOperation,
+    ) -> Result<Vec<BindGroup>, BackendDriverError> {
+        let pipeline = self.render_pipeline(dependencies, attachments, draw)?;
+        draw.descriptor_tables
+            .iter()
+            .enumerate()
+            .map(|(group, table)| {
+                let table_handle =
+                    dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
+                let Resource::DescriptorTable { bindings } = self.resource(table_handle)? else {
+                    return Err(kind_mismatch(table_handle));
+                };
+                let image_views = bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        let ResourceDependency::Image(image) = binding.resource else {
+                            return None;
+                        };
+                        Some(
+                            dependency_handle(dependencies, ResourceDependency::Image(image))
+                                .and_then(|handle| match self.resource(handle)? {
+                                    Resource::Image { texture, .. } => Ok((
+                                        binding.binding,
+                                        texture.create_view(&Default::default()),
+                                    )),
+                                    _ => Err(kind_mismatch(handle)),
+                                }),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let entries = bindings
+                    .iter()
+                    .map(|binding| {
+                        let handle = dependency_handle(dependencies, binding.resource)?;
+                        let resource = match self.resource(handle)? {
+                            Resource::Buffer { buffer, .. } => buffer.as_entire_binding(),
+                            Resource::Image { .. } => BindingResource::TextureView(
+                                &image_views
+                                    .iter()
+                                    .find(|(candidate, _)| *candidate == binding.binding)
+                                    .ok_or_else(|| unsupported("missing sampled-image view"))?
+                                    .1,
+                            ),
+                            Resource::Sampler { sampler } => BindingResource::Sampler(sampler),
+                            _ => return Err(kind_mismatch(handle)),
+                        };
+                        Ok(BindGroupEntry {
+                            binding: u32::from(binding.binding),
+                            resource,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, BackendDriverError>>()?;
+                let group = u32::try_from(group)
+                    .map_err(|_| unsupported("descriptor-table group overflow"))?;
+                let layout = pipeline.get_bind_group_layout(group);
+                Ok(self.device.create_bind_group(&BindGroupDescriptor {
+                    label: Some("Nixe neutral descriptor table"),
+                    layout: &layout,
+                    entries: &entries,
+                }))
+            })
+            .collect()
     }
 
     fn ensure_render_pipeline(
@@ -657,6 +745,7 @@ impl WgpuBackendDriver {
             topology: draw.topology,
             color_format,
             depth_format,
+            depth_state: draw.depth_state,
             vertex_buffers: draw.vertex_buffers.clone(),
         };
         let Resource::Pipeline {
@@ -684,8 +773,14 @@ impl WgpuBackendDriver {
                 Ok(DepthStencilState {
                     format: texture_format(format)
                         .ok_or_else(|| unsupported("depth attachment format"))?,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(CompareFunction::Always),
+                    depth_write_enabled: Some(
+                        draw.depth_state.test_enabled && draw.depth_state.write_enabled,
+                    ),
+                    depth_compare: Some(if draw.depth_state.test_enabled {
+                        compare_function(draw.depth_state.compare)
+                    } else {
+                        CompareFunction::Always
+                    }),
                     stencil: StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 })
@@ -785,6 +880,7 @@ impl WgpuBackendDriver {
                 .iter()
                 .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
                 .map(|attachment| attachment.format),
+            depth_state: draw.depth_state,
             vertex_buffers: draw.vertex_buffers.clone(),
         };
         let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
@@ -1126,26 +1222,25 @@ impl BackendDriver for WgpuBackendDriver {
                 id: _,
                 description,
                 view,
-            } => Resource::Image {
-                texture: self.device.create_texture(&TextureDescriptor {
-                    label: Some("Nixe neutral image"),
-                    size: texture_extent(*description),
-                    mip_level_count: u32::from(description.mip_levels()),
-                    sample_count: description.samples() as u32,
-                    dimension: texture_dimension(description.dimension()),
-                    format: texture_format(description.format())
-                        .ok_or_else(|| unsupported("image format"))?,
-                    usage: TextureUsages::COPY_SRC
-                        | TextureUsages::COPY_DST
-                        | TextureUsages::TEXTURE_BINDING
-                        | TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                }),
-                description: *description,
-                view: view.clone(),
-            },
+            } => {
+                let plan = image_texture_plan(description.format(), view.is_some())?;
+                Resource::Image {
+                    texture: self.device.create_texture(&TextureDescriptor {
+                        label: Some("Nixe neutral image"),
+                        size: texture_extent(*description),
+                        mip_level_count: u32::from(description.mip_levels()),
+                        sample_count: description.samples() as u32,
+                        dimension: texture_dimension(description.dimension()),
+                        format: plan.format,
+                        usage: plan.usages,
+                        view_formats: &[],
+                    }),
+                    description: *description,
+                    view: view.clone(),
+                }
+            }
             BackendResourceCreateInfo::Sampler { description, .. } => Resource::Sampler {
-                _sampler: self.device.create_sampler(&wgpu::SamplerDescriptor {
+                sampler: self.device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("Nixe neutral sampler"),
                     address_mode_u: address_mode(description.address_modes[0]),
                     address_mode_v: address_mode(description.address_modes[1]),
@@ -1174,7 +1269,11 @@ impl BackendDriver for WgpuBackendDriver {
                 description: *description,
                 render: HashMap::new(),
             },
-            BackendResourceCreateInfo::DescriptorTable { .. } => Resource::DescriptorTable,
+            BackendResourceCreateInfo::DescriptorTable { bindings, .. } => {
+                Resource::DescriptorTable {
+                    bindings: bindings.clone(),
+                }
+            }
             BackendResourceCreateInfo::RenderPass { .. } => Resource::RenderPass,
             BackendResourceCreateInfo::QueryPool { .. } => Resource::QueryPool,
         };
@@ -1318,15 +1417,67 @@ pub(crate) const fn texture_format(format: ImageFormat) -> Option<TextureFormat>
         ImageFormat::Rg32Float => TextureFormat::Rg32Float,
         ImageFormat::Rgba32Float => TextureFormat::Rgba32Float,
         ImageFormat::Depth16Unorm => TextureFormat::Depth16Unorm,
-        // `Depth24PlusStencil8` deliberately does not promise an observable
-        // 24-bit UNORM representation, so it cannot represent this neutral
-        // guest format without a conversion path.
-        ImageFormat::Depth24UnormStencil8Uint => return None,
+        // WebGPU deliberately leaves the physical depth representation opaque.
+        // It is therefore valid as an attachment but not as canonical D24S8
+        // storage. See https://www.w3.org/TR/webgpu/#texture-formats
+        ImageFormat::Depth24UnormStencil8Uint => TextureFormat::Depth24PlusStencil8,
         ImageFormat::Depth32Float => TextureFormat::Depth32Float,
         // This format requires an optional `wgpu` feature which the initial
         // device intentionally does not request.
         ImageFormat::Depth32FloatStencil8Uint => return None,
     })
+}
+
+const fn compare_function(compare: DepthCompareOperation) -> CompareFunction {
+    match compare {
+        DepthCompareOperation::Never => CompareFunction::Never,
+        DepthCompareOperation::Less => CompareFunction::Less,
+        DepthCompareOperation::Equal => CompareFunction::Equal,
+        DepthCompareOperation::LessEqual => CompareFunction::LessEqual,
+        DepthCompareOperation::Greater => CompareFunction::Greater,
+        DepthCompareOperation::NotEqual => CompareFunction::NotEqual,
+        DepthCompareOperation::GreaterEqual => CompareFunction::GreaterEqual,
+        DepthCompareOperation::Always => CompareFunction::Always,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageTexturePlan {
+    format: TextureFormat,
+    usages: TextureUsages,
+}
+
+fn image_texture_plan(
+    format: ImageFormat,
+    has_canonical_backing: bool,
+) -> Result<ImageTexturePlan, BackendDriverError> {
+    let host = texture_format(format).ok_or_else(|| unsupported("image format"))?;
+    if format == ImageFormat::Depth24UnormStencil8Uint {
+        if has_canonical_backing {
+            return Err(unsupported(
+                "canonical D24S8 transfer without an explicit depth/stencil conversion",
+            ));
+        }
+        return Ok(ImageTexturePlan {
+            format: host,
+            usages: TextureUsages::RENDER_ATTACHMENT,
+        });
+    }
+    Ok(ImageTexturePlan {
+        format: host,
+        usages: required_texture_usages(format),
+    })
+}
+
+pub(crate) fn required_texture_usages(format: ImageFormat) -> TextureUsages {
+    if format == ImageFormat::Depth24UnormStencil8Uint {
+        TextureUsages::RENDER_ATTACHMENT
+    } else {
+        TextureUsages::COPY_SRC
+            | TextureUsages::COPY_DST
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::RENDER_ATTACHMENT
+    }
 }
 
 const fn vertex_format(format: VertexFormat) -> WgpuVertexFormat {
@@ -1682,12 +1833,61 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 
 #[cfg(test)]
 mod tests {
-    use nixe_gpu::{BlockLinearLayout, ImageMemoryLayout, ViewportTransform};
+    use nixe_gpu::{
+        BlockLinearLayout, DepthCompareOperation, ImageFormat, ImageMemoryLayout, ViewportTransform,
+    };
+    use wgpu::{CompareFunction, TextureFormat, TextureUsages};
 
     use super::{
-        ImageCopyShape, WebGpuViewport, linearize_canonical_image, webgpu_viewport,
-        write_linear_image_to_canonical,
+        ImageCopyShape, WebGpuViewport, compare_function, image_texture_plan,
+        linearize_canonical_image, webgpu_viewport, write_linear_image_to_canonical,
     };
+
+    #[test]
+    fn neutral_depth_comparisons_map_exactly_to_wgpu() {
+        let cases = [
+            (DepthCompareOperation::Never, CompareFunction::Never),
+            (DepthCompareOperation::Less, CompareFunction::Less),
+            (DepthCompareOperation::Equal, CompareFunction::Equal),
+            (DepthCompareOperation::LessEqual, CompareFunction::LessEqual),
+            (DepthCompareOperation::Greater, CompareFunction::Greater),
+            (DepthCompareOperation::NotEqual, CompareFunction::NotEqual),
+            (
+                DepthCompareOperation::GreaterEqual,
+                CompareFunction::GreaterEqual,
+            ),
+            (DepthCompareOperation::Always, CompareFunction::Always),
+        ];
+        for (neutral, wgpu) in cases {
+            assert_eq!(compare_function(neutral), wgpu);
+        }
+    }
+
+    #[test]
+    fn transient_d24s8_uses_the_opaque_wgpu_attachment_format() {
+        let plan = image_texture_plan(ImageFormat::Depth24UnormStencil8Uint, false).unwrap();
+
+        assert_eq!(plan.format, TextureFormat::Depth24PlusStencil8);
+        assert_eq!(plan.usages, TextureUsages::RENDER_ATTACHMENT);
+    }
+
+    #[test]
+    fn canonical_d24s8_requires_an_explicit_conversion() {
+        let error = image_texture_plan(ImageFormat::Depth24UnormStencil8Uint, true).unwrap_err();
+
+        assert!(error.to_string().contains("canonical D24S8 transfer"));
+    }
+
+    #[test]
+    fn ordinary_images_keep_the_conservative_transfer_usage_set() {
+        let plan = image_texture_plan(ImageFormat::Rgba8Unorm, true).unwrap();
+
+        assert_eq!(plan.format, TextureFormat::Rgba8Unorm);
+        assert!(plan.usages.contains(TextureUsages::COPY_SRC));
+        assert!(plan.usages.contains(TextureUsages::COPY_DST));
+        assert!(plan.usages.contains(TextureUsages::TEXTURE_BINDING));
+        assert!(plan.usages.contains(TextureUsages::RENDER_ATTACHMENT));
+    }
 
     #[test]
     fn maxwell_negative_y_viewport_maps_exactly_to_webgpu_top_left_coordinates() {
