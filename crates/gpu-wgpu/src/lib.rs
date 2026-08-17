@@ -180,12 +180,7 @@ fn capabilities(adapter: &wgpu::Adapter, limits: &wgpu::Limits) -> BackendCapabi
             return false;
         };
         let allowed = adapter.get_texture_format_features(host).allowed_usages;
-        allowed.contains(
-            wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        )
+        allowed.contains(driver::required_texture_usages(*format))
     });
     BackendCapabilities::new(
         BackendFeatures::COPY

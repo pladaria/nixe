@@ -3,10 +3,11 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use nixe_video::{Frame, FrameMailbox, FrameNotifier};
 use wgpu::{
-    Backends, BindGroup, BindGroupLayout, Color, ColorTargetState, ColorWrites,
+    Backend, Backends, BindGroup, BindGroupLayout, Color, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor,
     ExperimentalFeatures, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor,
     LoadOp, MemoryHints, MipmapFilterMode, Operations, Origin3d, PipelineCompilationOptions,
@@ -158,6 +159,9 @@ struct Presenter {
     frame_texture: Option<Texture>,
     frame_bind_group: Option<BindGroup>,
     frame_dimensions: Option<(u32, u32)>,
+    backend_name: &'static str,
+    frame_rate: FrameRateTracker,
+    displayed_title: String,
     configured: bool,
 }
 
@@ -183,8 +187,9 @@ impl Presenter {
             .await
             .map_err(WindowError::adapter)?;
         let adapter_info = adapter.get_info();
+        let backend_name = backend_name(adapter_info.backend);
         log::info!(
-            "Vulkan presenter selected {} ({})",
+            "{backend_name} presenter selected {} ({})",
             adapter_info.name,
             adapter_info.driver
         );
@@ -280,9 +285,13 @@ impl Presenter {
             frame_texture: None,
             frame_bind_group: None,
             frame_dimensions: None,
+            backend_name,
+            frame_rate: FrameRateTracker::new(Instant::now()),
+            displayed_title: String::new(),
             configured: false,
         };
         presenter.resize(size.width, size.height);
+        presenter.refresh_title(Instant::now());
         Ok(presenter)
     }
 
@@ -302,6 +311,7 @@ impl Presenter {
         self.surface
             .configure(&self.device, &self.surface_configuration);
         self.configured = true;
+        self.update_title();
     }
 
     fn recreate_surface(&mut self) -> Result<(), WindowError> {
@@ -454,12 +464,104 @@ impl Presenter {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(surface_texture);
+        let now = Instant::now();
+        self.frame_rate.record_present();
+        self.refresh_title(now);
         if reconfigure_after_present {
             self.surface
                 .configure(&self.device, &self.surface_configuration);
         }
         Ok(())
     }
+
+    fn refresh_title(&mut self, now: Instant) {
+        if self.frame_rate.refresh(now) {
+            self.update_title();
+        } else if self.displayed_title.is_empty() {
+            self.update_title();
+        }
+    }
+
+    fn update_title(&mut self) {
+        let title = window_title(
+            self.backend_name,
+            (
+                self.surface_configuration.width,
+                self.surface_configuration.height,
+            ),
+            self.frame_rate.frames_per_second(),
+        );
+        if title != self.displayed_title {
+            self.window.set_title(&title);
+            self.displayed_title = title;
+        }
+    }
+}
+
+const TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const FRAME_RATE_SMOOTHING_WEIGHT: f64 = 0.35;
+
+#[derive(Clone, Copy, Debug)]
+struct FrameRateTracker {
+    sample_started: Instant,
+    presented_frames: u32,
+    frames_per_second: Option<f64>,
+}
+
+impl FrameRateTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            sample_started: now,
+            presented_frames: 0,
+            frames_per_second: None,
+        }
+    }
+
+    fn record_present(&mut self) {
+        self.presented_frames = self.presented_frames.saturating_add(1);
+    }
+
+    fn refresh(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.sample_started);
+        if elapsed < TITLE_REFRESH_INTERVAL {
+            return false;
+        }
+        let sample = f64::from(self.presented_frames) / elapsed.as_secs_f64();
+        self.frames_per_second = Some(match self.frames_per_second {
+            Some(previous) => {
+                previous * (1.0 - FRAME_RATE_SMOOTHING_WEIGHT)
+                    + sample * FRAME_RATE_SMOOTHING_WEIGHT
+            }
+            None => sample,
+        });
+        self.sample_started = now;
+        self.presented_frames = 0;
+        true
+    }
+
+    const fn frames_per_second(self) -> Option<f64> {
+        self.frames_per_second
+    }
+
+    fn next_refresh(self) -> Instant {
+        self.sample_started + TITLE_REFRESH_INTERVAL
+    }
+}
+
+const fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Vulkan => "Vulkan",
+        Backend::Metal => "Metal",
+        Backend::Dx12 => "Direct3D 12",
+        Backend::Gl => "OpenGL",
+        Backend::BrowserWebGpu => "WebGPU",
+        Backend::Noop => "Noop",
+    }
+}
+
+fn window_title(backend: &str, output: (u32, u32), fps: Option<f64>) -> String {
+    let fps = fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps:.1} FPS"));
+    format!("nixe - {backend} | {}×{} | {fps}", output.0, output.1)
 }
 
 struct PresenterApplication {
@@ -535,7 +637,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -550,6 +652,12 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             WindowEvent::CloseRequested => {
                 self.stop_requested.store(true, Ordering::Release);
                 self.presenter = None;
+                // Returning from `run_app` lets the CLI publish HostStop and
+                // join the guest worker through the normal teardown path.
+                // Merely recording the atomic flag would deadlock: this event
+                // loop waited for WorkerFinished while the worker waited for
+                // the HostStop sent after the event loop returned.
+                event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(presenter) = &mut self.presenter {
@@ -574,7 +682,14 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             event_loop.exit();
             return;
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
+        if let Some(presenter) = &mut self.presenter {
+            let now = Instant::now();
+            presenter.refresh_title(now);
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(presenter.frame_rate.next_refresh()));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -663,6 +778,51 @@ impl std::error::Error for WindowError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_reports_backend_output_size_and_optional_frame_rate() {
+        assert_eq!(
+            window_title("Vulkan", (1280, 720), None),
+            "nixe - Vulkan | 1280×720 | -- FPS"
+        );
+        assert_eq!(
+            window_title("Direct3D 12", (1920, 1080), Some(59.94)),
+            "nixe - Direct3D 12 | 1920×1080 | 59.9 FPS"
+        );
+    }
+
+    #[test]
+    fn frame_rate_uses_presented_frames_and_smoothed_half_second_samples() {
+        let started = Instant::now();
+        let mut tracker = FrameRateTracker::new(started);
+        for _ in 0..30 {
+            tracker.record_present();
+        }
+        assert!(!tracker.refresh(started + Duration::from_millis(499)));
+        assert!(tracker.frames_per_second().is_none());
+        assert!(tracker.refresh(started + Duration::from_millis(500)));
+        assert_eq!(tracker.frames_per_second(), Some(60.0));
+
+        for _ in 0..20 {
+            tracker.record_present();
+        }
+        assert!(tracker.refresh(started + Duration::from_millis(1000)));
+        assert_eq!(tracker.frames_per_second(), Some(53.0));
+        assert_eq!(
+            tracker.next_refresh(),
+            started + Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn every_wgpu_backend_has_a_stable_display_name() {
+        assert_eq!(backend_name(Backend::Vulkan), "Vulkan");
+        assert_eq!(backend_name(Backend::Metal), "Metal");
+        assert_eq!(backend_name(Backend::Dx12), "Direct3D 12");
+        assert_eq!(backend_name(Backend::Gl), "OpenGL");
+        assert_eq!(backend_name(Backend::BrowserWebGpu), "WebGPU");
+        assert_eq!(backend_name(Backend::Noop), "Noop");
+    }
 
     #[test]
     fn letterbox_viewport_centres_wide_content() {

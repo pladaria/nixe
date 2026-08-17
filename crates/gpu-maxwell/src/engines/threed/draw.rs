@@ -10,14 +10,15 @@ use nixe_gpu::{
     AccessMode, AccessScope, AccessTarget, AttachmentLoad, AttachmentStore, BackendCapabilities,
     BackendCapabilityError, BackendResourceCreateInfo, BarrierOperation, BufferId, BufferRange,
     BufferRegion, BufferView, CapabilityAgreement, CapabilityRequirements, ClearOperation,
-    ClearValue, CommandDescriptionError, DescriptorKind, DescriptorTableDescription,
-    DescriptorTableId, DrawArguments, DrawOperation, FrontendSubmissionId, GpuCommand,
-    GpuOperation, ImageId, ImageOrigin, ImageRegion, ImageSubresourceRange, ImageView,
-    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
-    PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId, RenderPassOperation,
-    ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, ShaderDescription,
-    ShaderId, ShaderResourceKind, ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    ClearValue, CommandDescriptionError, DepthCompareOperation, DepthState, DescriptorKind,
+    DescriptorTableBinding, DescriptorTableDescription, DescriptorTableId, DrawArguments,
+    DrawOperation, FrontendSubmissionId, GpuCommand, GpuOperation, ImageId, ImageOrigin,
+    ImageRegion, ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription,
+    PipelineId, PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment,
+    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency,
+    ResourceTransition, ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind,
+    ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+    ViewportTransform,
 };
 
 use crate::MaxwellMethodSource;
@@ -27,8 +28,9 @@ use super::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDBegin,
     MaxwellThreeDBlendEnableCommon, MaxwellThreeDClipIdTestEnable,
     MaxwellThreeDColorCompressionMode, MaxwellThreeDColorReductionThresholdsEnable,
-    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
-    MaxwellThreeDCsaaEnable, MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
+    MaxwellThreeDCompareOp, MaxwellThreeDConditionalLoadConstantBuffer,
+    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDLogicOp,
     MaxwellThreeDPatchSize, MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPointCenterMode,
@@ -133,20 +135,30 @@ impl MaxwellThreeDTranslatedShader {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderResourceUse {
     role: MaxwellThreeDResourceRole,
+    binding: u8,
+    kind: DescriptorKind,
     stages: PipelineStages,
-    usage: ResourceUsage,
+    usage: Option<ResourceUsage>,
 }
 
 impl MaxwellThreeDShaderResourceUse {
     pub fn new(
         role: MaxwellThreeDResourceRole,
+        binding: u8,
+        kind: DescriptorKind,
         stages: PipelineStages,
-        usage: ResourceUsage,
+        usage: Option<ResourceUsage>,
     ) -> Result<Self, MaxwellThreeDLoweringError> {
-        let _ = AccessScope::new(stages, AccessMode::Read, usage)
-            .map_err(|_| MaxwellThreeDLoweringError::InvalidShaderResourceUse { role })?;
+        if let Some(usage) = usage {
+            let _ = AccessScope::new(stages, AccessMode::Read, usage)
+                .map_err(|_| MaxwellThreeDLoweringError::InvalidShaderResourceUse { role })?;
+        } else if kind != DescriptorKind::Sampler {
+            return Err(MaxwellThreeDLoweringError::InvalidShaderResourceUse { role });
+        }
         Ok(Self {
             role,
+            binding,
+            kind,
             stages,
             usage,
         })
@@ -308,8 +320,15 @@ struct RenderPassRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DescriptorRecord {
     roles: Box<[MaxwellThreeDResourceRole]>,
+    bindings: Box<[u8]>,
     dependencies: Box<[ResourceDependency]>,
     id: DescriptorTableId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SamplerRecord {
+    sampler: super::MaxwellThreeDResolvedSampler,
+    id: SamplerId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -334,6 +353,7 @@ pub struct MaxwellThreeDLoweringCache {
     pipelines: Vec<PipelineRecord>,
     render_passes: Vec<RenderPassRecord>,
     descriptors: Vec<DescriptorRecord>,
+    samplers: Vec<SamplerRecord>,
     shader_translations: Vec<ShaderTranslationRecord>,
     retired_shader_resources: Vec<ResourceDependency>,
     accesses: Vec<(AccessTarget, AccessScope)>,
@@ -349,6 +369,7 @@ impl Default for MaxwellThreeDLoweringCache {
             pipelines: Vec::new(),
             render_passes: Vec::new(),
             descriptors: Vec::new(),
+            samplers: Vec::new(),
             shader_translations: Vec::new(),
             retired_shader_resources: Vec::new(),
             accesses: Vec::new(),
@@ -384,13 +405,6 @@ impl MaxwellThreeDLoweringCache {
         let mut shaders = Vec::with_capacity(programs.len());
         let mut resources: Vec<MaxwellThreeDShaderResourceUse> = Vec::new();
         for program in programs {
-            if let Some(binding) = program.texture_bindings().first() {
-                return Err(
-                    MaxwellThreeDLoweringError::TextureDescriptorMaterializationRequired {
-                        descriptor_index: binding.descriptor_index(),
-                    },
-                );
-            }
             let id = if let Some(record) = self
                 .shader_translations
                 .iter()
@@ -448,7 +462,7 @@ impl MaxwellThreeDLoweringCache {
             ));
             let stages = shader_pipeline_stages(program.stage())?;
             for resource in program.resources() {
-                let (role, usage) = match resource.kind() {
+                let (role, kind, usage) = match resource.kind() {
                     ShaderResourceKind::ConstantBuffer
                         if resource.readable() && !resource.writable() =>
                     {
@@ -457,18 +471,78 @@ impl MaxwellThreeDLoweringCache {
                                 group: program
                                     .bind_group()
                                     .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?,
-                                slot: resource.binding(),
+                                slot: program
+                                    .local_resource_binding(resource.binding())
+                                    .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?,
                             },
-                            ResourceUsage::StorageBuffer,
+                            DescriptorKind::Buffer,
+                            Some(ResourceUsage::StorageBuffer),
+                        )
+                    }
+                    ShaderResourceKind::SampledImage
+                        if resource.readable() && !resource.writable() =>
+                    {
+                        let texture = program
+                            .texture_bindings()
+                            .iter()
+                            .copied()
+                            .find(|binding| binding.image_binding() == resource.binding())
+                            .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+                        (
+                            MaxwellThreeDResourceRole::SampledImage(
+                                super::MaxwellThreeDTextureReference::new(
+                                    program.bind_group().ok_or(
+                                        MaxwellThreeDLoweringError::InvalidTranslatedShaders,
+                                    )?,
+                                    program.texture_constant_buffer_slot().ok_or(
+                                        MaxwellThreeDLoweringError::InvalidTranslatedShaders,
+                                    )?,
+                                    texture.constant_buffer_byte_offset(),
+                                ),
+                            ),
+                            DescriptorKind::SampledImage,
+                            Some(ResourceUsage::SampledImage),
+                        )
+                    }
+                    ShaderResourceKind::Sampler if resource.readable() && !resource.writable() => {
+                        let texture = program
+                            .texture_bindings()
+                            .iter()
+                            .copied()
+                            .find(|binding| binding.sampler_binding() == resource.binding())
+                            .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+                        (
+                            MaxwellThreeDResourceRole::Sampler(
+                                super::MaxwellThreeDTextureReference::new(
+                                    program.bind_group().ok_or(
+                                        MaxwellThreeDLoweringError::InvalidTranslatedShaders,
+                                    )?,
+                                    program.texture_constant_buffer_slot().ok_or(
+                                        MaxwellThreeDLoweringError::InvalidTranslatedShaders,
+                                    )?,
+                                    texture.constant_buffer_byte_offset(),
+                                ),
+                            ),
+                            DescriptorKind::Sampler,
+                            None,
                         )
                     }
                     _ => return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders),
                 };
                 if let Some(existing) = resources.iter_mut().find(|existing| existing.role == role)
                 {
+                    if existing.binding != resource.binding() || existing.kind != kind {
+                        return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders);
+                    }
                     existing.stages = existing.stages.union(stages);
                 } else {
-                    resources.push(MaxwellThreeDShaderResourceUse::new(role, stages, usage)?);
+                    resources.push(MaxwellThreeDShaderResourceUse::new(
+                        role,
+                        resource.binding(),
+                        kind,
+                        stages,
+                        usage,
+                    )?);
                 }
             }
         }
@@ -1210,6 +1284,12 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         &mut creations,
         &mut invalidations,
     )?;
+    let sampler_bindings = prepare_samplers(
+        resources,
+        &mut candidate,
+        &mut creations,
+        &mut invalidations,
+    )?;
     let (commands, dirty_images) = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { source: _ } => {
             let lowered = lower_clear(state, resources, &resource_bindings)?;
@@ -1227,6 +1307,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
                 state,
                 resources,
                 &resource_bindings,
+                &sampler_bindings,
                 shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?,
                 attachments,
                 vertex_count,
@@ -1931,7 +2012,9 @@ fn draw_resource_indices(
         }
     }
     for resource in shaders.resources() {
-        indices.push(resource_index(resources, resource.role())?);
+        if !matches!(resource.role(), MaxwellThreeDResourceRole::Sampler(_)) {
+            indices.push(resource_index(resources, resource.role())?);
+        }
     }
     indices.sort_unstable();
     indices.dedup();
@@ -2027,6 +2110,48 @@ fn draw_depth_stencil_aspects(state: &MaxwellThreeDState) -> (bool, bool) {
         boolean(MaxwellThreeDFixedFunctionRegister::DepthTestEnable).unwrap_or(true),
         boolean(MaxwellThreeDFixedFunctionRegister::StencilTestEnable).unwrap_or(true),
     )
+}
+
+fn draw_depth_state(state: &MaxwellThreeDState) -> Result<DepthState, MaxwellThreeDLoweringError> {
+    let register = |register| state.fixed_function().register(register).value();
+    let Some(MaxwellThreeDFixedFunctionValue::Boolean(test_enabled)) =
+        register(MaxwellThreeDFixedFunctionRegister::DepthTestEnable)
+    else {
+        return Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_DEPTH_TEST"));
+    };
+    if !test_enabled {
+        return Ok(DepthState::DISABLED);
+    }
+    let Some(MaxwellThreeDFixedFunctionValue::Boolean(write_enabled)) =
+        register(MaxwellThreeDFixedFunctionRegister::DepthWriteEnable)
+    else {
+        return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_DEPTH_WRITE",
+        ));
+    };
+    let Some(MaxwellThreeDFixedFunctionValue::Compare(compare)) =
+        register(MaxwellThreeDFixedFunctionRegister::DepthCompare)
+    else {
+        return Err(MaxwellThreeDLoweringError::IncompleteDraw("SET_DEPTH_FUNC"));
+    };
+    Ok(DepthState::new(
+        true,
+        *write_enabled,
+        neutral_depth_compare(*compare),
+    ))
+}
+
+const fn neutral_depth_compare(compare: MaxwellThreeDCompareOp) -> DepthCompareOperation {
+    match compare {
+        MaxwellThreeDCompareOp::Never => DepthCompareOperation::Never,
+        MaxwellThreeDCompareOp::Less => DepthCompareOperation::Less,
+        MaxwellThreeDCompareOp::Equal => DepthCompareOperation::Equal,
+        MaxwellThreeDCompareOp::LessEqual => DepthCompareOperation::LessEqual,
+        MaxwellThreeDCompareOp::Greater => DepthCompareOperation::Greater,
+        MaxwellThreeDCompareOp::NotEqual => DepthCompareOperation::NotEqual,
+        MaxwellThreeDCompareOp::GreaterEqual => DepthCompareOperation::GreaterEqual,
+        MaxwellThreeDCompareOp::Always => DepthCompareOperation::Always,
+    }
 }
 
 #[cfg(test)]
@@ -2314,6 +2439,82 @@ fn binding_at(
     )
 }
 
+fn prepare_samplers(
+    resources: &MaxwellThreeDResolvedResources,
+    cache: &mut MaxwellThreeDLoweringCache,
+    creations: &mut Vec<BackendResourceCreateInfo>,
+    invalidations: &mut Vec<ResourceDependency>,
+) -> Result<Vec<(MaxwellThreeDResourceRole, ResourceDependency)>, MaxwellThreeDLoweringError> {
+    let mut result = Vec::with_capacity(resources.samplers().len());
+    for sampler in resources.samplers().iter().copied() {
+        if let Some(record) = cache
+            .samplers
+            .iter()
+            .find(|record| record.sampler == sampler)
+            .copied()
+        {
+            result.push((sampler.role(), ResourceDependency::Sampler(record.id)));
+            continue;
+        }
+        let retired = cache
+            .samplers
+            .iter()
+            .filter(|record| record.sampler.role() == sampler.role())
+            .map(|record| ResourceDependency::Sampler(record.id))
+            .collect::<Vec<_>>();
+        cache
+            .samplers
+            .retain(|record| record.sampler.role() != sampler.role());
+        let retired_descriptors = cache
+            .descriptors
+            .iter()
+            .filter(|record| {
+                record
+                    .dependencies
+                    .iter()
+                    .any(|dependency| retired.contains(dependency))
+            })
+            .map(|record| ResourceDependency::DescriptorTable(record.id))
+            .collect::<Vec<_>>();
+        cache.descriptors.retain(|record| {
+            !retired_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
+        });
+        for dependency in retired.into_iter().chain(retired_descriptors) {
+            if !invalidations.contains(&dependency) {
+                invalidations.push(dependency);
+            }
+        }
+        let id = SamplerId::new(take_identity(cache)?);
+        creations.push(BackendResourceCreateInfo::Sampler {
+            id,
+            description: sampler.description().map_err(|_| {
+                MaxwellThreeDLoweringError::InvalidResolvedView {
+                    role: sampler.role(),
+                }
+            })?,
+        });
+        cache.samplers.push(SamplerRecord { sampler, id });
+        result.push((sampler.role(), ResourceDependency::Sampler(id)));
+    }
+    Ok(result)
+}
+
+fn shader_resource_dependency(
+    resources: &MaxwellThreeDResolvedResources,
+    bindings: &[Option<ResourceDependency>],
+    samplers: &[(MaxwellThreeDResourceRole, ResourceDependency)],
+    role: MaxwellThreeDResourceRole,
+) -> Result<ResourceDependency, MaxwellThreeDLoweringError> {
+    if let MaxwellThreeDResourceRole::Sampler(_) = role {
+        return samplers
+            .iter()
+            .find_map(|(candidate, dependency)| (*candidate == role).then_some(*dependency))
+            .ok_or(MaxwellThreeDLoweringError::MissingResolvedResource { role });
+    }
+    let index = resource_index(resources, role)?;
+    binding_at(resources, bindings, index)
+}
+
 fn clear_image_region(
     image: ImageId,
     subresources: ImageSubresourceRange,
@@ -2514,6 +2715,7 @@ fn lower_draw(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     bindings: &[Option<ResourceDependency>],
+    sampler_bindings: &[(MaxwellThreeDResourceRole, ResourceDependency)],
     shaders: &MaxwellThreeDTranslatedShaders,
     attachment_selection: &DrawAttachmentSelection,
     vertex_count: u32,
@@ -2676,36 +2878,53 @@ fn lower_draw(
         .iter()
         .map(|resource| resource.role)
         .collect::<Vec<_>>();
+    let descriptor_binding_numbers = shaders
+        .resources
+        .iter()
+        .map(|resource| resource.binding)
+        .collect::<Vec<_>>();
     let descriptor_dependencies = shaders
         .resources
         .iter()
         .map(|resource| {
-            resource_index(resources, resource.role)
-                .and_then(|index| binding_at(resources, bindings, index))
+            shader_resource_dependency(resources, bindings, sampler_bindings, resource.role)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let descriptor_tables = if descriptor_roles.is_empty() {
         Vec::new()
     } else if let Some(record) = cache.descriptors.iter().find(|record| {
         record.roles.as_ref() == descriptor_roles.as_slice()
+            && record.bindings.as_ref() == descriptor_binding_numbers.as_slice()
             && record.dependencies.as_ref() == descriptor_dependencies.as_slice()
     }) {
         vec![record.id]
     } else {
         let id = DescriptorTableId::new(take_identity(cache)?);
         let description = DescriptorTableDescription::new(
-            descriptor_roles
+            shaders
+                .resources
                 .iter()
-                .map(|role| descriptor_kind(*role))
+                .map(|resource| resource.kind)
                 .collect(),
         )
         .map_err(|_| MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
         cache.descriptors.push(DescriptorRecord {
             roles: descriptor_roles.into_boxed_slice(),
+            bindings: descriptor_binding_numbers.clone().into_boxed_slice(),
             dependencies: descriptor_dependencies.clone().into_boxed_slice(),
             id,
         });
-        creations.push(BackendResourceCreateInfo::DescriptorTable { id, description });
+        creations.push(BackendResourceCreateInfo::DescriptorTable {
+            id,
+            description,
+            bindings: descriptor_binding_numbers
+                .iter()
+                .copied()
+                .zip(descriptor_dependencies.iter().copied())
+                .map(|(binding, resource)| DescriptorTableBinding { binding, resource })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
         vec![id]
     };
 
@@ -2750,6 +2969,14 @@ fn lower_draw(
         .map(|shader| ResourceDependency::Shader(shader.shader))
         .collect::<Vec<_>>();
     for resource_use in &shaders.resources {
+        let dependency =
+            shader_resource_dependency(resources, bindings, sampler_bindings, resource_use.role)?;
+        if !shader_dependencies.contains(&dependency) {
+            shader_dependencies.push(dependency);
+        }
+        let Some(usage) = resource_use.usage else {
+            continue;
+        };
         let index = resource_index(resources, resource_use.role)?;
         let target = match &resources.resources()[index] {
             MaxwellThreeDResolvedResource::Buffer(buffer) => AccessTarget::Buffer {
@@ -2767,16 +2994,12 @@ fn lower_draw(
         };
         shader_accesses.push(ResourceAccess::new(
             target,
-            AccessScope::new(resource_use.stages, AccessMode::Read, resource_use.usage).map_err(
-                |_| MaxwellThreeDLoweringError::InvalidShaderResourceUse {
+            AccessScope::new(resource_use.stages, AccessMode::Read, usage).map_err(|_| {
+                MaxwellThreeDLoweringError::InvalidShaderResourceUse {
                     role: resource_use.role,
-                },
-            )?,
+                }
+            })?,
         ));
-        let dependency = binding_at(resources, bindings, index)?;
-        if !shader_dependencies.contains(&dependency) {
-            shader_dependencies.push(dependency);
-        }
     }
     let mut draw = DrawOperation::new(
         pipeline,
@@ -2795,6 +3018,9 @@ fn lower_draw(
     .map_err(MaxwellThreeDLoweringError::Command)?;
     if let Some(viewport_transform) = draw_viewport_transform(state)? {
         draw = draw.with_viewport_transform(viewport_transform);
+    }
+    if attachment_selection.depth_stencil.is_some() {
+        draw = draw.with_depth_state(draw_depth_state(state)?);
     }
     let begin = RenderPassOperation::begin(render_pass, render_pass_description, attachments)
         .map_err(MaxwellThreeDLoweringError::Command)?;
@@ -3174,16 +3400,6 @@ fn image_dependency(dependency: ResourceDependency) -> Result<ImageId, MaxwellTh
     }
 }
 
-fn descriptor_kind(role: MaxwellThreeDResourceRole) -> DescriptorKind {
-    match role {
-        MaxwellThreeDResourceRole::Samplers => DescriptorKind::Sampler,
-        MaxwellThreeDResourceRole::TextureHeaders => DescriptorKind::SampledImage,
-        MaxwellThreeDResourceRole::ColorTarget(_)
-        | MaxwellThreeDResourceRole::DepthStencilTarget => DescriptorKind::StorageImage,
-        _ => DescriptorKind::Buffer,
-    }
-}
-
 fn dependency_matches_target(dependency: ResourceDependency, target: AccessTarget) -> bool {
     matches!(
         (dependency, target),
@@ -3311,9 +3527,6 @@ pub enum MaxwellThreeDLoweringError {
         target: u8,
     },
     ShaderTranslationRequired,
-    TextureDescriptorMaterializationRequired {
-        descriptor_index: u16,
-    },
     InvalidTranslatedShaders,
     TranslatedShaderStageMismatch,
     TranslatedShaderMemoryConfigurationMismatch {
@@ -3625,10 +3838,6 @@ impl Display for MaxwellThreeDLoweringError {
             Self::ShaderTranslationRequired => {
                 formatter.write_str("Maxwell shader translation is required before draw lowering")
             }
-            Self::TextureDescriptorMaterializationRequired { descriptor_index } => write!(
-                formatter,
-                "Maxwell texture descriptor {descriptor_index} requires image and sampler materialization before draw lowering"
-            ),
             Self::InvalidTranslatedShaders => {
                 formatter.write_str("translated shader evidence is empty, duplicated, or invalid")
             }
@@ -3763,13 +3972,46 @@ const fn vertex_array_restart_is_neutral(topology: u8, vertex_count: u32) -> boo
 
 #[cfg(test)]
 mod tests {
-    use nixe_gpu::VertexFormat;
+    use nixe_gpu::{DepthCompareOperation, VertexFormat};
 
-    use crate::MaxwellThreeDVertexAttributeFormat;
+    use crate::{MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
     use super::{
-        depth_stencil_attachment_required, neutral_vertex_format, vertex_array_restart_is_neutral,
+        depth_stencil_attachment_required, neutral_depth_compare, neutral_vertex_format,
+        vertex_array_restart_is_neutral,
     };
+
+    #[test]
+    fn every_maxwell_depth_comparison_has_an_exact_neutral_mapping() {
+        let cases = [
+            (MaxwellThreeDCompareOp::Never, DepthCompareOperation::Never),
+            (MaxwellThreeDCompareOp::Less, DepthCompareOperation::Less),
+            (MaxwellThreeDCompareOp::Equal, DepthCompareOperation::Equal),
+            (
+                MaxwellThreeDCompareOp::LessEqual,
+                DepthCompareOperation::LessEqual,
+            ),
+            (
+                MaxwellThreeDCompareOp::Greater,
+                DepthCompareOperation::Greater,
+            ),
+            (
+                MaxwellThreeDCompareOp::NotEqual,
+                DepthCompareOperation::NotEqual,
+            ),
+            (
+                MaxwellThreeDCompareOp::GreaterEqual,
+                DepthCompareOperation::GreaterEqual,
+            ),
+            (
+                MaxwellThreeDCompareOp::Always,
+                DepthCompareOperation::Always,
+            ),
+        ];
+        for (maxwell, neutral) in cases {
+            assert_eq!(neutral_depth_compare(maxwell), neutral);
+        }
+    }
 
     #[test]
     fn depth_stencil_attachment_is_omitted_only_when_both_tests_are_explicitly_disabled() {

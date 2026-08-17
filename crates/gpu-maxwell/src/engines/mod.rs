@@ -35,6 +35,7 @@ pub use inline_to_memory::{
     MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
     MaxwellInlineToMemoryStateWrite, MaxwellInlineToMemoryUpload,
 };
+pub(crate) use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT,
@@ -99,9 +100,9 @@ pub use threed::{
     MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
     MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDResolvedBuffer,
     MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
-    MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias, MaxwellThreeDResourceError,
-    MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest, MaxwellThreeDRopL2CacheState,
-    MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleLocation,
+    MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest,
+    MaxwellThreeDRopL2CacheState, MaxwellThreeDRopL2CacheStateWrite, MaxwellThreeDSampleLocation,
     MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
     MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
@@ -132,6 +133,7 @@ pub use threed::{
     MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation,
     preflight_maxwell_three_d_operation_unnegotiated, resolve_maxwell_three_d_resources,
+    resolve_maxwell_three_d_resources_for_roles,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDClipEnable,

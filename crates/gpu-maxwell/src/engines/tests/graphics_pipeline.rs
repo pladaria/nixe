@@ -2201,6 +2201,19 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         binding.stage().value(),
         Some(&MaxwellThreeDShaderStage::Geometry)
     );
+    assert_eq!(binding.group().value(), Some(&0));
+    assert_eq!(binding.effective_group(), Some(3));
+    assert!(
+        channel.three_d().shader_bindings().stage_visibility(3)
+            [MaxwellThreeDShaderStage::Geometry as usize]
+    );
+    program_three_d(&mut channel, 0x20d0, 6);
+    let binding = &channel.three_d().shader_bindings().pipeline()[3];
+    assert_eq!(
+        binding.group().origin(),
+        MaxwellThreeDRegisterOrigin::Programmed
+    );
+    assert_eq!(binding.effective_group(), Some(6));
     assert_eq!(
         channel
             .three_d()

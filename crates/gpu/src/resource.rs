@@ -435,6 +435,16 @@ pub enum DescriptorKind {
     Sampler,
 }
 
+/// One explicitly numbered neutral descriptor-table binding.
+///
+/// The binding names a logical resource rather than a backend handle so the
+/// validated backend boundary remains instance- and API-independent.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DescriptorTableBinding {
+    pub binding: u8,
+    pub resource: crate::ResourceDependency,
+}
+
 /// Immutable descriptor-table shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DescriptorTableDescription {

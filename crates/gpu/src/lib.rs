@@ -38,10 +38,11 @@ pub use capability::{
 };
 pub use command::{
     AttachmentLoad, AttachmentStore, BarrierOperation, BufferRegion, CacheMaintenanceOperation,
-    ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DispatchOperation,
-    DrawArguments, DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
-    OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
+    ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DepthCompareOperation,
+    DepthState, DispatchOperation, DrawArguments, DrawOperation, GpuCommand, GpuOperation,
+    ImageOrigin, ImageRegion, IndexType, OperationSubmission, PrimitiveTopology, QueryOperation,
+    RenderAttachment, RenderPassOperation, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexStepMode, ViewportTransform,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,
@@ -54,12 +55,12 @@ pub use diagnostics::{
 };
 pub use nixe_memory::{CanonicalBackingSegment, MappingGeneration};
 pub use resource::{
-    AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableDescription,
-    DescriptorTableId, FilterMode, ImageDescription, ImageDimension, ImageExtent, ImageFormat,
-    ImageId, ImageKind, PipelineDescription, PipelineId, PipelineKind, QueryKind,
-    QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription, RenderPassDescription,
-    RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription, SamplerId,
-    ShaderDescription, ShaderId, ShaderStage,
+    AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableBinding,
+    DescriptorTableDescription, DescriptorTableId, FilterMode, ImageDescription, ImageDimension,
+    ImageExtent, ImageFormat, ImageId, ImageKind, PipelineDescription, PipelineId, PipelineKind,
+    QueryKind, QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription,
+    RenderPassDescription, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
+    SamplerId, ShaderDescription, ShaderId, ShaderStage,
 };
 pub use runtime::{
     BackendExecutionCompletion, BackendRuntimeError, NeutralBackendRuntime,

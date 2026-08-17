@@ -148,6 +148,7 @@ pub(crate) struct MaxwellShaderTranslationKey {
     options: MaxwellShaderTranslationOptions,
     source_segments: Box<[MaxwellShaderSourceSegment]>,
     staged_overlay: Box<[MaxwellStagedShaderWrite]>,
+    resource_binding_remap: Box<[(u8, u8)]>,
 }
 
 impl MaxwellShaderTranslationKey {
@@ -167,12 +168,13 @@ pub(crate) struct MaxwellTranslatedShaderProgram {
     ir: VerifiedShaderIr,
     module: ShaderBackendModule,
     maximum_api_visible_calls: u16,
+    texture_constant_buffer_slot: Option<u8>,
     texture_bindings: Box<[MaxwellTextureResourceBinding]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellTextureResourceBinding {
-    descriptor_index: u16,
+    constant_buffer_byte_offset: u32,
     image_binding: u8,
     sampler_binding: u8,
 }
@@ -194,6 +196,13 @@ impl MaxwellTranslatedShaderProgram {
         self.ir.ir().resources()
     }
 
+    pub(crate) fn local_resource_binding(&self, neutral_binding: u8) -> Option<u8> {
+        self.key
+            .resource_binding_remap
+            .iter()
+            .find_map(|(local, neutral)| (*neutral == neutral_binding).then_some(*local))
+    }
+
     pub(crate) const fn module(&self) -> &ShaderBackendModule {
         &self.module
     }
@@ -202,14 +211,24 @@ impl MaxwellTranslatedShaderProgram {
         self.maximum_api_visible_calls
     }
 
+    pub(crate) const fn texture_constant_buffer_slot(&self) -> Option<u8> {
+        self.texture_constant_buffer_slot
+    }
+
     pub(crate) fn texture_bindings(&self) -> &[MaxwellTextureResourceBinding] {
         &self.texture_bindings
     }
 }
 
 impl MaxwellTextureResourceBinding {
-    pub(crate) const fn descriptor_index(self) -> u16 {
-        self.descriptor_index
+    pub(crate) const fn constant_buffer_byte_offset(self) -> u32 {
+        self.constant_buffer_byte_offset
+    }
+    pub(crate) const fn image_binding(self) -> u8 {
+        self.image_binding
+    }
+    pub(crate) const fn sampler_binding(self) -> u8 {
+        self.sampler_binding
     }
 }
 
@@ -369,6 +388,11 @@ pub enum MaxwellShaderTranslationError {
         stage: MaxwellThreeDShaderStage,
         address: u64,
     },
+    ResourceBindingExhausted,
+    MissingResourceBindingRemap {
+        stage: MaxwellThreeDShaderStage,
+        binding: u8,
+    },
 }
 
 impl Display for MaxwellShaderTranslationError {
@@ -485,6 +509,13 @@ impl Display for MaxwellShaderTranslationError {
             Self::SourceChangedDuringRead { stage, address } => write!(
                 formatter,
                 "Maxwell {stage:?} shader source changed while it was read at gpu-va=0x{address:010x}"
+            ),
+            Self::ResourceBindingExhausted => formatter.write_str(
+                "translated Maxwell shader resources exceed the neutral eight-bit binding space",
+            ),
+            Self::MissingResourceBindingRemap { stage, binding } => write!(
+                formatter,
+                "Maxwell {stage:?} shader resource {binding} has no neutral binding allocation"
             ),
         }
     }
@@ -681,7 +712,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
 /// Attribute addresses follow Mesa NAK's pinned public Maxwell ABI constants:
 /// https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak_private.h#L45-L57
 ///
-/// The implemented EXIT, BRA, SSY, SYNC, ALD, AST, MOV32I, IPA, MUFU, FMUL,
+/// The implemented EXIT, BRA, SSY, SYNC, ALD, AST, MOV32I, IPA, RRO/MUFU, FMUL,
 /// FFMA, FADD, and FSETP encodings are derived from Mesa NAK's pinned SM50 encoder and
 /// opcode tables, rather than from the captured shader binaries:
 /// https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs
@@ -699,6 +730,7 @@ fn translate_shader_binary(
     let mut next_temporary = u16::from(register_count);
     let mut explicitly_stored = BTreeSet::new();
     let mut active_reconvergence_targets = Vec::new();
+    let mut pending_range_reduction = None;
     let mut exited = false;
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
@@ -710,6 +742,17 @@ fn translate_shader_binary(
                 + (slot * MAXWELL_INSTRUCTION_SIZE) as u32;
             let source = ShaderSourceLocation::new(offset);
             let predicate = decode_predicate(encoding);
+
+            if let Some(range_reduction) = pending_range_reduction.as_ref()
+                && !is_compatible_mufu(range_reduction, encoding, predicate)
+            {
+                return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    stage,
+                    instruction_offset: range_reduction.offset,
+                    encoding: range_reduction.encoding,
+                    detail: "RRO result is not consumed by an adjacent compatible MUFU",
+                });
+            }
 
             // A reconvergence target describes a structured control-flow
             // region, not a one-shot SSY/SYNC pair. Several mutually
@@ -778,6 +821,18 @@ fn translate_shader_binary(
                 continue;
             }
 
+            if is_range_reduction(encoding) {
+                pending_range_reduction = Some(decode_range_reduction(
+                    stage,
+                    offset,
+                    encoding,
+                    predicate,
+                    register_count,
+                    &mut next_temporary,
+                )?);
+                continue;
+            }
+
             let operation = if is_branch(encoding) {
                 ShaderOperation::Branch {
                     target: decode_shader_control_target(stage, offset, encoding, code_size)?,
@@ -825,6 +880,26 @@ fn translate_shader_binary(
             } else if is_interpolate(encoding) {
                 decode_interpolate(stage, offset, encoding, register_count, &inputs)?
             } else if is_mufu(encoding) {
+                if let Some(range_reduction) = pending_range_reduction.take() {
+                    if let Some(binding) = range_reduction.constant_buffer_binding {
+                        constant_buffer_bindings.insert(binding);
+                    }
+                    let operation = decode_range_reduced_mufu(
+                        stage,
+                        offset,
+                        encoding,
+                        register_count,
+                        &range_reduction,
+                    )?;
+                    append_expanded_operations(
+                        &mut instructions,
+                        range_reduction.source,
+                        range_reduction.predicate,
+                        range_reduction.preparation,
+                    );
+                    instructions.push(ShaderInstruction::new(source, predicate, operation));
+                    continue;
+                }
                 let operations =
                     decode_mufu(stage, offset, encoding, register_count, &mut next_temporary)?;
                 append_expanded_operations(&mut instructions, source, predicate, operations);
@@ -1299,6 +1374,11 @@ const fn is_mufu(encoding: u64) -> bool {
     ((encoding >> 48) as u16) & 0xfffe == 0x5080
 }
 
+const fn is_range_reduction(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    opcode & 0xfff8 == 0x5c90 || opcode & 0xfff8 == 0x4c90 || opcode & 0xfef8 == 0x3890
+}
+
 const fn is_float_multiply(encoding: u64) -> bool {
     let opcode = (encoding >> 48) as u16;
     opcode & 0xfffa == 0x5c68 || opcode & 0xfffa == 0x4c68 || opcode & 0xfefa == 0x3868
@@ -1339,6 +1419,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_move(encoding)
         || is_texture_sample_simplified(encoding)
         || is_interpolate(encoding)
+        || is_range_reduction(encoding)
         || is_mufu(encoding)
         || is_float_min_max(encoding)
         || is_float_multiply(encoding)
@@ -1370,7 +1451,12 @@ fn decode_texture_sample_simplified(
     let x_coordinate = ((encoding >> 8) & 0xff) as u8;
     let y_coordinate = ((encoding >> 20) & 0xff) as u8;
     let secondary_destination = ((encoding >> 28) & 0xff) as u8;
-    let descriptor_index = ((encoding >> 36) & 0x1fff) as u16;
+    // TEXS stores a dword offset into SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT,
+    // not a TIC index. The u32 fetched there is the raw TIC/TSC handle. This
+    // distinction is visible in yuzu's pinned Maxwell translator:
+    // https://github.com/yuzu-emu/yuzu/blob/55bf3dbf5ddaa3f7c1c3efade5553b07499fe289/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp#L28-L72
+    let constant_buffer_dword_offset = ((encoding >> 36) & 0x1fff) as u16;
+    let constant_buffer_byte_offset = u32::from(constant_buffer_dword_offset) * 4;
     validate_register_range(stage, offset, encoding, x_coordinate, 1, register_count)?;
     validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
 
@@ -1424,7 +1510,7 @@ fn decode_texture_sample_simplified(
         )?;
     }
 
-    let binding = if let Some(binding) = bindings.get(&descriptor_index).copied() {
+    let binding = if let Some(binding) = bindings.get(&constant_buffer_dword_offset).copied() {
         binding
     } else {
         let next_pair = u8::try_from(32 + bindings.len() * 2).map_err(|_| {
@@ -1436,7 +1522,7 @@ fn decode_texture_sample_simplified(
             )
         })?;
         let binding = MaxwellTextureResourceBinding {
-            descriptor_index,
+            constant_buffer_byte_offset,
             image_binding: next_pair,
             sampler_binding: next_pair.checked_add(1).ok_or_else(|| {
                 malformed(
@@ -1447,7 +1533,7 @@ fn decode_texture_sample_simplified(
                 )
             })?,
         };
-        bindings.insert(descriptor_index, binding);
+        bindings.insert(constant_buffer_dword_offset, binding);
         binding
     };
     let outputs = channels
@@ -1550,6 +1636,24 @@ struct DecodedFloatMinMax {
 
 struct DecodedFloatSetPredicate {
     operations: Vec<ShaderOperation>,
+    constant_buffer_binding: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaxwellRangeReduction {
+    SinCos,
+    Exp2,
+}
+
+struct PendingRangeReduction {
+    offset: u32,
+    encoding: u64,
+    source: ShaderSourceLocation,
+    predicate: ShaderPredicate,
+    destination: u8,
+    input: ShaderRegister,
+    mode: MaxwellRangeReduction,
+    preparation: Vec<ShaderOperation>,
     constant_buffer_binding: Option<u8>,
 }
 
@@ -2539,12 +2643,20 @@ fn decode_interpolate(
             })?;
             let reciprocal = ((encoding >> 20) & 0xff) as u8;
             validate_register_range(stage, offset, encoding, reciprocal, 1, register_count)?;
+            // Maxwell PASS_MUL_W names the register carrying the hardware
+            // interpolation factor. The neutral shader interface is logical:
+            // a perspective input has already received that interpolation by
+            // the time WGSL exposes it, so retaining this as an arithmetic
+            // source would apply perspective correction twice.
+            //
+            // Mesa NAK likewise models PASS_MUL_W's inv_w operand as part of
+            // interpolation rather than as a separate floating-point multiply:
+            // https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/a3fcccb47bfbaf49a5d1ffa56547973462e70ab0/src/nouveau/compiler/nak/from_nir.rs
             Ok(ShaderOperation::InterpolateInput {
                 destination: ShaderRegister::new(u16::from(destination)),
                 location,
                 component,
                 interpolation,
-                perspective_reciprocal: Some(ShaderRegister::new(u16::from(reciprocal))),
             })
         }
         _ => Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
@@ -2554,6 +2666,160 @@ fn decode_interpolate(
             detail: "IPA interpolation frequency",
         }),
     }
+}
+
+fn decode_range_reduction(
+    stage: MaxwellThreeDShaderStage,
+    offset: u32,
+    encoding: u64,
+    predicate: ShaderPredicate,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<PendingRangeReduction, MaxwellShaderTranslationError> {
+    // RRO source forms, modifiers, and the SINCOS/EX2 selector follow Mesa
+    // NAK's pinned SM50 encoder and envytools' pinned public GM107 table:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L708-L741
+    // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c#L2000
+    let destination = (encoding & 0xff) as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    let opcode = (encoding >> 48) as u16;
+    let mut preparation = Vec::with_capacity(3);
+    let mut constant_buffer_binding = None;
+    let input = if opcode & 0xfff8 == 0x5c90 {
+        prepare_float_register_source(
+            stage,
+            offset,
+            encoding,
+            ((encoding >> 20) & 0xff) as u8,
+            encoding & (1 << 49) != 0,
+            encoding & (1 << 45) != 0,
+            register_count,
+            next_temporary,
+            &mut preparation,
+        )?
+    } else {
+        let source = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "RRO source temporary register overflow",
+            next_temporary,
+        )?;
+        if opcode & 0xfff8 == 0x4c90 {
+            let binding = ((encoding >> 34) & 0x1f) as u8;
+            let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
+            constant_buffer_binding = Some(binding);
+            preparation.push(ShaderOperation::LoadConstantBuffer32 {
+                destination: source,
+                binding,
+                byte_offset,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            apply_float_source_modifiers(
+                stage,
+                offset,
+                encoding,
+                source,
+                encoding & (1 << 49) != 0,
+                encoding & (1 << 45) != 0,
+                next_temporary,
+                &mut preparation,
+            )?
+        } else {
+            if encoding & ((1 << 45) | (1 << 49)) != 0 {
+                return Err(malformed(
+                    stage,
+                    offset,
+                    encoding,
+                    "immediate RRO encodes source modifiers",
+                ));
+            }
+            let bits = ((((encoding >> 20) & 0x7ffff) as u32) << 12)
+                | if encoding & (1 << 56) != 0 {
+                    1 << 31
+                } else {
+                    0
+                };
+            preparation.push(ShaderOperation::MoveImmediate32 {
+                destination: source,
+                bits,
+                scalar_type: ShaderScalarType::Float32,
+            });
+            source
+        }
+    };
+
+    Ok(PendingRangeReduction {
+        offset,
+        encoding,
+        source: ShaderSourceLocation::new(offset),
+        predicate,
+        destination,
+        input,
+        mode: if encoding & (1 << 39) == 0 {
+            MaxwellRangeReduction::SinCos
+        } else {
+            MaxwellRangeReduction::Exp2
+        },
+        preparation,
+        constant_buffer_binding,
+    })
+}
+
+fn is_compatible_mufu(
+    range_reduction: &PendingRangeReduction,
+    encoding: u64,
+    predicate: ShaderPredicate,
+) -> bool {
+    if !is_mufu(encoding)
+        || predicate != range_reduction.predicate
+        || ((encoding >> 8) & 0xff) as u8 != range_reduction.destination
+        || encoding & ((1 << 46) | (1 << 48)) != 0
+    {
+        return false;
+    }
+    matches!(
+        (range_reduction.mode, ((encoding >> 20) & 0xf) as u8),
+        (MaxwellRangeReduction::Exp2, 2) | (MaxwellRangeReduction::SinCos, 0 | 1)
+    )
+}
+
+fn decode_range_reduced_mufu(
+    stage: MaxwellThreeDShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    range_reduction: &PendingRangeReduction,
+) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    if !is_compatible_mufu(range_reduction, encoding, decode_predicate(encoding)) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: range_reduction.offset,
+            encoding: range_reduction.encoding,
+            detail: "RRO result is not consumed by an adjacent compatible MUFU",
+        });
+    }
+    let destination = (encoding & 0xff) as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    let function = match ((encoding >> 20) & 0xf) as u8 {
+        0 => ShaderSpecialFunction::Cosine,
+        1 => ShaderSpecialFunction::Sine,
+        2 => ShaderSpecialFunction::Exp2,
+        _ => unreachable!("compatibility check bounds the MUFU operation"),
+    };
+    Ok(ShaderOperation::SpecialFunction32 {
+        destination: ShaderRegister::new(u16::from(destination)),
+        source: range_reduction.input,
+        function,
+        accuracy: ShaderMathAccuracy::Approximate,
+        float_control: ShaderFloatControl::new(
+            ShaderRoundingMode::NearestEven,
+            ShaderNanMode::Propagate,
+            false,
+            false,
+            false,
+        ),
+    })
 }
 
 fn decode_mufu(
@@ -2762,11 +3028,28 @@ pub(crate) fn translate_maxwell_shader_programs(
         let header = binary.header();
         validate_program_header(stage, header)?;
         let translated = translate_shader_binary(&binary, register_count)?;
+        let texture_constant_buffer_slot = if translated.texture_bindings.is_empty() {
+            bindings
+                .bindless_texture_constant_buffer_slot()
+                .value()
+                .copied()
+        } else {
+            Some(
+                bindings
+                    .bindless_texture_constant_buffer_slot()
+                    .value()
+                    .copied()
+                    .ok_or(MaxwellShaderTranslationError::IncompletePipelineBinding {
+                        pipeline: pipeline_index,
+                        field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
+                    })?,
+            )
+        };
         let ir = translated.ir;
         let bind_group = if ir.ir().resources().is_empty() {
-            pipeline.group().value().copied()
+            pipeline.effective_group()
         } else {
-            Some(pipeline.group().value().copied().ok_or(
+            Some(pipeline.effective_group().ok_or(
                 MaxwellShaderTranslationError::IncompletePipelineBinding {
                     pipeline: pipeline_index,
                     field: "SET_PIPELINE_BINDING group",
@@ -2781,19 +3064,161 @@ pub(crate) fn translate_maxwell_shader_programs(
                 options: MAXWELL_SHADER_TRANSLATION_OPTIONS,
                 source_segments: binary.source_segments.clone(),
                 staged_overlay: binary.staged_overlay.clone(),
+                resource_binding_remap: Box::new([]),
             },
             stage: neutral_stage(stage),
             bind_group,
             ir,
             module,
             maximum_api_visible_calls: 0,
+            texture_constant_buffer_slot,
             texture_bindings: translated.texture_bindings,
         });
     }
 
+    remap_graphics_resource_bindings(&mut programs)?;
+
     validate_graphics_stage_interfaces(&programs)?;
 
     Ok(programs)
+}
+
+/// Maxwell resource numbers are local to a shader binding group, whereas the
+/// neutral backend exposes one descriptor namespace shared by all stages.
+/// Allocate one stable host binding for each `(group, kind, local binding)` and
+/// rewrite both the verified IR and texture metadata before WGSL lowering.
+fn remap_graphics_resource_bindings(
+    programs: &mut [MaxwellTranslatedShaderProgram],
+) -> Result<(), MaxwellShaderTranslationError> {
+    let mut global = BTreeMap::<(u8, ShaderResourceKind, u8), u8>::new();
+
+    for program in programs.iter() {
+        let Some(group) = program.bind_group else {
+            if program.ir.ir().resources().is_empty() {
+                continue;
+            }
+            return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {
+                pipeline: program.key.stage as u8,
+                field: "effective shader binding group",
+            });
+        };
+        for resource in program.ir.ir().resources() {
+            let identity = (group, resource.kind(), resource.binding());
+            if global.contains_key(&identity) {
+                continue;
+            }
+            let binding = u8::try_from(global.len())
+                .map_err(|_| MaxwellShaderTranslationError::ResourceBindingExhausted)?;
+            global.insert(identity, binding);
+        }
+    }
+
+    for program in programs {
+        let Some(group) = program.bind_group else {
+            continue;
+        };
+        let mut local = BTreeMap::new();
+        for resource in program.ir.ir().resources() {
+            let binding = global
+                .get(&(group, resource.kind(), resource.binding()))
+                .copied()
+                .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
+                    stage: program.key.stage,
+                    binding: resource.binding(),
+                })?;
+            local.insert(resource.binding(), binding);
+        }
+
+        program.ir = remap_verified_shader_ir(&program.ir, program.key.stage, &local)?;
+        for texture in &mut program.texture_bindings {
+            texture.image_binding =
+                remapped_binding(&local, program.key.stage, texture.image_binding)?;
+            texture.sampler_binding =
+                remapped_binding(&local, program.key.stage, texture.sampler_binding)?;
+        }
+        program.key.resource_binding_remap = local.into_iter().collect();
+        program.module = lower_shader_ir_to_wgsl(&program.ir)?;
+    }
+
+    Ok(())
+}
+
+fn remap_verified_shader_ir(
+    ir: &VerifiedShaderIr,
+    stage: MaxwellThreeDShaderStage,
+    bindings: &BTreeMap<u8, u8>,
+) -> Result<VerifiedShaderIr, MaxwellShaderTranslationError> {
+    let resources = ir
+        .ir()
+        .resources()
+        .iter()
+        .map(|resource| {
+            Ok(ShaderResourceAccess::new(
+                remapped_binding(bindings, stage, resource.binding())?,
+                resource.kind(),
+                resource.readable(),
+                resource.writable(),
+            )
+            .expect("remapping preserves non-empty resource access"))
+        })
+        .collect::<Result<Vec<_>, MaxwellShaderTranslationError>>()?;
+    let instructions = ir
+        .ir()
+        .instructions()
+        .iter()
+        .map(|instruction| {
+            let operation = match instruction.operation() {
+                ShaderOperation::LoadConstantBuffer32 {
+                    destination,
+                    binding,
+                    byte_offset,
+                    scalar_type,
+                } => ShaderOperation::LoadConstantBuffer32 {
+                    destination: *destination,
+                    binding: remapped_binding(bindings, stage, *binding)?,
+                    byte_offset: *byte_offset,
+                    scalar_type: *scalar_type,
+                },
+                ShaderOperation::SampleTexture2D {
+                    outputs,
+                    coordinates,
+                    image_binding,
+                    sampler_binding,
+                } => ShaderOperation::SampleTexture2D {
+                    outputs: outputs.clone(),
+                    coordinates: *coordinates,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
+                },
+                operation => operation.clone(),
+            };
+            Ok(ShaderInstruction::new(
+                instruction.source(),
+                instruction.predicate(),
+                operation,
+            ))
+        })
+        .collect::<Result<Vec<_>, MaxwellShaderTranslationError>>()?;
+
+    VerifiedShaderIr::verify(ShaderIr::new(
+        ir.ir().stage(),
+        ir.ir().inputs().to_vec(),
+        ir.ir().outputs().to_vec(),
+        resources,
+        instructions,
+    ))
+    .map_err(MaxwellShaderTranslationError::from)
+}
+
+fn remapped_binding(
+    bindings: &BTreeMap<u8, u8>,
+    stage: MaxwellThreeDShaderStage,
+    binding: u8,
+) -> Result<u8, MaxwellShaderTranslationError> {
+    bindings
+        .get(&binding)
+        .copied()
+        .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap { stage, binding })
 }
 
 fn validate_graphics_stage_interfaces(
@@ -4203,6 +4628,181 @@ mod tests {
     }
 
     #[test]
+    fn captured_rro_ex2_fuses_with_the_matching_mufu() {
+        let captured = 0x5c90_0080_00a7_000a_u64;
+        let mut temporary = 16;
+        let range_reduction = decode_range_reduction(
+            MaxwellThreeDShaderStage::Pixel,
+            0x338,
+            captured,
+            decode_predicate(captured),
+            16,
+            &mut temporary,
+        )
+        .unwrap();
+        assert_eq!(range_reduction.destination, 10);
+        assert_eq!(range_reduction.input.index(), 10);
+        assert_eq!(range_reduction.mode, MaxwellRangeReduction::Exp2);
+        assert!(range_reduction.preparation.is_empty());
+
+        let mufu = 0x5080_0000_0027_0a0a_u64;
+        assert!(is_compatible_mufu(
+            &range_reduction,
+            mufu,
+            decode_predicate(mufu)
+        ));
+        assert!(matches!(
+            decode_range_reduced_mufu(
+                MaxwellThreeDShaderStage::Pixel,
+                0x348,
+                mufu,
+                16,
+                &range_reduction,
+            )
+            .unwrap(),
+            ShaderOperation::SpecialFunction32 {
+                destination,
+                source,
+                function: ShaderSpecialFunction::Exp2,
+                accuracy: ShaderMathAccuracy::Approximate,
+                ..
+            } if destination.index() == 10 && source.index() == 10
+        ));
+    }
+
+    #[test]
+    fn rro_register_constant_and_immediate_sources_decode() {
+        let mut temporary = 16;
+        let register = 0x5c90_0000_0027_0001_u64 | (2 << 20) | (1 << 45) | (1 << 49);
+        let register = decode_range_reduction(
+            MaxwellThreeDShaderStage::Pixel,
+            8,
+            register,
+            ShaderPredicate::Always,
+            16,
+            &mut temporary,
+        )
+        .unwrap();
+        assert_eq!(register.mode, MaxwellRangeReduction::SinCos);
+        assert!(matches!(
+            register.preparation.as_slice(),
+            [
+                ShaderOperation::FloatAbsolute32 { source, .. },
+                ShaderOperation::FloatNegate32 { .. }
+            ] if source.index() == 2
+        ));
+
+        let constant = 0x4c90_0000_0007_0001_u64 | (3 << 34) | (5 << 20) | (1 << 39);
+        let constant = decode_range_reduction(
+            MaxwellThreeDShaderStage::Pixel,
+            16,
+            constant,
+            ShaderPredicate::Always,
+            16,
+            &mut temporary,
+        )
+        .unwrap();
+        assert_eq!(constant.mode, MaxwellRangeReduction::Exp2);
+        assert_eq!(constant.constant_buffer_binding, Some(3));
+        assert!(matches!(
+            constant.preparation.as_slice(),
+            [ShaderOperation::LoadConstantBuffer32 {
+                binding: 3,
+                byte_offset: 20,
+                ..
+            }]
+        ));
+
+        let immediate_bits = (-2.0_f32).to_bits();
+        let immediate = 0x3890_0000_0007_0001_u64
+            | (u64::from((immediate_bits >> 12) & 0x7ffff) << 20)
+            | (u64::from(immediate_bits >> 31) << 56)
+            | (1 << 39);
+        let immediate = decode_range_reduction(
+            MaxwellThreeDShaderStage::Pixel,
+            24,
+            immediate,
+            ShaderPredicate::Always,
+            16,
+            &mut temporary,
+        )
+        .unwrap();
+        assert!(matches!(
+            immediate.preparation.as_slice(),
+            [ShaderOperation::MoveImmediate32 { bits, .. }] if *bits == immediate_bits
+        ));
+    }
+
+    #[test]
+    fn rro_fusion_rejects_mismatched_modes_predicates_and_modifiers() {
+        let encoding = 0x5c90_0080_0017_0101_u64;
+        let mut temporary = 4;
+        let range_reduction = decode_range_reduction(
+            MaxwellThreeDShaderStage::Pixel,
+            8,
+            encoding,
+            ShaderPredicate::Always,
+            4,
+            &mut temporary,
+        )
+        .unwrap();
+        let cosine = 0x5080_0000_0007_0101_u64;
+        assert!(!is_compatible_mufu(
+            &range_reduction,
+            cosine,
+            ShaderPredicate::Always
+        ));
+        let exp2 = cosine | (2 << 20);
+        assert!(!is_compatible_mufu(
+            &range_reduction,
+            exp2,
+            ShaderPredicate::Register {
+                register: 0,
+                inverted: false,
+            }
+        ));
+        assert!(!is_compatible_mufu(
+            &range_reduction,
+            exp2 | (1 << 46),
+            ShaderPredicate::Always
+        ));
+    }
+
+    #[test]
+    fn adjacent_rro_mufu_pair_lowers_as_one_high_level_special_function() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0002_0461;
+        header[4] = 0x000f_f000;
+        header[6] = 0x0000_0077;
+        header[13] = 0x0007_f000;
+        let rro = 0x5c90_0000_0007_0001_u64 | (1 << 20) | (1 << 39);
+        let mufu = 0x5080_0000_0007_0101_u64 | (2 << 20);
+        let translated = translated_fixture(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[0, rro, mufu, 0xe300_0000_0007_000f],
+        );
+        assert!(
+            translated
+                .ir()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(
+                    instruction.operation(),
+                    ShaderOperation::SpecialFunction32 {
+                        destination,
+                        source,
+                        function: ShaderSpecialFunction::Exp2,
+                        ..
+                    } if destination.index() == 1 && source.index() == 1
+                ))
+        );
+        let module = nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains("exp2"));
+        validate_wgsl(&module);
+    }
+
+    #[test]
     fn captured_fragment_ipa_reciprocal_and_color_output_translate() {
         let mut header = [0_u32; 20];
         header[0] = 0x0002_5462;
@@ -4256,6 +4856,8 @@ mod tests {
             4
         );
         let module = nixe_gpu::lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains("input.generic_0.x"));
+        assert!(!module.source().contains("input.generic_0.x *"));
         validate_wgsl(&module);
     }
 
@@ -4499,6 +5101,81 @@ mod tests {
     }
 
     #[test]
+    fn reset_stage_groups_receive_distinct_neutral_resource_bindings() {
+        let (allocation, address_space, address) = mapped_memory();
+        let mut vertex_header = [0_u32; 20];
+        vertex_header[0] = 0x0002_0461;
+        let mut fragment_header = [0_u32; 20];
+        fragment_header[0] = 0x0002_5462;
+        let mov = 0x0100_0000_0007_f000_u64 | (u64::from(1.0_f32.to_bits()) << 20);
+        let fadd_cbuf = 0x4c58_0000_0007_0001_u64;
+        let exit = 0xe300_0000_0007_000f_u64;
+        let program_bytes = |header: [u32; 20]| {
+            header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .chain(
+                    [0, mov, fadd_cbuf, exit]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes),
+                )
+                .collect::<Vec<_>>()
+        };
+        allocation.write(0, &program_bytes(vertex_header)).unwrap();
+        allocation
+            .write(0x100, &program_bytes(fragment_header))
+            .unwrap();
+
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        program_three_d(
+            &mut channel,
+            0,
+            SWITCH_1_GM20B_PROFILE.classes().three_d().0,
+        );
+        for (method, argument) in [
+            (0x1608, (address >> 32) as u32),
+            (0x160c, address as u32),
+            (0x2040, 0x11),
+            (0x2044, 0),
+            (0x204c, 4),
+            (0x2140, 0x51),
+            (0x2144, 0x100),
+            (0x214c, 4),
+        ] {
+            program_three_d(&mut channel, method, argument);
+        }
+
+        let translated =
+            translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].bind_group(), Some(0));
+        assert_eq!(translated[1].bind_group(), Some(4));
+        assert_eq!(translated[0].resources()[0].binding(), 0);
+        assert_eq!(translated[1].resources()[0].binding(), 1);
+        assert!(translated[0].module().source().contains("@binding(0)"));
+        assert!(translated[1].module().source().contains("@binding(1)"));
+
+        let lowered = MaxwellThreeDLoweringCache::default()
+            .stage_shader_translations(
+                &translated,
+                MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+            )
+            .unwrap();
+        assert_eq!(
+            lowered.resources()[0].role(),
+            crate::MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }
+        );
+        assert_eq!(
+            lowered.resources()[1].role(),
+            crate::MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 }
+        );
+    }
+
+    #[test]
     fn texs_2d_implicit_lod_decodes_captured_split_rgba_operands() {
         let encoding = 0xd830_0080_2007_0100;
         let mut bindings = BTreeMap::new();
@@ -4532,7 +5209,7 @@ mod tests {
         assert_eq!(
             bindings.get(&8),
             Some(&MaxwellTextureResourceBinding {
-                descriptor_index: 8,
+                constant_buffer_byte_offset: 32,
                 image_binding: 32,
                 sampler_binding: 33,
             })

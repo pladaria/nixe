@@ -7,7 +7,10 @@
 
 use crate::MaxwellMethodSource;
 
-use super::state::{MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET};
+use super::state::{
+    MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
+    MaxwellThreeDRegisterOrigin,
+};
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
@@ -105,6 +108,22 @@ impl MaxwellThreeDShaderStage {
             _ => None,
         }
     }
+
+    /// Binding group selected by the Switch graphics-driver shader-stage ABI
+    /// when `SET_PIPELINE_BINDING` remains at its hardware reset value.
+    ///
+    /// Switchbrew documents the stage-indexed bind-group constant-buffer
+    /// ranges used by the Maxwell 3D class:
+    /// <https://switchbrew.org/wiki/GPU_Classes#3D_engine_class>
+    const fn default_binding_group(self) -> u8 {
+        match self {
+            Self::VertexCullBeforeFetch | Self::Vertex => 0,
+            Self::TessellationInit => 1,
+            Self::Tessellation => 2,
+            Self::Geometry => 3,
+            Self::Pixel => 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +176,21 @@ impl MaxwellThreeDPipelineBindingState {
     #[must_use]
     pub const fn group(&self) -> &MaxwellThreeDRegister<u8> {
         &self.group
+    }
+
+    /// Resolves the shader-visible group without changing the raw register
+    /// value observed by MME register reads.
+    #[must_use]
+    pub fn effective_group(&self) -> Option<u8> {
+        match self.group.origin() {
+            MaxwellThreeDRegisterOrigin::Programmed => self.group.value().copied(),
+            MaxwellThreeDRegisterOrigin::VerifiedReset => self
+                .stage
+                .value()
+                .copied()
+                .map(MaxwellThreeDShaderStage::default_binding_group),
+            MaxwellThreeDRegisterOrigin::Unset => None,
+        }
     }
 }
 
@@ -453,7 +487,7 @@ impl MaxwellThreeDShaderBindingState {
         }
         for pipeline in &self.pipeline {
             if pipeline.enabled.value() == Some(&true)
-                && pipeline.group.value() == Some(&group)
+                && pipeline.effective_group() == Some(group)
                 && let Some(stage) = pipeline.stage.value()
             {
                 visible[*stage as usize] = true;

@@ -446,7 +446,6 @@ pub enum ShaderOperation {
         location: ShaderIoLocation,
         component: u8,
         interpolation: ShaderInterpolation,
-        perspective_reciprocal: Option<ShaderRegister>,
     },
     LoadConstantBuffer32 {
         destination: ShaderRegister,
@@ -668,12 +667,7 @@ pub fn evaluate_shader_ir(
     step_limit: usize,
 ) -> Result<ShaderEvaluationResult, ShaderEvaluationError> {
     let ir = shader.ir();
-    let targets = ir
-        .instructions
-        .iter()
-        .enumerate()
-        .map(|(index, instruction)| (instruction.source, index))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let targets = shader_instruction_entry_points(ir);
     let mut registers = vec![None; 256];
     let mut predicates = [None; 7];
     let mut result = ShaderEvaluationResult::default();
@@ -910,10 +904,9 @@ pub fn evaluate_shader_ir(
                 destination,
                 location,
                 component,
-                perspective_reciprocal,
                 ..
             } => {
-                let mut bits = inputs
+                let bits = inputs
                     .interface
                     .get(&(*location, *component))
                     .copied()
@@ -921,14 +914,6 @@ pub fn evaluate_shader_ir(
                         location: *location,
                         component: *component,
                     })?;
-                if let Some(reciprocal) = perspective_reciprocal {
-                    bits = evaluate_float_binary(
-                        bits,
-                        register_bits(&registers, *reciprocal)?,
-                        ShaderFloatControl::PRECISE,
-                        |a, b| a * b,
-                    )?;
-                }
                 registers[destination.index() as usize] = Some(bits);
             }
             ShaderOperation::LoadConstantBuffer32 {
@@ -1259,12 +1244,7 @@ fn emit_wgsl_control_flow(
     ir: &ShaderIr,
     source_map: &mut Vec<ShaderBackendSourceMapEntry>,
 ) -> Result<(), ShaderBackendLoweringError> {
-    let locations = ir
-        .instructions
-        .iter()
-        .enumerate()
-        .map(|(index, instruction)| (instruction.source, index))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let locations = shader_instruction_entry_points(ir);
     let mut leaders = BTreeSet::from([0_usize]);
     for (index, instruction) in ir.instructions.iter().enumerate() {
         if let ShaderOperation::Branch { target } = instruction.operation {
@@ -1870,20 +1850,13 @@ fn emit_wgsl_operation(
             destination,
             location,
             component,
-            perspective_reciprocal,
             ..
         } => {
-            let input = format!(
-                "input.{}{}",
+            source.push_str(&format!(
+                "  registers[{}] = bitcast<u32>(input.{}{});\n",
+                destination.index(),
                 wgsl_field_name(*location),
                 wgsl_component(*component)
-            );
-            let expression = perspective_reciprocal.map_or(input.clone(), |reciprocal| {
-                format!("{input} * bitcast<f32>(registers[{}])", reciprocal.index())
-            });
-            source.push_str(&format!(
-                "  registers[{}] = bitcast<u32>({expression});\n",
-                destination.index()
             ));
         }
         ShaderOperation::LoadConstantBuffer32 {
@@ -2276,12 +2249,7 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
     if ir.instructions.is_empty() {
         return Err(ShaderVerificationError::EmptyProgram);
     }
-    let locations = ir
-        .instructions
-        .iter()
-        .enumerate()
-        .map(|(index, instruction)| (instruction.source, index))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let locations = shader_instruction_entry_points(ir);
     let mut incoming = vec![None::<ShaderDefinitions>; ir.instructions.len()];
     incoming[0] = Some(ShaderDefinitions::default());
     let mut work = std::collections::VecDeque::from([0_usize]);
@@ -2500,6 +2468,19 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
     Ok(())
 }
 
+fn shader_instruction_entry_points(
+    ir: &ShaderIr,
+) -> std::collections::BTreeMap<ShaderSourceLocation, usize> {
+    let mut locations = std::collections::BTreeMap::new();
+    for (index, instruction) in ir.instructions.iter().enumerate() {
+        // One guest instruction may expand into several adjacent neutral
+        // operations with identical provenance. Guest control-flow targets
+        // enter before the complete expansion, never in its middle.
+        locations.entry(instruction.source).or_insert(index);
+    }
+    locations
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ShaderDefinitions {
     registers: BTreeSet<ShaderRegister>,
@@ -2560,10 +2541,6 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::ReciprocalSqrt32 { source, .. } => vec![*source],
         ShaderOperation::SpecialFunction32 { source, .. } => vec![*source],
         ShaderOperation::SetPredicateFloat32 { left, right, .. } => vec![*left, *right],
-        ShaderOperation::InterpolateInput {
-            perspective_reciprocal,
-            ..
-        } => perspective_reciprocal.iter().copied().collect(),
         ShaderOperation::SampleTexture2D { coordinates, .. } => coordinates.to_vec(),
         _ => Vec::new(),
     }
@@ -2918,6 +2895,90 @@ mod tests {
     }
 
     #[test]
+    fn branches_enter_the_first_neutral_operation_for_one_guest_instruction() {
+        let output = ShaderInterfaceElement::new(
+            ShaderIoLocation::Position,
+            0,
+            ShaderScalarType::Unsigned32,
+            None,
+        )
+        .unwrap();
+        let expanded_source = ShaderSourceLocation::new(32);
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            vec![output],
+            Vec::new(),
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Branch {
+                        target: expanded_source,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Undefined32 {
+                        destination: ShaderRegister::new(1),
+                    },
+                ),
+                ShaderInstruction::new(
+                    expanded_source,
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(1),
+                        bits: 42,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    expanded_source,
+                    ShaderPredicate::Always,
+                    ShaderOperation::Move32 {
+                        destination: ShaderRegister::new(2),
+                        source: ShaderRegister::new(1),
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(40),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                        location: ShaderIoLocation::Position,
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(48),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let result = evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 16).unwrap();
+        assert_eq!(result.output_bits(ShaderIoLocation::Position, 0), Some(42));
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(module.source().contains("registers[1] = 0x0000002au"));
+        assert!(module.source().contains("registers[2] = registers[1]"));
+        naga::front::wgsl::parse_str(module.source()).unwrap();
+    }
+
+    #[test]
     fn float_predicate_writes_drive_predicated_evaluation_and_wgsl() {
         let output = ShaderInterfaceElement::new(
             ShaderIoLocation::Position,
@@ -3093,7 +3154,7 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_preserves_pass_mul_w_interpolation() {
+    fn wgsl_uses_logical_perspective_input_without_reapplying_mul_w() {
         let input = ShaderInterfaceElement::new(
             ShaderIoLocation::Generic(0),
             0,
@@ -3110,25 +3171,15 @@ mod tests {
                 ShaderInstruction::new(
                     ShaderSourceLocation::new(8),
                     ShaderPredicate::Always,
-                    ShaderOperation::MoveImmediate32 {
-                        destination: ShaderRegister::new(0),
-                        bits: 0.5_f32.to_bits(),
-                        scalar_type: ShaderScalarType::Unsigned32,
-                    },
-                ),
-                ShaderInstruction::new(
-                    ShaderSourceLocation::new(16),
-                    ShaderPredicate::Always,
                     ShaderOperation::InterpolateInput {
                         destination: ShaderRegister::new(1),
                         location: ShaderIoLocation::Generic(0),
                         component: 0,
                         interpolation: ShaderInterpolation::Perspective,
-                        perspective_reciprocal: Some(ShaderRegister::new(0)),
                     },
                 ),
                 ShaderInstruction::new(
-                    ShaderSourceLocation::new(24),
+                    ShaderSourceLocation::new(16),
                     ShaderPredicate::Always,
                     ShaderOperation::Exit,
                 ),
@@ -3139,8 +3190,9 @@ mod tests {
         assert!(
             module
                 .source()
-                .contains("input.generic_0.x * bitcast<f32>(registers[0])")
+                .contains("registers[1] = bitcast<u32>(input.generic_0.x)")
         );
+        assert!(!module.source().contains("input.generic_0.x *"));
         naga::front::wgsl::parse_str(module.source()).unwrap();
     }
 

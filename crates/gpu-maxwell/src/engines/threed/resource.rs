@@ -10,12 +10,15 @@ use std::{
 };
 
 use nixe_gpu::{
-    BackingView, BlockLinearLayout, BufferDescription, BufferId, BufferView,
-    GpuAllocationDescription, GpuAllocationId, GpuVirtualAddress, ImageDescription, ImageDimension,
-    ImageExtent, ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageSubresourceRange,
-    ImageView, SampleCount, Swizzle,
+    AddressMode, BackingView, BlockLinearLayout, BufferDescription, BufferId, BufferView,
+    FilterMode, GpuAllocationDescription, GpuAllocationId, GpuVirtualAddress, ImageDescription,
+    ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind, ImageMemoryLayout,
+    ImageSubresourceRange, ImageView, SampleCount, SamplerDescription, Swizzle,
 };
-use nixe_memory::{CanonicalBackingRange, CanonicalRangeError, MemoryPermissions};
+use nixe_memory::{
+    CanonicalBackingRange, CanonicalRangeAccessError, CanonicalRangeError, CanonicalWriteBatch,
+    CanonicalWriteBatchError, MemoryPermissions,
+};
 
 use crate::{
     MaxwellAllocationId, MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellMappingId,
@@ -27,7 +30,8 @@ use super::{
     MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetState, MaxwellThreeDDepthStencilFormat,
     MaxwellThreeDDepthStencilTargetState, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDImageKind, MaxwellThreeDImageLayout,
-    MaxwellThreeDSampleMode, MaxwellThreeDState, MaxwellThreeDUnresolvedAddress,
+    MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode, MaxwellThreeDState,
+    MaxwellThreeDUnresolvedAddress,
 };
 
 // Public Switch NVIDIA memory kinds. Compressed color/depth kinds remain
@@ -52,8 +56,29 @@ pub enum MaxwellThreeDResourceRole {
     ConstantBuffer { group: u8, slot: u8 },
     TextureHeaders,
     Samplers,
+    SampledImage(MaxwellThreeDTextureReference),
+    Sampler(MaxwellThreeDTextureReference),
     ColorTarget(u8),
     DepthStencilTarget,
+}
+
+/// Draw-local location of a raw Maxwell TIC/TSC handle.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MaxwellThreeDTextureReference {
+    group: u8,
+    constant_buffer_slot: u8,
+    byte_offset: u32,
+}
+
+impl MaxwellThreeDTextureReference {
+    #[must_use]
+    pub const fn new(group: u8, constant_buffer_slot: u8, byte_offset: u32) -> Self {
+        Self {
+            group,
+            constant_buffer_slot,
+            byte_offset,
+        }
+    }
 }
 
 /// Access implied by the state reference before neutral command lowering.
@@ -157,6 +182,40 @@ pub struct MaxwellThreeDPreservedImageLayout {
 pub enum MaxwellThreeDGuestImageFormat {
     Color(MaxwellThreeDColorTargetFormat),
     DepthStencil(MaxwellThreeDDepthStencilFormat),
+    Texture(u32),
+}
+
+/// Source-preserving neutral interpretation of one Maxwell TSC entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDResolvedSampler {
+    role: MaxwellThreeDResourceRole,
+    min_filter: FilterMode,
+    mag_filter: FilterMode,
+    mip_filter: FilterMode,
+    address_modes: [AddressMode; 3],
+    lod_min_fixed: u16,
+    lod_max_fixed: u16,
+    max_anisotropy: u8,
+}
+
+impl MaxwellThreeDResolvedSampler {
+    #[must_use]
+    pub const fn role(self) -> MaxwellThreeDResourceRole {
+        self.role
+    }
+
+    pub fn description(self) -> Result<SamplerDescription, MaxwellThreeDResourceError> {
+        SamplerDescription::new(
+            self.min_filter,
+            self.mag_filter,
+            self.mip_filter,
+            self.address_modes,
+            f32::from(self.lod_min_fixed) / 256.0,
+            f32::from(self.lod_max_fixed) / 256.0,
+            f32::from(self.max_anisotropy),
+        )
+        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role: self.role })
+    }
 }
 
 impl MaxwellThreeDPreservedImageLayout {
@@ -340,6 +399,7 @@ impl MaxwellThreeDDirtySubresources {
 pub struct MaxwellThreeDResolvedResources {
     address_space_generation: nixe_memory::MappingGeneration,
     resources: Box<[MaxwellThreeDResolvedResource]>,
+    samplers: Box<[MaxwellThreeDResolvedSampler]>,
     aliases: Box<[MaxwellThreeDResourceAlias]>,
     dirty: MaxwellThreeDDirtySubresources,
 }
@@ -352,6 +412,10 @@ impl MaxwellThreeDResolvedResources {
     #[must_use]
     pub fn resources(&self) -> &[MaxwellThreeDResolvedResource] {
         &self.resources
+    }
+    #[must_use]
+    pub fn samplers(&self) -> &[MaxwellThreeDResolvedSampler] {
+        &self.samplers
     }
     #[must_use]
     pub fn aliases(&self) -> &[MaxwellThreeDResourceAlias] {
@@ -409,6 +473,28 @@ pub fn resolve_maxwell_three_d_resources(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
+    resolve_maxwell_three_d_resources_for_roles(state, address_space, &[])
+}
+
+pub fn resolve_maxwell_three_d_resources_for_roles(
+    state: &MaxwellThreeDState,
+    address_space: &MaxwellGpuAddressSpace,
+    required_roles: &[MaxwellThreeDResourceRole],
+) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
+    resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
+        state,
+        address_space,
+        required_roles,
+        None,
+    )
+}
+
+pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
+    state: &MaxwellThreeDState,
+    address_space: &MaxwellGpuAddressSpace,
+    required_roles: &[MaxwellThreeDResourceRole],
+    staged_writes: Option<&CanonicalWriteBatch>,
+) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
     let sample_mode = state
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::SampleMode)
@@ -417,7 +503,7 @@ pub fn resolve_maxwell_three_d_resources(
             MaxwellThreeDFixedFunctionValue::SampleMode(value) => Some(*value),
             _ => None,
         });
-    let mut builder = ResourceBuilder::new(address_space, sample_mode);
+    let mut builder = ResourceBuilder::new(address_space, sample_mode, staged_writes);
 
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
         if stream
@@ -498,6 +584,20 @@ pub fn resolve_maxwell_three_d_resources(
         bindings.texture_headers(),
     )?;
     builder.descriptor_pool(MaxwellThreeDResourceRole::Samplers, bindings.samplers())?;
+    let mut descriptors = BTreeSet::new();
+    for role in required_roles {
+        if let MaxwellThreeDResourceRole::SampledImage(descriptor) = role {
+            descriptors.insert(*descriptor);
+        }
+    }
+    for texture_reference in descriptors {
+        if !required_roles.contains(&MaxwellThreeDResourceRole::Sampler(texture_reference)) {
+            return Err(MaxwellThreeDResourceError::IncompleteState {
+                role: MaxwellThreeDResourceRole::Sampler(texture_reference),
+            });
+        }
+        builder.sampled_texture(bindings, texture_reference)?;
+    }
 
     for (index, target) in state.render_targets().color().iter().enumerate() {
         match target.readiness(true) {
@@ -522,8 +622,10 @@ pub fn resolve_maxwell_three_d_resources(
 
 struct ResourceBuilder<'a> {
     address_space: &'a MaxwellGpuAddressSpace,
+    staged_writes: Option<&'a CanonicalWriteBatch>,
     sample_mode: Option<MaxwellThreeDSampleMode>,
     resources: Vec<MaxwellThreeDResolvedResource>,
+    samplers: Vec<MaxwellThreeDResolvedSampler>,
 }
 
 struct RetainedResourceBacking {
@@ -546,11 +648,14 @@ impl<'a> ResourceBuilder<'a> {
     fn new(
         address_space: &'a MaxwellGpuAddressSpace,
         sample_mode: Option<MaxwellThreeDSampleMode>,
+        staged_writes: Option<&'a CanonicalWriteBatch>,
     ) -> Self {
         Self {
             address_space,
+            staged_writes,
             sample_mode,
             resources: Vec::new(),
+            samplers: Vec::new(),
         }
     }
 
@@ -613,6 +718,262 @@ impl<'a> ResourceBuilder<'a> {
             .and_then(|count| count.checked_mul(MAXWELL_DESCRIPTOR_SIZE))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
         self.buffer(role, address, size)
+    }
+
+    fn descriptor_bytes(
+        &self,
+        role: MaxwellThreeDResourceRole,
+        index: u32,
+    ) -> Result<[u8; 32], MaxwellThreeDResourceError> {
+        let buffer = self
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                MaxwellThreeDResolvedResource::Buffer(buffer) if buffer.role() == role => {
+                    Some(buffer)
+                }
+                _ => None,
+            })
+            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let offset = u64::from(index)
+            .checked_mul(MAXWELL_DESCRIPTOR_SIZE)
+            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        if offset
+            .checked_add(MAXWELL_DESCRIPTOR_SIZE)
+            .is_none_or(|end| end > buffer.description().size())
+        {
+            return Err(MaxwellThreeDResourceError::DescriptorIndexOutOfRange { role, index });
+        }
+        read_descriptor_bytes(buffer.view().backing().range(), offset, self.staged_writes)
+    }
+
+    fn sampled_texture(
+        &mut self,
+        bindings: &super::MaxwellThreeDShaderBindingState,
+        texture_reference: MaxwellThreeDTextureReference,
+    ) -> Result<(), MaxwellThreeDResourceError> {
+        let raw_handle = self.texture_handle(texture_reference)?;
+        // An unprogrammed selector retains the Maxwell class reset mode. Only
+        // an explicit false selects the legacy texture-header interpretation;
+        // the TIC decoder below independently requires a Maxwell v3 header.
+        // The public class definition confirms this is a one-bit selector:
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1210-L1213
+        if !uses_maxwell_texture_headers(bindings.maxwell_texture_headers().value()) {
+            return Err(MaxwellThreeDResourceError::UnsupportedTextureBindingMode {
+                descriptor: raw_handle,
+            });
+        }
+        // Maxwell resource handles use TIC in bits 0..20 and TSC in bits
+        // 20..32 when the tables are independent. Via-header mode uses the
+        // same raw index for both tables. Public corroborating definitions:
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/include/deko3d.h#L711-L724
+        // https://source.hodakov.me/hdkv/yuzu/src/commit/55bf3dbf5ddaa3f7c1c3efade5553b07499fe289/src/video_core/textures/texture.h#L147-L165
+        let (image_index, sampler_index) = match bindings.sampler_binding().value() {
+            Some(mode) => texture_descriptor_pair(*mode, raw_handle),
+            None => {
+                return Err(MaxwellThreeDResourceError::IncompleteState {
+                    role: MaxwellThreeDResourceRole::Sampler(texture_reference),
+                });
+            }
+        };
+        let tic = self.descriptor_bytes(MaxwellThreeDResourceRole::TextureHeaders, image_index)?;
+        let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
+        self.sampled_image(texture_reference, image_index, tic)?;
+        self.samplers
+            .push(decode_sampler(texture_reference, sampler_index, tsc)?);
+        Ok(())
+    }
+
+    fn texture_handle(
+        &self,
+        texture_reference: MaxwellThreeDTextureReference,
+    ) -> Result<u32, MaxwellThreeDResourceError> {
+        let role = MaxwellThreeDResourceRole::ConstantBuffer {
+            group: texture_reference.group,
+            slot: texture_reference.constant_buffer_slot,
+        };
+        let buffer = self
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                MaxwellThreeDResolvedResource::Buffer(buffer) if buffer.role() == role => {
+                    Some(buffer)
+                }
+                _ => None,
+            })
+            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let end = u64::from(texture_reference.byte_offset)
+            .checked_add(4)
+            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        if end > buffer.description().size() {
+            return Err(MaxwellThreeDResourceError::TextureHandleOutOfRange {
+                texture_reference,
+                constant_buffer_size: buffer.description().size(),
+            });
+        }
+        let mut bytes = [0_u8; 4];
+        read_backing_bytes(
+            buffer.view().backing().range(),
+            u64::from(texture_reference.byte_offset),
+            &mut bytes,
+            self.staged_writes,
+        )?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn sampled_image(
+        &mut self,
+        texture_reference: MaxwellThreeDTextureReference,
+        descriptor_index: u32,
+        bytes: [u8; 32],
+    ) -> Result<(), MaxwellThreeDResourceError> {
+        // Maxwell 2 TIC field placement follows deko3d's pinned public
+        // descriptor definition, itself cross-referenced to envytools:
+        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/texture_image_control_block.h
+        let words = descriptor_words(bytes);
+        let role = MaxwellThreeDResourceRole::SampledImage(texture_reference);
+        let format_word = words[0];
+        let image_format = (format_word & 0x7f) as u8;
+        let components = [7, 10, 13, 16].map(|shift| ((format_word >> shift) & 7) as u8);
+        let swizzle = [19, 22, 25, 28].map(|shift| ((format_word >> shift) & 7) as u8);
+        let srgb = words[4] & (1 << 22) != 0;
+        let format = match (image_format, components, swizzle, srgb, format_word >> 31) {
+            (0x08, [2, 2, 2, 2], [2, 3, 4, 5], false, 0) => ImageFormat::Rgba8Unorm,
+            (0x08, [2, 2, 2, 2], [2, 3, 4, 5], true, 0) => ImageFormat::Rgba8Srgb,
+            (0x08, [2, 2, 2, 2], [4, 3, 2, 5], false, 0) => ImageFormat::Bgra8Unorm,
+            (0x08, [2, 2, 2, 2], [4, 3, 2, 5], true, 0) => ImageFormat::Bgra8Srgb,
+            _ => {
+                return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+                    descriptor: descriptor_index,
+                    field: "format/component/swizzle",
+                    value: format_word,
+                });
+            }
+        };
+        let header_version = ((words[2] >> 21) & 7) as u8;
+        let texture_type = ((words[4] >> 23) & 0xf) as u8;
+        let width = (words[4] & 0xffff) + 1;
+        let height = (words[5] & 0xffff) + 1;
+        let depth = ((words[5] >> 16) & 0x3fff) + 1;
+        let block_width_log2 = (words[3] & 7) as u8;
+        let block_height_log2 = ((words[3] >> 3) & 7) as u8;
+        let block_depth_log2 = ((words[3] >> 6) & 7) as u8;
+        let mip_max = ((words[3] >> 28) & 0xf) as u8;
+        let view_mip_min = (words[7] & 0xf) as u8;
+        let view_mip_max = ((words[7] >> 4) & 0xf) as u8;
+        let msaa = ((words[7] >> 8) & 0xf) as u8;
+        let sparse = words[5] & (1 << 30) != 0;
+        let normalized = words[5] & (1 << 31) != 0;
+        let layer_base = ((words[4] >> 16) & 7)
+            | (((words[2] >> 16) & 0x1f) << 3)
+            | (((words[2] >> 29) & 7) << 8);
+        if header_version != 3
+            || texture_type != 1
+            || depth != 1
+            || block_width_log2 != 0
+            || block_depth_log2 != 0
+            || mip_max != 0
+            || view_mip_min != 0
+            || view_mip_max != 0
+            || msaa != 0
+            || sparse
+            || !normalized
+            || layer_base != 0
+        {
+            return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+                descriptor: descriptor_index,
+                field: "2D block-linear shape",
+                value: words[2] ^ words[3] ^ words[4] ^ words[5] ^ words[7],
+            });
+        }
+        let address = u64::from(words[1]) | (u64::from(words[2] & 0xffff) << 32);
+        let row = align_up(u64::from(width) * 4, 64, role)?;
+        let rows = align_up(u64::from(height), 8_u64 << block_height_log2, role)?;
+        let layer_stride = row
+            .checked_mul(rows)
+            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        let unresolved = MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32);
+        let source = self.resolve(unresolved, layer_stride, MemoryPermissions::READ, role)?;
+        let actual_kind = source
+            .segments()
+            .first()
+            .ok_or(MaxwellThreeDResourceError::ResourceExhausted)?
+            .mapping()
+            .kind();
+        if source
+            .segments()
+            .iter()
+            .any(|segment| segment.mapping().kind() != MAXWELL_GENERIC_BLOCK_LINEAR_KIND)
+        {
+            return Err(MaxwellThreeDResourceError::UnsupportedKind {
+                role,
+                expected: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                actual: actual_kind,
+            });
+        }
+        let description = image_description(MaxwellImageDescriptionRequest {
+            dimension: ImageDimension::Two,
+            extent: ImageExtent {
+                width,
+                height,
+                depth: 1,
+            },
+            format,
+            kind: ImageKind::Color,
+            layers: 1,
+            role,
+        })?;
+        let retained = retained_backing(&source)?;
+        let allocation_description = GpuAllocationDescription::new(allocation_size(&source)?, 1)
+            .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        let backing = BackingView::new(
+            GpuAllocationId::new(retained.allocation.get()),
+            allocation_description,
+            retained.allocation_offset,
+            retained.range,
+        )
+        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2,
+            block_height_log2,
+            block_depth_log2,
+            layer_stride,
+        });
+        let id = ImageId::new(resource_id(self.resources.len())?);
+        let view = ImageView::new(
+            id,
+            description,
+            Swizzle::IDENTITY,
+            vec![(
+                ImageSubresourceRange {
+                    plane: 0,
+                    mip_level: 0,
+                    base_layer: 0,
+                    layer_count: 1,
+                },
+                layout,
+                backing,
+            )],
+        )
+        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        self.resources.push(MaxwellThreeDResolvedResource::Image(
+            MaxwellThreeDResolvedImage {
+                role,
+                access: MaxwellThreeDResourceAccess::Read,
+                description,
+                allocation_description,
+                view,
+                source,
+                mappings: retained.mappings,
+                guest_layout: MaxwellThreeDPreservedImageLayout {
+                    layout,
+                    pte_kind: actual_kind,
+                    compression_enabled: false,
+                },
+                guest_format: MaxwellThreeDGuestImageFormat::Texture(format_word),
+            },
+        ));
+        Ok(())
     }
 
     fn color_target(
@@ -1018,6 +1379,7 @@ impl<'a> ResourceBuilder<'a> {
         let result = MaxwellThreeDResolvedResources {
             address_space_generation: self.address_space.mapping_generation(),
             resources: self.resources.into_boxed_slice(),
+            samplers: self.samplers.into_boxed_slice(),
             aliases: aliases.into_boxed_slice(),
             dirty: MaxwellThreeDDirtySubresources::default(),
         };
@@ -1145,6 +1507,140 @@ fn image_description(
     .map_err(|_| MaxwellThreeDResourceError::ContradictoryState { role: request.role })
 }
 
+fn read_descriptor_bytes(
+    range: &CanonicalBackingRange,
+    offset: u64,
+    staged_writes: Option<&CanonicalWriteBatch>,
+) -> Result<[u8; 32], MaxwellThreeDResourceError> {
+    let mut bytes = [0; 32];
+    read_backing_bytes(range, offset, &mut bytes, staged_writes)?;
+    Ok(bytes)
+}
+
+fn read_backing_bytes(
+    range: &CanonicalBackingRange,
+    offset: u64,
+    bytes: &mut [u8],
+    staged_writes: Option<&CanonicalWriteBatch>,
+) -> Result<(), MaxwellThreeDResourceError> {
+    if let Some(staged_writes) = staged_writes {
+        staged_writes
+            .read_staged(range, offset, bytes)
+            .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?;
+    } else {
+        range
+            .read(offset, bytes)
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
+    }
+    Ok(())
+}
+
+fn descriptor_words(bytes: [u8; 32]) -> [u32; 8] {
+    std::array::from_fn(|index| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    })
+}
+
+const fn texture_descriptor_pair(
+    mode: MaxwellThreeDSamplerBindingMode,
+    raw_handle: u32,
+) -> (u32, u32) {
+    match mode {
+        MaxwellThreeDSamplerBindingMode::Independent => {
+            (raw_handle & 0x000f_ffff, raw_handle >> 20)
+        }
+        MaxwellThreeDSamplerBindingMode::ViaTextureHeader => (raw_handle, raw_handle),
+    }
+}
+
+fn uses_maxwell_texture_headers(selector: Option<&bool>) -> bool {
+    selector.copied().unwrap_or(true)
+}
+
+fn decode_sampler(
+    texture_reference: MaxwellThreeDTextureReference,
+    descriptor: u32,
+    bytes: [u8; 32],
+) -> Result<MaxwellThreeDResolvedSampler, MaxwellThreeDResourceError> {
+    // Maxwell TSC field placement and public enums follow deko3d's pinned
+    // descriptor definition and generator:
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/texture_sampler_control_block.h
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/tsc_generate.cpp
+    let words = descriptor_words(bytes);
+    let role = MaxwellThreeDResourceRole::Sampler(texture_reference);
+    if words[0] & (1 << 9) != 0 || ((words[1] >> 10) & 3) != 0 {
+        return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+            descriptor,
+            field: "depth comparison or reduction filter",
+            value: words[0] ^ words[1],
+        });
+    }
+    let address_mode = |raw: u32| match raw {
+        0 => Ok(AddressMode::Repeat),
+        1 => Ok(AddressMode::MirroredRepeat),
+        2 => Ok(AddressMode::ClampToEdge),
+        3 => Ok(AddressMode::ClampToBorder),
+        _ => Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+            descriptor,
+            field: "address mode",
+            value: raw,
+        }),
+    };
+    let filter = |raw: u32, field| match raw {
+        1 => Ok(FilterMode::Nearest),
+        2 => Ok(FilterMode::Linear),
+        _ => Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+            descriptor,
+            field,
+            value: raw,
+        }),
+    };
+    let mip_filter = match (words[1] >> 6) & 3 {
+        1 | 2 => FilterMode::Nearest,
+        3 => FilterMode::Linear,
+        value => {
+            return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+                descriptor,
+                field: "mip filter",
+                value,
+            });
+        }
+    };
+    let bias = ((words[1] >> 12) & 0x1fff) as i32;
+    let signed_bias = (bias << 19) >> 19;
+    if signed_bias != 0 {
+        return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+            descriptor,
+            field: "LOD bias",
+            value: bias as u32,
+        });
+    }
+    let lod_min_fixed = (words[2] & 0xfff) as u16;
+    let lod_max_fixed = ((words[2] >> 12) & 0xfff) as u16;
+    if lod_min_fixed > lod_max_fixed {
+        return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+            descriptor,
+            field: "LOD clamp",
+            value: words[2] & 0x00ff_ffff,
+        });
+    }
+    let max_anisotropy = [1, 2, 4, 6, 8, 10, 12, 16][((words[0] >> 20) & 7) as usize];
+    Ok(MaxwellThreeDResolvedSampler {
+        role,
+        min_filter: filter((words[1] >> 4) & 3, "minification filter")?,
+        mag_filter: filter(words[1] & 3, "magnification filter")?,
+        mip_filter,
+        address_modes: [
+            address_mode(words[0] & 7)?,
+            address_mode((words[0] >> 3) & 7)?,
+            address_mode((words[0] >> 6) & 7)?,
+        ],
+        lod_min_fixed,
+        lod_max_fixed,
+        max_anisotropy,
+    })
+}
+
 fn depth_is_programmed(target: &MaxwellThreeDDepthStencilTargetState) -> bool {
     // SET_Z_COMPRESSION configures an operation performed on an attachment; it
     // does not describe or bind one. Keep it out of this presence test so a
@@ -1233,6 +1729,27 @@ pub enum MaxwellThreeDResourceError {
         role: MaxwellThreeDResourceRole,
         mode: MaxwellThreeDSampleMode,
     },
+    DescriptorIndexOutOfRange {
+        role: MaxwellThreeDResourceRole,
+        index: u32,
+    },
+    TextureHandleOutOfRange {
+        texture_reference: MaxwellThreeDTextureReference,
+        constant_buffer_size: u64,
+    },
+    UnsupportedTextureBindingMode {
+        descriptor: u32,
+    },
+    UnsupportedTextureDescriptor {
+        descriptor: u32,
+        field: &'static str,
+        value: u32,
+    },
+    UnsupportedSamplerDescriptor {
+        descriptor: u32,
+        field: &'static str,
+        value: u32,
+    },
     DiscontiguousAllocation,
     ContradictoryAlias {
         first: MaxwellThreeDResourceRole,
@@ -1248,6 +1765,8 @@ pub enum MaxwellThreeDResourceError {
         resource: usize,
     },
     Canonical(CanonicalRangeError),
+    CanonicalAccess(CanonicalRangeAccessError),
+    StagedCanonicalAccess(CanonicalWriteBatchError),
     ResourceExhausted,
 }
 
@@ -1302,6 +1821,37 @@ impl Display for MaxwellThreeDResourceError {
                 formatter,
                 "Maxwell sample mode has no neutral image interpretation: role={role:?} mode={mode:?}"
             ),
+            Self::DescriptorIndexOutOfRange { role, index } => write!(
+                formatter,
+                "Maxwell descriptor index exceeds its programmed pool: role={role:?} index={index}"
+            ),
+            Self::TextureHandleOutOfRange {
+                texture_reference,
+                constant_buffer_size,
+            } => write!(
+                formatter,
+                "Maxwell texture handle is outside its constant buffer: reference={texture_reference:?} constant-buffer-size={constant_buffer_size}"
+            ),
+            Self::UnsupportedTextureBindingMode { descriptor } => write!(
+                formatter,
+                "Maxwell texture descriptor {descriptor} uses an unsupported texture/sampler binding mode"
+            ),
+            Self::UnsupportedTextureDescriptor {
+                descriptor,
+                field,
+                value,
+            } => write!(
+                formatter,
+                "Maxwell texture descriptor {descriptor} has unsupported {field}: value=0x{value:08x}"
+            ),
+            Self::UnsupportedSamplerDescriptor {
+                descriptor,
+                field,
+                value,
+            } => write!(
+                formatter,
+                "Maxwell sampler descriptor {descriptor} has unsupported {field}: value=0x{value:08x}"
+            ),
             Self::DiscontiguousAllocation => formatter
                 .write_str("one resource range crosses non-contiguous allocation identities"),
             Self::ContradictoryAlias { first, second } => write!(
@@ -1327,6 +1877,12 @@ impl Display for MaxwellThreeDResourceError {
             Self::Canonical(error) => {
                 write!(formatter, "canonical resource snapshot failed: {error}")
             }
+            Self::CanonicalAccess(error) => {
+                write!(formatter, "canonical descriptor read failed: {error}")
+            }
+            Self::StagedCanonicalAccess(error) => {
+                write!(formatter, "staged descriptor read failed: {error}")
+            }
             Self::ResourceExhausted => {
                 formatter.write_str("Maxwell resource resolution exhausted host bookkeeping")
             }
@@ -1338,9 +1894,22 @@ impl std::error::Error for MaxwellThreeDResourceError {}
 
 #[cfg(test)]
 mod tests {
-    use nixe_gpu::{BlockLinearLayout, ImageMemoryLayout};
+    use nixe_gpu::{AddressMode, BlockLinearLayout, FilterMode, ImageMemoryLayout};
+    use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
 
-    use super::{MAXWELL_GENERIC_BLOCK_LINEAR_KIND, MaxwellThreeDPreservedImageLayout};
+    use super::{
+        MAXWELL_GENERIC_BLOCK_LINEAR_KIND, MaxwellThreeDPreservedImageLayout,
+        MaxwellThreeDResourceError, decode_sampler, read_backing_bytes, read_descriptor_bytes,
+        texture_descriptor_pair, uses_maxwell_texture_headers,
+    };
+
+    fn descriptor_bytes(words: [u32; 8]) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        for (index, word) in words.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
 
     #[test]
     fn generic_block_linear_color_bytes_remain_direct_when_compression_state_is_enabled() {
@@ -1373,5 +1942,113 @@ mod tests {
         };
 
         assert!(!layout.has_direct_canonical_representation());
+    }
+
+    #[test]
+    fn tsc_repeat_linear_sampler_becomes_an_exact_neutral_description() {
+        let words = [0, 2 | (2 << 4) | (3 << 6), (15 * 256) << 12, 0, 0, 0, 0, 0];
+        let texture_reference = super::MaxwellThreeDTextureReference::new(4, 3, 0x20);
+
+        let sampler = decode_sampler(texture_reference, 8, descriptor_bytes(words)).unwrap();
+        let description = sampler.description().unwrap();
+
+        assert_eq!(
+            sampler.role(),
+            super::MaxwellThreeDResourceRole::Sampler(texture_reference)
+        );
+        assert_eq!(description.min_filter, FilterMode::Linear);
+        assert_eq!(description.mag_filter, FilterMode::Linear);
+        assert_eq!(description.mip_filter, FilterMode::Linear);
+        assert_eq!(description.address_modes, [AddressMode::Repeat; 3]);
+        assert_eq!(description.lod_min, 0.0);
+        assert_eq!(description.lod_max, 15.0);
+        assert_eq!(description.max_anisotropy, 1.0);
+    }
+
+    #[test]
+    fn tsc_depth_comparison_is_rejected_instead_of_losing_semantics() {
+        let mut words = [0; 8];
+        words[0] = 1 << 9;
+        let texture_reference = super::MaxwellThreeDTextureReference::new(4, 3, 0x20);
+
+        assert!(matches!(
+            decode_sampler(texture_reference, 8, descriptor_bytes(words)),
+            Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+                descriptor: 8,
+                field: "depth comparison or reduction filter",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_texture_handle_selects_tic_and_tsc_for_each_binding_mode() {
+        assert_eq!(
+            texture_descriptor_pair(
+                super::MaxwellThreeDSamplerBindingMode::Independent,
+                0xabc0_0008,
+            ),
+            (8, 0xabc)
+        );
+        assert_eq!(
+            texture_descriptor_pair(super::MaxwellThreeDSamplerBindingMode::ViaTextureHeader, 8),
+            (8, 8)
+        );
+    }
+
+    #[test]
+    fn texture_header_selector_uses_the_maxwell_reset_mode_until_programmed() {
+        assert!(uses_maxwell_texture_headers(None));
+        assert!(uses_maxwell_texture_headers(Some(&true)));
+        assert!(!uses_maxwell_texture_headers(Some(&false)));
+    }
+
+    #[test]
+    fn descriptor_reads_see_ordered_staged_uploads_without_publishing_them() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut writes = CanonicalWriteBatch::new();
+        let expected = descriptor_bytes([
+            0x58d2_4908,
+            0x093d_7000,
+            0x0060_0000,
+            0x0007_0020,
+            0xe880_00ff,
+            0x8000_00ff,
+            0x0300_0000,
+            0,
+        ]);
+        writes.stage(&range, 8 * 32, &expected).unwrap();
+
+        assert_eq!(
+            read_descriptor_bytes(&range, 8 * 32, Some(&writes)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            read_descriptor_bytes(&range, 8 * 32, None).unwrap(),
+            [0; 32]
+        );
+    }
+
+    #[test]
+    fn bindless_texture_handle_reads_the_staged_constant_buffer_value() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mut writes = CanonicalWriteBatch::new();
+        writes
+            .stage(&range, 0x20, &0xabc0_0008_u32.to_le_bytes())
+            .unwrap();
+        let mut staged = [0; 4];
+        let mut published = [0; 4];
+
+        read_backing_bytes(&range, 0x20, &mut staged, Some(&writes)).unwrap();
+        read_backing_bytes(&range, 0x20, &mut published, None).unwrap();
+
+        assert_eq!(u32::from_le_bytes(staged), 0xabc0_0008);
+        assert_eq!(published, [0; 4]);
     }
 }

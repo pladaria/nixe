@@ -391,6 +391,48 @@ impl VertexBufferLayout {
     }
 }
 
+/// Host-independent depth comparison selected for a graphics draw.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DepthCompareOperation {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+/// Effective depth-test state carried by one neutral draw.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DepthState {
+    pub test_enabled: bool,
+    pub write_enabled: bool,
+    pub compare: DepthCompareOperation,
+}
+
+impl DepthState {
+    pub const DISABLED: Self = Self {
+        test_enabled: false,
+        write_enabled: false,
+        compare: DepthCompareOperation::Always,
+    };
+
+    #[must_use]
+    pub const fn new(
+        test_enabled: bool,
+        write_enabled: bool,
+        compare: DepthCompareOperation,
+    ) -> Self {
+        Self {
+            test_enabled,
+            write_enabled,
+            compare,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrawOperation {
     pub pipeline: PipelineId,
@@ -400,6 +442,7 @@ pub struct DrawOperation {
     pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
+    pub depth_state: DepthState,
     pub arguments: DrawArguments,
 }
 
@@ -436,6 +479,7 @@ impl DrawOperation {
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
             viewport_transform: None,
+            depth_state: DepthState::DISABLED,
             arguments,
         })
     }
@@ -443,6 +487,12 @@ impl DrawOperation {
     #[must_use]
     pub fn with_viewport_transform(mut self, viewport_transform: ViewportTransform) -> Self {
         self.viewport_transform = Some(viewport_transform);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_depth_state(mut self, depth_state: DepthState) -> Self {
+        self.depth_state = depth_state;
         self
     }
 }
