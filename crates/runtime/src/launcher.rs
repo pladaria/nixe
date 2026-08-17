@@ -17,9 +17,9 @@ use nixe_loader_title::{
 };
 
 use crate::launch_plan::{
-    AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, MAX_ADD_ON_MOUNTS,
-    MAX_LAUNCH_ADD_ONS, MAX_LAUNCH_MODULES, ModuleRole, MountProvenance, PackagedIdentity,
-    ReadOnlyMount,
+    AddOnContent, HomebrewIdentity, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan,
+    MAX_ADD_ON_MOUNTS, MAX_LAUNCH_ADD_ONS, MAX_LAUNCH_MODULES, ModuleRole, MountProvenance,
+    PackagedIdentity, ReadOnlyMount,
 };
 
 /// Configuration consumed atomically by [`Launcher::build`].
@@ -335,7 +335,11 @@ impl Launcher {
                 .map_err(LoadError::Storage)
                 .map_err(|error| LaunchError::load(LaunchStage::ExecutableModules, path, error))?,
         );
-        let image = NroLoader::load(storage)
+        let image = NroLoader::load(storage.clone())
+            .map_err(|error| LaunchError::load(LaunchStage::ExecutableModules, path, error))?;
+        let source_size = storage
+            .len()
+            .map_err(LoadError::Storage)
             .map_err(|error| LaunchError::load(LaunchStage::ExecutableModules, path, error))?;
         let primary = image
             .assets()
@@ -350,7 +354,7 @@ impl Launcher {
             LaunchModuleImage::Nro(image),
         );
         Ok(LaunchPlan::new(
-            LaunchKind::Homebrew,
+            LaunchKind::Homebrew(Box::new(HomebrewIdentity::new(storage, source_size))),
             vec![module],
             0,
             primary,
@@ -961,7 +965,11 @@ mod tests {
         let path = directory.path().join("demo.NRO");
         fs::write(&path, minimal_nro()).unwrap();
         let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-        assert!(matches!(plan.kind(), LaunchKind::Homebrew));
+        assert!(matches!(plan.kind(), LaunchKind::Homebrew(_)));
+        let identity = plan.homebrew_identity().unwrap();
+        assert_eq!(identity.guest_path(), "/.nixe/launch.nro");
+        assert_eq!(identity.argv0(), "sdmc:/.nixe/launch.nro");
+        assert_eq!(identity.size(), 0x2800);
         assert!(plan.packaged_identity().is_none());
         assert!(plan.effective_policy().is_none());
         assert!(plan.primary_file_system().is_none());

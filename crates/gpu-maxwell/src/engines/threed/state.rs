@@ -15,16 +15,15 @@ use super::{
     MaxwellThreeDColorReductionStateWrite, MaxwellThreeDCoverageState,
     MaxwellThreeDCoverageStateWrite, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
-    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDLineState, MaxwellThreeDLineStateWrite,
-    MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite, MaxwellThreeDPolygonMode,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderEnableStateWrite,
-    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
-    MaxwellThreeDRopL2CacheState, MaxwellThreeDRopL2CacheStateWrite,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState,
-    MaxwellThreeDZCullStateWrite,
+    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
+    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDMmeState,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
+    MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDShaderBindingState,
+    MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDTirMode, MaxwellThreeDVertexInputState,
+    MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
 };
 
 pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
@@ -769,7 +768,7 @@ pub struct MaxwellThreeDState {
     coverage: MaxwellThreeDCoverageState,
     line: MaxwellThreeDLineState,
     zcull: MaxwellThreeDZCullState,
-    rop_l2_cache: MaxwellThreeDRopL2CacheState,
+    l2_cache: MaxwellThreeDL2CacheState,
     report_semaphore: MaxwellThreeDReportSemaphoreState,
     mme: MaxwellThreeDMmeState,
 }
@@ -821,7 +820,7 @@ impl Default for MaxwellThreeDState {
             coverage: Default::default(),
             line: Default::default(),
             zcull: Default::default(),
-            rop_l2_cache: Default::default(),
+            l2_cache: Default::default(),
             report_semaphore: Default::default(),
             mme: Default::default(),
         }
@@ -895,8 +894,8 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
-    pub const fn rop_l2_cache(&self) -> &MaxwellThreeDRopL2CacheState {
-        &self.rop_l2_cache
+    pub const fn l2_cache(&self) -> &MaxwellThreeDL2CacheState {
+        &self.l2_cache
     }
 
     #[must_use]
@@ -1009,6 +1008,10 @@ impl MaxwellThreeDState {
             dependencies.push(self.render_targets.separate_fragment_data().raw());
         }
         dependencies.push(self.coverage.csaa_enable().raw());
+        dependencies.push(self.coverage.tir_mode().raw());
+        if self.coverage.tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM) {
+            dependencies.push(self.coverage.tir_control().raw());
+        }
         dependencies.push(self.coverage.hybrid_anti_alias_control().raw());
         dependencies.extend(
             self.coverage
@@ -1146,7 +1149,7 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::Coverage(write) => self.coverage.apply(write),
             MaxwellThreeDStateWrite::Line(write) => self.line.apply(write),
             MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
-            MaxwellThreeDStateWrite::RopL2Cache(write) => self.rop_l2_cache.apply(write),
+            MaxwellThreeDStateWrite::L2Cache(write) => self.l2_cache.apply(write),
             MaxwellThreeDStateWrite::ReportSemaphore(write) => self.report_semaphore.apply(write),
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
@@ -1403,7 +1406,7 @@ pub enum MaxwellThreeDStateWrite {
     Coverage(MaxwellThreeDCoverageStateWrite),
     Line(MaxwellThreeDLineStateWrite),
     ZCull(MaxwellThreeDZCullStateWrite),
-    RopL2Cache(MaxwellThreeDRopL2CacheStateWrite),
+    L2Cache(MaxwellThreeDL2CacheStateWrite),
     ReportSemaphore(MaxwellThreeDReportSemaphoreStateWrite),
     Mme(MaxwellThreeDMmeStateWrite),
 }

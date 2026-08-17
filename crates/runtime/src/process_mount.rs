@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use nixe_loader_executable::{EffectiveNpdmPolicy, FileSystemPermissions};
 use nixe_loader_title::TitleId;
 
-use crate::{AddOnContent, LaunchPlan, ReadOnlyMount};
+use crate::{AddOnContent, HomebrewIdentity, LaunchPlan, ReadOnlyMount};
 
 /// Immutable filesystem views visible to one process before Horizon IPC objects exist.
 #[derive(Clone, Debug)]
@@ -13,6 +13,7 @@ pub struct ProcessMountNamespace {
     primary: Option<ReadOnlyMount>,
     add_ons: Box<[AddOnContent]>,
     sd_card_root: Option<PathBuf>,
+    homebrew: Option<HomebrewIdentity>,
     policy: Option<EffectiveNpdmPolicy>,
 }
 
@@ -30,6 +31,7 @@ impl ProcessMountNamespace {
             primary: plan.primary_file_system().cloned(),
             add_ons,
             sd_card_root,
+            homebrew: plan.homebrew_identity().cloned(),
             policy,
         }
     }
@@ -47,6 +49,11 @@ impl ProcessMountNamespace {
     /// Returns the canonical host directory exposed as `sdmc:`, when present.
     pub fn sd_card_root(&self) -> Option<&Path> {
         self.sd_card_root.as_deref()
+    }
+
+    /// Returns the launched NRO overlaid into this process's SD-card view.
+    pub const fn homebrew_executable(&self) -> Option<&HomebrewIdentity> {
+        self.homebrew.as_ref()
     }
 
     /// Returns the immutable authorization policy associated with these mounts.

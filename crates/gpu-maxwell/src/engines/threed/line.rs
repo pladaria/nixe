@@ -14,6 +14,33 @@ use crate::MaxwellMethodSource;
 
 use super::{MaxwellThreeDRawValue, MaxwellThreeDRegister};
 
+/// Treatment of edges generated when polygon clipping precedes line-mode
+/// rasterization.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1261-L1264>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDPolygonClipGeneratedEdge {
+    DrawLine = 0,
+    DoNotDrawLine = 1,
+}
+
+impl MaxwellThreeDPolygonClipGeneratedEdge {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::DrawLine),
+            1 => Some(Self::DoNotDrawLine),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Whether rasterized lines use Maxwell's smooth antialiasing path.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
@@ -101,6 +128,10 @@ impl MaxwellThreeDAliasedLineWidthEnable {
 /// One validated line-rasterization register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDLineStateWrite {
+    PolygonClipGeneratedEdge {
+        value: MaxwellThreeDPolygonClipGeneratedEdge,
+        source: MaxwellMethodSource,
+    },
     AliasedLineWidthEnable {
         value: MaxwellThreeDAliasedLineWidthEnable,
         source: MaxwellMethodSource,
@@ -126,6 +157,7 @@ pub enum MaxwellThreeDLineStateWrite {
 /// Persistent line-rasterization configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDLineState {
+    polygon_clip_generated_edge: MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge>,
     aliased_line_width_enable: MaxwellThreeDRegister<MaxwellThreeDAliasedLineWidthEnable>,
     anti_aliased_line_enable: MaxwellThreeDRegister<MaxwellThreeDAntiAliasedLineEnable>,
     aliased_line_width: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
@@ -134,6 +166,13 @@ pub struct MaxwellThreeDLineState {
 }
 
 impl MaxwellThreeDLineState {
+    #[must_use]
+    pub const fn polygon_clip_generated_edge(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge> {
+        &self.polygon_clip_generated_edge
+    }
+
     #[must_use]
     pub const fn aliased_line_width_enable(
         &self,
@@ -166,6 +205,7 @@ impl MaxwellThreeDLineState {
     }
 
     pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+        dependencies.push(self.polygon_clip_generated_edge.raw());
         dependencies.push(self.aliased_line_width_enable.raw());
         dependencies.push(self.anti_aliased_line_enable.raw());
         dependencies.push(self.aliased_line_width.raw());
@@ -177,6 +217,10 @@ impl MaxwellThreeDLineState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDLineStateWrite) {
         match write {
+            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge { value, source } => {
+                self.polygon_clip_generated_edge =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source } => {
                 self.aliased_line_width_enable =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);

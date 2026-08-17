@@ -4,6 +4,7 @@ mod bindings;
 mod color_reduction;
 mod coverage;
 mod draw;
+mod l2_cache;
 mod line;
 mod mme;
 mod operations;
@@ -11,7 +12,6 @@ mod output;
 mod render_enable;
 mod render_targets;
 mod resource;
-mod rop_cache;
 mod shader_execution;
 mod state;
 mod vertex;
@@ -40,7 +40,7 @@ pub use coverage::{
     MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable,
     MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDSampleLocation,
-    MaxwellThreeDSampleLocationGroup,
+    MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
 };
 pub use draw::{
     MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
@@ -52,6 +52,7 @@ pub use draw::{
 pub use line::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAntiAliasedLineEnable,
     MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters,
+    MaxwellThreeDPolygonClipGeneratedEdge,
 };
 pub use mme::{
     MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS, MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES,
@@ -73,6 +74,11 @@ pub use operations::{
     lower_maxwell_three_d_synchronization,
 };
 
+pub use l2_cache::{
+    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
+    MaxwellThreeDRopL2CacheRequest, MaxwellThreeDSystemMemoryVolatile,
+    MaxwellThreeDVafL2CacheControl,
+};
 pub use output::{
     MAXWELL_SCISSOR_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
     MaxwellThreeDBlendControlState, MaxwellThreeDBlendEnableCommon, MaxwellThreeDBlendFactor,
@@ -97,13 +103,13 @@ pub use render_targets::{
     MAXWELL_COLOR_TARGET_COUNT, MaxwellThreeDAttachmentReadiness, MaxwellThreeDClearState,
     MaxwellThreeDClearSurface, MaxwellThreeDClearSurfaceControl, MaxwellThreeDColorCompressionMode,
     MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
-    MaxwellThreeDColorTargetState, MaxwellThreeDDepthStencilFormat,
-    MaxwellThreeDDepthStencilTargetState, MaxwellThreeDDepthTargetCount, MaxwellThreeDImageKind,
-    MaxwellThreeDImageLayout, MaxwellThreeDRawValue, MaxwellThreeDRectangle,
-    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
-    MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDRenderTargetWrite, MaxwellThreeDSeparateFragmentData,
-    MaxwellThreeDZCompressionMode,
+    MaxwellThreeDColorTargetState, MaxwellThreeDCompressionThreshold,
+    MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
+    MaxwellThreeDDepthTargetCount, MaxwellThreeDImageKind, MaxwellThreeDImageLayout,
+    MaxwellThreeDRawValue, MaxwellThreeDRectangle, MaxwellThreeDRenderTargetIndexOffset,
+    MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
+    MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
 pub(crate) use resource::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
 pub use resource::{
@@ -114,17 +120,15 @@ pub use resource::{
     MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureReference,
     resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
-pub use rop_cache::{
-    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDRopL2CacheRequest,
-    MaxwellThreeDRopL2CacheState, MaxwellThreeDRopL2CacheStateWrite,
-};
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDSubtilingPerfKnobA,
-    MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDVisibleCallLimit,
+    MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDShaderLocalMemoryPerWarpSize,
+    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderWatermarkRange,
+    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSmTimeoutCounterBit,
+    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDVisibleCallLimit,
 };
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
@@ -139,8 +143,8 @@ pub use state::{
 pub use vertex::{
     MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MaxwellThreeDAttributeDefaultVector,
-    MaxwellThreeDAttributeDefaults, MaxwellThreeDBegin, MaxwellThreeDIndexBufferState,
-    MaxwellThreeDIndexElementSize, MaxwellThreeDPatchSize,
+    MaxwellThreeDAttributeDefaults, MaxwellThreeDBalancedPrimitiveWorkload, MaxwellThreeDBegin,
+    MaxwellThreeDIndexBufferState, MaxwellThreeDIndexElementSize, MaxwellThreeDPatchSize,
     MaxwellThreeDPrimitiveCircularBufferThrottle, MaxwellThreeDPrimitiveState,
     MaxwellThreeDPrimitiveTopology, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
@@ -166,7 +170,7 @@ use super::{
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
-    MaxwellShaderProgramHeaderVersion, MaxwellShaderProgramHeaderVersionRange,
+    MaxwellShaderProgramHeaderVersion, MaxwellShaderProgramHeaderVersionRange, MaxwellSpaVersion,
 };
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb197);
@@ -177,6 +181,7 @@ enum MethodAction {
     NoOperation,
     SubtilingPerfKnobA,
     SubtilingPerfKnobB,
+    ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget),
     L1Configuration,
     ColorReductionThresholdsEnable,
     ColorReductionThresholdsUnorm8,
@@ -185,11 +190,14 @@ enum MethodAction {
     ColorReductionThresholdsFp16,
     ColorReductionThresholdsSrgb8,
     AlphaFraction,
+    TirMode,
+    TirControl,
     HybridAntiAliasControl,
     SampleLocations(u8),
     RasterBoundingBox,
     CheckSphVersion,
     CheckAamVersion,
+    VafL2CacheControl,
     RopL2CacheControl(MaxwellThreeDRopL2CacheRequest),
     ReportSemaphoreAddressUpper,
     ReportSemaphoreAddressLower,
@@ -211,6 +219,7 @@ enum MethodAction {
     PsOutputSampleMaskUsage,
     VisibleCallLimit,
     SmTimeoutCounterBit,
+    ShaderExceptionsEnable,
     ShaderLocalMemoryWindowBaseAddress,
     ShaderLocalMemoryAddressUpper,
     ShaderLocalMemoryAddressLower,
@@ -270,6 +279,32 @@ methods!(
         "SET_SUBTILING_PERF_KNOB_B",
         0x0000_00ff,
         MethodAction::SubtilingPerfKnobB
+    ),
+    SET_VTG_WARP_WATERMARKS => (
+        0x0f98,
+        "SET_VTG_WARP_WATERMARKS",
+        u32::MAX,
+        MethodAction::ShaderWatermarks(
+            MaxwellThreeDShaderWatermarkTarget::VertexTessellationGeometryWarps
+        )
+    ),
+    SET_PS_WARP_WATERMARKS => (
+        0x1450,
+        "SET_PS_WARP_WATERMARKS",
+        u32::MAX,
+        MethodAction::ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget::PixelWarps)
+    ),
+    SET_PS_REGISTER_WATERMARKS => (
+        0x1454,
+        "SET_PS_REGISTER_WATERMARKS",
+        u32::MAX,
+        MethodAction::ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget::PixelRegisters)
+    ),
+    SET_L2_CACHE_CONTROL_FOR_VAF_REQUESTS => (
+        0x1000,
+        "SET_L2_CACHE_CONTROL_FOR_VAF_REQUESTS",
+        0x0000_0031,
+        MethodAction::VafL2CacheControl
     ),
     INCREMENT_SYNC_POINT => (
         0x02c8,
@@ -355,6 +390,18 @@ methods!(
         0x0000_003f,
         MethodAction::HybridAntiAliasControl
     ),
+    SET_TIR => (
+        0x0fb4,
+        "SET_TIR",
+        0x0000_0003,
+        MethodAction::TirMode
+    ),
+    SET_TIR_CONTROL => (
+        0x1130,
+        "SET_TIR_CONTROL",
+        0x0000_0013,
+        MethodAction::TirControl
+    ),
     SAMPLE_LOCATIONS_0 => (
         0x11e0,
         "SAMPLE_LOCATIONS(0)",
@@ -420,6 +467,12 @@ methods!(
         "SET_SHADER_LOCAL_MEMORY_E",
         MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
         MethodAction::ShaderLocalMemoryDefaultSizePerWarp
+    ),
+    SET_SHADER_EXCEPTIONS => (
+        0x1528,
+        "SET_SHADER_EXCEPTIONS",
+        0x0000_0001,
+        MethodAction::ShaderExceptionsEnable
     ),
     CHECK_SPH_VERSION => (
         0x16a8,
@@ -958,6 +1011,18 @@ fn preflight_register(
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
+            MethodAction::ShaderWatermarks(target) => {
+                let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());
+                let write = MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
+                        target,
+                        value,
+                        source,
+                    },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::L1Configuration => {
                 let value = MaxwellThreeDDirectlyAddressableMemory::parse(source.argument())
                     .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1117,6 +1182,22 @@ fn preflight_register(
                     supported,
                 }
             }
+            MethodAction::VafL2CacheControl => {
+                let value = MaxwellThreeDVafL2CacheControl::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write =
+                    MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::VafControl {
+                        value,
+                        source,
+                    });
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::RopL2CacheControl(request) => {
                 let value = MaxwellThreeDL2CacheEvictionPolicy::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1125,13 +1206,12 @@ fn preflight_register(
                         defined_mask: declaration.defined_mask,
                     },
                 )?;
-                let write = MaxwellThreeDStateWrite::RopL2Cache(
-                    MaxwellThreeDRopL2CacheStateWrite::Policy {
+                let write =
+                    MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::RopPolicy {
                         request,
                         value,
                         source,
-                    },
-                );
+                    });
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
@@ -1355,6 +1435,36 @@ fn preflight_register(
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
+            MethodAction::TirMode => {
+                let value = MaxwellThreeDTirMode::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write =
+                    MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirMode {
+                        value,
+                        source,
+                    });
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TirControl => {
+                let value = MaxwellThreeDTirControl::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::TirControl { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::SampleLocations(group) => {
                 let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
                 let write = MaxwellThreeDStateWrite::Coverage(
@@ -1407,6 +1517,23 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
                     MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ShaderExceptionsEnable => {
+                let value = MaxwellThreeDShaderExceptionsEnable::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable {
+                        value,
+                        source,
+                    },
                 );
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
@@ -1926,6 +2053,19 @@ fn preflight_vertex_and_binding_state(
         })
     } else {
         match method {
+            0x0374 => Some((
+                V::BalancedPrimitiveWorkload {
+                    value: MaxwellThreeDBalancedPrimitiveWorkload::parse(raw).ok_or_else(|| {
+                        invalid_encoding(
+                            source,
+                            "SET_BALANCED_PRIMITIVE_WORKLOAD",
+                            "reserved bits are set",
+                        )
+                    })?,
+                    source,
+                },
+                "SET_BALANCED_PRIMITIVE_WORKLOAD",
+            )),
             0x0f84 if raw <= 0xff => Some((
                 V::StreamSubstituteAddressUpper {
                     value: raw as u8,
@@ -2248,6 +2388,15 @@ fn preflight_vertex_and_binding_state(
         ))
     } else {
         match method {
+            0x0310 => Some((
+                B::SpaVersion {
+                    value: MaxwellSpaVersion::parse(raw).ok_or_else(|| {
+                        invalid_encoding(source, "SET_SPA_VERSION", "reserved bits are set")
+                    })?,
+                    source,
+                },
+                "SET_SPA_VERSION",
+            )),
             0x1608 if raw <= 0xff => Some((
                 B::ProgramRegionAddressUpper {
                     value: raw as u8,
@@ -2392,6 +2541,19 @@ fn preflight_output_state(
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2610-L2611
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2785-L2788
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3108-L3121
+        0x0f8c => Some((
+            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge {
+                value: MaxwellThreeDPolygonClipGeneratedEdge::parse(raw).ok_or_else(|| {
+                    invalid_encoding(
+                        source,
+                        "SET_LINE_MODE_POLYGON_CLIP",
+                        "expected generated-edge selector 0 or 1",
+                    )
+                })?,
+                source,
+            },
+            "SET_LINE_MODE_POLYGON_CLIP",
+        )),
         0x13b4 => Some((
             MaxwellThreeDLineStateWrite::AliasedLineWidth {
                 value: MaxwellThreeDRawValue::new(raw),
@@ -2829,6 +2991,19 @@ fn preflight_output_state(
             Some((
                 MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, source },
                 "SET_CT_SELECT",
+            ))
+        }
+        0x1220 => {
+            let value = MaxwellThreeDCompressionThreshold::parse(raw).ok_or_else(|| {
+                invalid_encoding(
+                    source,
+                    "SET_COMPRESSION_THRESHOLD",
+                    "sample threshold is undefined or reserved bits are set",
+                )
+            })?;
+            Some((
+                MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, source },
+                "SET_COMPRESSION_THRESHOLD",
             ))
         }
         0x15cc if raw & !0x0001_ffff == 0 => Some((
@@ -3415,6 +3590,11 @@ fn preflight_output_state(
             R::StencilTestEnable,
             V::Boolean(checked_bool(source, "SET_STENCIL_TEST")?),
             "SET_STENCIL_TEST",
+        ),
+        0x1594 => (
+            R::TwoSidedStencilTestEnable,
+            V::Boolean(checked_bool(source, "SET_TWO_SIDED_STENCIL_TEST")?),
+            "SET_TWO_SIDED_STENCIL_TEST",
         ),
         0x1384 | 0x1388 | 0x138c | 0x1598 | 0x159c | 0x15a0 => {
             let value = MaxwellThreeDStencilOp::parse(raw).ok_or_else(|| {

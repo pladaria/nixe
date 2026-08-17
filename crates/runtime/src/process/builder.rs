@@ -285,6 +285,12 @@ impl ProcessBuilder {
                 self.config.address_space_id,
                 address,
                 main_thread_handle,
+                plan.homebrew_identity().ok_or_else(|| {
+                    error(
+                        ProcessBuildStage::Metadata,
+                        "homebrew launch has no retained executable identity",
+                    )
+                })?,
             )?;
             let loader_return = address
                 .checked_add(SYNTHETIC_PAGE_SIZE as u64 + RESOURCE_GUARD_SIZE)
@@ -507,7 +513,7 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
                     }),
             }
         }
-        LaunchKind::Homebrew => ProcessMetadata {
+        LaunchKind::Homebrew(_) => ProcessMetadata {
             execution_state: ExecutionState::A64,
             address_space: ProcessAddressSpace::Bit64,
             stack_size: DEFAULT_HOME_BREW_STACK_SIZE,
@@ -621,12 +627,36 @@ fn install_homebrew_context(
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     main_thread_handle: u32,
+    identity: &crate::HomebrewIdentity,
 ) -> Result<(), ProcessBuildError> {
     let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
     page[..4].copy_from_slice(&HOME_BREW_MAIN_THREAD_HANDLE_KEY.to_le_bytes());
     page[8..16].copy_from_slice(&u64::from(main_thread_handle).to_le_bytes());
-    // The following zeroed 24-byte entry is EntryType_EndOfList.
-    debug_assert!(HOME_BREW_CONFIG_ENTRY_SIZE * 2 <= page.len());
+    let argv_entry = HOME_BREW_CONFIG_ENTRY_SIZE;
+    page[argv_entry..argv_entry + 4].copy_from_slice(&HOME_BREW_ARGV_KEY.to_le_bytes());
+    let argv_address = address
+        .checked_add(HOME_BREW_ARGV_OFFSET as u64)
+        .ok_or_else(|| {
+            error(
+                ProcessBuildStage::Mapping,
+                "homebrew argv address overflows",
+            )
+        })?;
+    page[argv_entry + 16..argv_entry + 24].copy_from_slice(&argv_address.get().to_le_bytes());
+    let argv = identity.argv0().as_bytes();
+    let argv_end = HOME_BREW_ARGV_OFFSET
+        .checked_add(argv.len())
+        .and_then(|end| end.checked_add(1))
+        .filter(|end| *end <= page.len())
+        .ok_or_else(|| {
+            error(
+                ProcessBuildStage::Metadata,
+                "homebrew argv exceeds ABI page",
+            )
+        })?;
+    page[HOME_BREW_ARGV_OFFSET..argv_end - 1].copy_from_slice(argv);
+    // The zeroed third 24-byte entry is EntryType_EndOfList and the argv
+    // string is NUL-terminated by the zero-initialized ABI page.
     memory
         .install_ram_pages_atomic(
             address_space,

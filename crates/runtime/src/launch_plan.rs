@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use nixe_loader_content::{ApplicationVersion, RomFsArchive};
 use nixe_loader_executable::{EffectiveNpdmPolicy, Npdm, NroImage, NsoImage};
+use nixe_loader_storage::StorageRef;
 use nixe_loader_title::{ApplicationId, ControlMetadata, TitleId};
 
 /// Maximum executable modules retained by one launch plan.
@@ -11,6 +12,10 @@ pub const MAX_LAUNCH_MODULES: usize = 64;
 pub const MAX_LAUNCH_ADD_ONS: usize = 2_000;
 /// Maximum Data contents retained for one add-on title.
 pub const MAX_ADD_ON_MOUNTS: usize = 64;
+/// Private per-process SD-card path used to expose the launched NRO to libnx.
+pub const HOME_BREW_EXECUTABLE_GUEST_PATH: &str = "/.nixe/launch.nro";
+/// `argv[0]` passed through the homebrew ABI for the launched NRO.
+pub const HOME_BREW_EXECUTABLE_ARGV0: &str = "sdmc:/.nixe/launch.nro";
 
 /// Security and content identity for a packaged application.
 #[derive(Clone)]
@@ -77,11 +82,61 @@ impl PackagedIdentity {
     }
 }
 
+/// Launch identity and immutable source retained for standalone homebrew.
+#[derive(Clone)]
+pub struct HomebrewIdentity {
+    guest_path: Box<str>,
+    argv0: Box<str>,
+    source: StorageRef,
+    size: u64,
+}
+
+impl HomebrewIdentity {
+    pub(crate) fn new(source: StorageRef, size: u64) -> Self {
+        Self {
+            guest_path: HOME_BREW_EXECUTABLE_GUEST_PATH.into(),
+            argv0: HOME_BREW_EXECUTABLE_ARGV0.into(),
+            source,
+            size,
+        }
+    }
+
+    /// Returns the normalized path inside the process SD-card namespace.
+    pub fn guest_path(&self) -> &str {
+        &self.guest_path
+    }
+
+    /// Returns the homebrew command line containing the guest-visible NRO path.
+    pub fn argv0(&self) -> &str {
+        &self.argv0
+    }
+
+    /// Returns the immutable complete NRO storage exposed at [`Self::guest_path`].
+    pub fn source(&self) -> &StorageRef {
+        &self.source
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl Debug for HomebrewIdentity {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HomebrewIdentity")
+            .field("guest_path", &self.guest_path)
+            .field("argv0", &self.argv0)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Distinguishes official packaged software from standalone homebrew.
 #[derive(Debug)]
 pub enum LaunchKind {
     Packaged(Box<PackagedIdentity>),
-    Homebrew,
+    Homebrew(Box<HomebrewIdentity>),
 }
 
 /// Stable semantic role of one executable module.
@@ -247,7 +302,13 @@ impl LaunchPlan {
     pub fn packaged_identity(&self) -> Option<&PackagedIdentity> {
         match &self.kind {
             LaunchKind::Packaged(identity) => Some(identity.as_ref()),
-            LaunchKind::Homebrew => None,
+            LaunchKind::Homebrew(_) => None,
+        }
+    }
+    pub fn homebrew_identity(&self) -> Option<&HomebrewIdentity> {
+        match &self.kind {
+            LaunchKind::Homebrew(identity) => Some(identity.as_ref()),
+            LaunchKind::Packaged(_) => None,
         }
     }
     pub fn modules(&self) -> &[LaunchModule] {

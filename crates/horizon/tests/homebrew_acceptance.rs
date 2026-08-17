@@ -145,11 +145,8 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
 fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
     let directory = tempfile::tempdir().unwrap();
     let nro_path = directory.path().join("minimal-a64.nro");
-    fs::write(
-        &nro_path,
-        materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture")),
-    )
-    .unwrap();
+    let nro = materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture"));
+    fs::write(&nro_path, &nro).unwrap();
     let sd_card = directory.path().join("sdmc");
     fs::create_dir(&sd_card).unwrap();
     fs::write(sd_card.join("hello.txt"), b"hello from sdmc").unwrap();
@@ -193,9 +190,77 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
             .map(|entry| (entry.name(), entry.kind()))
             .collect::<Vec<_>>(),
         [
+            (".nixe", DirectoryEntryKind::Directory),
             ("hello.txt", DirectoryEntryKind::File),
             ("switch", DirectoryEntryKind::Directory),
         ]
+    );
+
+    let IpcResponse::Handle(launcher_directory) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenDirectory {
+                path: "/.nixe".into(),
+                mode: 3,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening the virtual launcher directory must return a directory object");
+    };
+    let IpcResponse::DirectoryEntries(entries) = process
+        .dispatch_ipc(
+            launcher_directory,
+            IpcRequest::ReadDirectory { max_entries: 8 },
+        )
+        .unwrap()
+    else {
+        panic!("reading the virtual launcher directory must return entries");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name(), "launch.nro");
+    assert_eq!(entries[0].kind(), DirectoryEntryKind::File);
+    assert_eq!(entries[0].size(), nro.len() as u64);
+
+    let IpcResponse::Handle(launched_nro) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/.nixe/launch.nro".into(),
+                mode: 1,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("opening the launched NRO must return a file object");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(launched_nro, IpcRequest::GetFileSize)
+            .unwrap(),
+        IpcResponse::Size(nro.len() as u64)
+    );
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                launched_nro,
+                IpcRequest::ReadFile {
+                    offset: 0,
+                    size: 0x20,
+                },
+            )
+            .unwrap(),
+        IpcResponse::Data(nro[..0x20].to_vec())
+    );
+    assert_eq!(
+        process.dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/.nixe/launch.nro".into(),
+                mode: 3,
+            },
+        ),
+        Err(IpcResultCode::ACCESS_DENIED)
     );
 
     let IpcResponse::Handle(file) = process
@@ -312,6 +377,48 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
             Err(IpcResultCode::ACCESS_DENIED)
         );
     }
+}
+
+#[test]
+fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let nro_path = directory.path().join("minimal-a64.nro");
+    let nro = materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture"));
+    fs::write(&nro_path, &nro).unwrap();
+
+    let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
+    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let fsp = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(filesystem) = process
+        .dispatch_ipc(fsp, IpcRequest::OpenSdCardFileSystem)
+        .unwrap()
+    else {
+        panic!("the launch overlay must provide an SD-card filesystem");
+    };
+    let IpcResponse::Handle(file) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/.nixe/launch.nro".into(),
+                mode: 1,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("the launch overlay must expose the complete NRO");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(
+                file,
+                IpcRequest::ReadFile {
+                    offset: 0x10,
+                    size: 4,
+                },
+            )
+            .unwrap(),
+        IpcResponse::Data(b"NRO0".to_vec())
+    );
 }
 
 #[test]

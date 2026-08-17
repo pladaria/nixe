@@ -251,6 +251,106 @@ fn invalid_color_compression_values_are_rejected_atomically() {
 }
 
 #[test]
+fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let two_d_before = channel.two_d().clone();
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+
+    for (argument, expected, samples) in [
+        (0, MaxwellThreeDCompressionThreshold::Samples0, 0),
+        (1, MaxwellThreeDCompressionThreshold::Samples1, 1),
+        (2, MaxwellThreeDCompressionThreshold::Samples2, 2),
+        (3, MaxwellThreeDCompressionThreshold::Samples4, 4),
+        (4, MaxwellThreeDCompressionThreshold::Samples8, 8),
+        (5, MaxwellThreeDCompressionThreshold::Samples16, 16),
+        (6, MaxwellThreeDCompressionThreshold::Samples32, 32),
+        (7, MaxwellThreeDCompressionThreshold::Samples64, 64),
+        (8, MaxwellThreeDCompressionThreshold::Samples128, 128),
+        (9, MaxwellThreeDCompressionThreshold::Samples256, 256),
+        (10, MaxwellThreeDCompressionThreshold::Samples512, 512),
+        (11, MaxwellThreeDCompressionThreshold::Samples1024, 1024),
+        (12, MaxwellThreeDCompressionThreshold::Samples2048, 2048),
+    ] {
+        let decoded = packet(0x1220 / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let method = &dispatch.methods()[0];
+        let source = method.method().source();
+        let register = channel.three_d().render_targets().compression_threshold();
+
+        assert_eq!(method.metadata().method_name(), "SET_COMPRESSION_THRESHOLD");
+        assert_eq!(
+            method.effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
+                MaxwellThreeDRenderTargetWrite::CompressionThreshold {
+                    value: expected,
+                    source,
+                }
+            ))
+        );
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value().copied(), Some(expected));
+        assert_eq!(register.source(), Some(source));
+        assert_eq!(expected.raw(), argument);
+        assert_eq!(expected.sample_count(), samples);
+        assert_eq!(
+            channel.three_d().pipeline_dependencies(&[]),
+            dependencies_before
+        );
+        assert_eq!(channel.two_d(), &two_d_before);
+    }
+
+    let resources =
+        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
+    assert!(resources.resources().is_empty());
+}
+
+#[test]
+fn compression_threshold_reserved_values_and_packet_suffix_are_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x1220, 5);
+
+    for argument in [13, 14, 15, 16, 0x8000_0000, u32::MAX] {
+        let before = channel.clone();
+        let decoded = packet(0x1220 / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_COMPRESSION_THRESHOLD",
+                reason: "sample threshold is undefined or reserved bits are set",
+            }) if source.argument() == argument
+        ));
+        assert_eq!(channel, before);
+    }
+
+    let before = channel.clone();
+    let decoded = non_incrementing_packet_on_subchannel(0, 0x1220 / 4, &[0, 13]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
+            if source.argument() == 13
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
 fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes() {
     let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
@@ -723,15 +823,18 @@ fn malformed_color_target_selection_and_packet_suffix_are_atomic() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x121c / 4, &[1, 0]);
+    let decoded = incrementing_packet(0x121c / 4, &[1, 13]);
     assert!(matches!(
         dispatch_maxwell_engine_packet(
             &mut channel,
             FrontendSubmissionId::new(3),
             &decoded.packets()[0]
         ),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1220)
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+            source,
+            method_name: "SET_COMPRESSION_THRESHOLD",
+            ..
+        }) if source.method() == GpuMethodId(0x1220)
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
@@ -3022,6 +3125,106 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
 }
 
 #[test]
+fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let two_d_before = channel.two_d().clone();
+    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
+
+    let decoded = packet(0x0310 / 4, 0x0503);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    let method = dispatch.methods()[0];
+    let source = method.method().source();
+    let register = channel
+        .three_d()
+        .shader_bindings()
+        .program_region()
+        .spa_version();
+    let value = *register.value().unwrap();
+    let _: MaxwellComputeSpaVersion = value;
+
+    assert_eq!(method.metadata().method_name(), "SET_SPA_VERSION");
+    assert_eq!(
+        method.effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
+            MaxwellThreeDShaderBindingWrite::SpaVersion { value, source }
+        ))
+    );
+    assert!(dispatch.operations().is_empty());
+    assert_eq!(value.major(), 5);
+    assert_eq!(value.minor(), 3);
+    assert_eq!(value.raw(), 0x0503);
+    assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+    assert_eq!(register.raw(), Some(0x0503));
+    assert_eq!(register.source(), Some(source));
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        inactive_dependencies
+    );
+    assert_eq!(channel.two_d(), &two_d_before);
+
+    program_three_d(&mut channel, 0x2000, 0x11);
+    let active_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    program_three_d(&mut channel, 0x0310, 0x0400);
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        active_dependencies
+    );
+}
+
+#[test]
+fn spa_version_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0310, 0x0503);
+
+    for argument in [0x1_0000, 0x8000_0000, u32::MAX] {
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = packet(0x0310 / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_SPA_VERSION",
+                reason: "reserved bits are set",
+            }) if source.argument() == argument
+        ));
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+
+    let frontend_before = channel.frontend();
+    let two_d_before = channel.two_d().clone();
+    let three_d_before = channel.three_d().clone();
+    let decoded = non_incrementing_packet_on_subchannel(0, 0x0310 / 4, &[0x0503, 0x1_0000]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
+            if source.method() == GpuMethodId(0x0310)
+                && source.argument() == 0x1_0000
+    ));
+    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.two_d(), &two_d_before);
+    assert_eq!(channel.three_d(), &three_d_before);
+}
+
+#[test]
 fn invalid_program_region_upper_and_packet_suffix_are_atomic() {
     let mut channel = channel();
     bind_three_d(&mut channel);
@@ -3170,7 +3373,7 @@ fn invalid_vertex_stream_substitute_upper_and_packet_are_atomic() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x0f84 / 4, &[0, 0x082c_3000, 0]);
+    let decoded = incrementing_packet(0x0f84 / 4, &[0, 0x082c_3000, 0, 0, 0]);
     assert!(matches!(
         dispatch_maxwell_engine_packet(
             &mut channel,
@@ -3178,7 +3381,7 @@ fn invalid_vertex_stream_substitute_upper_and_packet_are_atomic() {
             &decoded.packets()[0]
         ),
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x0f8c)
+            if source.method() == GpuMethodId(0x0f94)
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);

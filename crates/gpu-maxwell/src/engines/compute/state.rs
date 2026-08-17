@@ -3,7 +3,7 @@
 //! Register halves remain independently sourced. Combined addresses and sizes
 //! are exposed only after both halves have been programmed.
 
-use crate::MaxwellMethodSource;
+use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
 /// Number of indexed CWD reference counters exposed by `MAXWELL_COMPUTE_B`.
 pub const MAXWELL_COMPUTE_CWD_REF_COUNTER_COUNT: usize = 64;
@@ -83,40 +83,8 @@ impl MaxwellComputeAddress {
     }
 }
 
-/// Shader-program architecture version consumed by the compute frontend.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellComputeSpaVersion {
-    major: u8,
-    minor: u8,
-}
-
-impl MaxwellComputeSpaVersion {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        if raw <= 0xffff {
-            Some(Self {
-                major: (raw >> 8) as u8,
-                minor: raw as u8,
-            })
-        } else {
-            None
-        }
-    }
-
-    #[must_use]
-    pub const fn major(self) -> u8 {
-        self.major
-    }
-
-    #[must_use]
-    pub const fn minor(self) -> u8 {
-        self.minor
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        ((self.major as u32) << 8) | self.minor as u32
-    }
-}
+/// Backward-compatible compute name for the engine-independent SPA version.
+pub type MaxwellComputeSpaVersion = MaxwellSpaVersion;
 
 /// Nine-bit SM-count limit attached to a local-memory allocation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

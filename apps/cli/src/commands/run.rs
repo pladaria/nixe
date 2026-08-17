@@ -833,10 +833,36 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
                 ))
             }
         }
-        ProcessExitCause::GuestBreak { reason, info, size } => Err(format!(
-            "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}, code={:#x}",
-            exit.exit_code
-        )),
+        ProcessExitCause::GuestBreak {
+            reason,
+            info,
+            size,
+            payload,
+        } => {
+            let payload = payload.map_or_else(String::new, |payload| {
+                let bytes = payload.as_bytes();
+                let encoded = bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if let Ok(bytes) = <[u8; 4]>::try_from(bytes) {
+                    let result =
+                        nixe_horizon::HorizonIpcResult::from_raw(u32::from_le_bytes(bytes));
+                    format!(
+                        ", payload=0x{encoded}, result={:#x} (module={}, description={})",
+                        result.raw(),
+                        result.module(),
+                        result.description()
+                    )
+                } else {
+                    format!(", payload=0x{encoded}")
+                }
+            });
+            Err(format!(
+                "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}{payload}, code={:#x}",
+                exit.exit_code
+            ))
+        }
     }
 }
 
@@ -1008,11 +1034,30 @@ mod tests {
                 reason: 0,
                 info: 0x1234,
                 size: 4,
+                payload: None,
             },
             0,
         )))
         .unwrap_err();
         assert!(error.contains("fatal break"));
         assert!(error.contains("info=0x1234"));
+    }
+
+    #[test]
+    fn fatal_break_decodes_a_four_byte_horizon_result_payload() {
+        let payload = nixe_runtime::GuestBreakPayload::new(&0x60a_u32.to_le_bytes()).unwrap();
+        let error = classify_exit(Some(process_exit(
+            ProcessExitCause::GuestBreak {
+                reason: 0,
+                info: 0x1234,
+                size: 4,
+                payload: Some(payload),
+            },
+            0,
+        )))
+        .unwrap_err();
+
+        assert!(error.contains("payload=0x0a060000"));
+        assert!(error.contains("result=0x60a (module=10, description=3)"));
     }
 }

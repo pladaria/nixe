@@ -3,12 +3,12 @@
 use nixe_gpu::GpuMethodId;
 
 use super::{
-    CLASS, MaxwellTwoDClipEnable, MaxwellTwoDColorKeyEnable, MaxwellTwoDNotifyAddressLower,
-    MaxwellTwoDNotifyAddressUpper, MaxwellTwoDNotifyStateWrite, MaxwellTwoDOperation,
-    MaxwellTwoDPixelsFromMemoryCorralSize, MaxwellTwoDPixelsFromMemorySafeOverlap,
-    MaxwellTwoDPixelsFromMemoryStateWrite, MaxwellTwoDProcessingClusters,
-    MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableStateWrite, MaxwellTwoDState,
-    MaxwellTwoDStateWrite,
+    CLASS, MaxwellTwoDBeta1, MaxwellTwoDBeta4, MaxwellTwoDBetaStateWrite, MaxwellTwoDClipEnable,
+    MaxwellTwoDColorKeyEnable, MaxwellTwoDNotifyAddressLower, MaxwellTwoDNotifyAddressUpper,
+    MaxwellTwoDNotifyStateWrite, MaxwellTwoDOperation, MaxwellTwoDPixelsFromMemoryCorralSize,
+    MaxwellTwoDPixelsFromMemorySafeOverlap, MaxwellTwoDPixelsFromMemoryStateWrite,
+    MaxwellTwoDProcessingClusters, MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableStateWrite,
+    MaxwellTwoDState, MaxwellTwoDStateWrite,
 };
 use crate::engines::{
     MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
@@ -24,6 +24,8 @@ enum MethodAction {
     Operation,
     ClipEnable,
     ColorKeyEnable,
+    Beta1,
+    Beta4,
     PixelsFromMemoryCorralSize,
     PixelsFromMemorySafeOverlap,
     RenderEnableMode,
@@ -62,6 +64,9 @@ macro_rules! methods {
 // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L493-L579
 // SET_COLOR_KEY_ENABLE and its False/True values are defined specifically at:
 // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L551-L557
+// SET_BETA1 accepts all 32 bits while SET_BETA4 defines four byte-wide B/G/R/A
+// components. Neither write independently triggers a 2D operation:
+// https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L562-L571
 // SET_PIXELS_FROM_MEMORY_CORRAL_SIZE is a 10-bit field. The header publishes
 // no reset value, unit, or execution semantics for the value:
 // https://github.com/NVIDIA/open-gpu-doc/blob/9e6d83fe0770bc8644850a0b1bf5ddb1519905ba/classes/twod/cl902d.h#L931-L932
@@ -112,6 +117,18 @@ methods!(
         "SET_COLOR_KEY_ENABLE",
         0x0000_0001,
         MethodAction::ColorKeyEnable
+    ),
+    SET_BETA1 => (
+        0x02a4,
+        "SET_BETA1",
+        u32::MAX,
+        MethodAction::Beta1
+    ),
+    SET_BETA4 => (
+        0x02a8,
+        "SET_BETA4",
+        u32::MAX,
+        MethodAction::Beta4
     ),
     SET_OPERATION => (
         0x02ac,
@@ -171,6 +188,14 @@ pub(super) fn preflight(
                 .ok_or_else(|| invalid_value(source, declaration))?,
             source,
         },
+        MethodAction::Beta1 => MaxwellTwoDStateWrite::Beta(MaxwellTwoDBetaStateWrite::Beta1 {
+            value: MaxwellTwoDBeta1::new(source.argument()),
+            source,
+        }),
+        MethodAction::Beta4 => MaxwellTwoDStateWrite::Beta(MaxwellTwoDBetaStateWrite::Beta4 {
+            value: MaxwellTwoDBeta4::from_raw(source.argument()),
+            source,
+        }),
         MethodAction::PixelsFromMemoryCorralSize => MaxwellTwoDStateWrite::PixelsFromMemory(
             MaxwellTwoDPixelsFromMemoryStateWrite::CorralSize {
                 value: MaxwellTwoDPixelsFromMemoryCorralSize::parse(source.argument())

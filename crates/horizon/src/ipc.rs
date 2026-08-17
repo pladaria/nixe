@@ -263,10 +263,10 @@ fn dispatch_session(
         }
         (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
             require_sd_card_access(mounts)?;
-            let root = mounts
-                .sd_card_root()
-                .map(ToOwned::to_owned)
-                .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
+            let root = mounts.sd_card_root().map(ToOwned::to_owned);
+            if root.is_none() && mounts.homebrew_executable().is_none() {
+                return Err(IpcResultCode::PATH_NOT_FOUND);
+            }
             insert_handle(handles, HostDirectoryFileSystem::new(root))
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
@@ -456,6 +456,9 @@ fn dispatch_host_filesystem(
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
             let path = normalize_path(&path)?;
+            if is_reserved_homebrew_path(mounts, &path) {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
             let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
             let file = OpenOptions::new()
                 .write(true)
@@ -471,6 +474,9 @@ fn dispatch_host_filesystem(
         }
         IpcRequest::CreateDirectory { path } => {
             let path = normalize_path(&path)?;
+            if is_reserved_homebrew_path(mounts, &path) {
+                return Err(IpcResultCode::ACCESS_DENIED);
+            }
             let host_path = filesystem.resolve_new(&path).map_err(map_host_io_error)?;
             std::fs::create_dir(host_path).map_err(map_host_io_error)?;
             Ok(IpcResponse::None)
@@ -482,6 +488,27 @@ fn dispatch_host_filesystem(
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
             let path = normalize_path(&path)?;
+            if let Some(identity) = mounts.homebrew_executable() {
+                if path == identity.guest_path() {
+                    if mode & (FILE_OPEN_WRITE | FILE_OPEN_APPEND) != 0 {
+                        return Err(IpcResultCode::ACCESS_DENIED);
+                    }
+                    return insert_handle(
+                        handles,
+                        ReadOnlyFile::new(
+                            Arc::from(path),
+                            identity.size(),
+                            identity.source().clone(),
+                        ),
+                    );
+                }
+                if is_homebrew_virtual_directory(identity.guest_path(), &path) {
+                    return Err(IpcResultCode::NOT_A_FILE);
+                }
+                if is_reserved_homebrew_path(mounts, &path) {
+                    return Err(IpcResultCode::PATH_NOT_FOUND);
+                }
+            }
             let host_path = filesystem
                 .resolve_existing(&path)
                 .map_err(map_host_io_error)?;
@@ -513,7 +540,7 @@ fn dispatch_host_filesystem(
                 return Err(IpcResultCode::INVALID_ARGUMENT);
             }
             let path = normalize_path(&path)?;
-            let entries = host_directory_entries(filesystem, &path, mode)?;
+            let entries = host_directory_entries(mounts, filesystem, &path, mode)?;
             insert_handle(
                 handles,
                 ReadOnlyDirectory::new(Arc::from(path), entries.into()),
@@ -756,47 +783,135 @@ fn directory_entries(
 }
 
 fn host_directory_entries(
+    mounts: &ProcessMountNamespace,
     filesystem: &HostDirectoryFileSystem,
     path: &str,
     mode: u32,
 ) -> Result<Vec<DirectoryEntry>, IpcResultCode> {
-    let host_path = filesystem
-        .resolve_existing(path)
-        .map_err(map_host_io_error)?;
-    let metadata = std::fs::metadata(&host_path).map_err(map_host_io_error)?;
-    if !metadata.is_dir() {
-        return Err(IpcResultCode::NOT_A_DIRECTORY);
+    if let Some(identity) = mounts.homebrew_executable() {
+        if path == identity.guest_path() {
+            return Err(IpcResultCode::NOT_A_DIRECTORY);
+        }
+        if is_reserved_homebrew_path(mounts, path) {
+            if !is_homebrew_virtual_directory(identity.guest_path(), path) {
+                return Err(IpcResultCode::PATH_NOT_FOUND);
+            }
+            let mut entries = BTreeMap::new();
+            insert_homebrew_directory_child(&mut entries, identity, path, mode);
+            return collect_directory_entries(entries);
+        }
     }
     let mut entries = BTreeMap::new();
-    for entry in std::fs::read_dir(host_path).map_err(map_host_io_error)? {
-        let entry = entry.map_err(map_host_io_error)?;
-        let file_type = entry.file_type().map_err(map_host_io_error)?;
-        if file_type.is_symlink() {
-            continue;
+    if filesystem.has_host_root() {
+        let host_path = filesystem
+            .resolve_existing(path)
+            .map_err(map_host_io_error)?;
+        let metadata = std::fs::metadata(&host_path).map_err(map_host_io_error)?;
+        if !metadata.is_dir() {
+            return Err(IpcResultCode::NOT_A_DIRECTORY);
         }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
-        if name.len() > MAX_IPC_PATH_BYTES {
-            continue;
-        }
-        let (kind, size) = if file_type.is_dir() && mode & DIRECTORY_OPEN_DIRECTORIES != 0 {
-            (DirectoryEntryKind::Directory, 0)
-        } else if file_type.is_file() && mode & DIRECTORY_OPEN_FILES != 0 {
-            let size = if mode & DIRECTORY_OPEN_NO_FILE_SIZE != 0 {
-                0
+        for entry in std::fs::read_dir(host_path).map_err(map_host_io_error)? {
+            let entry = entry.map_err(map_host_io_error)?;
+            let file_type = entry.file_type().map_err(map_host_io_error)?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
+            if name.len() > MAX_IPC_PATH_BYTES {
+                continue;
+            }
+            let (kind, size) = if file_type.is_dir() && mode & DIRECTORY_OPEN_DIRECTORIES != 0 {
+                (DirectoryEntryKind::Directory, 0)
+            } else if file_type.is_file() && mode & DIRECTORY_OPEN_FILES != 0 {
+                let size = if mode & DIRECTORY_OPEN_NO_FILE_SIZE != 0 {
+                    0
+                } else {
+                    entry.metadata().map_err(map_host_io_error)?.len()
+                };
+                (DirectoryEntryKind::File, size)
             } else {
-                entry.metadata().map_err(map_host_io_error)?.len()
+                continue;
             };
-            (DirectoryEntryKind::File, size)
-        } else {
-            continue;
-        };
-        entries.insert(name, (kind, size));
-        if entries.len() > MAX_IPC_LIST_ENTRIES {
-            return Err(IpcResultCode::RESOURCE_LIMIT);
+            entries.insert(name, (kind, size));
+            if entries.len() > MAX_IPC_LIST_ENTRIES {
+                return Err(IpcResultCode::RESOURCE_LIMIT);
+            }
         }
+    }
+    if let Some(identity) = mounts.homebrew_executable() {
+        insert_homebrew_directory_child(&mut entries, identity, path, mode);
+    }
+    if !filesystem.has_host_root()
+        && !mounts
+            .homebrew_executable()
+            .is_some_and(|identity| is_homebrew_virtual_directory(identity.guest_path(), path))
+    {
+        return Err(IpcResultCode::PATH_NOT_FOUND);
+    }
+    collect_directory_entries(entries)
+}
+
+fn is_reserved_homebrew_path(mounts: &ProcessMountNamespace, path: &str) -> bool {
+    let Some(identity) = mounts.homebrew_executable() else {
+        return false;
+    };
+    let Some(component) = identity
+        .guest_path()
+        .strip_prefix('/')
+        .and_then(|path| path.split('/').next())
+    else {
+        return false;
+    };
+    let root = format!("/{component}");
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_homebrew_virtual_directory(file_path: &str, path: &str) -> bool {
+    path == "/"
+        || file_path
+            .strip_prefix(path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn insert_homebrew_directory_child(
+    entries: &mut BTreeMap<String, (DirectoryEntryKind, u64)>,
+    identity: &nixe_runtime::HomebrewIdentity,
+    path: &str,
+    mode: u32,
+) {
+    let prefix = if path == "/" {
+        "/".to_owned()
+    } else {
+        format!("{path}/")
+    };
+    let Some(remainder) = identity.guest_path().strip_prefix(&prefix) else {
+        return;
+    };
+    if let Some((name, _)) = remainder.split_once('/') {
+        if mode & DIRECTORY_OPEN_DIRECTORIES != 0 {
+            entries.insert(name.to_owned(), (DirectoryEntryKind::Directory, 0));
+        }
+    } else if !remainder.is_empty() && mode & DIRECTORY_OPEN_FILES != 0 {
+        let size = if mode & DIRECTORY_OPEN_NO_FILE_SIZE != 0 {
+            0
+        } else {
+            identity.size()
+        };
+        entries.insert(remainder.to_owned(), (DirectoryEntryKind::File, size));
+    }
+}
+
+fn collect_directory_entries(
+    entries: BTreeMap<String, (DirectoryEntryKind, u64)>,
+) -> Result<Vec<DirectoryEntry>, IpcResultCode> {
+    if entries.len() > MAX_IPC_LIST_ENTRIES {
+        return Err(IpcResultCode::RESOURCE_LIMIT);
     }
     Ok(entries
         .into_iter()

@@ -649,6 +649,7 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     DepthWriteEnable,
     DepthCompare,
     StencilTestEnable,
+    TwoSidedStencilTestEnable,
     BlendPerTargetEnable,
     AntiAliasEnable,
     AlphaToCoverageEnable,
@@ -1093,6 +1094,21 @@ impl MaxwellThreeDFixedFunctionState {
             MaxwellThreeDFixedFunctionRegister::BlendConstantAlpha,
             MaxwellThreeDFixedFunctionRegister::WindowClipType,
             MaxwellThreeDFixedFunctionRegister::LogicOpFunction,
+            MaxwellThreeDFixedFunctionRegister::TwoSidedStencilTestEnable,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilFail,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilDepthFail,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilPass,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilCompare,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilReference,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilCompareMask,
+            MaxwellThreeDFixedFunctionRegister::FrontStencilWriteMask,
+            MaxwellThreeDFixedFunctionRegister::BackStencilFail,
+            MaxwellThreeDFixedFunctionRegister::BackStencilDepthFail,
+            MaxwellThreeDFixedFunctionRegister::BackStencilPass,
+            MaxwellThreeDFixedFunctionRegister::BackStencilCompare,
+            MaxwellThreeDFixedFunctionRegister::BackStencilReference,
+            MaxwellThreeDFixedFunctionRegister::BackStencilCompareMask,
+            MaxwellThreeDFixedFunctionRegister::BackStencilWriteMask,
         ];
         dependencies.extend(
             self.registers
@@ -1105,6 +1121,37 @@ impl MaxwellThreeDFixedFunctionState {
                 })
                 .map(|(_, register)| register.raw()),
         );
+        let stencil_test_enable =
+            self.register(MaxwellThreeDFixedFunctionRegister::StencilTestEnable);
+        if stencil_test_enable.value() != Some(&MaxwellThreeDFixedFunctionValue::Boolean(false)) {
+            for register in [
+                MaxwellThreeDFixedFunctionRegister::FrontStencilFail,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilDepthFail,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilPass,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilCompare,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilReference,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilCompareMask,
+                MaxwellThreeDFixedFunctionRegister::FrontStencilWriteMask,
+            ] {
+                dependencies.push(self.register(register).raw());
+            }
+            let two_sided =
+                self.register(MaxwellThreeDFixedFunctionRegister::TwoSidedStencilTestEnable);
+            dependencies.push(two_sided.raw());
+            if two_sided.value() != Some(&MaxwellThreeDFixedFunctionValue::Boolean(false)) {
+                for register in [
+                    MaxwellThreeDFixedFunctionRegister::BackStencilFail,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilDepthFail,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilPass,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilCompare,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilReference,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilCompareMask,
+                    MaxwellThreeDFixedFunctionRegister::BackStencilWriteMask,
+                ] {
+                    dependencies.push(self.register(register).raw());
+                }
+            }
+        }
         let window_clip_enable =
             self.register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable);
         if window_clip_enable.value() != Some(&MaxwellThreeDFixedFunctionValue::Boolean(false)) {

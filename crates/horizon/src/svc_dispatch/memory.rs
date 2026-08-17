@@ -78,10 +78,34 @@ pub(super) fn break_process(
         result(context, HorizonKernelResult::SUCCESS);
         return resume();
     }
+    let payload = usize::try_from(size)
+        .ok()
+        .filter(|size| (1..=nixe_runtime::MAX_GUEST_BREAK_PAYLOAD_BYTES).contains(size))
+        .and_then(|size| {
+            let mut bytes = vec![0; size];
+            match crate::ipc_wire::read_bytes(
+                context.process(),
+                GuestVirtualAddress::new(info),
+                &mut bytes,
+            ) {
+                Ok(()) => nixe_runtime::GuestBreakPayload::new(&bytes),
+                Err(error) => {
+                    log::debug!(
+                        "svcBreak payload could not be captured: info={info:#x} size={size:#x} error={error:?}"
+                    );
+                    None
+                }
+            }
+        });
     ExceptionDispatchOutcome::Terminate {
         scope: ExceptionTerminationScope::Process,
         exit_code: reason,
-        reason: ExceptionTerminationReason::Break { reason, info, size },
+        reason: ExceptionTerminationReason::Break {
+            reason,
+            info,
+            size,
+            payload,
+        },
     }
 }
 

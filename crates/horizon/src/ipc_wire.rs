@@ -2660,6 +2660,16 @@ fn dispatch_applet(
             command_id => unsupported_service_command("ICommonStateGetter", command_id),
         },
         AppletObject::SelfController => match request.command_id {
+            // LockExit and UnlockExit mutate the application applet's shared
+            // exit-deferral state and carry no input or output payload:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1094-L1099
+            1 | 2 => {
+                if !request.data.is_empty() {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                session.set_exit_locked(request.command_id == 1);
+                applet_data(request.token, &[])
+            }
             40 => {
                 let Some(layer) = video_system.create_layer(1) else {
                     return applet_error(

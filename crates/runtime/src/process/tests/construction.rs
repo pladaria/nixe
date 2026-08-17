@@ -272,6 +272,57 @@ fn synthetic_launch_translates_entry_only_through_process_memory() {
             )
             .unwrap()
             .value,
+        MemoryValue::U32(HOME_BREW_ARGV_KEY)
+    );
+    let argv_address = context.checked_add(HOME_BREW_ARGV_OFFSET as u64).unwrap();
+    assert_eq!(
+        process
+            .memory()
+            .read(
+                process.cpu_context().address_space_id(),
+                context
+                    .checked_add((HOME_BREW_CONFIG_ENTRY_SIZE + 16) as u64)
+                    .unwrap(),
+                MemoryAccess::normal(MemoryAccessSize::Doubleword),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U64(argv_address.get())
+    );
+    let argv = crate::HOME_BREW_EXECUTABLE_ARGV0
+        .bytes()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let actual = (0..argv.len())
+        .map(|offset| {
+            let value = process
+                .memory()
+                .read(
+                    process.cpu_context().address_space_id(),
+                    argv_address.checked_add(offset as u64).unwrap(),
+                    MemoryAccess::normal(MemoryAccessSize::Byte),
+                )
+                .unwrap()
+                .value;
+            let MemoryValue::U8(value) = value else {
+                panic!("byte read must return a byte value");
+            };
+            value
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, argv);
+    assert_eq!(
+        process
+            .memory()
+            .read(
+                process.cpu_context().address_space_id(),
+                context
+                    .checked_add((HOME_BREW_CONFIG_ENTRY_SIZE * 2) as u64)
+                    .unwrap(),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
         MemoryValue::U32(0)
     );
 }

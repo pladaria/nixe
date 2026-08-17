@@ -6,7 +6,8 @@
 use crate::MaxwellMethodSource;
 
 use super::{
-    MaxwellTwoDNotifyState, MaxwellTwoDNotifyStateWrite, MaxwellTwoDPixelsFromMemoryState,
+    MaxwellTwoDBetaState, MaxwellTwoDBetaStateWrite, MaxwellTwoDNotifyState,
+    MaxwellTwoDNotifyStateWrite, MaxwellTwoDPixelsFromMemoryState,
     MaxwellTwoDPixelsFromMemoryStateWrite, MaxwellTwoDRenderEnableState,
     MaxwellTwoDRenderEnableStateWrite,
 };
@@ -195,6 +196,7 @@ pub enum MaxwellTwoDStateWrite {
         value: MaxwellTwoDColorKeyEnable,
         source: MaxwellMethodSource,
     },
+    Beta(MaxwellTwoDBetaStateWrite),
     PixelsFromMemory(MaxwellTwoDPixelsFromMemoryStateWrite),
     RenderEnable(MaxwellTwoDRenderEnableStateWrite),
     Notify(MaxwellTwoDNotifyStateWrite),
@@ -207,6 +209,7 @@ pub struct MaxwellTwoDState {
     operation: MaxwellTwoDRegister<MaxwellTwoDOperation>,
     clip_enable: MaxwellTwoDRegister<MaxwellTwoDClipEnable>,
     color_key_enable: MaxwellTwoDRegister<MaxwellTwoDColorKeyEnable>,
+    beta: MaxwellTwoDBetaState,
     pixels_from_memory: MaxwellTwoDPixelsFromMemoryState,
     render_enable: MaxwellTwoDRenderEnableState,
     notify: MaxwellTwoDNotifyState,
@@ -239,6 +242,11 @@ impl MaxwellTwoDState {
     }
 
     #[must_use]
+    pub const fn beta(&self) -> &MaxwellTwoDBetaState {
+        &self.beta
+    }
+
+    #[must_use]
     pub const fn pixels_from_memory(&self) -> &MaxwellTwoDPixelsFromMemoryState {
         &self.pixels_from_memory
     }
@@ -267,6 +275,9 @@ impl MaxwellTwoDState {
             }
             MaxwellTwoDStateWrite::ColorKeyEnable { value, source } => {
                 self.color_key_enable = MaxwellTwoDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellTwoDStateWrite::Beta(write) => {
+                self.beta.apply(write);
             }
             MaxwellTwoDStateWrite::PixelsFromMemory(write) => {
                 self.pixels_from_memory.apply(write);
