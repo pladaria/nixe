@@ -3,6 +3,7 @@
 //! Runtime stays console-agnostic; Horizon-specific sessions and services are
 //! layered on its process, mount, and extensible handle primitives.
 
+mod error_applet;
 mod graphics;
 mod graphics_event;
 mod hid;
@@ -17,6 +18,7 @@ mod scheduler_profile;
 mod svc;
 mod svc_dispatch;
 
+pub use error_applet::ErrorAppletDiagnostic;
 pub use graphics::{
     FramebufferError, GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
 };

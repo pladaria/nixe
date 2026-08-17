@@ -118,7 +118,7 @@ pub(super) fn ioctl_nvhost_as_gpu(
         IOCTL_AS_GPU_MAP_BUFFER_EX => {
             require_size(input, 40)?;
             let flags = input_u32(input, 0)?;
-            if flags & !MAP_KNOWN_FLAGS != 0 || flags & MAP_MODIFY != 0 && flags & MAP_FIXED == 0 {
+            if flags & !MAP_KNOWN_FLAGS != 0 {
                 return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
             }
             let kind = input_u32(input, 4)?;
@@ -128,6 +128,9 @@ pub(super) fn ioctl_nvhost_as_gpu(
                 .address(input_u64(input, 32)?)
                 .map_err(|error| driver_result(MaxwellAddressSpaceError::Address(error)))?;
             if flags & MAP_MODIFY != 0 {
+                // libnx deliberately emits Modify without FixedOffset here;
+                // the IOVA field already identifies the existing mapping.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/address_space.c#L74-L83
                 address_space
                     .modify_mapping(
                         offset,

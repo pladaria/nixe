@@ -15,9 +15,9 @@ use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
-    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonProcess,
-    HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
-    OperationMode, UnsupportedServiceOperation, switch_1_scheduler_profile,
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonIpcResult, HorizonKernelResult,
+    HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher,
+    IpcService, OperationMode, UnsupportedServiceOperation, switch_1_scheduler_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
@@ -789,7 +789,7 @@ fn cmif_session_close_releases_the_semantic_target_handle() {
 }
 
 #[test]
-fn malformed_wire_messages_are_rejected_with_bounded_diagnostics() {
+fn malformed_wire_messages_are_fatal_with_bounded_diagnostics() {
     let cases = [
         (
             {
@@ -820,21 +820,14 @@ fn malformed_wire_messages_are_rejected_with_bounded_diagnostics() {
         state(&mut process).write_w(x(0), handle);
         let mut dispatcher = HorizonSvcDispatcher::default();
 
-        let ExceptionHandlingResult::Rejected(fault) = dispatch_next(&mut process, &mut dispatcher)
-        else {
-            panic!("malformed wire input must be rejected")
-        };
         assert_eq!(
-            fault,
-            HorizonSvcFault::MalformedIpc {
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Fault(HorizonSvcFault::MalformedIpc {
                 immediate: 0x21,
                 reason: expected_reason,
-            }
+            })
         );
-        assert_eq!(
-            state(&mut process).read_w(x(0)),
-            HorizonKernelResult::INVALID_STATE.raw()
-        );
+        assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
     }
 }
 
@@ -1369,7 +1362,7 @@ fn closing_a_server_handle_wakes_a_client_in_another_guest_process() {
 }
 
 #[test]
-fn failed_user_buffer_delivery_rolls_back_materialized_handles() {
+fn read_only_user_buffer_is_rejected_before_session_dispatch() {
     let (_directory, mut process) = fixture_process(&[svc(0x22), svc(0x22)]);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let (server, client) = SessionObject::create_pair();
@@ -1379,28 +1372,9 @@ fn failed_user_buffer_delivery_rolls_back_materialized_handles() {
     state(&mut process).write_x(x(0), read_only_buffer);
     state(&mut process).write_x(x(1), 0x1000);
     state(&mut process).write_w(x(2), client_handle);
-    assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Suspended
-    );
-    assert!(matches!(server.receive(), Ok(SessionMessage::Buffer(_))));
-
-    let mut response = vec![0_u8; 0x1000];
-    put_u32(&mut response, 0, 4);
-    put_u32(&mut response, 4, 1 << 31);
-    put_u32(&mut response, 8, 1 << 1);
-    server
-        .reply(SessionMessage::TransportedBuffer {
-            bytes: response,
-            copy_handles: vec![Some(nixe_runtime::HandleObject::new(EventObject::new()))],
-            move_handles: Vec::new(),
-        })
-        .unwrap();
-    assert!(process.resume());
-
     let ExceptionHandlingResult::Rejected(fault) = dispatch_next(&mut process, &mut dispatcher)
     else {
-        panic!("writing a response to executable memory must be rejected")
+        panic!("a read-only response buffer must be rejected before dispatch")
     };
     assert!(matches!(
         fault,
@@ -1410,6 +1384,7 @@ fn failed_user_buffer_delivery_rolls_back_materialized_handles() {
         }
     ));
     assert_eq!(process.handles().len(), handles_before);
+    assert!(server.receive().is_err());
 }
 
 #[test]
@@ -1728,8 +1703,19 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         svc(0x21),
         svc(0x21),
         svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
         svc(0x13),
         svc(0x14),
+        svc(0x21),
     ]);
     let mut dispatcher = HorizonSvcDispatcher::new(
         OperationMode::Console,
@@ -1887,6 +1873,207 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let proxy_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
     assert_eq!(proxy_object_id, 2);
 
+    let mut get_self_controller = [0_u8; 0x100];
+    put_u32(&mut get_self_controller, 0, 4);
+    put_u32(&mut get_self_controller, 4, 10);
+    get_self_controller[16] = 1;
+    get_self_controller[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut get_self_controller, 20, proxy_object_id);
+    put_u32(&mut get_self_controller, 32, 0x4943_4653);
+    put_u32(&mut get_self_controller, 40, 1);
+    write_guest_bytes(&process, tls, &get_self_controller);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let self_controller_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(self_controller_object_id, 3);
+
+    let mut malformed_lock_exit = [0_u8; 0x100];
+    put_u32(&mut malformed_lock_exit, 0, 4);
+    put_u32(&mut malformed_lock_exit, 4, 12);
+    malformed_lock_exit[16] = 1;
+    malformed_lock_exit[18..20].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut malformed_lock_exit, 20, self_controller_object_id);
+    put_u32(&mut malformed_lock_exit, 32, 0x4943_4653);
+    put_u32(&mut malformed_lock_exit, 40, 1);
+    malformed_lock_exit[48] = 1;
+    write_guest_bytes(&process, tls, &malformed_lock_exit);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
+    let mut get_launchable_event = [0_u8; 0x100];
+    put_u32(&mut get_launchable_event, 0, 4);
+    put_u32(&mut get_launchable_event, 4, 10);
+    get_launchable_event[16] = 1;
+    get_launchable_event[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut get_launchable_event, 20, self_controller_object_id);
+    put_u32(&mut get_launchable_event, 32, 0x4943_4653);
+    put_u32(&mut get_launchable_event, 40, 9);
+    write_guest_bytes(&process, tls, &get_launchable_event);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let launchable_event_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    let launchable_event = process
+        .handles()
+        .get_as::<ReadableEventObject>(launchable_event_handle)
+        .unwrap()
+        .clone();
+    assert!(launchable_event.is_signalled());
+
+    let mut get_library_applet_creator = [0_u8; 0x100];
+    put_u32(&mut get_library_applet_creator, 0, 4);
+    put_u32(&mut get_library_applet_creator, 4, 10);
+    get_library_applet_creator[16] = 1;
+    get_library_applet_creator[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut get_library_applet_creator, 20, proxy_object_id);
+    put_u32(&mut get_library_applet_creator, 32, 0x4943_4653);
+    put_u32(&mut get_library_applet_creator, 40, 11);
+    write_guest_bytes(&process, tls, &get_library_applet_creator);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let library_applet_creator_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(library_applet_creator_object_id, 4);
+
+    let mut create_library_applet = [0_u8; 0x100];
+    put_u32(&mut create_library_applet, 0, 4);
+    put_u32(&mut create_library_applet, 4, 12);
+    create_library_applet[16] = 1;
+    create_library_applet[18..20].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(
+        &mut create_library_applet,
+        20,
+        library_applet_creator_object_id,
+    );
+    put_u32(&mut create_library_applet, 32, 0x4943_4653);
+    put_u32(&mut create_library_applet, 40, 0);
+    put_u32(&mut create_library_applet, 48, 0x0c);
+    put_u32(&mut create_library_applet, 52, 0);
+    write_guest_bytes(&process, tls, &create_library_applet);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    let library_applet_accessor_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(library_applet_accessor_object_id, 5);
+    // Creation alone does not consume the system-wide launch permission.
+    // libnx waits on this event before issuing ILibraryAppletAccessor::Start.
+    assert!(launchable_event.is_signalled());
+
+    let mut get_library_applet_state_event = [0_u8; 0x100];
+    put_u32(&mut get_library_applet_state_event, 0, 4);
+    put_u32(&mut get_library_applet_state_event, 4, 10);
+    get_library_applet_state_event[16] = 1;
+    get_library_applet_state_event[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(
+        &mut get_library_applet_state_event,
+        20,
+        library_applet_accessor_object_id,
+    );
+    put_u32(&mut get_library_applet_state_event, 32, 0x4943_4653);
+    put_u32(&mut get_library_applet_state_event, 40, 0);
+    write_guest_bytes(&process, tls, &get_library_applet_state_event);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let state_event_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    let state_event = process
+        .handles()
+        .get_as::<ReadableEventObject>(state_event_handle)
+        .unwrap();
+    assert!(!state_event.is_signalled());
+
+    let mut create_storage = [0_u8; 0x100];
+    put_u32(&mut create_storage, 0, 4);
+    put_u32(&mut create_storage, 4, 12);
+    create_storage[16] = 1;
+    create_storage[18..20].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut create_storage, 20, library_applet_creator_object_id);
+    put_u32(&mut create_storage, 32, 0x4943_4653);
+    put_u32(&mut create_storage, 40, 10);
+    put_u64(&mut create_storage, 48, 0x20);
+    write_guest_bytes(&process, tls, &create_storage);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let storage_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(storage_object_id, 6);
+
+    let mut open_storage = [0_u8; 0x100];
+    put_u32(&mut open_storage, 0, 4);
+    put_u32(&mut open_storage, 4, 10);
+    open_storage[16] = 1;
+    open_storage[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut open_storage, 20, storage_object_id);
+    put_u32(&mut open_storage, 32, 0x4943_4653);
+    put_u32(&mut open_storage, 40, 0);
+    write_guest_bytes(&process, tls, &open_storage);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let storage_accessor_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(storage_accessor_object_id, 7);
+
+    let mut get_storage_size = open_storage;
+    put_u32(&mut get_storage_size, 20, storage_accessor_object_id);
+    write_guest_bytes(&process, tls, &get_storage_size);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            read_guest_bytes(&process, tls.checked_add(48).unwrap(), 8)
+                .try_into()
+                .unwrap()
+        ),
+        0x20
+    );
+
+    let storage_input = tls.checked_add(0xe0).unwrap();
+    let mut write_storage = [0_u8; 0x100];
+    put_u32(&mut write_storage, 0, 4 | (1 << 16) | (1 << 20));
+    put_u32(&mut write_storage, 4, 14);
+    put_send_static(&mut write_storage, 8, 0, 0);
+    put_receive_buffer(&mut write_storage, 16, storage_input.get(), 8);
+    write_storage[32] = 1;
+    write_storage[34..36].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut write_storage, 36, storage_accessor_object_id);
+    put_u32(&mut write_storage, 48, 0x4943_4653);
+    put_u32(&mut write_storage, 56, 10);
+    put_u64(&mut write_storage, 64, 4);
+    write_storage[0xe0..0xe8].copy_from_slice(b"storage!");
+    write_guest_bytes(&process, tls, &write_storage);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+
     let mut get_common_state = [0_u8; 0x100];
     put_u32(&mut get_common_state, 0, 4);
     put_u32(&mut get_common_state, 4, 10);
@@ -1902,7 +2089,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         ExceptionHandlingResult::Resumed
     );
     let common_state_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
-    assert_eq!(common_state_object_id, 3);
+    assert_eq!(common_state_object_id, 8);
 
     let mut get_operation_mode = [0_u8; 0x100];
     put_u32(&mut get_operation_mode, 0, 4);
@@ -2091,6 +2278,26 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .mapping_info(process.cpu_context().address_space_id(), mapping_address)
             .is_none()
     );
+
+    let mut self_exit = [0_u8; 0x100];
+    put_u32(&mut self_exit, 0, 4);
+    put_u32(&mut self_exit, 4, 10);
+    self_exit[16] = 1;
+    self_exit[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut self_exit, 20, self_controller_object_id);
+    put_u32(&mut self_exit, 32, 0x4943_4653);
+    put_u32(&mut self_exit, 40, 0);
+    write_guest_bytes(&process, tls, &self_exit);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Terminated {
+            scope: ExceptionTerminationScope::Process,
+            exit_code: 0,
+            reason: ExceptionTerminationReason::Requested,
+        }
+    );
+    assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
 }
 
 #[test]

@@ -571,7 +571,8 @@ pub fn preflight_maxwell_submission_execution(
                 }
                 let drains_prior_work = matches!(
                     plan,
-                    MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
+                    MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }
+                        | MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
                         | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
                         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
                         | MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_)
@@ -723,6 +724,16 @@ pub fn execute_maxwell_software_initialization(
             MaxwellSubmissionExecutionStep::ComputeSynchronization(
                 MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
             ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::WaitForIdle {
+                    prior_work_pending: planned,
+                },
+            ) => {
+                if *planned != prior_work_pending {
+                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
+                }
+                prior_work_pending = false;
+            }
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
             ) => {}
@@ -954,6 +965,7 @@ fn execute_maxwell_backend_steps<T>(
                 }
             },
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan) => match plan {
+                MaxwellThreeDSynchronizationPlan::WaitForIdle { .. } => {}
                 MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
                     maintenance, ..
                 }
@@ -1482,6 +1494,26 @@ mod tests {
         assert!(plan.steps().is_empty());
         assert_eq!(plan.completion(), None);
         assert_eq!(plan.staged_cache().revision(), 0);
+    }
+
+    #[test]
+    fn three_d_wait_for_idle_rejects_an_inconsistent_ordering_plan() {
+        let plan = MaxwellSubmissionExecutionPlan {
+            frontend: FrontendSubmissionId::new(2),
+            predecessors: Box::new([]),
+            steps: Box::new([MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::WaitForIdle {
+                    prior_work_pending: true,
+                },
+            )]),
+            staged_cache: MaxwellThreeDLoweringCache::default(),
+            completion: None,
+        };
+
+        assert!(matches!(
+            execute_maxwell_software_initialization(plan, &address_space()),
+            Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan)
+        ));
     }
 
     #[test]

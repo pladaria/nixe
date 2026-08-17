@@ -2211,7 +2211,7 @@ fn taxonomy_separates_unsupported_invalid_capability_and_unknown_methods() {
             4,
             "argument sets bits outside its verified field mask",
         ),
-        (0x124, 3, "requires an unavailable execution capability"),
+        (0x304, 1, "requires an unavailable execution capability"),
         (0x2ffc, 0, "unknown Maxwell class method"),
     ];
     for (method, argument, expected) in cases {
@@ -3398,6 +3398,67 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
             MaxwellComputeSynchronizationPlan::WaitForIdle {
                 prior_work_pending: true,
             }
+        );
+    }
+    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.compute(), &compute_before);
+    assert_eq!(channel.three_d(), &three_d_before);
+    assert_eq!(channel.two_d(), &two_d_before);
+}
+
+#[test]
+fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let frontend_before = channel.frontend();
+    let compute_before = channel.compute().clone();
+    let three_d_before = channel.three_d().clone();
+    let two_d_before = channel.two_d().clone();
+
+    let waits = non_incrementing_packet_on_subchannel(0, 0x0110 / 4, &[0, 0xfeed_beef]);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &waits.packets()[0],
+    )
+    .unwrap();
+    assert_eq!(dispatch.methods().len(), 2);
+    assert_eq!(dispatch.synchronization_operations().len(), 2);
+    assert!(dispatch.operations().is_empty());
+    for (index, value) in [0, 0xfeed_beef].into_iter().enumerate() {
+        assert_eq!(
+            dispatch.methods()[index].metadata().method_name(),
+            "WAIT_FOR_IDLE"
+        );
+        assert!(matches!(
+            dispatch.methods()[index].effect(),
+            MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                MaxwellThreeDSynchronizationTrigger::WaitForIdle {
+                    value: actual,
+                    source,
+                }
+            ) if actual == value && source.argument() == value
+        ));
+        let operation = &dispatch.synchronization_operations()[index];
+        assert!(matches!(
+            operation.trigger(),
+            MaxwellThreeDSynchronizationTrigger::WaitForIdle {
+                value: actual,
+                source,
+            } if actual == value && source.argument() == value
+        ));
+        assert_eq!(operation.state(), &three_d_before);
+        assert_eq!(
+            lower_maxwell_three_d_synchronization(operation, None, false),
+            Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle {
+                prior_work_pending: false,
+            })
+        );
+        assert_eq!(
+            lower_maxwell_three_d_synchronization(operation, None, true),
+            Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle {
+                prior_work_pending: true,
+            })
         );
     }
     assert_eq!(channel.frontend(), frontend_before);

@@ -2470,6 +2470,376 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
 }
 
 #[test]
+fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    assert_eq!(
+        channel.three_d().mme().shadow_ram_control().origin(),
+        MaxwellThreeDRegisterOrigin::Unset
+    );
+
+    program_three_d(&mut channel, 0x0124, 0);
+    assert_eq!(
+        channel.three_d().mme().shadow_ram_control().value(),
+        Some(&MaxwellThreeDMmeShadowRamControl::MethodTrack)
+    );
+    program_three_d(&mut channel, 0x0dac, 0x1b02);
+    let tracked = channel
+        .three_d()
+        .mme()
+        .shadow_register(GpuMethodId(0x0dac))
+        .unwrap();
+    assert_eq!(tracked.raw(), Some(0x1b02));
+    assert_eq!(tracked.source().unwrap().argument(), 0x1b02);
+
+    program_three_d(&mut channel, 0x0124, 2);
+    program_three_d(&mut channel, 0x0dac, 0x1b01);
+    assert_eq!(
+        channel
+            .three_d()
+            .mme()
+            .shadow_register(GpuMethodId(0x0dac))
+            .unwrap()
+            .raw(),
+        Some(0x1b02)
+    );
+    assert_eq!(
+        channel
+            .three_d()
+            .raw_register(GpuMethodId(0x0dac))
+            .unwrap()
+            .raw(),
+        Some(0x1b01)
+    );
+
+    program_three_d(&mut channel, 0x0124, 3);
+    let replay = packet(0x0dac / 4, 0xffff_ffff);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &replay.packets()[0],
+    )
+    .unwrap();
+    let replayed_source = dispatch.methods()[0].method().source();
+    assert_eq!(replayed_source.argument(), 0x1b02);
+    assert_eq!(
+        channel
+            .three_d()
+            .raw_register(GpuMethodId(0x0dac))
+            .unwrap()
+            .raw(),
+        Some(0x1b02)
+    );
+
+    // The control method itself consumes the non-shadowed argument, allowing
+    // the stream to leave replay mode.
+    program_three_d(&mut channel, 0x0124, 1);
+    assert_eq!(
+        channel.three_d().mme().shadow_ram_control().value(),
+        Some(&MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter)
+    );
+    program_three_d(&mut channel, 0x0dac, 0x1b00);
+    assert_eq!(
+        channel
+            .three_d()
+            .mme()
+            .shadow_register(GpuMethodId(0x0dac))
+            .unwrap()
+            .raw(),
+        Some(0x1b00)
+    );
+
+    let before_invalid = channel.clone();
+    let invalid = packet(0x0124 / 4, 4);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            defined_mask: 3,
+            ..
+        })
+    ));
+    assert_eq!(channel, before_invalid);
+}
+
+#[test]
+fn mme_shadow_replay_without_a_tracked_value_fails_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0124, 3);
+    let before = channel.clone();
+    let decoded = packet(0x0db4 / 4, 1);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::MmeShadowRam {
+            error: MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
+                method_dword: 0x036d,
+            },
+            ..
+        })
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
+fn mme_shadow_scratch_family_is_indexed_readable_and_packet_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for (index, value) in [(0_u8, 0_u32), (1, 0xfeed_beef), (u8::MAX, u32::MAX)] {
+        let method = 0x3400 + u32::from(index) * 4;
+        let decoded = packet(method / 4, value);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let source = dispatch.methods()[0].method().source();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_MME_SHADOW_SCRATCH"
+        );
+        assert_eq!(
+            dispatch.methods()[0].effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Mme(
+                MaxwellThreeDMmeStateWrite::ShadowScratch {
+                    index: MaxwellThreeDMmeShadowScratchIndex::new(index),
+                    value,
+                    source,
+                }
+            ))
+        );
+        let scratch = channel
+            .three_d()
+            .mme()
+            .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
+            .unwrap();
+        assert_eq!(scratch.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(scratch.raw(), Some(value));
+        assert_eq!(scratch.value(), Some(&value));
+        assert_eq!(scratch.source(), Some(source));
+        assert_eq!(
+            channel
+                .three_d()
+                .raw_register(GpuMethodId(method))
+                .unwrap()
+                .raw(),
+            Some(value)
+        );
+    }
+    assert_eq!(channel.three_d().mme().shadow_scratch_count(), 3);
+    assert_eq!(MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT, 256);
+
+    let macro_index = 5;
+    let read_scratch_and_exit = 5 | (1 << 4) | (1 << 7) | (2 << 8) | ((0x3400 / 4) << 14);
+    load_mme_program(&mut channel, macro_index, &[read_scratch_and_exit, 0x11]);
+    let before_call = channel.three_d().clone();
+    let call = packet((0x3800 + u32::from(macro_index) * 8) / 4, 0);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &call.packets()[0],
+    )
+    .unwrap();
+    assert!(matches!(
+        dispatch.methods()[0].effect(),
+        MaxwellEngineMethodEffect::MmeMacroCall {
+            macro_index: 5,
+            parameter_count: 1,
+            ..
+        }
+    ));
+    assert_eq!(channel.three_d(), &before_call);
+
+    let before_invalid = channel.clone();
+    let invalid_suffix = incrementing_packet(0x37fc / 4, &[0x1234_5678, 0]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid_suffix.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::MmeExecution {
+            error: MaxwellThreeDMmeExecutionError::MissingStartAddress { macro_index: 0 },
+            ..
+        })
+    ));
+    assert_eq!(channel, before_invalid);
+}
+
+#[test]
+fn falcon_call_four_applies_masked_pgraph_writes_and_signals_completion() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x3404, 0x00f0_5500);
+    program_three_d(&mut channel, 0x3408, 0x00ff_0f00);
+
+    let decoded = packet(0x2310 / 4, 0x0041_8800);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    let source = dispatch.methods()[0].method().source();
+    let address = MaxwellThreeDFalconRegisterAddress::try_new(0x0041_8800).unwrap();
+    let expected =
+        MaxwellThreeDFalconMaskedRegisterWrite::new(address, 0x00f0_5500, 0x00ff_0f00, source);
+    assert_eq!(
+        dispatch.methods()[0].metadata().method_name(),
+        "SET_FALCON04"
+    );
+    assert_eq!(
+        dispatch.methods()[0].effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FalconMaskedRegister(
+            expected
+        ))
+    );
+    assert_eq!(
+        channel.three_d().falcon().last_masked_write(),
+        Some(expected)
+    );
+    let register = channel.three_d().falcon().register(address).unwrap();
+    assert_eq!(register.known_mask(), 0x00ff_0f00);
+    assert_eq!(register.value(), 0x00f0_0500);
+    assert_eq!(register.source(), source);
+    let completion = channel
+        .three_d()
+        .mme()
+        .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(0))
+        .unwrap();
+    assert_eq!(completion.raw(), Some(1));
+    assert_eq!(completion.source(), Some(source));
+    assert_eq!(
+        channel
+            .three_d()
+            .raw_register(GpuMethodId(0x3400))
+            .unwrap()
+            .raw(),
+        Some(1)
+    );
+
+    program_three_d(&mut channel, 0x3404, 0xaa00_00cc);
+    program_three_d(&mut channel, 0x3408, 0xff00_00ff);
+    program_three_d(&mut channel, 0x2310, address.raw());
+    let register = channel.three_d().falcon().register(address).unwrap();
+    assert_eq!(register.known_mask(), 0xffff_0fff);
+    assert_eq!(register.value(), 0xaaf0_05cc);
+}
+
+#[test]
+fn captured_deko_write_hardware_register_macro_reaches_falcon_call_four() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let macro_index = 2;
+    load_mme_program(
+        &mut channel,
+        macro_index,
+        &[
+            0x0011_0071,
+            0x0740_0251,
+            0x0000_0331,
+            0x0000_1041,
+            0x0000_1841,
+            0x0231_0021,
+            0x0000_0841,
+            0x0340_0115,
+            0xffff_c911,
+            0xffff_8817,
+            0x0010_00f1,
+            0x0000_0011,
+        ],
+    );
+
+    let call = increment_once_packet(
+        (0x3800 + u32::from(macro_index) * 8) / 4,
+        &[0x0041_8800, 0, 0x0180_0000],
+    );
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &call.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(dispatch.synchronization_operations().len(), 1);
+    let address = MaxwellThreeDFalconRegisterAddress::try_new(0x0041_8800).unwrap();
+    let write = channel.three_d().falcon().last_masked_write().unwrap();
+    assert_eq!(write.address(), address);
+    assert_eq!(write.value(), 0);
+    assert_eq!(write.mask(), 0x0180_0000);
+    assert_eq!(
+        channel
+            .three_d()
+            .mme()
+            .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(0))
+            .and_then(MaxwellThreeDRegister::raw),
+        Some(1)
+    );
+}
+
+#[test]
+fn falcon_call_four_rejects_incomplete_or_unaligned_transactions_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    let missing = packet(0x2310 / 4, 0x0041_8800);
+    let before_missing = channel.clone();
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &missing.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::FalconFirmware {
+            error: MaxwellThreeDFalconError::MissingFirmwareArgument { index: 1 },
+            ..
+        })
+    ));
+    assert_eq!(channel, before_missing);
+
+    program_three_d(&mut channel, 0x3404, 1);
+    program_three_d(&mut channel, 0x3408, 1);
+    let unaligned = packet(0x2310 / 4, 0x0041_8801);
+    let before_unaligned = channel.clone();
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &unaligned.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::FalconFirmware {
+            error: MaxwellThreeDFalconError::UnalignedRegisterAddress {
+                address: 0x0041_8801
+            },
+            ..
+        })
+    ));
+    assert_eq!(channel, before_unaligned);
+
+    let invalid_suffix = incrementing_packet(0x2310 / 4, &[0x0041_8800, 0]);
+    let before_suffix = channel.clone();
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid_suffix.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+            if source.method() == GpuMethodId(0x2314)
+    ));
+    assert_eq!(channel, before_suffix);
+}
+
+#[test]
 fn mme_emitted_draw_keeps_the_exact_candidate_snapshot() {
     let mut channel = channel();
     bind_three_d(&mut channel);

@@ -33,8 +33,9 @@ use super::{
     MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCsaaEnable,
     MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
-    MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDLogicOp,
-    MaxwellThreeDPatchSize, MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPointCenterMode,
+    MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl,
+    MaxwellThreeDIteratedBlend, MaxwellThreeDLogicOp, MaxwellThreeDPatchSize,
+    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPointCenterMode,
     MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonClipGeneratedEdge,
     MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex, MaxwellThreeDRenderEnableMode,
     MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
@@ -1300,6 +1301,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         {
             return Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value));
         }
+        validate_draw_iterated_blend_state(state, attachments)?;
         validate_draw_blending_state(state, attachments)?;
         validate_draw_logic_op_state(state, attachments)?;
         validate_draw_color_write_state(state, attachments)?;
@@ -1518,6 +1520,33 @@ fn validate_draw_blending_state(
         });
     }
     Ok(())
+}
+
+fn validate_draw_iterated_blend_state(
+    state: &MaxwellThreeDState,
+    attachments: &DrawAttachmentSelection,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    if attachments.colors.is_empty() {
+        return Ok(());
+    }
+    let controls = state.fixed_function().blend_controls();
+    let Some(value) = controls
+        .iterated_blend()
+        .value()
+        .copied()
+        .filter(|value| value.enabled())
+    else {
+        return Ok(());
+    };
+    Err(
+        MaxwellThreeDLoweringError::UnsupportedIteratedBlendSemantics {
+            value,
+            pass_count: controls
+                .iterated_blend_pass_count()
+                .value()
+                .map(|value| value.pass_count()),
+        },
+    )
 }
 
 fn validate_draw_logic_op_state(
@@ -3663,6 +3692,10 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedBlendSemantics {
         target: Option<u8>,
     },
+    UnsupportedIteratedBlendSemantics {
+        value: MaxwellThreeDIteratedBlend,
+        pass_count: Option<u8>,
+    },
     IncompleteLogicOpState,
     UnsupportedLogicOpSemantics(MaxwellThreeDLogicOp),
     IncompleteColorWriteState {
@@ -3954,6 +3987,12 @@ impl Display for MaxwellThreeDLoweringError {
                     "MAXWELL_B enabled common blend state is not representable in the neutral pipeline contract",
                 ),
             },
+            Self::UnsupportedIteratedBlendSemantics { value, pass_count } => write!(
+                formatter,
+                "MAXWELL_B iterated blending has no neutral backend representation: color={} alpha={} pass-count={pass_count:?}",
+                value.color_enabled(),
+                value.alpha_enabled()
+            ),
             Self::IncompleteLogicOpState => formatter.write_str(
                 "MAXWELL_B enabled logic operations require SET_LOGIC_OP_FUNC",
             ),

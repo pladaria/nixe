@@ -323,6 +323,110 @@ fn a64_integer_reference_semantics_execute_without_ir() {
 }
 
 #[test]
+fn a64_logical_shifted_executes_captured_eor_with_rotate_right() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.write_x(x(6), 0x075b_cd15);
+    a64.write_x(x(7), 0x73);
+
+    execute_one(&profile, &mut state, 0x4ac6_14e6_u32.into()).unwrap();
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a64.read_x(x(6)),
+        u64::from(0x73 ^ 0x075b_cd15_u32.rotate_right(5))
+    );
+    assert_eq!(a64.pc(), 4);
+}
+
+#[test]
+fn a64_logical_shifted_covers_operations_widths_inversion_shifts_and_flags() {
+    let profile = GuestCpuProfile::switch_1();
+    let lhs = 0x8123_4567_89ab_cdef_u64;
+    let rhs = 0xfedc_ba98_7654_3210_u64;
+    for width_64 in [false, true] {
+        let bits = if width_64 { 64 } else { 32 };
+        let mask = if width_64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let lhs = lhs & mask;
+        let rhs = rhs & mask;
+        let amount = if width_64 { 37 } else { 5 };
+        for opcode in 0_u32..4 {
+            for invert in [false, true] {
+                for shift_kind in 0_u32..4 {
+                    let encoding = 0x0a00_0000
+                        | u32::from(width_64) << 31
+                        | opcode << 29
+                        | shift_kind << 22
+                        | u32::from(invert) << 21
+                        | 2 << 16
+                        | amount << 10
+                        | 1 << 5;
+                    let shifted = match shift_kind {
+                        0 => rhs.wrapping_shl(amount) & mask,
+                        1 => rhs >> amount,
+                        2 if width_64 => ((rhs as i64) >> amount) as u64,
+                        2 => u64::from(((rhs as u32 as i32) >> amount) as u32),
+                        3 if width_64 => rhs.rotate_right(amount),
+                        3 => u64::from((rhs as u32).rotate_right(amount)),
+                        _ => unreachable!(),
+                    };
+                    let shifted = if invert { !shifted & mask } else { shifted };
+                    let expected = match opcode {
+                        0 | 3 => lhs & shifted,
+                        1 => lhs | shifted,
+                        2 => lhs ^ shifted,
+                        _ => unreachable!(),
+                    } & mask;
+                    let mut state = ThreadCpuState::A64(Box::default());
+                    let ThreadCpuState::A64(a64) = &mut state else {
+                        unreachable!()
+                    };
+                    a64.write_x(x(1), lhs);
+                    a64.write_x(x(2), rhs);
+                    a64.set_nzcv(Nzcv::from_bits(0xf000_0000));
+
+                    execute_one(&profile, &mut state, encoding.into()).unwrap_or_else(|error| {
+                        panic!("logical shifted encoding {encoding:#010x}: {error}")
+                    });
+
+                    let ThreadCpuState::A64(a64) = state else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        a64.read_x(x(0)),
+                        expected,
+                        "width={bits} opcode={opcode} invert={invert} shift={shift_kind}"
+                    );
+                    let expected_nzcv = if opcode == 3 {
+                        (if expected & (1_u64 << (bits - 1)) != 0 {
+                            Nzcv::N
+                        } else {
+                            0
+                        }) | if expected == 0 { Nzcv::Z } else { 0 }
+                    } else {
+                        0xf000_0000
+                    };
+                    assert_eq!(
+                        a64.nzcv().bits(),
+                        expected_nzcv,
+                        "width={bits} opcode={opcode} invert={invert} shift={shift_kind}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a64_high_dynamic_tag_comparison_takes_signed_greater_than_branch() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());

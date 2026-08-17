@@ -2,9 +2,76 @@
 
 use std::collections::BTreeMap;
 
+use nixe_gpu::GpuMethodId;
+
 use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
+
+/// Number of indexed MME shadow scratch registers exposed by `MAXWELL_B`.
+///
+/// NVIDIA defines the family as `0x3400 + i * 4`; the aperture ends where
+/// `CALL_MME_MACRO` begins at `0x3800`:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L4156-L4159>
+pub const MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT: usize = 256;
+
+/// How host method writes interact with the MME register shadow.
+///
+/// The field and all four encodings are published by NVIDIA:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L67-L72>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum MaxwellThreeDMmeShadowRamControl {
+    MethodTrack = 0,
+    MethodTrackWithFilter = 1,
+    MethodPassthrough = 2,
+    MethodReplay = 3,
+}
+
+impl MaxwellThreeDMmeShadowRamControl {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::MethodTrack),
+            1 => Some(Self::MethodTrackWithFilter),
+            2 => Some(Self::MethodPassthrough),
+            3 => Some(Self::MethodReplay),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    const fn tracks(self) -> bool {
+        matches!(self, Self::MethodTrack | Self::MethodTrackWithFilter)
+    }
+}
+
+/// Why one shadow-RAM transition cannot be represented faithfully.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDMmeShadowRamError {
+    ReplayRegisterUnavailable { method_dword: u16 },
+}
+
+/// Index of one `SET_MME_SHADOW_SCRATCH(i)` register.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDMmeShadowScratchIndex(u8);
+
+impl MaxwellThreeDMmeShadowScratchIndex {
+    #[must_use]
+    pub const fn new(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+}
 
 /// Maximum distinct instruction words retained by the current host model.
 ///
@@ -477,6 +544,9 @@ pub struct MaxwellThreeDMmeState {
     start_address_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
     start_addresses: BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>,
+    shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
+    shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
 }
 
 impl MaxwellThreeDMmeState {
@@ -528,6 +598,70 @@ impl MaxwellThreeDMmeState {
         self.start_addresses.len()
     }
 
+    #[must_use]
+    pub const fn shadow_ram_control(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl> {
+        &self.shadow_ram_control
+    }
+
+    #[must_use]
+    pub fn shadow_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
+        self.shadow_registers.get(&method.0)
+    }
+
+    pub(super) fn resolve_shadow_argument(
+        &self,
+        method: GpuMethodId,
+        submitted_argument: u32,
+    ) -> Result<u32, MaxwellThreeDMmeShadowRamError> {
+        // SET_MME_SHADOW_RAM_CONTROL consumes its non-shadowed argument so the
+        // command stream can always leave replay mode. This agrees with the
+        // source-preserving split used by yuzu's Maxwell frontend:
+        // https://ni.4a.si/anonymous/yuzu/tree/src/video_core/engines/maxwell_3d.cpp?id=9705094a576e6594e359cc0256b63385ac05de3f#n319
+        if method.0 == 0x0124
+            || self.shadow_ram_control.value()
+                != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
+        {
+            return Ok(submitted_argument);
+        }
+        self.shadow_register(method)
+            .and_then(MaxwellThreeDRegister::raw)
+            .ok_or(MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
+                method_dword: (method.0 / 4) as u16,
+            })
+    }
+
+    pub(super) fn track_shadow_register(
+        &mut self,
+        control: Option<MaxwellThreeDMmeShadowRamControl>,
+        source: MaxwellMethodSource,
+    ) {
+        // Public Maxwell implementations agree that TrackWithFilter follows
+        // Track for ordinary class-register writes; the undocumented filter
+        // distinction is intentionally not guessed here. MME call/data writes
+        // bypass this path entirely.
+        if control.is_some_and(|mode| mode.tracks()) {
+            self.shadow_registers.insert(
+                source.method().0,
+                MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn shadow_scratch(
+        &self,
+        index: MaxwellThreeDMmeShadowScratchIndex,
+    ) -> Option<&MaxwellThreeDRegister<u32>> {
+        self.shadow_scratch.get(&index.raw())
+    }
+
+    #[must_use]
+    pub fn shadow_scratch_count(&self) -> usize {
+        self.shadow_scratch.len()
+    }
+
     pub(super) fn apply(&mut self, write: MaxwellThreeDMmeStateWrite) {
         match write {
             MaxwellThreeDMmeStateWrite::InstructionPointer { value, source } => {
@@ -572,6 +706,20 @@ impl MaxwellThreeDMmeState {
                         .expect("MME index was preflighted"),
                 ));
             }
+            MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source } => {
+                self.shadow_ram_control =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDMmeStateWrite::ShadowScratch {
+                index,
+                value,
+                source,
+            } => {
+                self.shadow_scratch.insert(
+                    index.raw(),
+                    MaxwellThreeDRegister::programmed(value, value, source),
+                );
+            }
         }
     }
 }
@@ -595,6 +743,15 @@ pub enum MaxwellThreeDMmeStateWrite {
     StartAddress {
         index: MaxwellThreeDMmeRamAddress,
         address: MaxwellThreeDMmeRamAddress,
+        source: MaxwellMethodSource,
+    },
+    ShadowRamControl {
+        value: MaxwellThreeDMmeShadowRamControl,
+        source: MaxwellMethodSource,
+    },
+    ShadowScratch {
+        index: MaxwellThreeDMmeShadowScratchIndex,
+        value: u32,
         source: MaxwellMethodSource,
     },
 }

@@ -13,10 +13,12 @@ use crate::MaxwellMethodSource;
 use super::{
     MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
     MaxwellThreeDColorReductionStateWrite, MaxwellThreeDCoverageState,
-    MaxwellThreeDCoverageStateWrite, MaxwellThreeDFixedFunctionRegister,
-    MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
-    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
-    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDMmeState,
+    MaxwellThreeDCoverageStateWrite, MaxwellThreeDFalconMaskedRegisterWrite,
+    MaxwellThreeDFalconState, MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
+    MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
+    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
+    MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
+    MaxwellThreeDLineStateWrite, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
     MaxwellThreeDMmeStateWrite, MaxwellThreeDPolygonMode, MaxwellThreeDRenderEnableState,
     MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetState,
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
@@ -770,6 +772,8 @@ pub struct MaxwellThreeDState {
     zcull: MaxwellThreeDZCullState,
     l2_cache: MaxwellThreeDL2CacheState,
     report_semaphore: MaxwellThreeDReportSemaphoreState,
+    falcon: MaxwellThreeDFalconState,
+    instrumentation: MaxwellThreeDInstrumentationState,
     mme: MaxwellThreeDMmeState,
 }
 
@@ -822,6 +826,8 @@ impl Default for MaxwellThreeDState {
             zcull: Default::default(),
             l2_cache: Default::default(),
             report_semaphore: Default::default(),
+            falcon: Default::default(),
+            instrumentation: Default::default(),
             mme: Default::default(),
         }
     }
@@ -904,8 +910,22 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
+    pub const fn falcon(&self) -> &MaxwellThreeDFalconState {
+        &self.falcon
+    }
+
+    #[must_use]
+    pub const fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
+        &self.instrumentation
+    }
+
+    #[must_use]
     pub const fn mme(&self) -> &MaxwellThreeDMmeState {
         &self.mme
+    }
+
+    pub(super) const fn mme_mut(&mut self) -> &mut MaxwellThreeDMmeState {
+        &mut self.mme
     }
 
     /// Returns the last validated raw value for one byte-addressed class method.
@@ -1151,6 +1171,20 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
             MaxwellThreeDStateWrite::L2Cache(write) => self.l2_cache.apply(write),
             MaxwellThreeDStateWrite::ReportSemaphore(write) => self.report_semaphore.apply(write),
+            MaxwellThreeDStateWrite::Instrumentation(write) => self.instrumentation.apply(write),
+            MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
+                self.falcon.apply(write);
+                let completion = MaxwellThreeDMmeStateWrite::ShadowScratch {
+                    index: MaxwellThreeDMmeShadowScratchIndex::new(0),
+                    value: 1,
+                    source: write.source(),
+                };
+                self.mme.apply(completion);
+                self.raw_registers.insert(
+                    0x3400,
+                    MaxwellThreeDRegister::programmed(1, 1, write.source()),
+                );
+            }
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
     }
@@ -1408,5 +1442,7 @@ pub enum MaxwellThreeDStateWrite {
     ZCull(MaxwellThreeDZCullStateWrite),
     L2Cache(MaxwellThreeDL2CacheStateWrite),
     ReportSemaphore(MaxwellThreeDReportSemaphoreStateWrite),
+    Instrumentation(MaxwellThreeDInstrumentationStateWrite),
+    FalconMaskedRegister(MaxwellThreeDFalconMaskedRegisterWrite),
     Mme(MaxwellThreeDMmeStateWrite),
 }

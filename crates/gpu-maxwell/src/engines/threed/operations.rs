@@ -430,6 +430,10 @@ impl MaxwellThreeDSyncpointIncrement {
 /// One 3D execution-order trigger emitted by a class method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationTrigger {
+    WaitForIdle {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
         source: MaxwellMethodSource,
@@ -464,7 +468,8 @@ impl MaxwellThreeDSynchronizationTrigger {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::InvalidateShaderCaches { source, .. }
+            Self::WaitForIdle { source, .. }
+            | Self::InvalidateShaderCaches { source, .. }
             | Self::InvalidateShaderCachesNoWfi { source, .. }
             | Self::InvalidateTextureCacheNoWfi { source, .. }
             | Self::InvalidateTextureCache { source, .. }
@@ -504,6 +509,10 @@ impl MaxwellThreeDSynchronizationOperation {
 /// Validated host-independent lowering of one 3D synchronization operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationPlan {
+    /// Orders every earlier channel operation before later work.
+    WaitForIdle {
+        prior_work_pending: bool,
+    },
     InvalidateShaderCaches {
         request: MaxwellThreeDShaderCacheInvalidation,
         maintenance: CacheMaintenanceOperation,
@@ -602,12 +611,18 @@ impl Display for MaxwellThreeDSynchronizationError {
 /// The completion owner remains responsible for publishing the reservation
 /// only after the requested condition, cache maintenance, and preceding work
 /// have completed.
+///
+/// NVIDIA exposes `WAIT_FOR_IDLE` as a full-width channel-ordering method:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L51-L52>
 pub fn lower_maxwell_three_d_synchronization(
     operation: &MaxwellThreeDSynchronizationOperation,
     completion: Option<&ReservedTimelinePoint>,
     prior_work_pending: bool,
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
     match operation.trigger() {
+        MaxwellThreeDSynchronizationTrigger::WaitForIdle { .. } => {
+            Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle { prior_work_pending })
+        }
         MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source } => {
             if request.locks() {
                 return Err(

@@ -154,6 +154,12 @@ impl HorizonSvcDispatcher {
             Ok(SyncRequestResult::InvalidHandle) => {
                 self.generic_sync_request(context, tls, TLS_COMMAND_BUFFER_SIZE, handle, 0x21)
             }
+            Ok(SyncRequestResult::AppletExitRequested) => {
+                self.pending_wakes
+                    .remove(&context.thread().object().thread_id());
+                log::debug!("application applet requested process exit");
+                terminate(ExceptionTerminationScope::Process)
+            }
             Ok(SyncRequestResult::PendingNvDrv(wait)) => {
                 log::debug!(
                     "suspending thread {} for nvdrv {} wait request={:#010x} target={} timeout-us={} event-slot={:?}",
@@ -234,6 +240,12 @@ impl HorizonSvcDispatcher {
             }
             Ok(SyncRequestResult::InvalidHandle) => {
                 self.generic_sync_request(context, address, size, handle, 0x22)
+            }
+            Ok(SyncRequestResult::AppletExitRequested) => {
+                self.pending_wakes
+                    .remove(&context.thread().object().thread_id());
+                log::debug!("application applet requested process exit");
+                terminate(ExceptionTerminationScope::Process)
             }
             Ok(SyncRequestResult::PendingNvDrv(wait)) => {
                 self.pending_wakes.insert(
@@ -336,10 +348,17 @@ impl HorizonSvcDispatcher {
             Ok(None) => {}
             Err(error) => return session_error(context, error),
         }
+        if let Err(error) =
+            crate::ipc_wire::validate_writable_ram_range(context.process(), address, size)
+        {
+            return reject_ipc(context, immediate, error);
+        }
         let mut message = Vec::new();
         if message.try_reserve_exact(size).is_err() {
-            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-            return resume();
+            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcHostResourceExhausted {
+                immediate,
+                operation: "allocating a generic session IPC command buffer",
+            });
         }
         message.resize(size, 0);
         if let Err(error) = crate::ipc_wire::read_bytes(context.process(), address, &mut message) {
@@ -404,7 +423,15 @@ pub(super) fn finish_sync_response(
     }
     if let Err(error) = crate::ipc_wire::write_bytes(context.process(), address, &response) {
         close_encoded_handles(context.process_mut().handles_mut(), &response);
-        return reject_ipc(context, immediate, error);
+        return match error {
+            IpcWireError::GuestMemory(fault) => {
+                ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcResponseCommit {
+                    immediate,
+                    fault,
+                })
+            }
+            error => reject_ipc(context, immediate, error),
+        };
     }
     result(context, HorizonKernelResult::SUCCESS);
     resume()
@@ -619,19 +646,30 @@ pub(super) fn reject_ipc(
             reject(context, HorizonSvcFault::GuestMemory { immediate, fault })
         }
         IpcWireError::Malformed(reason) => {
-            reject(context, HorizonSvcFault::MalformedIpc { immediate, reason })
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::MalformedIpc { immediate, reason })
         }
         IpcWireError::Internal(reason) => {
             ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc { immediate, reason })
         }
-        IpcWireError::ResourceExhausted => {
-            result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-            resume()
+        IpcWireError::HostResourceExhausted(operation) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcHostResourceExhausted {
+                immediate,
+                operation,
+            })
+        }
+        IpcWireError::ResponseCommit(fault) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcResponseCommit { immediate, fault })
         }
         IpcWireError::CanonicalBacking(fault) => reject(
             context,
             HorizonSvcFault::CanonicalBacking { immediate, fault },
         ),
+        IpcWireError::ErrorApplet(diagnostic) => {
+            ExceptionDispatchOutcome::Fault(HorizonSvcFault::ErrorApplet {
+                immediate,
+                diagnostic,
+            })
+        }
         IpcWireError::UnsupportedNvDrv(operation) => {
             ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
                 immediate,

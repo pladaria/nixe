@@ -25,6 +25,103 @@ fn three_d_no_operation_is_named_and_implemented() {
 }
 
 #[test]
+fn instrumentation_header_and_data_are_source_preserving_pipeline_neutral_annotations() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+    let decoded = incrementing_packet(0x0150 / 4, &[0x4900_0000, 0x4900_0001]);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(
+        dispatch
+            .methods()
+            .iter()
+            .map(|method| method.metadata().method_name())
+            .collect::<Vec<_>>(),
+        [
+            "SET_INSTRUMENTATION_METHOD_HEADER",
+            "SET_INSTRUMENTATION_METHOD_DATA"
+        ]
+    );
+    assert!(dispatch.operations().is_empty());
+
+    let header_source = dispatch.methods()[0].method().source();
+    let header = MaxwellThreeDInstrumentationValue::from_bits(0x4900_0000);
+    assert_eq!(
+        dispatch.methods()[0].effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Instrumentation(
+            MaxwellThreeDInstrumentationStateWrite::Header {
+                value: header,
+                source: header_source,
+            }
+        ))
+    );
+    let header_register = channel.three_d().instrumentation().header();
+    assert_eq!(
+        header_register.origin(),
+        MaxwellThreeDRegisterOrigin::Programmed
+    );
+    assert_eq!(header_register.raw(), Some(0x4900_0000));
+    assert_eq!(header_register.value().copied(), Some(header));
+    assert_eq!(header_register.source(), Some(header_source));
+
+    let data_source = dispatch.methods()[1].method().source();
+    let data = MaxwellThreeDInstrumentationValue::from_bits(0x4900_0001);
+    assert_eq!(
+        dispatch.methods()[1].effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Instrumentation(
+            MaxwellThreeDInstrumentationStateWrite::Data {
+                value: data,
+                source: data_source,
+            }
+        ))
+    );
+    let data_register = channel.three_d().instrumentation().data();
+    assert_eq!(data_register.raw(), Some(0x4900_0001));
+    assert_eq!(data_register.value().copied(), Some(data));
+    assert_eq!(data_register.source(), Some(data_source));
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
+}
+
+#[test]
+fn instrumentation_accepts_all_word_bits_and_invalid_packet_suffix_is_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for (method, argument) in [(0x0150, u32::MAX), (0x0154, 0)] {
+        program_three_d(&mut channel, method, argument);
+        let register = if method == 0x0150 {
+            channel.three_d().instrumentation().header()
+        } else {
+            channel.three_d().instrumentation().data()
+        };
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value().map(|value| value.bits()), Some(argument));
+    }
+
+    let before = channel.clone();
+    let decoded = incrementing_packet(0x0150 / 4, &[1, 2, 3]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+            if source.method() == GpuMethodId(0x0158)
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
 fn shader_exceptions_enable_is_typed_source_preserving_diagnostic_state() {
     let mut channel = channel();
     bind_three_d(&mut channel);
@@ -3956,6 +4053,118 @@ fn zcull_enable_and_bounds_are_typed_source_preserving_pipeline_neutral_state() 
         dependencies_before
     );
     assert_eq!(channel.two_d(), &two_d_before);
+}
+
+#[test]
+fn zcull_criterion_is_typed_source_preserving_pipeline_neutral_state() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let two_d_before = channel.two_d().clone();
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+    let decoded = packet(0x0dd8 / 4, 0xff00_0005);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(dispatch.methods().len(), 1);
+    assert_eq!(
+        dispatch.methods()[0].metadata().method_name(),
+        "SET_ZCULL_CRITERION"
+    );
+    assert!(dispatch.operations().is_empty());
+
+    let source = dispatch.methods()[0].method().source();
+    let criterion = MaxwellThreeDZCullCriterion::parse(0xff00_0005).unwrap();
+    assert_eq!(
+        criterion.stencil_function(),
+        MaxwellThreeDZCullStencilFunction::NotEqual
+    );
+    assert!(!criterion.no_invalidate());
+    assert!(!criterion.force_match());
+    assert_eq!(criterion.stencil_reference(), 0);
+    assert_eq!(criterion.stencil_mask(), 0xff);
+    assert_eq!(criterion.raw(), 0xff00_0005);
+    assert_eq!(
+        dispatch.methods()[0].effect(),
+        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ZCull(
+            MaxwellThreeDZCullStateWrite::Criterion {
+                value: criterion,
+                source,
+            }
+        ))
+    );
+
+    let register = channel.three_d().zcull().criterion();
+    assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+    assert_eq!(register.raw(), Some(0xff00_0005));
+    assert_eq!(register.value().copied(), Some(criterion));
+    assert_eq!(register.source(), Some(source));
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
+    assert_eq!(channel.two_d(), &two_d_before);
+}
+
+#[test]
+fn zcull_criterion_decodes_the_complete_documented_field_family() {
+    for raw in 0..=7 {
+        let criterion = MaxwellThreeDZCullCriterion::parse(raw).unwrap();
+        assert_eq!(criterion.stencil_function().raw(), raw as u8);
+        assert_eq!(criterion.raw(), raw);
+    }
+
+    let criterion = MaxwellThreeDZCullCriterion::parse(0xa55a_0307).unwrap();
+    assert_eq!(
+        criterion.stencil_function(),
+        MaxwellThreeDZCullStencilFunction::Always
+    );
+    assert!(criterion.no_invalidate());
+    assert!(criterion.force_match());
+    assert_eq!(criterion.stencil_reference(), 0x5a);
+    assert_eq!(criterion.stencil_mask(), 0xa5);
+    assert_eq!(criterion.raw(), 0xa55a_0307);
+}
+
+#[test]
+fn zcull_criterion_invalid_values_and_packet_suffix_are_rejected_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0dd8, 0xff00_0005);
+
+    for argument in [8, 0x0000_0400, 0x0000_f000, u32::MAX] {
+        let before = channel.clone();
+        let decoded = packet(0x0dd8 / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                source,
+                defined_mask: 0xffff_03ff,
+                ..
+            }) if source.method() == GpuMethodId(0x0dd8) && source.argument() == argument
+        ));
+        assert_eq!(channel, before);
+    }
+
+    let before = channel.clone();
+    let decoded = incrementing_packet(0x0dd8 / 4, &[0, 0]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+            if source.method() == GpuMethodId(0x0ddc)
+    ));
+    assert_eq!(channel, before);
 }
 
 #[test]

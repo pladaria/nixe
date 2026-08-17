@@ -10,6 +10,112 @@ use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
 
+/// Stencil comparison used by Maxwell's internal Z-cull criterion.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum MaxwellThreeDZCullStencilFunction {
+    Never = 0,
+    Less = 1,
+    Equal = 2,
+    LessOrEqual = 3,
+    Greater = 4,
+    NotEqual = 5,
+    GreaterOrEqual = 6,
+    Always = 7,
+}
+
+impl MaxwellThreeDZCullStencilFunction {
+    const fn parse(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Never),
+            1 => Some(Self::Less),
+            2 => Some(Self::Equal),
+            3 => Some(Self::LessOrEqual),
+            4 => Some(Self::Greater),
+            5 => Some(Self::NotEqual),
+            6 => Some(Self::GreaterOrEqual),
+            7 => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Early-stencil criterion retained by Maxwell's Z-cull unit.
+///
+/// This is optimization state rather than the ordinary stencil-test state.
+/// A backend may preserve rendering semantics by using its normal late
+/// depth/stencil path, so the criterion deliberately remains pipeline-neutral.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1060-L1077>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDZCullCriterion {
+    stencil_function: MaxwellThreeDZCullStencilFunction,
+    no_invalidate: bool,
+    force_match: bool,
+    stencil_reference: u8,
+    stencil_mask: u8,
+}
+
+impl MaxwellThreeDZCullCriterion {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0xffff_03ff != 0 {
+            return None;
+        }
+        let Some(stencil_function) = MaxwellThreeDZCullStencilFunction::parse((raw & 0xff) as u8)
+        else {
+            return None;
+        };
+        Some(Self {
+            stencil_function,
+            no_invalidate: raw & (1 << 8) != 0,
+            force_match: raw & (1 << 9) != 0,
+            stencil_reference: ((raw >> 16) & 0xff) as u8,
+            stencil_mask: (raw >> 24) as u8,
+        })
+    }
+
+    #[must_use]
+    pub const fn stencil_function(self) -> MaxwellThreeDZCullStencilFunction {
+        self.stencil_function
+    }
+
+    #[must_use]
+    pub const fn no_invalidate(self) -> bool {
+        self.no_invalidate
+    }
+
+    #[must_use]
+    pub const fn force_match(self) -> bool {
+        self.force_match
+    }
+
+    #[must_use]
+    pub const fn stencil_reference(self) -> u8 {
+        self.stencil_reference
+    }
+
+    #[must_use]
+    pub const fn stencil_mask(self) -> u8 {
+        self.stencil_mask
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.stencil_function.raw() as u32
+            | (self.no_invalidate as u32) << 8
+            | (self.force_match as u32) << 9
+            | (self.stencil_reference as u32) << 16
+            | (self.stencil_mask as u32) << 24
+    }
+}
+
 /// Early depth/stencil rejection domains enabled on Maxwell.
 ///
 /// Z-cull is an implementation optimization: a backend may retain this state
@@ -156,6 +262,10 @@ impl MaxwellThreeDZCullStatsEnable {
 /// One validated Z-cull register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDZCullStateWrite {
+    Criterion {
+        value: MaxwellThreeDZCullCriterion,
+        source: MaxwellMethodSource,
+    },
     Enable {
         value: MaxwellThreeDZCullEnable,
         source: MaxwellMethodSource,
@@ -177,6 +287,7 @@ pub enum MaxwellThreeDZCullStateWrite {
 /// Persistent Z-cull configuration on one `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDZCullState {
+    criterion: MaxwellThreeDRegister<MaxwellThreeDZCullCriterion>,
     enable: MaxwellThreeDRegister<MaxwellThreeDZCullEnable>,
     bounds: MaxwellThreeDRegister<MaxwellThreeDZCullBounds>,
     active_region: MaxwellThreeDRegister<MaxwellThreeDZCullRegionId>,
@@ -184,6 +295,11 @@ pub struct MaxwellThreeDZCullState {
 }
 
 impl MaxwellThreeDZCullState {
+    #[must_use]
+    pub const fn criterion(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullCriterion> {
+        &self.criterion
+    }
+
     #[must_use]
     pub const fn enable(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCullEnable> {
         &self.enable
@@ -206,6 +322,9 @@ impl MaxwellThreeDZCullState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDZCullStateWrite) {
         match write {
+            MaxwellThreeDZCullStateWrite::Criterion { value, source } => {
+                self.criterion = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDZCullStateWrite::Enable { value, source } => {
                 self.enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }

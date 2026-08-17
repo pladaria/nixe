@@ -45,8 +45,8 @@ pub use threed::{
     MAXWELL_SAMPLE_LOCATION_GROUP_COUNT, MAXWELL_SAMPLE_LOCATIONS_PER_GROUP, MAXWELL_SCISSOR_COUNT,
     MAXWELL_TESSELLATION_LOD_COUNT, MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS,
     MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES, MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT,
-    MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT, MAXWELL_THREE_D_PRIMITIVE_AREA_MAX,
-    MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
+    MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT, MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT,
+    MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
@@ -72,21 +72,27 @@ pub use threed::{
     MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
     MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
     MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDDirtySubresource,
-    MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag, MaxwellThreeDFillViaTriangleMode,
+    MaxwellThreeDDirtySubresources, MaxwellThreeDEdgeFlag, MaxwellThreeDFalconError,
+    MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
+    MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState, MaxwellThreeDFillViaTriangleMode,
     MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
     MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace, MaxwellThreeDGuestImageFormat,
     MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState,
     MaxwellThreeDIndexElementSize, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
-    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters,
-    MaxwellThreeDLogicOp, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
-    MaxwellThreeDLoweringError, MaxwellThreeDLoweringPlan, MaxwellThreeDMappingReference,
-    MaxwellThreeDMmeExecutionError, MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction,
-    MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress,
-    MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite, MaxwellThreeDOperationTrigger,
-    MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
+    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
+    MaxwellThreeDInstrumentationValue, MaxwellThreeDIteratedBlend,
+    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDL2CacheEvictionPolicy,
+    MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
+    MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp,
+    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
+    MaxwellThreeDLoweringPlan, MaxwellThreeDMappingReference, MaxwellThreeDMmeExecutionError,
+    MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
+    MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
+    MaxwellThreeDMmeShadowRamError, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDOperationTrigger, MaxwellThreeDPatchSize,
+    MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
     MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
     MaxwellThreeDPointSpriteOrigin, MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
     MaxwellThreeDPolygonClipGeneratedEdge, MaxwellThreeDPolygonMode,
@@ -135,11 +141,11 @@ pub use threed::{
     MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
     MaxwellThreeDViewportZClipRange, MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState,
     MaxwellThreeDWindowClipType, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullBounds,
-    MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullState,
-    MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
-    lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation,
-    preflight_maxwell_three_d_operation_unnegotiated, resolve_maxwell_three_d_resources,
-    resolve_maxwell_three_d_resources_for_roles,
+    MaxwellThreeDZCullCriterion, MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId,
+    MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
+    MaxwellThreeDZCullStencilFunction, lower_maxwell_three_d_synchronization,
+    preflight_maxwell_three_d_operation, preflight_maxwell_three_d_operation_unnegotiated,
+    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDBeta1,
@@ -522,6 +528,10 @@ pub enum MaxwellEngineDispatchError {
         method_name: &'static str,
         reason: &'static str,
     },
+    FalconFirmware {
+        source: MaxwellMethodSource,
+        error: MaxwellThreeDFalconError,
+    },
     MmeRamLoad {
         source: MaxwellMethodSource,
         ram: MaxwellThreeDMmeRam,
@@ -530,6 +540,10 @@ pub enum MaxwellEngineDispatchError {
     MmeExecution {
         source: MaxwellMethodSource,
         error: MaxwellThreeDMmeExecutionError,
+    },
+    MmeShadowRam {
+        source: MaxwellMethodSource,
+        error: MaxwellThreeDMmeShadowRamError,
     },
     IncompatibleShaderProgramHeaderVersion {
         source: MaxwellMethodSource,
@@ -628,6 +642,10 @@ impl Display for MaxwellEngineDispatchError {
                 formatter,
                 "Maxwell method has an invalid verified encoding: {source} class-name=MAXWELL_DMA_COPY_A method-name={method_name} reason={reason}"
             ),
+            Self::FalconFirmware { source, error } => write!(
+                formatter,
+                "MAXWELL_B Falcon firmware call failed: {source} error={error:?}"
+            ),
             Self::MmeRamLoad { source, ram, error } => write!(
                 formatter,
                 "MAXWELL_B MME RAM load exceeds implemented host coverage: {source} ram={ram:?} error={error:?}"
@@ -635,6 +653,10 @@ impl Display for MaxwellEngineDispatchError {
             Self::MmeExecution { source, error } => write!(
                 formatter,
                 "MAXWELL_B MME execution failed: {source} error={error:?}"
+            ),
+            Self::MmeShadowRam { source, error } => write!(
+                formatter,
+                "MAXWELL_B MME shadow-RAM transition failed: {source} error={error:?}"
             ),
             Self::IncompatibleShaderProgramHeaderVersion {
                 source,
