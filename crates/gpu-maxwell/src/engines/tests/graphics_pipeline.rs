@@ -1,4 +1,30 @@
+use std::sync::Arc;
+
+use nixe_memory::{
+    CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint, DeviceVisibilityRequest,
+    NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
+};
+
 use super::*;
+
+struct MaterializationWriteback;
+
+impl VisibilityCoordinator for MaterializationWriteback {
+    fn make_device_visible(
+        &self,
+        _request: DeviceVisibilityRequest,
+        _canonical_bytes: &[u8],
+    ) -> Result<(), VisibilityCoordinatorError> {
+        Ok(())
+    }
+
+    fn make_cpu_visible(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        Ok(vec![0x5a; request.size].into_boxed_slice())
+    }
+}
 
 #[test]
 fn z_compression_selector_is_typed_depth_state_without_an_operation() {
@@ -369,6 +395,118 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             .resource_creations()
             .is_empty()
     );
+
+    cache.evict_views_for_test();
+    let after_host_view_eviction = preflight_maxwell_three_d_operation(
+        triggered.state(),
+        &resources,
+        triggered.trigger(),
+        None,
+        FrontendSubmissionId::new(14),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+    assert!(
+        after_host_view_eviction
+            .resource_creations()
+            .iter()
+            .any(|creation| matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. }))
+    );
+
+    // Rebinding the same canonical bytes through a different GPU allocation
+    // changes view identity, not the neutral representation of the image.
+    let remapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        42,
+        0xfe,
+    );
+    let remapped_address = remapping.offset().get();
+    program_three_d(&mut channel, 0x0800, (remapped_address >> 32) as u32);
+    program_three_d(&mut channel, 0x0804, remapped_address as u32);
+    program_three_d(&mut channel, 0x10f8, 0x10);
+    let remapped_clear = packet(0x19d0 / 4, 0x3c);
+    let remapped_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &remapped_clear.packets()[0],
+    )
+    .unwrap();
+    let remapped = &remapped_dispatch.operations()[0];
+    let remapped_resources =
+        resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
+    preflight_maxwell_three_d_operation(
+        remapped.state(),
+        &remapped_resources,
+        remapped.trigger(),
+        None,
+        FrontendSubmissionId::new(15),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+
+    let backing = allocation
+        .backing_range(MemoryPermissions::READ_WRITE)
+        .unwrap();
+    let declaration = DeviceAccessDeclaration::write(
+        NonCpuDeviceId::new(9),
+        DeviceVisibilityPoint::new(20),
+        DeviceVisibilityPoint::new(21),
+    )
+    .unwrap();
+    let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(MaterializationWriteback);
+    backing
+        .prepare_device_access(declaration, Arc::clone(&coordinator))
+        .unwrap();
+    backing
+        .complete_device_write(declaration, Arc::clone(&coordinator))
+        .unwrap();
+    // Presentation may materialize only the pages it reads. The remaining
+    // pages retain GPU authority and the original content generation.
+    let mut writeback = vec![0; 0x1000];
+    allocation.read(0, &mut writeback).unwrap();
+
+    let resources_after_writeback =
+        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    let after_writeback = preflight_maxwell_three_d_operation(
+        triggered.state(),
+        &resources_after_writeback,
+        triggered.trigger(),
+        None,
+        FrontendSubmissionId::new(16),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+    assert!(
+        after_writeback.resource_creations().iter().any(|creation| {
+            matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. })
+        })
+    );
+
+    allocation.write(0, &[0xa5]).unwrap();
+    let resources_after_cpu_write =
+        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    assert!(matches!(
+        preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources_after_cpu_write,
+            triggered.trigger(),
+            None,
+            FrontendSubmissionId::new(17),
+            Vec::new(),
+            &lowering_capabilities(BackendFeatures::CLEAR),
+            &cache,
+        ),
+        Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
+    ));
 }
 
 #[test]
@@ -806,7 +944,7 @@ fn render_target_state_distinguishes_unset_disabled_ready_and_profile_unavailabl
 }
 
 #[test]
-fn render_target_encodings_and_cross_register_contradictions_reject_atomically() {
+fn render_target_encodings_reject_atomically_and_cross_register_state_defers_to_consumption() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -829,17 +967,21 @@ fn render_target_encodings_and_cross_register_contradictions_reject_atomically()
         &three_dimensional.packets()[0],
     )
     .unwrap();
-    let before_layer = channel.three_d().clone();
     let nonzero_layer = packet(0x0820 / 4, 1);
-    assert!(matches!(
-        dispatch_maxwell_engine_packet(
-            &mut channel,
-            FrontendSubmissionId::new(3),
-            &nonzero_layer.packets()[0]
-        ),
-        Err(MaxwellEngineDispatchError::ContradictoryState { .. })
-    ));
-    assert_eq!(channel.three_d(), &before_layer);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &nonzero_layer.packets()[0],
+    )
+    .unwrap();
+    assert_eq!(
+        channel
+            .three_d()
+            .validate_cross_registers()
+            .unwrap_err()
+            .reason,
+        "a three-dimensional color target cannot select an array layer"
+    );
 }
 
 #[test]
@@ -2683,7 +2825,7 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
 }
 
 #[test]
-fn malformed_vertex_suffix_and_index_relationships_reject_atomically() {
+fn malformed_vertex_suffix_rejects_atomically_and_index_relationships_defer() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let malformed = incrementing_packet(0x1c00 / 4, &[0x1010, 0, 0x2000, 1, 0x2000]);
@@ -2707,17 +2849,65 @@ fn malformed_vertex_suffix_and_index_relationships_reject_atomically() {
         )
         .unwrap();
     }
-    let before_size = channel.three_d().clone();
     let size = packet(0x17d8 / 4, 2);
-    assert!(matches!(
-        dispatch_maxwell_engine_packet(
-            &mut channel,
-            FrontendSubmissionId::new(3),
-            &size.packets()[0]
-        ),
-        Err(MaxwellEngineDispatchError::ContradictoryState { .. })
-    ));
-    assert_eq!(channel.three_d(), &before_size);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &size.packets()[0],
+    )
+    .unwrap();
+    assert_eq!(
+        channel
+            .three_d()
+            .validate_cross_registers()
+            .unwrap_err()
+            .reason,
+        "the index-buffer range is not aligned to its element size"
+    );
+}
+
+#[test]
+fn vertex_stream_ranges_may_be_reprogrammed_across_packets_before_consumption() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for (method, argument) in [
+        (0x1c00, 0x1018),
+        (0x1c04, 0),
+        (0x1c08, 0x093f_5000),
+        (0x1f00, 0),
+        (0x1f04, 0x093f_6fdf),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+
+    // The lower address half is commonly written before the replacement
+    // limit. A move in the opposite direction therefore creates a legal,
+    // short-lived address > old-limit snapshot between these packets.
+    let address = incrementing_packet(0x1c00 / 4, &[0x1018, 0, 0x0941_3000]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &address.packets()[0],
+    )
+    .unwrap();
+    assert!(channel.three_d().validate_cross_registers().is_err());
+
+    let limit = incrementing_packet(0x1f00 / 4, &[0, 0x0941_6fbf]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &limit.packets()[0],
+    )
+    .unwrap();
+
+    let stream = &channel.three_d().vertex_input().streams()[0];
+    assert_eq!(
+        stream.address().map(|address| address.get()),
+        Some(0x0941_3000)
+    );
+    assert_eq!(stream.limit().map(|limit| limit.get()), Some(0x0941_6fbf));
+    assert!(channel.three_d().validate_cross_registers().is_ok());
 }
 
 #[test]

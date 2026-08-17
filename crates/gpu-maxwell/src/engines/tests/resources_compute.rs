@@ -1075,7 +1075,7 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
 }
 
 #[test]
-fn incomplete_bindings_and_misaligned_descriptor_tables_do_not_commit() {
+fn incomplete_bindings_reject_and_misaligned_descriptor_tables_defer() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let before = channel.three_d().clone();
@@ -1099,17 +1099,21 @@ fn incomplete_bindings_and_misaligned_descriptor_tables_do_not_commit() {
         )
         .unwrap();
     }
-    let before_maximum = channel.three_d().clone();
     let maximum = packet(0x157c / 4, 0);
-    assert!(matches!(
-        dispatch_maxwell_engine_packet(
-            &mut channel,
-            FrontendSubmissionId::new(3),
-            &maximum.packets()[0]
-        ),
-        Err(MaxwellEngineDispatchError::ContradictoryState { .. })
-    ));
-    assert_eq!(channel.three_d(), &before_maximum);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &maximum.packets()[0],
+    )
+    .unwrap();
+    assert_eq!(
+        channel
+            .three_d()
+            .validate_cross_registers()
+            .unwrap_err()
+            .reason,
+        "a descriptor pool address/range is misaligned or overflows"
+    );
 }
 
 #[test]

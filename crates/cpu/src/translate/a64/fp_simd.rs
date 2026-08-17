@@ -43,6 +43,8 @@ pub(super) fn lift(
         | FpSimdInstruction::ScalarVectorUnsignedIntToFloat(_)
         | FpSimdInstruction::VectorFloatDivide(_)
         | FpSimdInstruction::VectorFloatImmediate(_)
+        | FpSimdInstruction::VectorFloatAbsolute(_)
+        | FpSimdInstruction::VectorFloatNegate(_)
         | FpSimdInstruction::FloatToSignedInt(_)
         | FpSimdInstruction::FloatToUnsignedInt(_)
         | FpSimdInstruction::ScalarFloatImmediate(_)
@@ -53,13 +55,16 @@ pub(super) fn lift(
         | FpSimdInstruction::ScalarFloatMultiply(_)
         | FpSimdInstruction::ScalarFloatFusedMultiplyAdd(_)
         | FpSimdInstruction::ScalarFloatSquareRoot(_)
-        | FpSimdInstruction::ScalarFloatConditionalSelect(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::ScalarFloatConditionalSelect(_)
+        | FpSimdInstruction::ConditionalCompare(_) => Ok(interpret(decoded)),
         FpSimdInstruction::ScalarAbsolute(_) | FpSimdInstruction::ScalarNegate(_) => {
             Ok(interpret(decoded))
         }
         FpSimdInstruction::ShiftRightNarrow(_)
         | FpSimdInstruction::ScalarShiftRightImmediate(_)
-        | FpSimdInstruction::VectorShiftRightImmediate(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::VectorShiftRightImmediate(_)
+        | FpSimdInstruction::ScalarShiftLeftImmediate(_)
+        | FpSimdInstruction::VectorShiftLeftImmediate(_) => Ok(interpret(decoded)),
         FpSimdInstruction::CountBits(_) => Ok(interpret(decoded)),
         FpSimdInstruction::AddAcrossVector(_) => Ok(interpret(decoded)),
         FpSimdInstruction::Bitwise(_)

@@ -2241,7 +2241,7 @@ fn shader_local_memory_block_is_typed_source_preserving_and_shader_scoped() {
 }
 
 #[test]
-fn shader_local_memory_fields_ranges_and_packets_are_atomic() {
+fn shader_local_memory_fields_are_atomic_and_cross_register_ranges_defer() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -2303,24 +2303,19 @@ fn shader_local_memory_fields_ranges_and_packets_are_atomic() {
 
     program_three_d(&mut channel, 0x0790, 0xff);
     program_three_d(&mut channel, 0x0794, u32::MAX);
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
     let overflowing_size = incrementing_packet(0x0798 / 4, &[0, 2]);
-    assert!(matches!(
-        dispatch_maxwell_engine_packet(
-            &mut channel,
-            FrontendSubmissionId::new(3),
-            &overflowing_size.packets()[0]
-        ),
-        Err(MaxwellEngineDispatchError::ContradictoryState {
-            source: Some(source),
-            reason: "shader-local-memory region exceeds the 40-bit GPU address space",
-        }) if source.method() == GpuMethodId(0x079c)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &overflowing_size.packets()[0],
+    )
+    .unwrap();
+    let error = channel.three_d().validate_cross_registers().unwrap_err();
+    assert_eq!(
+        error.reason,
+        "shader-local-memory region exceeds the 40-bit GPU address space"
+    );
+    assert_eq!(error.source.unwrap().method(), GpuMethodId(0x079c));
 }
 
 #[test]

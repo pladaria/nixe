@@ -654,6 +654,83 @@ fn a64_simd_scalar_and_vector_immediate_right_shifts_cover_signedness_and_widths
 }
 
 #[test]
+fn a64_simd_scalar_and_vector_immediate_left_shifts_cover_aliases_and_widths() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(30, 0xaaaa_bbbb_cccc_dddd_0123_4567_89ab_cdef));
+    }
+
+    // Captured in-place scalar form. The scalar write clears the upper half.
+    execute_one(&profile, &mut state, 0x5f60_57de_u32.into()).unwrap(); // SHL D30,D30,#32
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.vector(30), Some(0x89ab_cdef_0000_0000));
+
+    for (encoding, source_register, destination_register, source, expected) in [
+        (
+            0x0f08_5420_u32,
+            1,
+            0,
+            0xaaaa_bbbb_cccc_dddd_8877_6655_4433_2211,
+            0x8877_6655_4433_2211,
+        ), // SHL V0.8B,V1.8B,#0
+        (
+            0x4f0f_5462,
+            3,
+            2,
+            0x0101_0101_0101_0101_0101_0101_0101_0101,
+            0x8080_8080_8080_8080_8080_8080_8080_8080,
+        ), // SHL V2.16B,V3.16B,#7
+        (
+            0x4f1f_54e6,
+            7,
+            6,
+            0x0001_0001_0001_0001_0001_0001_0001_0001,
+            0x8000_8000_8000_8000_8000_8000_8000_8000,
+        ), // SHL V6.8H,V7.8H,#15
+        (
+            0x4f3f_556a,
+            11,
+            10,
+            0x0000_0001_0000_0001_0000_0001_0000_0001,
+            0x8000_0000_8000_0000_8000_0000_8000_0000,
+        ), // SHL V10.4S,V11.4S,#31
+        (
+            0x4f7f_55ee,
+            15,
+            14,
+            0x0000_0000_0000_0001_0000_0000_0000_0001,
+            0x8000_0000_0000_0000_8000_0000_0000_0000,
+        ), // SHL V14.2D,V15.2D,#63
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(source_register, source));
+        assert!(a64.set_vector(destination_register, u128::MAX));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(destination_register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.pc(), 24);
+}
+
+#[test]
 fn a64_simd_variable_shifts_cover_signedness_widths_and_captured_alias() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
@@ -1333,6 +1410,85 @@ fn a64_scalar_fabs_fneg_transform_only_the_sign_bit_for_all_precisions() {
     assert_eq!(a64.fpcr(), u32::MAX);
     assert_eq!(a64.fpsr(), 0x95);
     assert_eq!(a64.pc(), 16);
+}
+
+#[test]
+fn a64_vector_fabs_fneg_cover_all_base_arrangements_and_captured_alias() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        a64.set_fpcr(u32::MAX);
+        a64.set_fpsr(0x95);
+    }
+
+    for (encoding, source_register, destination_register, source, expected) in [
+        (
+            0x0ea0_f820_u32,
+            1,
+            0,
+            (u128::from(u64::MAX) << 64) | 0x8000_0000_ff80_0001,
+            0x0000_0000_7f80_0001,
+        ), // FABS V0.2S,V1.2S
+        (
+            0x4ea0_f862,
+            3,
+            2,
+            0xff80_0001_8000_0000_7fc0_0001_0000_0001,
+            0x7f80_0001_0000_0000_7fc0_0001_0000_0001,
+        ), // FABS V2.4S,V3.4S
+        (
+            0x4ee0_f8a4,
+            5,
+            4,
+            0xfff0_0000_0000_0001_8000_0000_0000_0000,
+            0x7ff0_0000_0000_0001_0000_0000_0000_0000,
+        ), // FABS V4.2D,V5.2D
+        (
+            0x2ea0_fbde,
+            30,
+            30,
+            (u128::from(u64::MAX) << 64) | 0x3f80_0000_bf80_0000,
+            0xbf80_0000_3f80_0000,
+        ), // FNEG V30.2S,V30.2S (captured)
+        (
+            0x6ea0_f928,
+            9,
+            8,
+            0x7f80_0001_8000_0000_3f80_0000_bf80_0000,
+            0xff80_0001_0000_0000_bf80_0000_3f80_0000,
+        ), // FNEG V8.4S,V9.4S
+        (
+            0x6ee0_f96a,
+            11,
+            10,
+            0x7ff0_0000_0000_0001_8000_0000_0000_0000,
+            0xfff0_0000_0000_0001_0000_0000_0000_0000,
+        ), // FNEG V10.2D,V11.2D
+    ] {
+        let ThreadCpuState::A64(a64) = &mut state else {
+            unreachable!()
+        };
+        assert!(a64.set_vector(source_register, source));
+        execute_one(&profile, &mut state, encoding.into()).unwrap();
+        let ThreadCpuState::A64(a64) = &state else {
+            unreachable!()
+        };
+        assert_eq!(
+            a64.vector(destination_register),
+            Some(expected),
+            "encoding={encoding:#010x}"
+        );
+    }
+
+    let ThreadCpuState::A64(a64) = state else {
+        unreachable!()
+    };
+    assert_eq!(a64.fpcr(), u32::MAX);
+    assert_eq!(a64.fpsr(), 0x95);
+    assert_eq!(a64.pc(), 24);
 }
 
 #[test]
@@ -2875,6 +3031,68 @@ fn a64_scalar_fcmp_nan_signaling_and_enabled_exception_are_atomic() {
     assert_eq!(a64.nzcv().bits(), 1 << 31);
     assert_eq!(a64.fpsr(), 0x80);
     assert_eq!(a64.pc(), 4);
+}
+
+#[test]
+fn a64_scalar_fccmp_fccmpe_execute_both_condition_paths_and_captured_form() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(0, u128::from(0x7fc0_0001_u32))); // qNaN
+    assert!(a64.set_vector(1, u128::from(1.0_f32.to_bits())));
+    a64.set_fpcr(1 << 8); // IOE must not matter on the false condition path.
+    a64.set_fpsr(0x80);
+    a64.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(1 << 30)); // Z=1
+
+    execute_one(&profile, &mut state, 0x1e21_140a_u32.into()).unwrap(); // FCCMP S0,S1,#10,NE
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.nzcv().bits(), 0xa000_0000);
+    assert_eq!(a64.fpsr(), 0x80);
+
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(31, u128::from(1.0_f64.to_bits())));
+    assert!(a64.set_vector(30, u128::from(2.0_f64.to_bits())));
+    a64.set_fpcr(0);
+    a64.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(0)); // NE holds.
+    execute_one(&profile, &mut state, 0x1e7e_17e4_u32.into()).unwrap(); // FCCMP D31,D30,#4,NE
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.nzcv().bits(), 1 << 31);
+    assert_eq!(a64.fpsr(), 0x80);
+    assert_eq!(a64.pc(), 8);
+}
+
+#[test]
+fn a64_scalar_fccmpe_enabled_exception_is_atomic() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(2, u128::from(0x7fc0_0001_u32))); // qNaN
+    assert!(a64.set_vector(3, u128::from(1.0_f32.to_bits())));
+    a64.set_fpcr(1 << 8); // IOE
+    a64.set_fpsr(0x80);
+    a64.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(0));
+
+    let error = execute_one(&profile, &mut state, 0x1e23_e45f_u32.into()).unwrap_err(); // FCCMPE S2,S3,#15,AL
+    assert!(matches!(
+        error,
+        InterpreterError::UnsupportedInstruction { .. }
+    ));
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.nzcv().bits(), 0);
+    assert_eq!(a64.fpsr(), 0x80);
+    assert_eq!(a64.pc(), 0);
 }
 
 #[test]

@@ -537,10 +537,6 @@ pub enum MaxwellEngineDispatchError {
     UnsupportedConditionalConstantBufferLoad {
         source: MaxwellMethodSource,
     },
-    ContradictoryState {
-        source: Option<MaxwellMethodSource>,
-        reason: &'static str,
-    },
     MissingCapability {
         source: MaxwellMethodSource,
         metadata: &'static MaxwellEngineMethodMetadata,
@@ -661,13 +657,6 @@ impl Display for MaxwellEngineDispatchError {
                 formatter,
                 "conditional Maxwell constant-buffer load semantics are unavailable: {source}"
             ),
-            Self::ContradictoryState { source, reason } => {
-                write!(formatter, "contradictory Maxwell 3D state")?;
-                if let Some(source) = source {
-                    write!(formatter, ": {source}")?;
-                }
-                write!(formatter, " reason={reason}")
-            }
             Self::MissingCapability {
                 source,
                 metadata,
@@ -872,13 +861,12 @@ pub fn preflight_maxwell_engine_packet(
         }
         method_index += 1;
     }
-    three_d_after.validate_cross_registers().map_err(|error| {
-        MaxwellEngineDispatchError::ContradictoryState {
-            source: error.source,
-            reason: error.reason,
-        }
-    })?;
-
+    // Maxwell register programming is not transactional across pushbuffer
+    // packets. Related address, limit, format, and selector fields may form an
+    // inconsistent intermediate snapshot while the guest moves from one valid
+    // configuration to the next. Keep method-local encoding checks here, but
+    // defer relational validation until a draw or clear consumes its immutable
+    // state snapshot in the neutral lowering preflight.
     Ok(MaxwellEnginePacketDispatch {
         binding,
         compute_before,

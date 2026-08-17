@@ -8,9 +8,10 @@ use std::{
 use crate::{
     AccessMode, AccessScope, AccessTarget, BackendFeatures, BufferId, BufferRange,
     CapabilityRequirement, CapabilityRequirements, DescriptorTableId, FrontendSubmissionId,
-    ImageExtent, ImageFormat, ImageId, ImageKind, ImageSubresourceRange, PipelineId,
-    PipelineStages, QueryKind, QueryPoolId, QueryRange, RenderPassDescription, RenderPassId,
-    ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage, SampleCount,
+    FrontendSubmissionSegment, ImageExtent, ImageFormat, ImageId, ImageKind, ImageSubresourceRange,
+    PipelineId, PipelineStages, QueryKind, QueryPoolId, QueryRange, RenderPassDescription,
+    RenderPassId, ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage,
+    SampleCount,
 };
 
 /// One buffer and exact byte range named by an operation.
@@ -901,6 +902,8 @@ impl GpuCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationSubmission {
     id: FrontendSubmissionId,
+    segment: FrontendSubmissionSegment,
+    final_segment: bool,
     predecessors: Box<[FrontendSubmissionId]>,
     operations: Box<[GpuOperation]>,
 }
@@ -908,6 +911,25 @@ pub struct OperationSubmission {
 impl OperationSubmission {
     pub fn new(
         id: FrontendSubmissionId,
+        predecessors: Vec<FrontendSubmissionId>,
+        operations: Vec<GpuOperation>,
+    ) -> Result<Self, CommandDescriptionError> {
+        Self::new_segment(
+            id,
+            FrontendSubmissionSegment::FIRST,
+            true,
+            predecessors,
+            operations,
+        )
+    }
+
+    /// Constructs one ordered backend segment of a logical frontend
+    /// submission. Segment zero must be submitted first and exactly one
+    /// segment must be marked final.
+    pub fn new_segment(
+        id: FrontendSubmissionId,
+        segment: FrontendSubmissionSegment,
+        final_segment: bool,
         predecessors: Vec<FrontendSubmissionId>,
         operations: Vec<GpuOperation>,
     ) -> Result<Self, CommandDescriptionError> {
@@ -924,6 +946,8 @@ impl OperationSubmission {
         }
         Ok(Self {
             id,
+            segment,
+            final_segment,
             predecessors: predecessors.into_boxed_slice(),
             operations: operations.into_boxed_slice(),
         })
@@ -932,6 +956,16 @@ impl OperationSubmission {
     #[must_use]
     pub const fn id(&self) -> FrontendSubmissionId {
         self.id
+    }
+
+    #[must_use]
+    pub const fn segment(&self) -> FrontendSubmissionSegment {
+        self.segment
+    }
+
+    #[must_use]
+    pub const fn is_final_segment(&self) -> bool {
+        self.final_segment
     }
 
     #[must_use]
@@ -975,6 +1009,7 @@ pub enum CommandDescriptionError {
     AttachmentDescriptionMismatch,
     DuplicateAttachment,
     EmptySubmission,
+    TooManySubmissionSegments,
     SelfDependency,
     DuplicateSubmissionDependency,
 }
@@ -1023,6 +1058,9 @@ impl Display for CommandDescriptionError {
                 formatter.write_str("render pass names one image subresource more than once")
             }
             Self::EmptySubmission => formatter.write_str("operation submission is empty"),
+            Self::TooManySubmissionSegments => {
+                formatter.write_str("submission contains too many ordered backend segments")
+            }
             Self::SelfDependency => formatter.write_str("submission depends on itself"),
             Self::DuplicateSubmissionDependency => {
                 formatter.write_str("submission contains a duplicate ordering dependency")

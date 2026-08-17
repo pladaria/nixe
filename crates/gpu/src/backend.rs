@@ -346,6 +346,12 @@ struct SubmissionRecord {
     resources: Box<[BackendResourceHandle]>,
 }
 
+struct ActiveFrontendSubmission {
+    id: FrontendSubmissionId,
+    predecessors: Box<[FrontendSubmissionId]>,
+    next_segment: crate::FrontendSubmissionSegment,
+}
+
 /// Validated neutral backend instance consumed by the composition root.
 pub struct Backend<D> {
     instance: BackendInstanceId,
@@ -357,6 +363,7 @@ pub struct Backend<D> {
     resources_by_dependency: HashMap<ResourceDependency, BackendResourceHandle>,
     submissions: Vec<SubmissionSlot>,
     accepted_frontends: HashSet<FrontendSubmissionId>,
+    active_frontend: Option<ActiveFrontendSubmission>,
 }
 
 impl<D: BackendDriver> Backend<D> {
@@ -372,6 +379,7 @@ impl<D: BackendDriver> Backend<D> {
             resources_by_dependency: HashMap::new(),
             submissions: Vec::new(),
             accepted_frontends: HashSet::new(),
+            active_frontend: None,
         }
     }
 
@@ -484,7 +492,11 @@ impl<D: BackendDriver> Backend<D> {
         Ok(())
     }
 
-    /// Validates and atomically submits a complete neutral operation sequence.
+    /// Validates and atomically submits one neutral operation segment.
+    ///
+    /// A segmented frontend submission must arrive contiguously in ordinal
+    /// order. Its identity becomes available to successors only after the
+    /// final segment has been accepted.
     pub fn submit(
         &mut self,
         submission: &OperationSubmission,
@@ -493,11 +505,66 @@ impl<D: BackendDriver> Backend<D> {
         if self.accepted_frontends.contains(&submission.id()) {
             return Err(BackendError::DuplicateSubmission(submission.id()));
         }
-        for predecessor in submission.predecessors() {
-            if !self.accepted_frontends.contains(predecessor) {
-                return Err(BackendError::UnknownPredecessor(*predecessor));
+        match &self.active_frontend {
+            Some(active) => {
+                if active.id != submission.id() {
+                    return Err(BackendError::FrontendSubmissionInProgress {
+                        active: active.id,
+                        attempted: submission.id(),
+                    });
+                }
+                if active.next_segment != submission.segment() {
+                    return Err(BackendError::UnexpectedSubmissionSegment {
+                        submission: submission.id(),
+                        expected: active.next_segment,
+                        observed: submission.segment(),
+                    });
+                }
+                if active.predecessors.as_ref() != submission.predecessors() {
+                    return Err(BackendError::SubmissionSegmentPredecessorsChanged(
+                        submission.id(),
+                    ));
+                }
+            }
+            None => {
+                if submission.segment() != crate::FrontendSubmissionSegment::FIRST {
+                    return Err(BackendError::UnexpectedSubmissionSegment {
+                        submission: submission.id(),
+                        expected: crate::FrontendSubmissionSegment::FIRST,
+                        observed: submission.segment(),
+                    });
+                }
+                for predecessor in submission.predecessors() {
+                    if !self.accepted_frontends.contains(predecessor) {
+                        return Err(BackendError::UnknownPredecessor(*predecessor));
+                    }
+                }
             }
         }
+        let next_segment = if submission.is_final_segment() {
+            None
+        } else {
+            Some(
+                submission
+                    .segment()
+                    .checked_next()
+                    .ok_or(BackendError::SubmissionSegmentExhausted(submission.id()))?,
+            )
+        };
+        let continuation = if let Some(next_segment) = next_segment {
+            let mut predecessors = Vec::new();
+            predecessors
+                .try_reserve_exact(submission.predecessors().len())
+                .map_err(|_| BackendError::ResourceExhausted)?;
+            predecessors.extend_from_slice(submission.predecessors());
+            Some(ActiveFrontendSubmission {
+                id: submission.id(),
+                predecessors: predecessors.into_boxed_slice(),
+                next_segment,
+            })
+        } else {
+            None
+        };
         let requirements = submission.capability_requirements();
         let agreement = self
             .capabilities
@@ -524,9 +591,11 @@ impl<D: BackendDriver> Backend<D> {
         self.submissions
             .try_reserve(usize::from(slot as usize == self.submissions.len()))
             .map_err(|_| BackendError::ResourceExhausted)?;
-        self.accepted_frontends
-            .try_reserve(1)
-            .map_err(|_| BackendError::ResourceExhausted)?;
+        if submission.is_final_segment() {
+            self.accepted_frontends
+                .try_reserve(1)
+                .map_err(|_| BackendError::ResourceExhausted)?;
+        }
 
         let accepted = AcceptedBackendSubmission {
             token,
@@ -545,7 +614,12 @@ impl<D: BackendDriver> Backend<D> {
                 .into_boxed_slice(),
         };
         commit_submission_slot(&mut self.submissions, slot, generation, record);
-        self.accepted_frontends.insert(submission.id());
+        if submission.is_final_segment() {
+            self.active_frontend = None;
+            self.accepted_frontends.insert(submission.id());
+        } else {
+            self.active_frontend = continuation;
+        }
         Ok(token)
     }
 
@@ -843,6 +917,7 @@ impl<D: BackendDriver> Backend<D> {
         self.resources_by_dependency.clear();
         self.submissions.clear();
         self.accepted_frontends.clear();
+        self.active_frontend = None;
     }
 }
 
@@ -951,6 +1026,17 @@ pub enum BackendError {
     ResourceKindMismatch(BackendResourceHandle),
     StaleResource(BackendResourceHandle),
     DuplicateSubmission(FrontendSubmissionId),
+    FrontendSubmissionInProgress {
+        active: FrontendSubmissionId,
+        attempted: FrontendSubmissionId,
+    },
+    UnexpectedSubmissionSegment {
+        submission: FrontendSubmissionId,
+        expected: crate::FrontendSubmissionSegment,
+        observed: crate::FrontendSubmissionSegment,
+    },
+    SubmissionSegmentPredecessorsChanged(FrontendSubmissionId),
+    SubmissionSegmentExhausted(FrontendSubmissionId),
     UnknownPredecessor(FrontendSubmissionId),
     StaleSubmission(BackendSubmissionToken),
     SubmissionIncomplete(BackendSubmissionToken),
@@ -981,6 +1067,30 @@ impl Display for BackendError {
             }
             Self::StaleResource(handle) => write!(formatter, "stale or destroyed {handle}"),
             Self::DuplicateSubmission(submission) => write!(formatter, "duplicate {submission}"),
+            Self::FrontendSubmissionInProgress { active, attempted } => write!(
+                formatter,
+                "cannot begin {attempted} while segmented {active} is incomplete"
+            ),
+            Self::UnexpectedSubmissionSegment {
+                submission,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "unexpected segment {} for {submission}: expected {}",
+                observed.get(),
+                expected.get()
+            ),
+            Self::SubmissionSegmentPredecessorsChanged(submission) => write!(
+                formatter,
+                "segmented {submission} changed its predecessor set"
+            ),
+            Self::SubmissionSegmentExhausted(submission) => {
+                write!(
+                    formatter,
+                    "segmented {submission} exhausted its ordinal space"
+                )
+            }
             Self::UnknownPredecessor(submission) => {
                 write!(formatter, "unknown submission predecessor: {submission}")
             }
@@ -1400,6 +1510,67 @@ mod tests {
             backend.has_completed(token),
             Err(BackendError::StaleSubmission(token))
         );
+    }
+
+    #[test]
+    fn segmented_frontend_submission_accepts_each_ordinal_once_and_completes_last() {
+        let mut backend = backend(1);
+        backend.create_resource(buffer_info(1)).unwrap();
+        backend.create_resource(buffer_info(2)).unwrap();
+        let operation = copy_submission(1, 1, 2).operations()[0].clone();
+        let first = OperationSubmission::new_segment(
+            FrontendSubmissionId::new(1),
+            crate::FrontendSubmissionSegment::FIRST,
+            false,
+            Vec::new(),
+            vec![operation.clone()],
+        )
+        .unwrap();
+        let final_segment = OperationSubmission::new_segment(
+            FrontendSubmissionId::new(1),
+            crate::FrontendSubmissionSegment::new(1),
+            true,
+            Vec::new(),
+            vec![operation],
+        )
+        .unwrap();
+
+        let first_token = backend.submit(&first).unwrap();
+        backend.driver.completed.insert(first_token);
+        backend.release_submission(first_token).unwrap();
+        assert_eq!(
+            backend.submit(&copy_submission(2, 1, 2)),
+            Err(BackendError::FrontendSubmissionInProgress {
+                active: FrontendSubmissionId::new(1),
+                attempted: FrontendSubmissionId::new(2),
+            })
+        );
+        let skipped = OperationSubmission::new_segment(
+            FrontendSubmissionId::new(1),
+            crate::FrontendSubmissionSegment::new(2),
+            true,
+            Vec::new(),
+            vec![copy_submission(3, 1, 2).operations()[0].clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            backend.submit(&skipped),
+            Err(BackendError::UnexpectedSubmissionSegment {
+                submission: FrontendSubmissionId::new(1),
+                expected: crate::FrontendSubmissionSegment::new(1),
+                observed: crate::FrontendSubmissionSegment::new(2),
+            })
+        );
+        let final_token = backend.submit(&final_segment).unwrap();
+        assert_eq!(backend.driver().submissions.len(), 2);
+        assert_eq!(
+            backend.submit(&final_segment),
+            Err(BackendError::DuplicateSubmission(
+                FrontendSubmissionId::new(1)
+            ))
+        );
+        backend.driver.completed.insert(final_token);
+        backend.release_submission(final_token).unwrap();
     }
 
     #[test]

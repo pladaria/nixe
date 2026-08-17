@@ -4064,7 +4064,7 @@ fn effective_color_write_mask_is_selected_and_validated_before_draw_publication(
 }
 
 #[test]
-fn vertex_array_restart_accepts_complete_lists_and_rejects_connected_or_incomplete_draws() {
+fn enabled_vertex_array_restart_uses_each_neutral_draw_boundary() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x121c, 0);
@@ -4126,27 +4126,27 @@ fn vertex_array_restart_accepts_complete_lists_and_rejects_connected_or_incomple
     ));
     assert_eq!(cache, cache_before);
 
-    for (topology, vertex_count) in [(4, 2), (3, 4), (5, 6), (6, 6)] {
+    for (topology, vertex_count) in [(4, 2), (5, 7), (6, 6)] {
         program_three_d(&mut channel, 0x1618, topology);
-        assert!(matches!(
-            preflight_maxwell_three_d_operation(
-                channel.three_d(),
-                &resources,
-                MaxwellThreeDOperationTrigger::DrawVertexArray {
-                    source,
-                    vertex_count,
-                },
-                None,
-                FrontendSubmissionId::new(12),
-                Vec::new(),
-                &capabilities,
-                &cache,
-            ),
-            Err(MaxwellThreeDLoweringError::UnsupportedVertexArrayPrimitiveRestartSemantics {
-                topology: rejected_topology,
-                vertex_count: rejected_count,
-            }) if rejected_topology == topology as u8 && rejected_count == vertex_count
-        ));
+        let result = preflight_maxwell_three_d_operation(
+            channel.three_d(),
+            &resources,
+            MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count,
+            },
+            None,
+            FrontendSubmissionId::new(12),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        );
+        let error = result.err().expect("draw must reach a later preflight gap");
+        assert_eq!(
+            error,
+            MaxwellThreeDLoweringError::ShaderTranslationRequired,
+            "topology={topology:#x} vertex-count={vertex_count}"
+        );
         assert_eq!(cache, cache_before);
     }
 
@@ -5425,7 +5425,7 @@ fn color_reduction_only_blocks_draws_when_explicitly_enabled_and_never_blocks_cl
 }
 
 #[test]
-fn coverage_line_and_vertex_array_restart_selectors_separate_pipeline_identity() {
+fn coverage_and_line_selectors_change_pipeline_but_vertex_restart_is_command_scoped() {
     let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
     let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
@@ -5565,7 +5565,7 @@ fn coverage_line_and_vertex_array_restart_selectors_separate_pipeline_identity()
         &cache,
     )
     .unwrap();
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
+    assert!(!plan.resource_creations().iter().any(|creation| matches!(
         creation,
         nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
     )));
@@ -5574,7 +5574,7 @@ fn coverage_line_and_vertex_array_restart_selectors_separate_pipeline_identity()
         nixe_gpu::BackendResourceCreateInfo::RenderPass { .. }
     )));
     plan.commit_cache(&mut cache).unwrap();
-    assert_eq!(cache.pipeline_count(), pipeline_count + 1);
+    assert_eq!(cache.pipeline_count(), pipeline_count);
 }
 
 #[test]

@@ -502,11 +502,12 @@ impl MaxwellThreeDPrimitiveTopology {
     }
 }
 
-/// Whether non-indexed vertex-array draws recognize primitive restart.
+/// Whether each non-indexed vertex-array draw starts a new primitive segment.
 ///
 /// This selector is deliberately distinct from the indexed primitive-restart
-/// enable and index registers. NVIDIA publishes only the boolean encoding;
-/// its enabled execution semantics are validated at the draw boundary.
+/// enable and index registers. Each neutral draw already has an explicit
+/// command boundary, so enabled restart is represented without a host pipeline
+/// selector, including for connected topologies such as triangle strips.
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1084-L1090>
@@ -770,7 +771,6 @@ impl MaxwellThreeDVertexInputState {
         // logical vertex-input or pipeline configuration.
         dependencies.push(self.primitive.topology_override.raw());
         dependencies.push(self.primitive.topology.raw());
-        dependencies.push(self.primitive.vertex_array_restart_enabled.raw());
         dependencies.push(self.primitive.restart_enabled.raw());
         dependencies.push(self.primitive.restart_index.raw());
         if self.primitive.is_open() {
