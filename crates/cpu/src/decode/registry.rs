@@ -196,6 +196,9 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0038 if bits & 0x9f80_fc00 == 0x0f00_0400 => {
             validate_a64_simd_shift_right_immediate(false, bits)
         }
+        0x0000_0038 if bits & 0xbf80_fc00 == 0x0f00_5400 => {
+            validate_a64_simd_shift_left_immediate(false, bits)
+        }
         0x0000_0038 if matches!(bits & 0xbf20_fc00, 0x0e20_4400 | 0x2e20_4400) => {
             validate_a64_simd_shift_register(bits)
         }
@@ -203,6 +206,9 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             validate_a64_simd_integer_to_float(bits)
         }
         0x0000_0038 if bits & 0xbfa0_fc00 == 0x2e20_fc00 => validate_a64_simd_float_vector(bits),
+        0x0000_0038 if matches!(bits & 0xbfbf_fc00, 0x0ea0_f800 | 0x2ea0_f800) => {
+            validate_a64_simd_float_vector(bits)
+        }
         0x0000_0038 if bits & 0x9ff8_fc00 == 0x0f00_f400 => validate_a64_simd_float_immediate(bits),
         0x0000_0038 if bits & 0xbf3f_fc00 == 0x0e21_2800 => validate_a64_simd_extract_narrow(bits),
         0x0000_0038 if bits & 0xbf20_fc00 == 0x0e00_0400 => {
@@ -244,6 +250,10 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
         0x0000_0091 | 0x0000_0092 => {
             validate_a64_simd_shift_right_immediate(id == 0x0000_0091, bits)
         }
+        0x0000_0099 | 0x0000_009a => {
+            validate_a64_simd_shift_left_immediate(id == 0x0000_0099, bits)
+        }
+        0x0000_009c | 0x0000_009d => validate_a64_simd_float_vector(bits),
         0x0000_0095 | 0x0000_0096 => validate_a64_simd_shift_register(bits),
         0x0000_0094 => validate_a64_simd_add_across_vector(bits),
         0x0000_0088 => validate_a64_simd_extract_narrow(bits),
@@ -275,6 +285,20 @@ fn validate_a64_simd_shift_right_immediate(scalar: bool, bits: u32) -> Allocatio
         AllocationStatus::Unallocated("SIMD right shift has no element-size bit")
     } else if scalar && immediate_high & 8 == 0 {
         AllocationStatus::Unallocated("scalar SIMD right shift requires a 64-bit element")
+    } else if !scalar && !vector_128 && immediate_high & 8 != 0 {
+        AllocationStatus::Reserved("64-bit SIMD lanes require a 128-bit vector")
+    } else {
+        AllocationStatus::Allocated
+    }
+}
+
+fn validate_a64_simd_shift_left_immediate(scalar: bool, bits: u32) -> AllocationStatus {
+    let immediate_high = (bits >> 19) & 0xf;
+    let vector_128 = bits & (1 << 30) != 0;
+    if immediate_high == 0 {
+        AllocationStatus::Unallocated("SIMD left shift has no element-size bit")
+    } else if scalar && immediate_high & 8 == 0 {
+        AllocationStatus::Unallocated("scalar SIMD left shift requires a 64-bit element")
     } else if !scalar && !vector_128 && immediate_high & 8 != 0 {
         AllocationStatus::Reserved("64-bit SIMD lanes require a 128-bit vector")
     } else {
@@ -564,6 +588,9 @@ mod tests {
             0x0e08_0400, // 64-bit DUP element requires a Q destination
             0x5f00_0400, // scalar right shift requires a 64-bit element
             0x2f7f_05ac, // 64-bit right-shift lanes require a Q destination
+            0x5f00_5400, // scalar left shift requires a 64-bit element
+            0x0f40_5400, // 64-bit left-shift lanes require a Q destination
+            0x0ee0_f800, // 64-bit FABS lanes require a Q destination
             0x0eb1_b928, // ADDV 32-bit elements require a Q source
             0x4ef1_b928, // ADDV has no 64-bit element form
         ];

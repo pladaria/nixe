@@ -78,8 +78,8 @@ pub use shader::{
     lower_shader_ir_to_wgsl,
 };
 pub use submission::{
-    BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, HostCompletion,
-    VisibilityCompletion,
+    BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,
+    HostCompletion, VisibilityCompletion,
 };
 pub use synchronization::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint, OwnerMismatch,

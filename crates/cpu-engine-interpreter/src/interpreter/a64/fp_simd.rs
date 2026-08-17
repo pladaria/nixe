@@ -150,6 +150,14 @@ pub(super) fn execute(
             );
             None
         }
+        Instruction::ScalarShiftLeftImmediate(_) | Instruction::VectorShiftLeftImmediate(_) => {
+            shift_left_immediate(
+                state,
+                fields,
+                matches!(instruction, Instruction::ScalarShiftLeftImmediate(_)),
+            );
+            None
+        }
         Instruction::VectorSignedShiftRegister(_) | Instruction::VectorUnsignedShiftRegister(_) => {
             shift_register(
                 state,
@@ -241,6 +249,14 @@ pub(super) fn execute(
         }
         Instruction::VectorFloatImmediate(_) => {
             vector_float_immediate(state, fields);
+            None
+        }
+        Instruction::VectorFloatAbsolute(_) | Instruction::VectorFloatNegate(_) => {
+            vector_float_sign_operation(
+                state,
+                fields,
+                matches!(instruction, Instruction::VectorFloatNegate(_)),
+            );
             None
         }
         Instruction::ScalarFloatImmediate(_) => {
@@ -342,6 +358,10 @@ pub(super) fn execute(
         }
         Instruction::ScalarFloatConditionalSelect(_) => {
             scalar_float_conditional_select(state, fields);
+            None
+        }
+        Instruction::ConditionalCompare(_) => {
+            scalar_float_conditional_compare(state, fields, decoded)?;
             None
         }
         Instruction::CompareRegister(_) | Instruction::CompareZero(_) => {
@@ -527,6 +547,33 @@ fn scalar_sign_operation(
     } else {
         source & !sign
     };
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// Vector FABS/FNEG apply a bitwise sign transformation independently to every
+// active S or D lane. They preserve NaN payloads and subnormal bits, leave
+// FPCR/FPSR unchanged, and clear the inactive upper half of 2S destinations.
+// Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FABS--vector---Floating-point-Absolute-value--vector--
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNEG--vector---Floating-point-Negate--vector--
+fn vector_float_sign_operation(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    negate: bool,
+) {
+    let lane_bits = if fields.opc & 1 == 0 { 32_u32 } else { 64_u32 };
+    let vector_bits = if fields.vector_128 { 128_u32 } else { 64_u32 };
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let sign = 1_u128 << (lane_bits - 1);
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized vector sign-operation source register");
+    let mut result = 0_u128;
+    for offset in (0..vector_bits).step_by(lane_bits as usize) {
+        let lane = (source >> offset) & lane_mask;
+        let transformed = if negate { lane ^ sign } else { lane & !sign };
+        result |= transformed << offset;
+    }
     assert!(state.set_vector(fields.rd, result));
 }
 
@@ -1998,6 +2045,32 @@ fn scalar_float_conditional_select(
     assert!(state.set_vector(fields.rd, value));
 }
 
+// FCCMP/FCCMPE perform the floating-point comparison only when the encoded
+// condition holds. Otherwise NZCV is replaced by the encoded immediate and no
+// floating-point operand is processed. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCCMP--FCCMPE---Floating-point-Conditional-Compare--scalar--
+fn scalar_float_conditional_compare(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+) -> Result<(), InterpreterError> {
+    if !evaluate_a64(
+        Condition::from_encoding(fields.condition),
+        state.nzcv().bits(),
+    ) {
+        state.set_nzcv(Nzcv::from_bits(u32::from(fields.nzcv_immediate) << 28));
+        return Ok(());
+    }
+
+    let outcome = scalar_float_compare(state, fields, false);
+    if fp_status_traps(outcome.status, state.fpcr()) {
+        return Err(super::super::unsupported(decoded));
+    }
+    state.set_nzcv(Nzcv::from_bits(outcome.nzcv));
+    state.set_fpsr(state.fpsr() | fp_status_bits(outcome.status));
+    Ok(())
+}
+
 fn multiply_ieee_lane(
     lhs_bits: u64,
     rhs_bits: u64,
@@ -3172,6 +3245,40 @@ fn shift_right_immediate(
             value >> shift
         };
         result |= (shifted & lane_mask) << (lane * lane_bits);
+    }
+    assert!(state.set_vector(fields.rd, result));
+}
+
+// SHL encodes the shift as the concatenated immh:immb value minus the element
+// width. Scalar forms operate on Dn; vector forms process every active lane.
+// Reading the source before replacing Rd preserves in-place forms such as the
+// captured SHL D30,D30,#32. Arm ARM DDI 0602 (2025-12):
+// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHL--immediate---Shift-Left--immediate--
+fn shift_left_immediate(
+    state: &mut A64State,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    scalar: bool,
+) {
+    let bits = fields.helper_token.helper_abi_value();
+    let immediate = (bits >> 16) & 0x7f;
+    let immediate_high = immediate >> 3;
+    let lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+    let shift = immediate - lane_bits;
+    let active_bits = if scalar || !fields.vector_128 {
+        64
+    } else {
+        128
+    };
+    let lane_count = active_bits / lane_bits;
+    let lane_mask = (1_u128 << lane_bits) - 1;
+    let source = state
+        .vector(fields.rn)
+        .expect("normalized SHL source register");
+    let mut result = 0_u128;
+    for lane in 0..lane_count {
+        let offset = lane * lane_bits;
+        let value = (source >> offset) & lane_mask;
+        result |= ((value << shift) & lane_mask) << offset;
     }
     assert!(state.set_vector(fields.rd, result));
 }

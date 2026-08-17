@@ -286,6 +286,43 @@ fn qemu_a64_matches_every_register_semantic_family() {
     if filter.matches(0x91, "simd-scalar-shift-right-immediate") {
         cases.push((0x7f60_07fe, "USHR D30,D31,#32 (captured)"));
     }
+    if filter.matches(0x99, "simd-scalar-shift-left-immediate") {
+        cases.extend([
+            (0x5f40_5420, "SHL D0,D1,#0"),
+            (0x5f60_57de, "SHL D30,D30,#32 (captured)"),
+            (0x5f7f_54a4, "SHL D4,D5,#63"),
+        ]);
+    }
+    if filter.matches(0x9a, "simd-vector-shift-left-immediate") {
+        cases.extend([
+            (0x0f08_5420, "SHL V0.8B,V1.8B,#0"),
+            (0x4f1f_54e6, "SHL V6.8H,V7.8H,#15"),
+            (0x4f3f_556a, "SHL V10.4S,V11.4S,#31"),
+            (0x4f7f_55ee, "SHL V14.2D,V15.2D,#63"),
+        ]);
+    }
+    if filter.matches(0x9b, "fp-scalar-floating-point-conditional-compare") {
+        cases.extend([
+            (0x1e21_0400, "FCCMP S0,S1,#0,EQ"),
+            (0x1e23_e45f, "FCCMPE S2,S3,#15,AL"),
+            (0x1e7e_17e4, "FCCMP D31,D30,#4,NE (captured)"),
+            (0x1e67_c4da, "FCCMPE D6,D7,#10,GT"),
+        ]);
+    }
+    if filter.matches(0x9c, "simd-floating-point-absolute") {
+        cases.extend([
+            (0x0ea0_f820, "FABS V0.2S,V1.2S"),
+            (0x4ea0_f862, "FABS V2.4S,V3.4S"),
+            (0x4ee0_f8a4, "FABS V4.2D,V5.2D"),
+        ]);
+    }
+    if filter.matches(0x9d, "simd-floating-point-negate") {
+        cases.extend([
+            (0x2ea0_fbde, "FNEG V30.2S,V30.2S (captured)"),
+            (0x6ea0_f928, "FNEG V8.4S,V9.4S"),
+            (0x6ee0_f96a, "FNEG V10.2D,V11.2D"),
+        ]);
+    }
     if filter.matches(0x93, "simd-count-bits") {
         cases.push((0x0e20_5bde, "CNT V30.8B,V30.8B (captured)"));
     }
@@ -429,6 +466,9 @@ fn register_semantic_id(id: u32) -> bool {
             | 0x0000_0030..=0x0000_0032
             | 0x0000_0035..=0x0000_003f
             | 0x0000_0098
+            | 0x0000_0099..=0x0000_009a
+            | 0x0000_009b
+            | 0x0000_009c..=0x0000_009d
             | 0x0000_0048
             | 0x0000_004a..=0x0000_004b
             | 0x0000_004e..=0x0000_0061

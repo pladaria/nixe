@@ -368,6 +368,30 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD_FP16,
     ),
+    // Arm A64 vector FABS/FNEG clear or toggle each active lane's sign bit
+    // without processing the floating-point value. Base 2S/4S/2D forms are
+    // covered here; optional half precision remains feature-gated behind the
+    // recognized Advanced SIMD fallback. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FABS--vector---Floating-point-Absolute-value--vector--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNEG--vector---Floating-point-Negate--vector--
+    pattern(
+        "simd-floating-point-absolute",
+        0xbfbf_fc00,
+        0x0ea0_f800,
+        0x0000_009c,
+        210,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-floating-point-negate",
+        0xbfbf_fc00,
+        0x2ea0_f800,
+        0x0000_009d,
+        210,
+        &[],
+        SIMD,
+    ),
     // Arm A64 FSQRT (scalar), base single/double precision forms. Optional
     // half precision remains independently feature-gated. Arm ARM DDI 0602
     // (2025-12):
@@ -396,6 +420,20 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x1e20_2008,
         0x0000_0037,
         107,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 FCCMP/FCCMPE conditionally compare scalar S/D operands or copy
+    // an immediate NZCV value. FCCMPE signals every NaN while FCCMP signals
+    // only signaling NaNs. Optional half precision remains feature-gated
+    // behind the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCCMP--FCCMPE---Floating-point-Conditional-Compare--scalar--
+    pattern(
+        "fp-scalar-floating-point-conditional-compare",
+        0xffa0_0c00,
+        0x1e20_0400,
+        0x0000_009b,
+        209,
         &[],
         SIMD,
     ),
@@ -521,6 +559,28 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0f00_0400,
         0x0000_0092,
         202,
+        &[],
+        SIMD,
+    ),
+    // Arm A64 SHL shifts each scalar or vector lane left by an immediate in
+    // the range 0..element size - 1. Keep U fixed here so the neighboring SLI
+    // encoding retains its distinct destination-preserving semantics:
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHL--immediate---Shift-Left--immediate--
+    pattern(
+        "simd-scalar-shift-left-immediate",
+        0xff80_fc00,
+        0x5f00_5400,
+        0x0000_0099,
+        208,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "simd-vector-shift-left-immediate",
+        0xbf80_fc00,
+        0x0f00_5400,
+        0x0000_009a,
+        207,
         &[],
         SIMD,
     ),
@@ -1128,6 +1188,7 @@ pub struct Operands {
     pub signaling_compare: bool,
     pub operation_bit: bool,
     pub immediate_4: u8,
+    pub nzcv_immediate: u8,
     pub condition: u8,
     pub element_size: u8,
     pub fp_immediate_8: u8,
@@ -1252,8 +1313,11 @@ instructions!(
     ScalarMove,
     ScalarAbsolute,
     ScalarNegate,
+    VectorFloatAbsolute,
+    VectorFloatNegate,
     CompareRegister,
     CompareZero,
+    ConditionalCompare,
     ModifiedImmediate,
     UnsignedMoveToGeneral,
     InsertElement,
@@ -1282,6 +1346,8 @@ instructions!(
     ShiftRightNarrow,
     ScalarShiftRightImmediate,
     VectorShiftRightImmediate,
+    ScalarShiftLeftImmediate,
+    VectorShiftLeftImmediate,
     VectorSignedShiftRegister,
     VectorUnsignedShiftRegister,
     CountBits,
@@ -1343,6 +1409,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         signaling_compare: bits & (1 << 4) != 0,
         operation_bit: bits & (1 << 29) != 0,
         immediate_4: ((bits >> 11) & 0xf) as u8,
+        nzcv_immediate: (bits & 0xf) as u8,
         condition: ((bits >> 12) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
         fp_immediate_8: ((bits >> 13) & 0xff) as u8,
@@ -1399,8 +1466,11 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0035 | 0x0000_0089 => Instruction::ScalarMove(operands),
         0x0000_008d | 0x0000_008f => Instruction::ScalarAbsolute(operands),
         0x0000_008e | 0x0000_0090 => Instruction::ScalarNegate(operands),
+        0x0000_009c => Instruction::VectorFloatAbsolute(operands),
+        0x0000_009d => Instruction::VectorFloatNegate(operands),
         0x0000_0036 => Instruction::CompareRegister(operands),
         0x0000_0037 => Instruction::CompareZero(operands),
+        0x0000_009b => Instruction::ConditionalCompare(operands),
         0x0000_004a => Instruction::ModifiedImmediate(operands),
         0x0000_004b => Instruction::UnsignedMoveToGeneral(operands),
         0x0000_0060 => Instruction::InsertElement(operands),
@@ -1432,6 +1502,8 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0065 => Instruction::ShiftRightNarrow(operands),
         0x0000_0091 => Instruction::ScalarShiftRightImmediate(operands),
         0x0000_0092 => Instruction::VectorShiftRightImmediate(operands),
+        0x0000_0099 => Instruction::ScalarShiftLeftImmediate(operands),
+        0x0000_009a => Instruction::VectorShiftLeftImmediate(operands),
         0x0000_0095 => Instruction::VectorSignedShiftRegister(operands),
         0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),

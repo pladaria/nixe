@@ -17,8 +17,8 @@ pub use access::{
     MemoryPermissions, NonCpuDeviceId,
 };
 pub use backing::{
-    CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalPageError,
-    CanonicalWriteBatch, CanonicalWriteBatchError,
+    CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalCpuWriteOverlap,
+    CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
 };
 pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalRangeAccessError, CanonicalRangeError,

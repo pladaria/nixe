@@ -20,6 +20,7 @@ use nixe_gpu::{
     ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
     ViewportTransform,
 };
+use nixe_memory::{CanonicalCpuWriteOverlap, CanonicalPageId, ContentGeneration};
 
 use crate::MaxwellMethodSource;
 use crate::shader::{MaxwellShaderTranslationKey, MaxwellTranslatedShaderProgram};
@@ -259,6 +260,82 @@ impl ViewKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ColorRepresentationSegment {
+    page: CanonicalPageId,
+    offset: u64,
+    size: u64,
+    generation: ContentGeneration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColorRepresentationBinding {
+    subresources: ImageSubresourceRange,
+    layout: nixe_gpu::ImageMemoryLayout,
+    segments: Box<[ColorRepresentationSegment]>,
+}
+
+/// Stable neutral representation state. GPU virtual mappings and backend view
+/// identities are deliberately excluded: neither changes the represented
+/// bytes. Canonical pages, byte ranges and image layout define the domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColorRepresentationRecord {
+    description: nixe_gpu::ImageDescription,
+    swizzle: nixe_gpu::Swizzle,
+    guest_format: super::MaxwellThreeDGuestImageFormat,
+    guest_pte_kind: u8,
+    guest_compression_enabled: bool,
+    bindings: Box<[ColorRepresentationBinding]>,
+}
+
+impl ColorRepresentationRecord {
+    fn same_domain(&self, other: &Self) -> bool {
+        self.description == other.description
+            && self.swizzle == other.swizzle
+            && self.guest_format == other.guest_format
+            && self.guest_pte_kind == other.guest_pte_kind
+            && self.guest_compression_enabled == other.guest_compression_enabled
+            && self.bindings.len() == other.bindings.len()
+            && self
+                .bindings
+                .iter()
+                .zip(&other.bindings)
+                .all(|(left, right)| {
+                    left.subresources == right.subresources
+                        && left.layout == right.layout
+                        && left.segments.len() == right.segments.len()
+                        && left
+                            .segments
+                            .iter()
+                            .zip(&right.segments)
+                            .all(|(left, right)| {
+                                left.page == right.page
+                                    && left.offset == right.offset
+                                    && left.size == right.size
+                            })
+                })
+    }
+
+    fn remains_materialized_for(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
+        let current = color_representation_record(image);
+        self.same_domain(&current)
+            && image.view().bindings().iter().zip(&self.bindings).all(
+                |(current_binding, recorded_binding)| {
+                    current_binding
+                        .backing()
+                        .range()
+                        .segments()
+                        .iter()
+                        .zip(&recorded_binding.segments)
+                        .all(|(current_segment, recorded_segment)| {
+                            current_segment.cpu_write_overlap_since(recorded_segment.generation)
+                                == Ok(CanonicalCpuWriteOverlap::No)
+                        })
+                },
+            )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ViewRecord {
     key: ViewKey,
@@ -269,7 +346,7 @@ struct ViewRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewMaterialization {
     Direct,
-    CompressedColor { color: bool },
+    CompressedColor,
     CompressedDepthStencil { depth: bool, stencil: bool },
 }
 
@@ -281,12 +358,8 @@ impl ViewMaterialization {
                 depth: materialized_depth,
                 stencil: materialized_stencil,
             } => (!depth || materialized_depth) && (!stencil || materialized_stencil),
-            Self::CompressedColor { .. } => false,
+            Self::CompressedColor => false,
         }
-    }
-
-    const fn supports_color(self) -> bool {
-        matches!(self, Self::Direct | Self::CompressedColor { color: true })
     }
 }
 
@@ -350,6 +423,7 @@ pub struct MaxwellThreeDLoweringCache {
         nixe_gpu::GpuAllocationDescription,
     )>,
     views: Vec<ViewRecord>,
+    color_materializations: Vec<ColorRepresentationRecord>,
     pipelines: Vec<PipelineRecord>,
     render_passes: Vec<RenderPassRecord>,
     descriptors: Vec<DescriptorRecord>,
@@ -366,6 +440,7 @@ impl Default for MaxwellThreeDLoweringCache {
             next_identity: 1,
             allocations: Vec::new(),
             views: Vec::new(),
+            color_materializations: Vec::new(),
             pipelines: Vec::new(),
             render_passes: Vec::new(),
             descriptors: Vec::new(),
@@ -389,6 +464,11 @@ impl MaxwellThreeDLoweringCache {
     #[must_use]
     pub fn pipeline_count(&self) -> usize {
         self.pipelines.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evict_views_for_test(&mut self) {
+        self.views.clear();
     }
 
     #[cfg(test)]
@@ -1094,33 +1174,6 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         if state
             .vertex_input()
             .primitive()
-            .vertex_array_restart_enabled()
-            .value()
-            == Some(&super::MaxwellThreeDVertexArrayPrimitiveRestartEnable::Enabled)
-        {
-            let vertex_count = match trigger {
-                MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. } => vertex_count,
-                MaxwellThreeDOperationTrigger::ClearSurface { .. } => unreachable!(),
-            };
-            let topology = state
-                .vertex_input()
-                .primitive()
-                .active_begin()
-                .copied()
-                .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("BEGIN"))?
-                .topology();
-            if !vertex_array_restart_is_neutral(topology, vertex_count) {
-                return Err(
-                    MaxwellThreeDLoweringError::UnsupportedVertexArrayPrimitiveRestartSemantics {
-                        topology,
-                        vertex_count,
-                    },
-                );
-            }
-        }
-        if state
-            .vertex_input()
-            .primitive()
             .active_begin()
             .is_some_and(|begin| begin.topology() == 14)
         {
@@ -1303,7 +1356,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
             let attachments = draw_attachments
                 .as_ref()
                 .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
-            lower_draw(
+            let lowered = lower_draw(
                 state,
                 resources,
                 &resource_bindings,
@@ -1313,7 +1366,9 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
                 vertex_count,
                 &mut candidate,
                 &mut creations,
-            )?
+            )?;
+            record_draw_color_materializations(state, resources, attachments, &mut candidate)?;
+            lowered
         }
     };
     let operations = sequence_with_transitions(commands, &mut candidate)?;
@@ -1853,22 +1908,17 @@ fn record_clear_materialization(
         .value()
         .copied()
         .ok_or(MaxwellThreeDLoweringError::IncompleteClear("CLEAR_SURFACE"))?;
-    if surface.color_mask() != 0 {
+    if surface.color_mask() != 0
+        && state.render_targets().color()[surface.color_target() as usize]
+            .compression()
+            .value()
+            == Some(&MaxwellThreeDColorCompressionMode::Enabled)
+    {
         let index = resource_index(
             resources,
             MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
         )?;
-        let key = view_key(&resources.resources()[index]);
-        let record = cache
-            .views
-            .iter_mut()
-            .find(|record| record.key == key)
-            .ok_or(MaxwellThreeDLoweringError::InvalidResolvedView {
-                role: MaxwellThreeDResourceRole::ColorTarget(surface.color_target()),
-            })?;
-        if let ViewMaterialization::CompressedColor { color } = &mut record.materialization {
-            *color = true;
-        }
+        record_color_materialization(resolved_image(resources, index)?, cache);
     }
     if surface.depth() || surface.stencil() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
@@ -1890,6 +1940,35 @@ fn record_clear_materialization(
     Ok(())
 }
 
+fn record_draw_color_materializations(
+    state: &MaxwellThreeDState,
+    resources: &MaxwellThreeDResolvedResources,
+    attachments: &DrawAttachmentSelection,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    for target in attachments.color_targets().filter(|target| {
+        state.render_targets().color()[*target as usize]
+            .compression()
+            .value()
+            == Some(&MaxwellThreeDColorCompressionMode::Enabled)
+    }) {
+        let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
+        record_color_materialization(resolved_image(resources, index)?, cache);
+    }
+    Ok(())
+}
+
+fn record_color_materialization(
+    image: &super::MaxwellThreeDResolvedImage,
+    cache: &mut MaxwellThreeDLoweringCache,
+) {
+    let current = color_representation_record(image);
+    cache
+        .color_materializations
+        .retain(|previous| !previous.same_domain(&current));
+    cache.color_materializations.push(current);
+}
+
 fn validate_compressed_color_materialization(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
@@ -1897,52 +1976,52 @@ fn validate_compressed_color_materialization(
     draw_attachments: Option<&DrawAttachmentSelection>,
     cache: &MaxwellThreeDLoweringCache,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let consumed_target = match trigger {
+    let consumed_targets = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { .. } => state
             .render_targets()
             .clear()
             .last_surface()
             .value()
             .filter(|surface| surface.color_mask() != 0)
-            .map(|surface| surface.color_target()),
+            .map(|surface| vec![surface.color_target()])
+            .unwrap_or_default(),
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => draw_attachments
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?
             .color_targets()
-            .find(|target| {
+            .filter(|target| {
                 state.render_targets().color()[*target as usize]
                     .compression()
                     .value()
                     == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-            }),
+            })
+            .collect(),
     };
-    let Some(target) = consumed_target.filter(|target| {
+    for target in consumed_targets.into_iter().filter(|target| {
         state.render_targets().color()[*target as usize]
             .compression()
             .value()
             == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-    }) else {
-        return Ok(());
-    };
-    let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
-    let image = resolved_image(resources, index)?;
-    let key = view_key(&resources.resources()[index]);
-    if cache
-        .views
-        .iter()
-        .any(|record| record.key == key && record.materialization.supports_color())
-    {
-        return Ok(());
-    }
-    let full_clear = matches!(trigger, MaxwellThreeDOperationTrigger::ClearSurface { .. })
-        && state
-            .render_targets()
-            .clear()
-            .last_surface()
-            .value()
-            .is_some_and(|surface| surface.color_mask() == 0xf)
-        && clear_fully_covers_image(state, image)?;
-    if !full_clear {
-        return Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target });
+    }) {
+        let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
+        let image = resolved_image(resources, index)?;
+        if cache
+            .color_materializations
+            .iter()
+            .any(|previous| previous.remains_materialized_for(image))
+        {
+            continue;
+        }
+        let full_clear = matches!(trigger, MaxwellThreeDOperationTrigger::ClearSurface { .. })
+            && state
+                .render_targets()
+                .clear()
+                .last_surface()
+                .value()
+                .is_some_and(|surface| surface.color_mask() == 0xf)
+            && clear_fully_covers_image(state, image)?;
+        if !full_clear {
+            return Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target });
+        }
     }
     Ok(())
 }
@@ -2360,9 +2439,7 @@ fn prepare_resources(
                     stencil: false,
                 }
             }
-            MaxwellThreeDResolvedResource::Image(_) => {
-                ViewMaterialization::CompressedColor { color: false }
-            }
+            MaxwellThreeDResolvedResource::Image(_) => ViewMaterialization::CompressedColor,
         };
         let dependency = match resource {
             MaxwellThreeDResolvedResource::Buffer(value) => {
@@ -3340,6 +3417,41 @@ fn view_key(resource: &MaxwellThreeDResolvedResource) -> ViewKey {
     }
 }
 
+fn color_representation_record(
+    image: &super::MaxwellThreeDResolvedImage,
+) -> ColorRepresentationRecord {
+    ColorRepresentationRecord {
+        description: image.description(),
+        swizzle: image.view().swizzle(),
+        guest_format: image.guest_format(),
+        guest_pte_kind: image.guest_layout().pte_kind(),
+        guest_compression_enabled: image.guest_layout().requires_materialization(),
+        bindings: image
+            .view()
+            .bindings()
+            .iter()
+            .map(|binding| ColorRepresentationBinding {
+                subresources: binding.subresources(),
+                layout: binding.layout(),
+                segments: binding
+                    .backing()
+                    .range()
+                    .segments()
+                    .iter()
+                    .map(|segment| ColorRepresentationSegment {
+                        page: segment.page(),
+                        offset: segment.offset(),
+                        size: segment.size(),
+                        generation: segment.content_generation(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }
+}
+
 fn canonical_backings_overlap(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
     left.range().segments().iter().any(|left| {
         right.range().segments().iter().any(|right| {
@@ -3464,10 +3576,6 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedLineStippleSemantics {
         factor: u8,
         pattern: u16,
-    },
-    UnsupportedVertexArrayPrimitiveRestartSemantics {
-        topology: u8,
-        vertex_count: u32,
     },
     UnsupportedVertexAttributeFormat {
         attribute: u8,
@@ -3694,13 +3802,6 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedLineStippleSemantics { factor, pattern } => write!(
                 formatter,
                 "MAXWELL_B line stippling has no neutral backend representation: factor={factor} pattern=0x{pattern:04x}"
-            ),
-            Self::UnsupportedVertexArrayPrimitiveRestartSemantics {
-                topology,
-                vertex_count,
-            } => write!(
-                formatter,
-                "MAXWELL_B enabled vertex-array primitive restart may change primitive segmentation: topology={topology:#x} vertex-count={vertex_count}"
             ),
             Self::UnsupportedVertexAttributeFormat {
                 attribute,
@@ -3953,33 +4054,13 @@ impl Display for MaxwellThreeDLoweringError {
 
 impl std::error::Error for MaxwellThreeDLoweringError {}
 
-/// Returns whether restarting at this complete non-indexed draw boundary cannot
-/// change primitive assembly. The published Maxwell ABI names this control but
-/// does not define its segmentation algorithm, so only complete point, line,
-/// and triangle lists are accepted; connected and incomplete topologies remain
-/// typed failures.
-///
-/// ABI source:
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1084-L1090>
-const fn vertex_array_restart_is_neutral(topology: u8, vertex_count: u32) -> bool {
-    match topology {
-        0 => true,
-        1 => vertex_count.is_multiple_of(2),
-        4 => vertex_count.is_multiple_of(3),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use nixe_gpu::{DepthCompareOperation, VertexFormat};
 
     use crate::{MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
-    use super::{
-        depth_stencil_attachment_required, neutral_depth_compare, neutral_vertex_format,
-        vertex_array_restart_is_neutral,
-    };
+    use super::{depth_stencil_attachment_required, neutral_depth_compare, neutral_vertex_format};
 
     #[test]
     fn every_maxwell_depth_comparison_has_an_exact_neutral_mapping() {
@@ -4027,22 +4108,6 @@ mod tests {
         ] {
             assert!(depth_stencil_attachment_required(state.0, state.1));
         }
-    }
-
-    #[test]
-    fn vertex_array_restart_is_neutral_only_at_complete_list_boundaries() {
-        assert!(vertex_array_restart_is_neutral(0, 1));
-        assert!(vertex_array_restart_is_neutral(0, 7));
-        assert!(vertex_array_restart_is_neutral(1, 2));
-        assert!(vertex_array_restart_is_neutral(1, 8));
-        assert!(vertex_array_restart_is_neutral(4, 3));
-        assert!(vertex_array_restart_is_neutral(4, 12));
-
-        assert!(!vertex_array_restart_is_neutral(1, 3));
-        assert!(!vertex_array_restart_is_neutral(4, 2));
-        assert!(!vertex_array_restart_is_neutral(3, 4));
-        assert!(!vertex_array_restart_is_neutral(5, 6));
-        assert!(!vertex_array_restart_is_neutral(6, 6));
     }
 
     #[test]

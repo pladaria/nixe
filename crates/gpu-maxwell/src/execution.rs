@@ -5,8 +5,8 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{
     BackendExecutionCompletion, BackendResourceCreateInfo, BackendRuntimeError,
     CacheMaintenanceOperation, CapabilityRequirements, CommandDescriptionError,
-    FrontendSubmissionId, GpuCommand, GpuOperation, GuestTimelinePoint, NeutralBackendRuntime,
-    OperationSubmission, ReservedTimelinePoint, ResourceDependency,
+    FrontendSubmissionId, FrontendSubmissionSegment, GpuCommand, GpuOperation, GuestTimelinePoint,
+    NeutralBackendRuntime, OperationSubmission, ReservedTimelinePoint, ResourceDependency,
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
@@ -783,15 +783,46 @@ pub fn execute_maxwell_software_initialization(
 
 /// Executes one preflighted submission through the selected neutral backend.
 ///
-/// Command-processor inline writes are committed before host GPU consumption;
-/// report-semaphore writes are committed only after host completion and GPU
-/// write visibility. The caller still owns guest timeline publication and may
+/// Command-processor writes are committed at their command-order boundaries.
+/// Reusing one canonical buffer across draws therefore preserves the contents
+/// visible to each draw instead of exposing only the final update. Report-
+/// semaphore writes are committed only after host completion and GPU write
+/// visibility. The caller still owns guest timeline publication and may
 /// advance it only after this function succeeds.
 pub fn execute_maxwell_backend_submission(
     plan: MaxwellSubmissionExecutionPlan,
     address_space: &MaxwellGpuAddressSpace,
     backend: &mut dyn NeutralBackendRuntime,
 ) -> Result<MaxwellBackendExecutionCompletion, MaxwellBackendExecutionError> {
+    let completion = execute_maxwell_backend_steps(
+        &plan,
+        address_space,
+        |creations, invalidations, submission| {
+            backend
+                .execute(creations, invalidations, submission)
+                .map_err(MaxwellBackendExecutionError::Backend)
+        },
+    )?
+    .ok_or(MaxwellBackendExecutionError::InvalidSubmission(
+        CommandDescriptionError::EmptySubmission,
+    ))?;
+
+    Ok(MaxwellBackendExecutionCompletion {
+        staged_cache: plan.staged_cache,
+        completion: plan.completion,
+        backend: completion,
+    })
+}
+
+fn execute_maxwell_backend_steps<T>(
+    plan: &MaxwellSubmissionExecutionPlan,
+    address_space: &MaxwellGpuAddressSpace,
+    mut execute_segment: impl FnMut(
+        &[BackendResourceCreateInfo],
+        &[ResourceDependency],
+        &OperationSubmission,
+    ) -> Result<T, MaxwellBackendExecutionError>,
+) -> Result<Option<T>, MaxwellBackendExecutionError> {
     let mut pre_writes = CanonicalWriteBatch::new();
     let mut post_writes = CanonicalWriteBatch::new();
     let mut pre_write_source = None;
@@ -799,13 +830,25 @@ pub fn execute_maxwell_backend_submission(
     let mut creations = Vec::<BackendResourceCreateInfo>::new();
     let mut invalidations = Vec::<ResourceDependency>::new();
     let mut operations = Vec::<GpuOperation>::new();
+    let mut last_completion = None;
+    let mut segments = BackendSegmentCursor::for_plan(plan)?;
 
     for step in &plan.steps {
         match step {
             MaxwellSubmissionExecutionStep::HostSynchronization { operation, .. } => {
+                commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
                 operations.push(operation.clone());
             }
             MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
+                flush_maxwell_backend_segment(
+                    plan,
+                    &mut creations,
+                    &mut invalidations,
+                    &mut operations,
+                    &mut segments,
+                    &mut execute_segment,
+                    &mut last_completion,
+                )?;
                 stage_inline_write(
                     address_space,
                     target,
@@ -817,6 +860,15 @@ pub fn execute_maxwell_backend_submission(
                 pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
             }
             MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
+                flush_maxwell_backend_segment(
+                    plan,
+                    &mut creations,
+                    &mut invalidations,
+                    &mut operations,
+                    &mut segments,
+                    &mut execute_segment,
+                    &mut last_completion,
+                )?;
                 stage_inline_write(
                     address_space,
                     target,
@@ -832,6 +884,15 @@ pub fn execute_maxwell_backend_submission(
                 source,
                 destination,
             } => {
+                flush_maxwell_backend_segment(
+                    plan,
+                    &mut creations,
+                    &mut invalidations,
+                    &mut operations,
+                    &mut segments,
+                    &mut execute_segment,
+                    &mut last_completion,
+                )?;
                 stage_dma_copy(
                     address_space,
                     *operation,
@@ -843,6 +904,15 @@ pub fn execute_maxwell_backend_submission(
                 pre_write_source = Some(CanonicalWriteSource::Dma(operation.source()));
             }
             MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
+                flush_maxwell_backend_segment(
+                    plan,
+                    &mut creations,
+                    &mut invalidations,
+                    &mut operations,
+                    &mut segments,
+                    &mut execute_segment,
+                    &mut last_completion,
+                )?;
                 stage_inline_write(
                     address_space,
                     target,
@@ -865,6 +935,7 @@ pub fn execute_maxwell_backend_submission(
                 post_write_source = Some(release.source());
             }
             MaxwellSubmissionExecutionStep::ThreeD(work) => {
+                commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
                 creations.extend_from_slice(work.resource_creations());
                 invalidations.extend_from_slice(work.resource_invalidations());
                 operations.extend_from_slice(work.submission().operations());
@@ -872,6 +943,7 @@ pub fn execute_maxwell_backend_submission(
             MaxwellSubmissionExecutionStep::ComputeSynchronization(plan) => match plan {
                 MaxwellComputeSynchronizationPlan::WaitForIdle { .. } => {}
                 MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches } => {
+                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
                     operations.push(cache_maintenance_operation(
                         CacheMaintenanceOperation::InvalidateShaderCaches {
                             instruction: caches.instruction(),
@@ -895,8 +967,12 @@ pub fn execute_maxwell_backend_submission(
                 }
                 | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
                     maintenance, ..
-                } => operations.push(cache_maintenance_operation(*maintenance)),
+                } => {
+                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
+                    operations.push(cache_maintenance_operation(*maintenance));
+                }
                 MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
+                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
                     operations.push(cache_maintenance_operation(
                         CacheMaintenanceOperation::FlushDirtyDeviceWrites,
                     ));
@@ -911,22 +987,143 @@ pub fn execute_maxwell_backend_submission(
         }
     }
 
-    commit_write_batch(pre_writes, pre_write_source)
-        .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-    let submission =
-        OperationSubmission::new(plan.frontend, plan.predecessors.to_vec(), operations)
-            .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
-    let completion = backend
-        .execute(&creations, &invalidations, &submission)
-        .map_err(MaxwellBackendExecutionError::Backend)?;
+    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
+    flush_maxwell_backend_segment(
+        plan,
+        &mut creations,
+        &mut invalidations,
+        &mut operations,
+        &mut segments,
+        &mut execute_segment,
+        &mut last_completion,
+    )?;
     commit_inline_batch(post_writes, post_write_source)
         .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
 
-    Ok(MaxwellBackendExecutionCompletion {
-        staged_cache: plan.staged_cache,
-        completion: plan.completion,
-        backend: completion,
-    })
+    Ok(last_completion)
+}
+
+fn commit_pending_backend_writes(
+    writes: &mut CanonicalWriteBatch,
+    source: &mut Option<CanonicalWriteSource>,
+) -> Result<(), MaxwellBackendExecutionError> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    commit_write_batch(std::mem::take(writes), source.take())
+        .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))
+}
+
+struct BackendSegmentCursor {
+    count: u32,
+    next: FrontendSubmissionSegment,
+}
+
+impl BackendSegmentCursor {
+    fn for_plan(
+        plan: &MaxwellSubmissionExecutionPlan,
+    ) -> Result<Self, MaxwellBackendExecutionError> {
+        let mut count = 0_usize;
+        let mut operations_pending = false;
+        for step in &plan.steps {
+            if backend_step_is_canonical_write(step) && operations_pending {
+                count = count.checked_add(1).ok_or_else(too_many_backend_segments)?;
+                operations_pending = false;
+            }
+            operations_pending |= backend_step_emits_operation(step);
+        }
+        if operations_pending {
+            count = count.checked_add(1).ok_or_else(too_many_backend_segments)?;
+        }
+        let count = u32::try_from(count).map_err(|_| too_many_backend_segments())?;
+        Ok(Self {
+            count,
+            next: FrontendSubmissionSegment::FIRST,
+        })
+    }
+
+    fn take(&mut self) -> Result<(FrontendSubmissionSegment, bool), MaxwellBackendExecutionError> {
+        let segment = self.next;
+        let completed = segment
+            .get()
+            .checked_add(1)
+            .ok_or_else(too_many_backend_segments)?;
+        if completed > self.count {
+            return Err(too_many_backend_segments());
+        }
+        let final_segment = completed == self.count;
+        if !final_segment {
+            self.next = segment
+                .checked_next()
+                .ok_or_else(too_many_backend_segments)?;
+        }
+        Ok((segment, final_segment))
+    }
+}
+
+fn backend_step_is_canonical_write(step: &MaxwellSubmissionExecutionStep) -> bool {
+    matches!(
+        step,
+        MaxwellSubmissionExecutionStep::ComputeInlineToMemory { .. }
+            | MaxwellSubmissionExecutionStep::InlineToMemory { .. }
+            | MaxwellSubmissionExecutionStep::DmaCopy { .. }
+            | MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { .. }
+    )
+}
+
+fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
+    matches!(
+        step,
+        MaxwellSubmissionExecutionStep::HostSynchronization { .. }
+            | MaxwellSubmissionExecutionStep::ThreeD(_)
+            | MaxwellSubmissionExecutionStep::ComputeSynchronization(
+                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. }
+            )
+            | MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
+                    | MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. }
+                    | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { .. }
+                    | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
+                    | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+            )
+    )
+}
+
+fn too_many_backend_segments() -> MaxwellBackendExecutionError {
+    MaxwellBackendExecutionError::InvalidSubmission(
+        CommandDescriptionError::TooManySubmissionSegments,
+    )
+}
+
+fn flush_maxwell_backend_segment<T>(
+    plan: &MaxwellSubmissionExecutionPlan,
+    creations: &mut Vec<BackendResourceCreateInfo>,
+    invalidations: &mut Vec<ResourceDependency>,
+    operations: &mut Vec<GpuOperation>,
+    segments: &mut BackendSegmentCursor,
+    execute_segment: &mut impl FnMut(
+        &[BackendResourceCreateInfo],
+        &[ResourceDependency],
+        &OperationSubmission,
+    ) -> Result<T, MaxwellBackendExecutionError>,
+    last_completion: &mut Option<T>,
+) -> Result<(), MaxwellBackendExecutionError> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let (segment, final_segment) = segments.take()?;
+    let submission = OperationSubmission::new_segment(
+        plan.frontend,
+        segment,
+        final_segment,
+        plan.predecessors.to_vec(),
+        std::mem::take(operations),
+    )
+    .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
+    *last_completion = Some(execute_segment(creations, invalidations, &submission)?);
+    creations.clear();
+    invalidations.clear();
+    Ok(())
 }
 
 fn cache_maintenance_operation(maintenance: CacheMaintenanceOperation) -> GpuOperation {
@@ -1729,6 +1926,83 @@ mod tests {
         execute_maxwell_software_initialization(plan, &address_space).unwrap();
         allocation.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+    }
+
+    #[test]
+    fn backend_segments_preserve_reused_constant_buffer_versions() {
+        let mut address_space = address_space();
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset().get();
+        let frontend = FrontendSubmissionId::new(2);
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(&mut channel, frontend, &bind.packets()[0]).unwrap();
+        let selector = packet(0, 0x2380 / 4, &[4, (address >> 32) as u32, address as u32]);
+        dispatch_maxwell_engine_packet(&mut channel, frontend, &selector.packets()[0]).unwrap();
+
+        let mut dispatches = Vec::new();
+        for value in [0xff00_0000, 0x00ff_0000, 0x0000_ff00] {
+            let load = packet(0, 0x238c / 4, &[0, value]);
+            dispatches.push(
+                dispatch_maxwell_engine_packet(&mut channel, frontend, &load.packets()[0]).unwrap(),
+            );
+            let invalidate = packet(0, 0x1288 / 4, &[0]);
+            dispatches.push(
+                dispatch_maxwell_engine_packet(&mut channel, frontend, &invalidate.packets()[0])
+                    .unwrap(),
+            );
+        }
+        let plan = preflight_maxwell_submission_execution(
+            &dispatches,
+            &address_space,
+            frontend,
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+
+        let mut observed = Vec::new();
+        let completion = execute_maxwell_backend_steps(
+            &plan,
+            &address_space,
+            |creations, invalidations, submission| {
+                assert!(creations.is_empty());
+                assert!(invalidations.is_empty());
+                assert_eq!(submission.id(), frontend);
+                assert_eq!(submission.operations().len(), 1);
+                assert_eq!(submission.segment().get(), observed.len() as u32);
+                assert_eq!(submission.is_final_segment(), observed.len() == 2);
+                let mut bytes = [0_u8; 4];
+                allocation.read(0, &mut bytes).unwrap();
+                observed.push(u32::from_le_bytes(bytes));
+                Ok(observed.len())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed, [0xff00_0000, 0x00ff_0000, 0x0000_ff00]);
+        assert_eq!(completion, Some(3));
     }
 
     #[test]

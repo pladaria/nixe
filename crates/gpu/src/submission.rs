@@ -41,6 +41,37 @@ opaque_submission_id!(
     "frontend-submission"
 );
 
+/// Zero-based backend transaction within one logical frontend submission.
+///
+/// Most frontend submissions contain one final segment at index zero. A
+/// frontend may use additional ordered segments when canonical-memory updates
+/// must become visible between otherwise neutral GPU operations.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct FrontendSubmissionSegment(u32);
+
+impl FrontendSubmissionSegment {
+    pub const FIRST: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
 /// Identity of one initialized backend instance.
 ///
 /// It is assigned by the composition root and is neither a host pointer nor a

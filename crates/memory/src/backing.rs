@@ -1,6 +1,6 @@
 //! Retained canonical RAM backing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +28,83 @@ struct CanonicalPageState {
     generation: ContentGeneration,
     visibility: PageVisibility,
     visibility_epoch: u64,
+    cpu_writes: CpuWriteJournal,
+}
+
+const CPU_WRITE_JOURNAL_CAPACITY: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CpuWriteRecord {
+    generation: ContentGeneration,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Default)]
+struct CpuWriteJournal {
+    records: VecDeque<CpuWriteRecord>,
+    lost_through: Option<ContentGeneration>,
+}
+
+impl CpuWriteJournal {
+    fn prepare(&mut self) -> Result<(), CanonicalPageError> {
+        if self.records.capacity() < CPU_WRITE_JOURNAL_CAPACITY {
+            self.records
+                .try_reserve_exact(CPU_WRITE_JOURNAL_CAPACITY - self.records.len())
+                .map_err(|_| CanonicalPageError::ResourceExhausted)?;
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, generation: ContentGeneration, start: u64, end: u64) {
+        if start == end {
+            return;
+        }
+        if self.records.len() == CPU_WRITE_JOURNAL_CAPACITY {
+            let removed = self
+                .records
+                .pop_front()
+                .expect("a full CPU-write journal has a front record");
+            self.lost_through = Some(self.lost_through.map_or(removed.generation, |current| {
+                current.max(removed.generation)
+            }));
+        }
+        self.records.push_back(CpuWriteRecord {
+            generation,
+            start,
+            end,
+        });
+    }
+
+    fn overlap_since(
+        &self,
+        generation: ContentGeneration,
+        start: u64,
+        end: u64,
+    ) -> CanonicalCpuWriteOverlap {
+        if self
+            .lost_through
+            .is_some_and(|lost_through| generation < lost_through)
+        {
+            return CanonicalCpuWriteOverlap::Unknown;
+        }
+        if self.records.iter().any(|record| {
+            record.generation > generation && record.start < end && start < record.end
+        }) {
+            CanonicalCpuWriteOverlap::Yes
+        } else {
+            CanonicalCpuWriteOverlap::No
+        }
+    }
+}
+
+/// Whether canonical CPU-side writes touched a byte range after a snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCpuWriteOverlap {
+    No,
+    Yes,
+    /// The bounded provenance journal no longer covers the requested snapshot.
+    Unknown,
 }
 
 struct CanonicalPageInner {
@@ -84,6 +161,7 @@ impl CanonicalBackingPage {
                     generation,
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    cpu_writes: CpuWriteJournal::default(),
                 }),
             }),
         })
@@ -112,6 +190,7 @@ impl CanonicalBackingPage {
                     generation,
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    cpu_writes: CpuWriteJournal::default(),
                 }),
             }),
         })
@@ -193,9 +272,10 @@ impl CanonicalBackingPage {
         loop {
             self.ensure_cpu_visible()
                 .map_err(CanonicalPageError::Visibility)?;
-            let state = self.lock_state();
+            let mut state = self.lock_state();
             match state.visibility {
                 PageVisibility::Clean | PageVisibility::CpuNewer => {
+                    state.cpu_writes.prepare()?;
                     let mut bytes = Vec::new();
                     bytes
                         .try_reserve_exact(self.size())
@@ -247,6 +327,7 @@ impl CanonicalBackingPage {
             contents.resize(self.inner.size, 0);
             state.bytes = Some(contents.into_boxed_slice());
         }
+        state.cpu_writes.prepare()?;
         Ok(())
     }
 
@@ -275,6 +356,7 @@ impl CanonicalBackingPage {
             return Err(CanonicalPageError::InvalidGenerationTransition);
         }
         let mut state = self.lock_state();
+        state.cpu_writes.prepare()?;
         if state.generation != expected {
             return Err(CanonicalPageError::StaleGeneration {
                 expected,
@@ -300,6 +382,7 @@ impl CanonicalBackingPage {
                 .copy_from_slice(bytes);
         }
         state.generation = next;
+        state.cpu_writes.record(next, offset as u64, end as u64);
         Ok(())
     }
 
@@ -316,6 +399,7 @@ impl CanonicalBackingPage {
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
         let mut state = self.lock_state();
+        state.cpu_writes.prepare()?;
         if state.generation != generation {
             return Err(CanonicalPageError::StaleGeneration {
                 expected: generation,
@@ -340,7 +424,29 @@ impl CanonicalBackingPage {
                 .expect("materialized canonical page has bytes")[offset..end]
                 .copy_from_slice(bytes);
         }
+        state
+            .cpu_writes
+            .record(generation, offset as u64, end as u64);
         Ok(())
+    }
+
+    /// Reports exact CPU-side byte writes newer than `generation`.
+    pub fn cpu_write_overlap_since(
+        &self,
+        generation: ContentGeneration,
+        offset: u64,
+        size: u64,
+    ) -> Result<CanonicalCpuWriteOverlap, CanonicalPageError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalPageError::InvalidRange)?;
+        if end > self.size() as u64 {
+            return Err(CanonicalPageError::InvalidRange);
+        }
+        Ok(self
+            .lock_state()
+            .cpu_writes
+            .overlap_since(generation, offset, end))
     }
 
     pub(crate) fn prepare_device_access(
@@ -552,6 +658,7 @@ struct PendingCanonicalPageWrite {
     expected_generation: ContentGeneration,
     expected_visibility_epoch: u64,
     bytes: Box<[u8]>,
+    dirty_ranges: Vec<(u64, u64)>,
 }
 
 /// Atomic CPU-side mutation assembled over retained canonical ranges.
@@ -703,6 +810,7 @@ impl CanonicalWriteBatch {
                             expected_generation: generation,
                             expected_visibility_epoch: visibility_epoch,
                             bytes: page_bytes,
+                            dirty_ranges: Vec::new(),
                         })
                     }
                 };
@@ -720,6 +828,9 @@ impl CanonicalWriteBatch {
                     .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
                 pending.bytes[page_offset..page_offset + count]
                     .copy_from_slice(&bytes[copied..copied_end]);
+                pending
+                    .dirty_ranges
+                    .push((page_offset as u64, (page_offset + count) as u64));
                 copied = copied_end;
             }
             logical_start = logical_end;
@@ -741,6 +852,7 @@ impl CanonicalWriteBatch {
             next_generation: ContentGeneration,
             next_visibility_epoch: u64,
             bytes: Option<Box<[u8]>>,
+            dirty_ranges: Vec<(u64, u64)>,
         }
 
         let mut backings = Vec::new();
@@ -767,6 +879,7 @@ impl CanonicalWriteBatch {
                 next_generation,
                 next_visibility_epoch,
                 bytes: Some(pending.bytes),
+                dirty_ranges: pending.dirty_ranges,
             });
         }
 
@@ -790,6 +903,9 @@ impl CanonicalWriteBatch {
             state.generation = write.next_generation;
             state.visibility = PageVisibility::CpuNewer;
             state.visibility_epoch = write.next_visibility_epoch;
+            for &(start, end) in &write.dirty_ranges {
+                state.cpu_writes.record(write.next_generation, start, end);
+            }
         }
         Ok(())
     }
@@ -1489,5 +1605,65 @@ mod tests {
         let mut canonical = [0xff; 4];
         allocation.read(0x0ffe, &mut canonical).unwrap();
         assert_eq!(canonical, [0; 4]);
+    }
+
+    #[test]
+    fn cpu_write_provenance_distinguishes_ranges_within_one_page() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let generation = page.content_generation();
+
+        allocation.write(0x300, &[0x5a]).unwrap();
+        assert_eq!(
+            page.cpu_write_overlap_since(generation, 0x100, 0x100),
+            Ok(CanonicalCpuWriteOverlap::No)
+        );
+        assert_eq!(
+            page.cpu_write_overlap_since(generation, 0x280, 0x100),
+            Ok(CanonicalCpuWriteOverlap::Yes)
+        );
+    }
+
+    #[test]
+    fn canonical_write_batch_records_only_staged_dirty_ranges() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let generation = page.content_generation();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0x700, &[1, 2, 3, 4]).unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(
+            page.cpu_write_overlap_since(generation, 0x100, 0x100),
+            Ok(CanonicalCpuWriteOverlap::No)
+        );
+        assert_eq!(
+            page.cpu_write_overlap_since(generation, 0x702, 1),
+            Ok(CanonicalCpuWriteOverlap::Yes)
+        );
+    }
+
+    #[test]
+    fn expired_cpu_write_provenance_is_conservatively_unknown() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let generation = page.content_generation();
+        for index in 0..=CPU_WRITE_JOURNAL_CAPACITY {
+            allocation.write(index, &[index as u8]).unwrap();
+        }
+
+        assert_eq!(
+            page.cpu_write_overlap_since(generation, 0x800, 0x100),
+            Ok(CanonicalCpuWriteOverlap::Unknown)
+        );
     }
 }

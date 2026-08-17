@@ -7,9 +7,9 @@ use std::{
 };
 
 use crate::{
-    AddressSpaceId, CanonicalBackingPage, CanonicalPageError, CanonicalPageId, ContentGeneration,
-    DeviceAccessDeclaration, GuestVirtualAddress, MappingGeneration, MemoryPermissions,
-    VisibilityCoordinator, VisibilityError, VisibilityState,
+    AddressSpaceId, CanonicalBackingPage, CanonicalCpuWriteOverlap, CanonicalPageError,
+    CanonicalPageId, ContentGeneration, DeviceAccessDeclaration, GuestVirtualAddress,
+    MappingGeneration, MemoryPermissions, VisibilityCoordinator, VisibilityError, VisibilityState,
 };
 
 /// One contiguous segment of a translated canonical backing range.
@@ -102,6 +102,15 @@ impl CanonicalBackingSegment {
     #[must_use]
     pub fn visibility_state(&self) -> VisibilityState {
         self.backing.visibility_state()
+    }
+
+    /// Reports CPU-side writes overlapping this segment since `generation`.
+    pub fn cpu_write_overlap_since(
+        &self,
+        generation: ContentGeneration,
+    ) -> Result<CanonicalCpuWriteOverlap, CanonicalPageError> {
+        self.backing
+            .cpu_write_overlap_since(generation, self.offset, self.size)
     }
 }
 
