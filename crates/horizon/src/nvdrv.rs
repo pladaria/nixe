@@ -2757,6 +2757,55 @@ mod tests {
             alias.backing().segments()[0].page()
         );
 
+        // This is the exact MapBufferEx shape emitted by libnx's
+        // nvAddressSpaceModify: Modify is set without FixedOffset, handle and
+        // page size are zero, and the existing mapping is selected by IOVA.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/address_space.c#L74-L83
+        let mut invalid_modify = [0_u8; 40];
+        invalid_modify[0..4].copy_from_slice(&(1_u32 << 8).to_le_bytes());
+        invalid_modify[4..8].copy_from_slice(&0xfe_u32.to_le_bytes());
+        invalid_modify[24..32].copy_from_slice(&0x2_0000_u64.to_le_bytes());
+        invalid_modify[32..40].copy_from_slice(&(second_offset + 0x2_0000).to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX,
+                    &invalid_modify,
+                )
+                .unwrap(),
+            (invalid_modify.to_vec(), NV_BAD_VALUE)
+        );
+        assert_eq!(
+            session
+                .gpu_address_space(as_gpu_fd)
+                .unwrap()
+                .mapping_count(),
+            2
+        );
+
+        let mut modify = invalid_modify;
+        modify[32..40].copy_from_slice(&first_offset.to_le_bytes());
+        assert_eq!(
+            session
+                .ioctl(
+                    as_gpu_fd,
+                    nvhost_as_gpu::IOCTL_AS_GPU_MAP_BUFFER_EX,
+                    &modify,
+                )
+                .unwrap(),
+            (modify.to_vec(), NV_SUCCESS)
+        );
+        let modified = session
+            .gpu_address_space(as_gpu_fd)
+            .unwrap()
+            .mapping(first_address)
+            .unwrap();
+        assert_eq!(modified.kind(), 0xfe);
+        assert!(!modified.cacheable());
+        assert_eq!(modified.allocation(), retained.allocation());
+        assert_eq!(modified.backing(), retained.backing());
+
         let foreign_nvmap_fd = session.open(b"/dev/nvmap", 99).unwrap();
         let (foreign_created, _) = session
             .ioctl(

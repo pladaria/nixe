@@ -178,6 +178,18 @@ pub enum HorizonSvcFault {
         immediate: u32,
         reason: &'static str,
     },
+    IpcHostResourceExhausted {
+        immediate: u32,
+        operation: &'static str,
+    },
+    IpcResponseCommit {
+        immediate: u32,
+        fault: DataAccessFault,
+    },
+    ErrorApplet {
+        immediate: u32,
+        diagnostic: Box<crate::ErrorAppletDiagnostic>,
+    },
     InternalRuntime {
         operation: &'static str,
     },
@@ -233,9 +245,12 @@ impl HorizonSvcFault {
             },
             Self::CanonicalMemory { .. }
             | Self::CanonicalBacking { .. }
+            | Self::MalformedIpc { .. }
             | Self::InternalIpc { .. }
+            | Self::IpcHostResourceExhausted { .. }
+            | Self::IpcResponseCommit { .. }
+            | Self::ErrorApplet { .. }
             | Self::InternalRuntime { .. } => None,
-            Self::MalformedIpc { .. } => Some(HorizonKernelResult::INVALID_STATE),
             Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
@@ -299,6 +314,24 @@ impl Display for HorizonSvcFault {
             Self::InternalIpc { immediate, reason } => write!(
                 formatter,
                 "Horizon SVC {immediate:#x} reached invalid emulator IPC state: {reason}"
+            ),
+            Self::IpcHostResourceExhausted {
+                immediate,
+                operation,
+            } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} exhausted host resources while {operation}"
+            ),
+            Self::IpcResponseCommit { immediate, fault } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} could not commit a prevalidated IPC response: {fault:?}"
+            ),
+            Self::ErrorApplet {
+                immediate,
+                diagnostic,
+            } => write!(
+                formatter,
+                "Horizon SVC {immediate:#x} launched the unimplemented Error library applet: {diagnostic}"
             ),
             Self::InternalRuntime { operation } => {
                 write!(
@@ -1807,6 +1840,42 @@ mod tests {
         let fault = HorizonSvcFault::InternalIpc {
             immediate: 0x21,
             reason: "synthetic internal invariant",
+        };
+
+        assert_eq!(fault.guest_result(), None);
+    }
+
+    #[test]
+    fn malformed_ipc_has_no_unverified_guest_result() {
+        let fault = HorizonSvcFault::MalformedIpc {
+            immediate: 0x21,
+            reason: "synthetic malformed request",
+        };
+
+        assert_eq!(fault.guest_result(), None);
+    }
+
+    #[test]
+    fn error_applet_content_is_reported_as_a_fatal_host_fault() {
+        let diagnostic = crate::ErrorAppletDiagnostic::decode(&[]).with_launch_mode(0);
+        let fault = HorizonSvcFault::ErrorApplet {
+            immediate: 0x21,
+            diagnostic: Box::new(diagnostic),
+        };
+
+        assert_eq!(fault.guest_result(), None);
+        let rendered = fault.to_string();
+        assert!(rendered.contains("unimplemented Error library applet"));
+        assert!(rendered.contains("mode=AllForeground"));
+        assert!(rendered.contains("storages=[]"));
+        assert!(rendered.contains("header=[missing]"));
+    }
+
+    #[test]
+    fn host_ipc_resource_exhaustion_has_no_guest_result() {
+        let fault = HorizonSvcFault::IpcHostResourceExhausted {
+            immediate: 0x21,
+            operation: "allocating a synthetic response",
         };
 
         assert_eq!(fault.guest_result(), None);

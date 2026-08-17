@@ -283,6 +283,13 @@ fn qemu_a64_matches_every_register_semantic_family() {
             cases.push((encoding, name));
         }
     }
+    if filter.matches(0x15, "logical-shifted") {
+        cases.extend([
+            (0x4ac6_14e6, "EOR W6,W7,W6,ROR#5 (captured)"),
+            (0x2aa5_1c83, "ORN W3,W4,W5,ASR#7"),
+            (0xeae2_9420, "BICS X0,X1,X2,ROR#37"),
+        ]);
+    }
     if filter.matches(0x91, "simd-scalar-shift-right-immediate") {
         cases.push((0x7f60_07fe, "USHR D30,D31,#32 (captured)"));
     }

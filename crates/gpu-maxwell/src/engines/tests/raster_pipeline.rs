@@ -1302,7 +1302,7 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x0dcc / 4, &[3, 0]);
+    let decoded = incrementing_packet(0x0dcc / 4, &[3, 0, 0, 0, 0]);
     assert!(matches!(
         dispatch_maxwell_engine_packet(
             &mut channel,
@@ -1310,11 +1310,202 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
             &decoded.packets()[0]
         ),
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x0dd0)
+            if source.method() == GpuMethodId(0x0ddc)
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
+}
+
+#[test]
+fn iterated_blend_family_is_typed_source_preserving_and_disabled_pipeline_neutral() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[0]);
+    let ordinary_blend_before = *channel.three_d().fixed_function().blend_enable_common();
+    let decoded = incrementing_packet(0x0dd0 / 4, &[0, 5]);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(
+        dispatch
+            .methods()
+            .iter()
+            .map(|method| method.metadata().method_name())
+            .collect::<Vec<_>>(),
+        ["SET_ITERATED_BLEND", "SET_ITERATED_BLEND_PASS"]
+    );
+    assert!(dispatch.operations().is_empty());
+    let controls = channel.three_d().fixed_function().blend_controls();
+    let value = controls.iterated_blend().value().copied().unwrap();
+    assert!(!value.color_enabled());
+    assert!(!value.alpha_enabled());
+    assert!(!value.enabled());
+    assert_eq!(value.raw(), 0);
+    assert_eq!(controls.iterated_blend().raw(), Some(0));
+    assert_eq!(
+        controls.iterated_blend().source(),
+        Some(dispatch.methods()[0].method().source())
+    );
+    let pass_count = controls
+        .iterated_blend_pass_count()
+        .value()
+        .copied()
+        .unwrap();
+    assert_eq!(pass_count.pass_count(), 5);
+    assert_eq!(pass_count.raw(), 5);
+    assert_eq!(controls.iterated_blend_pass_count().raw(), Some(5));
+    assert_eq!(
+        controls.iterated_blend_pass_count().source(),
+        Some(dispatch.methods()[1].method().source())
+    );
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[0]),
+        dependencies_before
+    );
+    assert_eq!(
+        channel.three_d().fixed_function().blend_enable_common(),
+        &ordinary_blend_before
+    );
+}
+
+#[test]
+fn iterated_blend_values_are_complete_and_invalid_packets_are_atomic() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for raw in 0..=3 {
+        program_three_d(&mut channel, 0x0dd0, raw);
+        let value = channel
+            .three_d()
+            .fixed_function()
+            .blend_controls()
+            .iterated_blend()
+            .value()
+            .copied()
+            .unwrap();
+        assert_eq!(value.raw(), raw);
+        assert_eq!(value.color_enabled(), raw & 1 != 0);
+        assert_eq!(value.alpha_enabled(), raw & 2 != 0);
+    }
+    for raw in [0, 0xff] {
+        program_three_d(&mut channel, 0x0dd4, raw);
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .blend_controls()
+                .iterated_blend_pass_count()
+                .value()
+                .map(|value| value.pass_count()),
+            Some(raw as u8)
+        );
+    }
+
+    for (method, argument, defined_mask) in [
+        (0x0dd0, 4, 0x3),
+        (0x0dd0, u32::MAX, 0x3),
+        (0x0dd4, 0x100, 0xff),
+        (0x0dd4, u32::MAX, 0xff),
+    ] {
+        let before = channel.clone();
+        let decoded = packet(method / 4, argument);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                source,
+                defined_mask: actual_mask,
+                ..
+            }) if source.method() == GpuMethodId(method)
+                && source.argument() == argument
+                && actual_mask == defined_mask
+        ));
+        assert_eq!(channel, before);
+    }
+
+    let before = channel.clone();
+    let decoded = incrementing_packet(0x0dd0 / 4, &[0, 5, 0, 0]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+            if source.method() == GpuMethodId(0x0ddc)
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
+fn active_iterated_blend_is_rejected_at_draw_consumption() {
+    let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
+    let target_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    let mut address_space = resource_address_space();
+    let vertex = map_resource(
+        &mut address_space,
+        vertex_allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        76,
+        0,
+    )
+    .offset()
+    .get();
+    let target = map_resource(
+        &mut address_space,
+        target_allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        77,
+        0xfe,
+    )
+    .offset()
+    .get();
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_basic_draw_state(&mut channel, vertex);
+    program_color_target(&mut channel, 0, target, 0xd5);
+    program_three_d(&mut channel, 0x121c, 1);
+    program_three_d(&mut channel, 0x0dd0, 3);
+    program_three_d(&mut channel, 0x0dd4, 4);
+    let draw = packet(0x0d78 / 4, 3);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &draw.packets()[0],
+    )
+    .unwrap();
+    let triggered = &dispatch.operations()[0];
+    let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    let (shaders, cache) = translated_graphics_shaders();
+    let capabilities =
+        lowering_capabilities(BackendFeatures::DRAW.union(BackendFeatures::RENDER_PASS));
+
+    assert!(matches!(
+        preflight_maxwell_three_d_operation(
+            triggered.state(),
+            &resources,
+            triggered.trigger(),
+            Some(&shaders),
+            FrontendSubmissionId::new(30),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        ),
+        Err(MaxwellThreeDLoweringError::UnsupportedIteratedBlendSemantics {
+            value,
+            pass_count: Some(4),
+        }) if value.color_enabled() && value.alpha_enabled()
+    ));
 }
 
 #[test]

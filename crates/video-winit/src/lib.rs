@@ -291,7 +291,7 @@ impl Presenter {
             configured: false,
         };
         presenter.resize(size.width, size.height);
-        presenter.refresh_title(Instant::now());
+        presenter.update_title();
         Ok(presenter)
     }
 
@@ -476,8 +476,6 @@ impl Presenter {
 
     fn refresh_title(&mut self, now: Instant) {
         if self.frame_rate.refresh(now) {
-            self.update_title();
-        } else if self.displayed_title.is_empty() {
             self.update_title();
         }
     }

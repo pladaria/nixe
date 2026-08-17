@@ -137,14 +137,15 @@ fn add_sub_immediate(state: &mut A64State, fields: Operands) -> bool {
     true
 }
 
-fn shifted(value: u64, fields: Operands) -> Option<u64> {
-    if (width(fields) == 32 && fields.shift_amount >= 32) || fields.shift_kind == 3 {
+fn shifted(value: u64, fields: Operands, allow_rotate: bool) -> Option<u64> {
+    if width(fields) == 32 && fields.shift_amount >= 32 {
         return None;
     }
     let kind = match fields.shift_kind {
         0 => ShiftKind::LogicalLeft,
         1 => ShiftKind::LogicalRight,
         2 => ShiftKind::ArithmeticRight,
+        3 if allow_rotate => ShiftKind::RotateRight,
         _ => return None,
     };
     Some(
@@ -161,7 +162,7 @@ fn shifted(value: u64, fields: Operands) -> Option<u64> {
 }
 
 fn add_sub_shifted(state: &mut A64State, fields: Operands) -> bool {
-    let Some(rhs) = shifted(read(state, fields.rm, width(fields), false), fields) else {
+    let Some(rhs) = shifted(read(state, fields.rm, width(fields), false), fields, false) else {
         return false;
     };
     let lhs = read(state, fields.rn, width(fields), false);
@@ -249,7 +250,10 @@ fn logical_immediate(state: &mut A64State, fields: Operands) -> bool {
 
 fn logical_shifted(state: &mut A64State, fields: Operands) -> bool {
     let bits = width(fields);
-    let Some(mut rhs) = shifted(read(state, fields.rm, bits, false), fields) else {
+    // Arm A-profile logical (shifted register) instructions admit LSL, LSR,
+    // ASR, and ROR, unlike the adjacent add/subtract shifted family.
+    // https://developer.arm.com/documentation/ddi0602/2025-06/Base-Instructions/EOR--shifted-register---Bitwise-Exclusive-OR--shifted-register--
+    let Some(mut rhs) = shifted(read(state, fields.rm, bits, false), fields, true) else {
         return false;
     };
     if fields.invert {

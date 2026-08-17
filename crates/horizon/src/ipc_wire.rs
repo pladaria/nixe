@@ -7,17 +7,24 @@
 use chrono::{Datelike, Offset, Timelike};
 use chrono_tz::OffsetComponents;
 use nixe_cpu::address::GuestVirtualAddress;
-use nixe_cpu::memory::{DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryValue};
+use nixe_cpu::memory::{
+    DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAccessSize,
+    MemoryPermissions, MemoryRegionKind, MemoryValue,
+};
 use nixe_memory::CanonicalRangeAccessError;
 use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
 
 use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
-    HipcRequest, MessageError, ReceiveStatics, SendStaticDescriptor,
+    HipcRequest, MessageError, ReceiveStaticDescriptor, ReceiveStatics, SendStaticDescriptor,
 };
 use crate::nvdrv::NvDrvIoctlOutcome;
 use crate::nvdrv::{NvDrvFileDescriptor, NvDrvService, NvDrvServiceError};
-use crate::object::AppletObject;
+use crate::object::{
+    AppletObject, AppletProxyKind, AppletStorageAccessError, CreateAppletStorageError,
+    CreateLibraryAppletError, LibraryAppletId, LibraryAppletMode, OpenAppletStorageAccessorError,
+    PrepareLibraryAppletLaunchError, PushLibraryAppletStorageError,
+};
 use crate::{
     AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HidSystem,
     HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
@@ -44,8 +51,10 @@ pub(crate) enum IpcWireError {
     GuestMemory(DataAccessFault),
     Malformed(&'static str),
     Internal(&'static str),
-    ResourceExhausted,
+    HostResourceExhausted(&'static str),
+    ResponseCommit(DataAccessFault),
     CanonicalBacking(CanonicalRangeAccessError),
+    ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
     /// A decoded direct nvdrv wait which must suspend at the SVC boundary.
@@ -272,10 +281,11 @@ pub(crate) fn send_sync_request_from_buffer(
             "IPC message buffer is smaller than the TLS command buffer",
         ));
     }
+    validate_writable_ram_range(process, address, size)?;
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(size)
-        .map_err(|_| IpcWireError::ResourceExhausted)?;
+        .map_err(|_| IpcWireError::HostResourceExhausted("allocating the IPC command buffer"))?;
     buffer.resize(size, 0);
     read_bytes(process, address, &mut buffer)?;
     let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
@@ -332,7 +342,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 &object_id.to_le_bytes(),
                 None,
             )?;
-            write_bytes(process, address, &response)?;
+            write_response(process, address, size, &response)?;
             log::debug!("appletOE converted to domain with root object {object_id:#x}");
             return Ok(SyncRequestResult::Success);
         }
@@ -349,7 +359,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 &object_id.to_le_bytes(),
                 None,
             )?;
-            write_bytes(process, address, &response)?;
+            write_response(process, address, size, &response)?;
             log::debug!(
                 "{:?} converted to domain with root object {object_id:#x}",
                 String::from_utf8_lossy(service.service().name())
@@ -365,10 +375,9 @@ pub(crate) fn send_sync_request_from_buffer(
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L308-L337
             // A cloned `IpcSession` has a distinct process-handle object while
             // retaining the shared domain table of the source connection.
-            let cloned_handle = process
-                .handles_mut()
-                .insert(service.clone())
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let cloned_handle = process.handles_mut().insert(service.clone()).map_err(|_| {
+                IpcWireError::HostResourceExhausted("cloning a CMIF session handle")
+            })?;
             let response = match encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
@@ -381,7 +390,7 @@ pub(crate) fn send_sync_request_from_buffer(
                     return Err(error);
                 }
             };
-            if let Err(error) = write_bytes(process, address, &response) {
+            if let Err(error) = write_response(process, address, size, &response) {
                 let _ = process.handles_mut().close(cloned_handle);
                 return Err(error);
             }
@@ -397,14 +406,14 @@ pub(crate) fn send_sync_request_from_buffer(
             let cloned_handle = process
                 .handles_mut()
                 .insert(vi.clone())
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| IpcWireError::HostResourceExhausted("cloning a VI session handle"))?;
             let response = encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
                 &[],
                 Some(cloned_handle),
             )?;
-            write_bytes(process, address, &response)?;
+            write_response(process, address, size, &response)?;
             return Ok(SyncRequestResult::Success);
         }
         if matches!(request.command_id, 2 | 4)
@@ -414,20 +423,22 @@ pub(crate) fn send_sync_request_from_buffer(
             // nvdrv client. The connections share initialization, descriptors,
             // allocations, and close effects, but retain distinct identities
             // for descriptor ownership.
-            let cloned_session = nvdrv
-                .clone_connection()
-                .ok_or(IpcWireError::ResourceExhausted)?;
-            let cloned_handle = process
-                .handles_mut()
-                .insert(cloned_session)
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let cloned_session =
+                nvdrv
+                    .clone_connection()
+                    .ok_or(IpcWireError::HostResourceExhausted(
+                        "cloning an nvdrv connection",
+                    ))?;
+            let cloned_handle = process.handles_mut().insert(cloned_session).map_err(|_| {
+                IpcWireError::HostResourceExhausted("installing a cloned nvdrv session handle")
+            })?;
             let response = encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
                 &[],
                 Some(cloned_handle),
             )?;
-            write_bytes(process, address, &response)?;
+            write_response(process, address, size, &response)?;
             return Ok(SyncRequestResult::Success);
         }
         let response = match request.command_id {
@@ -441,9 +452,12 @@ pub(crate) fn send_sync_request_from_buffer(
             ),
             command_id => return unsupported_service_command("CMIF control", command_id),
         }?;
-        write_bytes(process, address, &response)?;
+        write_response(process, address, size, &response)?;
         return Ok(SyncRequestResult::Success);
     }
+    let applet_exit_requested = applet
+        .as_ref()
+        .is_some_and(|session| applet_requests_self_exit(session, &request, &hipc));
     let (response, created_handle) = if let Some(manager) = manager {
         dispatch_service_manager(
             process,
@@ -501,20 +515,40 @@ pub(crate) fn send_sync_request_from_buffer(
     } else {
         unreachable!("typed session kind was checked")
     };
-    if let Err(error) = write_bytes(process, address, &response) {
+    if let Err(error) = write_response(process, address, size, &response) {
         if let Some(handle) = created_handle {
             let _ = process.handles_mut().close(handle);
         }
         return Err(error);
     }
-    Ok(SyncRequestResult::Success)
+    Ok(if applet_exit_requested {
+        SyncRequestResult::AppletExitRequested
+    } else {
+        SyncRequestResult::Success
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncRequestResult {
     Success,
     InvalidHandle,
+    AppletExitRequested,
     PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
+}
+
+fn applet_requests_self_exit(
+    session: &AppletSession,
+    request: &CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> bool {
+    request.command_id == 0
+        && request.data.is_empty()
+        && !has_ipc_descriptors(hipc)
+        && matches!(
+            &request.domain,
+            Some(DomainRequest::SendMessage { object_id, .. })
+                if session.object(*object_id) == Some(AppletObject::SelfController)
+        )
 }
 
 fn dispatch_service_manager(
@@ -620,7 +654,9 @@ fn dispatch_service_manager(
                 let handle = process
                     .handles_mut()
                     .insert(AccountSession::new())
-                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                    .map_err(|_| {
+                        IpcWireError::HostResourceExhausted("installing an account service handle")
+                    })?;
                 return Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
                     Some(handle),
@@ -644,7 +680,9 @@ fn dispatch_service_manager(
                         ViObjectKind::Root(kind),
                         host_systems.video.clone(),
                     ))
-                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                    .map_err(|_| {
+                        IpcWireError::HostResourceExhausted("installing a VI service handle")
+                    })?;
                 return Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
                     Some(handle),
@@ -665,7 +703,9 @@ fn dispatch_service_manager(
                 let handle = process
                     .handles_mut()
                     .insert(host_systems.video.nvdrv())
-                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                    .map_err(|_| {
+                        IpcWireError::HostResourceExhausted("installing an nvdrv service handle")
+                    })?;
                 return Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
                     Some(handle),
@@ -1127,7 +1167,13 @@ fn decode_object_request(
                         "file write request size is out of range",
                     ))?;
                 if requested > MAX_IPC_READ_BYTES {
-                    return Err(IpcWireError::ResourceExhausted);
+                    return Err(IpcWireError::UnsupportedService(
+                        UnsupportedServiceOperation::CommandVariant {
+                            service: "IFile",
+                            command_id: request.command_id,
+                            detail: "requested write exceeds Nixe's implemented IPC bound",
+                        },
+                    ));
                 }
                 let descriptor = one_send_buffer(hipc)?;
                 let capacity = usize::try_from(descriptor.size)
@@ -1242,7 +1288,9 @@ fn encode_semantic_response(
             let mut encoded = Vec::new();
             encoded
                 .try_reserve_exact(entries.len().saturating_mul(FS_DIRECTORY_ENTRY_SIZE))
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("encoding filesystem directory entries")
+                })?;
             encoded.resize(entries.len() * FS_DIRECTORY_ENTRY_SIZE, 0);
             for (index, entry) in entries.iter().enumerate() {
                 let start = index * FS_DIRECTORY_ENTRY_SIZE;
@@ -1272,7 +1320,9 @@ fn encode_semantic_response(
             let mut encoded = Vec::new();
             encoded
                 .try_reserve_exact(entries.len().saturating_mul(4))
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("encoding add-on-content entries")
+                })?;
             for entry in entries {
                 let Some(index) = entry.horizon_index else {
                     continue;
@@ -1404,6 +1454,99 @@ fn one_send_buffer(hipc: &HipcRequest<'_>) -> Result<BufferDescriptor, IpcWireEr
         )),
         _ => Err(IpcWireError::Malformed(
             "request requires exactly one input buffer",
+        )),
+    }
+}
+
+fn one_auto_select_input(hipc: &HipcRequest<'_>) -> Result<(u64, usize), IpcWireError> {
+    let [pointer] = hipc.send_statics.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "auto-select input requires exactly one pointer descriptor",
+        ));
+    };
+    let [map_alias] = hipc.send_buffers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "auto-select input requires exactly one map-alias descriptor",
+        ));
+    };
+    if pointer.index != 0 {
+        return Err(IpcWireError::Malformed(
+            "auto-select input pointer has an invalid index",
+        ));
+    }
+    if map_alias.mode == BufferMode::Invalid {
+        return Err(IpcWireError::Malformed(
+            "auto-select input map-alias has an invalid mapping mode",
+        ));
+    }
+
+    // HIPC auto-select reserves both descriptor slots and places the transfer
+    // in exactly one of them, leaving the inactive side as a null placeholder:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L228-L247
+    let pointer_present = pointer.address != 0 || pointer.size != 0;
+    let map_alias_present = map_alias.address != 0 || map_alias.size != 0;
+    match (pointer_present, map_alias_present) {
+        (true, false) if pointer.address != 0 => Ok((pointer.address, usize::from(pointer.size))),
+        (false, true) if map_alias.address != 0 => Ok((
+            map_alias.address,
+            usize::try_from(map_alias.size)
+                .map_err(|_| IpcWireError::Malformed("input buffer is too large"))?,
+        )),
+        (false, false) => Ok((0, 0)),
+        (true, true) => Err(IpcWireError::Malformed(
+            "auto-select input has both descriptor sides active",
+        )),
+        _ => Err(IpcWireError::Malformed(
+            "auto-select input has a null address with nonzero size",
+        )),
+    }
+}
+
+fn one_auto_select_output(hipc: &HipcRequest<'_>) -> Result<(u64, usize), IpcWireError> {
+    let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "auto-select output requires exactly one pointer descriptor",
+        ));
+    };
+    let [
+        ReceiveStaticDescriptor {
+            address: pointer_address,
+            size: pointer_size,
+        },
+    ] = pointers.as_slice()
+    else {
+        return Err(IpcWireError::Malformed(
+            "auto-select output requires exactly one pointer descriptor",
+        ));
+    };
+    let [map_alias] = hipc.receive_buffers.as_slice() else {
+        return Err(IpcWireError::Malformed(
+            "auto-select output requires exactly one map-alias descriptor",
+        ));
+    };
+    if map_alias.mode == BufferMode::Invalid {
+        return Err(IpcWireError::Malformed(
+            "auto-select output map-alias has an invalid mapping mode",
+        ));
+    }
+
+    let pointer_present = *pointer_address != 0 || *pointer_size != 0;
+    let map_alias_present = map_alias.address != 0 || map_alias.size != 0;
+    match (pointer_present, map_alias_present) {
+        (true, false) if *pointer_address != 0 => {
+            Ok((*pointer_address, usize::from(*pointer_size)))
+        }
+        (false, true) if map_alias.address != 0 => Ok((
+            map_alias.address,
+            usize::try_from(map_alias.size)
+                .map_err(|_| IpcWireError::Malformed("output buffer is too large"))?,
+        )),
+        (false, false) => Ok((0, 0)),
+        (true, true) => Err(IpcWireError::Malformed(
+            "auto-select output has both descriptor sides active",
+        )),
+        _ => Err(IpcWireError::Malformed(
+            "auto-select output has a null address with nonzero size",
         )),
     }
 }
@@ -1813,7 +1956,9 @@ fn dispatch_performance_manager(
                     Some(handle),
                 ))
             }
-            Err(_) => cmif_error(request.token, HorizonIpcResult::SM_OUT_OF_SESSIONS),
+            Err(_) => Err(IpcWireError::HostResourceExhausted(
+                "installing a performance-manager child handle",
+            )),
         },
         1 => {
             log::debug!("apm returned normal performance mode");
@@ -2017,10 +2162,9 @@ fn dispatch_vi(
                 let Some(event) = video.vsync_event(display_id) else {
                     return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
                 };
-                let handle = process
-                    .handles_mut()
-                    .insert(event)
-                    .map_err(|_| IpcWireError::ResourceExhausted)?;
+                let handle = process.handles_mut().insert(event).map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a VI event handle")
+                })?;
                 Ok((
                     CmifResponse {
                         token: request.token,
@@ -2235,7 +2379,9 @@ fn dispatch_binder_relay(
                         }
                         crate::graphics::FramebufferError::NvMap(
                             crate::NvMapViewError::ResourceExhausted,
-                        ) => IpcWireError::ResourceExhausted,
+                        ) => IpcWireError::HostResourceExhausted(
+                            "resolving a Binder framebuffer nvmap view",
+                        ),
                         crate::graphics::FramebufferError::NvMap(
                             crate::NvMapViewError::Backing(error),
                         ) => IpcWireError::CanonicalBacking(error),
@@ -2271,10 +2417,9 @@ fn dispatch_binder_relay(
             let Some(event) = video.binder_event(binder_id) else {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             };
-            let handle = process
-                .handles_mut()
-                .insert(event)
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+            let handle = process.handles_mut().insert(event).map_err(|_| {
+                IpcWireError::HostResourceExhausted("installing a Binder event handle")
+            })?;
             Ok((
                 CmifResponse {
                     token: request.token,
@@ -2465,12 +2610,9 @@ fn dispatch_nvdrv(
                 .query_event(NvDrvFileDescriptor::new(fd), event_id, process.process_id())
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let handle = if let Some(event) = event {
-                Some(
-                    process
-                        .handles_mut()
-                        .insert(event)
-                        .map_err(|_| IpcWireError::ResourceExhausted)?,
-                )
+                Some(process.handles_mut().insert(event).map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing an nvdrv event handle")
+                })?)
             } else {
                 None
             };
@@ -2540,7 +2682,7 @@ fn vi_child(
     let handle = process
         .handles_mut()
         .insert(ViSession::new(kind, video.clone()))
-        .map_err(|_| IpcWireError::ResourceExhausted)?;
+        .map_err(|_| IpcWireError::HostResourceExhausted("installing a VI child handle"))?;
     Ok((
         encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
         Some(handle),
@@ -2580,9 +2722,6 @@ fn dispatch_applet(
             ));
         }
     };
-    if !input_objects.is_empty() {
-        return unsupported_service_command("appletOE", request.command_id);
-    }
     let Some(object) = session.object(object_id) else {
         return Ok((
             encode_domain_response(
@@ -2595,54 +2734,130 @@ fn dispatch_applet(
             None,
         ));
     };
+    let accepts_input_objects =
+        matches!(object, AppletObject::LibraryAppletAccessor { .. }) && request.command_id == 100;
+    if !input_objects.is_empty() && !accepts_input_objects {
+        return unsupported_service_command(applet_object_name(object), request.command_id);
+    }
 
     match object {
         AppletObject::Root => {
-            if request.command_id != 0 {
-                return unsupported_service_command(applet_object_name(object), request.command_id);
-            }
             if hipc.pid.is_none()
                 || hipc.copy_handles.as_slice() != [crate::CURRENT_PROCESS_HANDLE]
                 || request_u64(request.data, 0) != Some(0)
+                || request.data[8..].iter().any(|byte| *byte != 0)
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || !matches!(hipc.receive_statics, ReceiveStatics::None)
             {
                 return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
+            // libnx selects the root command from the process applet role:
+            // application uses 0, while system applet uses 100. Keep the
+            // resulting proxies distinct because their child command graphs
+            // diverge after the shared controller interfaces.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L155-L182
+            let Some(kind) = applet_proxy_kind(request.command_id) else {
+                return unsupported_service_command(applet_object_name(object), request.command_id);
+            };
             applet_child(
                 session,
                 request.token,
-                AppletObject::ApplicationProxy,
-                "IApplicationProxy",
+                AppletObject::Proxy(kind),
+                applet_proxy_name(kind),
             )
         }
-        AppletObject::ApplicationProxy => {
-            let child = match request.command_id {
-                0 => AppletObject::CommonStateGetter,
-                1 => AppletObject::SelfController,
-                2 => AppletObject::WindowController,
-                3 => AppletObject::AudioController,
-                4 => AppletObject::DisplayController,
-                11 => AppletObject::LibraryAppletCreator,
-                20 => AppletObject::ApplicationFunctions,
-                1000 => AppletObject::DebugFunctions,
-                _ => {
-                    return unsupported_service_command(
-                        applet_object_name(object),
-                        request.command_id,
-                    );
-                }
+        AppletObject::Proxy(kind) => {
+            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let Some(child) = applet_proxy_child(kind, request.command_id) else {
+                return unsupported_service_command(applet_object_name(object), request.command_id);
             };
             applet_child(session, request.token, child, applet_object_name(child))
         }
-        AppletObject::CommonStateGetter => match request.command_id {
+        AppletObject::CommonStateGetter => {
+            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            match request.command_id {
+                0 => {
+                    let (_writable, readable) = EventObject::create_pair();
+                    let handle = match process.handles_mut().insert(readable) {
+                        Ok(handle) => handle,
+                        Err(_) => {
+                            return Err(IpcWireError::HostResourceExhausted(
+                                "installing the common-state message event handle",
+                            ));
+                        }
+                    };
+                    log::debug!("appletOE returned message event handle {handle:#x}");
+                    Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[handle],
+                            &[],
+                        )?,
+                        Some(handle),
+                    ))
+                }
+                5 => applet_data(request.token, &[session.operation_mode().as_raw()]),
+                6 => applet_data(request.token, &PERFORMANCE_MODE_NORMAL.to_le_bytes()),
+                9 => applet_data(request.token, &[1]), // Application is in focus.
+                command_id => unsupported_service_command("ICommonStateGetter", command_id),
+            }
+        }
+        AppletObject::SelfController => match request.command_id {
+            // SelfExit is a no-I/O request. Once AM accepts it, libnx sleeps
+            // forever and relies on AM to terminate the process. The wire
+            // layer therefore returns a typed lifecycle action after writing
+            // the successful response instead of allowing that artificial
+            // sleep loop to keep the emulated process alive:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L358-L405
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1094-L1099
             0 => {
-                let (_writable, readable) = EventObject::create_pair();
-                let handle = match process.handles_mut().insert(readable) {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                applet_data(request.token, &[])
+            }
+            // LockExit and UnlockExit mutate the application applet's shared
+            // exit-deferral state and carry no input or output payload:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1094-L1099
+            1 | 2 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                session.set_exit_locked(request.command_id == 1);
+                applet_data(request.token, &[])
+            }
+            // GetLibraryAppletLaunchableEvent has no input and returns one
+            // copied, manual-clear event handle (`autoclear=false`).
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
+            // https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14546#GetLibraryAppletLaunchableEvent
+            9 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let handle = match process
+                    .handles_mut()
+                    .insert(session.library_applet_launchable_event())
+                {
                     Ok(handle) => handle,
                     Err(_) => {
-                        return applet_error(request.token, HorizonIpcResult::SM_OUT_OF_SESSIONS);
+                        return Err(IpcWireError::HostResourceExhausted(
+                            "installing the library-applet launchable event handle",
+                        ));
                     }
                 };
-                log::debug!("appletOE returned message event handle {handle:#x}");
+                log::debug!(
+                    "ISelfController returned library-applet launchable event handle {handle:#x}"
+                );
                 Ok((
                     encode_domain_response(
                         request.token,
@@ -2654,23 +2869,10 @@ fn dispatch_applet(
                     Some(handle),
                 ))
             }
-            5 => applet_data(request.token, &[session.operation_mode().as_raw()]),
-            6 => applet_data(request.token, &PERFORMANCE_MODE_NORMAL.to_le_bytes()),
-            9 => applet_data(request.token, &[1]), // Application is in focus.
-            command_id => unsupported_service_command("ICommonStateGetter", command_id),
-        },
-        AppletObject::SelfController => match request.command_id {
-            // LockExit and UnlockExit mutate the application applet's shared
-            // exit-deferral state and carry no input or output payload:
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1094-L1099
-            1 | 2 => {
-                if !request.data.is_empty() {
+            40 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 }
-                session.set_exit_locked(request.command_id == 1);
-                applet_data(request.token, &[])
-            }
-            40 => {
                 let Some(layer) = video_system.create_layer(1) else {
                     return applet_error(
                         request.token,
@@ -2685,6 +2887,9 @@ fn dispatch_applet(
                 let Some(enabled) = request.data.first() else {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
+                if request.data[1..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
                 session.set_operation_mode_changed_notification(*enabled != 0);
                 applet_data(request.token, &[])
             }
@@ -2692,6 +2897,9 @@ fn dispatch_applet(
                 let Some(enabled) = request.data.first() else {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
+                if request.data[1..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
                 session.set_performance_mode_changed_notification(*enabled != 0);
                 applet_data(request.token, &[])
             }
@@ -2699,26 +2907,352 @@ fn dispatch_applet(
                 let Some(mode) = request.data.get(..3) else {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
+                if request.data[3..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
                 session.set_focus_handling_mode([mode[0] != 0, mode[1] != 0, mode[2] != 0]);
                 applet_data(request.token, &[])
             }
             command_id => unsupported_service_command("ISelfController", command_id),
         },
         AppletObject::WindowController => match request.command_id {
-            1 => applet_data(request.token, &process.process_id().to_le_bytes()),
+            1 if request.data.is_empty() && !has_ipc_descriptors(hipc) => {
+                applet_data(request.token, &process.process_id().to_le_bytes())
+            }
             // AcquireForegroundRights has no input/output payload:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1271-L1279
             10 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
                 session.acquire_foreground_rights();
                 applet_data(request.token, &[])
             }
             command_id => unsupported_service_command("IWindowController", command_id),
         },
         AppletObject::ApplicationFunctions => match request.command_id {
-            40 => applet_data(request.token, &[1]),
+            40 if request.data.is_empty() && !has_ipc_descriptors(hipc) => {
+                applet_data(request.token, &[1])
+            }
             command_id => unsupported_service_command("IApplicationFunctions", command_id),
         },
-        AppletObject::LibraryAppletCreator
+        AppletObject::LibraryAppletCreator => match request.command_id {
+            // CreateLibraryApplet takes one AppletId/LibAppletMode pair and
+            // returns an ILibraryAppletAccessor domain object. libnx consumes
+            // that accessor immediately to obtain its state-change event:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1516-L1564
+            0 => {
+                if request.data.len() < 8
+                    || request.data[8..].iter().any(|byte| *byte != 0)
+                    || has_ipc_descriptors(hipc)
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let Some(applet_id) =
+                    request_u32(request.data, 0).and_then(LibraryAppletId::from_raw)
+                else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                let Some(mode) = request_u32(request.data, 4).and_then(LibraryAppletMode::from_raw)
+                else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                match session.create_library_applet(applet_id, mode) {
+                    Ok(accessor_object_id) => {
+                        log::debug!(
+                            "ILibraryAppletCreator created {applet_id:?} in {mode:?} mode as domain object {accessor_object_id:#x}"
+                        );
+                        Ok((
+                            encode_domain_response(
+                                request.token,
+                                HorizonIpcResult::SUCCESS,
+                                &[],
+                                &[],
+                                &[accessor_object_id],
+                            )?,
+                            None,
+                        ))
+                    }
+                    Err(CreateLibraryAppletError::Busy) => Err(IpcWireError::UnsupportedService(
+                        UnsupportedServiceOperation::CommandVariant {
+                            service: "ILibraryAppletCreator",
+                            command_id: 0,
+                            detail: "a prior library applet remains active",
+                        },
+                    )),
+                    Err(CreateLibraryAppletError::DomainCapacityExhausted) => {
+                        Err(IpcWireError::HostResourceExhausted(
+                            "allocating a library-applet domain object",
+                        ))
+                    }
+                    Err(CreateLibraryAppletError::NotDomain) => Err(IpcWireError::Internal(
+                        "library applet creation escaped its domain session",
+                    )),
+                }
+            }
+            // CreateStorage allocates one zero-filled IStorage object. The
+            // signed libnx size reaches CMIF as the same 64-bit bit pattern:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1761-L1767
+            10 => {
+                if request.data.len() < 8
+                    || request.data[8..].iter().any(|byte| *byte != 0)
+                    || has_ipc_descriptors(hipc)
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let size =
+                    request_u64(request.data, 0).expect("validated CreateStorage payload length");
+                match session.create_storage(size) {
+                    Ok(storage_object_id) => Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[],
+                            &[storage_object_id],
+                        )?,
+                        None,
+                    )),
+                    Err(CreateAppletStorageError::DomainCapacityExhausted) => {
+                        Err(IpcWireError::HostResourceExhausted(
+                            "allocating an applet-storage domain object",
+                        ))
+                    }
+                    Err(CreateAppletStorageError::SizeOutOfRange) => {
+                        Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "ILibraryAppletCreator",
+                                command_id: 10,
+                                detail: "applet storage size cannot be represented by the host",
+                            },
+                        ))
+                    }
+                    Err(CreateAppletStorageError::AllocationFailed) => Err(
+                        IpcWireError::HostResourceExhausted("allocating applet-storage backing"),
+                    ),
+                    Err(CreateAppletStorageError::NotDomain) => Err(IpcWireError::Internal(
+                        "applet storage creation escaped its domain session",
+                    )),
+                }
+            }
+            command_id => unsupported_service_command("ILibraryAppletCreator", command_id),
+        },
+        AppletObject::LibraryAppletAccessor { .. } => match request.command_id {
+            0 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let Some(event) = session.library_applet_state_changed_event(object_id) else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND);
+                };
+                let handle = process.handles_mut().insert(event).map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a library-applet event handle")
+                })?;
+                Ok((
+                    encode_domain_response(
+                        request.token,
+                        HorizonIpcResult::SUCCESS,
+                        &[],
+                        &[handle],
+                        &[],
+                    )?,
+                    Some(handle),
+                ))
+            }
+            // Start freezes the queued inputs into one launch request. Until
+            // Nixe has a graphical system-applet host, Error applets become a
+            // typed fatal diagnostic rather than hanging on their state event
+            // or pretending that the dialog completed.
+            10 => {
+                if !request.data.is_empty()
+                    || has_ipc_descriptors(hipc)
+                    || !input_objects.is_empty()
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let launch = session
+                    .prepare_library_applet_launch(object_id)
+                    .map_err(|error| match error {
+                        PrepareLibraryAppletLaunchError::AppletNotFound => IpcWireError::Internal(
+                            "live library-applet accessor lost its launch state",
+                        ),
+                        PrepareLibraryAppletLaunchError::StorageBackingMissing => {
+                            IpcWireError::Internal(
+                                "library-applet input queue lost retained storage backing",
+                            )
+                        }
+                        PrepareLibraryAppletLaunchError::AllocationFailed => {
+                            IpcWireError::HostResourceExhausted(
+                                "snapshotting library-applet launch inputs",
+                            )
+                        }
+                    })?;
+                if launch.applet_id != LibraryAppletId::Error {
+                    return Err(IpcWireError::UnsupportedService(
+                        UnsupportedServiceOperation::CommandVariant {
+                            service: "ILibraryAppletAccessor",
+                            command_id: 10,
+                            detail: "library-applet execution coordinator is unavailable",
+                        },
+                    ));
+                }
+                Err(IpcWireError::ErrorApplet(Box::new(
+                    crate::ErrorAppletDiagnostic::decode(&launch.input_storages)
+                        .with_launch_mode(launch.mode.as_raw()),
+                )))
+            }
+            // PushInData transfers one IStorage domain object into the
+            // library applet's ordered input channel. libnx closes its local
+            // storage object after dispatch, so the channel must retain the
+            // backing independently until the applet consumes or releases it.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L779-L793
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1754-L1758
+            100 => {
+                if !request.data.is_empty() || has_ipc_descriptors(hipc) || input_objects.len() != 1
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                match session.push_library_applet_input_storage(object_id, input_objects[0]) {
+                    Ok(()) => applet_data(request.token, &[]),
+                    Err(PushLibraryAppletStorageError::AllocationFailed) => Err(
+                        IpcWireError::HostResourceExhausted("queuing library-applet input storage"),
+                    ),
+                    Err(PushLibraryAppletStorageError::AppletNotFound) => {
+                        Err(IpcWireError::Internal(
+                            "live library-applet accessor lost its active applet",
+                        ))
+                    }
+                    Err(PushLibraryAppletStorageError::StorageNotFound) => {
+                        Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "ILibraryAppletAccessor",
+                                command_id: 100,
+                                detail: "input domain object is not a live IStorage",
+                            },
+                        ))
+                    }
+                }
+            }
+            command_id => unsupported_service_command("ILibraryAppletAccessor", command_id),
+        },
+        AppletObject::Storage { storage_id } => match request.command_id {
+            0 if request.data.is_empty() && !has_ipc_descriptors(hipc) => {
+                let accessor_object_id = match session.open_storage_accessor(storage_id) {
+                    Ok(object_id) => object_id,
+                    Err(OpenAppletStorageAccessorError::StorageNotFound) => {
+                        return Err(IpcWireError::Internal(
+                            "live applet storage object lost its backing",
+                        ));
+                    }
+                    Err(OpenAppletStorageAccessorError::DomainCapacityExhausted) => {
+                        return Err(IpcWireError::HostResourceExhausted(
+                            "allocating an applet-storage accessor domain object",
+                        ));
+                    }
+                    Err(OpenAppletStorageAccessorError::ObjectIdExhausted) => {
+                        return Err(IpcWireError::HostResourceExhausted(
+                            "allocating an applet-storage accessor object ID",
+                        ));
+                    }
+                };
+                Ok((
+                    encode_domain_response(
+                        request.token,
+                        HorizonIpcResult::SUCCESS,
+                        &[],
+                        &[],
+                        &[accessor_object_id],
+                    )?,
+                    None,
+                ))
+            }
+            command_id => unsupported_service_command("IStorage", command_id),
+        },
+        AppletObject::StorageAccessor { storage_id } => match request.command_id {
+            0 if request.data.is_empty() && !has_ipc_descriptors(hipc) => {
+                let Some(size) = session.storage_size(storage_id) else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND);
+                };
+                applet_data(request.token, &size.to_le_bytes())
+            }
+            // libnx selects pointer or map-alias buffers according to the
+            // transfer size and sends the byte offset as a signed 64-bit
+            // value. Negative offsets retain their bit pattern and therefore
+            // fail the checked storage range below:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1830-L1879
+            10 => {
+                if request.data.len() < 8
+                    || request.data[8..].iter().any(|byte| *byte != 0)
+                    || hipc.pid.is_some()
+                    || !hipc.copy_handles.is_empty()
+                    || !hipc.move_handles.is_empty()
+                    || !matches!(hipc.receive_statics, ReceiveStatics::None)
+                    || !hipc.receive_buffers.is_empty()
+                    || !hipc.exchange_buffers.is_empty()
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let (address, size) = one_auto_select_input(hipc)?;
+                let mut bytes = vec![0; size];
+                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+                let offset = request_u64(request.data, 0)
+                    .expect("validated IStorageAccessor::Write payload length");
+                match session.write_storage(storage_id, offset, &bytes) {
+                    Ok(()) => applet_data(request.token, &[]),
+                    Err(AppletStorageAccessError::NotFound) => {
+                        applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
+                    }
+                    Err(AppletStorageAccessError::OutOfRange) => {
+                        Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IStorageAccessor",
+                                command_id: 10,
+                                detail: "out-of-range applet storage write",
+                            },
+                        ))
+                    }
+                }
+            }
+            11 => {
+                if request.data.len() < 8
+                    || request.data[8..].iter().any(|byte| *byte != 0)
+                    || hipc.pid.is_some()
+                    || !hipc.copy_handles.is_empty()
+                    || !hipc.move_handles.is_empty()
+                    || !hipc.send_statics.is_empty()
+                    || !hipc.send_buffers.is_empty()
+                    || !hipc.exchange_buffers.is_empty()
+                {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                let (address, size) = one_auto_select_output(hipc)?;
+                let offset = request_u64(request.data, 0)
+                    .expect("validated IStorageAccessor::Read payload length");
+                match session.read_storage(storage_id, offset, size) {
+                    Ok(bytes) => {
+                        write_bytes(process, GuestVirtualAddress::new(address), &bytes)?;
+                        applet_data(request.token, &[])
+                    }
+                    Err(AppletStorageAccessError::NotFound) => {
+                        applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
+                    }
+                    Err(AppletStorageAccessError::OutOfRange) => {
+                        Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IStorageAccessor",
+                                command_id: 11,
+                                detail: "out-of-range applet storage read",
+                            },
+                        ))
+                    }
+                }
+            }
+            command_id => unsupported_service_command("IStorageAccessor", command_id),
+        },
+        AppletObject::HomeMenuFunctions
+        | AppletObject::GlobalStateController
+        | AppletObject::ApplicationCreator
+        | AppletObject::AppletCommonFunctions
         | AppletObject::AudioController
         | AppletObject::DisplayController
         | AppletObject::DebugFunctions => {
@@ -2745,7 +3279,9 @@ fn dispatch_hid(
             let handle = process
                 .handles_mut()
                 .insert(session.create_applet_resource())
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a HID applet-resource handle")
+                })?;
             log::debug!("hid created IAppletResource handle {handle:#x}");
             semantic_success(request.token, false, &[], &[], &[], Some(handle))
         }
@@ -2833,7 +3369,9 @@ fn dispatch_hid_applet_resource(
     let handle = process
         .handles_mut()
         .insert(resource.shared_memory())
-        .map_err(|_| IpcWireError::ResourceExhausted)?;
+        .map_err(|_| {
+            IpcWireError::HostResourceExhausted("installing a HID shared-memory handle")
+        })?;
     log::debug!("hid returned shared-memory handle {handle:#x}");
     semantic_success(request.token, false, &[], &[handle], &[], None)
 }
@@ -2862,7 +3400,9 @@ fn dispatch_time(
             let handle = process
                 .handles_mut()
                 .insert(session.shared_memory())
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a time shared-memory handle")
+                })?;
             log::debug!("time:u returned shared-memory handle {handle:#x}");
             return semantic_success(request.token, false, &[], &[handle], &[], None);
         }
@@ -2871,7 +3411,9 @@ fn dispatch_time(
     let handle = process
         .handles_mut()
         .insert_object(child.expect("time child command was selected"))
-        .map_err(|_| IpcWireError::ResourceExhausted)?;
+        .map_err(|_| {
+            IpcWireError::HostResourceExhausted("installing a time service child handle")
+        })?;
     log::debug!(
         "time:u command {} returned child session handle {handle:#x}",
         request.command_id
@@ -2903,7 +3445,9 @@ fn dispatch_system_clock(
             };
             session
                 .set_current_time(i64::from_le_bytes(timestamp.try_into().unwrap()))
-                .map_err(|_| IpcWireError::ResourceExhausted)?;
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("updating the emulated system clock")
+                })?;
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         command_id => unsupported_service_command("ISystemClock", command_id),
@@ -2990,7 +3534,9 @@ fn applet_child(
     name: &'static str,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(object_id) = session.insert_object(object) else {
-        return applet_error(token, HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES);
+        return Err(IpcWireError::HostResourceExhausted(
+            "allocating an applet domain child object",
+        ));
     };
     log::debug!("appletOE opened {name} as domain object {object_id:#x}");
     Ok((
@@ -3016,8 +3562,12 @@ fn applet_error(
 const fn applet_object_name(object: AppletObject) -> &'static str {
     match object {
         AppletObject::Root => "IApplicationProxyService",
-        AppletObject::ApplicationProxy => "IApplicationProxy",
+        AppletObject::Proxy(kind) => applet_proxy_name(kind),
         AppletObject::ApplicationFunctions => "IApplicationFunctions",
+        AppletObject::HomeMenuFunctions => "IHomeMenuFunctions",
+        AppletObject::GlobalStateController => "IGlobalStateController",
+        AppletObject::ApplicationCreator => "IApplicationCreator",
+        AppletObject::AppletCommonFunctions => "IAppletCommonFunctions",
         AppletObject::LibraryAppletCreator => "ILibraryAppletCreator",
         AppletObject::CommonStateGetter => "ICommonStateGetter",
         AppletObject::SelfController => "ISelfController",
@@ -3025,7 +3575,45 @@ const fn applet_object_name(object: AppletObject) -> &'static str {
         AppletObject::AudioController => "IAudioController",
         AppletObject::DisplayController => "IDisplayController",
         AppletObject::DebugFunctions => "IDebugFunctions",
+        AppletObject::LibraryAppletAccessor { .. } => "ILibraryAppletAccessor",
+        AppletObject::Storage { .. } => "IStorage",
+        AppletObject::StorageAccessor { .. } => "IStorageAccessor",
     }
+}
+
+const fn applet_proxy_name(kind: AppletProxyKind) -> &'static str {
+    match kind {
+        AppletProxyKind::Application => "IApplicationProxy",
+        AppletProxyKind::SystemApplet => "ISystemAppletProxy",
+    }
+}
+
+const fn applet_proxy_kind(command_id: u32) -> Option<AppletProxyKind> {
+    match command_id {
+        0 => Some(AppletProxyKind::Application),
+        100 => Some(AppletProxyKind::SystemApplet),
+        _ => None,
+    }
+}
+
+const fn applet_proxy_child(kind: AppletProxyKind, command_id: u32) -> Option<AppletObject> {
+    Some(match command_id {
+        0 => AppletObject::CommonStateGetter,
+        1 => AppletObject::SelfController,
+        2 => AppletObject::WindowController,
+        3 => AppletObject::AudioController,
+        4 => AppletObject::DisplayController,
+        11 => AppletObject::LibraryAppletCreator,
+        1000 => AppletObject::DebugFunctions,
+        20 => match kind {
+            AppletProxyKind::Application => AppletObject::ApplicationFunctions,
+            AppletProxyKind::SystemApplet => AppletObject::HomeMenuFunctions,
+        },
+        21 if matches!(kind, AppletProxyKind::SystemApplet) => AppletObject::GlobalStateController,
+        22 if matches!(kind, AppletProxyKind::SystemApplet) => AppletObject::ApplicationCreator,
+        23 if matches!(kind, AppletProxyKind::SystemApplet) => AppletObject::AppletCommonFunctions,
+        _ => return None,
+    })
 }
 
 fn cmif_error(
@@ -3241,6 +3829,81 @@ pub(crate) fn write_bytes(
     Ok(())
 }
 
+pub(crate) fn validate_writable_ram_range(
+    process: &ExceptionProcessContext<'_>,
+    start: GuestVirtualAddress,
+    size: usize,
+) -> Result<(), IpcWireError> {
+    let address_space = process.cpu().address_space_id();
+    let end = start.get().checked_add(size as u64).ok_or_else(|| {
+        IpcWireError::GuestMemory(DataAccessFault::new(
+            address_space,
+            start,
+            DataAccessKind::Write,
+            DataAccessFaultReason::AddressOverflow,
+        ))
+    })?;
+    let limit = GuestVirtualAddress::new(process.address_space_limit());
+    let mut cursor = start;
+    while cursor.get() < end {
+        let Some(mapping) = process.memory().query_memory(address_space, cursor, limit) else {
+            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
+                address_space,
+                cursor,
+                DataAccessKind::Write,
+                DataAccessFaultReason::Unmapped,
+            )));
+        };
+        if mapping.region != Some(MemoryRegionKind::Ram) {
+            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
+                address_space,
+                cursor,
+                DataAccessKind::Write,
+                DataAccessFaultReason::Device(
+                    "IPC response buffer must be backed by ordinary RAM".into(),
+                ),
+            )));
+        }
+        if !mapping.permissions.contains(MemoryPermissions::WRITE) {
+            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
+                address_space,
+                cursor,
+                DataAccessKind::Write,
+                DataAccessFaultReason::WritePermissionDenied,
+            )));
+        }
+        let mapping_end = mapping
+            .base
+            .get()
+            .checked_add(mapping.size)
+            .ok_or(IpcWireError::Internal("guest memory query range overflows"))?;
+        if mapping_end <= cursor.get() {
+            return Err(IpcWireError::Internal(
+                "guest memory query did not advance while validating an IPC response",
+            ));
+        }
+        cursor = GuestVirtualAddress::new(mapping_end.min(end));
+    }
+    Ok(())
+}
+
+fn write_response(
+    process: &ExceptionProcessContext<'_>,
+    start: GuestVirtualAddress,
+    capacity: usize,
+    response: &[u8],
+) -> Result<(), IpcWireError> {
+    if response.len() > capacity {
+        return Err(IpcWireError::Internal(
+            "encoded IPC response exceeds its prevalidated command buffer",
+        ));
+    }
+    write_bytes(process, start, response).map_err(|error| match error {
+        IpcWireError::GuestMemory(fault) => IpcWireError::ResponseCommit(fault),
+        error => error,
+    })
+}
+
 fn read_u8(
     process: &ExceptionProcessContext<'_>,
     address: GuestVirtualAddress,
@@ -3272,6 +3935,60 @@ fn add(address: GuestVirtualAddress, offset: usize) -> Result<GuestVirtualAddres
 mod tests {
     use super::*;
     use crate::ipc_message::ReceiveStaticDescriptor;
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_send_static(bytes: &mut [u8], offset: usize, address: u64, size: u16) {
+        let first = (((address >> 36) as u32 & 0x3f) << 6)
+            | (((address >> 32) as u32 & 0xf) << 12)
+            | (u32::from(size) << 16);
+        put_u32(bytes, offset, first);
+        put_u32(bytes, offset + 4, address as u32);
+    }
+
+    fn put_buffer(bytes: &mut [u8], offset: usize, address: u64, size: u64) {
+        put_u32(bytes, offset, size as u32);
+        put_u32(bytes, offset + 4, address as u32);
+        put_u32(
+            bytes,
+            offset + 8,
+            ((address >> 36) as u32 & 0x3f_ffff) << 2
+                | ((size >> 32) as u32 & 0xf) << 24
+                | ((address >> 32) as u32 & 0xf) << 28,
+        );
+    }
+
+    fn auto_select_input(
+        pointer: (u64, u16),
+        map_alias: (u64, u64),
+    ) -> Result<(u64, usize), IpcWireError> {
+        let mut command = [0_u8; COMMAND_BUFFER_SIZE];
+        put_u32(&mut command, 0, 4 | (1 << 16) | (1 << 20));
+        put_send_static(&mut command, 8, pointer.0, pointer.1);
+        put_buffer(&mut command, 16, map_alias.0, map_alias.1);
+        let hipc = HipcRequest::decode(&command).unwrap();
+        one_auto_select_input(&hipc)
+    }
+
+    fn auto_select_output(
+        pointer: (u64, u16),
+        map_alias: (u64, u64),
+    ) -> Result<(u64, usize), IpcWireError> {
+        let mut command = [0_u8; COMMAND_BUFFER_SIZE];
+        put_u32(&mut command, 0, 4 | (1 << 24));
+        put_u32(&mut command, 4, 3 << 10);
+        put_buffer(&mut command, 8, map_alias.0, map_alias.1);
+        put_u32(&mut command, 20, pointer.0 as u32);
+        put_u32(
+            &mut command,
+            24,
+            ((pointer.0 >> 32) as u32 & 0xffff) | (u32::from(pointer.1) << 16),
+        );
+        let hipc = HipcRequest::decode(&command).unwrap();
+        one_auto_select_output(&hipc)
+    }
 
     fn nv_ioctl_descriptors(
         input: BufferDescriptor,
@@ -3329,6 +4046,53 @@ mod tests {
             size,
             mode: BufferMode::Normal,
         }
+    }
+
+    #[test]
+    fn auto_select_input_decodes_the_libnx_descriptor_pair() {
+        assert_eq!(auto_select_input((0, 0), (0x2000, 8)), Ok((0x2000, 8)));
+        assert_eq!(auto_select_input((0x3000, 4), (0, 0)), Ok((0x3000, 4)));
+        assert_eq!(auto_select_input((0, 0), (0, 0)), Ok((0, 0)));
+    }
+
+    #[test]
+    fn auto_select_input_rejects_ambiguous_or_invalid_pairs() {
+        assert_eq!(
+            auto_select_input((0x1000, 4), (0x2000, 4)),
+            Err(IpcWireError::Malformed(
+                "auto-select input has both descriptor sides active"
+            ))
+        );
+        assert_eq!(
+            auto_select_input((0, 4), (0, 0)),
+            Err(IpcWireError::Malformed(
+                "auto-select input has a null address with nonzero size"
+            ))
+        );
+    }
+
+    #[test]
+    fn auto_select_output_decodes_the_libnx_descriptor_pair() {
+        assert_eq!(auto_select_output((0, 0), (0x4000, 16)), Ok((0x4000, 16)));
+        assert_eq!(auto_select_output((0x5000, 12), (0, 0)), Ok((0x5000, 12)));
+        assert_eq!(
+            auto_select_output((0x5000, 12), (0x4000, 16)),
+            Err(IpcWireError::Malformed(
+                "auto-select output has both descriptor sides active"
+            ))
+        );
+    }
+
+    #[test]
+    fn complete_descriptor_check_includes_receive_statics() {
+        let mut command = [0_u8; COMMAND_BUFFER_SIZE];
+        put_u32(&mut command, 0, 4);
+        put_u32(&mut command, 4, 3 << 10);
+        put_u32(&mut command, 8, 0x2000);
+        put_u32(&mut command, 12, 4 << 16);
+        let hipc = HipcRequest::decode(&command).unwrap();
+
+        assert!(has_ipc_descriptors(&hipc));
     }
 
     #[test]
@@ -3392,6 +4156,25 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn applet_proxy_children_follow_the_caller_role() {
+        assert_eq!(applet_proxy_kind(100), Some(AppletProxyKind::SystemApplet));
+        assert_eq!(applet_proxy_kind(200), None);
+        assert_eq!(
+            applet_proxy_child(AppletProxyKind::Application, 20),
+            Some(AppletObject::ApplicationFunctions)
+        );
+        assert_eq!(
+            applet_proxy_child(AppletProxyKind::SystemApplet, 20),
+            Some(AppletObject::HomeMenuFunctions)
+        );
+        assert_eq!(
+            applet_proxy_child(AppletProxyKind::SystemApplet, 23),
+            Some(AppletObject::AppletCommonFunctions)
+        );
+        assert_eq!(applet_proxy_child(AppletProxyKind::Application, 23), None);
     }
 
     #[test]

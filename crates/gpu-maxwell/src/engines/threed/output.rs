@@ -394,6 +394,75 @@ impl MaxwellThreeDBlendEnableCommon {
     }
 }
 
+/// Color and alpha participation in Maxwell's iterated-blend path.
+///
+/// Iterated blending performs additional blend passes and therefore changes
+/// output semantics when either bit is enabled. A disabled value is neutral;
+/// enabled values must remain visible to draw lowering rather than being
+/// mistaken for ordinary single-pass blending.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cla297.h#L1065-L1074>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDIteratedBlend {
+    color_enabled: bool,
+    alpha_enabled: bool,
+}
+
+impl MaxwellThreeDIteratedBlend {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x3 != 0 {
+            return None;
+        }
+        Some(Self {
+            color_enabled: raw & 1 != 0,
+            alpha_enabled: raw & 2 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn color_enabled(self) -> bool {
+        self.color_enabled
+    }
+
+    #[must_use]
+    pub const fn alpha_enabled(self) -> bool {
+        self.alpha_enabled
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.color_enabled || self.alpha_enabled
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.color_enabled as u32 | (self.alpha_enabled as u32) << 1
+    }
+}
+
+/// Eight-bit pass count paired with `SET_ITERATED_BLEND`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct MaxwellThreeDIteratedBlendPassCount(u8);
+
+impl MaxwellThreeDIteratedBlendPassCount {
+    #[must_use]
+    pub const fn new(pass_count: u8) -> Self {
+        Self(pass_count)
+    }
+
+    #[must_use]
+    pub const fn pass_count(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0 as u32
+    }
+}
+
 /// Whether format-specific blend handling is selected for
 /// `SNORM8`/`UNORM16`/`SNORM16` color targets.
 ///
@@ -477,6 +546,8 @@ pub struct MaxwellThreeDBlendControlState {
     per_format_enable: MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable>,
     float_pixel_kill_enable: MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable>,
     zero_times_anything_is_zero: MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero>,
+    iterated_blend: MaxwellThreeDRegister<MaxwellThreeDIteratedBlend>,
+    iterated_blend_pass_count: MaxwellThreeDRegister<MaxwellThreeDIteratedBlendPassCount>,
 }
 
 impl MaxwellThreeDBlendControlState {
@@ -499,6 +570,18 @@ impl MaxwellThreeDBlendControlState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero> {
         &self.zero_times_anything_is_zero
+    }
+
+    #[must_use]
+    pub const fn iterated_blend(&self) -> &MaxwellThreeDRegister<MaxwellThreeDIteratedBlend> {
+        &self.iterated_blend
+    }
+
+    #[must_use]
+    pub const fn iterated_blend_pass_count(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDIteratedBlendPassCount> {
+        &self.iterated_blend_pass_count
     }
 }
 
@@ -1187,6 +1270,16 @@ impl MaxwellThreeDFixedFunctionState {
             dependencies.push(self.blend_controls.per_format_enable.raw());
             dependencies.push(self.blend_controls.zero_times_anything_is_zero.raw());
         }
+        if !active_color_targets.is_empty()
+            && self
+                .blend_controls
+                .iterated_blend
+                .value()
+                .is_some_and(|value| value.enabled())
+        {
+            dependencies.push(self.blend_controls.iterated_blend.raw());
+            dependencies.push(self.blend_controls.iterated_blend_pass_count.raw());
+        }
         if self
             .register(MaxwellThreeDFixedFunctionRegister::LogicOpEnable)
             .value()
@@ -1366,6 +1459,14 @@ impl MaxwellThreeDFixedFunctionState {
                 self.blend_controls.zero_times_anything_is_zero =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, .. } => {
+                self.blend_controls.iterated_blend =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, .. } => {
+                self.blend_controls.iterated_blend_pass_count =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
         }
     }
 }
@@ -1454,6 +1555,14 @@ pub enum MaxwellThreeDFixedFunctionWrite {
         value: MaxwellThreeDBlendZeroTimesAnythingIsZero,
         source: MaxwellMethodSource,
     },
+    IteratedBlend {
+        value: MaxwellThreeDIteratedBlend,
+        source: MaxwellMethodSource,
+    },
+    IteratedBlendPassCount {
+        value: MaxwellThreeDIteratedBlendPassCount,
+        source: MaxwellMethodSource,
+    },
 }
 impl MaxwellThreeDFixedFunctionWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
@@ -1473,7 +1582,9 @@ impl MaxwellThreeDFixedFunctionWrite {
             | Self::BlendState { source, .. }
             | Self::BlendPerFormatEnable { source, .. }
             | Self::BlendFloatPixelKillEnable { source, .. }
-            | Self::BlendZeroTimesAnythingIsZero { source, .. } => source,
+            | Self::BlendZeroTimesAnythingIsZero { source, .. }
+            | Self::IteratedBlend { source, .. }
+            | Self::IteratedBlendPassCount { source, .. } => source,
         }
     }
 }

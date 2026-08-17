@@ -56,6 +56,10 @@ impl MaxwellMethodSource {
         }
     }
 
+    pub(crate) const fn with_effective_argument(self, argument: u32) -> Self {
+        Self { argument, ..self }
+    }
+
     #[must_use]
     pub const fn channel(self) -> MaxwellChannelId {
         self.channel
@@ -143,6 +147,13 @@ impl MaxwellMethodDispatch {
             source,
             class,
             kind: MaxwellMethodDispatchKind::ClassMethod,
+        }
+    }
+
+    pub(crate) const fn with_effective_argument(self, argument: u32) -> Self {
+        Self {
+            source: self.source.with_effective_argument(argument),
+            ..self
         }
     }
 

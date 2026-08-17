@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(capture.total_words(), 5);
         assert_eq!(capture.words()[0].location().entry_index, 0);
         assert_eq!(capture.words()[1].location().entry_index, 1);
-        assert_eq!(first.packets().len(), 2);
+        assert_eq!(first.packets().len(), 3);
         assert_eq!(
             first.packets()[1].methods()[0].metadata().method_name(),
             "NO_OPERATION"
@@ -551,11 +551,19 @@ mod tests {
             first.packets()[1].methods()[0].method().source().argument(),
             0xfeed_beef
         );
+        assert_eq!(
+            first.packets()[2].methods()[0].metadata().method_name(),
+            "WAIT_FOR_IDLE"
+        );
+        assert!(matches!(
+            first.packets()[2].methods()[0].effect(),
+            crate::MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                crate::MaxwellThreeDSynchronizationTrigger::WaitForIdle { value: 0, .. }
+            )
+        ));
         assert!(matches!(
             first.failure(),
-            MaxwellFrontendFailure::EngineDispatch(
-                MaxwellEngineDispatchError::MissingCapability { .. }
-            )
+            MaxwellFrontendFailure::ExecutionUnavailable
         ));
 
         let mut replay_channel = initial;
