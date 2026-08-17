@@ -323,6 +323,79 @@ pub enum MaxwellThreeDColorCompressionMode {
     Enabled = 1,
 }
 
+/// Sample-count threshold used by Maxwell's internal compression policy.
+///
+/// This register does not enable compression, select an image layout, or
+/// change guest-visible attachment contents. It is retained separately from
+/// the per-target compression selectors so a future hardware-accurate memory
+/// implementation can consume the policy without leaking it into host
+/// pipeline identity.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9297.h#L1620-L1634>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDCompressionThreshold {
+    Samples0 = 0,
+    Samples1 = 1,
+    Samples2 = 2,
+    Samples4 = 3,
+    Samples8 = 4,
+    Samples16 = 5,
+    Samples32 = 6,
+    Samples64 = 7,
+    Samples128 = 8,
+    Samples256 = 9,
+    Samples512 = 10,
+    Samples1024 = 11,
+    Samples2048 = 12,
+}
+
+impl MaxwellThreeDCompressionThreshold {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Samples0),
+            1 => Some(Self::Samples1),
+            2 => Some(Self::Samples2),
+            3 => Some(Self::Samples4),
+            4 => Some(Self::Samples8),
+            5 => Some(Self::Samples16),
+            6 => Some(Self::Samples32),
+            7 => Some(Self::Samples64),
+            8 => Some(Self::Samples128),
+            9 => Some(Self::Samples256),
+            10 => Some(Self::Samples512),
+            11 => Some(Self::Samples1024),
+            12 => Some(Self::Samples2048),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    #[must_use]
+    pub const fn sample_count(self) -> u16 {
+        match self {
+            Self::Samples0 => 0,
+            Self::Samples1 => 1,
+            Self::Samples2 => 2,
+            Self::Samples4 => 4,
+            Self::Samples8 => 8,
+            Self::Samples16 => 16,
+            Self::Samples32 => 32,
+            Self::Samples64 => 64,
+            Self::Samples128 => 128,
+            Self::Samples256 => 256,
+            Self::Samples512 => 512,
+            Self::Samples1024 => 1024,
+            Self::Samples2048 => 2048,
+        }
+    }
+}
+
 /// Ordered color-target routing selected by `SET_CT_SELECT`.
 ///
 /// The complete register payload is retained, including selectors beyond
@@ -725,6 +798,7 @@ impl MaxwellThreeDClearState {
 pub struct MaxwellThreeDRenderTargetState {
     color: [MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT],
     color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
+    compression_threshold: MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold>,
     separate_fragment_data: MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData>,
     render_target_layer: MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer>,
     render_target_index_offset: MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset>,
@@ -743,6 +817,12 @@ impl MaxwellThreeDRenderTargetState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection> {
         &self.color_target_selection
+    }
+    #[must_use]
+    pub const fn compression_threshold(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold> {
+        &self.compression_threshold
     }
     #[must_use]
     pub const fn separate_fragment_data(
@@ -830,6 +910,9 @@ impl MaxwellThreeDRenderTargetState {
             }
             MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, .. } => {
                 self.color_target_selection = MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, .. } => {
+                self.compression_threshold = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
                 self.separate_fragment_data = MaxwellThreeDRegister::programmed(raw, value, source)
@@ -965,6 +1048,10 @@ pub enum MaxwellThreeDRenderTargetWrite {
         value: MaxwellThreeDColorTargetSelection,
         source: MaxwellMethodSource,
     },
+    CompressionThreshold {
+        value: MaxwellThreeDCompressionThreshold,
+        source: MaxwellMethodSource,
+    },
     SeparateFragmentData {
         value: MaxwellThreeDSeparateFragmentData,
         source: MaxwellMethodSource,
@@ -1067,6 +1154,7 @@ impl MaxwellThreeDRenderTargetWrite {
             | Self::ColorLayer { source, .. }
             | Self::ColorCompression { source, .. }
             | Self::ColorTargetSelection { source, .. }
+            | Self::CompressionThreshold { source, .. }
             | Self::SeparateFragmentData { source, .. }
             | Self::RenderTargetLayer { source, .. }
             | Self::RenderTargetIndexOffset { source, .. }

@@ -586,8 +586,49 @@ impl MaxwellThreeDPatchSize {
     }
 }
 
+/// Internal primitive-work scheduling policy selected by
+/// `SET_BALANCED_PRIMITIVE_WORKLOAD`.
+///
+/// Both boolean fields are published in NVIDIA's public Kepler 3D class and
+/// inherited by later Maxwell classes. They tune hardware scheduling rather
+/// than the observable primitive or raster result:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9297.h#L476-L482>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDBalancedPrimitiveWorkload {
+    in_unpartitioned_mode: bool,
+    in_timesliced_mode: bool,
+}
+
+impl MaxwellThreeDBalancedPrimitiveWorkload {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x11 != 0 {
+            return None;
+        }
+        Some(Self {
+            in_unpartitioned_mode: raw & 1 != 0,
+            in_timesliced_mode: raw & 0x10 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn in_unpartitioned_mode(self) -> bool {
+        self.in_unpartitioned_mode
+    }
+
+    #[must_use]
+    pub const fn in_timesliced_mode(self) -> bool {
+        self.in_timesliced_mode
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.in_unpartitioned_mode as u32 | ((self.in_timesliced_mode as u32) << 4)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDPrimitiveState {
+    balanced_workload: MaxwellThreeDRegister<MaxwellThreeDBalancedPrimitiveWorkload>,
     circular_buffer_throttle: MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle>,
     patch_size: MaxwellThreeDRegister<MaxwellThreeDPatchSize>,
     topology_override: MaxwellThreeDRegister<bool>,
@@ -603,6 +644,13 @@ pub struct MaxwellThreeDPrimitiveState {
 }
 
 impl MaxwellThreeDPrimitiveState {
+    #[must_use]
+    pub const fn balanced_workload(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDBalancedPrimitiveWorkload> {
+        &self.balanced_workload
+    }
+
     #[must_use]
     pub const fn circular_buffer_throttle(
         &self,
@@ -794,6 +842,10 @@ impl MaxwellThreeDVertexInputState {
         let raw = write.raw();
         let source = write.source();
         match write {
+            MaxwellThreeDVertexInputWrite::BalancedPrimitiveWorkload { value, .. } => {
+                self.primitive.balanced_workload =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDVertexInputWrite::PrimitiveCircularBufferThrottle { value, .. } => {
                 self.primitive.circular_buffer_throttle =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -905,6 +957,10 @@ impl MaxwellThreeDVertexInputState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDVertexInputWrite {
+    BalancedPrimitiveWorkload {
+        value: MaxwellThreeDBalancedPrimitiveWorkload,
+        source: MaxwellMethodSource,
+    },
     PrimitiveCircularBufferThrottle {
         value: MaxwellThreeDPrimitiveCircularBufferThrottle,
         source: MaxwellMethodSource,
@@ -1030,7 +1086,8 @@ pub enum MaxwellThreeDVertexInputWrite {
 impl MaxwellThreeDVertexInputWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::PrimitiveCircularBufferThrottle { source, .. }
+            Self::BalancedPrimitiveWorkload { source, .. }
+            | Self::PrimitiveCircularBufferThrottle { source, .. }
             | Self::PatchSize { source, .. }
             | Self::StreamFormat { source, .. }
             | Self::StreamAddressUpper { source, .. }

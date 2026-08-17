@@ -27,7 +27,7 @@ pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume,
     ExceptionRouteError, ExceptionTerminationReason, ExceptionTerminationScope,
-    ExceptionThreadContext,
+    ExceptionThreadContext, GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
 };
 pub use execution_record::{
     ExecutionObservation, ExecutionRecord, MAX_EXECUTION_RECORD_OBSERVATIONS, RecordedStop,
@@ -45,8 +45,9 @@ pub use handle::{
     TransferMemoryObject, WritableEventObject,
 };
 pub use launch_plan::{
-    AddOnContent, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,
-    MountProvenance, PackagedIdentity, ReadOnlyMount,
+    AddOnContent, HOME_BREW_EXECUTABLE_ARGV0, HOME_BREW_EXECUTABLE_GUEST_PATH, HomebrewIdentity,
+    LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole, MountProvenance,
+    PackagedIdentity, ReadOnlyMount,
 };
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
 pub use module_memory::{

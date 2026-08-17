@@ -1,11 +1,15 @@
 //! GM20B `FERMI_TWOD_A` engine boundary.
 
+mod beta;
 mod methods;
 mod notify;
 mod pixels_from_memory;
 mod render_enable;
 mod state;
 
+pub use beta::{
+    MaxwellTwoDBeta1, MaxwellTwoDBeta4, MaxwellTwoDBetaState, MaxwellTwoDBetaStateWrite,
+};
 pub use notify::{
     MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDNotifyAddressLower,
     MaxwellTwoDNotifyAddressUpper, MaxwellTwoDNotifyState, MaxwellTwoDNotifyStateWrite,

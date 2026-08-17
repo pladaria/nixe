@@ -15,6 +15,77 @@ use crate::MaxwellMethodSource;
 
 use super::MaxwellThreeDRegister;
 
+/// Target-independent rasterization mode selected by `SET_TIR`.
+///
+/// NVIDIA publishes the mode and the related `SET_TIR_CONTROL` bit fields in
+/// the pinned `MAXWELL_B` class header:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1302-L1305>
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1801-L1810>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDTirMode {
+    Disabled = 0,
+    RasterNTargetM = 1,
+}
+
+impl MaxwellThreeDTirMode {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::RasterNTargetM),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Validated `SET_TIR_CONTROL` coverage and query policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDTirControl {
+    z_pass_pixel_count_uses_raster_samples: bool,
+    reduce_coverage: bool,
+    alpha_to_coverage_uses_raster_samples: bool,
+}
+
+impl MaxwellThreeDTirControl {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x13 != 0 {
+            return None;
+        }
+        Some(Self {
+            z_pass_pixel_count_uses_raster_samples: raw & 1 != 0,
+            reduce_coverage: raw & 2 != 0,
+            alpha_to_coverage_uses_raster_samples: raw & 0x10 != 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn z_pass_pixel_count_uses_raster_samples(self) -> bool {
+        self.z_pass_pixel_count_uses_raster_samples
+    }
+
+    #[must_use]
+    pub const fn reduce_coverage(self) -> bool {
+        self.reduce_coverage
+    }
+
+    #[must_use]
+    pub const fn alpha_to_coverage_uses_raster_samples(self) -> bool {
+        self.alpha_to_coverage_uses_raster_samples
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.z_pass_pixel_count_uses_raster_samples as u32
+            | ((self.reduce_coverage as u32) << 1)
+            | ((self.alpha_to_coverage_uses_raster_samples as u32) << 4)
+    }
+}
+
 pub const MAXWELL_SAMPLE_LOCATION_GROUP_COUNT: usize = 4;
 pub const MAXWELL_SAMPLE_LOCATIONS_PER_GROUP: usize = 4;
 
@@ -246,6 +317,14 @@ impl MaxwellThreeDCsaaEnable {
 /// One validated coverage-sampling register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDCoverageStateWrite {
+    TirMode {
+        value: MaxwellThreeDTirMode,
+        source: MaxwellMethodSource,
+    },
+    TirControl {
+        value: MaxwellThreeDTirControl,
+        source: MaxwellMethodSource,
+    },
     SampleLocations {
         group: u8,
         value: MaxwellThreeDSampleLocationGroup,
@@ -268,6 +347,8 @@ pub enum MaxwellThreeDCoverageStateWrite {
 /// Persistent coverage-sampling configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDCoverageState {
+    tir_mode: MaxwellThreeDRegister<MaxwellThreeDTirMode>,
+    tir_control: MaxwellThreeDRegister<MaxwellThreeDTirControl>,
     sample_locations: [MaxwellThreeDRegister<MaxwellThreeDSampleLocationGroup>;
         MAXWELL_SAMPLE_LOCATION_GROUP_COUNT],
     hybrid_anti_alias_control: MaxwellThreeDRegister<MaxwellThreeDHybridAntiAliasControl>,
@@ -276,6 +357,16 @@ pub struct MaxwellThreeDCoverageState {
 }
 
 impl MaxwellThreeDCoverageState {
+    #[must_use]
+    pub const fn tir_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTirMode> {
+        &self.tir_mode
+    }
+
+    #[must_use]
+    pub const fn tir_control(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTirControl> {
+        &self.tir_control
+    }
+
     #[must_use]
     pub const fn sample_locations(
         &self,
@@ -305,6 +396,12 @@ impl MaxwellThreeDCoverageState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDCoverageStateWrite) {
         match write {
+            MaxwellThreeDCoverageStateWrite::TirMode { value, source } => {
+                self.tir_mode = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDCoverageStateWrite::TirControl { value, source } => {
+                self.tir_control = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDCoverageStateWrite::SampleLocations {
                 group,
                 value,

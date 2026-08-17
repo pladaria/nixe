@@ -16,7 +16,9 @@ use nixe_cpu_engine::{
 };
 use nixe_memory::GuestVirtualAddress;
 
-use crate::{DiagnosticsPolicy, ExceptionTerminationScope, ReportDetail, VirtualClock};
+use crate::{
+    DiagnosticsPolicy, ExceptionTerminationScope, GuestBreakPayload, ReportDetail, VirtualClock,
+};
 
 static NEXT_ENGINE_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -51,7 +53,12 @@ pub enum ProcessExitCause {
     ProcessRequested,
     LastThreadExited,
     LoaderReturned,
-    GuestBreak { reason: u64, info: u64, size: u64 },
+    GuestBreak {
+        reason: u64,
+        info: u64,
+        size: u64,
+        payload: Option<GuestBreakPayload>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

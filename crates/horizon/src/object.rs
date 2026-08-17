@@ -720,6 +720,7 @@ struct AppletDomain {
     performance_mode_changed_notification: bool,
     focus_handling_mode: [bool; 3],
     foreground_rights_acquired: bool,
+    exit_locked: bool,
 }
 
 /// Client session connected to Horizon's `appletOE` service.
@@ -746,6 +747,7 @@ impl AppletSession {
                 performance_mode_changed_notification: false,
                 focus_handling_mode: [false; 3],
                 foreground_rights_acquired: false,
+                exit_locked: false,
             })),
         }
     }
@@ -847,6 +849,22 @@ impl AppletSession {
         }
     }
 
+    pub(crate) fn set_exit_locked(&self, locked: bool) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domain.exit_locked = locked;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_locked(&self) -> bool {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exit_locked
+    }
+
     #[cfg(test)]
     fn requested_runtime_policy(&self) -> (bool, bool, [bool; 3], bool) {
         let domain = self
@@ -912,6 +930,21 @@ mod applet_tests {
             session.requested_runtime_policy(),
             (true, true, [true, false, true], true)
         );
+    }
+
+    #[test]
+    fn applet_exit_lock_is_shared_idempotent_and_reversible() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        assert!(!session.exit_locked());
+
+        cloned.set_exit_locked(true);
+        cloned.set_exit_locked(true);
+        assert!(session.exit_locked());
+
+        session.set_exit_locked(false);
+        session.set_exit_locked(false);
+        assert!(!cloned.exit_locked());
     }
 }
 
@@ -1033,25 +1066,34 @@ impl ReadOnlyFileSystem {
     }
 }
 
-/// Host-directory filesystem exposed as the removable SD card.
+/// Process-local SD-card filesystem with an optional host-directory backing.
 ///
 /// Guest paths are normalized by the semantic IPC layer. Resolution rejects
 /// every symbolic-link component so a guest cannot escape the configured root
-/// through host filesystem indirection.
+/// through host filesystem indirection. A filesystem without host backing may
+/// still expose immutable launch-time overlay entries.
 #[derive(Clone, Debug)]
 pub struct HostDirectoryFileSystem {
-    root: Arc<PathBuf>,
+    root: Option<Arc<PathBuf>>,
 }
 
 impl HostDirectoryFileSystem {
-    pub(crate) fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: Option<PathBuf>) -> Self {
         Self {
-            root: Arc::new(root),
+            root: root.map(Arc::new),
         }
     }
 
+    pub(crate) const fn has_host_root(&self) -> bool {
+        self.root.is_some()
+    }
+
     pub(crate) fn resolve_existing(&self, guest_path: &str) -> io::Result<PathBuf> {
-        let mut resolved = self.root.as_ref().clone();
+        let mut resolved = self
+            .root
+            .as_ref()
+            .map(|root| root.as_ref().clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SD card is not backed"))?;
         for component in guest_path.trim_start_matches('/').split('/') {
             if component.is_empty() {
                 continue;

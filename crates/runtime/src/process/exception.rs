@@ -161,9 +161,17 @@ impl RunnableProcess {
                 )?;
                 let exit = ProcessExit {
                     cause: match reason {
-                        ExceptionTerminationReason::Break { reason, info, size } => {
-                            ProcessExitCause::GuestBreak { reason, info, size }
-                        }
+                        ExceptionTerminationReason::Break {
+                            reason,
+                            info,
+                            size,
+                            payload,
+                        } => ProcessExitCause::GuestBreak {
+                            reason,
+                            info,
+                            size,
+                            payload,
+                        },
                         ExceptionTerminationReason::Requested => match scope {
                             ExceptionTerminationScope::CurrentThread => {
                                 ProcessExitCause::LastThreadExited

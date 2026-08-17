@@ -3099,6 +3099,7 @@ fn break_retains_guest_payload_in_the_process_exit_record() {
                 reason: 2,
                 info: 0x1234,
                 size: 0x40,
+                payload: None,
             },
         }
     );
@@ -3108,8 +3109,38 @@ fn break_retains_guest_payload_in_the_process_exit_record() {
             reason: 2,
             info: 0x1234,
             size: 0x40,
+            payload: None,
         }
     );
+}
+
+#[test]
+fn break_snapshots_a_small_readable_guest_payload() {
+    let (_directory, mut process) = fixture_process(&[svc(0x26)]);
+    let payload_address = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, payload_address, &[0x0a, 0x06, 0x00, 0x00]);
+    state(&mut process).write_x(x(0), 0);
+    state(&mut process).write_x(x(1), payload_address.get());
+    state(&mut process).write_x(x(2), 4);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+
+    assert!(matches!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Terminated {
+            reason: ExceptionTerminationReason::Break {
+                payload: Some(payload),
+                ..
+            },
+            ..
+        } if payload.as_bytes() == [0x0a, 0x06, 0x00, 0x00]
+    ));
+    assert!(matches!(
+        process.exit().unwrap().cause,
+        ProcessExitCause::GuestBreak {
+            payload: Some(payload),
+            ..
+        } if payload.as_bytes() == [0x0a, 0x06, 0x00, 0x00]
+    ));
 }
 
 #[test]

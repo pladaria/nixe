@@ -5,7 +5,7 @@
 //! `9fdf5c4062007929d9f4e6cbad9c9771fe61b880`:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 
-use crate::MaxwellMethodSource;
+use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
 use super::state::{
     MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
@@ -59,6 +59,7 @@ impl MaxwellThreeDTessellationLod {
 pub struct MaxwellThreeDProgramRegionState {
     address_upper: MaxwellThreeDRegister<u8>,
     address_lower: MaxwellThreeDRegister<u32>,
+    spa_version: MaxwellThreeDRegister<MaxwellSpaVersion>,
 }
 
 impl MaxwellThreeDProgramRegionState {
@@ -70,6 +71,11 @@ impl MaxwellThreeDProgramRegionState {
     #[must_use]
     pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
         &self.address_lower
+    }
+
+    #[must_use]
+    pub const fn spa_version(&self) -> &MaxwellThreeDRegister<MaxwellSpaVersion> {
+        &self.spa_version
     }
 
     #[must_use]
@@ -502,6 +508,7 @@ impl MaxwellThreeDShaderBindingState {
             // base, so both halves participate only while a stage is active.
             dependencies.push(self.program_region.address_upper.raw());
             dependencies.push(self.program_region.address_lower.raw());
+            dependencies.push(self.program_region.spa_version.raw());
         }
         for pipeline in &self.pipeline {
             dependencies.push(pipeline.enabled.raw());
@@ -539,6 +546,10 @@ impl MaxwellThreeDShaderBindingState {
             }
             MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { value, .. } => {
                 self.program_region.address_lower =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDShaderBindingWrite::SpaVersion { value, .. } => {
+                self.program_region.spa_version =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDShaderBindingWrite::PipelineShader {
@@ -656,6 +667,10 @@ pub enum MaxwellThreeDShaderBindingWrite {
         value: u32,
         source: MaxwellMethodSource,
     },
+    SpaVersion {
+        value: MaxwellSpaVersion,
+        source: MaxwellMethodSource,
+    },
     PipelineShader {
         pipeline: u8,
         enabled: bool,
@@ -754,6 +769,7 @@ impl MaxwellThreeDShaderBindingWrite {
         match self {
             Self::ProgramRegionAddressUpper { source, .. }
             | Self::ProgramRegionAddressLower { source, .. }
+            | Self::SpaVersion { source, .. }
             | Self::PipelineShader { source, .. }
             | Self::PipelineProgram { source, .. }
             | Self::PipelineRegisterCount { source, .. }

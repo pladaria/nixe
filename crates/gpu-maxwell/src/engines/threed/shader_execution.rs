@@ -8,6 +8,42 @@ use crate::MaxwellMethodSource;
 
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
+/// Whether Maxwell shader-exception reporting is enabled.
+///
+/// This is guest execution-diagnostic policy rather than a host shader or
+/// pipeline capability. NVIDIA's public class header defines the boolean
+/// field but does not specify an exception payload or reporting transport.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2717-L2720>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDShaderExceptionsEnable {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+impl MaxwellThreeDShaderExceptionsEnable {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Maxwell SPM resource fractions requested for each hardware subtile.
 ///
 /// These fields are performance policy for Maxwell's internal work
@@ -91,6 +127,53 @@ impl MaxwellThreeDSubtilingPerfKnobB {
     pub const fn raw(self) -> u32 {
         self.0 as u32
     }
+}
+
+/// Low and high hardware-occupancy watermarks for one shader resource.
+///
+/// NVIDIA exposes both fields as independent 16-bit values. Their scheduling
+/// effect is internal to the guest GPU, so neutral lowering retains them for
+/// diagnostics and replay without making them host-pipeline dependencies.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9297.h>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDShaderWatermarkRange {
+    low: u16,
+    high: u16,
+}
+
+impl MaxwellThreeDShaderWatermarkRange {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Self {
+        Self {
+            low: raw as u16,
+            high: (raw >> 16) as u16,
+        }
+    }
+
+    #[must_use]
+    pub const fn low(self) -> u16 {
+        self.low
+    }
+
+    #[must_use]
+    pub const fn high(self) -> u16 {
+        self.high
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.low as u32 | (self.high as u32) << 16
+    }
+}
+
+/// Shader resource whose internal occupancy watermarks are being programmed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDShaderWatermarkTarget {
+    VertexTessellationGeometryWarps,
+    PixelWarps,
+    PixelRegisters,
 }
 
 /// Largest byte count representable by
@@ -354,12 +437,21 @@ impl MaxwellThreeDSmTimeoutCounterBit {
 /// One validated shader-execution register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderExecutionStateWrite {
+    ShaderExceptionsEnable {
+        value: MaxwellThreeDShaderExceptionsEnable,
+        source: MaxwellMethodSource,
+    },
     SubtilingPerfKnobA {
         value: MaxwellThreeDSubtilingPerfKnobA,
         source: MaxwellMethodSource,
     },
     SubtilingPerfKnobB {
         value: MaxwellThreeDSubtilingPerfKnobB,
+        source: MaxwellMethodSource,
+    },
+    ShaderWatermarks {
+        target: MaxwellThreeDShaderWatermarkTarget,
+        value: MaxwellThreeDShaderWatermarkRange,
         source: MaxwellMethodSource,
     },
     L1Configuration {
@@ -403,8 +495,12 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
+    shader_exceptions_enable: MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable>,
     subtiling_perf_knob_a: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA>,
     subtiling_perf_knob_b: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB>,
+    vtg_warp_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
+    ps_warp_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
+    ps_register_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
     l1_configuration: MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory>,
     visible_call_limit: MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit>,
     sm_timeout_counter_bit: MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit>,
@@ -412,6 +508,13 @@ pub struct MaxwellThreeDShaderExecutionState {
 }
 
 impl MaxwellThreeDShaderExecutionState {
+    #[must_use]
+    pub const fn shader_exceptions_enable(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable> {
+        &self.shader_exceptions_enable
+    }
+
     #[must_use]
     pub const fn subtiling_perf_knob_a(
         &self,
@@ -424,6 +527,27 @@ impl MaxwellThreeDShaderExecutionState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB> {
         &self.subtiling_perf_knob_b
+    }
+
+    #[must_use]
+    pub const fn vtg_warp_watermarks(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        &self.vtg_warp_watermarks
+    }
+
+    #[must_use]
+    pub const fn ps_warp_watermarks(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        &self.ps_warp_watermarks
+    }
+
+    #[must_use]
+    pub const fn ps_register_watermarks(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        &self.ps_register_watermarks
     }
 
     #[must_use]
@@ -459,6 +583,10 @@ impl MaxwellThreeDShaderExecutionState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
+            MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source } => {
+                self.shader_exceptions_enable =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source } => {
                 self.subtiling_perf_knob_a =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
@@ -466,6 +594,22 @@ impl MaxwellThreeDShaderExecutionState {
             MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source } => {
                 self.subtiling_perf_knob_b =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
+                target,
+                value,
+                source,
+            } => {
+                let register = match target {
+                    MaxwellThreeDShaderWatermarkTarget::VertexTessellationGeometryWarps => {
+                        &mut self.vtg_warp_watermarks
+                    }
+                    MaxwellThreeDShaderWatermarkTarget::PixelWarps => &mut self.ps_warp_watermarks,
+                    MaxwellThreeDShaderWatermarkTarget::PixelRegisters => {
+                        &mut self.ps_register_watermarks
+                    }
+                };
+                *register = MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source } => {
                 self.l1_configuration =

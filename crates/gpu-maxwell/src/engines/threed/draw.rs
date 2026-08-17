@@ -35,13 +35,15 @@ use super::{
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDLogicOp,
     MaxwellThreeDPatchSize, MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPointCenterMode,
-    MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex,
-    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderTargetIndexOffset,
-    MaxwellThreeDRenderTargetLayer, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
-    MaxwellThreeDResourceRole, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData,
-    MaxwellThreeDShadeMode, MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage,
-    MaxwellThreeDState, MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
-    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonClipGeneratedEdge,
+    MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex, MaxwellThreeDRenderEnableMode,
+    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
+    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole,
+    MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
+    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage, MaxwellThreeDState,
+    MaxwellThreeDTirControl, MaxwellThreeDTirMode, MaxwellThreeDVertexNumericalType,
+    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportPixelCenter,
+    MaxwellThreeDViewportScaleOffsetEnable,
 };
 
 #[derive(Clone, Debug)]
@@ -1031,6 +1033,15 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.coverage().tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedTirSemantics {
+            control: state.coverage().tir_control().value().copied(),
+        });
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) && let Some(value) = state
         .coverage()
         .hybrid_anti_alias_control()
@@ -1308,6 +1319,12 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         draw_attachments.as_ref(),
         cache,
     )?;
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) {
+        validate_draw_stencil_state(state)?;
+    }
     let shaders = if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
@@ -1767,6 +1784,13 @@ fn validate_line_rasterization_state(
             },
         );
     }
+    if polygon_primitive
+        && polygon_line_mode
+        && state.line().polygon_clip_generated_edge().value()
+            == Some(&MaxwellThreeDPolygonClipGeneratedEdge::DoNotDrawLine)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPolygonClipGeneratedEdgeSemantics);
+    }
 
     match state.line().aliased_line_width_enable().value() {
         None => Err(MaxwellThreeDLoweringError::IncompleteDraw(
@@ -2218,6 +2242,26 @@ fn draw_depth_state(state: &MaxwellThreeDState) -> Result<DepthState, MaxwellThr
         *write_enabled,
         neutral_depth_compare(*compare),
     ))
+}
+
+fn validate_draw_stencil_state(
+    state: &MaxwellThreeDState,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    match state
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::StencilTestEnable)
+        .value()
+    {
+        Some(MaxwellThreeDFixedFunctionValue::Boolean(true)) => {
+            let two_sided = state
+                .fixed_function()
+                .register(MaxwellThreeDFixedFunctionRegister::TwoSidedStencilTestEnable)
+                .value()
+                == Some(&MaxwellThreeDFixedFunctionValue::Boolean(true));
+            Err(MaxwellThreeDLoweringError::UnsupportedStencilTestSemantics { two_sided })
+        }
+        _ => Ok(()),
+    }
 }
 
 const fn neutral_depth_compare(compare: MaxwellThreeDCompareOp) -> DepthCompareOperation {
@@ -3548,6 +3592,9 @@ pub enum MaxwellThreeDLoweringError {
     },
     UnsupportedColorReductionSemantics,
     UnsupportedCsaaSemantics,
+    UnsupportedTirSemantics {
+        control: Option<MaxwellThreeDTirControl>,
+    },
     UnsupportedHybridAntiAliasSemantics(MaxwellThreeDHybridAntiAliasControl),
     UnsupportedSampleLocationsSemantics {
         group: u8,
@@ -3568,6 +3615,9 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedSurfaceClipSemantics,
     UnsupportedWindowClipSemantics,
     UnsupportedClipIdTestSemantics,
+    UnsupportedStencilTestSemantics {
+        two_sided: bool,
+    },
     UnsupportedClearStencilMaskSemantics,
     UnsupportedClearScissorSemantics,
     UnsupportedClearViewportClipSemantics,
@@ -3577,6 +3627,7 @@ pub enum MaxwellThreeDLoweringError {
         factor: u8,
         pattern: u16,
     },
+    UnsupportedPolygonClipGeneratedEdgeSemantics,
     UnsupportedVertexAttributeFormat {
         attribute: u8,
         component_widths: super::MaxwellThreeDVertexComponentWidths,
@@ -3731,6 +3782,10 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
             ),
+            Self::UnsupportedTirSemantics { control } => write!(
+                formatter,
+                "MAXWELL_B enabled target-independent rasterization has no neutral raster, coverage, alpha-to-coverage, or query representation: control={control:?}"
+            ),
             Self::UnsupportedHybridAntiAliasSemantics(value) => write!(
                 formatter,
                 "MAXWELL_B hybrid antialiasing is not represented by the neutral raster pipeline: passes={} centroid={:?} passes-extended={}",
@@ -3784,6 +3839,10 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedClipIdTestSemantics => formatter.write_str(
                 "MAXWELL_B enabled clip-ID testing has no implemented extent, surface-ID, comparison, or backend rasterization semantics",
             ),
+            Self::UnsupportedStencilTestSemantics { two_sided } => write!(
+                formatter,
+                "MAXWELL_B enabled stencil testing has no neutral pipeline representation: two-sided={two_sided}"
+            ),
             Self::UnsupportedClearStencilMaskSemantics => formatter.write_str(
                 "MAXWELL_B stencil-masked clear has no neutral backend representation",
             ),
@@ -3802,6 +3861,9 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedLineStippleSemantics { factor, pattern } => write!(
                 formatter,
                 "MAXWELL_B line stippling has no neutral backend representation: factor={factor} pattern=0x{pattern:04x}"
+            ),
+            Self::UnsupportedPolygonClipGeneratedEdgeSemantics => formatter.write_str(
+                "MAXWELL_B suppression of polygon-clip-generated edges has no neutral backend representation",
             ),
             Self::UnsupportedVertexAttributeFormat {
                 attribute,

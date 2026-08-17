@@ -22,6 +22,51 @@ use crate::{
     ProcessMountNamespace, ThreadObject,
 };
 
+/// Maximum number of guest bytes retained from a fatal break payload.
+pub const MAX_GUEST_BREAK_PAYLOAD_BYTES: usize = 32;
+
+/// Pointer-free snapshot of a small guest diagnostic payload.
+///
+/// Exception dispatch captures this while guest memory is still available so
+/// later teardown and reporting never need to dereference a stale guest
+/// address. Larger payloads remain represented by their original address and
+/// size only.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct GuestBreakPayload {
+    bytes: [u8; MAX_GUEST_BREAK_PAYLOAD_BYTES],
+    len: u8,
+}
+
+impl GuestBreakPayload {
+    #[must_use]
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_GUEST_BREAK_PAYLOAD_BYTES {
+            return None;
+        }
+        let mut snapshot = [0; MAX_GUEST_BREAK_PAYLOAD_BYTES];
+        snapshot[..bytes.len()].copy_from_slice(bytes);
+        Some(Self {
+            bytes: snapshot,
+            len: bytes.len() as u8,
+        })
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl std::fmt::Debug for GuestBreakPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("0x")?;
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 pub use nixe_cpu_engine::ExceptionDispatchRequest;
 
 pub(crate) trait MappingInvalidationControl {
@@ -71,7 +116,12 @@ pub enum ExceptionTerminationReason {
     /// An ordinary process or thread exit SVC.
     Requested,
     /// A fatal Horizon-style break carrying its guest diagnostic payload.
-    Break { reason: u64, info: u64, size: u64 },
+    Break {
+        reason: u64,
+        info: u64,
+        size: u64,
+        payload: Option<GuestBreakPayload>,
+    },
 }
 
 /// Runtime decision produced by an exception dispatcher.

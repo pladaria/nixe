@@ -23,6 +23,12 @@ pub struct HorizonIpcResult(u32);
 impl HorizonIpcResult {
     pub const SUCCESS: Self = Self(0);
 
+    /// Decodes an arbitrary result received from guest memory.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
     pub(crate) const SM_INVALID_CLIENT: Self = Self::new(MODULE_SM, 2);
     pub(crate) const SM_OUT_OF_SESSIONS: Self = Self::new(MODULE_SM, 3);
     pub(crate) const SM_INVALID_SERVICE_NAME: Self = Self::new(MODULE_SM, 6);
