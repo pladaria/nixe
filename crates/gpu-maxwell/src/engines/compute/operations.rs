@@ -63,7 +63,7 @@ impl MaxwellComputeOperationTrigger {
     }
 }
 
-/// One compute trigger paired with the exact candidate state at that method.
+/// One compute trigger paired with the exact channel-state snapshot at that method.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellComputeTriggeredOperation {
     trigger: MaxwellComputeOperationTrigger,

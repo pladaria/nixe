@@ -26,25 +26,27 @@ use crate::MaxwellMethodSource;
 use crate::shader::{MaxwellShaderTranslationKey, MaxwellTranslatedShaderProgram};
 
 use super::{
-    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDBegin,
+    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaToCoverageOverride,
+    MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDBegin,
     MaxwellThreeDBlendEnableCommon, MaxwellThreeDClipIdTestEnable,
     MaxwellThreeDColorCompressionMode, MaxwellThreeDColorReductionThresholdsEnable,
     MaxwellThreeDCompareOp, MaxwellThreeDConditionalLoadConstantBuffer,
-    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
     MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDIteratedBlend, MaxwellThreeDLogicOp, MaxwellThreeDPatchSize,
-    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPointCenterMode,
-    MaxwellThreeDPointSpriteSelect, MaxwellThreeDPolygonClipGeneratedEdge,
-    MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex, MaxwellThreeDRenderEnableMode,
-    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
-    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResourceRole,
-    MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
-    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage, MaxwellThreeDState,
-    MaxwellThreeDTirControl, MaxwellThreeDTirMode, MaxwellThreeDVertexNumericalType,
-    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportPixelCenter,
-    MaxwellThreeDViewportScaleOffsetEnable,
+    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderInterlockControl,
+    MaxwellThreeDPointCenterMode, MaxwellThreeDPointSpriteSelect,
+    MaxwellThreeDPolygonClipGeneratedEdge, MaxwellThreeDPolygonMode,
+    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDProvokingVertex,
+    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderTargetIndexOffset,
+    MaxwellThreeDRenderTargetLayer, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
+    MaxwellThreeDResourceRole, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData,
+    MaxwellThreeDShadeMode, MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage,
+    MaxwellThreeDState, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
+    MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
+    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
 };
 
 #[derive(Clone, Debug)]
@@ -1027,9 +1029,85 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     if matches!(
         trigger,
         MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.constant_color_rendering().enabled().value() == Some(&true)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedConstantColorRenderingSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.shader_execution().api_mandated_early_z().value()
+        == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedApiMandatedEarlyZSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && state.coverage().post_z_pixel_shader_imask().value()
+        == Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPostZPixelShaderImaskSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(value) = state
+        .shader_execution()
+        .pixel_shader_interlock_control()
+        .value()
+        .copied()
+        .filter(|value| value.conflict_detection_enabled())
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPixelShaderInterlockSemantics(value));
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(base_vertex) = state
+        .vertex_input()
+        .assembly()
+        .global_base_vertex_index()
+        .value()
+        .copied()
+        .filter(|value| *value != 0)
+    {
+        // The neutral non-indexed draw currently has one first-vertex value,
+        // which controls both vertex-buffer addressing and the shader-visible
+        // vertex index. Maxwell's global base changes only the latter; mapping
+        // it to first_vertex would therefore silently fetch different data.
+        return Err(MaxwellThreeDLoweringError::UnsupportedGlobalBaseVertexIndex(base_vertex));
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
     ) && state.coverage().csaa_enable().value() == Some(&MaxwellThreeDCsaaEnable::Enabled)
     {
         return Err(MaxwellThreeDLoweringError::UnsupportedCsaaSemantics);
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(value) = state
+        .coverage()
+        .coverage_to_color()
+        .value()
+        .copied()
+        .filter(|value| value.enabled())
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedCoverageToColorSemantics(value));
+    }
+    if matches!(
+        trigger,
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
+    ) && let Some(value) = state
+        .coverage()
+        .alpha_to_coverage_override()
+        .value()
+        .copied()
+        .filter(|value| value.raw() != 0)
+    {
+        return Err(MaxwellThreeDLoweringError::UnsupportedAlphaToCoverageOverrideSemantics(value));
     }
     if matches!(
         trigger,
@@ -2912,6 +2990,13 @@ fn lower_draw(
         .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
             "VERTEX_ARRAY_START",
         ))?;
+    let first_instance = state
+        .vertex_input()
+        .assembly()
+        .global_base_instance_index()
+        .value()
+        .copied()
+        .unwrap_or(0);
 
     let mut vertex_buffers = Vec::new();
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
@@ -3161,7 +3246,7 @@ fn lower_draw(
         DrawArguments::NonIndexed {
             first_vertex,
             vertex_count,
-            first_instance: 0,
+            first_instance,
             instance_count: 1,
         },
     )
@@ -3620,7 +3705,14 @@ pub enum MaxwellThreeDLoweringError {
         limit: u16,
     },
     UnsupportedColorReductionSemantics,
+    UnsupportedConstantColorRenderingSemantics,
+    UnsupportedApiMandatedEarlyZSemantics,
+    UnsupportedPostZPixelShaderImaskSemantics,
+    UnsupportedPixelShaderInterlockSemantics(MaxwellThreeDPixelShaderInterlockControl),
+    UnsupportedGlobalBaseVertexIndex(u32),
     UnsupportedCsaaSemantics,
+    UnsupportedCoverageToColorSemantics(MaxwellThreeDCoverageToColor),
+    UnsupportedAlphaToCoverageOverrideSemantics(MaxwellThreeDAlphaToCoverageOverride),
     UnsupportedTirSemantics {
         control: Option<MaxwellThreeDTirControl>,
     },
@@ -3812,8 +3904,36 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedColorReductionSemantics => formatter.write_str(
                 "MAXWELL_B enabled color reduction has no verified neutral threshold evaluation or color-output semantics",
             ),
+            Self::UnsupportedConstantColorRenderingSemantics => formatter.write_str(
+                "MAXWELL_B enabled constant-color rendering is not represented by the neutral pipeline",
+            ),
+            Self::UnsupportedApiMandatedEarlyZSemantics => formatter.write_str(
+                "MAXWELL_B API-mandated early depth/stencil ordering is not represented by the neutral pipeline",
+            ),
+            Self::UnsupportedPostZPixelShaderImaskSemantics => formatter.write_str(
+                "MAXWELL_B post-Z pixel-shader invocation mask is not represented by the neutral pipeline",
+            ),
+            Self::UnsupportedPixelShaderInterlockSemantics(value) => write!(
+                formatter,
+                "MAXWELL_B pixel-shader interlock is not represented by the neutral pipeline: control={value:?}"
+            ),
+            Self::UnsupportedGlobalBaseVertexIndex(value) => write!(
+                formatter,
+                "MAXWELL_B global base vertex index cannot be represented independently from vertex-buffer addressing: value={value}"
+            ),
             Self::UnsupportedCsaaSemantics => formatter.write_str(
                 "MAXWELL_B enabled CSAA has no verified coverage sampling, resolve, capability, or coherency semantics",
+            ),
+            Self::UnsupportedCoverageToColorSemantics(value) => write!(
+                formatter,
+                "MAXWELL_B coverage-to-color output is not represented by the neutral pipeline: color-target={}",
+                value.color_target()
+            ),
+            Self::UnsupportedAlphaToCoverageOverrideSemantics(value) => write!(
+                formatter,
+                "MAXWELL_B alpha-to-coverage override qualification is not represented by the neutral pipeline: qualify-by-aa={} qualify-by-ps-sample-mask={}",
+                value.qualify_by_anti_alias_enable(),
+                value.qualify_by_pixel_shader_sample_mask()
             ),
             Self::UnsupportedTirSemantics { control } => write!(
                 formatter,

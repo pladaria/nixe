@@ -139,6 +139,8 @@ impl MaxwellThreeDVertexIdUsesArrayStart {
 pub struct MaxwellThreeDVertexAssemblyState {
     attribute_defaults: MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults>,
     vertex_id_uses_array_start: MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart>,
+    global_base_vertex_index: MaxwellThreeDRegister<u32>,
+    global_base_instance_index: MaxwellThreeDRegister<u32>,
 }
 
 impl MaxwellThreeDVertexAssemblyState {
@@ -154,6 +156,24 @@ impl MaxwellThreeDVertexAssemblyState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart> {
         &self.vertex_id_uses_array_start
+    }
+
+    /// Base added to the vertex index presented to shader execution.
+    ///
+    /// ABI source:
+    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2633-L2634>
+    #[must_use]
+    pub const fn global_base_vertex_index(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.global_base_vertex_index
+    }
+
+    /// Base added to the instance index presented to shader execution.
+    ///
+    /// ABI source:
+    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2636-L2637>
+    #[must_use]
+    pub const fn global_base_instance_index(&self) -> &MaxwellThreeDRegister<u32> {
+        &self.global_base_instance_index
     }
 }
 
@@ -943,6 +963,14 @@ impl MaxwellThreeDVertexInputState {
                 self.assembly.vertex_id_uses_array_start =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
+            MaxwellThreeDVertexInputWrite::GlobalBaseVertexIndex { value, .. } => {
+                self.assembly.global_base_vertex_index =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
+            MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { value, .. } => {
+                self.assembly.global_base_instance_index =
+                    MaxwellThreeDRegister::programmed(raw, value, source)
+            }
             MaxwellThreeDVertexInputWrite::StreamSubstituteAddressUpper { value, .. } => {
                 self.stream_substitute.address_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -1073,6 +1101,14 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: MaxwellThreeDVertexIdUsesArrayStart,
         source: MaxwellMethodSource,
     },
+    GlobalBaseVertexIndex {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
+    GlobalBaseInstanceIndex {
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     StreamSubstituteAddressUpper {
         value: u8,
         source: MaxwellMethodSource,
@@ -1113,6 +1149,8 @@ impl MaxwellThreeDVertexInputWrite {
             | Self::End { source, .. }
             | Self::AttributeDefaults { source, .. }
             | Self::VertexIdUsesArrayStart { source, .. }
+            | Self::GlobalBaseVertexIndex { source, .. }
+            | Self::GlobalBaseInstanceIndex { source, .. }
             | Self::StreamSubstituteAddressUpper { source, .. }
             | Self::StreamSubstituteAddressLower { source, .. } => source,
         }

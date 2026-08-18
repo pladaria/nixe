@@ -571,7 +571,8 @@ pub fn preflight_maxwell_submission_execution(
                 }
                 let drains_prior_work = matches!(
                     plan,
-                    MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }
+                    MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
+                        | MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }
                         | MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
                         | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
                         | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
@@ -724,6 +725,17 @@ pub fn execute_maxwell_software_initialization(
             MaxwellSubmissionExecutionStep::ComputeSynchronization(
                 MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
             ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface {
+                    prior_work_pending: planned,
+                    ..
+                },
+            ) => {
+                if *planned != prior_work_pending {
+                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
+                }
+                prior_work_pending = false;
+            }
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::WaitForIdle {
                     prior_work_pending: planned,
@@ -965,7 +977,8 @@ fn execute_maxwell_backend_steps<T>(
                 }
             },
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan) => match plan {
-                MaxwellThreeDSynchronizationPlan::WaitForIdle { .. } => {}
+                MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
+                | MaxwellThreeDSynchronizationPlan::WaitForIdle { .. } => {}
                 MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
                     maintenance, ..
                 }

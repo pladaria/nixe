@@ -2,6 +2,8 @@
 
 mod bindings;
 mod color_reduction;
+mod constant_color;
+mod counters;
 mod coverage;
 mod draw;
 mod falcon;
@@ -16,6 +18,7 @@ mod render_targets;
 mod resource;
 mod shader_execution;
 mod state;
+mod tiled_cache;
 mod vertex;
 mod zcull;
 
@@ -37,12 +40,22 @@ pub use color_reduction::{
     MaxwellThreeDColorReductionThresholdsUnorm10, MaxwellThreeDColorReductionThresholdsUnorm16,
     MaxwellThreeDUnorm8,
 };
+pub use constant_color::{
+    MaxwellThreeDConstantColorComponent, MaxwellThreeDConstantColorRenderingState,
+    MaxwellThreeDConstantColorRenderingStateWrite, MaxwellThreeDConstantColorValue,
+};
+pub use counters::{
+    MaxwellThreeDCounterState, MaxwellThreeDCounterStateWrite, MaxwellThreeDZPassPixelCountEnable,
+};
 pub use coverage::{
     MAXWELL_SAMPLE_LOCATION_GROUP_COUNT, MAXWELL_SAMPLE_LOCATIONS_PER_GROUP,
-    MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDAlphaToCoverageOverride, MaxwellThreeDCoverageState,
+    MaxwellThreeDCoverageStateWrite, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
     MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
-    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDSampleLocation,
-    MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
+    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPsOutputSampleMaskUsage,
+    MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl,
+    MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
+    MaxwellThreeDTirModulationFunction,
 };
 pub use draw::{
     MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
@@ -71,19 +84,19 @@ pub use mme::{
     MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
     MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
     MaxwellThreeDMmeShadowRamError, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDMutableMethodControl,
 };
 pub use operations::{
-    MaxwellThreeDFlushPendingWrites, MaxwellThreeDReportSemaphoreControl,
-    MaxwellThreeDReportSemaphoreOperation, MaxwellThreeDReportSemaphorePipelineLocation,
-    MaxwellThreeDReportSemaphoreRelease, MaxwellThreeDReportSemaphoreState,
-    MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDReportSemaphoreStructureSize,
-    MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDSynchronizationError,
-    MaxwellThreeDSynchronizationOperation, MaxwellThreeDSynchronizationPlan,
-    MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
-    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTextureCacheInvalidation,
-    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureCacheTarget,
-    lower_maxwell_three_d_synchronization,
+    MaxwellThreeDDecompressSurface, MaxwellThreeDFlushPendingWrites,
+    MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
+    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreRelease,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
+    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDShaderCacheInvalidation,
+    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
+    MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
+    MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
+    MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
+    MaxwellThreeDTextureCacheTarget, lower_maxwell_three_d_synchronization,
 };
 
 pub use l2_cache::{
@@ -134,13 +147,15 @@ pub use resource::{
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
-    MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDShaderLocalMemoryPerWarpSize,
-    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderWatermarkRange,
-    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSmTimeoutCounterBit,
-    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
-    MaxwellThreeDVisibleCallLimit,
+    MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MaxwellThreeDApiMandatedEarlyZ,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDPixelShaderInterlockControl,
+    MaxwellThreeDPixelShaderInterlockFragmentOrder, MaxwellThreeDPixelShaderInterlockMode,
+    MaxwellThreeDPixelShaderInterlockTileSize, MaxwellThreeDShaderExceptionsEnable,
+    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
+    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
+    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
+    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDSubtilingPerfKnobA,
+    MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDVisibleCallLimit,
 };
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
@@ -151,6 +166,10 @@ pub use state::{
     MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin, MaxwellThreeDState,
     MaxwellThreeDStateWrite, MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState,
     MaxwellThreeDViewportZClipRange,
+};
+pub use tiled_cache::{
+    MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite,
+    MaxwellThreeDTiledCacheTileSize, MaxwellThreeDTiledCacheUnknownConfig,
 };
 pub use vertex::{
     MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
@@ -192,8 +211,10 @@ const CLASS_NAME: &str = "MAXWELL_B";
 #[derive(Clone, Copy)]
 enum MethodAction {
     NoOperation,
+    DecompressSurface,
     WaitForIdle,
     MmeShadowRamControl,
+    MutableMethodControl,
     FalconFirmwareCall4,
     InstrumentationHeader,
     InstrumentationData,
@@ -201,6 +222,9 @@ enum MethodAction {
     IteratedBlendPassCount,
     SubtilingPerfKnobA,
     SubtilingPerfKnobB,
+    TiledCacheEnable,
+    TiledCacheTileSize,
+    TiledCacheUnknownConfig(u8),
     ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget),
     L1Configuration,
     ColorReductionThresholdsEnable,
@@ -209,9 +233,18 @@ enum MethodAction {
     ColorReductionThresholdsUnorm16,
     ColorReductionThresholdsFp16,
     ColorReductionThresholdsSrgb8,
+    ApiMandatedEarlyZ,
+    PostZPixelShaderImask,
+    PixelShaderInterlockControl,
+    ConstantColorRenderingEnable,
+    ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent),
     AlphaFraction,
     TirMode,
     TirControl,
+    TirModulation,
+    TirModulationFunction,
+    CoverageToColor,
+    AlphaToCoverageOverride,
     HybridAntiAliasControl,
     SampleLocations(u8),
     RasterBoundingBox,
@@ -250,6 +283,7 @@ enum MethodAction {
     AliasedLineWidthEnable,
     ActiveZCullRegion,
     ZCullStatsEnable,
+    ZPassPixelCountEnable,
     ZCullCriterion,
     ZCullEnable,
     ZCullBounds,
@@ -289,6 +323,13 @@ macro_rules! methods {
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 methods!(
     NO_OPERATION => (0x0100, "NO_OPERATION", u32::MAX, MethodAction::NoOperation),
+    DECOMPRESS_SURFACE => (
+        0x02e0,
+        "DECOMPRESS_SURFACE",
+        0x000f_fff7,
+        MethodAction::DecompressSurface
+    ),
+    PIPE_NOP => (0x1a2c, "PIPE_NOP", u32::MAX, MethodAction::NoOperation),
     SET_INSTRUMENTATION_METHOD_HEADER => (
         0x0150,
         "SET_INSTRUMENTATION_METHOD_HEADER",
@@ -312,6 +353,96 @@ methods!(
         "SET_SUBTILING_PERF_KNOB_B",
         0x0000_00ff,
         MethodAction::SubtilingPerfKnobB
+    ),
+    SET_CONSTANT_COLOR_RENDERING => (
+        0x0f40,
+        "SET_CONSTANT_COLOR_RENDERING",
+        0x0000_0001,
+        MethodAction::ConstantColorRenderingEnable
+    ),
+    SET_CONSTANT_COLOR_RENDERING_RED => (
+        0x0f44,
+        "SET_CONSTANT_COLOR_RENDERING_RED",
+        u32::MAX,
+        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Red)
+    ),
+    SET_CONSTANT_COLOR_RENDERING_GREEN => (
+        0x0f48,
+        "SET_CONSTANT_COLOR_RENDERING_GREEN",
+        u32::MAX,
+        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Green)
+    ),
+    SET_CONSTANT_COLOR_RENDERING_BLUE => (
+        0x0f4c,
+        "SET_CONSTANT_COLOR_RENDERING_BLUE",
+        u32::MAX,
+        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Blue)
+    ),
+    SET_CONSTANT_COLOR_RENDERING_ALPHA => (
+        0x0f50,
+        "SET_CONSTANT_COLOR_RENDERING_ALPHA",
+        u32::MAX,
+        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Alpha)
+    ),
+    SET_API_MANDATED_EARLY_Z => (
+        0x0210,
+        "SET_API_MANDATED_EARLY_Z",
+        0x0000_0001,
+        MethodAction::ApiMandatedEarlyZ
+    ),
+    SET_POST_Z_PS_IMASK => (
+        0x0f1c,
+        "SET_POST_Z_PS_IMASK",
+        0x0000_0001,
+        MethodAction::PostZPixelShaderImask
+    ),
+    SET_PIXEL_SHADER_INTERLOCK_CONTROL => (
+        0x1224,
+        "SET_PIXEL_SHADER_INTERLOCK_CONTROL",
+        0x0000_000f,
+        MethodAction::PixelShaderInterlockControl
+    ),
+    SET_TILED_CACHE_ENABLE => (
+        0x0f60,
+        "SET_TILED_CACHE_ENABLE",
+        0x0000_0001,
+        MethodAction::TiledCacheEnable
+    ),
+    SET_TILED_CACHE_TILE_SIZE => (
+        0x0f64,
+        "SET_TILED_CACHE_TILE_SIZE",
+        u32::MAX,
+        MethodAction::TiledCacheTileSize
+    ),
+    SET_TILED_CACHE_UNKNOWN_CONFIG_0 => (
+        0x0f68,
+        "SET_TILED_CACHE_UNKNOWN_CONFIG_0",
+        u32::MAX,
+        MethodAction::TiledCacheUnknownConfig(0)
+    ),
+    SET_TILED_CACHE_UNKNOWN_CONFIG_1 => (
+        0x0f6c,
+        "SET_TILED_CACHE_UNKNOWN_CONFIG_1",
+        u32::MAX,
+        MethodAction::TiledCacheUnknownConfig(1)
+    ),
+    SET_TILED_CACHE_UNKNOWN_CONFIG_2 => (
+        0x1108,
+        "SET_TILED_CACHE_UNKNOWN_CONFIG_2",
+        u32::MAX,
+        MethodAction::TiledCacheUnknownConfig(2)
+    ),
+    SET_TILED_CACHE_UNKNOWN_CONFIG_3 => (
+        0x0f70,
+        "SET_TILED_CACHE_UNKNOWN_CONFIG_3",
+        u32::MAX,
+        MethodAction::TiledCacheUnknownConfig(3)
+    ),
+    SET_MUTABLE_METHOD_CONTROL => (
+        0x1134,
+        "SET_MUTABLE_METHOD_CONTROL",
+        0x0000_0001,
+        MethodAction::MutableMethodControl
     ),
     SET_VTG_WARP_WATERMARKS => (
         0x0f98,
@@ -428,6 +559,30 @@ methods!(
         "SET_TIR",
         0x0000_0003,
         MethodAction::TirMode
+    ),
+    SET_TIR_MODULATION => (
+        0x0fd4,
+        "SET_TIR_MODULATION",
+        0x0000_0003,
+        MethodAction::TirModulation
+    ),
+    SET_TIR_MODULATION_FUNCTION => (
+        0x0fd8,
+        "SET_TIR_MODULATION_FUNCTION",
+        0x0000_0001,
+        MethodAction::TirModulationFunction
+    ),
+    SET_COVERAGE_TO_COLOR => (
+        0x11f8,
+        "SET_COVERAGE_TO_COLOR",
+        0x0000_0071,
+        MethodAction::CoverageToColor
+    ),
+    SET_ALPHA_TO_COVERAGE_OVERRIDE => (
+        0x16b4,
+        "SET_ALPHA_TO_COVERAGE_OVERRIDE",
+        0x0000_0003,
+        MethodAction::AlphaToCoverageOverride
     ),
     SET_TIR_CONTROL => (
         0x1130,
@@ -704,6 +859,12 @@ methods!(
         "SET_ZCULL_STATS",
         0x0000_0001,
         MethodAction::ZCullStatsEnable
+    ),
+    SET_ZPASS_PIXEL_COUNT => (
+        0x1514,
+        "SET_ZPASS_PIXEL_COUNT",
+        0x0000_0001,
+        MethodAction::ZPassPixelCountEnable
     ),
     SET_ZCULL_CRITERION => (
         0x0dd8,
@@ -1070,6 +1231,18 @@ fn preflight_register(
     let effect =
         match declaration.action {
             MethodAction::NoOperation => MaxwellEngineMethodEffect::NoOperation,
+            MethodAction::DecompressSurface => {
+                let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                    MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source },
+                )
+            }
             MethodAction::InstrumentationHeader => {
                 let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
                 let write = MaxwellThreeDStateWrite::Instrumentation(
@@ -1130,6 +1303,20 @@ fn preflight_register(
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
+            MethodAction::MutableMethodControl => {
+                let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Mme(
+                    MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::FalconFirmwareCall4 => {
                 let address = MaxwellThreeDFalconRegisterAddress::try_new(source.argument())
                     .ok_or(MaxwellEngineDispatchError::FalconFirmware {
@@ -1174,6 +1361,34 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
                     MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TiledCacheEnable => {
+                let value = source.argument() != 0;
+                let write = MaxwellThreeDStateWrite::TiledCache(
+                    MaxwellThreeDTiledCacheStateWrite::Enable { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TiledCacheTileSize => {
+                let value = MaxwellThreeDTiledCacheTileSize::parse(source.argument());
+                let write = MaxwellThreeDStateWrite::TiledCache(
+                    MaxwellThreeDTiledCacheStateWrite::TileSize { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TiledCacheUnknownConfig(index) => {
+                let value = MaxwellThreeDTiledCacheUnknownConfig::from_bits(source.argument());
+                let write = MaxwellThreeDStateWrite::TiledCache(
+                    MaxwellThreeDTiledCacheStateWrite::UnknownConfig {
+                        index,
+                        value,
+                        source,
+                    },
                 );
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
@@ -1277,6 +1492,70 @@ fn preflight_register(
                     })?;
                 let write = MaxwellThreeDStateWrite::ColorReduction(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ConstantColorRenderingEnable => {
+                let value = source.argument() != 0;
+                let write = MaxwellThreeDStateWrite::ConstantColorRendering(
+                    MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ConstantColorRenderingComponent(component) => {
+                let value = MaxwellThreeDConstantColorValue::from_bits(source.argument());
+                let write = MaxwellThreeDStateWrite::ConstantColorRendering(
+                    MaxwellThreeDConstantColorRenderingStateWrite::Component {
+                        component,
+                        value,
+                        source,
+                    },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ApiMandatedEarlyZ => {
+                let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::PostZPixelShaderImask => {
+                let value = MaxwellThreeDPostZPixelShaderImask::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::PixelShaderInterlockControl => {
+                let value = MaxwellThreeDPixelShaderInterlockControl::parse(source.argument())
+                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    })?;
+                let write = MaxwellThreeDStateWrite::ShaderExecution(
+                    MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
+                        value,
+                        source,
+                    },
                 );
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
@@ -1632,6 +1911,61 @@ fn preflight_register(
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
+            MethodAction::TirModulation => {
+                let value = MaxwellThreeDTirModulationComponentSelect::parse(source.argument())
+                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    })?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::TirModulation { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TirModulationFunction => {
+                let value = MaxwellThreeDTirModulationFunction::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::CoverageToColor => {
+                let value = MaxwellThreeDCoverageToColor::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::AlphaToCoverageOverride => {
+                let value = MaxwellThreeDAlphaToCoverageOverride::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Coverage(
+                    MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source },
+                );
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
             MethodAction::SampleLocations(group) => {
                 let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
                 let write = MaxwellThreeDStateWrite::Coverage(
@@ -1828,6 +2162,20 @@ fn preflight_register(
                         value,
                         source,
                     });
+                candidate.apply(write);
+                MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::ZPassPixelCountEnable => {
+                let value = MaxwellThreeDZPassPixelCountEnable::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                let write = MaxwellThreeDStateWrite::Counter(
+                    MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source },
+                );
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
             }
@@ -2325,6 +2673,17 @@ fn preflight_vertex_and_binding_state(
             0x0d74 => Some((
                 V::VertexArrayStart { value: raw, source },
                 "SET_VERTEX_ARRAY_START",
+            )),
+            // NVIDIA publishes both global draw-index registers as complete
+            // 32-bit fields.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2633-L2637
+            0x1434 => Some((
+                V::GlobalBaseVertexIndex { value: raw, source },
+                "SET_GLOBAL_BASE_VERTEX_INDEX",
+            )),
+            0x1438 => Some((
+                V::GlobalBaseInstanceIndex { value: raw, source },
+                "SET_GLOBAL_BASE_INSTANCE_INDEX",
             )),
             0x1610 => Some((
                 V::AttributeDefaults {

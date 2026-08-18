@@ -1,8 +1,8 @@
 //! Declarative Maxwell class-method routing.
 //!
-//! This layer validates every class method in a decoded packet before the
-//! packet's binding state is committed. It contains no Horizon ABI, guest
-//! mappings, scheduler state, or host-backend objects.
+//! This layer applies decoded class methods to channel-owned state in stream
+//! order and returns the first typed fatal boundary. It contains no Horizon
+//! ABI, guest mappings, scheduler state, or host-backend objects.
 
 mod compute;
 mod dma_copy;
@@ -50,7 +50,8 @@ pub use threed::{
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
-    MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDAttachmentReadiness,
+    MaxwellThreeDAlphaToCoverageOverride, MaxwellThreeDAntiAliasedLineEnable,
+    MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDAttachmentReadiness,
     MaxwellThreeDAttributeDefaultVector, MaxwellThreeDAttributeDefaults,
     MaxwellThreeDAttributePointSize, MaxwellThreeDBalancedPrimitiveWorkload, MaxwellThreeDBegin,
     MaxwellThreeDBindGroupState, MaxwellThreeDBlendControlState, MaxwellThreeDBlendEnableCommon,
@@ -67,8 +68,11 @@ pub use threed::{
     MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp, MaxwellThreeDCompressionThreshold,
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
     MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
-    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDCoverageState,
-    MaxwellThreeDCoverageStateWrite, MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace,
+    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDConstantColorComponent,
+    MaxwellThreeDConstantColorRenderingState, MaxwellThreeDConstantColorRenderingStateWrite,
+    MaxwellThreeDConstantColorValue, MaxwellThreeDCounterState, MaxwellThreeDCounterStateWrite,
+    MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCoverageToColor,
+    MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace, MaxwellThreeDDecompressSurface,
     MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
     MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
     MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDDirtySubresource,
@@ -91,17 +95,20 @@ pub use threed::{
     MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
     MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
     MaxwellThreeDMmeShadowRamError, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDOperationTrigger, MaxwellThreeDPatchSize,
-    MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDMutableMethodControl, MaxwellThreeDOperationTrigger,
+    MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
+    MaxwellThreeDPixelShaderInterlockControl, MaxwellThreeDPixelShaderInterlockFragmentOrder,
+    MaxwellThreeDPixelShaderInterlockMode, MaxwellThreeDPixelShaderInterlockTileSize,
     MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
     MaxwellThreeDPointSpriteOrigin, MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
     MaxwellThreeDPolygonClipGeneratedEdge, MaxwellThreeDPolygonMode,
-    MaxwellThreeDPreservedImageLayout, MaxwellThreeDPrimitiveCircularBufferThrottle,
-    MaxwellThreeDPrimitiveState, MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState,
-    MaxwellThreeDProvokingVertex, MaxwellThreeDPsOutputSampleMaskUsage,
-    MaxwellThreeDRasterBoundingBox, MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState,
-    MaxwellThreeDRawValue, MaxwellThreeDRectangle, MaxwellThreeDRegister,
-    MaxwellThreeDRegisterOrigin, MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPreservedImageLayout,
+    MaxwellThreeDPrimitiveCircularBufferThrottle, MaxwellThreeDPrimitiveState,
+    MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState, MaxwellThreeDProvokingVertex,
+    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDRasterBoundingBox,
+    MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState, MaxwellThreeDRawValue,
+    MaxwellThreeDRectangle, MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin,
+    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableState,
     MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetIndexOffset,
     MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
     MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
@@ -127,7 +134,10 @@ pub use threed::{
     MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
     MaxwellThreeDSystemMemoryVolatile, MaxwellThreeDTessellationLod,
     MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
-    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
+    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheState,
+    MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDTiledCacheTileSize,
+    MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
+    MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
     MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
     MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVafL2CacheControl, MaxwellThreeDVertexArrayPrimitiveRestartEnable,
@@ -143,9 +153,10 @@ pub use threed::{
     MaxwellThreeDWindowClipType, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullBounds,
     MaxwellThreeDZCullCriterion, MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId,
     MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
-    MaxwellThreeDZCullStencilFunction, lower_maxwell_three_d_synchronization,
-    preflight_maxwell_three_d_operation, preflight_maxwell_three_d_operation_unnegotiated,
-    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
+    MaxwellThreeDZCullStencilFunction, MaxwellThreeDZPassPixelCountEnable,
+    lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation,
+    preflight_maxwell_three_d_operation_unnegotiated, resolve_maxwell_three_d_resources,
+    resolve_maxwell_three_d_resources_for_roles,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDBeta1,
@@ -167,7 +178,7 @@ use crate::{
     MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellDecodedPushbuffer, MaxwellGpuChannel,
     MaxwellHostMemoryOperation, MaxwellHostMethod, MaxwellMethodDispatch,
     MaxwellMethodDispatchError, MaxwellMethodDispatchKind, MaxwellMethodSource,
-    MaxwellPacketDispatch, MaxwellShaderProgramHeaderVersionRange, preflight_maxwell_packet,
+    MaxwellPacketDispatch, MaxwellShaderProgramHeaderVersionRange, dispatch_maxwell_packet,
 };
 
 /// Execution layer required by a known method whose semantics are unavailable.
@@ -320,7 +331,7 @@ impl MaxwellHostSynchronizationOperation {
     }
 }
 
-/// One named, validated class method ready for an atomic packet commit.
+/// One named class method applied during direct packet dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellEngineMethodDispatch {
     method: MaxwellMethodDispatch,
@@ -357,20 +368,10 @@ impl MaxwellEngineMethodDispatch {
     }
 }
 
-/// Complete engine preflight paired with its class-binding preflight.
+/// Validated packet methods and ordered operations after immediate state commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellEnginePacketDispatch {
     binding: MaxwellPacketDispatch,
-    compute_before: MaxwellComputeState,
-    compute_after: MaxwellComputeState,
-    dma_copy_before: MaxwellDmaCopyState,
-    dma_copy_after: MaxwellDmaCopyState,
-    inline_to_memory_before: MaxwellInlineToMemoryState,
-    inline_to_memory_after: MaxwellInlineToMemoryState,
-    two_d_before: MaxwellTwoDState,
-    two_d_after: MaxwellTwoDState,
-    three_d_before: MaxwellThreeDState,
-    three_d_after: MaxwellThreeDState,
     methods: Box<[MaxwellEngineMethodDispatch]>,
     ordered_operations: Box<[MaxwellEngineOperation]>,
     compute_operations: Box<[MaxwellComputeTriggeredOperation]>,
@@ -378,7 +379,7 @@ pub struct MaxwellEnginePacketDispatch {
     operations: Box<[MaxwellThreeDTriggeredOperation]>,
 }
 
-/// One execution trigger paired with the exact candidate state at that method.
+/// One execution trigger paired with the exact channel-state snapshot at that method.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDTriggeredOperation {
     trigger: MaxwellThreeDOperationTrigger,
@@ -414,56 +415,6 @@ impl MaxwellEnginePacketDispatch {
     }
 
     #[must_use]
-    pub const fn compute_before(&self) -> &MaxwellComputeState {
-        &self.compute_before
-    }
-
-    #[must_use]
-    pub const fn compute_after(&self) -> &MaxwellComputeState {
-        &self.compute_after
-    }
-
-    #[must_use]
-    pub const fn dma_copy_before(&self) -> &MaxwellDmaCopyState {
-        &self.dma_copy_before
-    }
-
-    #[must_use]
-    pub const fn dma_copy_after(&self) -> &MaxwellDmaCopyState {
-        &self.dma_copy_after
-    }
-
-    #[must_use]
-    pub const fn inline_to_memory_before(&self) -> &MaxwellInlineToMemoryState {
-        &self.inline_to_memory_before
-    }
-
-    #[must_use]
-    pub const fn inline_to_memory_after(&self) -> &MaxwellInlineToMemoryState {
-        &self.inline_to_memory_after
-    }
-
-    #[must_use]
-    pub const fn two_d_before(&self) -> &MaxwellTwoDState {
-        &self.two_d_before
-    }
-
-    #[must_use]
-    pub const fn two_d_after(&self) -> &MaxwellTwoDState {
-        &self.two_d_after
-    }
-
-    #[must_use]
-    pub const fn three_d_before(&self) -> &MaxwellThreeDState {
-        &self.three_d_before
-    }
-
-    #[must_use]
-    pub const fn three_d_after(&self) -> &MaxwellThreeDState {
-        &self.three_d_after
-    }
-
-    #[must_use]
     pub fn operations(&self) -> &[MaxwellThreeDTriggeredOperation] {
         &self.operations
     }
@@ -483,9 +434,6 @@ impl MaxwellEnginePacketDispatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellEngineDispatchError {
     Binding(MaxwellMethodDispatchError),
-    EngineStateChanged {
-        channel: crate::MaxwellChannelId,
-    },
     UnsupportedClass {
         source: MaxwellMethodSource,
         class: GpuClassId,
@@ -576,10 +524,6 @@ impl Display for MaxwellEngineDispatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binding(error) => write!(formatter, "class binding failed: {error}"),
-            Self::EngineStateChanged { channel } => write!(
-                formatter,
-                "Maxwell channel engine state changed after packet preflight: {channel}"
-            ),
             Self::UnsupportedClass {
                 source,
                 class,
@@ -704,23 +648,16 @@ impl Display for MaxwellEngineDispatchError {
 
 impl std::error::Error for MaxwellEngineDispatchError {}
 
-/// Validates binding and every engine method without mutating channel state.
-pub fn preflight_maxwell_engine_packet(
-    channel: &MaxwellGpuChannel,
+/// Dispatches one packet directly against channel-owned engine state.
+///
+/// Unsupported semantics terminate the guest process, so successfully applied
+/// method prefixes are intentionally not rolled back.
+pub fn dispatch_maxwell_engine_packet(
+    channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedPacket,
 ) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
-    let binding = preflight_maxwell_packet(channel, submission, packet)?;
-    let compute_before = channel.compute().clone();
-    let mut compute_after = compute_before.clone();
-    let dma_copy_before = channel.dma_copy().clone();
-    let mut dma_copy_after = dma_copy_before.clone();
-    let inline_to_memory_before = channel.inline_to_memory().clone();
-    let mut inline_to_memory_after = inline_to_memory_before.clone();
-    let two_d_before = channel.two_d().clone();
-    let mut two_d_after = two_d_before.clone();
-    let three_d_before = channel.three_d().clone();
-    let mut three_d_after = three_d_before.clone();
+    let binding = dispatch_maxwell_packet(channel, submission, packet)?;
     let mut methods = Vec::new();
     let mut ordered_operations = Vec::new();
     let mut compute_operations = Vec::new();
@@ -777,7 +714,7 @@ pub fn preflight_maxwell_engine_packet(
             let macro_preflight = threed::preflight_mme_call(
                 channel.profile(),
                 &binding.methods()[method_index..end],
-                &mut three_d_after,
+                channel.three_d_mut(),
             )?;
             methods
                 .try_reserve(macro_preflight.methods.len())
@@ -799,15 +736,7 @@ pub fn preflight_maxwell_engine_packet(
             continue;
         }
         if method.kind() == MaxwellMethodDispatchKind::ClassMethod {
-            let method = preflight_class_method(
-                channel,
-                method,
-                &mut compute_after,
-                &mut dma_copy_after,
-                &mut inline_to_memory_after,
-                &mut two_d_after,
-                &mut three_d_after,
-            )?;
+            let method = dispatch_class_method(channel, method)?;
             let trigger = match method.effect() {
                 MaxwellEngineMethodEffect::ThreeDTrigger(trigger)
                 | MaxwellEngineMethodEffect::ThreeDStateAndTrigger { trigger, .. } => Some(trigger),
@@ -848,8 +777,8 @@ pub fn preflight_maxwell_engine_packet(
                 compute_operations
                     .try_reserve(1)
                     .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-                let operation =
-                    MaxwellComputeTriggeredOperation::new(trigger, compute_after.clone());
+                let state = channel.compute();
+                let operation = MaxwellComputeTriggeredOperation::new(trigger, state.clone());
                 ordered_operations
                     .try_reserve(1)
                     .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
@@ -862,9 +791,10 @@ pub fn preflight_maxwell_engine_packet(
                 operations
                     .try_reserve(1)
                     .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
+                let state = channel.three_d();
                 let operation = MaxwellThreeDTriggeredOperation {
                     trigger,
-                    state: three_d_after.clone(),
+                    state: state.clone(),
                 };
                 ordered_operations
                     .try_reserve(1)
@@ -877,8 +807,8 @@ pub fn preflight_maxwell_engine_packet(
                 synchronization_operations
                     .try_reserve(1)
                     .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-                let operation =
-                    MaxwellThreeDSynchronizationOperation::new(trigger, three_d_after.clone());
+                let state = channel.three_d();
+                let operation = MaxwellThreeDSynchronizationOperation::new(trigger, state.clone());
                 ordered_operations
                     .try_reserve(1)
                     .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
@@ -898,16 +828,6 @@ pub fn preflight_maxwell_engine_packet(
     // state snapshot in the neutral lowering preflight.
     Ok(MaxwellEnginePacketDispatch {
         binding,
-        compute_before,
-        compute_after,
-        dma_copy_before,
-        dma_copy_after,
-        inline_to_memory_before,
-        inline_to_memory_after,
-        two_d_before,
-        two_d_after,
-        three_d_before,
-        three_d_after,
         methods: methods.into_boxed_slice(),
         ordered_operations: ordered_operations.into_boxed_slice(),
         compute_operations: compute_operations.into_boxed_slice(),
@@ -944,50 +864,7 @@ fn preflight_host_method(
     }
 }
 
-/// Commits binding and engine state together after revalidating both snapshots.
-pub fn commit_maxwell_engine_packet(
-    channel: &mut MaxwellGpuChannel,
-    dispatch: &MaxwellEnginePacketDispatch,
-) -> Result<(), MaxwellEngineDispatchError> {
-    if channel.id() != dispatch.binding.channel()
-        || channel.frontend() != dispatch.binding.frontend_before()
-    {
-        return Err(MaxwellMethodDispatchError::FrontendStateChanged {
-            channel: channel.id(),
-        }
-        .into());
-    }
-    if channel.compute() != &dispatch.compute_before
-        || channel.dma_copy() != &dispatch.dma_copy_before
-        || channel.inline_to_memory() != &dispatch.inline_to_memory_before
-        || channel.two_d() != &dispatch.two_d_before
-        || channel.three_d() != &dispatch.three_d_before
-    {
-        return Err(MaxwellEngineDispatchError::EngineStateChanged {
-            channel: channel.id(),
-        });
-    }
-    channel.replace_frontend(dispatch.binding.frontend_after());
-    channel.replace_compute(dispatch.compute_after.clone());
-    channel.replace_dma_copy(dispatch.dma_copy_after.clone());
-    channel.replace_inline_to_memory(dispatch.inline_to_memory_after.clone());
-    channel.replace_two_d(dispatch.two_d_after.clone());
-    channel.replace_three_d(dispatch.three_d_after.clone());
-    Ok(())
-}
-
-/// Preflights and atomically commits one packet.
-pub fn dispatch_maxwell_engine_packet(
-    channel: &mut MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: &MaxwellDecodedPacket,
-) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
-    let dispatch = preflight_maxwell_engine_packet(channel, submission, packet)?;
-    commit_maxwell_engine_packet(channel, &dispatch)?;
-    Ok(dispatch)
-}
-
-/// Dispatches packets in order with per-packet atomicity.
+/// Dispatches packets and methods in stream order.
 pub fn dispatch_maxwell_engine_pushbuffer(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
@@ -1003,31 +880,27 @@ pub fn dispatch_maxwell_engine_pushbuffer(
     Ok(packets.into_boxed_slice())
 }
 
-fn preflight_class_method(
-    channel: &MaxwellGpuChannel,
+fn dispatch_class_method(
+    channel: &mut MaxwellGpuChannel,
     method: MaxwellMethodDispatch,
-    compute: &mut MaxwellComputeState,
-    dma_copy: &mut MaxwellDmaCopyState,
-    inline_to_memory: &mut MaxwellInlineToMemoryState,
-    two_d: &mut MaxwellTwoDState,
-    three_d: &mut MaxwellThreeDState,
 ) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
     let classes = channel.profile().classes();
+    let profile = channel.profile();
     let class = method.class();
     if class == compute::CLASS {
-        return compute::preflight(class, method, compute);
+        return compute::preflight(class, method, channel.compute_mut());
     }
     if class == dma_copy::CLASS {
-        return dma_copy::preflight(method, dma_copy);
+        return dma_copy::preflight(method, channel.dma_copy_mut());
     }
     if class == inline_to_memory::CLASS {
-        return inline_to_memory::preflight(method, inline_to_memory);
+        return inline_to_memory::preflight(method, channel.inline_to_memory_mut());
     }
     if class == threed::CLASS {
-        return threed::preflight(channel.profile(), method, three_d);
+        return threed::preflight(profile, method, channel.three_d_mut());
     }
     if class == twod::CLASS {
-        return twod::preflight(method, two_d);
+        return twod::preflight(method, channel.two_d_mut());
     }
 
     let class_name = if class == classes.gpfifo() {

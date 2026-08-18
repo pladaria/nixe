@@ -25,6 +25,37 @@ fn three_d_no_operation_is_named_and_implemented() {
 }
 
 #[test]
+fn pipe_nop_accepts_its_full_payload_without_state_or_execution_effects() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for argument in [0, 1, 0x8000_0000, u32::MAX] {
+        let frontend_before = channel.frontend();
+        let two_d_before = channel.two_d().clone();
+        let three_d_before = channel.three_d().clone();
+        let decoded = packet(0x1a2c / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+
+        assert_eq!(dispatch.methods().len(), 1);
+        assert_eq!(dispatch.methods()[0].metadata().class_name(), "MAXWELL_B");
+        assert_eq!(dispatch.methods()[0].metadata().method_name(), "PIPE_NOP");
+        assert_eq!(
+            dispatch.methods()[0].effect(),
+            MaxwellEngineMethodEffect::NoOperation
+        );
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(channel.three_d(), &three_d_before);
+    }
+}
+
+#[test]
 fn instrumentation_header_and_data_are_source_preserving_pipeline_neutral_annotations() {
     let mut channel = channel();
     bind_three_d(&mut channel);
@@ -92,7 +123,7 @@ fn instrumentation_header_and_data_are_source_preserving_pipeline_neutral_annota
 }
 
 #[test]
-fn instrumentation_accepts_all_word_bits_and_invalid_packet_suffix_is_atomic() {
+fn instrumentation_accepts_all_word_bits_and_invalid_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -118,7 +149,469 @@ fn instrumentation_accepts_all_word_bits_and_invalid_packet_suffix_is_atomic() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x0158)
     ));
+    assert_ne!(channel, before);
+}
+
+#[test]
+fn tiled_cache_initialization_family_is_typed_source_preserving_and_pipeline_neutral() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+
+    for (method, argument) in [
+        (0x0f60, 1),
+        (0x0f64, 0x0080_0080),
+        (0x0f68, 0x0000_1109),
+        (0x0f6c, 0x0808_0202),
+        (0x1108, 0x0000_001f),
+        (0x0f70, 0x0008_0001),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+
+    let state = channel.three_d().tiled_cache();
+    assert_eq!(state.enabled().value(), Some(&true));
+    assert_eq!(state.enabled().raw(), Some(1));
+    let tile_size = state.tile_size().value().copied().unwrap();
+    assert_eq!(tile_size.width(), 128);
+    assert_eq!(tile_size.height(), 128);
+    assert_eq!(tile_size.raw(), 0x0080_0080);
+    for (index, expected) in [0x0000_1109, 0x0808_0202, 0x0000_001f, 0x0008_0001]
+        .into_iter()
+        .enumerate()
+    {
+        let register = state.unknown_config(index as u8).unwrap();
+        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(register.raw(), Some(expected));
+        assert_eq!(register.value().map(|value| value.bits()), Some(expected));
+        assert!(register.source().is_some());
+    }
+    assert!(state.unknown_config(4).is_none());
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
+}
+
+#[test]
+fn tiled_cache_enable_rejects_reserved_bits_and_failed_packet_keeps_valid_prefix() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0f60, 1);
+
+    let before = channel.clone();
+    let decoded = incrementing_packet(0x0f60 / 4, &[0, 0x0040_0020, 3, 4, 5, 6]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+            if source.method() == GpuMethodId(0x0f74)
+    ));
+    assert_ne!(channel, before);
+
+    let after_prefix = channel.clone();
+    let invalid_enable = packet(0x0f60 / 4, 2);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid_enable.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+            if source.method() == GpuMethodId(0x0f60)
+    ));
+    assert_eq!(channel, after_prefix);
+}
+
+#[test]
+fn mutable_method_control_is_typed_source_preserving_and_pipeline_neutral() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+    assert_eq!(
+        channel.three_d().mme().mutable_method_control().origin(),
+        MaxwellThreeDRegisterOrigin::Unset
+    );
+
+    for (argument, expected) in [
+        (0, MaxwellThreeDMutableMethodControl::Lightweight),
+        (1, MaxwellThreeDMutableMethodControl::Heavyweight),
+    ] {
+        let decoded = packet(0x1134 / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let source = dispatch.methods()[0].method().source();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_MUTABLE_METHOD_CONTROL"
+        );
+        assert_eq!(
+            dispatch.methods()[0].effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Mme(
+                MaxwellThreeDMmeStateWrite::MutableMethodControl {
+                    value: expected,
+                    source,
+                }
+            ))
+        );
+        let register = channel.three_d().mme().mutable_method_control();
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value(), Some(&expected));
+        assert_eq!(register.source(), Some(source));
+    }
+
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
+}
+
+#[test]
+fn mutable_method_control_rejects_reserved_bits_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x1134, 1);
+    let before = channel.clone();
+
+    let decoded = packet(0x1134 / 4, 2);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+            if source.method() == GpuMethodId(0x1134)
+    ));
     assert_eq!(channel, before);
+}
+
+#[test]
+fn constant_color_rendering_family_is_typed_and_conditionally_pipeline_relevant() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0f40, 0);
+    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+
+    for (method, component, bits) in [
+        (
+            0x0f44,
+            MaxwellThreeDConstantColorComponent::Red,
+            0x3f80_0000,
+        ),
+        (
+            0x0f48,
+            MaxwellThreeDConstantColorComponent::Green,
+            0x4000_0000,
+        ),
+        (
+            0x0f4c,
+            MaxwellThreeDConstantColorComponent::Blue,
+            0x4040_0000,
+        ),
+        (
+            0x0f50,
+            MaxwellThreeDConstantColorComponent::Alpha,
+            0x4080_0000,
+        ),
+    ] {
+        let decoded = packet(method / 4, bits);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let source = dispatch.methods()[0].method().source();
+        let register = channel
+            .three_d()
+            .constant_color_rendering()
+            .component(component);
+        assert_eq!(register.raw(), Some(bits));
+        assert_eq!(register.value().map(|value| value.bits()), Some(bits));
+        assert_eq!(register.source(), Some(source));
+    }
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        disabled_dependencies
+    );
+
+    program_three_d(&mut channel, 0x0f40, 1);
+    let enabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    assert_ne!(enabled_dependencies, disabled_dependencies);
+    for raw in [1, 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000] {
+        assert!(enabled_dependencies.contains(&Some(raw)));
+    }
+}
+
+#[test]
+fn constant_color_rendering_rejects_reserved_enable_bits_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0f40, 0);
+    let before = channel.clone();
+
+    let decoded = incrementing_packet(0x0f40 / 4, &[1, 2, 3, 4, 5, 0x100]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
+            if source.method() == GpuMethodId(0x0f54)
+    ));
+    assert_ne!(channel, before);
+
+    let after_prefix = channel.clone();
+    let invalid_enable = packet(0x0f40 / 4, 2);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &invalid_enable.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+            if source.method() == GpuMethodId(0x0f40)
+    ));
+    assert_eq!(channel, after_prefix);
+}
+
+#[test]
+fn api_mandated_early_z_is_typed_and_source_preserving() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x2000, 0x11);
+
+    program_three_d(&mut channel, 0x0210, 0);
+    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    let disabled = channel.three_d().shader_execution().api_mandated_early_z();
+    assert_eq!(
+        disabled.value(),
+        Some(&MaxwellThreeDApiMandatedEarlyZ::Disabled)
+    );
+    assert_eq!(disabled.raw(), Some(0));
+    assert!(disabled.source().is_some());
+
+    program_three_d(&mut channel, 0x0210, 1);
+    let enabled = channel.three_d().shader_execution().api_mandated_early_z();
+    assert_eq!(
+        enabled.value(),
+        Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
+    );
+    assert_eq!(enabled.raw(), Some(1));
+    assert!(enabled.source().is_some());
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        disabled_dependencies
+    );
+}
+
+#[test]
+fn api_mandated_early_z_rejects_reserved_bits_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0210, 0);
+    let before = channel.clone();
+
+    let decoded = packet(0x0210 / 4, 2);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+            if source.method() == GpuMethodId(0x0210)
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
+fn post_z_pixel_shader_imask_is_typed_and_only_active_state_is_pipeline_relevant() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    program_three_d(&mut channel, 0x0f1c, 0);
+    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    let disabled = channel.three_d().coverage().post_z_pixel_shader_imask();
+    assert_eq!(
+        disabled.value(),
+        Some(&MaxwellThreeDPostZPixelShaderImask::Disabled)
+    );
+    assert_eq!(disabled.raw(), Some(0));
+    assert!(disabled.source().is_some());
+
+    program_three_d(&mut channel, 0x0f1c, 1);
+    let enabled = channel.three_d().coverage().post_z_pixel_shader_imask();
+    assert_eq!(
+        enabled.value(),
+        Some(&MaxwellThreeDPostZPixelShaderImask::Enabled)
+    );
+    assert_eq!(enabled.raw(), Some(1));
+    assert!(enabled.source().is_some());
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        disabled_dependencies
+    );
+}
+
+#[test]
+fn post_z_pixel_shader_imask_rejects_reserved_bits_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x0f1c, 0);
+    let before = channel.clone();
+
+    let decoded = packet(0x0f1c / 4, 2);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+            if source.method() == GpuMethodId(0x0f1c)
+    ));
+    assert_eq!(channel, before);
+}
+
+#[test]
+fn pixel_shader_interlock_control_decodes_all_allocated_field_combinations() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x2000, 0x11);
+
+    for raw in 0..=0x0f {
+        if raw & 3 == 3 {
+            continue;
+        }
+        program_three_d(&mut channel, 0x1224, raw);
+        let value = channel
+            .three_d()
+            .shader_execution()
+            .pixel_shader_interlock_control()
+            .value()
+            .copied()
+            .unwrap();
+        assert_eq!(value.raw(), raw);
+        assert_eq!(
+            value.tile_size(),
+            if raw & 4 == 0 {
+                MaxwellThreeDPixelShaderInterlockTileSize::Tile16x16
+            } else {
+                MaxwellThreeDPixelShaderInterlockTileSize::Tile8x8
+            }
+        );
+        assert_eq!(
+            value.fragment_order(),
+            if raw & 8 == 0 {
+                MaxwellThreeDPixelShaderInterlockFragmentOrder::Ordered
+            } else {
+                MaxwellThreeDPixelShaderInterlockFragmentOrder::Unordered
+            }
+        );
+        assert_eq!(value.conflict_detection_enabled(), raw & 3 != 0);
+    }
+
+    program_three_d(&mut channel, 0x1224, 0);
+    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    program_three_d(&mut channel, 0x1224, 1);
+    assert_ne!(
+        channel.three_d().pipeline_dependencies(&[]),
+        inactive_dependencies
+    );
+}
+
+#[test]
+fn pixel_shader_interlock_control_rejects_reserved_encodings_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x1224, 0);
+
+    for raw in [3, 7, 0x0b, 0x0f, 0x10, u32::MAX] {
+        let before = channel.clone();
+        let decoded = packet(0x1224 / 4, raw);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+                if source.method() == GpuMethodId(0x1224)
+        ));
+        assert_eq!(channel, before);
+    }
+}
+
+#[test]
+fn global_draw_indices_preserve_full_width_values_without_changing_pipeline_identity() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+
+    for raw in [0, 1, i32::MAX as u32, u32::MAX] {
+        let decoded = packet(0x1434 / 4, raw);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let register = channel
+            .three_d()
+            .vertex_input()
+            .assembly()
+            .global_base_vertex_index();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_GLOBAL_BASE_VERTEX_INDEX"
+        );
+        assert_eq!(register.raw(), Some(raw));
+        assert_eq!(register.value(), Some(&raw));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+    }
+
+    for raw in [0, 1, u32::MAX] {
+        let decoded = packet(0x1438 / 4, raw);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let register = channel
+            .three_d()
+            .vertex_input()
+            .assembly()
+            .global_base_instance_index();
+        assert_eq!(
+            dispatch.methods()[0].metadata().method_name(),
+            "SET_GLOBAL_BASE_INSTANCE_INDEX"
+        );
+        assert_eq!(register.raw(), Some(raw));
+        assert_eq!(register.value(), Some(&raw));
+        assert_eq!(
+            register.source(),
+            Some(dispatch.methods()[0].method().source())
+        );
+    }
+
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        dependencies_before
+    );
 }
 
 #[test]
@@ -180,7 +673,7 @@ fn shader_exceptions_enable_is_typed_source_preserving_diagnostic_state() {
 }
 
 #[test]
-fn shader_exceptions_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn shader_exceptions_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1528, 1);
@@ -226,7 +719,7 @@ fn shader_exceptions_reserved_bits_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -286,7 +779,7 @@ fn alpha_fraction_is_typed_source_preserving_raster_state() {
 }
 
 #[test]
-fn invalid_alpha_fraction_values_and_packet_suffix_are_rejected_atomically() {
+fn invalid_alpha_fraction_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x074c, 0x3f);
@@ -329,7 +822,7 @@ fn invalid_alpha_fraction_values_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -584,7 +1077,7 @@ fn raster_bounding_box_is_typed_source_preserving_and_pipeline_neutral() {
 }
 
 #[test]
-fn invalid_raster_bounding_box_values_and_packet_suffix_are_atomic() {
+fn invalid_raster_bounding_box_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x02ec, 0x60);
@@ -1061,7 +1554,7 @@ fn vaf_l2_cache_control_preserves_volatility_policy_source_and_isolation() {
 }
 
 #[test]
-fn invalid_vaf_l2_cache_controls_and_packet_suffix_are_rejected_atomically() {
+fn invalid_vaf_l2_cache_controls_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1000, 0x10);
@@ -1107,11 +1600,11 @@ fn invalid_vaf_l2_cache_controls_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
-fn invalid_rop_l2_cache_policies_and_packet_suffix_are_rejected_atomically() {
+fn invalid_rop_l2_cache_policies_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let methods = [0x0218, 0x10fc, 0x1290, 0x12d8, 0x12dc];
@@ -1162,7 +1655,7 @@ fn invalid_rop_l2_cache_policies_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -1334,7 +1827,7 @@ fn incrementing_notify_address_fragments_commit_together() {
 }
 
 #[test]
-fn unsupported_notify_trigger_discards_both_address_fragments() {
+fn unsupported_notify_trigger_keeps_both_address_fragments() {
     let mut channel = channel();
     bind_two_d(&mut channel);
     let frontend_before = channel.frontend();
@@ -1354,7 +1847,7 @@ fn unsupported_notify_trigger_discards_both_address_fragments() {
         }) if source.method() == GpuMethodId(0x010c)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
+    assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
 
@@ -1822,7 +2315,7 @@ fn invalid_two_d_color_key_enable_rejects_without_mutating_channel_state() {
 }
 
 #[test]
-fn unsupported_method_after_color_key_enable_discards_the_packet_prefix() {
+fn unsupported_method_after_color_key_enable_keeps_the_packet_prefix() {
     let mut channel = channel();
     bind_two_d(&mut channel);
     let frontend_before = channel.frontend();
@@ -1842,7 +2335,7 @@ fn unsupported_method_after_color_key_enable_discards_the_packet_prefix() {
         }) if source.method() == GpuMethodId(0x02a0)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
+    assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
 
@@ -2059,7 +2552,7 @@ fn invalid_two_d_operation_values_are_rejected_atomically() {
 }
 
 #[test]
-fn unsupported_method_after_two_d_operation_discards_the_packet_prefix() {
+fn unsupported_method_after_two_d_operation_keeps_the_packet_prefix() {
     let mut channel = channel();
     bind_two_d(&mut channel);
     let frontend_before = channel.frontend();
@@ -2079,7 +2572,7 @@ fn unsupported_method_after_two_d_operation_discards_the_packet_prefix() {
         }) if source.method() == GpuMethodId(0x02b0)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
+    assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
 
@@ -2110,7 +2603,7 @@ fn invalid_two_d_value_rejects_without_mutating_any_channel_state() {
 }
 
 #[test]
-fn unsupported_two_d_suffix_discards_the_valid_packet_prefix() {
+fn unsupported_two_d_suffix_keeps_the_valid_packet_prefix() {
     let mut channel = channel();
     bind_two_d(&mut channel);
     let frontend_before = channel.frontend();
@@ -2130,37 +2623,24 @@ fn unsupported_two_d_suffix_discards_the_valid_packet_prefix() {
         }) if source.method() == GpuMethodId(0x0264)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
+    assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
 
 #[test]
-fn commit_rejects_intervening_two_d_state_without_partial_publish() {
+fn two_d_packet_mutates_only_its_engine_state() {
     let mut channel = channel();
     bind_two_d(&mut channel);
+    let three_d_before = channel.three_d().clone();
     let first = packet_on_subchannel(3, 0x0260 / 4, 0);
-    let prepared = preflight_maxwell_engine_packet(
-        &channel,
+    dispatch_maxwell_engine_packet(
+        &mut channel,
         FrontendSubmissionId::new(3),
         &first.packets()[0],
     )
     .unwrap();
-    let intervening = packet_on_subchannel(3, 0x0260 / 4, 1);
-    dispatch_maxwell_engine_packet(
-        &mut channel,
-        FrontendSubmissionId::new(3),
-        &intervening.packets()[0],
-    )
-    .unwrap();
-    let committed_two_d = channel.two_d().clone();
-    let committed_three_d = channel.three_d().clone();
-
-    assert!(matches!(
-        commit_maxwell_engine_packet(&mut channel, &prepared),
-        Err(MaxwellEngineDispatchError::EngineStateChanged { .. })
-    ));
-    assert_eq!(channel.two_d(), &committed_two_d);
-    assert_eq!(channel.three_d(), &committed_three_d);
+    assert_eq!(channel.two_d().processing_clusters().raw(), Some(0));
+    assert_eq!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -2580,7 +3060,7 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
 }
 
 #[test]
-fn invalid_l1_configurations_and_packet_suffix_are_rejected_atomically() {
+fn invalid_l1_configurations_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0308, 1);
@@ -2626,7 +3106,7 @@ fn invalid_l1_configurations_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -2767,7 +3247,7 @@ fn shader_local_memory_fields_are_atomic_and_cross_register_ranges_defer() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 
     program_three_d(&mut channel, 0x0790, 0xff);
     program_three_d(&mut channel, 0x0794, u32::MAX);
@@ -2977,7 +3457,7 @@ fn visible_call_limit_is_typed_source_preserving_execution_state() {
 }
 
 #[test]
-fn invalid_visible_call_limits_and_packet_suffix_are_rejected_atomically() {
+fn invalid_visible_call_limits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0d64, 8);
@@ -3020,7 +3500,7 @@ fn invalid_visible_call_limits_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3178,7 +3658,7 @@ fn active_zcull_region_is_typed_source_preserving_and_pipeline_neutral() {
 }
 
 #[test]
-fn active_zcull_region_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn active_zcull_region_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1590, 0x3f);
@@ -3221,7 +3701,7 @@ fn active_zcull_region_reserved_bits_and_packet_suffix_are_rejected_atomically()
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3272,7 +3752,7 @@ fn two_sided_stencil_test_is_typed_source_preserving_state() {
 }
 
 #[test]
-fn invalid_two_sided_stencil_test_values_and_packet_suffix_are_atomic() {
+fn invalid_two_sided_stencil_test_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1594, 1);
@@ -3317,7 +3797,7 @@ fn invalid_two_sided_stencil_test_values_and_packet_suffix_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3529,7 +4009,105 @@ fn zcull_stats_enable_is_typed_source_preserving_isolated_three_d_state() {
 }
 
 #[test]
-fn invalid_zcull_stats_values_and_packet_suffix_are_rejected_atomically() {
+fn zpass_pixel_count_enable_is_typed_source_preserving_pipeline_neutral_state() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let frontend_before = channel.frontend();
+    let two_d_before = channel.two_d().clone();
+    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
+    assert_eq!(
+        channel
+            .three_d()
+            .counters()
+            .zpass_pixel_count_enable()
+            .origin(),
+        MaxwellThreeDRegisterOrigin::Unset
+    );
+
+    for (argument, expected) in [
+        (0, MaxwellThreeDZPassPixelCountEnable::Disabled),
+        (1, MaxwellThreeDZPassPixelCountEnable::Enabled),
+    ] {
+        let decoded = packet(0x1514 / 4, argument);
+        let dispatch = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0],
+        )
+        .unwrap();
+        let method = &dispatch.methods()[0];
+        let source = method.method().source();
+        let register = channel.three_d().counters().zpass_pixel_count_enable();
+
+        assert_eq!(method.metadata().method_name(), "SET_ZPASS_PIXEL_COUNT");
+        assert_eq!(
+            method.effect(),
+            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Counter(
+                MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable {
+                    value: expected,
+                    source,
+                }
+            ))
+        );
+        assert!(dispatch.operations().is_empty());
+        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+        assert_eq!(register.raw(), Some(argument));
+        assert_eq!(register.value().copied(), Some(expected));
+        assert_eq!(register.source(), Some(source));
+        assert_eq!(expected.raw(), argument);
+        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.two_d(), &two_d_before);
+        assert_eq!(
+            channel.three_d().pipeline_dependencies(&[]),
+            dependencies_before
+        );
+    }
+}
+
+#[test]
+fn invalid_zpass_pixel_count_values_and_related_failed_packet_keeps_valid_prefix() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    program_three_d(&mut channel, 0x1514, 1);
+
+    for argument in [2, 3, 0x8000_0000, u32::MAX] {
+        let channel_before = channel.clone();
+        let decoded = packet(0x1514 / 4, argument);
+
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                source,
+                defined_mask: 1,
+                ..
+            }) if source.argument() == argument
+        ));
+        assert_eq!(channel, channel_before);
+    }
+
+    let channel_before = channel.clone();
+    let decoded = incrementing_packet(0x1514 / 4, &[0, 0x3f80_0000, 2]);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &decoded.packets()[0]
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            source,
+            defined_mask: 1,
+            ..
+        }) if source.method() == GpuMethodId(0x151c) && source.argument() == 2
+    ));
+    assert_ne!(channel, channel_before);
+}
+
+#[test]
+fn invalid_zcull_stats_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x151c, 1);
@@ -3572,7 +4150,7 @@ fn invalid_zcull_stats_values_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3720,7 +4298,7 @@ fn balanced_primitive_workload_is_typed_source_preserving_nonsemantic_policy() {
 }
 
 #[test]
-fn balanced_primitive_workload_reserved_bits_and_packet_suffix_are_atomic() {
+fn balanced_primitive_workload_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0374, 0x11);
@@ -3754,7 +4332,7 @@ fn balanced_primitive_workload_reserved_bits_and_packet_suffix_are_atomic() {
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
             if source.argument() == 2
     ));
-    assert_eq!(channel, before);
+    assert_ne!(channel, before);
 }
 
 #[test]
@@ -3830,7 +4408,7 @@ fn subtiling_perf_knobs_are_typed_source_preserving_nonsemantic_policy() {
 }
 
 #[test]
-fn subtiling_perf_knob_b_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn subtiling_perf_knob_b_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0360, 0x2016_4010);
@@ -3877,7 +4455,7 @@ fn subtiling_perf_knob_b_reserved_bits_and_packet_suffix_are_rejected_atomically
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3954,7 +4532,7 @@ fn shader_watermark_family_is_typed_source_preserving_nonsemantic_policy() {
 }
 
 #[test]
-fn shader_watermark_packet_suffix_is_atomic() {
+fn shader_watermark_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1450, 0x0080_0008);
@@ -3971,7 +4549,7 @@ fn shader_watermark_packet_suffix_is_atomic() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x1458)
     ));
-    assert_eq!(channel, before);
+    assert_ne!(channel, before);
 }
 
 #[test]
@@ -4130,7 +4708,7 @@ fn zcull_criterion_decodes_the_complete_documented_field_family() {
 }
 
 #[test]
-fn zcull_criterion_invalid_values_and_packet_suffix_are_rejected_atomically() {
+fn zcull_criterion_invalid_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0dd8, 0xff00_0005);
@@ -4164,11 +4742,11 @@ fn zcull_criterion_invalid_values_and_packet_suffix_are_rejected_atomically() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x0ddc)
     ));
-    assert_eq!(channel, before);
+    assert_ne!(channel, before);
 }
 
 #[test]
-fn zcull_control_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn zcull_control_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1968, 0x11);
@@ -4217,5 +4795,5 @@ fn zcull_control_reserved_bits_and_packet_suffix_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
