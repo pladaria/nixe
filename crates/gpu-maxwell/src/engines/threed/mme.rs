@@ -6,7 +6,7 @@ use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
 
-use super::MaxwellThreeDRegister;
+use super::{MaxwellThreeDRegister, state::verified_raw_register_reset};
 
 /// Number of indexed MME shadow scratch registers exposed by `MAXWELL_B`.
 ///
@@ -26,6 +26,39 @@ pub enum MaxwellThreeDMmeShadowRamControl {
     MethodTrackWithFilter = 1,
     MethodPassthrough = 2,
     MethodReplay = 3,
+}
+
+/// Whether Maxwell must process mutable methods through its heavyweight path.
+///
+/// NVIDIA publishes this as a single boolean scheduling-control field. The
+/// neutral frontend already preserves strict method order, so the value is
+/// retained with provenance but does not introduce a host pipeline dependency:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1812-L1815>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDMutableMethodControl {
+    Lightweight,
+    Heavyweight,
+}
+
+impl MaxwellThreeDMutableMethodControl {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Lightweight),
+            1 => Some(Self::Heavyweight),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn treats_mutable_as_heavyweight(self) -> bool {
+        matches!(self, Self::Heavyweight)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.treats_mutable_as_heavyweight() as u32
+    }
 }
 
 impl MaxwellThreeDMmeShadowRamControl {
@@ -545,6 +578,7 @@ pub struct MaxwellThreeDMmeState {
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
     start_addresses: BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>,
     shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
+    mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
     shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
     shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
 }
@@ -606,6 +640,13 @@ impl MaxwellThreeDMmeState {
     }
 
     #[must_use]
+    pub const fn mutable_method_control(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl> {
+        &self.mutable_method_control
+    }
+
+    #[must_use]
     pub fn shadow_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
         self.shadow_registers.get(&method.0)
     }
@@ -627,6 +668,7 @@ impl MaxwellThreeDMmeState {
         }
         self.shadow_register(method)
             .and_then(MaxwellThreeDRegister::raw)
+            .or_else(|| verified_raw_register_reset(method))
             .ok_or(MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
                 method_dword: (method.0 / 4) as u16,
             })
@@ -710,6 +752,10 @@ impl MaxwellThreeDMmeState {
                 self.shadow_ram_control =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
+            MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source } => {
+                self.mutable_method_control =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDMmeStateWrite::ShadowScratch {
                 index,
                 value,
@@ -724,7 +770,7 @@ impl MaxwellThreeDMmeState {
     }
 }
 
-/// One checked MME RAM transition ready for candidate state.
+/// One checked MME RAM transition ready for direct application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDMmeStateWrite {
     InstructionPointer {
@@ -747,6 +793,10 @@ pub enum MaxwellThreeDMmeStateWrite {
     },
     ShadowRamControl {
         value: MaxwellThreeDMmeShadowRamControl,
+        source: MaxwellMethodSource,
+    },
+    MutableMethodControl {
+        value: MaxwellThreeDMutableMethodControl,
         source: MaxwellMethodSource,
     },
     ShadowScratch {

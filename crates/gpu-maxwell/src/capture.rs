@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_packet_is_atomic_and_replay_requires_exact_initial_state() {
+    fn first_method_rejection_preserves_initial_state_and_replay_requires_it() {
         let words = [
             method_header(1, 0, 0, 1),
             SWITCH_1_GM20B_PROFILE.classes().three_d().0 | (1 << 31),

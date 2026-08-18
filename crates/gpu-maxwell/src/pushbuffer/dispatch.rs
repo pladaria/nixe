@@ -183,12 +183,9 @@ impl Display for MaxwellMethodDispatch {
     }
 }
 
-/// Complete result of one atomically preflighted packet.
+/// Methods decoded and applied while dispatching one packet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellPacketDispatch {
-    channel: MaxwellChannelId,
-    frontend_before: MaxwellChannelFrontendState,
-    frontend_after: MaxwellChannelFrontendState,
     methods: Box<[MaxwellMethodDispatch]>,
 }
 
@@ -196,21 +193,6 @@ impl MaxwellPacketDispatch {
     #[must_use]
     pub fn methods(&self) -> &[MaxwellMethodDispatch] {
         &self.methods
-    }
-
-    #[must_use]
-    pub const fn channel(&self) -> MaxwellChannelId {
-        self.channel
-    }
-
-    #[must_use]
-    pub const fn frontend_before(&self) -> MaxwellChannelFrontendState {
-        self.frontend_before
-    }
-
-    #[must_use]
-    pub const fn frontend_after(&self) -> MaxwellChannelFrontendState {
-        self.frontend_after
     }
 }
 
@@ -221,9 +203,6 @@ pub enum MaxwellMethodDispatchError {
         source: MaxwellGpfifoSourceLocation,
         channel: MaxwellChannelId,
         submission: FrontendSubmissionId,
-    },
-    FrontendStateChanged {
-        channel: MaxwellChannelId,
     },
     MissingPacketSubchannel {
         source: MaxwellGpfifoSourceLocation,
@@ -271,10 +250,6 @@ impl Display for MaxwellMethodDispatchError {
             } => write!(
                 formatter,
                 "Maxwell method source belongs to another dispatch: expected=[{channel} {submission}] actual=[{source}]"
-            ),
-            Self::FrontendStateChanged { channel } => write!(
-                formatter,
-                "Maxwell channel frontend changed after packet preflight: {channel}"
             ),
             Self::MissingPacketSubchannel { source } => {
                 write!(
@@ -340,13 +315,12 @@ impl Display for MaxwellMethodDispatchError {
 
 impl std::error::Error for MaxwellMethodDispatchError {}
 
-/// Preflights one complete decoded packet without mutating channel state.
+/// Dispatches one packet in method order, mutating frontend state directly.
 ///
-/// Method writes are evaluated against a private copy of the channel frontend.
-/// T7-C can validate every resulting class method before calling
-/// [`commit_maxwell_packet`], keeping binding and future class state atomic.
-pub fn preflight_maxwell_packet(
-    channel: &MaxwellGpuChannel,
+/// Unsupported semantics are fatal to the guest process, so successfully
+/// dispatched method prefixes are not rolled back when a later method fails.
+pub fn dispatch_maxwell_packet(
+    channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedPacket,
 ) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
@@ -359,9 +333,6 @@ pub fn preflight_maxwell_packet(
             match operation {
                 MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment => {
                     Ok(MaxwellPacketDispatch {
-                        channel: channel.id(),
-                        frontend_before: channel.frontend(),
-                        frontend_after: channel.frontend(),
                         methods: Box::new([]),
                     })
                 }
@@ -378,38 +349,7 @@ pub fn preflight_maxwell_packet(
     }
 }
 
-/// Commits a previously preflighted packet if no intervening frontend state
-/// change occurred. Engine handlers must finish their own preflight first.
-pub fn commit_maxwell_packet(
-    channel: &mut MaxwellGpuChannel,
-    dispatch: &MaxwellPacketDispatch,
-) -> Result<(), MaxwellMethodDispatchError> {
-    if channel.id() != dispatch.channel || channel.frontend() != dispatch.frontend_before {
-        return Err(MaxwellMethodDispatchError::FrontendStateChanged {
-            channel: channel.id(),
-        });
-    }
-    channel.replace_frontend(dispatch.frontend_after);
-    Ok(())
-}
-
-/// Preflights and commits the class-binding portion of one packet.
-///
-/// T7-C and later layers should use the explicit preflight/commit pair so
-/// engine-specific validation occurs before any frontend state is committed.
-pub fn dispatch_maxwell_packet(
-    channel: &mut MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: &MaxwellDecodedPacket,
-) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
-    let dispatch = preflight_maxwell_packet(channel, submission, packet)?;
-    commit_maxwell_packet(channel, &dispatch)?;
-    Ok(dispatch)
-}
-
-/// Dispatches decoded packets in stream order while preserving per-packet
-/// atomicity. A failing packet cannot mutate bindings or expose its prefix;
-/// bindings committed by earlier complete packets remain frontend state.
+/// Dispatches decoded packets and methods in stream order.
 pub fn dispatch_maxwell_pushbuffer(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
@@ -426,16 +366,13 @@ pub fn dispatch_maxwell_pushbuffer(
 }
 
 fn dispatch_method_packet(
-    channel: &MaxwellGpuChannel,
+    channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedMethodPacket,
 ) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
     validate_source_identity(channel.id(), submission, packet.header())?;
     if packet.methods().is_empty() {
         return Ok(MaxwellPacketDispatch {
-            channel: channel.id(),
-            frontend_before: channel.frontend(),
-            frontend_after: channel.frontend(),
             methods: Box::new([]),
         });
     }
@@ -445,33 +382,30 @@ fn dispatch_method_packet(
             .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel {
                 source: packet.header(),
             })?;
-    let frontend_before = channel.frontend();
-    let mut frontend_after = frontend_before;
+    let channel_id = channel.id();
+    let profile = channel.profile();
     let mut methods = Vec::new();
     methods
         .try_reserve_exact(packet.methods().len())
         .map_err(|_| MaxwellMethodDispatchError::ResourceExhausted)?;
 
     for method in packet.methods() {
-        methods.push(preflight_method(
-            channel.id(),
-            channel.profile(),
+        methods.push(dispatch_method(
+            channel_id,
+            profile,
             submission,
             subchannel,
             *method,
-            &mut frontend_after,
+            channel.frontend_mut(),
         )?);
     }
 
     Ok(MaxwellPacketDispatch {
-        channel: channel.id(),
-        frontend_before,
-        frontend_after,
         methods: methods.into_boxed_slice(),
     })
 }
 
-fn preflight_method(
+fn dispatch_method(
     channel: MaxwellChannelId,
     profile: MaxwellGpuProfile,
     submission: FrontendSubmissionId,
@@ -720,39 +654,27 @@ mod tests {
     }
 
     #[test]
-    fn explicit_preflight_defers_commit_and_detects_intervening_state() {
+    fn failing_packet_keeps_the_successfully_dispatched_frontend_prefix() {
         let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
         let subchannel = MaxwellPushbufferSubchannel::try_new(0).unwrap();
-        let decoded = decode(&[word(header(1, 0, 0, 1), 0), word(class.0, 1)]);
+        let decoded = decode(&[word(header(1, 0, 0, 2), 0), word(class.0, 1), word(0, 2)]);
         let mut channel = channel();
 
-        let prepared = preflight_maxwell_packet(
-            &channel,
+        let error = dispatch_maxwell_packet(
+            &mut channel,
             FrontendSubmissionId::new(11),
             &decoded.packets()[0],
         )
-        .unwrap();
-        assert_eq!(channel.frontend().subchannel_binding(subchannel), None);
-        commit_maxwell_packet(&mut channel, &prepared).unwrap();
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MaxwellMethodDispatchError::UnsupportedHostMethod { .. }
+        ));
         assert_eq!(
             channel.frontend().subchannel_binding(subchannel),
             Some(class)
         );
-
-        let prepared = preflight_maxwell_packet(
-            &channel,
-            FrontendSubmissionId::new(11),
-            &decoded.packets()[0],
-        )
-        .unwrap();
-        channel.reset_subchannel_bindings();
-        assert_eq!(
-            commit_maxwell_packet(&mut channel, &prepared),
-            Err(MaxwellMethodDispatchError::FrontendStateChanged {
-                channel: MaxwellChannelId::new(7)
-            })
-        );
-        assert_eq!(channel.frontend().subchannel_binding(subchannel), None);
     }
 
     #[test]
@@ -821,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn later_invalid_set_object_makes_the_whole_packet_atomic() {
+    fn later_invalid_set_object_keeps_the_valid_prefix() {
         let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
         let decoded = decode(&[
             word(header(3, 0, 0, 2), 0),
@@ -839,7 +761,7 @@ mod tests {
             Err(MaxwellMethodDispatchError::InvalidSetObjectValue { source })
                 if source.location() == location(2)
         ));
-        assert_eq!(channel.frontend(), before);
+        assert_ne!(channel.frontend(), before);
     }
 
     #[test]
@@ -982,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_unsupported_legacy_mem_ops_reject_the_complete_packet() {
+    fn invalid_or_unsupported_legacy_mem_ops_fail_after_applying_valid_prefix() {
         let invalid = decode(&[
             word(header(1, 0x28 / 4, 6, 2), 0),
             word(0x1234_5678, 1),
@@ -998,7 +920,7 @@ mod tests {
             Err(MaxwellMethodDispatchError::InvalidHostMethodValue { source, .. })
                 if source.location() == location(2)
         ));
-        assert_eq!(channel.frontend().legacy_mem_op_a(), None);
+        assert_ne!(channel.frontend().legacy_mem_op_a(), None);
 
         let unsupported = decode(&[word(header(1, 0x2c / 4, 6, 1), 0), word(0x2800_0000, 1)]);
         assert!(matches!(

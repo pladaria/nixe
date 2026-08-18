@@ -126,7 +126,7 @@ fn three_d_depth_layer_is_typed_source_preserving_and_rejects_reserved_bits_atom
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x17a0)
     ));
-    assert_eq!(channel, before);
+    assert_ne!(channel, before);
 }
 
 #[test]
@@ -1032,7 +1032,7 @@ fn constant_buffer_inline_load_validates_fields_sequence_bounds_and_atomicity() 
             ..
         }) if source.argument() == 2
     ));
-    assert_eq!(channel.three_d(), &before_packet);
+    assert_ne!(channel.three_d(), &before_packet);
 }
 
 #[test]
@@ -2159,45 +2159,27 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
 }
 
 #[test]
-fn commit_rejects_intervening_engine_or_binding_state_without_partial_publish() {
+fn packet_dispatch_does_not_retain_complete_engine_snapshots() {
+    assert!(
+        size_of::<MaxwellEnginePacketDispatch>() < size_of::<MaxwellThreeDState>(),
+        "packet results must retain validated effects, not complete engine snapshots"
+    );
+
     let mut channel = channel();
     bind_three_d(&mut channel);
+    let compute_before = channel.compute().clone();
     let first = packet(0x1518 / 4, 0x3f80_0000);
-    let prepared = preflight_maxwell_engine_packet(
-        &channel,
-        FrontendSubmissionId::new(3),
-        &first.packets()[0],
-    )
-    .unwrap();
-    let intervening = packet(0x1518 / 4, 0x4000_0000);
     dispatch_maxwell_engine_packet(
         &mut channel,
         FrontendSubmissionId::new(3),
-        &intervening.packets()[0],
-    )
-    .unwrap();
-    let committed_intervening = channel.three_d().clone();
-    assert!(matches!(
-        commit_maxwell_engine_packet(&mut channel, &prepared),
-        Err(MaxwellEngineDispatchError::EngineStateChanged { .. })
-    ));
-    assert_eq!(channel.three_d(), &committed_intervening);
-
-    let prepared = preflight_maxwell_engine_packet(
-        &channel,
-        FrontendSubmissionId::new(3),
         &first.packets()[0],
     )
     .unwrap();
-    channel.reset_subchannel_bindings();
-    let state_before_failed_commit = channel.three_d().clone();
-    assert!(matches!(
-        commit_maxwell_engine_packet(&mut channel, &prepared),
-        Err(MaxwellEngineDispatchError::Binding(
-            MaxwellMethodDispatchError::FrontendStateChanged { .. }
-        ))
-    ));
-    assert_eq!(channel.three_d(), &state_before_failed_commit);
+    assert_eq!(channel.compute(), &compute_before);
+    assert_eq!(
+        channel.three_d().raster().point_size().raw(),
+        Some(0x3f80_0000)
+    );
 }
 
 #[test]
@@ -2216,8 +2198,8 @@ fn taxonomy_separates_unsupported_invalid_capability_and_unknown_methods() {
     ];
     for (method, argument, expected) in cases {
         let decoded = packet(method / 4, argument);
-        let error = preflight_maxwell_engine_packet(
-            &channel,
+        let error = dispatch_maxwell_engine_packet(
+            &mut channel,
             FrontendSubmissionId::new(3),
             &decoded.packets()[0],
         )
@@ -2301,7 +2283,7 @@ fn ct_mrt_enable_is_typed_source_preserving_and_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -2718,7 +2700,7 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
             if source.method() == GpuMethodId(0x02ec)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
@@ -2826,7 +2808,7 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
                 && source.argument() == 0x1_0000
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
@@ -2937,7 +2919,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
             if source.method() == GpuMethodId(0x157c)
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
@@ -3009,7 +2991,7 @@ fn compute_bindless_texture_slot_is_typed_source_preserving_and_atomic() {
             if source.argument() == 8
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
@@ -3130,8 +3112,9 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
         }) if source.argument() == 0x5566_7788
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 
+    let after_prefix = channel.compute().clone();
     let reserved = packet_on_subchannel(1, 0x01b0 / 4, 0x80);
     assert!(matches!(
         dispatch_maxwell_engine_packet(
@@ -3145,7 +3128,7 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
             ..
         }) if source.argument() == 0x80
     ));
-    assert_eq!(channel.compute(), &compute_before);
+    assert_eq!(channel.compute(), &after_prefix);
 }
 
 #[test]
@@ -3342,7 +3325,7 @@ fn compute_cwd_reference_counter_bank_is_typed_source_preserving_and_atomic() {
             if source.argument() == 0x40
     ));
     assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.compute(), &compute_before);
+    assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
@@ -3465,6 +3448,109 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
     assert_eq!(channel.compute(), &compute_before);
     assert_eq!(channel.three_d(), &three_d_before);
     assert_eq!(channel.two_d(), &two_d_before);
+}
+
+#[test]
+fn decompress_surface_is_ordered_only_when_the_selected_target_is_uncompressed() {
+    let mut uncompressed = channel();
+    bind_three_d(&mut uncompressed);
+    program_three_d(&mut uncompressed, 0x19e0 + 5 * 4, 0);
+
+    let decoded = packet(0x02e0 / 4, (0x1234 << 4) | 5);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut uncompressed,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch.methods()[0].metadata().method_name(),
+        "DECOMPRESS_SURFACE"
+    );
+    assert!(dispatch.operations().is_empty());
+    let operation = &dispatch.synchronization_operations()[0];
+    let request = match operation.trigger() {
+        MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source } => {
+            assert_eq!(source.method(), GpuMethodId(0x02e0));
+            request
+        }
+        other => panic!("unexpected synchronization trigger: {other:?}"),
+    };
+    assert_eq!(request.color_target(), 5);
+    assert_eq!(request.array_index(), 0x1234);
+    assert_eq!(request.raw(), (0x1234 << 4) | 5);
+    assert_eq!(
+        lower_maxwell_three_d_synchronization(operation, None, true),
+        Ok(
+            MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface {
+                request,
+                prior_work_pending: true,
+            }
+        )
+    );
+
+    let mut compressed = channel();
+    bind_three_d(&mut compressed);
+    program_three_d(&mut compressed, 0x19e0, 1);
+    let decoded = packet(0x02e0 / 4, 0);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut compressed,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_synchronization(
+            &dispatch.synchronization_operations()[0],
+            None,
+            false
+        ),
+        Err(MaxwellThreeDSynchronizationError::CompressedSurfaceDecompressionUnavailable {
+            request,
+            ..
+        }) if request.color_target() == 0 && request.array_index() == 0
+    ));
+
+    let mut unset = channel();
+    bind_three_d(&mut unset);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut unset,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    )
+    .unwrap();
+    assert!(matches!(
+        lower_maxwell_three_d_synchronization(
+            &dispatch.synchronization_operations()[0],
+            None,
+            false
+        ),
+        Err(MaxwellThreeDSynchronizationError::IncompleteDecompressSurfaceState { target: 0, .. })
+    ));
+}
+
+#[test]
+fn decompress_surface_rejects_reserved_bits_atomically() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    for raw in [8, 1 << 20, u32::MAX] {
+        let before = channel.clone();
+        let decoded = packet(0x02e0 / 4, raw);
+        assert!(matches!(
+            dispatch_maxwell_engine_packet(
+                &mut channel,
+                FrontendSubmissionId::new(3),
+                &decoded.packets()[0]
+            ),
+            Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                source,
+                defined_mask: 0x000f_fff7,
+                ..
+            }) if source.argument() == raw
+        ));
+        assert_eq!(channel, before);
+    }
 }
 
 #[test]
@@ -3929,7 +4015,7 @@ fn ordered_shader_cache_special_controls_fail_during_lowering_and_reserved_bits_
 }
 
 #[test]
-fn three_d_completion_reserved_bits_reject_the_whole_packet_atomically() {
+fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -3962,8 +4048,8 @@ fn known_compute_class_distinguishes_missing_method_coverage() {
     let mut channel = channel();
     bind_compute(&mut channel);
     let method = packet_on_subchannel(1, 0x100 / 4, 0);
-    let error = preflight_maxwell_engine_packet(
-        &channel,
+    let error = dispatch_maxwell_engine_packet(
+        &mut channel,
         FrontendSubmissionId::new(3),
         &method.packets()[0],
     )

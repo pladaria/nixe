@@ -12,9 +12,11 @@ use crate::MaxwellMethodSource;
 
 use super::{
     MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
-    MaxwellThreeDColorReductionStateWrite, MaxwellThreeDCoverageState,
-    MaxwellThreeDCoverageStateWrite, MaxwellThreeDFalconMaskedRegisterWrite,
-    MaxwellThreeDFalconState, MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
+    MaxwellThreeDColorReductionStateWrite, MaxwellThreeDConstantColorRenderingState,
+    MaxwellThreeDConstantColorRenderingStateWrite, MaxwellThreeDCounterState,
+    MaxwellThreeDCounterStateWrite, MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite,
+    MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
+    MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
     MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
     MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
@@ -24,7 +26,8 @@ use super::{
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
     MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDTirMode, MaxwellThreeDVertexInputState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDTiledCacheState,
+    MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDTirMode, MaxwellThreeDVertexInputState,
     MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
 };
 
@@ -33,6 +36,7 @@ pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
 /// Byte-addressed polygon-mode registers read by the Switch graphics macros.
 pub(super) const MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD: u32 = 0x0dac;
 pub(super) const MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD: u32 = 0x0db0;
+pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD: u32 = 0x13ac;
 pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD: u32 = 0x2000;
 pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE: u32 = 0x40;
 
@@ -60,6 +64,47 @@ pub(super) const MAXWELL_THREE_D_PIPELINE_SHADER_RESET: u32 = 0;
 /// zero is a valid typed value and is observable when a guest relies on reset
 /// state rather than redundantly programming the method.
 pub(super) const MAXWELL_THREE_D_PIPELINE_BINDING_RESET: u32 = 0;
+
+/// Reset value of `SET_WINDOW_ORIGIN`: upper-left with no Y flip.
+///
+/// NVIDIA publishes those encodings as zero. yuzu initializes the live class
+/// state first and then copies it into the shadow register file; Ryujinx
+/// independently initializes its live and shadow arrays through the same
+/// default-state routine. Neither overrides `SET_WINDOW_ORIGIN`, so both
+/// retain the zero-initialized class value in shadow RAM:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2599-L2605>
+/// <https://ni.4a.si/anonymous/yuzu/tree/src/video_core/engines/maxwell_3d.cpp?id=9705094a576e6594e359cc0256b63385ac05de3f#n29>
+/// <https://www.git.axenov.dev/Museum/ryujinx/src/commit/4594c3b31014655fb0b37f1305598fc3cbafdc73/Ryujinx.Graphics.Gpu/State/GpuState.cs#L48-L67>
+pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_RESET: u32 = 0;
+
+/// Returns a raw class-register reset verified by pinned public sources.
+///
+/// The live and MME shadow register files share this lookup so replay starts
+/// from the same architectural state. Registers absent from this set remain
+/// unknown rather than being silently fabricated as zero.
+pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u32> {
+    match method.0 {
+        MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD | MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD => {
+            Some(MAXWELL_THREE_D_POLYGON_MODE_RESET)
+        }
+        MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD => Some(MAXWELL_THREE_D_WINDOW_ORIGIN_RESET),
+        raw if raw >= MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD => {
+            let offset = raw - MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD;
+            let pipeline = offset / MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
+            let register = offset % MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
+            if pipeline < MAXWELL_PIPELINE_SHADER_COUNT as u32 {
+                match register {
+                    0 => Some(MAXWELL_THREE_D_PIPELINE_SHADER_RESET),
+                    0x10 => Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 /// How a modeled Maxwell register acquired its current value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -767,13 +812,16 @@ pub struct MaxwellThreeDState {
     render_enable: MaxwellThreeDRenderEnableState,
     shader_execution: MaxwellThreeDShaderExecutionState,
     color_reduction: MaxwellThreeDColorReductionState,
+    constant_color_rendering: MaxwellThreeDConstantColorRenderingState,
     coverage: MaxwellThreeDCoverageState,
     line: MaxwellThreeDLineState,
     zcull: MaxwellThreeDZCullState,
     l2_cache: MaxwellThreeDL2CacheState,
     report_semaphore: MaxwellThreeDReportSemaphoreState,
+    counters: MaxwellThreeDCounterState,
     falcon: MaxwellThreeDFalconState,
     instrumentation: MaxwellThreeDInstrumentationState,
+    tiled_cache: MaxwellThreeDTiledCacheState,
     mme: MaxwellThreeDMmeState,
 }
 
@@ -783,32 +831,26 @@ impl Default for MaxwellThreeDState {
         for method in [
             MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
             MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
+            MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,
         ] {
+            let reset = verified_raw_register_reset(GpuMethodId(method))
+                .expect("listed Maxwell register reset must be verified");
             raw_registers.insert(
                 method,
-                MaxwellThreeDRegister::verified_reset(
-                    MAXWELL_THREE_D_POLYGON_MODE_RESET,
-                    Some(MAXWELL_THREE_D_POLYGON_MODE_RESET),
-                ),
+                MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
             );
         }
         for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
             let method = MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD
                 + pipeline as u32 * MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
-            raw_registers.insert(
-                method,
-                MaxwellThreeDRegister::verified_reset(
-                    MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-                    Some(MAXWELL_THREE_D_PIPELINE_SHADER_RESET),
-                ),
-            );
-            raw_registers.insert(
-                method + 0x10,
-                MaxwellThreeDRegister::verified_reset(
-                    MAXWELL_THREE_D_PIPELINE_BINDING_RESET,
-                    Some(MAXWELL_THREE_D_PIPELINE_BINDING_RESET),
-                ),
-            );
+            for register in [method, method + 0x10] {
+                let reset = verified_raw_register_reset(GpuMethodId(register))
+                    .expect("listed Maxwell pipeline reset must be verified");
+                raw_registers.insert(
+                    register,
+                    MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
+                );
+            }
         }
         Self {
             raw_registers,
@@ -821,13 +863,16 @@ impl Default for MaxwellThreeDState {
             render_enable: Default::default(),
             shader_execution: Default::default(),
             color_reduction: Default::default(),
+            constant_color_rendering: Default::default(),
             coverage: Default::default(),
             line: Default::default(),
             zcull: Default::default(),
             l2_cache: Default::default(),
             report_semaphore: Default::default(),
+            counters: Default::default(),
             falcon: Default::default(),
             instrumentation: Default::default(),
+            tiled_cache: Default::default(),
             mme: Default::default(),
         }
     }
@@ -885,6 +930,11 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
+    pub const fn constant_color_rendering(&self) -> &MaxwellThreeDConstantColorRenderingState {
+        &self.constant_color_rendering
+    }
+
+    #[must_use]
     pub const fn coverage(&self) -> &MaxwellThreeDCoverageState {
         &self.coverage
     }
@@ -910,6 +960,11 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
+    pub const fn counters(&self) -> &MaxwellThreeDCounterState {
+        &self.counters
+    }
+
+    #[must_use]
     pub const fn falcon(&self) -> &MaxwellThreeDFalconState {
         &self.falcon
     }
@@ -917,6 +972,11 @@ impl MaxwellThreeDState {
     #[must_use]
     pub const fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
         &self.instrumentation
+    }
+
+    #[must_use]
+    pub const fn tiled_cache(&self) -> &MaxwellThreeDTiledCacheState {
+        &self.tiled_cache
     }
 
     #[must_use]
@@ -1002,6 +1062,8 @@ impl MaxwellThreeDState {
             }
         }
         dependencies.push(self.raster.alpha_fraction.raw());
+        self.constant_color_rendering
+            .append_pipeline_dependencies(&mut dependencies);
         dependencies.push(self.raster.fill_via_triangle.raw());
         dependencies.push(self.raster.conservative_raster.raw());
         dependencies.push(self.viewport.z_clip_range.raw());
@@ -1028,9 +1090,32 @@ impl MaxwellThreeDState {
             dependencies.push(self.render_targets.separate_fragment_data().raw());
         }
         dependencies.push(self.coverage.csaa_enable().raw());
+        if self.coverage.post_z_pixel_shader_imask().value()
+            == Some(&super::MaxwellThreeDPostZPixelShaderImask::Enabled)
+        {
+            dependencies.push(self.coverage.post_z_pixel_shader_imask().raw());
+        }
         dependencies.push(self.coverage.tir_mode().raw());
         if self.coverage.tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM) {
             dependencies.push(self.coverage.tir_control().raw());
+            dependencies.push(self.coverage.tir_modulation().raw());
+            dependencies.push(self.coverage.tir_modulation_function().raw());
+        }
+        if self
+            .coverage
+            .coverage_to_color()
+            .value()
+            .is_some_and(|value| value.enabled())
+        {
+            dependencies.push(self.coverage.coverage_to_color().raw());
+        }
+        if self
+            .coverage
+            .alpha_to_coverage_override()
+            .value()
+            .is_some_and(|value| value.raw() != 0)
+        {
+            dependencies.push(self.coverage.alpha_to_coverage_override().raw());
         }
         dependencies.push(self.coverage.hybrid_anti_alias_control().raw());
         dependencies.extend(
@@ -1166,12 +1251,17 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::RenderEnable(write) => self.render_enable.apply(write),
             MaxwellThreeDStateWrite::ShaderExecution(write) => self.shader_execution.apply(write),
             MaxwellThreeDStateWrite::ColorReduction(write) => self.color_reduction.apply(write),
+            MaxwellThreeDStateWrite::ConstantColorRendering(write) => {
+                self.constant_color_rendering.apply(write);
+            }
             MaxwellThreeDStateWrite::Coverage(write) => self.coverage.apply(write),
             MaxwellThreeDStateWrite::Line(write) => self.line.apply(write),
             MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
             MaxwellThreeDStateWrite::L2Cache(write) => self.l2_cache.apply(write),
             MaxwellThreeDStateWrite::ReportSemaphore(write) => self.report_semaphore.apply(write),
+            MaxwellThreeDStateWrite::Counter(write) => self.counters.apply(write),
             MaxwellThreeDStateWrite::Instrumentation(write) => self.instrumentation.apply(write),
+            MaxwellThreeDStateWrite::TiledCache(write) => self.tiled_cache.apply(write),
             MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
                 self.falcon.apply(write);
                 let completion = MaxwellThreeDMmeStateWrite::ShadowScratch {
@@ -1362,7 +1452,7 @@ pub(in crate::engines) struct MaxwellThreeDStateValidationError {
     pub reason: &'static str,
 }
 
-/// One checked `MAXWELL_B` register transition ready for candidate state.
+/// One checked `MAXWELL_B` register transition ready for direct application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDStateWrite {
     PointSize {
@@ -1437,12 +1527,15 @@ pub enum MaxwellThreeDStateWrite {
     RenderEnable(MaxwellThreeDRenderEnableStateWrite),
     ShaderExecution(MaxwellThreeDShaderExecutionStateWrite),
     ColorReduction(MaxwellThreeDColorReductionStateWrite),
+    ConstantColorRendering(MaxwellThreeDConstantColorRenderingStateWrite),
     Coverage(MaxwellThreeDCoverageStateWrite),
     Line(MaxwellThreeDLineStateWrite),
     ZCull(MaxwellThreeDZCullStateWrite),
     L2Cache(MaxwellThreeDL2CacheStateWrite),
     ReportSemaphore(MaxwellThreeDReportSemaphoreStateWrite),
+    Counter(MaxwellThreeDCounterStateWrite),
     Instrumentation(MaxwellThreeDInstrumentationStateWrite),
+    TiledCache(MaxwellThreeDTiledCacheStateWrite),
     FalconMaskedRegister(MaxwellThreeDFalconMaskedRegisterWrite),
     Mme(MaxwellThreeDMmeStateWrite),
 }

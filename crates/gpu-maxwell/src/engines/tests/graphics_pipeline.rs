@@ -313,7 +313,7 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
 }
 
 #[test]
-fn compression_threshold_reserved_values_and_packet_suffix_are_atomic() {
+fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1220, 5);
@@ -347,7 +347,7 @@ fn compression_threshold_reserved_values_and_packet_suffix_are_atomic() {
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
             if source.argument() == 13
     ));
-    assert_eq!(channel, before);
+    assert_ne!(channel, before);
 }
 
 #[test]
@@ -742,7 +742,7 @@ fn render_target_layer_is_typed_source_preserving_and_conditionally_dependent() 
 }
 
 #[test]
-fn render_target_layer_reserved_bits_and_packet_suffix_are_atomic() {
+fn render_target_layer_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x15cc, 0);
@@ -787,11 +787,11 @@ fn render_target_layer_reserved_bits_and_packet_suffix_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
-fn malformed_color_target_selection_and_packet_suffix_are_atomic() {
+fn malformed_color_target_selection_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let valid = color_target_selection_raw(2, [1, 0, 7, 6, 5, 4, 3, 2]);
@@ -838,7 +838,7 @@ fn malformed_color_target_selection_and_packet_suffix_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -934,43 +934,38 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
 }
 
 #[test]
-fn three_d_register_write_uses_private_candidate_then_atomic_commit() {
+fn three_d_register_write_applies_immediately() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let decoded = packet(0x1518 / 4, 0x3fc0_0000);
     let before = channel.three_d().clone();
 
-    let prepared = preflight_maxwell_engine_packet(
-        &channel,
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
         FrontendSubmissionId::new(3),
         &decoded.packets()[0],
     )
     .unwrap();
     assert_eq!(
         channel.three_d().raster().point_size().origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
-    let after = prepared.three_d_after().clone();
-    assert_eq!(
-        after.raster().point_size().origin(),
         MaxwellThreeDRegisterOrigin::Programmed
     );
-    assert_eq!(after.raster().point_size().raw(), Some(0x3fc0_0000));
     assert_eq!(
-        after.raster().point_size().value().copied(),
+        channel.three_d().raster().point_size().raw(),
+        Some(0x3fc0_0000)
+    );
+    assert_eq!(
+        channel.three_d().raster().point_size().value().copied(),
         Some(MaxwellThreeDPointSize::from_bits(0x3fc0_0000))
     );
     assert_eq!(
-        prepared.methods()[0].effect(),
+        dispatch.methods()[0].effect(),
         MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::PointSize {
             value: MaxwellThreeDPointSize::from_bits(0x3fc0_0000),
-            source: prepared.methods()[0].method().source(),
+            source: dispatch.methods()[0].method().source(),
         })
     );
-
-    commit_maxwell_engine_packet(&mut channel, &prepared).unwrap();
     assert_ne!(channel.three_d(), &before);
-    assert_eq!(channel.three_d(), &after);
 }
 
 #[test]
@@ -1218,7 +1213,7 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
 }
 
 #[test]
-fn clear_surface_control_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn clear_surface_control_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x10f8, 0x1111);
@@ -1260,7 +1255,7 @@ fn clear_surface_control_reserved_bits_and_packet_suffix_are_rejected_atomically
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -1314,7 +1309,7 @@ fn unsupported_clear_surface_modifiers_fail_only_when_consumed() {
 }
 
 #[test]
-fn malformed_scissor_suffix_discards_the_whole_candidate() {
+fn malformed_scissor_suffix_keeps_valid_prefix_before_failure() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let decoded = incrementing_packet(0x0e00 / 4, &[1, (100 << 16) | 5, (10 << 16) | 20]);
@@ -1327,7 +1322,7 @@ fn malformed_scissor_suffix_discards_the_whole_candidate() {
         ),
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_ne!(channel.three_d(), &before);
 }
 
 #[test]
@@ -1466,7 +1461,7 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
 }
 
 #[test]
-fn malformed_window_clip_rectangle_discards_the_whole_packet() {
+fn malformed_window_clip_rectangle_keeps_valid_prefix_before_failure() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let valid = incrementing_packet(0x0d00 / 4, &[0; 16]);
@@ -1673,7 +1668,7 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -1845,7 +1840,7 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -2102,7 +2097,7 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
                 ..
             }) if actual == ram
         ));
-        assert_eq!(channel.three_d(), &before);
+        assert_ne!(channel.three_d(), &before);
     }
 
     let before = channel.three_d().clone();
@@ -2127,7 +2122,7 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
             ..
         })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_ne!(channel.three_d(), &before);
 
     let mut arguments = Vec::with_capacity(MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES + 2);
     arguments.push(0);
@@ -2147,7 +2142,7 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
             ..
         })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_ne!(channel.three_d(), &before);
 }
 
 #[test]
@@ -2589,7 +2584,68 @@ fn mme_shadow_replay_without_a_tracked_value_fails_atomically() {
 }
 
 #[test]
-fn mme_shadow_scratch_family_is_indexed_readable_and_packet_atomic() {
+fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    assert!(
+        channel
+            .three_d()
+            .mme()
+            .shadow_register(GpuMethodId(0x13ac))
+            .is_none()
+    );
+    let reset = channel
+        .three_d()
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::WindowOrigin);
+    assert_eq!(reset.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+    assert_eq!(reset.raw(), Some(0));
+    assert_eq!(reset.source(), None);
+
+    program_three_d(&mut channel, 0x0124, 3);
+    let replay = packet(0x13ac / 4, 0x10);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &replay.packets()[0],
+    )
+    .unwrap();
+
+    let source = dispatch.methods()[0].method().source();
+    assert_eq!(source.argument(), 0);
+    assert_eq!(
+        dispatch.methods()[0].metadata().method_name(),
+        "SET_WINDOW_ORIGIN"
+    );
+    let window_origin = channel
+        .three_d()
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::WindowOrigin);
+    assert_eq!(
+        window_origin.origin(),
+        MaxwellThreeDRegisterOrigin::Programmed
+    );
+    assert_eq!(window_origin.raw(), Some(0));
+    assert_eq!(
+        window_origin.value(),
+        Some(&MaxwellThreeDFixedFunctionValue::Mask(0))
+    );
+    assert_eq!(window_origin.source(), Some(source));
+
+    // Replay consumes the immutable reset without turning it into a tracked
+    // guest write.
+    assert!(
+        channel
+            .three_d()
+            .mme()
+            .shadow_register(GpuMethodId(0x13ac))
+            .is_none()
+    );
+}
+
+#[test]
+fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
 
@@ -2672,7 +2728,7 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_packet_atomic() {
             ..
         })
     ));
-    assert_eq!(channel, before_invalid);
+    assert_ne!(channel, before_invalid);
 }
 
 #[test]
@@ -2836,11 +2892,11 @@ fn falcon_call_four_rejects_incomplete_or_unaligned_transactions_atomically() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x2314)
     ));
-    assert_eq!(channel, before_suffix);
+    assert_ne!(channel, before_suffix);
 }
 
 #[test]
-fn mme_emitted_draw_keeps_the_exact_candidate_snapshot() {
+fn mme_emitted_draw_keeps_the_exact_method_state_snapshot() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     let macro_index = 6;
@@ -2936,7 +2992,7 @@ fn mme_execution_errors_and_partial_emissions_are_atomic() {
             ..
         })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_ne!(channel.three_d(), &before);
 }
 
 #[test]
@@ -3113,7 +3169,7 @@ fn vertex_assembly_controls_are_draw_dependencies() {
 }
 
 #[test]
-fn invalid_vertex_assembly_controls_and_packet_suffix_are_atomic() {
+fn invalid_vertex_assembly_controls_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1610, 0x0e);
@@ -3168,7 +3224,7 @@ fn invalid_vertex_assembly_controls_and_packet_suffix_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3282,7 +3338,7 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 
     let decoded = incrementing_packet(0x1614 / 4, &[1, 5]);
     dispatch_maxwell_engine_packet(
@@ -3311,7 +3367,7 @@ fn malformed_vertex_suffix_rejects_atomically_and_index_relationships_defer() {
         ),
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_ne!(channel.three_d(), &before);
 
     for (method, argument) in [(0x17c8, 0), (0x17cc, 0x1000), (0x17d0, 0), (0x17d4, 0x100e)] {
         let decoded = packet(method / 4, argument);
@@ -3548,7 +3604,7 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
 }
 
 #[test]
-fn spa_version_reserved_bits_and_packet_suffix_are_rejected_atomically() {
+fn spa_version_reserved_bits_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0310, 0x0503);
@@ -3595,7 +3651,7 @@ fn spa_version_reserved_bits_and_packet_suffix_are_rejected_atomically() {
 }
 
 #[test]
-fn invalid_program_region_upper_and_packet_suffix_are_atomic() {
+fn invalid_program_region_upper_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x1608, 4);
@@ -3641,7 +3697,7 @@ fn invalid_program_region_upper_and_packet_suffix_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -3712,7 +3768,7 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
 }
 
 #[test]
-fn invalid_vertex_stream_substitute_upper_and_packet_are_atomic() {
+fn invalid_vertex_stream_substitute_upper_and_failed_packet_keeps_valid_prefix() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     program_three_d(&mut channel, 0x0f84, 4);
@@ -3755,7 +3811,7 @@ fn invalid_vertex_stream_substitute_upper_and_packet_are_atomic() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]

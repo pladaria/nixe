@@ -365,8 +365,8 @@ impl MaxwellGpuChannel {
         self.frontend
     }
 
-    pub(crate) fn replace_frontend(&mut self, frontend: MaxwellChannelFrontendState) {
-        self.frontend = frontend;
+    pub(crate) const fn frontend_mut(&mut self) -> &mut MaxwellChannelFrontendState {
+        &mut self.frontend
     }
 
     /// Returns an immutable snapshot of channel-owned `MAXWELL_COMPUTE_B` state.
@@ -375,8 +375,8 @@ impl MaxwellGpuChannel {
         &self.compute
     }
 
-    pub(crate) fn replace_compute(&mut self, compute: MaxwellComputeState) {
-        self.compute = compute;
+    pub(crate) const fn compute_mut(&mut self) -> &mut MaxwellComputeState {
+        &mut self.compute
     }
 
     /// Returns the channel-owned `MAXWELL_DMA_COPY_A` state.
@@ -385,8 +385,8 @@ impl MaxwellGpuChannel {
         &self.dma_copy
     }
 
-    pub(crate) fn replace_dma_copy(&mut self, dma_copy: MaxwellDmaCopyState) {
-        self.dma_copy = dma_copy;
+    pub(crate) const fn dma_copy_mut(&mut self) -> &mut MaxwellDmaCopyState {
+        &mut self.dma_copy
     }
 
     /// Returns the channel-owned `MAXWELL_INLINE_TO_MEMORY_A` state.
@@ -395,8 +395,8 @@ impl MaxwellGpuChannel {
         &self.inline_to_memory
     }
 
-    pub(crate) fn replace_inline_to_memory(&mut self, state: MaxwellInlineToMemoryState) {
-        self.inline_to_memory = state;
+    pub(crate) const fn inline_to_memory_mut(&mut self) -> &mut MaxwellInlineToMemoryState {
+        &mut self.inline_to_memory
     }
 
     /// Returns an immutable snapshot of channel-owned `FERMI_TWOD_A` state.
@@ -405,8 +405,8 @@ impl MaxwellGpuChannel {
         &self.two_d
     }
 
-    pub(crate) fn replace_two_d(&mut self, two_d: MaxwellTwoDState) {
-        self.two_d = two_d;
+    pub(crate) const fn two_d_mut(&mut self) -> &mut MaxwellTwoDState {
+        &mut self.two_d
     }
 
     /// Returns an immutable snapshot of channel-owned `MAXWELL_B` state.
@@ -415,8 +415,8 @@ impl MaxwellGpuChannel {
         &self.three_d
     }
 
-    pub(crate) fn replace_three_d(&mut self, three_d: MaxwellThreeDState) {
-        self.three_d = three_d;
+    pub(crate) const fn three_d_mut(&mut self) -> &mut MaxwellThreeDState {
+        &mut self.three_d
     }
 
     /// Resets frontend class selection at a verified channel-reset boundary.

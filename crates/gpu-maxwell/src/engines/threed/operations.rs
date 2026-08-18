@@ -6,8 +6,48 @@ use nixe_gpu::{
     CacheMaintenanceOperation, GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint,
 };
 
-use super::{MaxwellThreeDRegister, MaxwellThreeDState, MaxwellThreeDUnresolvedAddress};
+use super::{
+    MaxwellThreeDColorCompressionMode, MaxwellThreeDRegister, MaxwellThreeDState,
+    MaxwellThreeDUnresolvedAddress,
+};
 use crate::{MaxwellMethodSource, MaxwellShaderCacheInvalidation};
+
+/// Surface selected by the execution-triggering `DECOMPRESS_SURFACE` method.
+///
+/// ABI source:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L315-L317>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDDecompressSurface {
+    color_target: u8,
+    array_index: u16,
+}
+
+impl MaxwellThreeDDecompressSurface {
+    pub(super) const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x000f_fff7 != 0 {
+            return None;
+        }
+        Some(Self {
+            color_target: (raw & 7) as u8,
+            array_index: ((raw >> 4) & 0xffff) as u16,
+        })
+    }
+
+    #[must_use]
+    pub const fn color_target(self) -> u8 {
+        self.color_target
+    }
+
+    #[must_use]
+    pub const fn array_index(self) -> u16 {
+        self.array_index
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        (self.color_target as u32) | ((self.array_index as u32) << 4)
+    }
+}
 
 /// Source-preserving setup for the `SET_REPORT_SEMAPHORE_A..C` registers.
 ///
@@ -430,6 +470,10 @@ impl MaxwellThreeDSyncpointIncrement {
 /// One 3D execution-order trigger emitted by a class method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationTrigger {
+    DecompressSurface {
+        request: MaxwellThreeDDecompressSurface,
+        source: MaxwellMethodSource,
+    },
     WaitForIdle {
         value: u32,
         source: MaxwellMethodSource,
@@ -468,7 +512,8 @@ impl MaxwellThreeDSynchronizationTrigger {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         match self {
-            Self::WaitForIdle { source, .. }
+            Self::DecompressSurface { source, .. }
+            | Self::WaitForIdle { source, .. }
             | Self::InvalidateShaderCaches { source, .. }
             | Self::InvalidateShaderCachesNoWfi { source, .. }
             | Self::InvalidateTextureCacheNoWfi { source, .. }
@@ -509,6 +554,12 @@ impl MaxwellThreeDSynchronizationOperation {
 /// Validated host-independent lowering of one 3D synchronization operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationPlan {
+    /// Orders prior work but performs no conversion because compression is
+    /// explicitly disabled for the selected color target.
+    DecompressUncompressedSurface {
+        request: MaxwellThreeDDecompressSurface,
+        prior_work_pending: bool,
+    },
     /// Orders every earlier channel operation before later work.
     WaitForIdle {
         prior_work_pending: bool,
@@ -544,6 +595,14 @@ pub enum MaxwellThreeDSynchronizationPlan {
 /// Inconsistent completion ownership at the 3D synchronization boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationError {
+    IncompleteDecompressSurfaceState {
+        source: MaxwellMethodSource,
+        target: u8,
+    },
+    CompressedSurfaceDecompressionUnavailable {
+        source: MaxwellMethodSource,
+        request: MaxwellThreeDDecompressSurface,
+    },
     UnsupportedShaderCacheLockInvalidation {
         source: MaxwellMethodSource,
     },
@@ -573,6 +632,16 @@ impl std::error::Error for MaxwellThreeDSynchronizationError {}
 impl Display for MaxwellThreeDSynchronizationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IncompleteDecompressSurfaceState { source, target } => write!(
+                formatter,
+                "MAXWELL_B DECOMPRESS_SURFACE target has no defined compression state: source=[{source}] target={target}"
+            ),
+            Self::CompressedSurfaceDecompressionUnavailable { source, request } => write!(
+                formatter,
+                "MAXWELL_B compressed surface decompression has no neutral materialization operation: source=[{source}] target={} array-index={}",
+                request.color_target(),
+                request.array_index()
+            ),
             Self::UnsupportedShaderCacheLockInvalidation { source } => write!(
                 formatter,
                 "MAXWELL_B shader-cache lock invalidation is not represented by neutral cache maintenance: source=[{source}]"
@@ -620,6 +689,33 @@ pub fn lower_maxwell_three_d_synchronization(
     prior_work_pending: bool,
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
     match operation.trigger() {
+        MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source } => {
+            let compression = operation.state().render_targets().color()
+                [usize::from(request.color_target())]
+            .compression()
+            .value()
+            .copied()
+            .ok_or(
+                MaxwellThreeDSynchronizationError::IncompleteDecompressSurfaceState {
+                    source,
+                    target: request.color_target(),
+                },
+            )?;
+            if compression == MaxwellThreeDColorCompressionMode::Enabled {
+                return Err(
+                    MaxwellThreeDSynchronizationError::CompressedSurfaceDecompressionUnavailable {
+                        source,
+                        request,
+                    },
+                );
+            }
+            Ok(
+                MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface {
+                    request,
+                    prior_work_pending,
+                },
+            )
+        }
         MaxwellThreeDSynchronizationTrigger::WaitForIdle { .. } => {
             Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle { prior_work_pending })
         }

@@ -3,7 +3,9 @@
 use crate::MaxwellMethodSource;
 
 use super::render_targets::{MaxwellThreeDRawValue, MaxwellThreeDRectangle};
-use super::state::{MAXWELL_THREE_D_POLYGON_MODE_RESET, MaxwellThreeDRegister};
+use super::state::{
+    MAXWELL_THREE_D_POLYGON_MODE_RESET, MAXWELL_THREE_D_WINDOW_ORIGIN_RESET, MaxwellThreeDRegister,
+};
 
 pub const MAXWELL_VIEWPORT_COUNT: usize = 16;
 pub const MAXWELL_SCISSOR_COUNT: usize = 16;
@@ -1055,6 +1057,13 @@ impl Default for MaxwellThreeDFixedFunctionState {
             registers[register.index()] =
                 MaxwellThreeDRegister::verified_reset(MAXWELL_THREE_D_POLYGON_MODE_RESET, None);
         }
+        registers[MaxwellThreeDFixedFunctionRegister::WindowOrigin.index()] =
+            MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_WINDOW_ORIGIN_RESET,
+                Some(MaxwellThreeDFixedFunctionValue::Mask(
+                    MAXWELL_THREE_D_WINDOW_ORIGIN_RESET,
+                )),
+            );
         Self {
             surface_clip_horizontal: Default::default(),
             surface_clip_vertical: Default::default(),

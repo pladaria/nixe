@@ -8,6 +8,127 @@ use crate::MaxwellMethodSource;
 
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
+/// Whether API semantics require depth/stencil testing before pixel shading.
+///
+/// NVIDIA publishes a one-bit enable field. The ordering becomes observable
+/// for pixel shaders with discard or side effects, so an active value must not
+/// be treated as a performance hint:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L249-L252>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDApiMandatedEarlyZ {
+    Disabled = 0,
+    Enabled = 1,
+}
+
+/// Conflict-detection granularity for Maxwell pixel-shader interlocks.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDPixelShaderInterlockMode {
+    NoConflictDetect = 0,
+    ConflictDetectSample = 1,
+    ConflictDetectPixel = 2,
+}
+
+/// Tile size used by the pixel-shader interlock coalescer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDPixelShaderInterlockTileSize {
+    Tile16x16 = 0,
+    Tile8x8 = 1,
+}
+
+/// Fragment-order policy used by the pixel-shader interlock coalescer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDPixelShaderInterlockFragmentOrder {
+    Ordered = 0,
+    Unordered = 1,
+}
+
+/// Validated `SET_PIXEL_SHADER_INTERLOCK_CONTROL` fields.
+///
+/// NVIDIA publishes the two-bit mode and the two one-bit coalescer fields:
+/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2030-L2040>
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaxwellThreeDPixelShaderInterlockControl {
+    mode: MaxwellThreeDPixelShaderInterlockMode,
+    tile_size: MaxwellThreeDPixelShaderInterlockTileSize,
+    fragment_order: MaxwellThreeDPixelShaderInterlockFragmentOrder,
+}
+
+impl MaxwellThreeDPixelShaderInterlockControl {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        if raw & !0x0f != 0 {
+            return None;
+        }
+        let mode = match raw & 3 {
+            0 => MaxwellThreeDPixelShaderInterlockMode::NoConflictDetect,
+            1 => MaxwellThreeDPixelShaderInterlockMode::ConflictDetectSample,
+            2 => MaxwellThreeDPixelShaderInterlockMode::ConflictDetectPixel,
+            _ => return None,
+        };
+        Some(Self {
+            mode,
+            tile_size: if raw & 4 == 0 {
+                MaxwellThreeDPixelShaderInterlockTileSize::Tile16x16
+            } else {
+                MaxwellThreeDPixelShaderInterlockTileSize::Tile8x8
+            },
+            fragment_order: if raw & 8 == 0 {
+                MaxwellThreeDPixelShaderInterlockFragmentOrder::Ordered
+            } else {
+                MaxwellThreeDPixelShaderInterlockFragmentOrder::Unordered
+            },
+        })
+    }
+
+    #[must_use]
+    pub const fn mode(self) -> MaxwellThreeDPixelShaderInterlockMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn tile_size(self) -> MaxwellThreeDPixelShaderInterlockTileSize {
+        self.tile_size
+    }
+
+    #[must_use]
+    pub const fn fragment_order(self) -> MaxwellThreeDPixelShaderInterlockFragmentOrder {
+        self.fragment_order
+    }
+
+    #[must_use]
+    pub const fn conflict_detection_enabled(self) -> bool {
+        !matches!(
+            self.mode,
+            MaxwellThreeDPixelShaderInterlockMode::NoConflictDetect
+        )
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.mode as u32 | (self.tile_size as u32) << 2 | (self.fragment_order as u32) << 3
+    }
+}
+
+impl MaxwellThreeDApiMandatedEarlyZ {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Whether Maxwell shader-exception reporting is enabled.
 ///
 /// This is guest execution-diagnostic policy rather than a host shader or
@@ -437,6 +558,14 @@ impl MaxwellThreeDSmTimeoutCounterBit {
 /// One validated shader-execution register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderExecutionStateWrite {
+    PixelShaderInterlockControl {
+        value: MaxwellThreeDPixelShaderInterlockControl,
+        source: MaxwellMethodSource,
+    },
+    ApiMandatedEarlyZ {
+        value: MaxwellThreeDApiMandatedEarlyZ,
+        source: MaxwellMethodSource,
+    },
     ShaderExceptionsEnable {
         value: MaxwellThreeDShaderExceptionsEnable,
         source: MaxwellMethodSource,
@@ -495,6 +624,8 @@ pub enum MaxwellThreeDShaderExecutionStateWrite {
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderExecutionState {
+    pixel_shader_interlock_control: MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl>,
+    api_mandated_early_z: MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ>,
     shader_exceptions_enable: MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable>,
     subtiling_perf_knob_a: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA>,
     subtiling_perf_knob_b: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB>,
@@ -508,6 +639,20 @@ pub struct MaxwellThreeDShaderExecutionState {
 }
 
 impl MaxwellThreeDShaderExecutionState {
+    #[must_use]
+    pub const fn pixel_shader_interlock_control(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl> {
+        &self.pixel_shader_interlock_control
+    }
+
+    #[must_use]
+    pub const fn api_mandated_early_z(
+        &self,
+    ) -> &MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ> {
+        &self.api_mandated_early_z
+    }
+
     #[must_use]
     pub const fn shader_exceptions_enable(
         &self,
@@ -577,12 +722,33 @@ impl MaxwellThreeDShaderExecutionState {
     }
 
     pub(super) fn append_shader_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+        if self.api_mandated_early_z.value() == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled) {
+            dependencies.push(self.api_mandated_early_z.raw());
+        }
+        if self
+            .pixel_shader_interlock_control
+            .value()
+            .is_some_and(|value| value.conflict_detection_enabled())
+        {
+            dependencies.push(self.pixel_shader_interlock_control.raw());
+        }
         self.shader_local_memory
             .append_pipeline_dependencies(dependencies);
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
+            MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
+                value,
+                source,
+            } => {
+                self.pixel_shader_interlock_control =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
+            MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source } => {
+                self.api_mandated_early_z =
+                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            }
             MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source } => {
                 self.shader_exceptions_enable =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
