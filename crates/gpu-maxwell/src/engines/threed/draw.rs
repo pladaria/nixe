@@ -7,17 +7,18 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{
-    AccessMode, AccessScope, AccessTarget, AttachmentLoad, AttachmentStore, BackendCapabilities,
-    BackendCapabilityError, BackendResourceCreateInfo, BarrierOperation, BufferId, BufferRange,
-    BufferRegion, BufferView, CapabilityAgreement, CapabilityRequirements, ClearOperation,
-    ClearValue, CommandDescriptionError, DepthCompareOperation, DepthState, DescriptorKind,
-    DescriptorTableBinding, DescriptorTableDescription, DescriptorTableId, DrawArguments,
-    DrawOperation, FrontendSubmissionId, GpuCommand, GpuOperation, ImageId, ImageOrigin,
-    ImageRegion, ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription,
-    PipelineId, PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment,
-    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency,
-    ResourceTransition, ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind,
-    ShaderStage, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+    AccessMode, AccessScope, AccessTarget, AlphaCompareOperation, AlphaTest, AttachmentLoad,
+    AttachmentStore, BackendCapabilities, BackendCapabilityError, BackendResourceCreateInfo,
+    BarrierOperation, BufferId, BufferRange, BufferRegion, BufferView, CapabilityAgreement,
+    CapabilityRequirements, ClearOperation, ClearValue, CommandDescriptionError,
+    DepthCompareOperation, DepthState, DescriptorKind, DescriptorTableBinding,
+    DescriptorTableDescription, DescriptorTableId, DrawArguments, DrawOperation,
+    FrontendSubmissionId, GpuCommand, GpuOperation, ImageId, ImageOrigin, ImageRegion,
+    ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription, PipelineId,
+    PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment, RenderPassDescription,
+    RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency, ResourceTransition,
+    ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
     ViewportTransform,
 };
 use nixe_memory::{CanonicalCpuWriteOverlap, CanonicalPageId, ContentGeneration};
@@ -44,8 +45,8 @@ use super::{
     MaxwellThreeDRenderTargetLayer, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
     MaxwellThreeDResourceRole, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSeparateFragmentData,
     MaxwellThreeDShadeMode, MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderStage,
-    MaxwellThreeDState, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
-    MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
+    MaxwellThreeDState, MaxwellThreeDTextureDimension, MaxwellThreeDTirControl,
+    MaxwellThreeDTirMode, MaxwellThreeDVertexNumericalType, MaxwellThreeDViewportCoordinateSwizzle,
     MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
 };
 
@@ -614,7 +615,7 @@ impl MaxwellThreeDLoweringCache {
                             Some(ResourceUsage::StorageBuffer),
                         )
                     }
-                    ShaderResourceKind::SampledImage
+                    ShaderResourceKind::SampledImage | ShaderResourceKind::SampledImage2DArray
                         if resource.readable() && !resource.writable() =>
                     {
                         let texture = program
@@ -624,8 +625,8 @@ impl MaxwellThreeDLoweringCache {
                             .find(|binding| binding.image_binding() == resource.binding())
                             .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
                         (
-                            MaxwellThreeDResourceRole::SampledImage(
-                                super::MaxwellThreeDTextureReference::new(
+                            MaxwellThreeDResourceRole::SampledImage {
+                                texture: super::MaxwellThreeDTextureReference::new(
                                     program.bind_group().ok_or(
                                         MaxwellThreeDLoweringError::InvalidTranslatedShaders,
                                     )?,
@@ -634,7 +635,20 @@ impl MaxwellThreeDLoweringCache {
                                     )?,
                                     texture.constant_buffer_byte_offset(),
                                 ),
-                            ),
+                                dimension: match texture.image_kind() {
+                                    ShaderResourceKind::SampledImage => {
+                                        MaxwellThreeDTextureDimension::Two
+                                    }
+                                    ShaderResourceKind::SampledImage2DArray => {
+                                        MaxwellThreeDTextureDimension::TwoArray
+                                    }
+                                    _ => {
+                                        return Err(
+                                            MaxwellThreeDLoweringError::InvalidTranslatedShaders,
+                                        );
+                                    }
+                                },
+                            },
                             DescriptorKind::SampledImage,
                             Some(ResourceUsage::SampledImage),
                         )
@@ -1274,7 +1288,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
             .fill_via_triangle()
             .value()
             .copied()
-            .filter(|mode| *mode != MaxwellThreeDFillViaTriangleMode::Disabled)
+            .filter(|mode| *mode == MaxwellThreeDFillViaTriangleMode::FillAll)
         {
             return Err(MaxwellThreeDLoweringError::UnsupportedFillViaTriangleSemantics(mode));
         }
@@ -1434,7 +1448,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         validate_draw_blending_state(state, attachments)?;
         validate_draw_logic_op_state(state, attachments)?;
         validate_draw_color_write_state(state, attachments)?;
-        validate_draw_alpha_test_state(state)?;
+        draw_alpha_test_state(state)?;
     }
     validate_compressed_depth_materialization(
         state,
@@ -1745,16 +1759,16 @@ fn validate_draw_color_write_state(
     Ok(())
 }
 
-fn validate_draw_alpha_test_state(
+fn draw_alpha_test_state(
     state: &MaxwellThreeDState,
-) -> Result<(), MaxwellThreeDLoweringError> {
+) -> Result<Option<AlphaTest>, MaxwellThreeDLoweringError> {
     let fixed = state.fixed_function();
     if fixed
         .register(MaxwellThreeDFixedFunctionRegister::AlphaTestEnable)
         .value()
         != Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
     {
-        return Ok(());
+        return Ok(None);
     }
     let reference = match fixed
         .register(MaxwellThreeDFixedFunctionRegister::AlphaTestReference)
@@ -1788,10 +1802,20 @@ fn validate_draw_alpha_test_state(
             });
         }
     };
-    Err(MaxwellThreeDLoweringError::UnsupportedAlphaTestSemantics {
-        function,
-        reference,
-    })
+    let comparison = match function {
+        MaxwellThreeDCompareOp::Never => AlphaCompareOperation::Never,
+        MaxwellThreeDCompareOp::Less => AlphaCompareOperation::Less,
+        MaxwellThreeDCompareOp::Equal => AlphaCompareOperation::Equal,
+        MaxwellThreeDCompareOp::LessEqual => AlphaCompareOperation::LessEqual,
+        MaxwellThreeDCompareOp::Greater => AlphaCompareOperation::Greater,
+        MaxwellThreeDCompareOp::NotEqual => AlphaCompareOperation::NotEqual,
+        MaxwellThreeDCompareOp::GreaterEqual => AlphaCompareOperation::GreaterEqual,
+        MaxwellThreeDCompareOp::Always => AlphaCompareOperation::Always,
+    };
+    Ok(Some(AlphaTest {
+        comparison,
+        reference_bits: reference.get(),
+    }))
 }
 
 fn validate_common_blend_equation_state(
@@ -3212,6 +3236,43 @@ fn lower_draw(
             .map_err(MaxwellThreeDLoweringError::Command)?,
         );
     }
+    let triangle_rasterization = match state
+        .raster()
+        .fill_via_triangle()
+        .value()
+        .copied()
+        .unwrap_or(MaxwellThreeDFillViaTriangleMode::Disabled)
+    {
+        MaxwellThreeDFillViaTriangleMode::Disabled => TriangleRasterization::Fill,
+        MaxwellThreeDFillViaTriangleMode::FillBoundingBox => {
+            if topology != PrimitiveTopology::Triangles {
+                return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
+                    "primitive topology is not a triangle list",
+                ));
+            }
+            if first_vertex % 3 != 0 || vertex_count % 3 != 0 {
+                return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
+                    "vertex range is not aligned to complete triangles",
+                ));
+            }
+            if vertex_buffers
+                .iter()
+                .any(|layout| layout.step_mode == VertexStepMode::Vertex)
+            {
+                return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
+                    "per-vertex attributes require vertex-pulling expansion",
+                ));
+            }
+            TriangleRasterization::FillRectangle
+        }
+        MaxwellThreeDFillViaTriangleMode::FillAll => {
+            return Err(
+                MaxwellThreeDLoweringError::UnsupportedFillViaTriangleSemantics(
+                    MaxwellThreeDFillViaTriangleMode::FillAll,
+                ),
+            );
+        }
+    };
     let attachments = attachment_records(resources, bindings, attachment_selection)?;
     if attachments.is_empty() {
         return Err(MaxwellThreeDLoweringError::IncompleteDraw("render target"));
@@ -3395,6 +3456,10 @@ fn lower_draw(
         },
     )
     .map_err(MaxwellThreeDLoweringError::Command)?;
+    draw = draw.with_triangle_rasterization(triangle_rasterization);
+    if let Some(alpha_test) = draw_alpha_test_state(state)? {
+        draw = draw.with_alpha_test(alpha_test);
+    }
     if let Some(viewport_transform) = draw_viewport_transform(state)? {
         draw = draw.with_viewport_transform(viewport_transform);
     }
@@ -3911,6 +3976,7 @@ pub enum MaxwellThreeDLoweringError {
     UnsupportedAntiAliasedPointSemantics,
     UnsupportedPointCenterSemantics(MaxwellThreeDPointCenterMode),
     UnsupportedFillViaTriangleSemantics(MaxwellThreeDFillViaTriangleMode),
+    UnsupportedFillRectangleDraw(&'static str),
     UnsupportedConservativeRasterSemantics,
     UnsupportedPolygonSmoothSemantics,
     UnsupportedPolygonStippleSemantics,
@@ -3942,10 +4008,6 @@ pub enum MaxwellThreeDLoweringError {
         mask: super::MaxwellThreeDColorMask,
     },
     IncompleteAlphaTestState(&'static str),
-    UnsupportedAlphaTestSemantics {
-        function: super::MaxwellThreeDCompareOp,
-        reference: super::MaxwellThreeDRawValue,
-    },
     CompressedDepthImportRequired {
         kind: u8,
     },
@@ -4203,6 +4265,10 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "MAXWELL_B fill-via-triangle mode is not represented by the neutral pipeline contract: mode={mode:?}"
             ),
+            Self::UnsupportedFillRectangleDraw(reason) => write!(
+                formatter,
+                "MAXWELL_B fill-rectangle draw is not representable: {reason}"
+            ),
             Self::UnsupportedConservativeRasterSemantics => formatter.write_str(
                 "MAXWELL_B conservative rasterization is not represented by the neutral pipeline contract",
             ),
@@ -4276,14 +4342,6 @@ impl Display for MaxwellThreeDLoweringError {
             Self::IncompleteAlphaTestState(field) => write!(
                 formatter,
                 "MAXWELL_B enabled alpha testing requires SET_ALPHA_{field}"
-            ),
-            Self::UnsupportedAlphaTestSemantics {
-                function,
-                reference,
-            } => write!(
-                formatter,
-                "MAXWELL_B alpha testing is not represented by shader or neutral backend lowering: function={function:?} reference-bits=0x{:08x}",
-                reference.get()
             ),
             Self::CompressedDepthImportRequired { kind } => write!(
                 formatter,

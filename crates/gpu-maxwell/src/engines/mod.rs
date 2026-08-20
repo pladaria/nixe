@@ -85,18 +85,21 @@ pub use threed::{
     MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState,
     MaxwellThreeDIndexElementSize, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
-    MaxwellThreeDInstrumentationValue, MaxwellThreeDIteratedBlend,
-    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDL2CacheEvictionPolicy,
-    MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
-    MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp,
-    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
-    MaxwellThreeDLoweringPlan, MaxwellThreeDMappingReference, MaxwellThreeDMmeExecutionError,
-    MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
-    MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
-    MaxwellThreeDMmeShadowRamError, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDMutableMethodControl, MaxwellThreeDOperationTrigger,
-    MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
+    MaxwellThreeDInlineToMemoryCompletion, MaxwellThreeDInlineToMemoryLaunch,
+    MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
+    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDInstrumentationState,
+    MaxwellThreeDInstrumentationStateWrite, MaxwellThreeDInstrumentationValue,
+    MaxwellThreeDIteratedBlend, MaxwellThreeDIteratedBlendPassCount,
+    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
+    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters,
+    MaxwellThreeDLogicOp, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
+    MaxwellThreeDLoweringError, MaxwellThreeDLoweringPlan, MaxwellThreeDMappingReference,
+    MaxwellThreeDMmeExecutionError, MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction,
+    MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress,
+    MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeShadowRamError,
+    MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
+    MaxwellThreeDMutableMethodControl, MaxwellThreeDOperationTrigger, MaxwellThreeDPatchSize,
+    MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
     MaxwellThreeDPixelShaderInterlockControl, MaxwellThreeDPixelShaderInterlockFragmentOrder,
     MaxwellThreeDPixelShaderInterlockMode, MaxwellThreeDPixelShaderInterlockTileSize,
     MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
@@ -289,6 +292,10 @@ pub enum MaxwellEngineMethodEffect {
     ThreeDStateAndInlineConstantBufferUpload {
         state: MaxwellThreeDStateWrite,
         upload: MaxwellThreeDInlineConstantBufferUpload,
+    },
+    ThreeDStateAndInlineToMemoryUpload {
+        state: MaxwellThreeDStateWrite,
+        upload: MaxwellInlineToMemoryUpload,
     },
     MmeMacroCall {
         macro_index: u8,
@@ -758,6 +765,9 @@ pub fn dispatch_maxwell_engine_packet(
                 MaxwellEngineMethodEffect::InlineToMemoryStateAndUpload { upload, .. } => {
                     Some(MaxwellEngineOperation::InlineToMemory(upload))
                 }
+                MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload {
+                    upload, ..
+                } => Some(MaxwellEngineOperation::InlineToMemory(upload)),
                 MaxwellEngineMethodEffect::DmaCopyStateAndLaunch { operation, .. } => {
                     Some(MaxwellEngineOperation::DmaCopy(operation))
                 }

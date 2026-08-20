@@ -117,10 +117,19 @@ pub const MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS: usize = 4096;
 pub const MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES: usize = 256;
 
 /// Maximum instructions retired by one macro invocation.
-pub const MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT: u32 = 4096;
+///
+/// This is an emulator watchdog rather than a hardware limit. Deko3D's
+/// bounded draw macros legitimately execute roughly eight instructions per
+/// emitted vertex batch and exceed the separate 4096-method output bound in
+/// retired instructions well before exhausting emitted methods.
+pub const MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT: u32 = 65_536;
 
 /// Maximum class methods emitted by one macro invocation.
-pub const MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT: u32 = 4096;
+///
+/// This independently bounds frontend state/operation growth. Captured
+/// deko3d geometry macros legitimately emit multiple methods for each of 3600
+/// iterations, so the previous 4096-entry host bound rejected finite work.
+pub const MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT: u32 = 16_384;
 
 const MME_REGISTER_COUNT: usize = 8;
 const MME_METHOD_DWORD_MASK: u32 = 0x0fff;

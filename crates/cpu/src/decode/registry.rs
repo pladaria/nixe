@@ -254,6 +254,16 @@ pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
             validate_a64_simd_shift_left_immediate(id == 0x0000_0099, bits)
         }
         0x0000_009c | 0x0000_009d => validate_a64_simd_float_vector(bits),
+        0x0000_009e | 0x0000_009f => {
+            let scale = ((bits >> 10) & 0x3f) as u8;
+            if !sf && scale < 32 {
+                AllocationStatus::Reserved(
+                    "32-bit fixed-point floating conversion exceeds 32 fractional bits",
+                )
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
         0x0000_0095 | 0x0000_0096 => validate_a64_simd_shift_register(bits),
         0x0000_0094 => validate_a64_simd_add_across_vector(bits),
         0x0000_0088 => validate_a64_simd_extract_narrow(bits),

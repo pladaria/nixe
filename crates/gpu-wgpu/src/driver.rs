@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
-    AcceptedBackendSubmission, AttachmentLoad, AttachmentStore, BackendDriver, BackendDriverError,
-    BackendResourceCreateInfo, BackendResourceHandle, BackendSubmissionToken, BackingView,
-    ClearOperation, ClearValue, CopyOperation, DepthCompareOperation, DepthState, DrawArguments,
-    DrawOperation, GpuCommand, ImageDescription, ImageDimension, ImageFormat, ImageMemoryLayout,
-    ImageOrigin, ImageRegion, ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind,
-    PrimitiveTopology, RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage,
+    AcceptedBackendSubmission, AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore,
+    BackendDriver, BackendDriverError, BackendResourceCreateInfo, BackendResourceHandle,
+    BackendSubmissionToken, BackingView, ClearOperation, ClearValue, CopyOperation,
+    DepthCompareOperation, DepthState, DrawArguments, DrawOperation, GpuCommand, ImageDescription,
+    ImageDimension, ImageFormat, ImageMemoryLayout, ImageOrigin, ImageRegion,
+    ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind, PrimitiveTopology,
+    RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage, TriangleRasterization,
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use wgpu::{
@@ -22,7 +23,7 @@ use wgpu::{
     RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, StencilState,
     StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
     TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-    TextureViewDescriptor, VertexAttribute as WgpuVertexAttribute,
+    TextureViewDescriptor, TextureViewDimension, VertexAttribute as WgpuVertexAttribute,
     VertexBufferLayout as WgpuVertexBufferLayout, VertexFormat as WgpuVertexFormat, VertexState,
     VertexStepMode as WgpuVertexStepMode,
 };
@@ -63,6 +64,8 @@ struct RenderPipelineKey {
     vertex: BackendResourceHandle,
     fragment: BackendResourceHandle,
     topology: PrimitiveTopology,
+    triangle_rasterization: TriangleRasterization,
+    alpha_test: Option<AlphaTest>,
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
     depth_state: DepthState,
@@ -84,6 +87,20 @@ enum PendingWriteback {
         height: u32,
         depth_or_layers: u32,
     },
+}
+
+fn alpha_test_entry_point(alpha_test: Option<AlphaTest>) -> &'static str {
+    match alpha_test.map(|test| test.comparison) {
+        None => "main",
+        Some(AlphaCompareOperation::Never) => "nixe_alpha_never",
+        Some(AlphaCompareOperation::Less) => "nixe_alpha_less",
+        Some(AlphaCompareOperation::Equal) => "nixe_alpha_equal",
+        Some(AlphaCompareOperation::LessEqual) => "nixe_alpha_less_equal",
+        Some(AlphaCompareOperation::Greater) => "nixe_alpha_greater",
+        Some(AlphaCompareOperation::NotEqual) => "nixe_alpha_not_equal",
+        Some(AlphaCompareOperation::GreaterEqual) => "nixe_alpha_greater_equal",
+        Some(AlphaCompareOperation::Always) => "nixe_alpha_always",
+    }
 }
 
 /// Accelerated implementation retained behind [`nixe_gpu::Backend`].
@@ -612,10 +629,23 @@ impl WgpuBackendDriver {
                     vertex_count,
                     first_instance,
                     instance_count,
-                } => pass.draw(
-                    first_vertex..first_vertex + vertex_count,
-                    first_instance..first_instance + instance_count,
-                ),
+                } => {
+                    let (first_vertex, vertex_count) = match draw.triangle_rasterization {
+                        TriangleRasterization::Fill => (first_vertex, vertex_count),
+                        TriangleRasterization::FillRectangle => (
+                            first_vertex.checked_mul(2).ok_or_else(|| {
+                                unsupported("fill-rectangle first vertex overflow")
+                            })?,
+                            vertex_count.checked_mul(2).ok_or_else(|| {
+                                unsupported("fill-rectangle vertex count overflow")
+                            })?,
+                        ),
+                    };
+                    pass.draw(
+                        first_vertex..first_vertex + vertex_count,
+                        first_instance..first_instance + instance_count,
+                    );
+                }
                 DrawArguments::Indexed {
                     first_index,
                     index_count,
@@ -676,9 +706,15 @@ impl WgpuBackendDriver {
                         Some(
                             dependency_handle(dependencies, ResourceDependency::Image(image))
                                 .and_then(|handle| match self.resource(handle)? {
-                                    Resource::Image { texture, .. } => Ok((
+                                    Resource::Image {
+                                        texture,
+                                        description,
+                                        ..
+                                    } => Ok((
                                         binding.binding,
-                                        texture.create_view(&Default::default()),
+                                        texture.create_view(&sampled_texture_view_descriptor(
+                                            *description,
+                                        )),
                                     )),
                                     _ => Err(kind_mismatch(handle)),
                                 }),
@@ -743,6 +779,8 @@ impl WgpuBackendDriver {
             vertex: vertex_handle,
             fragment: fragment_handle,
             topology: draw.topology,
+            triangle_rasterization: draw.triangle_rasterization,
+            alpha_test: draw.alpha_test,
             color_format,
             depth_format,
             depth_state: draw.depth_state,
@@ -817,6 +855,12 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
+        let alpha_constants = draw.alpha_test.map(|test| {
+            [(
+                "nixe_alpha_reference",
+                f64::from(f32::from_bits(test.reference_bits)),
+            )]
+        });
         let pipeline = self
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
@@ -824,7 +868,10 @@ impl WgpuBackendDriver {
                 layout: None,
                 vertex: VertexState {
                     module: &vertex,
-                    entry_point: Some("main"),
+                    entry_point: Some(match draw.triangle_rasterization {
+                        TriangleRasterization::Fill => "main",
+                        TriangleRasterization::FillRectangle => "nixe_fill_rectangle",
+                    }),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &vertex_buffers,
                 },
@@ -841,8 +888,11 @@ impl WgpuBackendDriver {
                 multisample: MultisampleState::default(),
                 fragment: Some(FragmentState {
                     module: &fragment,
-                    entry_point: Some("main"),
-                    compilation_options: PipelineCompilationOptions::default(),
+                    entry_point: Some(alpha_test_entry_point(draw.alpha_test)),
+                    compilation_options: PipelineCompilationOptions {
+                        constants: alpha_constants.as_ref().map_or(&[], |values| values),
+                        ..PipelineCompilationOptions::default()
+                    },
                     targets: &targets,
                 }),
                 multiview_mask: None,
@@ -871,6 +921,8 @@ impl WgpuBackendDriver {
             vertex,
             fragment,
             topology: draw.topology,
+            triangle_rasterization: draw.triangle_rasterization,
+            alpha_test: draw.alpha_test,
             color_format: attachments
                 .iter()
                 .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
@@ -1570,6 +1622,29 @@ fn texture_view_descriptor(range: ImageSubresourceRange) -> TextureViewDescripto
     }
 }
 
+fn sampled_texture_view_descriptor(
+    description: ImageDescription,
+) -> TextureViewDescriptor<'static> {
+    let dimension = match description.dimension() {
+        ImageDimension::One => TextureViewDimension::D1,
+        ImageDimension::Two if description.array_layers() == 1 => TextureViewDimension::D2,
+        ImageDimension::Two => TextureViewDimension::D2Array,
+        ImageDimension::Three => TextureViewDimension::D3,
+        ImageDimension::Cube if description.array_layers() == 6 => TextureViewDimension::Cube,
+        ImageDimension::Cube => TextureViewDimension::CubeArray,
+    };
+    TextureViewDescriptor {
+        label: Some("Nixe neutral sampled image view"),
+        dimension: Some(dimension),
+        base_mip_level: 0,
+        mip_level_count: Some(u32::from(description.mip_levels())),
+        base_array_layer: 0,
+        array_layer_count: Some(u32::from(description.array_layers())),
+        aspect: TextureAspect::All,
+        ..Default::default()
+    }
+}
+
 fn require_full_image_region(
     description: ImageDescription,
     region: ImageRegion,
@@ -1843,14 +1918,34 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 #[cfg(test)]
 mod tests {
     use nixe_gpu::{
-        BlockLinearLayout, DepthCompareOperation, ImageFormat, ImageMemoryLayout, ViewportTransform,
+        BlockLinearLayout, DepthCompareOperation, ImageDescription, ImageDimension, ImageExtent,
+        ImageFormat, ImageKind, ImageMemoryLayout, SampleCount, ViewportTransform,
     };
-    use wgpu::{CompareFunction, TextureFormat, TextureUsages};
+    use wgpu::{CompareFunction, TextureFormat, TextureUsages, TextureViewDimension};
 
     use super::{
         ImageCopyShape, WebGpuViewport, compare_function, image_texture_plan,
-        linearize_canonical_image, webgpu_viewport, write_linear_image_to_canonical,
+        linearize_canonical_image, sampled_texture_view_descriptor, webgpu_viewport,
+        write_linear_image_to_canonical,
     };
+
+    #[test]
+    fn two_dimensional_image_arrays_create_explicit_array_views() {
+        let description = ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(64, 32, 1).unwrap(),
+            ImageFormat::Rgba8Unorm,
+            ImageKind::Color,
+            1,
+            7,
+            SampleCount::One,
+        )
+        .unwrap();
+
+        let view = sampled_texture_view_descriptor(description);
+        assert_eq!(view.dimension, Some(TextureViewDimension::D2Array));
+        assert_eq!(view.array_layer_count, Some(7));
+    }
 
     #[test]
     fn neutral_depth_comparisons_map_exactly_to_wgpu() {

@@ -290,6 +290,18 @@ fn qemu_a64_matches_every_register_semantic_family() {
             (0xeae2_9420, "BICS X0,X1,X2,ROR#37"),
         ]);
     }
+    if filter.matches(0x9e, "fp-float-to-signed-fixed-int") {
+        cases.extend([
+            (0x1e58_f862, "FCVTZS W2,D3,#2"),
+            (0x9e18_f0a4, "FCVTZS X4,S5,#4"),
+        ]);
+    }
+    if filter.matches(0x9f, "fp-float-to-unsigned-fixed-int") {
+        cases.extend([
+            (0x1e19_e027, "FCVTZU W7,S1,#8 (captured)"),
+            (0x9e59_c3a6, "FCVTZU X6,D29,#16"),
+        ]);
+    }
     if filter.matches(0x91, "simd-scalar-shift-right-immediate") {
         cases.push((0x7f60_07fe, "USHR D30,D31,#32 (captured)"));
     }
@@ -476,6 +488,7 @@ fn register_semantic_id(id: u32) -> bool {
             | 0x0000_0099..=0x0000_009a
             | 0x0000_009b
             | 0x0000_009c..=0x0000_009d
+            | 0x0000_009e..=0x0000_009f
             | 0x0000_0048
             | 0x0000_004a..=0x0000_004b
             | 0x0000_004e..=0x0000_0061

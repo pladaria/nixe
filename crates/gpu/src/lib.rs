@@ -37,12 +37,13 @@ pub use capability::{
     CapabilityAgreement, CapabilityRequirement, CapabilityRequirements,
 };
 pub use command::{
-    AttachmentLoad, AttachmentStore, BarrierOperation, BufferRegion, CacheMaintenanceOperation,
-    ClearOperation, ClearValue, CommandDescriptionError, CopyOperation, DepthCompareOperation,
-    DepthState, DispatchOperation, DrawArguments, DrawOperation, GpuCommand, GpuOperation,
-    ImageOrigin, ImageRegion, IndexType, OperationSubmission, PrimitiveTopology, QueryOperation,
-    RenderAttachment, RenderPassOperation, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
+    BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue, CommandDescriptionError,
+    CopyOperation, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
+    DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
+    OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
+    ViewportTransform,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,

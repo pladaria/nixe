@@ -3213,6 +3213,82 @@ fn mme_register_reads_and_execution_limit_fail_typed_and_atomically() {
 }
 
 #[test]
+fn mme_finite_loop_may_retire_more_instructions_than_the_method_output_limit() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    let decrement_r1 = 1 | (1 << 4) | (1 << 8) | (1 << 11) | ((-1_i32 as u32) << 14);
+    let branch_to_decrement_while_r1_nonzero =
+        7 | (1 << 4) | (1 << 5) | (1 << 11) | ((-1_i32 as u32) << 14);
+    let exit = 1 | (1 << 4) | (1 << 7);
+    let delay_slot = 1 | (1 << 4);
+    let macro_index = 14;
+    load_mme_program(
+        &mut channel,
+        macro_index,
+        &[
+            decrement_r1,
+            branch_to_decrement_while_r1_nonzero,
+            exit,
+            delay_slot,
+        ],
+    );
+    let call = packet((0x3800 + u32::from(macro_index) * 8) / 4, 20_000);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &call.packets()[0],
+    )
+    .unwrap();
+
+    let MaxwellEngineMethodEffect::MmeMacroCall { report, .. } = dispatch.methods()[0].effect()
+    else {
+        panic!("expected an MME macro call");
+    };
+    assert!(report.instructions > MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT);
+    assert_eq!(report.emitted_methods, 0);
+}
+
+#[test]
+fn mme_finite_loop_may_emit_more_than_the_old_host_budget() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    let set_nop_method = 1 | (2 << 4) | ((0x0100 / 4) << 14);
+    let decrement_r1_and_send = 1 | (4 << 4) | (1 << 8) | (1 << 11) | ((-1_i32 as u32) << 14);
+    let branch_to_decrement_while_r1_nonzero =
+        7 | (1 << 4) | (1 << 5) | (1 << 11) | ((-1_i32 as u32) << 14);
+    let exit = 1 | (1 << 4) | (1 << 7);
+    let delay_slot = 1 | (1 << 4);
+    let macro_index = 15;
+    load_mme_program(
+        &mut channel,
+        macro_index,
+        &[
+            set_nop_method,
+            decrement_r1_and_send,
+            branch_to_decrement_while_r1_nonzero,
+            exit,
+            delay_slot,
+        ],
+    );
+    let call = packet((0x3800 + u32::from(macro_index) * 8) / 4, 5_000);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &call.packets()[0],
+    )
+    .unwrap();
+
+    let MaxwellEngineMethodEffect::MmeMacroCall { report, .. } = dispatch.methods()[0].effect()
+    else {
+        panic!("expected an MME macro call");
+    };
+    assert_eq!(report.emitted_methods, 5_000);
+    assert!(report.emitted_methods > 4096);
+}
+
+#[test]
 fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
     let mut channel = channel();
     bind_three_d(&mut channel);

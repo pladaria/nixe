@@ -18,6 +18,7 @@ use super::{
     MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
     MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
+    MaxwellThreeDInlineToMemoryState, MaxwellThreeDInlineToMemoryStateWrite,
     MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
     MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
     MaxwellThreeDLineStateWrite, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
@@ -850,6 +851,7 @@ pub struct MaxwellThreeDState {
     counters: MaxwellThreeDCounterState,
     falcon: MaxwellThreeDFalconState,
     instrumentation: MaxwellThreeDInstrumentationState,
+    inline_to_memory: MaxwellThreeDInlineToMemoryState,
     tiled_cache: MaxwellThreeDTiledCacheState,
     mme: MaxwellThreeDMmeState,
 }
@@ -921,6 +923,7 @@ impl Default for MaxwellThreeDState {
             counters: Default::default(),
             falcon: Default::default(),
             instrumentation: Default::default(),
+            inline_to_memory: Default::default(),
             tiled_cache: Default::default(),
             mme: Default::default(),
         }
@@ -1021,6 +1024,11 @@ impl MaxwellThreeDState {
     #[must_use]
     pub const fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
         &self.instrumentation
+    }
+
+    #[must_use]
+    pub const fn inline_to_memory(&self) -> &MaxwellThreeDInlineToMemoryState {
+        &self.inline_to_memory
     }
 
     #[must_use]
@@ -1232,6 +1240,9 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::PointSize { value, source } => {
                 self.raster.point_size =
                     MaxwellThreeDRegister::programmed(value.bits(), value, source);
+            }
+            MaxwellThreeDStateWrite::InlineToMemory(write) => {
+                self.inline_to_memory.apply(write);
             }
             MaxwellThreeDStateWrite::AttributePointSize { value, source } => {
                 self.raster.attribute_point_size =
@@ -1510,6 +1521,7 @@ pub(in crate::engines) struct MaxwellThreeDStateValidationError {
 /// One checked `MAXWELL_B` register transition ready for direct application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDStateWrite {
+    InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite),
     PointSize {
         value: MaxwellThreeDPointSize,
         source: MaxwellMethodSource,
