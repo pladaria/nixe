@@ -7,6 +7,7 @@ mod counters;
 mod coverage;
 mod draw;
 mod falcon;
+mod inline_to_memory;
 mod instrumentation;
 mod l2_cache;
 mod line;
@@ -67,6 +68,11 @@ pub use draw::{
 pub use falcon::{
     MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
     MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState,
+};
+pub use inline_to_memory::{
+    MaxwellThreeDInlineToMemoryCompletion, MaxwellThreeDInlineToMemoryLaunch,
+    MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
+    MaxwellThreeDInlineToMemoryStateWrite,
 };
 pub use instrumentation::{
     MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
@@ -143,8 +149,9 @@ pub use resource::{
     MaxwellThreeDMappingReference, MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer,
     MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
     MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias,
-    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureReference,
-    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureDimension,
+    MaxwellThreeDTextureReference, resolve_maxwell_three_d_resources,
+    resolve_maxwell_three_d_resources_for_roles,
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
@@ -1074,17 +1081,19 @@ impl MaxwellThreeDMmeHost for MmeDispatchHost<'_> {
             _ => None,
         };
         let inline_upload = match preflight.effect() {
+            MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload { upload, .. } => {
+                Some(MaxwellEngineOperation::InlineToMemory(upload))
+            }
             MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
                 upload, ..
-            } => Some(upload),
+            } => Some(MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)),
             _ => None,
         };
         if let Some(upload) = inline_upload {
             self.ordered_operations
                 .try_reserve(1)
                 .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            self.ordered_operations
-                .push(MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload));
+            self.ordered_operations.push(upload);
         }
         if let Some(trigger) = trigger {
             self.operations
@@ -1154,6 +1163,7 @@ fn preflight_with_shadow(
         dispatch.effect(),
         MaxwellEngineMethodEffect::ThreeDState(_)
             | MaxwellEngineMethodEffect::ThreeDStateAndTrigger { .. }
+            | MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload { .. }
             | MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload { .. }
     ) {
         candidate.record_raw_register(dispatch.method().source());
@@ -1172,6 +1182,20 @@ fn preflight_register(
     candidate: &mut MaxwellThreeDState,
 ) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
     let source = method.source();
+    if let Some((write, method_name, upload)) =
+        inline_to_memory::preflight(source, candidate.inline_to_memory())?
+    {
+        candidate.apply(write);
+        let metadata =
+            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
+        let effect = upload.map_or(MaxwellEngineMethodEffect::ThreeDState(write), |upload| {
+            MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload {
+                state: write,
+                upload,
+            }
+        });
+        return Ok(MaxwellEngineMethodDispatch::new(method, metadata, effect));
+    }
     if let Some((write, method_name)) = preflight_mme_state(source, candidate)? {
         candidate.apply(write);
         let metadata =

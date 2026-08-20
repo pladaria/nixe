@@ -2496,6 +2496,51 @@ fn a64_scalar_float_to_integer_converts_all_switch1_width_combinations() {
 }
 
 #[test]
+fn a64_scalar_fixed_point_float_to_integer_converts_the_complete_scalar_family() {
+    let profile = GuestCpuProfile::switch_1();
+    let captured = InstructionEncoding::from_u32(0x1e19_e027); // FCVTZU W7,S1,#8
+    let decoded =
+        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
+        {
+            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
+            other => panic!("expected decoded fixed-point FCVTZU, got {other:?}"),
+        };
+    assert_eq!(
+        instruction_support(&decoded),
+        InstructionSupport::InterpreterOnly
+    );
+    let nixe_cpu::decode::a64::A64Instruction::FpSimd(instruction) =
+        nixe_cpu::decode::a64::normalize(&decoded.instruction, captured)
+    else {
+        panic!("expected normalized fixed-point floating conversion")
+    };
+    assert_eq!(instruction.operands().fixed_point_fraction_bits, Some(8));
+
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert!(a64.set_vector(1, u128::from(1.5_f32.to_bits())));
+    assert!(a64.set_vector(3, u128::from((-1.25_f64).to_bits())));
+    assert!(a64.set_vector(5, u128::from((-2.5_f32).to_bits())));
+    assert!(a64.set_vector(29, u128::from(3.5_f64.to_bits())));
+
+    execute_one(&profile, &mut state, captured).unwrap();
+    execute_one(&profile, &mut state, 0x1e58_f862_u32.into()).unwrap(); // FCVTZS W2,D3,#2
+    execute_one(&profile, &mut state, 0x9e18_f0a4_u32.into()).unwrap(); // FCVTZS X4,S5,#4
+    execute_one(&profile, &mut state, 0x9e59_c3a6_u32.into()).unwrap(); // FCVTZU X6,D29,#16
+
+    let ThreadCpuState::A64(a64) = &state else {
+        unreachable!()
+    };
+    assert_eq!(a64.read_x(x(7)), 384);
+    assert_eq!(a64.read_x(x(2)), u64::from((-5_i32) as u32));
+    assert_eq!(a64.read_x(x(4)), (-40_i64) as u64);
+    assert_eq!(a64.read_x(x(6)), 229_376);
+    assert_eq!(a64.fpsr(), 0);
+}
+
+#[test]
 fn a64_scalar_float_to_integer_saturates_and_handles_subnormal_inputs() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());

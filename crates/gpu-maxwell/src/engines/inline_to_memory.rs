@@ -60,7 +60,7 @@ impl<T> MaxwellInlineToMemoryRegister<T> {
 pub struct MaxwellInlineToMemoryAddress(u64);
 
 impl MaxwellInlineToMemoryAddress {
-    const fn new(upper: u32, lower: u32) -> Option<Self> {
+    pub(super) const fn new(upper: u32, lower: u32) -> Option<Self> {
         if upper <= 0xff {
             Some(Self((upper as u64) << 32 | lower as u64))
         } else {
@@ -300,6 +300,20 @@ pub struct MaxwellInlineToMemoryUpload {
 }
 
 impl MaxwellInlineToMemoryUpload {
+    pub(super) const fn new(
+        address: MaxwellInlineToMemoryAddress,
+        offset: u32,
+        value: u32,
+        source: MaxwellMethodSource,
+    ) -> Self {
+        Self {
+            address,
+            offset,
+            value,
+            source,
+        }
+    }
+
     #[must_use]
     pub const fn address(self) -> MaxwellInlineToMemoryAddress {
         self.address

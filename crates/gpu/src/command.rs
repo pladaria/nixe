@@ -182,6 +182,37 @@ pub enum PrimitiveTopology {
     Patches,
 }
 
+/// Rasterization rule applied after triangle assembly.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TriangleRasterization {
+    /// Cover samples inside the triangle edges.
+    #[default]
+    Fill,
+    /// Cover the triangle's axis-aligned post-projection bounding box while
+    /// retaining the original triangle's interpolation planes.
+    FillRectangle,
+}
+
+/// Comparison applied by the legacy fixed-function alpha test.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AlphaCompareOperation {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+/// Optional fixed-function alpha test performed after fragment evaluation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AlphaTest {
+    pub comparison: AlphaCompareOperation,
+    pub reference_bits: u32,
+}
+
 /// Width and interpretation of indices in an index buffer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IndexType {
@@ -455,6 +486,8 @@ pub struct DrawOperation {
     pub pipeline: PipelineId,
     pub render_pass: RenderPassId,
     pub topology: PrimitiveTopology,
+    pub triangle_rasterization: TriangleRasterization,
+    pub alpha_test: Option<AlphaTest>,
     pub descriptor_tables: Box<[DescriptorTableId]>,
     pub vertex_buffers: Box<[VertexBufferLayout]>,
     pub index_buffer: Option<(BufferRegion, IndexType)>,
@@ -492,6 +525,8 @@ impl DrawOperation {
             pipeline,
             render_pass,
             topology,
+            triangle_rasterization: TriangleRasterization::Fill,
+            alpha_test: None,
             descriptor_tables: descriptor_tables.into_boxed_slice(),
             vertex_buffers: vertex_buffers.into_boxed_slice(),
             index_buffer,
@@ -510,6 +545,21 @@ impl DrawOperation {
     #[must_use]
     pub const fn with_depth_state(mut self, depth_state: DepthState) -> Self {
         self.depth_state = depth_state;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_triangle_rasterization(
+        mut self,
+        triangle_rasterization: TriangleRasterization,
+    ) -> Self {
+        self.triangle_rasterization = triangle_rasterization;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_alpha_test(mut self, alpha_test: AlphaTest) -> Self {
+        self.alpha_test = Some(alpha_test);
         self
     }
 }

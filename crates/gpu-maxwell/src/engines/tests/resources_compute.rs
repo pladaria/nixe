@@ -1,6 +1,120 @@
 use super::*;
 
 #[test]
+fn three_d_embedded_inline_upload_covers_captured_block_linear_gob_row() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    let setup = incrementing_packet(0x0180 / 4, &[0x40, 1, 0, 0x0409_3000]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &setup.packets()[0],
+    )
+    .unwrap();
+    program_three_d(&mut channel, 0x01b0, 0);
+
+    let words = [
+        0x7017_ff8f,
+        0x00f5_0000,
+        0x0060_0005,
+        0x0007_0008,
+        0xea80_000f,
+        0x80ff_000f,
+        0x0300_0000,
+        0,
+        0x0002_6412,
+        0x0000_0351,
+        0x00f0_0000,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let data = non_incrementing_packet_on_subchannel(0, 0x01b4 / 4, &words);
+    let dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &data.packets()[0],
+    )
+    .unwrap();
+
+    assert_eq!(dispatch.ordered_operations().len(), words.len());
+    for (index, operation) in dispatch.ordered_operations().iter().enumerate() {
+        assert!(matches!(
+            operation,
+            MaxwellEngineOperation::InlineToMemory(upload)
+                if upload.address().get() == 0x0409_3000
+                    && upload.offset() == index as u32 * 4
+                    && upload.value() == words[index]
+        ));
+    }
+    let inline = channel.three_d().inline_to_memory();
+    assert_eq!(inline.line_length().value(), Some(&0x40));
+    assert_eq!(inline.line_count().value(), Some(&1));
+    assert_eq!(
+        inline.launch().value().map(|launch| launch.layout()),
+        Some(MaxwellThreeDInlineToMemoryLayout::BlockLinear)
+    );
+    assert_eq!(inline.last_data().value(), Some(&0));
+}
+
+#[test]
+fn three_d_embedded_inline_upload_rejects_unrepresented_block_linear_rows() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let setup = incrementing_packet(0x0180 / 4, &[0x44, 1, 0, 0x0409_3000]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &setup.packets()[0],
+    )
+    .unwrap();
+
+    let launch = packet(0x01b0 / 4, 0);
+    assert!(matches!(
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            &launch.packets()[0],
+        ),
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+            method_name: "LAUNCH_DMA",
+            reason: "only one contiguous row of the first block-linear GOB is implemented",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn three_d_embedded_inline_upload_retains_pitch_flush_only_launch() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    let setup = incrementing_packet(0x0180 / 4, &[4, 1, 0, 0x0409_3000]);
+    dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &setup.packets()[0],
+    )
+    .unwrap();
+    program_three_d(&mut channel, 0x01b0, 0x11);
+
+    let launch = channel
+        .three_d()
+        .inline_to_memory()
+        .launch()
+        .value()
+        .copied()
+        .unwrap();
+    assert_eq!(launch.layout(), MaxwellThreeDInlineToMemoryLayout::Pitch);
+    assert_eq!(
+        launch.completion(),
+        MaxwellThreeDInlineToMemoryCompletion::FlushOnly
+    );
+}
+
+#[test]
 fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
     let mut channel = channel();
     bind_three_d(&mut channel);

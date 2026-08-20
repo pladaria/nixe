@@ -150,6 +150,7 @@ pub(crate) struct MaxwellShaderTranslationKey {
     source_segments: Box<[MaxwellShaderSourceSegment]>,
     staged_overlay: Box<[MaxwellStagedShaderWrite]>,
     resource_binding_remap: Box<[(u8, u8)]>,
+    linked_output_interpolation: Box<[(ShaderIoLocation, ShaderInterpolation)]>,
 }
 
 impl MaxwellShaderTranslationKey {
@@ -179,6 +180,7 @@ pub(crate) struct MaxwellTextureResourceBinding {
     constant_buffer_byte_offset: u32,
     image_binding: u8,
     sampler_binding: u8,
+    image_kind: ShaderResourceKind,
 }
 
 impl MaxwellTranslatedShaderProgram {
@@ -240,6 +242,9 @@ impl MaxwellTextureResourceBinding {
     }
     pub(crate) const fn sampler_binding(self) -> u8 {
         self.sampler_binding
+    }
+    pub(crate) const fn image_kind(self) -> ShaderResourceKind {
+        self.image_kind
     }
 }
 
@@ -849,20 +854,28 @@ fn translate_shader_binary(
                     target: decode_shader_control_target(stage, offset, encoding, code_size)?,
                 }
             } else if is_attribute_load(encoding) {
-                let operation = decode_attribute_load(stage, offset, encoding, register_count)?;
-                if let ShaderOperation::LoadInput {
-                    location: location @ (ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId),
-                    scalar_type,
-                    ..
-                } = operation
-                    && !inputs.iter().any(|input| input.location() == location)
-                {
-                    inputs.push(
-                        ShaderInterfaceElement::new(location, 0, scalar_type, None)
-                            .expect("Maxwell vertex system values are scalar inputs"),
-                    );
+                let operations = decode_attribute_load(stage, offset, encoding, register_count)?;
+                for operation in &operations {
+                    if let ShaderOperation::LoadInput {
+                        location:
+                            location @ (ShaderIoLocation::VertexId | ShaderIoLocation::InstanceId),
+                        scalar_type,
+                        ..
+                    } = operation
+                        && !inputs.iter().any(|input| input.location() == *location)
+                    {
+                        inputs.push(
+                            ShaderInterfaceElement::new(*location, 0, *scalar_type, None)
+                                .expect("Maxwell vertex system values are scalar inputs"),
+                        );
+                    }
                 }
-                operation
+                instructions.extend(
+                    operations
+                        .into_iter()
+                        .map(|operation| ShaderInstruction::new(source, predicate, operation)),
+                );
+                continue;
             } else if is_attribute_store(encoding) {
                 let operation = decode_attribute_store(stage, offset, encoding, register_count)?;
                 if let ShaderOperation::StoreOutput {
@@ -895,6 +908,60 @@ fn translate_shader_binary(
                 continue;
             } else if is_shift_left(encoding) {
                 let decoded = decode_shift_left(
+                    stage,
+                    offset,
+                    encoding,
+                    register_count,
+                    &mut next_temporary,
+                )?;
+                if let Some(binding) = decoded.constant_buffer_binding {
+                    constant_buffer_bindings.insert(binding);
+                }
+                append_expanded_operations(
+                    &mut instructions,
+                    source,
+                    predicate,
+                    decoded.operations,
+                );
+                continue;
+            } else if is_integer_to_float(encoding) {
+                let decoded = decode_integer_to_float(
+                    stage,
+                    offset,
+                    encoding,
+                    register_count,
+                    &mut next_temporary,
+                )?;
+                if let Some(binding) = decoded.constant_buffer_binding {
+                    constant_buffer_bindings.insert(binding);
+                }
+                append_expanded_operations(
+                    &mut instructions,
+                    source,
+                    predicate,
+                    decoded.operations,
+                );
+                continue;
+            } else if is_float_to_float(encoding) {
+                let decoded = decode_float_to_float(
+                    stage,
+                    offset,
+                    encoding,
+                    register_count,
+                    &mut next_temporary,
+                )?;
+                if let Some(binding) = decoded.constant_buffer_binding {
+                    constant_buffer_bindings.insert(binding);
+                }
+                append_expanded_operations(
+                    &mut instructions,
+                    source,
+                    predicate,
+                    decoded.operations,
+                );
+                continue;
+            } else if is_float_to_integer(encoding) {
+                let decoded = decode_float_to_integer(
                     stage,
                     offset,
                     encoding,
@@ -1056,13 +1123,8 @@ fn translate_shader_binary(
         .collect::<Vec<_>>();
     for binding in texture_bindings.values().copied() {
         resources.push(
-            ShaderResourceAccess::new(
-                binding.image_binding,
-                ShaderResourceKind::SampledImage,
-                true,
-                false,
-            )
-            .expect("read-only sampled-image access is valid"),
+            ShaderResourceAccess::new(binding.image_binding, binding.image_kind, true, false)
+                .expect("read-only sampled-image access is valid"),
         );
         resources.push(
             ShaderResourceAccess::new(
@@ -1418,6 +1480,21 @@ const fn is_shift_left(encoding: u64) -> bool {
     matches!(opcode, 0x5c48 | 0x4c48) || opcode & 0xfeff == 0x3848
 }
 
+const fn is_integer_to_float(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    matches!(opcode, 0x5cb8 | 0x4cb8) || opcode & 0xfeff == 0x38b8
+}
+
+const fn is_float_to_float(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    matches!(opcode, 0x5ca8 | 0x4ca8) || opcode & 0xfeff == 0x38a8
+}
+
+const fn is_float_to_integer(encoding: u64) -> bool {
+    let opcode = (encoding >> 48) as u16;
+    matches!(opcode, 0x5cb0 | 0x4cb0) || opcode & 0xfeff == 0x38b0
+}
+
 const fn is_constant_buffer_load(encoding: u64) -> bool {
     ((encoding >> 48) as u16) & 0xfff8 == 0xef90
 }
@@ -1474,6 +1551,9 @@ const fn is_supported_family(encoding: u64) -> bool {
         || is_move_immediate(encoding)
         || is_move(encoding)
         || is_shift_left(encoding)
+        || is_integer_to_float(encoding)
+        || is_float_to_float(encoding)
+        || is_float_to_integer(encoding)
         || is_constant_buffer_load(encoding)
         || is_texture_sample_simplified(encoding)
         || is_interpolate(encoding)
@@ -1497,12 +1577,12 @@ fn decode_texture_sample_simplified(
     // channel masks follow envytools' pinned public GM107 ISA table:
     // https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/envydis/gm107.c
     let selector = ((encoding >> 53) & 0xf) as u8;
-    if stage != MaxwellThreeDShaderStage::Pixel || selector != 1 {
+    if stage != MaxwellThreeDShaderStage::Pixel || !matches!(selector, 1 | 7) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "TEXS mode other than fragment 2D implicit LOD",
+            detail: "TEXS mode other than fragment 2D/2D-array implicit LOD",
         });
     }
     let primary_destination = (encoding & 0xff) as u8;
@@ -1515,8 +1595,21 @@ fn decode_texture_sample_simplified(
     // https://github.com/yuzu-emu/yuzu/blob/55bf3dbf5ddaa3f7c1c3efade5553b07499fe289/src/shader_recompiler/frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp#L28-L72
     let constant_buffer_dword_offset = ((encoding >> 36) & 0x1fff) as u16;
     let constant_buffer_byte_offset = u32::from(constant_buffer_dword_offset) * 4;
-    validate_register_range(stage, offset, encoding, x_coordinate, 1, register_count)?;
-    validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
+    if selector == 1 {
+        validate_register_range(stage, offset, encoding, x_coordinate, 1, register_count)?;
+        validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
+    } else {
+        if !x_coordinate.is_multiple_of(2) {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "TEXS 2D-array packed layer/first-coordinate register is misaligned",
+            ));
+        }
+        validate_register_range(stage, offset, encoding, x_coordinate, 2, register_count)?;
+        validate_register_range(stage, offset, encoding, y_coordinate, 1, register_count)?;
+    }
 
     let channel_selector = ((encoding >> 50) & 0x7) as usize;
     let channels: &[u8] = if secondary_destination == u8::MAX {
@@ -1568,7 +1661,20 @@ fn decode_texture_sample_simplified(
         )?;
     }
 
+    let image_kind = if selector == 1 {
+        ShaderResourceKind::SampledImage
+    } else {
+        ShaderResourceKind::SampledImage2DArray
+    };
     let binding = if let Some(binding) = bindings.get(&constant_buffer_dword_offset).copied() {
+        if binding.image_kind != image_kind {
+            return Err(malformed(
+                stage,
+                offset,
+                encoding,
+                "TEXS reuses one descriptor with contradictory image dimensions",
+            ));
+        }
         binding
     } else {
         let next_pair = u8::try_from(32 + bindings.len() * 2).map_err(|_| {
@@ -1590,6 +1696,7 @@ fn decode_texture_sample_simplified(
                     "TEXS neutral resource binding space is exhausted",
                 )
             })?,
+            image_kind,
         };
         bindings.insert(constant_buffer_dword_offset, binding);
         binding
@@ -1608,15 +1715,28 @@ fn decode_texture_sample_simplified(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    Ok(ShaderOperation::SampleTexture2D {
-        outputs,
-        coordinates: [
-            ShaderRegister::new(u16::from(x_coordinate)),
-            ShaderRegister::new(u16::from(y_coordinate)),
-        ],
-        image_binding: binding.image_binding,
-        sampler_binding: binding.sampler_binding,
-    })
+    if selector == 1 {
+        Ok(ShaderOperation::SampleTexture2D {
+            outputs,
+            coordinates: [
+                ShaderRegister::new(u16::from(x_coordinate)),
+                ShaderRegister::new(u16::from(y_coordinate)),
+            ],
+            image_binding: binding.image_binding,
+            sampler_binding: binding.sampler_binding,
+        })
+    } else {
+        Ok(ShaderOperation::SampleTexture2DArray {
+            outputs,
+            coordinates: [
+                ShaderRegister::new(u16::from(x_coordinate + 1)),
+                ShaderRegister::new(u16::from(y_coordinate)),
+            ],
+            array_index: ShaderRegister::new(u16::from(x_coordinate)),
+            image_binding: binding.image_binding,
+            sampler_binding: binding.sampler_binding,
+        })
+    }
 }
 
 fn decode_shader_control_target(
@@ -1680,6 +1800,402 @@ struct DecodedMove {
 struct DecodedShiftLeft {
     operations: Vec<ShaderOperation>,
     constant_buffer_binding: Option<u8>,
+}
+
+struct DecodedIntegerToFloat {
+    operations: Vec<ShaderOperation>,
+    constant_buffer_binding: Option<u8>,
+}
+
+struct DecodedFloatToFloat {
+    operations: Vec<ShaderOperation>,
+    constant_buffer_binding: Option<u8>,
+}
+
+struct DecodedFloatToInteger {
+    operations: Vec<ShaderOperation>,
+    constant_buffer_binding: Option<u8>,
+}
+
+fn decode_float_to_integer(
+    stage: MaxwellThreeDShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<DecodedFloatToInteger, MaxwellShaderTranslationError> {
+    // Operand forms, destination type, rounding, and FTZ follow Mesa NAK's
+    // pinned SM50 F2I encoder. Range clamping and NaN/FTZ behavior follow
+    // NVIDIA's public PTX conversion semantics:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1802-L1840
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt
+    let destination = (encoding & 0xff) as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    let destination_bits = match (encoding >> 8) & 0x3 {
+        0 => 8,
+        1 => 16,
+        2 => 32,
+        3 => {
+            return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                stage,
+                instruction_offset: offset,
+                encoding,
+                detail: "F2I 64-bit destination",
+            });
+        }
+        _ => unreachable!(),
+    };
+    if (encoding >> 10) & 0x3 != 2 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2I source width other than F32",
+        });
+    }
+    if encoding & (1 << 41) != 0 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            "F2I F32 source selects half swizzle",
+        ));
+    }
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2I condition-code output",
+        });
+    }
+    let rounding = match (encoding >> 39) & 0x3 {
+        0 => ShaderRoundingMode::NearestEven,
+        1 => ShaderRoundingMode::TowardNegative,
+        2 => ShaderRoundingMode::TowardPositive,
+        3 => ShaderRoundingMode::TowardZero,
+        _ => unreachable!(),
+    };
+    let destination_type = if encoding & (1 << 12) != 0 {
+        ShaderScalarType::Signed32
+    } else {
+        ShaderScalarType::Unsigned32
+    };
+
+    let opcode = (encoding >> 48) as u16;
+    let mut operations = Vec::with_capacity(4);
+    let (source, constant_buffer_binding) = if opcode == 0x5cb0 {
+        let source = ((encoding >> 20) & 0xff) as u8;
+        (
+            prepare_float_register_source(
+                stage,
+                offset,
+                encoding,
+                source,
+                encoding & (1 << 49) != 0,
+                encoding & (1 << 45) != 0,
+                register_count,
+                next_temporary,
+                &mut operations,
+            )?,
+            None,
+        )
+    } else if opcode == 0x4cb0 {
+        let temporary = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "F2I operand temporary register overflow",
+            next_temporary,
+        )?;
+        let binding = ((encoding >> 34) & 0x1f) as u8;
+        let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
+        operations.push(ShaderOperation::LoadConstantBuffer32 {
+            destination: temporary,
+            binding,
+            byte_offset,
+            scalar_type: ShaderScalarType::Float32,
+        });
+        let source = apply_float_source_modifiers(
+            stage,
+            offset,
+            encoding,
+            temporary,
+            encoding & (1 << 49) != 0,
+            encoding & (1 << 45) != 0,
+            next_temporary,
+            &mut operations,
+        )?;
+        (source, Some(binding))
+    } else {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2I immediate operand",
+        });
+    };
+    operations.push(ShaderOperation::ConvertFloat32ToInteger {
+        destination: ShaderRegister::new(u16::from(destination)),
+        source,
+        destination_type,
+        destination_bits,
+        rounding,
+        flush_denormals_to_zero: encoding & (1 << 44) != 0,
+    });
+    Ok(DecodedFloatToInteger {
+        operations,
+        constant_buffer_binding,
+    })
+}
+
+fn decode_float_to_float(
+    stage: MaxwellThreeDShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<DecodedFloatToFloat, MaxwellShaderTranslationError> {
+    // Operand forms and conversion controls follow Mesa NAK's pinned SM50
+    // F2F encoder:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1756-L1800
+    let destination = (encoding & 0xff) as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    if (encoding >> 8) & 0x3 != 2 || (encoding >> 10) & 0x3 != 2 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2F width other than F32-to-F32",
+        });
+    }
+    if encoding & (1 << 41) != 0 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            "F2F F32 source selects half swizzle",
+        ));
+    }
+    if encoding & (1 << 42) == 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2F without integral rounding",
+        });
+    }
+    if encoding & (1 << 47) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2F condition-code output",
+        });
+    }
+    if encoding & (1 << 50) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2F saturation",
+        });
+    }
+    let rounding = match (encoding >> 39) & 0x3 {
+        0 => {
+            return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                stage,
+                instruction_offset: offset,
+                encoding,
+                detail: "F2F nearest-even integral rounding",
+            });
+        }
+        1 => ShaderRoundingMode::TowardNegative,
+        2 => ShaderRoundingMode::TowardPositive,
+        3 => ShaderRoundingMode::TowardZero,
+        _ => unreachable!(),
+    };
+
+    let opcode = (encoding >> 48) as u16;
+    let mut operations = Vec::with_capacity(4);
+    let (source, constant_buffer_binding) = if opcode == 0x5ca8 {
+        let source = ((encoding >> 20) & 0xff) as u8;
+        (
+            prepare_float_register_source(
+                stage,
+                offset,
+                encoding,
+                source,
+                encoding & (1 << 49) != 0,
+                encoding & (1 << 45) != 0,
+                register_count,
+                next_temporary,
+                &mut operations,
+            )?,
+            None,
+        )
+    } else if opcode == 0x4ca8 {
+        let temporary = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "F2F operand temporary register overflow",
+            next_temporary,
+        )?;
+        let binding = ((encoding >> 34) & 0x1f) as u8;
+        let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
+        operations.push(ShaderOperation::LoadConstantBuffer32 {
+            destination: temporary,
+            binding,
+            byte_offset,
+            scalar_type: ShaderScalarType::Float32,
+        });
+        let source = apply_float_source_modifiers(
+            stage,
+            offset,
+            encoding,
+            temporary,
+            encoding & (1 << 49) != 0,
+            encoding & (1 << 45) != 0,
+            next_temporary,
+            &mut operations,
+        )?;
+        (source, Some(binding))
+    } else {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "F2F immediate operand",
+        });
+    };
+    operations.push(ShaderOperation::RoundFloat32ToIntegral {
+        destination: ShaderRegister::new(u16::from(destination)),
+        source,
+        rounding,
+        flush_denormals_to_zero: encoding & (1 << 44) != 0,
+    });
+    Ok(DecodedFloatToFloat {
+        operations,
+        constant_buffer_binding,
+    })
+}
+
+fn decode_integer_to_float(
+    stage: MaxwellThreeDShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+    next_temporary: &mut u16,
+) -> Result<DecodedIntegerToFloat, MaxwellShaderTranslationError> {
+    // Operand forms and type/modifier fields follow Mesa NAK's pinned SM50
+    // I2F encoder:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1842-L1880
+    let destination = (encoding & 0xff) as u8;
+    validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    if (encoding >> 8) & 0x3 != 2 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F destination width other than F32",
+        });
+    }
+    if (encoding >> 10) & 0x3 != 2 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F source width other than 32 bits",
+        });
+    }
+    if (encoding >> 39) & 0x3 != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F directed rounding mode",
+        });
+    }
+    if (encoding >> 41) & 0x3 != 0 {
+        return Err(malformed(
+            stage,
+            offset,
+            encoding,
+            "I2F encodes a reserved sub-operation",
+        ));
+    }
+    if encoding & (1 << 45) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F integer source negation",
+        });
+    }
+    if encoding & (1 << 49) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "I2F integer source absolute value",
+        });
+    }
+
+    let source_type = if encoding & (1 << 13) != 0 {
+        ShaderScalarType::Signed32
+    } else {
+        ShaderScalarType::Unsigned32
+    };
+    let opcode = (encoding >> 48) as u16;
+    let mut operations = Vec::with_capacity(2);
+    let (source, constant_buffer_binding) = if opcode == 0x5cb8 {
+        let source = ((encoding >> 20) & 0xff) as u8;
+        validate_register_range(stage, offset, encoding, source, 1, register_count)?;
+        (ShaderRegister::new(u16::from(source)), None)
+    } else {
+        let temporary = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "I2F operand temporary register overflow",
+            next_temporary,
+        )?;
+        if opcode == 0x4cb8 {
+            let binding = ((encoding >> 34) & 0x1f) as u8;
+            let byte_offset = (((encoding >> 20) & 0x3fff) as u32) * 4;
+            operations.push(ShaderOperation::LoadConstantBuffer32 {
+                destination: temporary,
+                binding,
+                byte_offset,
+                scalar_type: source_type,
+            });
+            (temporary, Some(binding))
+        } else {
+            let low = ((encoding >> 20) & 0x7ffff) as u32;
+            let bits = low
+                | if encoding & (1 << 56) != 0 {
+                    0xfff8_0000
+                } else {
+                    0
+                };
+            operations.push(ShaderOperation::MoveImmediate32 {
+                destination: temporary,
+                bits,
+                scalar_type: source_type,
+            });
+            (temporary, None)
+        }
+    };
+    operations.push(ShaderOperation::ConvertIntegerToFloat32 {
+        destination: ShaderRegister::new(u16::from(destination)),
+        source,
+        source_type,
+    });
+    Ok(DecodedIntegerToFloat {
+        operations,
+        constant_buffer_binding,
+    })
 }
 
 struct DecodedConstantBufferLoad {
@@ -2631,7 +3147,7 @@ fn decode_attribute_load(
     offset: u32,
     encoding: u64,
     register_count: u8,
-) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     let destination = (encoding & 0xff) as u8;
     let components = (((encoding >> 47) & 0x3) + 1) as u8;
     validate_register_range(
@@ -2650,26 +3166,46 @@ fn decode_attribute_load(
             "indexed ALD is not encoded with RZ operands",
         ));
     }
-    let address = ((encoding >> 20) & 0x3ff) as u16;
-    let (location, first_component, scalar_type, available_components) =
-        input_attribute_location(stage, offset, encoding, address)?;
-    if first_component + components > available_components {
-        return Err(malformed(
-            stage,
-            offset,
-            encoding,
-            "ALD crosses the selected attribute boundary",
-        ));
+    // ALD addresses a contiguous sequence of 32-bit attribute slots. A
+    // vector load may therefore cross an attribute-vector boundary; the
+    // captured deko3d vertex shader uses the two adjacent ABI slots at 0x2f8
+    // and 0x2fc to load InstanceId and VertexId together. Mesa NAK preserves
+    // this component count in bits 47..49:
+    // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L2855-L2876
+    // Split the contiguous hardware transfer at neutral-IR location and type
+    // boundaries instead of pretending that it belongs to one vec4 input.
+    let first_address = ((encoding >> 20) & 0x3ff) as u16;
+    let mut operations = Vec::new();
+    for component in 0..components {
+        let address = first_address
+            .checked_add(u16::from(component) * 4)
+            .ok_or_else(|| malformed(stage, offset, encoding, "ALD attribute address overflows"))?;
+        let (location, first_component, scalar_type, _) =
+            input_attribute_location(stage, offset, encoding, address)?;
+        let destination = ShaderRegister::new(u16::from(destination + component));
+        if let Some(ShaderOperation::LoadInput {
+            destinations,
+            location: previous_location,
+            first_component: previous_first_component,
+            scalar_type: previous_scalar_type,
+        }) = operations.last_mut()
+            && *previous_location == location
+            && *previous_scalar_type == scalar_type
+            && *previous_first_component + destinations.len() as u8 == first_component
+        {
+            let mut grouped = destinations.to_vec();
+            grouped.push(destination);
+            *destinations = grouped.into_boxed_slice();
+        } else {
+            operations.push(ShaderOperation::LoadInput {
+                destinations: vec![destination].into_boxed_slice(),
+                location,
+                first_component,
+                scalar_type,
+            });
+        }
     }
-    Ok(ShaderOperation::LoadInput {
-        destinations: (0..components)
-            .map(|component| ShaderRegister::new(u16::from(destination + component)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-        location,
-        first_component,
-        scalar_type,
-    })
+    Ok(operations)
 }
 
 fn input_attribute_location(
@@ -2853,14 +3389,39 @@ fn decode_interpolate(
     }
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
+    if encoding & (1_u64 << 38) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "indexed IPA attribute addressing",
+        });
+    }
+    if encoding & (1_u64 << 51) != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "saturated IPA result",
+        });
+    }
+    let sample_mode = ((encoding >> 52) & 0x3) as u8;
+    if sample_mode != 0 {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage,
+            instruction_offset: offset,
+            encoding,
+            detail: "IPA centroid/offset sample mode",
+        });
+    }
     let address = ((encoding >> 28) & 0x3ff) as u16;
     let (location, component) = attribute_location(stage, offset, encoding, address)?;
-    let frequency = ((encoding >> 54) & 0x3) as u8;
+    let interpolation_mode = ((encoding >> 54) & 0x3) as u8;
     let interpolation = inputs
         .iter()
         .find(|input| input.location() == location && input.component() == component)
         .and_then(|input| input.interpolation());
-    match frequency {
+    match interpolation_mode {
         0 => Ok(ShaderOperation::LoadInput {
             destinations: vec![ShaderRegister::new(u16::from(destination))].into_boxed_slice(),
             location,
@@ -2876,6 +3437,14 @@ fn decode_interpolate(
                     "IPA.PASS_MUL_W references a non-interpolated input",
                 )
             })?;
+            if interpolation != ShaderInterpolation::Perspective {
+                return Err(malformed(
+                    stage,
+                    offset,
+                    encoding,
+                    "IPA.PASS_MUL_W requires a perspective input",
+                ));
+            }
             let reciprocal = ((encoding >> 20) & 0xff) as u8;
             validate_register_range(stage, offset, encoding, reciprocal, 1, register_count)?;
             // Maxwell PASS_MUL_W names the register carrying the hardware
@@ -2894,12 +3463,39 @@ fn decode_interpolate(
                 interpolation,
             })
         }
-        _ => Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-            stage,
-            instruction_offset: offset,
-            encoding,
-            detail: "IPA interpolation frequency",
-        }),
+        2 => {
+            if interpolation != Some(ShaderInterpolation::Constant) {
+                return Err(malformed(
+                    stage,
+                    offset,
+                    encoding,
+                    "IPA.CONSTANT requires a flat input declared by the shader header",
+                ));
+            }
+            Ok(ShaderOperation::InterpolateInput {
+                destination: ShaderRegister::new(u16::from(destination)),
+                location,
+                component,
+                interpolation: ShaderInterpolation::Constant,
+            })
+        }
+        3 => {
+            let interpolation = interpolation.ok_or_else(|| {
+                malformed(
+                    stage,
+                    offset,
+                    encoding,
+                    "IPA.SC references a non-interpolated input",
+                )
+            })?;
+            Ok(ShaderOperation::InterpolateInput {
+                destination: ShaderRegister::new(u16::from(destination)),
+                location,
+                component,
+                interpolation,
+            })
+        }
+        _ => unreachable!("two-bit IPA interpolation mode"),
     }
 }
 
@@ -3300,6 +3896,7 @@ pub(crate) fn translate_maxwell_shader_programs(
                 source_segments: binary.source_segments.clone(),
                 staged_overlay: binary.staged_overlay.clone(),
                 resource_binding_remap: Box::new([]),
+                linked_output_interpolation: Box::new([]),
             },
             stage: neutral_stage(stage),
             bind_group,
@@ -3319,8 +3916,65 @@ pub(crate) fn translate_maxwell_shader_programs(
     remap_graphics_resource_bindings(&mut programs)?;
 
     validate_graphics_stage_interfaces(&programs)?;
+    link_graphics_stage_interpolation(&mut programs)?;
 
     Ok(programs)
+}
+
+/// Maxwell records interpolation on fragment `IPA` inputs. Copy that linked
+/// contract onto matching vertex outputs before backend lowering so derived
+/// rasterization paths can preserve the same interpolation planes.
+fn link_graphics_stage_interpolation(
+    programs: &mut [MaxwellTranslatedShaderProgram],
+) -> Result<(), MaxwellShaderTranslationError> {
+    let fragment_inputs = programs
+        .iter()
+        .find(|program| program.stage == ShaderStage::Fragment)
+        .map(|fragment| {
+            fragment
+                .ir
+                .ir()
+                .inputs()
+                .iter()
+                .filter_map(|input| {
+                    input
+                        .interpolation()
+                        .map(|interpolation| (input.location(), interpolation))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let Some(vertex) = programs
+        .iter_mut()
+        .find(|program| program.stage == ShaderStage::Vertex)
+    else {
+        return Ok(());
+    };
+    let outputs = vertex
+        .ir
+        .ir()
+        .outputs()
+        .iter()
+        .map(|output| {
+            ShaderInterfaceElement::new(
+                output.location(),
+                output.component(),
+                output.scalar_type(),
+                fragment_inputs.get(&output.location()).copied(),
+            )
+            .expect("linking preserves the verified interface shape")
+        })
+        .collect::<Vec<_>>();
+    vertex.ir = VerifiedShaderIr::verify(ShaderIr::new(
+        vertex.ir.ir().stage(),
+        vertex.ir.ir().inputs().to_vec(),
+        outputs,
+        vertex.ir.ir().resources().to_vec(),
+        vertex.ir.ir().instructions().to_vec(),
+    ))?;
+    vertex.key.linked_output_interpolation = fragment_inputs.into_iter().collect();
+    vertex.module = lower_shader_ir_to_wgsl(&vertex.ir)?;
+    Ok(())
 }
 
 /// Maxwell resource numbers are local to a shader binding group, whereas the
@@ -3440,6 +4094,19 @@ fn remap_verified_shader_ir(
                 } => ShaderOperation::SampleTexture2D {
                     outputs: outputs.clone(),
                     coordinates: *coordinates,
+                    image_binding: remapped_binding(bindings, stage, *image_binding)?,
+                    sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
+                },
+                ShaderOperation::SampleTexture2DArray {
+                    outputs,
+                    coordinates,
+                    array_index,
+                    image_binding,
+                    sampler_binding,
+                } => ShaderOperation::SampleTexture2DArray {
+                    outputs: outputs.clone(),
+                    coordinates: *coordinates,
+                    array_index: *array_index,
                     image_binding: remapped_binding(bindings, stage, *image_binding)?,
                     sampler_binding: remapped_binding(bindings, stage, *sampler_binding)?,
                 },
@@ -3888,6 +4555,337 @@ mod tests {
     }
 
     #[test]
+    fn captured_signed_i2f_reaches_verified_ir_and_wgsl() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_1000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_ff80_2f87_ff00,
+                0x5cb8_0000_0007_2a00,
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+
+        assert!(matches!(
+            translated.ir().instructions()[2].operation(),
+            ShaderOperation::ConvertIntegerToFloat32 {
+                destination,
+                source,
+                source_type: ShaderScalarType::Signed32,
+            } if destination.index() == 0 && source.index() == 0
+        ));
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(
+            module
+                .source()
+                .contains("registers[0] = bitcast<u32>(f32(bitcast<i32>(registers[0])))")
+        );
+        validate_wgsl(&module);
+    }
+
+    #[test]
+    fn captured_f2f_floor_ftz_reaches_verified_ir_and_wgsl() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_1000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_ff80_2f87_ff00,
+                0x5ca8_1480_0007_0a03,
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+
+        assert!(matches!(
+            translated.ir().instructions()[2].operation(),
+            ShaderOperation::RoundFloat32ToIntegral {
+                destination,
+                source,
+                rounding: ShaderRoundingMode::TowardNegative,
+                flush_denormals_to_zero: true,
+            } if destination.index() == 3 && source.index() == 0
+        ));
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains(
+            "registers[3] = bitcast<u32>(floor(bitcast<f32>(nixe_flush_denormal(registers[0]))))"
+        ));
+        validate_wgsl(&module);
+    }
+
+    #[test]
+    fn captured_f2i_u16_nearest_ftz_reaches_verified_ir_and_wgsl() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0006_0461;
+        header[13] = 0x0000_1000;
+        let translated = translated_fixture_with_register_count(
+            MaxwellThreeDShaderStage::Vertex,
+            header,
+            &[
+                0,
+                0xefd8_ff80_2f87_ff00,
+                0x5cb0_1000_0007_0900,
+                0xe300_0000_0007_000f,
+            ],
+            4,
+        );
+
+        assert!(matches!(
+            translated.ir().instructions()[2].operation(),
+            ShaderOperation::ConvertFloat32ToInteger {
+                destination,
+                source,
+                destination_type: ShaderScalarType::Unsigned32,
+                destination_bits: 16,
+                rounding: ShaderRoundingMode::NearestEven,
+                flush_denormals_to_zero: true,
+            } if destination.index() == 0 && source.index() == 0
+        ));
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains("nixe_round_ties_even"));
+        assert!(module.source().contains("0x0000ffffu"));
+        validate_wgsl(&module);
+    }
+
+    #[test]
+    fn float_to_integer_covers_width_sign_rounding_and_cbuf_forms() {
+        for (width_field, expected_bits) in [(0_u64, 8_u8), (1, 16), (2, 32)] {
+            for (rounding_field, expected_rounding) in [
+                (0_u64, ShaderRoundingMode::NearestEven),
+                (1, ShaderRoundingMode::TowardNegative),
+                (2, ShaderRoundingMode::TowardPositive),
+                (3, ShaderRoundingMode::TowardZero),
+            ] {
+                let mut next_temporary = 8;
+                let encoding =
+                    0x5cb0_0000_0037_0802 | (width_field << 8) | (rounding_field << 39) | (1 << 12);
+                let decoded = decode_float_to_integer(
+                    MaxwellThreeDShaderStage::Vertex,
+                    16,
+                    encoding,
+                    8,
+                    &mut next_temporary,
+                )
+                .unwrap();
+                assert!(matches!(
+                    decoded.operations.as_slice(),
+                    [ShaderOperation::ConvertFloat32ToInteger {
+                        destination_type: ShaderScalarType::Signed32,
+                        destination_bits,
+                        rounding,
+                        ..
+                    }] if *destination_bits == expected_bits && *rounding == expected_rounding
+                ));
+            }
+        }
+
+        let mut next_temporary = 8;
+        let constant = decode_float_to_integer(
+            MaxwellThreeDShaderStage::Vertex,
+            16,
+            0x4cb0_0088_0037_0902,
+            8,
+            &mut next_temporary,
+        )
+        .unwrap();
+        assert_eq!(constant.constant_buffer_binding, Some(2));
+        assert!(matches!(
+            constant.operations.as_slice(),
+            [
+                ShaderOperation::LoadConstantBuffer32 {
+                    binding: 2,
+                    byte_offset: 12,
+                    ..
+                },
+                ShaderOperation::ConvertFloat32ToInteger {
+                    destination_bits: 16,
+                    rounding: ShaderRoundingMode::TowardNegative,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn float_to_float_integral_rounding_covers_directed_modes_and_cbuf() {
+        for (field, expected) in [
+            (1_u64, ShaderRoundingMode::TowardNegative),
+            (2, ShaderRoundingMode::TowardPositive),
+            (3, ShaderRoundingMode::TowardZero),
+        ] {
+            let mut next_temporary = 8;
+            let decoded = decode_float_to_float(
+                MaxwellThreeDShaderStage::Vertex,
+                16,
+                0x5ca8_0400_0037_0a02 | (field << 39),
+                8,
+                &mut next_temporary,
+            )
+            .unwrap();
+            assert_eq!(decoded.constant_buffer_binding, None);
+            assert!(matches!(
+                decoded.operations.last(),
+                Some(ShaderOperation::RoundFloat32ToIntegral {
+                    destination,
+                    source,
+                    rounding,
+                    ..
+                }) if destination.index() == 2 && source.index() == 3 && *rounding == expected
+            ));
+        }
+
+        let mut next_temporary = 8;
+        let constant = decode_float_to_float(
+            MaxwellThreeDShaderStage::Vertex,
+            16,
+            0x4ca8_0488_0037_0a02,
+            8,
+            &mut next_temporary,
+        )
+        .unwrap();
+        assert_eq!(constant.constant_buffer_binding, Some(2));
+        assert!(matches!(
+            constant.operations.as_slice(),
+            [
+                ShaderOperation::LoadConstantBuffer32 {
+                    binding: 2,
+                    byte_offset: 12,
+                    ..
+                },
+                ShaderOperation::RoundFloat32ToIntegral {
+                    rounding: ShaderRoundingMode::TowardNegative,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
+        let mut next_temporary = 8;
+        let register = decode_integer_to_float(
+            MaxwellThreeDShaderStage::Vertex,
+            16,
+            0x5cb8_0000_0037_0a02,
+            8,
+            &mut next_temporary,
+        )
+        .unwrap();
+        assert_eq!(register.constant_buffer_binding, None);
+        assert!(matches!(
+            register.operations.as_slice(),
+            [ShaderOperation::ConvertIntegerToFloat32 {
+                destination,
+                source,
+                source_type: ShaderScalarType::Unsigned32,
+            }] if destination.index() == 2 && source.index() == 3
+        ));
+
+        let immediate = decode_integer_to_float(
+            MaxwellThreeDShaderStage::Vertex,
+            16,
+            0x39b8_0000_0037_2a02,
+            8,
+            &mut next_temporary,
+        )
+        .unwrap();
+        assert_eq!(immediate.constant_buffer_binding, None);
+        assert!(matches!(
+            immediate.operations.as_slice(),
+            [
+                ShaderOperation::MoveImmediate32 {
+                    bits: 0xfff8_0003,
+                    scalar_type: ShaderScalarType::Signed32,
+                    ..
+                },
+                ShaderOperation::ConvertIntegerToFloat32 {
+                    source_type: ShaderScalarType::Signed32,
+                    ..
+                }
+            ]
+        ));
+
+        let constant = decode_integer_to_float(
+            MaxwellThreeDShaderStage::Vertex,
+            16,
+            0x4cb8_0008_0037_0a02,
+            8,
+            &mut next_temporary,
+        )
+        .unwrap();
+        assert_eq!(constant.constant_buffer_binding, Some(2));
+        assert!(matches!(
+            constant.operations.as_slice(),
+            [
+                ShaderOperation::LoadConstantBuffer32 {
+                    binding: 2,
+                    byte_offset: 12,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    ..
+                },
+                ShaderOperation::ConvertIntegerToFloat32 {
+                    source_type: ShaderScalarType::Unsigned32,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn integer_to_float_rejects_unrepresented_width_rounding_and_modifiers() {
+        for (modifier, detail) in [
+            (1_u64 << 39, "I2F directed rounding mode"),
+            (1_u64 << 45, "I2F integer source negation"),
+            (1_u64 << 49, "I2F integer source absolute value"),
+        ] {
+            let mut next_temporary = 8;
+            assert!(matches!(
+                decode_integer_to_float(
+                    MaxwellThreeDShaderStage::Vertex,
+                    16,
+                    0x5cb8_0000_0037_0a02 | modifier,
+                    8,
+                    &mut next_temporary,
+                ),
+                Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    detail: actual,
+                    ..
+                }) if actual == detail
+            ));
+        }
+        for (encoding, detail) in [
+            (
+                0x5cb8_0000_0037_0902,
+                "I2F destination width other than F32",
+            ),
+            (0x5cb8_0000_0037_0602, "I2F source width other than 32 bits"),
+        ] {
+            let mut next_temporary = 8;
+            assert!(matches!(
+                decode_integer_to_float(
+                    MaxwellThreeDShaderStage::Vertex,
+                    16,
+                    encoding,
+                    8,
+                    &mut next_temporary,
+                ),
+                Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    detail: actual,
+                    ..
+                }) if actual == detail
+            ));
+        }
+    }
+
+    #[test]
     fn captured_immediate_shift_left_reaches_verified_ir_and_wgsl() {
         let mut header = [0_u32; 20];
         header[0] = 0x0006_0461;
@@ -4084,18 +5082,30 @@ mod tests {
     }
 
     #[test]
-    fn vertex_system_value_ald_rejects_vectors_and_non_vertex_stages() {
+    fn vertex_system_value_ald_spans_adjacent_instance_and_vertex_id_slots() {
+        let operations = decode_attribute_load(
+            MaxwellThreeDShaderStage::Vertex,
+            8,
+            0xefd8_ff80_2f87_ff00,
+            4,
+        )
+        .unwrap();
         assert!(matches!(
-            decode_attribute_load(
-                MaxwellThreeDShaderStage::Vertex,
-                8,
-                0xefd8_ff80_2fc7_ff00,
-                4,
-            ),
-            Err(MaxwellShaderTranslationError::MalformedInstruction {
-                reason: "ALD crosses the selected attribute boundary",
-                ..
-            })
+            operations.as_slice(),
+            [
+                ShaderOperation::LoadInput {
+                    destinations: instance,
+                    location: ShaderIoLocation::InstanceId,
+                    first_component: 0,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                },
+                ShaderOperation::LoadInput {
+                    destinations: vertex,
+                    location: ShaderIoLocation::VertexId,
+                    first_component: 0,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                }
+            ] if instance[0].index() == 0 && vertex[0].index() == 1
         ));
         assert!(matches!(
             decode_attribute_load(MaxwellThreeDShaderStage::Pixel, 8, 0xefd8_7f80_2fc7_ff00, 4,),
@@ -4103,6 +5113,34 @@ mod tests {
                 reason: "vertex system-value ALD is used outside a vertex shader",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn attribute_load_spans_generic_vectors_without_losing_register_order() {
+        let operations = decode_attribute_load(
+            MaxwellThreeDShaderStage::Vertex,
+            8,
+            0xefd8_ff80_08c7_ff02,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                ShaderOperation::LoadInput {
+                    destinations: first,
+                    location: ShaderIoLocation::Generic(0),
+                    first_component: 3,
+                    ..
+                },
+                ShaderOperation::LoadInput {
+                    destinations: second,
+                    location: ShaderIoLocation::Generic(1),
+                    first_component: 0,
+                    ..
+                }
+            ] if first[0].index() == 2 && second[0].index() == 3
         ));
     }
 
@@ -5425,6 +6463,73 @@ mod tests {
     }
 
     #[test]
+    fn ipa_constant_and_sc_modes_preserve_declared_interpolation_and_reject_unmodeled_bits() {
+        let captured = 0xe083_ff89_0ff7_ff00;
+        let constant_input = ShaderInterfaceElement::new(
+            ShaderIoLocation::Generic(1),
+            0,
+            ShaderScalarType::Float32,
+            Some(ShaderInterpolation::Constant),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_interpolate(
+                MaxwellThreeDShaderStage::Pixel,
+                0x38,
+                captured,
+                1,
+                &[constant_input],
+            )
+            .unwrap(),
+            ShaderOperation::InterpolateInput {
+                destination: ShaderRegister::new(0),
+                location: ShaderIoLocation::Generic(1),
+                component: 0,
+                interpolation: ShaderInterpolation::Constant,
+            }
+        );
+
+        let screen_input = ShaderInterfaceElement::new(
+            ShaderIoLocation::Generic(1),
+            0,
+            ShaderScalarType::Float32,
+            Some(ShaderInterpolation::ScreenLinear),
+        )
+        .unwrap();
+        let sc = (captured & !(3_u64 << 54)) | (3_u64 << 54);
+        assert!(matches!(
+            decode_interpolate(
+                MaxwellThreeDShaderStage::Pixel,
+                0x38,
+                sc,
+                1,
+                &[screen_input],
+            ),
+            Ok(ShaderOperation::InterpolateInput {
+                interpolation: ShaderInterpolation::ScreenLinear,
+                ..
+            })
+        ));
+
+        for unsupported in [
+            captured | (1_u64 << 38),
+            captured | (1_u64 << 51),
+            captured | (1_u64 << 52),
+        ] {
+            assert!(matches!(
+                decode_interpolate(
+                    MaxwellThreeDShaderStage::Pixel,
+                    0x38,
+                    unsupported,
+                    1,
+                    &[constant_input],
+                ),
+                Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn generated_valid_mov32i_encodings_decode_by_family() {
         let mut seed = 0x4d59_5df4_d0f3_3173_u64;
         let mut header = [0_u32; 20];
@@ -5755,8 +6860,73 @@ mod tests {
                 constant_buffer_byte_offset: 32,
                 image_binding: 32,
                 sampler_binding: 33,
+                image_kind: ShaderResourceKind::SampledImage,
             })
         );
+    }
+
+    #[test]
+    fn texs_2d_array_implicit_lod_decodes_packed_layer_and_coordinates() {
+        let encoding = 0xd8e0_1a4f_f027_0003;
+        let mut bindings = BTreeMap::new();
+        let operation = decode_texture_sample_simplified(
+            MaxwellThreeDShaderStage::Pixel,
+            0x30,
+            encoding,
+            4,
+            &mut bindings,
+        )
+        .unwrap();
+
+        assert_eq!(
+            operation,
+            ShaderOperation::SampleTexture2DArray {
+                outputs: vec![ShaderTextureSampleOutput::new(ShaderRegister::new(3), 0).unwrap()]
+                    .into_boxed_slice(),
+                coordinates: [ShaderRegister::new(1), ShaderRegister::new(2)],
+                array_index: ShaderRegister::new(0),
+                image_binding: 32,
+                sampler_binding: 33,
+            }
+        );
+        assert_eq!(
+            bindings.get(&420),
+            Some(&MaxwellTextureResourceBinding {
+                constant_buffer_byte_offset: 1680,
+                image_binding: 32,
+                sampler_binding: 33,
+                image_kind: ShaderResourceKind::SampledImage2DArray,
+            })
+        );
+    }
+
+    #[test]
+    fn texs_2d_array_lowers_to_an_array_texture_and_unsigned_u16_layer() {
+        let mut header = [0_u32; 20];
+        header[0] = 0x0002_5462;
+        header[18] = 0x0000_000f;
+        let translated = translated_fixture(
+            MaxwellThreeDShaderStage::Pixel,
+            header,
+            &[
+                0,
+                0x0100_0000_0007_f000_u64 | (7_u64 << 20),
+                0x0100_0000_0007_f001_u64 | (u64::from(0.25_f32.to_bits()) << 20),
+                0x0100_0000_0007_f002_u64 | (u64::from(0.75_f32.to_bits()) << 20),
+                0,
+                0xd8e0_1a4f_f027_0003,
+                0xe300_0000_0007_000f,
+                0,
+            ],
+        );
+
+        assert!(translated.ir().resources().iter().any(|resource| {
+            resource.binding() == 32 && resource.kind() == ShaderResourceKind::SampledImage2DArray
+        }));
+        let module = lower_shader_ir_to_wgsl(&translated).unwrap();
+        assert!(module.source().contains("texture_2d_array<f32>"));
+        assert!(module.source().contains("i32(registers[0] & 0xffffu)"));
+        validate_wgsl(&module);
     }
 
     #[test]

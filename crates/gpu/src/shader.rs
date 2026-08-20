@@ -213,7 +213,10 @@ pub enum ShaderSpecialFunction {
 pub enum ShaderResourceKind {
     ConstantBuffer,
     StorageBuffer,
+    /// Two-dimensional sampled image with exactly one visible array layer.
     SampledImage,
+    /// Two-dimensional sampled image whose array layer is selected by the shader.
+    SampledImage2DArray,
     StorageImage,
     Sampler,
 }
@@ -377,6 +380,25 @@ pub enum ShaderOperation {
         destination: ShaderRegister,
         source: ShaderRegister,
     },
+    ConvertIntegerToFloat32 {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        source_type: ShaderScalarType,
+    },
+    RoundFloat32ToIntegral {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        rounding: ShaderRoundingMode,
+        flush_denormals_to_zero: bool,
+    },
+    ConvertFloat32ToInteger {
+        destination: ShaderRegister,
+        source: ShaderRegister,
+        destination_type: ShaderScalarType,
+        destination_bits: u8,
+        rounding: ShaderRoundingMode,
+        flush_denormals_to_zero: bool,
+    },
     LoadInput {
         destinations: Box<[ShaderRegister]>,
         location: ShaderIoLocation,
@@ -473,6 +495,14 @@ pub enum ShaderOperation {
     SampleTexture2D {
         outputs: Box<[ShaderTextureSampleOutput]>,
         coordinates: [ShaderRegister; 2],
+        image_binding: u8,
+        sampler_binding: u8,
+    },
+    SampleTexture2DArray {
+        outputs: Box<[ShaderTextureSampleOutput]>,
+        coordinates: [ShaderRegister; 2],
+        /// Register whose low 16 bits hold the unsigned Maxwell array layer.
+        array_index: ShaderRegister,
         image_binding: u8,
         sampler_binding: u8,
     },
@@ -726,6 +756,77 @@ pub fn evaluate_shader_ir(
             } => {
                 registers[destination.index() as usize] =
                     Some(register_bits(&registers, *source)? ^ 0x8000_0000);
+            }
+            ShaderOperation::ConvertIntegerToFloat32 {
+                destination,
+                source,
+                source_type,
+            } => {
+                let bits = register_bits(&registers, *source)?;
+                let value = match source_type {
+                    ShaderScalarType::Signed32 => (bits as i32) as f32,
+                    ShaderScalarType::Unsigned32 => bits as f32,
+                    _ => unreachable!("verified integer-to-float source is 32-bit integer"),
+                };
+                registers[destination.index() as usize] = Some(value.to_bits());
+            }
+            ShaderOperation::RoundFloat32ToIntegral {
+                destination,
+                source,
+                rounding,
+                flush_denormals_to_zero,
+            } => {
+                let mut bits = register_bits(&registers, *source)?;
+                if *flush_denormals_to_zero {
+                    bits = flush_denormal_bits(bits);
+                }
+                let value = f32::from_bits(bits);
+                let rounded = match rounding {
+                    ShaderRoundingMode::TowardNegative => value.floor(),
+                    ShaderRoundingMode::TowardPositive => value.ceil(),
+                    ShaderRoundingMode::TowardZero => value.trunc(),
+                    ShaderRoundingMode::NearestEven => {
+                        return Err(ShaderEvaluationError::UnsupportedRoundingMode(*rounding));
+                    }
+                };
+                registers[destination.index() as usize] = Some(rounded.to_bits());
+            }
+            ShaderOperation::ConvertFloat32ToInteger {
+                destination,
+                source,
+                destination_type,
+                destination_bits,
+                rounding,
+                flush_denormals_to_zero,
+            } => {
+                let mut bits = register_bits(&registers, *source)?;
+                if *flush_denormals_to_zero {
+                    bits = flush_denormal_bits(bits);
+                }
+                let value = f32::from_bits(bits);
+                let rounded = match rounding {
+                    ShaderRoundingMode::NearestEven => value.round_ties_even(),
+                    ShaderRoundingMode::TowardNegative => value.floor(),
+                    ShaderRoundingMode::TowardPositive => value.ceil(),
+                    ShaderRoundingMode::TowardZero => value.trunc(),
+                };
+                let converted = if rounded.is_nan() {
+                    0
+                } else if *destination_type == ShaderScalarType::Signed32 {
+                    let shift = 32 - u32::from(*destination_bits);
+                    let minimum = -(1_i64 << (u32::from(*destination_bits) - 1));
+                    let maximum = (1_i64 << (u32::from(*destination_bits) - 1)) - 1;
+                    let integer = (rounded as i64).clamp(minimum, maximum) as i32;
+                    ((integer << shift) >> shift) as u32
+                } else {
+                    let maximum = if *destination_bits == 32 {
+                        u32::MAX as u64
+                    } else {
+                        (1_u64 << u32::from(*destination_bits)) - 1
+                    };
+                    (rounded as u64).min(maximum) as u32
+                };
+                registers[destination.index() as usize] = Some(converted);
             }
             ShaderOperation::LoadInput {
                 destinations,
@@ -987,7 +1088,8 @@ pub fn evaluate_shader_ir(
                         })?,
                 );
             }
-            ShaderOperation::SampleTexture2D { .. } => {
+            ShaderOperation::SampleTexture2D { .. }
+            | ShaderOperation::SampleTexture2DArray { .. } => {
                 return Err(ShaderEvaluationError::TextureSampling(instruction.source));
             }
             ShaderOperation::Branch { target } => {
@@ -1216,7 +1318,16 @@ pub fn lower_shader_ir_to_wgsl(
     if !matches!(ir.stage, ShaderStage::Vertex | ShaderStage::Fragment) {
         return Err(ShaderBackendLoweringError::UnsupportedStage(ir.stage));
     }
-    let input_groups = interface_groups(&ir.inputs)?;
+    let mut input_groups = interface_groups(&ir.inputs)?;
+    if ir.stage == ShaderStage::Vertex {
+        input_groups
+            .entry(ShaderIoLocation::VertexId)
+            .or_insert(InterfaceGroup {
+                components: 1,
+                scalar_type: ShaderScalarType::Unsigned32,
+                interpolation: None,
+            });
+    }
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
     emit_wgsl_resources(&mut source, ir)?;
@@ -1224,21 +1335,31 @@ pub fn lower_shader_ir_to_wgsl(
         "fn nixe_flush_denormal(bits: u32) -> u32 {\n\
            let magnitude = bits & 0x7fffffffu;\n\
            return select(bits, bits & 0x80000000u, magnitude > 0u && magnitude < 0x00800000u);\n\
+         }\n\n\
+         fn nixe_round_ties_even(value: f32) -> f32 {\n\
+           if (value != value) { return value; }\n\
+           let lower = floor(value);\n\
+           let fraction = value - lower;\n\
+           if (fraction < 0.5) { return lower; }\n\
+           if (fraction > 0.5) { return lower + 1.0; }\n\
+           return select(lower, lower + 1.0, (i32(lower) & 1) != 0);\n\
          }\n\n",
     );
     if !input_groups.is_empty() {
         emit_interface_struct(&mut source, "ShaderInput", ir.stage, true, &input_groups)?;
     }
     emit_interface_struct(&mut source, "ShaderOutput", ir.stage, false, &output_groups)?;
-    source.push_str(match ir.stage {
-        ShaderStage::Vertex => "@vertex\n",
-        ShaderStage::Fragment => "@fragment\n",
-        _ => unreachable!(),
-    });
+    let entry_point = match ir.stage {
+        ShaderStage::Vertex => "nixe_guest_vertex",
+        ShaderStage::Fragment => "nixe_guest_fragment",
+        _ => unreachable!("unsupported stages returned above"),
+    };
     if input_groups.is_empty() {
-        source.push_str("fn main() -> ShaderOutput {\n");
+        source.push_str(&format!("fn {entry_point}() -> ShaderOutput {{\n"));
     } else {
-        source.push_str("fn main(input: ShaderInput) -> ShaderOutput {\n");
+        source.push_str(&format!(
+            "fn {entry_point}(input: ShaderInput) -> ShaderOutput {{\n"
+        ));
     }
     source.push_str("  var registers: array<u32, 256>;\n");
     source.push_str("  var predicates: array<bool, 7>;\n");
@@ -1251,46 +1372,179 @@ pub fn lower_shader_ir_to_wgsl(
     {
         emit_wgsl_control_flow(&mut source, ir, &mut source_map)?;
         source.push_str("}\n");
-        return Ok(ShaderBackendModule {
-            stage: ir.stage,
-            language: ShaderBackendLanguage::Wgsl,
-            source: source.into_boxed_str(),
-            source_map: source_map.into_boxed_slice(),
-        });
-    }
-    for instruction in &ir.instructions {
-        let line = source.lines().count() as u32 + 1;
-        source_map.push(ShaderBackendSourceMapEntry {
-            backend_line: line,
-            source: instruction.source,
-        });
-        source.push_str(&format!(
-            "  // Maxwell code byte offset 0x{:x}\n",
-            instruction.source.byte_offset()
-        ));
-        let conditional = match instruction.predicate {
-            ShaderPredicate::Never => continue,
-            ShaderPredicate::Register { register, inverted } => {
-                source.push_str(&format!(
-                    "  if ({}predicates[{register}]) {{\n",
-                    if inverted { "!" } else { "" }
-                ));
-                true
+    } else {
+        for instruction in &ir.instructions {
+            let line = source.lines().count() as u32 + 1;
+            source_map.push(ShaderBackendSourceMapEntry {
+                backend_line: line,
+                source: instruction.source,
+            });
+            source.push_str(&format!(
+                "  // Maxwell code byte offset 0x{:x}\n",
+                instruction.source.byte_offset()
+            ));
+            let conditional = match instruction.predicate {
+                ShaderPredicate::Never => continue,
+                ShaderPredicate::Register { register, inverted } => {
+                    source.push_str(&format!(
+                        "  if ({}predicates[{register}]) {{\n",
+                        if inverted { "!" } else { "" }
+                    ));
+                    true
+                }
+                ShaderPredicate::Always => false,
+            };
+            emit_wgsl_operation(&mut source, instruction)?;
+            if conditional {
+                source.push_str("  }\n");
             }
-            ShaderPredicate::Always => false,
-        };
-        emit_wgsl_operation(&mut source, instruction)?;
-        if conditional {
-            source.push_str("  }\n");
         }
+        source.push_str("}\n");
     }
-    source.push_str("}\n");
+    if ir.stage == ShaderStage::Vertex
+        && output_groups
+            .get(&ShaderIoLocation::Position)
+            .is_some_and(|position| position.scalar_type == ShaderScalarType::Float32)
+    {
+        emit_wgsl_vertex_entry_points(&mut source, &output_groups)?;
+    } else if ir.stage == ShaderStage::Vertex {
+        source.push_str(
+            "\n@vertex\nfn main(input: ShaderInput) -> ShaderOutput {\n  return nixe_guest_vertex(input);\n}\n",
+        );
+    } else {
+        emit_wgsl_fragment_entry_points(&mut source, &input_groups, &output_groups);
+    }
     Ok(ShaderBackendModule {
         stage: ir.stage,
         language: ShaderBackendLanguage::Wgsl,
         source: source.into_boxed_str(),
         source_map: source_map.into_boxed_slice(),
     })
+}
+
+fn emit_wgsl_fragment_entry_points(
+    source: &mut String,
+    inputs: &std::collections::BTreeMap<ShaderIoLocation, InterfaceGroup>,
+    outputs: &std::collections::BTreeMap<ShaderIoLocation, InterfaceGroup>,
+) {
+    let parameter = if inputs.is_empty() {
+        ""
+    } else {
+        "input: ShaderInput"
+    };
+    let argument = if inputs.is_empty() { "" } else { "input" };
+    source.push_str(&format!(
+        "\n@fragment\nfn main({parameter}) -> ShaderOutput {{\n  return nixe_guest_fragment({argument});\n}}\n"
+    ));
+    if !outputs
+        .get(&ShaderIoLocation::Color(0))
+        .is_some_and(|color| {
+            color.scalar_type == ShaderScalarType::Float32 && color.components == 4
+        })
+    {
+        return;
+    }
+    source.push_str("\noverride nixe_alpha_reference: f32 = 0.0;\n");
+    for (name, comparison) in [
+        ("never", None),
+        ("less", Some("<")),
+        ("equal", Some("==")),
+        ("less_equal", Some("<=")),
+        ("greater", Some(">")),
+        ("not_equal", Some("!=")),
+        ("greater_equal", Some(">=")),
+        ("always", Some("always")),
+    ] {
+        source.push_str(&format!(
+            "\n@fragment\nfn nixe_alpha_{name}({parameter}) -> ShaderOutput {{\n  let output = nixe_guest_fragment({argument});\n"
+        ));
+        match comparison {
+            None => source.push_str("  discard;\n"),
+            Some("always") => {}
+            Some(operator) => source.push_str(&format!(
+                "  if (!(output.color_0.w {operator} nixe_alpha_reference)) {{ discard; }}\n"
+            )),
+        }
+        source.push_str("  return output;\n}\n");
+    }
+}
+
+fn emit_wgsl_vertex_entry_points(
+    source: &mut String,
+    outputs: &std::collections::BTreeMap<ShaderIoLocation, InterfaceGroup>,
+) -> Result<(), ShaderBackendLoweringError> {
+    source.push_str(
+        "\n@vertex\nfn main(input: ShaderInput) -> ShaderOutput {\n  return nixe_guest_vertex(input);\n}\n\n\
+         @vertex\nfn nixe_fill_rectangle(input: ShaderInput) -> ShaderOutput {\n\
+           let host_vertex = input.vertex_id;\n\
+           let guest_base = (host_vertex / 6u) * 3u;\n\
+           var input0 = input;\n  var input1 = input;\n  var input2 = input;\n\
+           input0.vertex_id = guest_base;\n\
+           input1.vertex_id = guest_base + 1u;\n\
+           input2.vertex_id = guest_base + 2u;\n\
+           let vertex0 = nixe_guest_vertex(input0);\n\
+           let vertex1 = nixe_guest_vertex(input1);\n\
+           let vertex2 = nixe_guest_vertex(input2);\n\
+           let point0 = vertex0.position.xy / vertex0.position.w;\n\
+           let point1 = vertex1.position.xy / vertex1.position.w;\n\
+           let point2 = vertex2.position.xy / vertex2.position.w;\n\
+           let lower = min(point0, min(point1, point2));\n\
+           let upper = max(point0, max(point1, point2));\n\
+           let corners = array<vec2<f32>, 6>(\n\
+             vec2<f32>(lower.x, lower.y), vec2<f32>(upper.x, lower.y),\n\
+             vec2<f32>(upper.x, upper.y), vec2<f32>(lower.x, lower.y),\n\
+             vec2<f32>(upper.x, upper.y), vec2<f32>(lower.x, upper.y));\n\
+           let corner = corners[host_vertex % 6u];\n\
+           let denominator = (point1.y - point2.y) * (point0.x - point2.x) +\n\
+             (point2.x - point1.x) * (point0.y - point2.y);\n\
+           let weight0 = ((point1.y - point2.y) * (corner.x - point2.x) +\n\
+             (point2.x - point1.x) * (corner.y - point2.y)) / denominator;\n\
+           let weight1 = ((point2.y - point0.y) * (corner.x - point2.x) +\n\
+             (point0.x - point2.x) * (corner.y - point2.y)) / denominator;\n\
+           let weight2 = 1.0 - weight0 - weight1;\n\
+           let reciprocal_w = weight0 / vertex0.position.w +\n\
+             weight1 / vertex1.position.w + weight2 / vertex2.position.w;\n\
+           let rectangle_w = 1.0 / reciprocal_w;\n\
+           var output = vertex0;\n",
+    );
+    for (location, group) in outputs {
+        let field = wgsl_field_name(*location);
+        match location {
+            ShaderIoLocation::Position => source.push_str(
+                "  let rectangle_z = weight0 * vertex0.position.z / vertex0.position.w +\n\
+                   weight1 * vertex1.position.z / vertex1.position.w +\n\
+                   weight2 * vertex2.position.z / vertex2.position.w;\n\
+                   output.position = vec4<f32>(corner * rectangle_w, rectangle_z * rectangle_w, rectangle_w);\n",
+            ),
+            ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_) => match group.interpolation {
+                Some(ShaderInterpolation::Constant) => {
+                    source.push_str(&format!("  output.{field} = vertex2.{field};\n"));
+                }
+                Some(ShaderInterpolation::ScreenLinear) => {
+                    if group.scalar_type != ShaderScalarType::Float32 {
+                        return Err(ShaderBackendLoweringError::InconsistentInterfaceType(*location));
+                    }
+                    source.push_str(&format!(
+                        "  output.{field} = weight0 * vertex0.{field} + weight1 * vertex1.{field} + weight2 * vertex2.{field};\n"
+                    ));
+                }
+                Some(ShaderInterpolation::Perspective) => {
+                    if group.scalar_type != ShaderScalarType::Float32 {
+                        return Err(ShaderBackendLoweringError::InconsistentInterfaceType(*location));
+                    }
+                    source.push_str(&format!(
+                        "  output.{field} = (weight0 * vertex0.{field} / vertex0.position.w + weight1 * vertex1.{field} / vertex1.position.w + weight2 * vertex2.{field} / vertex2.position.w) * rectangle_w;\n"
+                    ));
+                }
+                // An unconsumed vertex output has no linked interpolation
+                // contract. Its value is irrelevant to the fragment stage.
+                None => {}
+            },
+            other => return Err(ShaderBackendLoweringError::UnsupportedInterface(*other)),
+        }
+    }
+    source.push_str("  return output;\n}\n");
+    Ok(())
 }
 
 fn emit_wgsl_control_flow(
@@ -1488,6 +1742,10 @@ fn emit_wgsl_resources(
                 "@group(0) @binding({}) var sampled_image_{}: texture_2d<f32>;\n",
                 resource.binding, resource.binding
             )),
+            ShaderResourceKind::SampledImage2DArray => source.push_str(&format!(
+                "@group(0) @binding({}) var sampled_image_{}: texture_2d_array<f32>;\n",
+                resource.binding, resource.binding
+            )),
             ShaderResourceKind::Sampler => source.push_str(&format!(
                 "@group(0) @binding({}) var sampler_{}: sampler;\n",
                 resource.binding, resource.binding
@@ -1653,6 +1911,143 @@ fn emit_wgsl_operation(
             destination.index(),
             operand.index()
         )),
+        ShaderOperation::ConvertIntegerToFloat32 {
+            destination,
+            source: operand,
+            source_type,
+        } => {
+            let integer = match source_type {
+                ShaderScalarType::Signed32 => {
+                    format!("bitcast<i32>(registers[{}])", operand.index())
+                }
+                ShaderScalarType::Unsigned32 => format!("registers[{}]", operand.index()),
+                _ => {
+                    return Err(ShaderBackendLoweringError::NumericControl(
+                        instruction.source,
+                    ));
+                }
+            };
+            source.push_str(&format!(
+                "  registers[{}] = bitcast<u32>(f32({integer}));\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::RoundFloat32ToIntegral {
+            destination,
+            source: operand,
+            rounding,
+            flush_denormals_to_zero,
+        } => {
+            let bits = if *flush_denormals_to_zero {
+                format!("nixe_flush_denormal(registers[{}])", operand.index())
+            } else {
+                format!("registers[{}]", operand.index())
+            };
+            let function = match rounding {
+                ShaderRoundingMode::TowardNegative => "floor",
+                ShaderRoundingMode::TowardPositive => "ceil",
+                ShaderRoundingMode::TowardZero => "trunc",
+                ShaderRoundingMode::NearestEven => {
+                    return Err(ShaderBackendLoweringError::NumericControl(
+                        instruction.source,
+                    ));
+                }
+            };
+            source.push_str(&format!(
+                "  registers[{}] = bitcast<u32>({function}(bitcast<f32>({bits})));\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::ConvertFloat32ToInteger {
+            destination,
+            source: operand,
+            destination_type,
+            destination_bits,
+            rounding,
+            flush_denormals_to_zero,
+        } => {
+            let bits = if *flush_denormals_to_zero {
+                format!("nixe_flush_denormal(registers[{}])", operand.index())
+            } else {
+                format!("registers[{}]", operand.index())
+            };
+            let value = format!("bitcast<f32>({bits})");
+            let rounded = match rounding {
+                ShaderRoundingMode::NearestEven => format!("nixe_round_ties_even({value})"),
+                ShaderRoundingMode::TowardNegative => format!("floor({value})"),
+                ShaderRoundingMode::TowardPositive => format!("ceil({value})"),
+                ShaderRoundingMode::TowardZero => format!("trunc({value})"),
+            };
+            let local = format!("nixe_f2i_{:x}", instruction.source.byte_offset());
+            source.push_str(&format!("  let {local} = {rounded};\n"));
+            let clean = format!("{local}_clean");
+            source.push_str(&format!(
+                "  let {clean} = select({local}, 0.0, {local} != {local});\n"
+            ));
+            let (minimum, maximum, converted) = match destination_type {
+                ShaderScalarType::Signed32 => {
+                    let minimum = -(1_i64 << (u32::from(*destination_bits) - 1));
+                    let maximum = (1_i64 << (u32::from(*destination_bits) - 1)) - 1;
+                    let conversion_maximum = if *destination_bits == 32 {
+                        2_147_483_520_i64
+                    } else {
+                        maximum
+                    };
+                    (
+                        format!("{minimum}.0"),
+                        format!("{}.0", maximum + 1),
+                        format!(
+                            "bitcast<u32>(i32(clamp({clean}, {minimum}.0, {conversion_maximum}.0)))"
+                        ),
+                    )
+                }
+                ShaderScalarType::Unsigned32 => {
+                    let maximum = 1_u64 << u32::from(*destination_bits);
+                    let conversion_maximum = if *destination_bits == 32 {
+                        4_294_967_040_u64
+                    } else {
+                        maximum - 1
+                    };
+                    (
+                        "0.0".to_owned(),
+                        format!("{maximum}.0"),
+                        format!("u32(clamp({clean}, 0.0, {conversion_maximum}.0))"),
+                    )
+                }
+                _ => {
+                    return Err(ShaderBackendLoweringError::NumericControl(
+                        instruction.source,
+                    ));
+                }
+            };
+            let minimum_bits = if *destination_type == ShaderScalarType::Signed32 {
+                1_u32 << (u32::from(*destination_bits) - 1)
+            } else {
+                0
+            };
+            let minimum_bits =
+                if *destination_type == ShaderScalarType::Signed32 && *destination_bits < 32 {
+                    minimum_bits | (!0_u32 << u32::from(*destination_bits))
+                } else {
+                    minimum_bits
+                };
+            let maximum_bits = if *destination_type == ShaderScalarType::Signed32 {
+                (1_u32 << (u32::from(*destination_bits) - 1)).wrapping_sub(1)
+            } else if *destination_bits == 32 {
+                u32::MAX
+            } else {
+                (1_u32 << u32::from(*destination_bits)) - 1
+            };
+            source.push_str(&format!(
+                "  registers[{}] = select(select({converted}, 0x{maximum_bits:08x}u, {clean} >= {maximum}), 0x{minimum_bits:08x}u, {clean} <= {minimum});\n",
+                destination.index()
+            ));
+            source.push_str(&format!(
+                "  registers[{}] = select(registers[{}], 0u, {local} != {local});\n",
+                destination.index(),
+                destination.index()
+            ));
+        }
         ShaderOperation::LoadInput {
             destinations,
             location,
@@ -1975,6 +2370,28 @@ fn emit_wgsl_operation(
                 "  let {sample} = textureSample(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])));\n",
                 coordinates[0].index(),
                 coordinates[1].index(),
+            ));
+            for output in outputs {
+                source.push_str(&format!(
+                    "  registers[{}] = bitcast<u32>({sample}{});\n",
+                    output.destination().index(),
+                    wgsl_component(output.component()),
+                ));
+            }
+        }
+        ShaderOperation::SampleTexture2DArray {
+            outputs,
+            coordinates,
+            array_index,
+            image_binding,
+            sampler_binding,
+        } => {
+            let sample = format!("nixe_sample_{:x}", instruction.source.byte_offset());
+            source.push_str(&format!(
+                "  let {sample} = textureSample(sampled_image_{image_binding}, sampler_{sampler_binding}, vec2<f32>(bitcast<f32>(registers[{}]), bitcast<f32>(registers[{}])), i32(registers[{}] & 0xffffu));\n",
+                coordinates[0].index(),
+                coordinates[1].index(),
+                array_index.index(),
             ));
             for output in outputs {
                 source.push_str(&format!(
@@ -2326,6 +2743,14 @@ fn verify_interface_set(
                 }
                 _ => element.interpolation.is_none(),
             }
+        } else if !input && stage == ShaderStage::Vertex {
+            match element.location {
+                // Frontends may leave an unconsumed output unlinked (`None`)
+                // or attach the interpolation contract selected by the next
+                // graphics stage.
+                ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_) => true,
+                _ => element.interpolation.is_none(),
+            }
         } else {
             element.interpolation.is_none()
         };
@@ -2388,6 +2813,9 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::Move32 { destination, .. }
             | ShaderOperation::FloatAbsolute32 { destination, .. }
             | ShaderOperation::FloatNegate32 { destination, .. }
+            | ShaderOperation::ConvertIntegerToFloat32 { destination, .. }
+            | ShaderOperation::RoundFloat32ToIntegral { destination, .. }
+            | ShaderOperation::ConvertFloat32ToInteger { destination, .. }
             | ShaderOperation::LoadConstantBuffer32 { destination, .. }
             | ShaderOperation::LoadConstantBufferIndexed32 { destination, .. }
             | ShaderOperation::Reciprocal32 { destination, .. }
@@ -2532,6 +2960,57 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                         .extend(outputs.iter().map(|output| output.destination()));
                 }
             }
+            ShaderOperation::SampleTexture2DArray {
+                outputs,
+                coordinates,
+                array_index,
+                image_binding,
+                sampler_binding,
+            } => {
+                for source in [coordinates[0], coordinates[1], *array_index] {
+                    require_definition(instruction.source, source, &definitions.registers)?;
+                }
+                let valid_outputs = !outputs.is_empty()
+                    && outputs.len() <= 4
+                    && outputs
+                        .iter()
+                        .map(|output| output.component())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == outputs.len()
+                    && outputs
+                        .iter()
+                        .map(|output| output.destination())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == outputs.len();
+                if ir.stage != ShaderStage::Fragment || !valid_outputs {
+                    return Err(ShaderVerificationError::InvalidTextureSample {
+                        source: instruction.source,
+                    });
+                }
+                for (binding, kind) in [
+                    (*image_binding, ShaderResourceKind::SampledImage2DArray),
+                    (*sampler_binding, ShaderResourceKind::Sampler),
+                ] {
+                    if !ir.resources.iter().any(|resource| {
+                        resource.binding == binding
+                            && resource.kind == kind
+                            && resource.readable
+                            && !resource.writable
+                    }) {
+                        return Err(ShaderVerificationError::UndeclaredResourceAccess {
+                            source: instruction.source,
+                            binding,
+                        });
+                    }
+                }
+                if !conditional {
+                    definitions
+                        .registers
+                        .extend(outputs.iter().map(|output| output.destination()));
+                }
+            }
             ShaderOperation::Branch { target } => {
                 let target_index = locations.get(target).copied().ok_or(
                     ShaderVerificationError::InvalidBranchTarget {
@@ -2640,7 +3119,10 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::ShiftLeft32 { value, amount, .. } => vec![*value, *amount],
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
-        | ShaderOperation::FloatNegate32 { source, .. } => vec![*source],
+        | ShaderOperation::FloatNegate32 { source, .. }
+        | ShaderOperation::ConvertIntegerToFloat32 { source, .. }
+        | ShaderOperation::RoundFloat32ToIntegral { source, .. } => vec![*source],
+        ShaderOperation::ConvertFloat32ToInteger { source, .. } => vec![*source],
         ShaderOperation::FusedMultiplyAdd32 {
             left,
             right,
@@ -2656,6 +3138,11 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
             ..
         } => vec![*dynamic_byte_offset],
         ShaderOperation::SampleTexture2D { coordinates, .. } => coordinates.to_vec(),
+        ShaderOperation::SampleTexture2DArray {
+            coordinates,
+            array_index,
+            ..
+        } => vec![coordinates[0], coordinates[1], *array_index],
         _ => Vec::new(),
     }
 }

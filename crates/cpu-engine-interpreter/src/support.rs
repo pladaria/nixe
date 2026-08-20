@@ -34,6 +34,7 @@ pub(crate) const fn semantic_availability(
                     | 0x0000_004e..=0x0000_0058
                     | 0x0000_0059..=0x0000_005d
                     | 0x0000_0060..=0x0000_0094
+                    | 0x0000_009e..=0x0000_009f
             ) =>
         {
             SemanticAvailability::Implemented

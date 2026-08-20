@@ -1011,6 +1011,29 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     ),
+    // Arm A64 FCVTZS/FCVTZU (scalar, fixed-point). The scale field encodes
+    // `fbits` as 64-scale; the 32-bit destination forms reserve fbits>32.
+    // Arm ARM DDI 0602 (2025-12):
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZS--scalar--fixed-point---Floating-point-Convert-to-Signed-fixed-point--rounding-toward-Zero--scalar--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTZU--scalar--fixed-point---Floating-point-Convert-to-Unsigned-fixed-point--rounding-toward-Zero--scalar--
+    pattern(
+        "fp-float-to-signed-fixed-int",
+        0x7fbf_0000,
+        0x1e18_0000,
+        0x0000_009e,
+        176,
+        &[],
+        SIMD,
+    ),
+    pattern(
+        "fp-float-to-unsigned-fixed-int",
+        0x7fbf_0000,
+        0x1e19_0000,
+        0x0000_009f,
+        175,
+        &[],
+        SIMD,
+    ),
     // Arm A64 scalar floating-point to integer conversions with an explicit
     // rounding direction. These cover the base S/D-to-W/X forms; optional
     // FP16 forms remain classified by the feature-gated fallback. Arm ARM
@@ -1194,6 +1217,7 @@ pub struct Operands {
     pub fp_immediate_8: u8,
     pub float_conversion: Option<FloatConversion>,
     pub float_to_integer_rounding: Option<FloatToIntegerRounding>,
+    pub fixed_point_fraction_bits: Option<u8>,
     pub float_round_operation: Option<FloatRoundOperation>,
     pub float_add_operation: Option<FloatAddOperation>,
     pub float_multiply_operation: Option<FloatMultiplyOperation>,
@@ -1423,9 +1447,13 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
             0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
             0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
             0x0000_0083 | 0x0000_0084 => Some(FloatToIntegerRounding::TowardNegative),
-            0x0000_003c | 0x0000_003d => Some(FloatToIntegerRounding::TowardZero),
+            0x0000_003c | 0x0000_003d | 0x0000_009e | 0x0000_009f => {
+                Some(FloatToIntegerRounding::TowardZero)
+            }
             _ => None,
         },
+        fixed_point_fraction_bits: matches!(semantic_id, 0x0000_009e | 0x0000_009f)
+            .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
         float_round_operation: match semantic_id {
             0x0000_0072 => Some(FloatRoundOperation::NearestEven),
             0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
@@ -1477,10 +1505,10 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         0x0000_0061 => Instruction::InsertGeneral(operands),
         0x0000_003a => Instruction::SignedIntToFloat(operands),
         0x0000_003b => Instruction::UnsignedIntToFloat(operands),
-        0x0000_003c | 0x0000_007d | 0x0000_007f | 0x0000_0081 | 0x0000_0083 => {
+        0x0000_003c | 0x0000_007d | 0x0000_007f | 0x0000_0081 | 0x0000_0083 | 0x0000_009e => {
             Instruction::FloatToSignedInt(operands)
         }
-        0x0000_003d | 0x0000_007e | 0x0000_0080 | 0x0000_0082 | 0x0000_0084 => {
+        0x0000_003d | 0x0000_007e | 0x0000_0080 | 0x0000_0082 | 0x0000_0084 | 0x0000_009f => {
             Instruction::FloatToUnsignedInt(operands)
         }
         0x0000_003e => Instruction::MoveToGeneral(operands),

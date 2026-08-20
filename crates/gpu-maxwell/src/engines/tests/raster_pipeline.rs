@@ -258,6 +258,7 @@ fn hybrid_anti_alias_only_blocks_non_neutral_draw_configuration() {
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let cache = MaxwellThreeDLoweringCache::default();
+    let cache_before = cache.clone();
 
     program_three_d(&mut channel, 0x0754, 1);
     let source = channel
@@ -291,7 +292,6 @@ fn hybrid_anti_alias_only_blocks_non_neutral_draw_configuration() {
         .value()
         .copied()
         .unwrap();
-    let cache_before = cache.clone();
     assert!(matches!(
         preflight_maxwell_three_d_operation(
             channel.three_d(),
@@ -2196,7 +2196,7 @@ fn effective_polygon_smoothing_and_stipple_are_topology_aware() {
 }
 
 #[test]
-fn effective_triangle_fill_modes_stop_draws_before_publication() {
+fn effective_triangle_fill_modes_preserve_supported_bounding_box_semantics() {
     let mut channel = channel();
     bind_three_d(&mut channel);
     for (method, argument) in [(0x121c, 0), (0x1618, 4), (0x113c, 0), (0x1148, 0)] {
@@ -2251,11 +2251,7 @@ fn effective_triangle_fill_modes_stop_draws_before_publication() {
     program_three_d(&mut channel, 0x113c, 2);
     assert!(matches!(
         preflight(&channel),
-        Err(
-            MaxwellThreeDLoweringError::UnsupportedFillViaTriangleSemantics(
-                MaxwellThreeDFillViaTriangleMode::FillBoundingBox
-            )
-        )
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x113c, 0);
@@ -4129,7 +4125,6 @@ fn disabled_alpha_test_is_neutral_and_enabled_test_stops_draws() {
     ));
 
     program_three_d(&mut channel, 0x12ec, 1);
-    let cache_before = cache.clone();
     assert!(matches!(
         preflight(&channel),
         Err(MaxwellThreeDLoweringError::IncompleteAlphaTestState(
@@ -4146,12 +4141,8 @@ fn disabled_alpha_test_is_neutral_and_enabled_test_stops_draws() {
     program_three_d(&mut channel, 0x1314, 0x204);
     assert!(matches!(
         preflight(&channel),
-        Err(MaxwellThreeDLoweringError::UnsupportedAlphaTestSemantics {
-            function: MaxwellThreeDCompareOp::Greater,
-            reference,
-        }) if reference.get() == 0x3f00_0000
+        Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]

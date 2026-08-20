@@ -1161,7 +1161,15 @@ fn scalar_float_to_integer(
         .vector(fields.rn)
         .expect("normalized scalar floating-point conversion source") as u64
         & source_mask;
-    float_bits_to_integer(source, format, width, signed, rounding, state.fpcr())
+    float_bits_to_integer(
+        source,
+        format,
+        width,
+        signed,
+        rounding,
+        fields.fixed_point_fraction_bits.unwrap_or(0),
+        state.fpcr(),
+    )
 }
 
 fn float_bits_to_integer(
@@ -1170,6 +1178,7 @@ fn float_bits_to_integer(
     width: u8,
     signed: bool,
     rounding: FloatToIntegerRounding,
+    fractional_bits: u8,
     fpcr: u32,
 ) -> IntegerConversionOutcome {
     let sign = source & format.sign_mask() != 0;
@@ -1226,7 +1235,7 @@ fn float_bits_to_integer(
             exponent as i32 - format.exponent_bias,
         )
     };
-    let shift = unbiased_exponent - format.fraction_bits as i32;
+    let shift = unbiased_exponent - format.fraction_bits as i32 + i32::from(fractional_bits);
     let (magnitude, discarded, relation_to_half) = if shift >= 0 {
         let shift = shift as u32;
         if shift >= 128 || significand > (u128::MAX >> shift) {
