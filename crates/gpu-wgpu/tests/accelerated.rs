@@ -522,7 +522,7 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     )
     .unwrap()
     .with_viewport_transform(
-        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5]).unwrap(),
+        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5], [0.0, 1.0]).unwrap(),
     );
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(2),

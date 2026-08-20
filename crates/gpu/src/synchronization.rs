@@ -229,6 +229,7 @@ pub struct ReservedTimelinePoint {
     instance: TimelineInstanceId,
     reservation: u64,
     owner: TimelineOwnerId,
+    increments: u32,
     logical_position: u64,
     point: GuestTimelinePoint,
 }
@@ -244,6 +245,12 @@ impl ReservedTimelinePoint {
     #[must_use]
     pub const fn owner(&self) -> TimelineOwnerId {
         self.owner
+    }
+
+    /// Returns how many guest increments lead to this reservation's endpoint.
+    #[must_use]
+    pub const fn increments(&self) -> u32 {
+        self.increments
     }
 
     /// Returns the timeline-local reservation identity.
@@ -444,6 +451,7 @@ impl GuestTimeline {
             instance: self.instance,
             reservation,
             owner,
+            increments,
             logical_position,
             point: self.point_at(logical_position),
         };
@@ -730,6 +738,8 @@ mod tests {
         let first = timeline.reserve(OWNER, 1).unwrap();
         let second = timeline.reserve(OWNER, 2).unwrap();
 
+        assert_eq!(first.increments(), 1);
+        assert_eq!(second.increments(), 2);
         assert_eq!(first.point().value().get(), u32::MAX);
         assert_eq!(second.point().value().get(), 1);
         assert_eq!(second.checked_cmp(&first), Ok(std::cmp::Ordering::Greater));

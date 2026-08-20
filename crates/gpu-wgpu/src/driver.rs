@@ -1363,6 +1363,7 @@ struct WebGpuViewport {
 fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, BackendDriverError> {
     let scale = transform.scale();
     let offset = transform.offset();
+    let [min_depth, max_depth] = transform.depth_range();
 
     // WebGPU NDC has its origin at bottom-left while framebuffer coordinates
     // start at top-left. Consequently its positive viewport height already
@@ -1377,14 +1378,22 @@ fn webgpu_viewport(transform: ViewportTransform) -> Result<WebGpuViewport, Backe
     if scale[2] < 0.0 {
         return Err(unsupported("reversed Maxwell depth viewport scale"));
     }
+    if !(0.0..=1.0).contains(&min_depth)
+        || !(0.0..=1.0).contains(&max_depth)
+        || min_depth > max_depth
+    {
+        return Err(unsupported(
+            "viewport depth range cannot be represented by WebGPU",
+        ));
+    }
 
     let viewport = WebGpuViewport {
         x: offset[0] - scale[0],
         y: offset[1] + scale[1],
         width: scale[0] * 2.0,
         height: scale[1] * -2.0,
-        min_depth: offset[2] - scale[2],
-        max_depth: offset[2] + scale[2],
+        min_depth,
+        max_depth,
     };
     if ![
         viewport.x,
@@ -1891,7 +1900,8 @@ mod tests {
 
     #[test]
     fn maxwell_negative_y_viewport_maps_exactly_to_webgpu_top_left_coordinates() {
-        let transform = ViewportTransform::new([32.0, -16.0, 0.5], [32.0, 16.0, 0.5]).unwrap();
+        let transform =
+            ViewportTransform::new([32.0, -16.0, 0.5], [32.0, 16.0, 0.5], [0.0, 1.0]).unwrap();
 
         assert_eq!(
             webgpu_viewport(transform).unwrap(),
@@ -1908,11 +1918,31 @@ mod tests {
 
     #[test]
     fn viewport_axis_signs_without_an_exact_webgpu_mapping_remain_typed_failures() {
-        let flipped_x = ViewportTransform::new([-32.0, -16.0, 0.5], [32.0, 16.0, 0.5]).unwrap();
-        let flipped_y = ViewportTransform::new([32.0, 16.0, 0.5], [32.0, 16.0, 0.5]).unwrap();
+        let flipped_x =
+            ViewportTransform::new([-32.0, -16.0, 0.5], [32.0, 16.0, 0.5], [0.0, 1.0]).unwrap();
+        let flipped_y =
+            ViewportTransform::new([32.0, 16.0, 0.5], [32.0, 16.0, 0.5], [0.0, 1.0]).unwrap();
 
         assert!(webgpu_viewport(flipped_x).is_err());
         assert!(webgpu_viewport(flipped_y).is_err());
+    }
+
+    #[test]
+    fn maxwell_zero_to_one_depth_range_is_not_inferred_from_scale_and_offset() {
+        let transform =
+            ViewportTransform::new([640.0, -360.0, 1.0], [640.0, 360.0, 0.0], [0.0, 1.0]).unwrap();
+
+        let viewport = webgpu_viewport(transform).unwrap();
+        assert_eq!(viewport.min_depth, 0.0);
+        assert_eq!(viewport.max_depth, 1.0);
+    }
+
+    #[test]
+    fn unrepresentable_depth_ranges_fail_before_wgpu_validation() {
+        let transform =
+            ViewportTransform::new([32.0, -16.0, 1.0], [32.0, 16.0, 0.0], [-1.0, 1.0]).unwrap();
+
+        assert!(webgpu_viewport(transform).is_err());
     }
 
     #[test]

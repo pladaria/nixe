@@ -24,12 +24,21 @@ We follow standard Rust conventions to separate unit and integration tests. Plea
 - **Integration Tests:** Place them in separate files inside the root `tests/` directory (e.g., `tests/api_tests.rs`). Use them to test the public API as an external consumer.
 - **Prohibited:** Do **NOT** put integration tests, end-to-end flows, or public API testing inside `src/lib.rs` or `mod.rs`. Keep these files focused exclusively on module definitions and internal unit tests.
 
+## Fail-fast Policy
+
+Nixe prioritizes correctness over resilience.
+
+- Unsupported guest-visible behavior must stop execution immediately with a precise, actionable error. Never ignore
+  it, fabricate success, substitute defaults, or downgrade it to a warning or debug message.
+- Validate state when an operation consumes it. Unrelated partial state must not block the operation, but required
+  invalid or incomplete state must fail.
+- Prefer direct, single-pass execution. Add preflight validation, transactions, rollback, or recovery only when
+  required by guest-visible semantics or a documented emulator invariant, not speculatively.
+- Tests must preserve these failure boundaries and reject fabricated success paths.
+
 ## Contribution Principles
 
 - Prefer correctness and clear behavior over premature optimization.
-- If an emulated service or component lacks required semantics, stop the emulator with a typed host-side error.
-  Never hide missing implementation with a guest-visible error or fabricated data; guest-visible failures are valid
-  only when they faithfully model the emulated system.
 - Add tests for new behavior whenever practical.
 - When an implementation relies on external references, record those references in nearby code comments and link
   to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.

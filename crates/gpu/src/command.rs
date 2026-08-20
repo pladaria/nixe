@@ -212,19 +212,28 @@ pub enum DrawArguments {
 /// Backend-independent affine transform from normalized device coordinates to
 /// framebuffer coordinates: `window = ndc * scale + offset`.
 ///
+/// The depth interval is retained independently because guest APIs may program
+/// clip-depth bounds that cannot be reconstructed from the Z coefficients.
+///
 /// IEEE-754 bit patterns are retained so negative viewport axes and exact guest
 /// state survive frontend lowering without relying on one host API convention.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ViewportTransform {
     scale: [u32; 3],
     offset: [u32; 3],
+    depth_range: [u32; 2],
 }
 
 impl ViewportTransform {
-    pub fn new(scale: [f32; 3], offset: [f32; 3]) -> Result<Self, CommandDescriptionError> {
+    pub fn new(
+        scale: [f32; 3],
+        offset: [f32; 3],
+        depth_range: [f32; 2],
+    ) -> Result<Self, CommandDescriptionError> {
         if scale
             .into_iter()
             .chain(offset)
+            .chain(depth_range)
             .any(|value| !value.is_finite())
         {
             return Err(CommandDescriptionError::NonFiniteViewportTransform);
@@ -235,6 +244,7 @@ impl ViewportTransform {
         Ok(Self {
             scale: scale.map(f32::to_bits),
             offset: offset.map(f32::to_bits),
+            depth_range: depth_range.map(f32::to_bits),
         })
     }
 
@@ -246,6 +256,12 @@ impl ViewportTransform {
     #[must_use]
     pub fn offset(self) -> [f32; 3] {
         self.offset.map(f32::from_bits)
+    }
+
+    /// Returns the guest-programmed minimum and maximum window-space depth.
+    #[must_use]
+    pub fn depth_range(self) -> [f32; 2] {
+        self.depth_range.map(f32::from_bits)
     }
 }
 
@@ -1330,15 +1346,21 @@ mod tests {
 
     #[test]
     fn viewport_transform_preserves_negative_axes_and_rejects_invalid_values() {
-        let viewport = ViewportTransform::new([640.0, -360.0, 0.5], [640.0, 360.0, 0.5]).unwrap();
+        let viewport =
+            ViewportTransform::new([640.0, -360.0, 0.5], [640.0, 360.0, 0.5], [0.0, 1.0]).unwrap();
         assert_eq!(viewport.scale(), [640.0, -360.0, 0.5]);
         assert_eq!(viewport.offset(), [640.0, 360.0, 0.5]);
+        assert_eq!(viewport.depth_range(), [0.0, 1.0]);
         assert_eq!(
-            ViewportTransform::new([0.0, 1.0, 1.0], [0.0; 3]),
+            ViewportTransform::new([0.0, 1.0, 1.0], [0.0; 3], [0.0, 1.0]),
             Err(CommandDescriptionError::EmptyViewport)
         );
         assert_eq!(
-            ViewportTransform::new([1.0, f32::NAN, 1.0], [0.0; 3]),
+            ViewportTransform::new([1.0, f32::NAN, 1.0], [0.0; 3], [0.0, 1.0]),
+            Err(CommandDescriptionError::NonFiniteViewportTransform)
+        );
+        assert_eq!(
+            ViewportTransform::new([1.0; 3], [0.0; 3], [0.0, f32::INFINITY]),
             Err(CommandDescriptionError::NonFiniteViewportTransform)
         );
     }

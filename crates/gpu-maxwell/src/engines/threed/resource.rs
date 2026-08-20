@@ -41,6 +41,14 @@ use super::{
 const MAXWELL_PITCH_KIND: u8 = 0x00;
 const MAXWELL_PITCH_NO_SWIZZLE_KIND: u8 = 0xfd;
 const MAXWELL_GENERIC_BLOCK_LINEAR_KIND: u8 = 0xfe;
+// Deko3d's verified single-sample compressed color kinds. These retain the
+// same block-linear address equation as the corresponding generic surface,
+// but identify the color-compression family selected for each texel width.
+// https://github.com/devkitPro/deko3d/blob/6ee80db52aac0168303fc2f6417232997e464999/source/maxwell/image_formats.cpp#L95-L128
+// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L210-L243
+const MAXWELL_C32_2CRA_KIND: u8 = 0xdb;
+const MAXWELL_C64_2CRA_KIND: u8 = 0xe9;
+const MAXWELL_C128_2CR_KIND: u8 = 0xf5;
 // Public Switch kind table names 0x17 as S8Z24_2CZ; deko3d selects it for
 // compressed, single-sample S8Z24 depth images.
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L35-L45
@@ -234,10 +242,10 @@ impl MaxwellThreeDPreservedImageLayout {
         self.compression_enabled
     }
 
-    /// Returns whether the canonical mapping itself uses the generic
-    /// uncompressed block-linear kind. Maxwell may keep compression enabled as
-    /// pipeline state while the selected surface PTE still requires ordinary
-    /// 16Bx2 bytes. That representation can be written back directly.
+    /// Returns whether the guest bytes already have a direct canonical
+    /// representation. Disabled compression is direct regardless of the
+    /// compressible PTE family; with compression enabled, only generic 16Bx2
+    /// mappings are already canonical.
     #[must_use]
     pub const fn has_direct_canonical_representation(self) -> bool {
         !self.compression_enabled || self.pte_kind == MAXWELL_GENERIC_BLOCK_LINEAR_KIND
@@ -473,9 +481,20 @@ pub fn resolve_maxwell_three_d_resources(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
-    resolve_maxwell_three_d_resources_for_roles(state, address_space, &[])
+    resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
+        state,
+        address_space,
+        &[],
+        None,
+        true,
+    )
 }
 
+/// Resolves only the explicitly consumed resource roles.
+///
+/// Unlike [`resolve_maxwell_three_d_resources`], unrelated partially
+/// programmed state is outside this operation-scoped boundary. Every named
+/// role remains strict when its state is consumed.
 pub fn resolve_maxwell_three_d_resources_for_roles(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
@@ -486,6 +505,7 @@ pub fn resolve_maxwell_three_d_resources_for_roles(
         address_space,
         required_roles,
         None,
+        false,
     )
 }
 
@@ -494,6 +514,7 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     address_space: &MaxwellGpuAddressSpace,
     required_roles: &[MaxwellThreeDResourceRole],
     staged_writes: Option<&CanonicalWriteBatch>,
+    inspect_complete_state: bool,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
     let sample_mode = state
         .fixed_function()
@@ -506,26 +527,20 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     let mut builder = ResourceBuilder::new(address_space, sample_mode, staged_writes);
 
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
-        if stream
-            .format()
-            .value()
-            .is_some_and(|format| format.enabled())
+        let role = MaxwellThreeDResourceRole::VertexStream(index as u8);
+        if (inspect_complete_state || required_roles.contains(&role))
+            && stream
+                .format()
+                .value()
+                .is_some_and(|format| format.enabled())
         {
             let address = stream
                 .address()
-                .ok_or(MaxwellThreeDResourceError::IncompleteState {
-                    role: MaxwellThreeDResourceRole::VertexStream(index as u8),
-                })?;
+                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
             let limit = stream
                 .limit()
-                .ok_or(MaxwellThreeDResourceError::IncompleteState {
-                    role: MaxwellThreeDResourceRole::VertexStream(index as u8),
-                })?;
-            builder.buffer(
-                MaxwellThreeDResourceRole::VertexStream(index as u8),
-                address,
-                inclusive_size(address, limit)?,
-            )?;
+                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+            builder.buffer(role, address, inclusive_size(address, limit, role)?)?;
         }
     }
 
@@ -538,7 +553,11 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     ]
     .iter()
     .any(Option::is_some);
-    if index_programmed {
+    let index_required = required_roles.contains(&MaxwellThreeDResourceRole::IndexBuffer);
+    // MME shadow state may contain an unrelated partial binding. Complete-state
+    // inspection validates any programmed prefix; operation-scoped resolution
+    // requires the binding only for a trigger that explicitly names the role.
+    if (inspect_complete_state && index_programmed) || index_required {
         let address = unresolved(index.address_upper().value(), index.address_lower().value())
             .ok_or(MaxwellThreeDResourceError::IncompleteState {
                 role: MaxwellThreeDResourceRole::IndexBuffer,
@@ -551,23 +570,26 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
         builder.buffer(
             MaxwellThreeDResourceRole::IndexBuffer,
             address,
-            inclusive_size(address, limit)?,
+            inclusive_size(address, limit, MaxwellThreeDResourceRole::IndexBuffer)?,
         )?;
     }
 
     let bindings = state.shader_bindings();
     for group in 0..MAXWELL_BIND_GROUP_COUNT {
         for slot in 0..MAXWELL_CONSTANT_BUFFER_SLOT_COUNT {
+            let role = MaxwellThreeDResourceRole::ConstantBuffer {
+                group: group as u8,
+                slot: slot as u8,
+            };
+            if !inspect_complete_state && !required_roles.contains(&role) {
+                continue;
+            }
             let Some(binding) = bindings.groups()[group].constant_buffers()[slot] else {
                 continue;
             };
             if !binding.enabled() {
                 continue;
             }
-            let role = MaxwellThreeDResourceRole::ConstantBuffer {
-                group: group as u8,
-                slot: slot as u8,
-            };
             let address = binding
                 .address()
                 .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
@@ -579,11 +601,27 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
             builder.buffer(role, address, size)?;
         }
     }
-    builder.descriptor_pool(
-        MaxwellThreeDResourceRole::TextureHeaders,
-        bindings.texture_headers(),
-    )?;
-    builder.descriptor_pool(MaxwellThreeDResourceRole::Samplers, bindings.samplers())?;
+    let texture_headers_required = required_roles.iter().any(|role| {
+        matches!(
+            role,
+            MaxwellThreeDResourceRole::TextureHeaders | MaxwellThreeDResourceRole::SampledImage(_)
+        )
+    });
+    if inspect_complete_state || texture_headers_required {
+        builder.descriptor_pool(
+            MaxwellThreeDResourceRole::TextureHeaders,
+            bindings.texture_headers(),
+        )?;
+    }
+    let samplers_required = required_roles.iter().any(|role| {
+        matches!(
+            role,
+            MaxwellThreeDResourceRole::Samplers | MaxwellThreeDResourceRole::Sampler(_)
+        )
+    });
+    if inspect_complete_state || samplers_required {
+        builder.descriptor_pool(MaxwellThreeDResourceRole::Samplers, bindings.samplers())?;
+    }
     let mut descriptors = BTreeSet::new();
     for role in required_roles {
         if let MaxwellThreeDResourceRole::SampledImage(descriptor) = role {
@@ -600,20 +638,27 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     }
 
     for (index, target) in state.render_targets().color().iter().enumerate() {
+        let role = MaxwellThreeDResourceRole::ColorTarget(index as u8);
+        if !inspect_complete_state && !required_roles.contains(&role) {
+            continue;
+        }
         match target.readiness(true) {
             MaxwellThreeDAttachmentReadiness::Unprogrammed
             | MaxwellThreeDAttachmentReadiness::Disabled => {}
             MaxwellThreeDAttachmentReadiness::Ready => builder.color_target(index as u8, target)?,
             _ => {
-                return Err(MaxwellThreeDResourceError::IncompleteState {
-                    role: MaxwellThreeDResourceRole::ColorTarget(index as u8),
-                });
+                return Err(MaxwellThreeDResourceError::IncompleteState { role });
             }
         }
     }
+    let depth_required = required_roles.contains(&MaxwellThreeDResourceRole::DepthStencilTarget);
     let depth_explicitly_unselected = state.render_targets().depth_target_count().value()
         == Some(&super::MaxwellThreeDDepthTargetCount::None);
-    if !depth_explicitly_unselected && depth_is_programmed(state.render_targets().depth_stencil()) {
+    if depth_required
+        || (inspect_complete_state
+            && !depth_explicitly_unselected
+            && depth_is_programmed(state.render_targets().depth_stencil()))
+    {
         builder.depth_target(state.render_targets().depth_stencil())?;
     }
 
@@ -1166,7 +1211,7 @@ impl<'a> ResourceBuilder<'a> {
         address: MaxwellThreeDUnresolvedAddress,
         description: ImageDescription,
         layout: MaxwellThreeDImageLayout,
-        array_pitch: Option<u32>,
+        array_pitch_dwords: Option<u32>,
         selected_layer: u16,
         guest_format: MaxwellThreeDGuestImageFormat,
         compression_enabled: bool,
@@ -1192,11 +1237,17 @@ impl<'a> ResourceBuilder<'a> {
             .checked_mul(u64::from(extent.height))
             .and_then(|size| size.checked_mul(u64::from(extent.depth)))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        let (neutral_layout, layer_stride, expected_kind) = match layout {
+        // Maxwell render-target and zeta ARRAY_PITCH registers count dwords,
+        // not bytes. This is visible in deko3d's 1280x720 target, whose
+        // captured 0x000f0000 value denotes a 0x003c0000-byte layer stride.
+        // Keep the conversion at the guest/neutral boundary so the neutral
+        // image layout remains byte-addressed.
+        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/texture_cache/image_info.cpp#L126-L177
+        let array_pitch = array_pitch_dwords.map(|pitch| u64::from(pitch) * 4);
+        let (neutral_layout, layer_stride, expected_kind, generic_kind_allowed) = match layout {
             MaxwellThreeDImageLayout::PitchLinear => {
                 let stride = array_pitch
                     .filter(|value| *value != 0)
-                    .map(u64::from)
                     .unwrap_or(compact_layer);
                 (
                     ImageMemoryLayout::PitchLinear {
@@ -1205,6 +1256,7 @@ impl<'a> ResourceBuilder<'a> {
                     },
                     stride,
                     MAXWELL_PITCH_KIND,
+                    false,
                 )
             }
             MaxwellThreeDImageLayout::BlockLinear {
@@ -1218,19 +1270,25 @@ impl<'a> ResourceBuilder<'a> {
                     .checked_mul(rows)
                     .and_then(|size| size.checked_mul(depths))
                     .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-                let stride = array_pitch
-                    .filter(|value| *value != 0)
-                    .map(u64::from)
-                    .unwrap_or(minimum);
-                let expected_kind = if compression_enabled
-                    && guest_format
-                        == MaxwellThreeDGuestImageFormat::DepthStencil(
-                            MaxwellThreeDDepthStencilFormat::Stencil8Z24,
-                        ) {
-                    MAXWELL_S8Z24_2CZ_KIND
-                } else {
-                    MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+                let stride = array_pitch.filter(|value| *value != 0).unwrap_or(minimum);
+                let compressed_color_kind = match guest_format {
+                    MaxwellThreeDGuestImageFormat::Color(_) => {
+                        single_sample_compressed_color_kind(bpp)
+                    }
+                    _ => None,
                 };
+                let expected_kind = compressed_color_kind.unwrap_or_else(|| {
+                    if compression_enabled
+                        && guest_format
+                            == MaxwellThreeDGuestImageFormat::DepthStencil(
+                                MaxwellThreeDDepthStencilFormat::Stencil8Z24,
+                            )
+                    {
+                        MAXWELL_S8Z24_2CZ_KIND
+                    } else {
+                        MAXWELL_GENERIC_BLOCK_LINEAR_KIND
+                    }
+                });
                 (
                     ImageMemoryLayout::BlockLinear(BlockLinearLayout {
                         block_width_log2: 0,
@@ -1240,6 +1298,7 @@ impl<'a> ResourceBuilder<'a> {
                     }),
                     stride,
                     expected_kind,
+                    compressed_color_kind.is_some(),
                 )
             }
         };
@@ -1268,7 +1327,12 @@ impl<'a> ResourceBuilder<'a> {
             .kind();
         if source.segments().iter().any(|segment| {
             segment.mapping().kind() != actual_kind
-                || !image_kind_matches(layout, expected_kind, segment.mapping().kind())
+                || !image_kind_matches(
+                    layout,
+                    expected_kind,
+                    generic_kind_allowed,
+                    segment.mapping().kind(),
+                )
         }) {
             return Err(MaxwellThreeDResourceError::UnsupportedKind {
                 role,
@@ -1453,12 +1517,13 @@ fn unresolved(upper: Option<&u8>, lower: Option<&u32>) -> Option<MaxwellThreeDUn
 fn inclusive_size(
     address: MaxwellThreeDUnresolvedAddress,
     limit: MaxwellThreeDUnresolvedAddress,
+    role: MaxwellThreeDResourceRole,
 ) -> Result<u64, MaxwellThreeDResourceError> {
     limit
         .get()
         .checked_sub(address.get())
         .and_then(|size| size.checked_add(1))
-        .ok_or(MaxwellThreeDResourceError::ResourceExhausted)
+        .ok_or(MaxwellThreeDResourceError::ContradictoryState { role })
 }
 fn resource_id(index: usize) -> Result<u64, MaxwellThreeDResourceError> {
     u64::try_from(index)
@@ -1477,12 +1542,29 @@ fn align_up(
         .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })
 }
 
-const fn image_kind_matches(layout: MaxwellThreeDImageLayout, expected: u8, actual: u8) -> bool {
+const fn single_sample_compressed_color_kind(bytes_per_texel: u64) -> Option<u8> {
+    match bytes_per_texel {
+        4 => Some(MAXWELL_C32_2CRA_KIND),
+        8 => Some(MAXWELL_C64_2CRA_KIND),
+        16 => Some(MAXWELL_C128_2CR_KIND),
+        _ => None,
+    }
+}
+
+const fn image_kind_matches(
+    layout: MaxwellThreeDImageLayout,
+    expected: u8,
+    generic_kind_allowed: bool,
+    actual: u8,
+) -> bool {
     match layout {
         MaxwellThreeDImageLayout::PitchLinear => {
             matches!(actual, MAXWELL_PITCH_KIND | MAXWELL_PITCH_NO_SWIZZLE_KIND)
         }
-        MaxwellThreeDImageLayout::BlockLinear { .. } => actual == expected,
+        MaxwellThreeDImageLayout::BlockLinear { .. } => {
+            actual == expected
+                || (generic_kind_allowed && actual == MAXWELL_GENERIC_BLOCK_LINEAR_KIND)
+        }
     }
 }
 
@@ -1898,9 +1980,10 @@ mod tests {
     use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
 
     use super::{
-        MAXWELL_GENERIC_BLOCK_LINEAR_KIND, MaxwellThreeDPreservedImageLayout,
-        MaxwellThreeDResourceError, decode_sampler, read_backing_bytes, read_descriptor_bytes,
-        texture_descriptor_pair, uses_maxwell_texture_headers,
+        MAXWELL_C32_2CRA_KIND, MAXWELL_C64_2CRA_KIND, MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+        MaxwellThreeDPreservedImageLayout, MaxwellThreeDResourceError, decode_sampler,
+        image_kind_matches, read_backing_bytes, read_descriptor_bytes, texture_descriptor_pair,
+        uses_maxwell_texture_headers,
     };
 
     fn descriptor_bytes(words: [u32; 8]) -> [u8; 32] {
@@ -1942,6 +2025,33 @@ mod tests {
         };
 
         assert!(!layout.has_direct_canonical_representation());
+    }
+
+    #[test]
+    fn c32_block_linear_kind_accepts_generic_storage_but_rejects_c64_storage() {
+        let maxwell_layout = super::MaxwellThreeDImageLayout::BlockLinear {
+            block_height_log2: 4,
+            block_depth_log2: 0,
+        };
+
+        assert!(image_kind_matches(
+            maxwell_layout,
+            MAXWELL_C32_2CRA_KIND,
+            true,
+            MAXWELL_C32_2CRA_KIND,
+        ));
+        assert!(image_kind_matches(
+            maxwell_layout,
+            MAXWELL_C32_2CRA_KIND,
+            true,
+            MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+        ));
+        assert!(!image_kind_matches(
+            maxwell_layout,
+            MAXWELL_C32_2CRA_KIND,
+            true,
+            MAXWELL_C64_2CRA_KIND,
+        ));
     }
 
     #[test]
