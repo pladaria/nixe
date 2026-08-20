@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeSet, fmt::Display};
 
-use crate::ShaderStage;
+use crate::{ShaderStage, VertexBufferLayout, VertexComponentWidth, VertexStepMode};
 
 /// Stable location within the original guest shader byte stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1260,6 +1260,7 @@ pub struct ShaderBackendModule {
     language: ShaderBackendLanguage,
     source: Box<str>,
     source_map: Box<[ShaderBackendSourceMapEntry]>,
+    ir: VerifiedShaderIr,
 }
 
 impl ShaderBackendModule {
@@ -1282,6 +1283,11 @@ impl ShaderBackendModule {
     pub fn source_map(&self) -> &[ShaderBackendSourceMapEntry] {
         &self.source_map
     }
+
+    #[must_use]
+    pub const fn ir(&self) -> &VerifiedShaderIr {
+        &self.ir
+    }
 }
 
 /// Neutral-to-backend lowering limitation, distinct from malformed guest code.
@@ -1293,6 +1299,7 @@ pub enum ShaderBackendLoweringError {
     ControlFlow(ShaderSourceLocation),
     ResourceAccess(ShaderSourceLocation),
     NumericControl(ShaderSourceLocation),
+    VertexFetch(&'static str),
 }
 
 impl Display for ShaderBackendLoweringError {
@@ -1314,6 +1321,23 @@ struct InterfaceGroup {
 pub fn lower_shader_ir_to_wgsl(
     shader: &VerifiedShaderIr,
 ) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+    lower_shader_ir_to_wgsl_impl(shader, None)
+}
+
+/// Lowers a vertex shader with exact storage-buffer fetches for input formats
+/// whose conversion or complete vector value cannot be represented directly.
+pub fn lower_shader_ir_to_wgsl_with_vertex_pulling(
+    shader: &VerifiedShaderIr,
+    layouts: &[VertexBufferLayout],
+    bind_group: u32,
+) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
+    lower_shader_ir_to_wgsl_impl(shader, Some((layouts, bind_group)))
+}
+
+fn lower_shader_ir_to_wgsl_impl(
+    shader: &VerifiedShaderIr,
+    vertex_pulling: Option<(&[VertexBufferLayout], u32)>,
+) -> Result<ShaderBackendModule, ShaderBackendLoweringError> {
     let ir = shader.ir();
     if !matches!(ir.stage, ShaderStage::Vertex | ShaderStage::Fragment) {
         return Err(ShaderBackendLoweringError::UnsupportedStage(ir.stage));
@@ -1327,10 +1351,30 @@ pub fn lower_shader_ir_to_wgsl(
                 scalar_type: ShaderScalarType::Unsigned32,
                 interpolation: None,
             });
+        if vertex_pulling.is_some_and(|(layouts, _)| {
+            layouts.iter().any(|layout| {
+                layout.step_mode == VertexStepMode::Instance
+                    && layout
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.format.requires_vertex_pulling())
+            })
+        }) {
+            input_groups
+                .entry(ShaderIoLocation::InstanceId)
+                .or_insert(InterfaceGroup {
+                    components: 1,
+                    scalar_type: ShaderScalarType::Unsigned32,
+                    interpolation: None,
+                });
+        }
     }
     let output_groups = interface_groups(&ir.outputs)?;
     let mut source = String::new();
     emit_wgsl_resources(&mut source, ir)?;
+    if let Some((layouts, bind_group)) = vertex_pulling {
+        emit_wgsl_vertex_pull_resources(&mut source, layouts, bind_group);
+    }
     source.push_str(
         "fn nixe_flush_denormal(bits: u32) -> u32 {\n\
            let magnitude = bits & 0x7fffffffu;\n\
@@ -1414,12 +1458,209 @@ pub fn lower_shader_ir_to_wgsl(
     } else {
         emit_wgsl_fragment_entry_points(&mut source, &input_groups, &output_groups);
     }
+    if let Some((layouts, _)) = vertex_pulling {
+        if ir.stage != ShaderStage::Vertex {
+            return Err(ShaderBackendLoweringError::VertexFetch(
+                "vertex pulling was requested for a non-vertex shader",
+            ));
+        }
+        let supports_fill_rectangle = output_groups
+            .get(&ShaderIoLocation::Position)
+            .is_some_and(|position| position.scalar_type == ShaderScalarType::Float32);
+        emit_wgsl_vertex_pull_entry_points(
+            &mut source,
+            &input_groups,
+            layouts,
+            supports_fill_rectangle,
+        )?;
+    }
     Ok(ShaderBackendModule {
         stage: ir.stage,
         language: ShaderBackendLanguage::Wgsl,
         source: source.into_boxed_str(),
         source_map: source_map.into_boxed_slice(),
+        ir: shader.clone(),
     })
+}
+
+fn emit_wgsl_vertex_pull_resources(
+    source: &mut String,
+    layouts: &[VertexBufferLayout],
+    bind_group: u32,
+) {
+    for (slot, layout) in layouts.iter().enumerate() {
+        if !layout
+            .attributes
+            .iter()
+            .any(|attribute| attribute.format.requires_vertex_pulling())
+        {
+            continue;
+        }
+        source.push_str(&format!(
+            "@group({bind_group}) @binding({slot}) var<storage, read> nixe_vertex_buffer_{slot}: array<u32>;\n\
+             fn nixe_vertex_buffer_{slot}_u8(byte_offset: u32) -> u32 {{\n\
+               let word = nixe_vertex_buffer_{slot}[byte_offset >> 2u];\n\
+               return (word >> ((byte_offset & 3u) * 8u)) & 0xffu;\n\
+             }}\n\
+             fn nixe_vertex_buffer_{slot}_u16(byte_offset: u32) -> u32 {{\n\
+               return nixe_vertex_buffer_{slot}_u8(byte_offset) |\n\
+                 (nixe_vertex_buffer_{slot}_u8(byte_offset + 1u) << 8u);\n\
+             }}\n\
+             fn nixe_vertex_buffer_{slot}_u32(byte_offset: u32) -> u32 {{\n\
+               return nixe_vertex_buffer_{slot}_u16(byte_offset) |\n\
+                 (nixe_vertex_buffer_{slot}_u16(byte_offset + 2u) << 16u);\n\
+             }}\n\n"
+        ));
+    }
+}
+
+fn emit_wgsl_vertex_pull_entry_points(
+    source: &mut String,
+    inputs: &std::collections::BTreeMap<ShaderIoLocation, InterfaceGroup>,
+    layouts: &[VertexBufferLayout],
+    supports_fill_rectangle: bool,
+) -> Result<(), ShaderBackendLoweringError> {
+    let mut pulled = std::collections::BTreeMap::new();
+    for (slot, layout) in layouts.iter().enumerate() {
+        for attribute in &layout.attributes {
+            if attribute.format.requires_vertex_pulling() {
+                pulled.insert(attribute.shader_location, (slot, layout, attribute));
+            }
+        }
+    }
+    let host_inputs = inputs
+        .iter()
+        .filter(|(location, _)| {
+            !matches!(location, ShaderIoLocation::Generic(index) if pulled.contains_key(&u32::from(*index)))
+        })
+        .map(|(location, group)| (*location, *group))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    emit_interface_struct(
+        source,
+        "NixeVertexPullInput",
+        ShaderStage::Vertex,
+        true,
+        &host_inputs,
+    )?;
+    source.push_str(
+        "\nfn nixe_vertex_pull_input(host: NixeVertexPullInput) -> ShaderInput {\n  var input: ShaderInput;\n",
+    );
+    for (location, group) in inputs {
+        let field = wgsl_field_name(*location);
+        let ShaderIoLocation::Generic(index) = location else {
+            source.push_str(&format!("  input.{field} = host.{field};\n"));
+            continue;
+        };
+        let Some((slot, layout, attribute)) = pulled.get(&u32::from(*index)).copied() else {
+            source.push_str(&format!("  input.{field} = host.{field};\n"));
+            continue;
+        };
+        let scaled = attribute.format.scaled_layout();
+        let integer = attribute.format.integer_layout();
+        let (signed, width, stored_components) = scaled
+            .or(integer)
+            .expect("pulled attributes have an explicit storage layout");
+        let expected_type = if scaled.is_some() {
+            ShaderScalarType::Float32
+        } else if signed {
+            ShaderScalarType::Signed32
+        } else {
+            ShaderScalarType::Unsigned32
+        };
+        if group.scalar_type != expected_type {
+            return Err(ShaderBackendLoweringError::VertexFetch(
+                "vertex storage format and shader input scalar type differ",
+            ));
+        }
+        let element = match layout.step_mode {
+            VertexStepMode::Vertex => "host.vertex_id",
+            VertexStepMode::Instance => "host.instance_id",
+        };
+        let base = layout
+            .buffer
+            .range
+            .offset()
+            .checked_add(attribute.offset)
+            .ok_or(ShaderBackendLoweringError::VertexFetch(
+                "vertex attribute base offset overflows",
+            ))?;
+        let base = u32::try_from(base).map_err(|_| {
+            ShaderBackendLoweringError::VertexFetch("vertex attribute base exceeds WGSL u32")
+        })?;
+        let stride = u32::try_from(layout.array_stride).map_err(|_| {
+            ShaderBackendLoweringError::VertexFetch("vertex stride exceeds WGSL u32")
+        })?;
+        let component_bytes = width.bytes() as u32;
+        // Generic vertex inputs use the neutral vec4 ABI even when the shader
+        // only consumes a prefix of their components. Populate that complete
+        // value so storage-backed and native vertex inputs expose the same
+        // interface to the guest shader body.
+        let values = (0..4)
+            .map(|component| {
+                if component >= stored_components.get() {
+                    return match (expected_type, component == 3) {
+                        (ShaderScalarType::Float32, true) => "1.0",
+                        (ShaderScalarType::Float32, false) => "0.0",
+                        (ShaderScalarType::Signed32, true) => "1i",
+                        (ShaderScalarType::Signed32, false) => "0i",
+                        (ShaderScalarType::Unsigned32, true) => "1u",
+                        (ShaderScalarType::Unsigned32, false) => "0u",
+                        _ => unreachable!("vertex storage formats are 32-bit shader scalars"),
+                    }
+                    .to_owned();
+                }
+                let offset = base + u32::from(component) * component_bytes;
+                let load = match width {
+                    VertexComponentWidth::Bits8 => "u8",
+                    VertexComponentWidth::Bits16 => "u16",
+                    VertexComponentWidth::Bits32 => "u32",
+                };
+                let raw =
+                    format!("nixe_vertex_buffer_{slot}_{load}({offset}u + {element} * {stride}u)");
+                if scaled.is_some() && signed {
+                    let shift = 32 - component_bytes * 8;
+                    format!("f32(i32({raw} << {shift}u) >> {shift}u)")
+                } else if scaled.is_some() {
+                    format!("f32({raw})")
+                } else if signed {
+                    let shift = 32 - component_bytes * 8;
+                    format!("i32({raw} << {shift}u) >> {shift}u")
+                } else {
+                    raw
+                }
+            })
+            .collect::<Vec<_>>();
+        let scalar = match expected_type {
+            ShaderScalarType::Float32 => "f32",
+            ShaderScalarType::Signed32 => "i32",
+            ShaderScalarType::Unsigned32 => "u32",
+            _ => unreachable!("vertex storage formats are 32-bit shader scalars"),
+        };
+        let value = format!("vec4<{scalar}>({})", values.join(", "));
+        source.push_str(&format!("  input.{field} = {value};\n"));
+    }
+    source.push_str(
+        "  return input;\n}\n\n\
+         @vertex\nfn nixe_vertex_pull(host: NixeVertexPullInput) -> ShaderOutput {\n\
+           return nixe_guest_vertex(nixe_vertex_pull_input(host));\n}\n",
+    );
+    if supports_fill_rectangle {
+        source.push_str(
+            "\n@vertex\nfn nixe_vertex_pull_fill_rectangle(host: NixeVertexPullInput) -> ShaderOutput {\n\
+               let host_vertex = host.vertex_id;\n\
+               let guest_base = (host_vertex / 6u) * 3u;\n\
+               var host0 = host;\n  var host1 = host;\n  var host2 = host;\n\
+               host0.vertex_id = guest_base;\n\
+               host1.vertex_id = guest_base + 1u;\n\
+               host2.vertex_id = guest_base + 2u;\n\
+               return nixe_expand_fill_rectangle(\n\
+                 nixe_guest_vertex(nixe_vertex_pull_input(host0)),\n\
+                 nixe_guest_vertex(nixe_vertex_pull_input(host1)),\n\
+                 nixe_guest_vertex(nixe_vertex_pull_input(host2)),\n\
+                 host_vertex);\n}\n",
+        );
+    }
+    Ok(())
 }
 
 fn emit_wgsl_fragment_entry_points(
@@ -1475,16 +1716,9 @@ fn emit_wgsl_vertex_entry_points(
 ) -> Result<(), ShaderBackendLoweringError> {
     source.push_str(
         "\n@vertex\nfn main(input: ShaderInput) -> ShaderOutput {\n  return nixe_guest_vertex(input);\n}\n\n\
-         @vertex\nfn nixe_fill_rectangle(input: ShaderInput) -> ShaderOutput {\n\
-           let host_vertex = input.vertex_id;\n\
-           let guest_base = (host_vertex / 6u) * 3u;\n\
-           var input0 = input;\n  var input1 = input;\n  var input2 = input;\n\
-           input0.vertex_id = guest_base;\n\
-           input1.vertex_id = guest_base + 1u;\n\
-           input2.vertex_id = guest_base + 2u;\n\
-           let vertex0 = nixe_guest_vertex(input0);\n\
-           let vertex1 = nixe_guest_vertex(input1);\n\
-           let vertex2 = nixe_guest_vertex(input2);\n\
+         fn nixe_expand_fill_rectangle(\n\
+           vertex0: ShaderOutput, vertex1: ShaderOutput, vertex2: ShaderOutput,\n\
+           host_vertex: u32) -> ShaderOutput {\n\
            let point0 = vertex0.position.xy / vertex0.position.w;\n\
            let point1 = vertex1.position.xy / vertex1.position.w;\n\
            let point2 = vertex2.position.xy / vertex2.position.w;\n\
@@ -1536,14 +1770,24 @@ fn emit_wgsl_vertex_entry_points(
                         "  output.{field} = (weight0 * vertex0.{field} / vertex0.position.w + weight1 * vertex1.{field} / vertex1.position.w + weight2 * vertex2.{field} / vertex2.position.w) * rectangle_w;\n"
                     ));
                 }
-                // An unconsumed vertex output has no linked interpolation
-                // contract. Its value is irrelevant to the fragment stage.
                 None => {}
             },
             other => return Err(ShaderBackendLoweringError::UnsupportedInterface(*other)),
         }
     }
-    source.push_str("  return output;\n}\n");
+    source.push_str(
+        "  return output;\n}\n\n\
+         @vertex\nfn nixe_fill_rectangle(input: ShaderInput) -> ShaderOutput {\n\
+           let host_vertex = input.vertex_id;\n\
+           let guest_base = (host_vertex / 6u) * 3u;\n\
+           var input0 = input;\n  var input1 = input;\n  var input2 = input;\n\
+           input0.vertex_id = guest_base;\n\
+           input1.vertex_id = guest_base + 1u;\n\
+           input2.vertex_id = guest_base + 2u;\n\
+           return nixe_expand_fill_rectangle(\n\
+             nixe_guest_vertex(input0), nixe_guest_vertex(input1),\n\
+             nixe_guest_vertex(input2), host_vertex);\n}\n",
+    );
     Ok(())
 }
 
@@ -4773,6 +5017,146 @@ mod tests {
             module
                 .source()
                 .contains("constant_buffer_1[(registers[0] + 0xfffffff0u) >> 2u]")
+        );
+        let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&parsed)
+        .unwrap();
+    }
+
+    #[test]
+    fn scaled_instance_input_lowers_to_exact_storage_buffer_vertex_pulling() {
+        let input = ShaderInterfaceElement::new(
+            ShaderIoLocation::Generic(0),
+            0,
+            ShaderScalarType::Float32,
+            None,
+        )
+        .unwrap();
+        let integer_input = ShaderInterfaceElement::new(
+            ShaderIoLocation::Generic(1),
+            0,
+            ShaderScalarType::Unsigned32,
+            None,
+        )
+        .unwrap();
+        let outputs = (0..4)
+            .map(|component| {
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Position,
+                    component,
+                    ShaderScalarType::Float32,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut instructions = vec![ShaderInstruction::new(
+            ShaderSourceLocation::new(8),
+            ShaderPredicate::Always,
+            ShaderOperation::LoadInput {
+                destinations: vec![ShaderRegister::new(0)].into_boxed_slice(),
+                location: ShaderIoLocation::Generic(0),
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            },
+        )];
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(12),
+            ShaderPredicate::Always,
+            ShaderOperation::LoadInput {
+                destinations: vec![ShaderRegister::new(4)].into_boxed_slice(),
+                location: ShaderIoLocation::Generic(1),
+                first_component: 0,
+                scalar_type: ShaderScalarType::Unsigned32,
+            },
+        ));
+        for register in 1..4 {
+            instructions.push(ShaderInstruction::new(
+                ShaderSourceLocation::new(8 + register * 8),
+                ShaderPredicate::Always,
+                ShaderOperation::MoveImmediate32 {
+                    destination: ShaderRegister::new(register as u16),
+                    bits: if register == 3 { 1.0_f32.to_bits() } else { 0 },
+                    scalar_type: ShaderScalarType::Float32,
+                },
+            ));
+        }
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(40),
+            ShaderPredicate::Always,
+            ShaderOperation::StoreOutput {
+                sources: (0..4).map(ShaderRegister::new).collect(),
+                location: ShaderIoLocation::Position,
+                first_component: 0,
+                scalar_type: ShaderScalarType::Float32,
+            },
+        ));
+        instructions.push(ShaderInstruction::new(
+            ShaderSourceLocation::new(48),
+            ShaderPredicate::Always,
+            ShaderOperation::Exit,
+        ));
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            vec![input, integer_input],
+            outputs,
+            Vec::new(),
+            instructions,
+        ))
+        .unwrap();
+        let layout = crate::VertexBufferLayout::new(
+            crate::BufferRegion {
+                buffer: crate::BufferId::new(1),
+                range: crate::BufferRange::new(16, 64).unwrap(),
+            },
+            4,
+            crate::VertexStepMode::Instance,
+            vec![
+                crate::VertexAttribute {
+                    format: crate::VertexFormat::Uscaled {
+                        width: crate::VertexComponentWidth::Bits16,
+                        components: crate::VertexComponentCount::One,
+                    },
+                    offset: 0,
+                    shader_location: 0,
+                },
+                crate::VertexAttribute {
+                    format: crate::VertexFormat::Uint8x2,
+                    offset: 2,
+                    shader_location: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let module = lower_shader_ir_to_wgsl_with_vertex_pulling(&shader, &[layout], 1).unwrap();
+        assert!(module.source().contains("@group(1) @binding(0)"));
+        assert!(module.source().contains("nixe_vertex_buffer_0_u16"));
+        assert!(module.source().contains("16u + host.instance_id * 4u"));
+        assert!(module.source().contains("input.generic_0 = vec4<f32>(f32("));
+        assert!(
+            module
+                .source()
+                .contains("input.generic_1 = vec4<u32>(nixe_vertex_buffer_0_u8")
+        );
+        assert!(module.source().contains(", 0u, 1u);"));
+        assert!(
+            module
+                .source()
+                .contains("@vertex\nfn nixe_vertex_pull_fill_rectangle(host: NixeVertexPullInput)")
+        );
+        assert!(
+            module
+                .source()
+                .contains("nixe_guest_vertex(nixe_vertex_pull_input(host0))")
+        );
+        assert!(
+            module
+                .source()
+                .contains("return nixe_expand_fill_rectangle(")
         );
         let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
         naga::valid::Validator::new(

@@ -42,8 +42,8 @@ pub use command::{
     CopyOperation, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
     DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
     OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
-    ViewportTransform,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
+    VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
 pub use completion::{
     BackendCompletionError, BackendCompletionSource, CompletionPropagationError,
@@ -76,7 +76,7 @@ pub use shader::{
     ShaderPredicateSetOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
     ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
     ShaderTextureSampleOutput, ShaderVerificationError, VerifiedShaderIr, evaluate_shader_ir,
-    lower_shader_ir_to_wgsl,
+    lower_shader_ir_to_wgsl, lower_shader_ir_to_wgsl_with_vertex_pulling,
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,

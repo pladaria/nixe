@@ -149,10 +149,11 @@ async fn initialize_backend_async(
         .map_err(|error| WgpuBackendInitializationError::Adapter(error.to_string().into()))?;
     let info = adapter.get_info();
     let required_limits = adapter.limits();
+    let required_features = requested_device_features(adapter.features());
     let (device, queue) = adapter
         .request_device(&DeviceDescriptor {
             label: Some("Nixe accelerated GPU backend"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: required_limits.clone(),
             experimental_features: ExperimentalFeatures::disabled(),
             memory_hints: MemoryHints::Performance,
@@ -160,7 +161,7 @@ async fn initialize_backend_async(
         })
         .await
         .map_err(|error| WgpuBackendInitializationError::Device(error.to_string().into()))?;
-    let capabilities = capabilities(&adapter, &required_limits);
+    let capabilities = capabilities(&adapter, &required_limits, required_features);
     let visibility = Arc::new(WgpuVisibilityCoordinator::new(device_id));
     let driver = WgpuBackendDriver::new(device, queue, Arc::clone(&visibility));
     Ok(InitializedWgpuBackend {
@@ -174,8 +175,31 @@ async fn initialize_backend_async(
     })
 }
 
-fn capabilities(adapter: &wgpu::Adapter, limits: &wgpu::Limits) -> BackendCapabilities {
+fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
+    adapter_features & wgpu::Features::FLOAT32_FILTERABLE
+}
+
+fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
+    match format {
+        // The neutral format capability currently covers every supported use of
+        // a format. Keep the float32 family out of that contract unless wgpu can
+        // also represent its filtered sampled-image use exactly.
+        ImageFormat::R32Float | ImageFormat::Rg32Float | ImageFormat::Rgba32Float => {
+            wgpu::Features::FLOAT32_FILTERABLE
+        }
+        _ => wgpu::Features::empty(),
+    }
+}
+
+fn capabilities(
+    adapter: &wgpu::Adapter,
+    limits: &wgpu::Limits,
+    enabled_features: wgpu::Features,
+) -> BackendCapabilities {
     let formats = ALL_IMAGE_FORMATS.into_iter().filter(|format| {
+        if !enabled_features.contains(required_features_for_image_format(*format)) {
+            return false;
+        }
         let Some(host) = driver::texture_format(*format) else {
             return false;
         };
@@ -247,6 +271,31 @@ impl std::error::Error for WgpuBackendInitializationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_enables_float32_filtering_only_when_the_adapter_supports_it() {
+        assert_eq!(
+            requested_device_features(wgpu::Features::FLOAT32_FILTERABLE),
+            wgpu::Features::FLOAT32_FILTERABLE
+        );
+        assert!(requested_device_features(wgpu::Features::empty()).is_empty());
+    }
+
+    #[test]
+    fn float32_image_formats_require_the_filtering_feature() {
+        for format in [
+            ImageFormat::R32Float,
+            ImageFormat::Rg32Float,
+            ImageFormat::Rgba32Float,
+        ] {
+            assert_eq!(
+                required_features_for_image_format(format),
+                wgpu::Features::FLOAT32_FILTERABLE
+            );
+        }
+        assert!(required_features_for_image_format(ImageFormat::Rgba16Float).is_empty());
+        assert!(required_features_for_image_format(ImageFormat::Rgba8Unorm).is_empty());
+    }
 
     #[test]
     fn non_vulkan_selection_is_explicitly_rejected_in_this_build() {

@@ -18,8 +18,8 @@ use nixe_gpu::{
     PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment, RenderPassDescription,
     RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency, ResourceTransition,
     ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage,
-    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode,
-    ViewportTransform,
+    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
+    VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{CanonicalCpuWriteOverlap, CanonicalPageId, ContentGeneration};
 
@@ -3162,13 +3162,15 @@ fn lower_draw(
         .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
             "VERTEX_ARRAY_START",
         ))?;
-    let first_instance = state
+    let base_instance = state
         .vertex_input()
         .assembly()
         .global_base_instance_index()
         .value()
         .copied()
         .unwrap_or(0);
+    let relative_instance = state.vertex_input().primitive().instance_index();
+    let first_instance = neutral_first_instance(base_instance, relative_instance)?;
 
     let mut vertex_buffers = Vec::new();
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
@@ -3598,8 +3600,13 @@ fn shader_pipeline_stages(
 fn primitive_topology(
     begin: MaxwellThreeDBegin,
 ) -> Result<PrimitiveTopology, MaxwellThreeDLoweringError> {
-    if begin.preserve_primitive_id() || begin.instance_id() != 0 || begin.split_mode() != 0 {
-        return Err(MaxwellThreeDLoweringError::UnsupportedBeginMode);
+    if begin.preserve_primitive_id() {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPrimitiveIdContinuation);
+    }
+    if begin.split_mode() != 0 {
+        return Err(MaxwellThreeDLoweringError::UnsupportedPrimitiveSplitMode(
+            begin.split_mode(),
+        ));
     }
     match begin.topology() {
         0 => Ok(PrimitiveTopology::Points),
@@ -3611,6 +3618,11 @@ fn primitive_topology(
         14 => Ok(PrimitiveTopology::Patches),
         topology => Err(MaxwellThreeDLoweringError::UnsupportedTopology(topology)),
     }
+}
+
+fn neutral_first_instance(base: u32, relative: u32) -> Result<u32, MaxwellThreeDLoweringError> {
+    base.checked_add(relative)
+        .ok_or(MaxwellThreeDLoweringError::InstanceIndexOverflow { base, relative })
 }
 
 fn neutral_vertex_format(
@@ -3640,6 +3652,24 @@ fn neutral_vertex_format(
 
     // Maxwell field values are pinned to NVIDIA's public class header:
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9097.h#L1021-L1055
+    let scaled_layout = || {
+        let (width, components) = match widths.raw() {
+            0x1d => (VertexComponentWidth::Bits8, VertexComponentCount::One),
+            0x18 => (VertexComponentWidth::Bits8, VertexComponentCount::Two),
+            0x13 => (VertexComponentWidth::Bits8, VertexComponentCount::Three),
+            0x0a => (VertexComponentWidth::Bits8, VertexComponentCount::Four),
+            0x1b => (VertexComponentWidth::Bits16, VertexComponentCount::One),
+            0x0f => (VertexComponentWidth::Bits16, VertexComponentCount::Two),
+            0x05 => (VertexComponentWidth::Bits16, VertexComponentCount::Three),
+            0x03 => (VertexComponentWidth::Bits16, VertexComponentCount::Four),
+            0x12 => (VertexComponentWidth::Bits32, VertexComponentCount::One),
+            0x04 => (VertexComponentWidth::Bits32, VertexComponentCount::Two),
+            0x02 => (VertexComponentWidth::Bits32, VertexComponentCount::Three),
+            0x01 => (VertexComponentWidth::Bits32, VertexComponentCount::Four),
+            _ => return None,
+        };
+        Some((width, components))
+    };
     let vertex = match (widths.raw(), numerical) {
         (0x01, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x4,
         (0x02, MaxwellThreeDVertexNumericalType::Float) => VertexFormat::Float32x3,
@@ -3673,6 +3703,28 @@ fn neutral_vertex_format(
         (0x18, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => VertexFormat::Unorm8x2,
         (0x30, MaxwellThreeDVertexNumericalType::UnsignedNormalized) => {
             VertexFormat::Unorm10_10_10_2
+        }
+        (_, MaxwellThreeDVertexNumericalType::UnsignedScaled) => {
+            let (width, components) = scaled_layout().ok_or(
+                MaxwellThreeDLoweringError::UnsupportedVertexAttributeFormat {
+                    attribute,
+                    component_widths: widths,
+                    numerical_type: numerical,
+                    swap_red_blue: false,
+                },
+            )?;
+            VertexFormat::Uscaled { width, components }
+        }
+        (_, MaxwellThreeDVertexNumericalType::SignedScaled) => {
+            let (width, components) = scaled_layout().ok_or(
+                MaxwellThreeDLoweringError::UnsupportedVertexAttributeFormat {
+                    attribute,
+                    component_widths: widths,
+                    numerical_type: numerical,
+                    swap_red_blue: false,
+                },
+            )?;
+            VertexFormat::Sscaled { width, components }
         }
         _ => {
             return Err(
@@ -4064,7 +4116,12 @@ pub enum MaxwellThreeDLoweringError {
         target: u8,
     },
     EmptyDraw,
-    UnsupportedBeginMode,
+    UnsupportedPrimitiveIdContinuation,
+    UnsupportedPrimitiveSplitMode(u8),
+    InstanceIndexOverflow {
+        base: u32,
+        relative: u32,
+    },
     UnsupportedTopology(u8),
     AliasedDrawResources {
         first: MaxwellThreeDResourceRole,
@@ -4435,8 +4492,16 @@ impl Display for MaxwellThreeDLoweringError {
                 "SET_CT_SELECT routes one color target more than once: target={target}"
             ),
             Self::EmptyDraw => formatter.write_str("draw vertex count is zero"),
-            Self::UnsupportedBeginMode => formatter
-                .write_str("BEGIN selects unsupported primitive-ID, instance, or split semantics"),
+            Self::UnsupportedPrimitiveIdContinuation => formatter
+                .write_str("BEGIN requests unsupported primitive-ID continuation semantics"),
+            Self::UnsupportedPrimitiveSplitMode(mode) => write!(
+                formatter,
+                "BEGIN requests unsupported split-primitive semantics: mode={mode}"
+            ),
+            Self::InstanceIndexOverflow { base, relative } => write!(
+                formatter,
+                "Maxwell instance index exceeds the neutral u32 domain: base={base} relative={relative}"
+            ),
             Self::UnsupportedTopology(topology) => write!(
                 formatter,
                 "primitive topology has no neutral lowering: topology={topology:#x}"
@@ -4473,11 +4538,17 @@ impl std::error::Error for MaxwellThreeDLoweringError {}
 
 #[cfg(test)]
 mod tests {
-    use nixe_gpu::{DepthCompareOperation, VertexFormat};
+    use nixe_gpu::{
+        DepthCompareOperation, PrimitiveTopology, VertexComponentCount, VertexComponentWidth,
+        VertexFormat,
+    };
 
-    use crate::{MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
+    use crate::{MaxwellThreeDBegin, MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
-    use super::{depth_stencil_attachment_required, neutral_depth_compare, neutral_vertex_format};
+    use super::{
+        MaxwellThreeDLoweringError, depth_stencil_attachment_required, neutral_depth_compare,
+        neutral_first_instance, neutral_vertex_format, primitive_topology,
+    };
 
     #[test]
     fn every_maxwell_depth_comparison_has_an_exact_neutral_mapping() {
@@ -4539,5 +4610,112 @@ mod tests {
         assert_eq!(neutral_vertex_format(1, color), Ok(VertexFormat::Float32x3));
         assert_eq!(position.offset(), 0);
         assert_eq!(color.offset(), 12);
+    }
+
+    #[test]
+    fn scaled_vertex_family_preserves_width_count_and_signedness() {
+        for (width_raw, width, components) in [
+            (0x1d, VertexComponentWidth::Bits8, VertexComponentCount::One),
+            (0x18, VertexComponentWidth::Bits8, VertexComponentCount::Two),
+            (
+                0x13,
+                VertexComponentWidth::Bits8,
+                VertexComponentCount::Three,
+            ),
+            (
+                0x0a,
+                VertexComponentWidth::Bits8,
+                VertexComponentCount::Four,
+            ),
+            (
+                0x1b,
+                VertexComponentWidth::Bits16,
+                VertexComponentCount::One,
+            ),
+            (
+                0x0f,
+                VertexComponentWidth::Bits16,
+                VertexComponentCount::Two,
+            ),
+            (
+                0x05,
+                VertexComponentWidth::Bits16,
+                VertexComponentCount::Three,
+            ),
+            (
+                0x03,
+                VertexComponentWidth::Bits16,
+                VertexComponentCount::Four,
+            ),
+            (
+                0x12,
+                VertexComponentWidth::Bits32,
+                VertexComponentCount::One,
+            ),
+            (
+                0x04,
+                VertexComponentWidth::Bits32,
+                VertexComponentCount::Two,
+            ),
+            (
+                0x02,
+                VertexComponentWidth::Bits32,
+                VertexComponentCount::Three,
+            ),
+            (
+                0x01,
+                VertexComponentWidth::Bits32,
+                VertexComponentCount::Four,
+            ),
+        ] {
+            for (type_raw, expected) in [
+                (5, VertexFormat::Uscaled { width, components }),
+                (6, VertexFormat::Sscaled { width, components }),
+            ] {
+                let format =
+                    MaxwellThreeDVertexAttributeFormat::parse((width_raw << 21) | (type_raw << 27))
+                        .unwrap();
+                assert_eq!(neutral_vertex_format(0, format), Ok(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn instance_begin_modes_do_not_change_primitive_topology() {
+        for instance in [0, 1, 2] {
+            let begin = MaxwellThreeDBegin::parse(4 | (instance << 26)).unwrap();
+            assert_eq!(primitive_topology(begin), Ok(PrimitiveTopology::Triangles));
+        }
+    }
+
+    #[test]
+    fn primitive_continuation_modes_remain_precise_fatal_boundaries() {
+        let primitive_id = MaxwellThreeDBegin::parse(4 | (1 << 24)).unwrap();
+        assert_eq!(
+            primitive_topology(primitive_id),
+            Err(MaxwellThreeDLoweringError::UnsupportedPrimitiveIdContinuation)
+        );
+
+        for split_mode in 1..=3 {
+            let split = MaxwellThreeDBegin::parse(4 | (split_mode << 29)).unwrap();
+            assert_eq!(
+                primitive_topology(split),
+                Err(MaxwellThreeDLoweringError::UnsupportedPrimitiveSplitMode(
+                    split_mode as u8
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn relative_instance_is_added_to_base_instance_without_loss() {
+        assert_eq!(neutral_first_instance(7, 2), Ok(9));
+        assert_eq!(
+            neutral_first_instance(u32::MAX, 1),
+            Err(MaxwellThreeDLoweringError::InstanceIndexOverflow {
+                base: u32::MAX,
+                relative: 1,
+            })
+        );
     }
 }

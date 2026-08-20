@@ -660,6 +660,7 @@ pub struct MaxwellThreeDPrimitiveState {
     vertex_array_start: MaxwellThreeDRegister<u32>,
     begin: MaxwellThreeDRegister<MaxwellThreeDBegin>,
     end: MaxwellThreeDRegister<bool>,
+    instance_index: u32,
     open: bool,
 }
 
@@ -730,13 +731,27 @@ impl MaxwellThreeDPrimitiveState {
     pub const fn active_begin(&self) -> Option<&MaxwellThreeDBegin> {
         if self.open { self.begin.value() } else { None }
     }
+
+    /// Zero-based instance selected by the current `BEGIN` sequence.
+    #[must_use]
+    pub const fn instance_index(&self) -> u32 {
+        self.instance_index
+    }
+}
+
+/// Instance-counter transition selected by `BEGIN.INSTANCE_ID`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MaxwellThreeDBeginInstance {
+    First,
+    Subsequent,
+    Unchanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDBegin {
     topology: u8,
     preserve_primitive_id: bool,
-    instance_id: u8,
+    instance: MaxwellThreeDBeginInstance,
     split_mode: u8,
 }
 
@@ -748,7 +763,12 @@ impl MaxwellThreeDBegin {
         Some(Self {
             topology: (raw & 0xff) as u8,
             preserve_primitive_id: raw & (1 << 24) != 0,
-            instance_id: ((raw >> 26) & 3) as u8,
+            instance: match (raw >> 26) & 3 {
+                0 => MaxwellThreeDBeginInstance::First,
+                1 => MaxwellThreeDBeginInstance::Subsequent,
+                2 => MaxwellThreeDBeginInstance::Unchanged,
+                _ => return None,
+            },
             split_mode: ((raw >> 29) & 3) as u8,
         })
     }
@@ -762,7 +782,15 @@ impl MaxwellThreeDBegin {
     }
     #[must_use]
     pub const fn instance_id(self) -> u8 {
-        self.instance_id
+        match self.instance {
+            MaxwellThreeDBeginInstance::First => 0,
+            MaxwellThreeDBeginInstance::Subsequent => 1,
+            MaxwellThreeDBeginInstance::Unchanged => 2,
+        }
+    }
+    #[must_use]
+    pub const fn instance(self) -> MaxwellThreeDBeginInstance {
+        self.instance
     }
     #[must_use]
     pub const fn split_mode(self) -> u8 {
@@ -842,7 +870,14 @@ impl MaxwellThreeDVertexInputState {
         dependencies.push(self.primitive.restart_enabled.raw());
         dependencies.push(self.primitive.restart_index.raw());
         if self.primitive.is_open() {
-            dependencies.push(self.primitive.begin.raw());
+            // BEGIN instance sequencing, primitive-ID continuation, and split
+            // boundaries are draw-command state. Only topology contributes to
+            // immutable host pipeline identity.
+            dependencies.push(
+                self.primitive
+                    .active_begin()
+                    .map(|begin| u32::from(begin.topology())),
+            );
         }
         if self
             .primitive
@@ -948,6 +983,16 @@ impl MaxwellThreeDVertexInputState {
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::Begin { value, .. } => {
+                // deko3d emits FIRST followed by SUBSEQUENT BEGIN writes for
+                // the one-instance draws that compose a public instanced draw.
+                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
+                self.primitive.instance_index = match value.instance() {
+                    MaxwellThreeDBeginInstance::First => 0,
+                    MaxwellThreeDBeginInstance::Subsequent => {
+                        self.primitive.instance_index.wrapping_add(1)
+                    }
+                    MaxwellThreeDBeginInstance::Unchanged => self.primitive.instance_index,
+                };
                 self.primitive.begin = MaxwellThreeDRegister::programmed(raw, value, source);
                 self.primitive.open = true;
             }

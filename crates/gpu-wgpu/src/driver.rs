@@ -47,6 +47,7 @@ enum Resource {
     Shader {
         module: ShaderModule,
         stage: ShaderStage,
+        ir: nixe_gpu::VerifiedShaderIr,
     },
     Pipeline {
         description: PipelineDescription,
@@ -100,6 +101,18 @@ fn alpha_test_entry_point(alpha_test: Option<AlphaTest>) -> &'static str {
         Some(AlphaCompareOperation::NotEqual) => "nixe_alpha_not_equal",
         Some(AlphaCompareOperation::GreaterEqual) => "nixe_alpha_greater_equal",
         Some(AlphaCompareOperation::Always) => "nixe_alpha_always",
+    }
+}
+
+fn vertex_entry_point(
+    uses_vertex_pulling: bool,
+    triangle_rasterization: TriangleRasterization,
+) -> &'static str {
+    match (uses_vertex_pulling, triangle_rasterization) {
+        (false, TriangleRasterization::Fill) => "main",
+        (false, TriangleRasterization::FillRectangle) => "nixe_fill_rectangle",
+        (true, TriangleRasterization::Fill) => "nixe_vertex_pull",
+        (true, TriangleRasterization::FillRectangle) => "nixe_vertex_pull_fill_rectangle",
     }
 }
 
@@ -595,6 +608,13 @@ impl WgpuBackendDriver {
             let pipeline = self.render_pipeline(dependencies, attachments, draw)?;
             pass.set_pipeline(pipeline);
             for (slot, layout) in draw.vertex_buffers.iter().enumerate() {
+                if !layout
+                    .attributes
+                    .iter()
+                    .any(|attribute| !attribute.format.requires_vertex_pulling())
+                {
+                    continue;
+                }
                 let buffer = self.buffer(dependency_handle(
                     dependencies,
                     ResourceDependency::Buffer(layout.buffer.buffer),
@@ -688,7 +708,8 @@ impl WgpuBackendDriver {
         draw: &DrawOperation,
     ) -> Result<Vec<BindGroup>, BackendDriverError> {
         let pipeline = self.render_pipeline(dependencies, attachments, draw)?;
-        draw.descriptor_tables
+        let mut groups = draw
+            .descriptor_tables
             .iter()
             .enumerate()
             .map(|(group, table)| {
@@ -752,7 +773,43 @@ impl WgpuBackendDriver {
                     entries: &entries,
                 }))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let pulled_layouts = draw
+            .vertex_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, layout)| {
+                layout
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.format.requires_vertex_pulling())
+            })
+            .collect::<Vec<_>>();
+        if !pulled_layouts.is_empty() {
+            let group = u32::try_from(draw.descriptor_tables.len())
+                .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
+            let entries = pulled_layouts
+                .into_iter()
+                .map(|(slot, layout)| {
+                    let handle = dependency_handle(
+                        dependencies,
+                        ResourceDependency::Buffer(layout.buffer.buffer),
+                    )?;
+                    let buffer = self.buffer(handle)?;
+                    Ok(BindGroupEntry {
+                        binding: u32::try_from(slot)
+                            .map_err(|_| unsupported("vertex-pull binding overflow"))?,
+                        resource: buffer.as_entire_binding(),
+                    })
+                })
+                .collect::<Result<Vec<_>, BackendDriverError>>()?;
+            groups.push(self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Nixe vertex-pull buffers"),
+                layout: &pipeline.get_bind_group_layout(group),
+                entries: &entries,
+            }));
+        }
+        Ok(groups)
     }
 
     fn ensure_render_pipeline(
@@ -763,8 +820,9 @@ impl WgpuBackendDriver {
     ) -> Result<(), BackendDriverError> {
         let pipeline_handle =
             dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let (vertex_handle, vertex) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
-        let (fragment_handle, fragment) =
+        let (vertex_handle, vertex, vertex_ir) =
+            self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
+        let (fragment_handle, fragment, _) =
             self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
         let color_format = attachments
             .iter()
@@ -825,6 +883,30 @@ impl WgpuBackendDriver {
             })
             .transpose()?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
+        let uses_vertex_pulling = draw.vertex_buffers.iter().any(|layout| {
+            layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.format.requires_vertex_pulling())
+        });
+        let vertex = if uses_vertex_pulling {
+            let group = u32::try_from(draw.descriptor_tables.len())
+                .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
+            let module = nixe_gpu::lower_shader_ir_to_wgsl_with_vertex_pulling(
+                &vertex_ir,
+                &draw.vertex_buffers,
+                group,
+            )
+            .map_err(|error| {
+                BackendDriverError::failure(format!("vertex-input pulling failed: {error}"))
+            })?;
+            self.device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("Nixe vertex-pulling shader"),
+                source: ShaderSource::Wgsl(module.source().into()),
+            })
+        } else {
+            vertex
+        };
         let attribute_storage = draw
             .vertex_buffers
             .iter()
@@ -832,8 +914,10 @@ impl WgpuBackendDriver {
                 layout
                     .attributes
                     .iter()
+                    .filter(|attribute| !attribute.format.requires_vertex_pulling())
                     .map(|attribute| WgpuVertexAttribute {
-                        format: vertex_format(attribute.format),
+                        format: vertex_format(attribute.format)
+                            .expect("pulled formats were filtered before native vertex lowering"),
                         offset: attribute.offset,
                         shader_location: attribute.shader_location,
                     })
@@ -845,7 +929,7 @@ impl WgpuBackendDriver {
             .iter()
             .zip(&attribute_storage)
             .map(|(layout, attributes)| {
-                Some(WgpuVertexBufferLayout {
+                (!attributes.is_empty()).then_some(WgpuVertexBufferLayout {
                     array_stride: layout.array_stride,
                     step_mode: match layout.step_mode {
                         VertexStepMode::Vertex => WgpuVertexStepMode::Vertex,
@@ -868,10 +952,10 @@ impl WgpuBackendDriver {
                 layout: None,
                 vertex: VertexState {
                     module: &vertex,
-                    entry_point: Some(match draw.triangle_rasterization {
-                        TriangleRasterization::Fill => "main",
-                        TriangleRasterization::FillRectangle => "nixe_fill_rectangle",
-                    }),
+                    entry_point: Some(vertex_entry_point(
+                        uses_vertex_pulling,
+                        draw.triangle_rasterization,
+                    )),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &vertex_buffers,
                 },
@@ -915,8 +999,8 @@ impl WgpuBackendDriver {
     ) -> Result<&RenderPipeline, BackendDriverError> {
         let pipeline_handle =
             dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let (vertex, _) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
-        let (fragment, _) = self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
+        let (vertex, _, _) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
+        let (fragment, _, _) = self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
         let key = RenderPipelineKey {
             vertex,
             fragment,
@@ -947,19 +1031,27 @@ impl WgpuBackendDriver {
         &self,
         dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
         stage: ShaderStage,
-    ) -> Result<(BackendResourceHandle, ShaderModule), BackendDriverError> {
+    ) -> Result<
+        (
+            BackendResourceHandle,
+            ShaderModule,
+            nixe_gpu::VerifiedShaderIr,
+        ),
+        BackendDriverError,
+    > {
         let mut found = None;
         for handle in dependencies.values().copied() {
             if let Some(Resource::Shader {
                 module,
                 stage: candidate,
+                ir,
             }) = self.resources.get(&handle)
                 && *candidate == stage
             {
                 if found.is_some() {
                     return Err(unsupported("multiple shaders for one pipeline stage"));
                 }
-                found = Some((handle, module.clone()));
+                found = Some((handle, module.clone(), ir.clone()));
             }
         }
         found.ok_or_else(|| unsupported("missing shader stage"))
@@ -1316,6 +1408,7 @@ impl BackendDriver for WgpuBackendDriver {
                     source: ShaderSource::Wgsl(module.source().into()),
                 }),
                 stage: description.stage,
+                ir: module.ir().clone(),
             },
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
                 description: *description,
@@ -1541,8 +1634,8 @@ pub(crate) fn required_texture_usages(format: ImageFormat) -> TextureUsages {
     }
 }
 
-const fn vertex_format(format: VertexFormat) -> WgpuVertexFormat {
-    match format {
+const fn vertex_format(format: VertexFormat) -> Option<WgpuVertexFormat> {
+    Some(match format {
         VertexFormat::Uint8x2 => WgpuVertexFormat::Uint8x2,
         VertexFormat::Uint8x4 => WgpuVertexFormat::Uint8x4,
         VertexFormat::Sint8x2 => WgpuVertexFormat::Sint8x2,
@@ -1574,7 +1667,8 @@ const fn vertex_format(format: VertexFormat) -> WgpuVertexFormat {
         VertexFormat::Sint32x3 => WgpuVertexFormat::Sint32x3,
         VertexFormat::Sint32x4 => WgpuVertexFormat::Sint32x4,
         VertexFormat::Unorm10_10_10_2 => WgpuVertexFormat::Unorm10_10_10_2,
-    }
+        VertexFormat::Uscaled { .. } | VertexFormat::Sscaled { .. } => return None,
+    })
 }
 
 fn texture_extent(description: ImageDescription) -> Extent3d {
@@ -1919,15 +2013,36 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 mod tests {
     use nixe_gpu::{
         BlockLinearLayout, DepthCompareOperation, ImageDescription, ImageDimension, ImageExtent,
-        ImageFormat, ImageKind, ImageMemoryLayout, SampleCount, ViewportTransform,
+        ImageFormat, ImageKind, ImageMemoryLayout, SampleCount, TriangleRasterization,
+        ViewportTransform,
     };
     use wgpu::{CompareFunction, TextureFormat, TextureUsages, TextureViewDimension};
 
     use super::{
         ImageCopyShape, WebGpuViewport, compare_function, image_texture_plan,
-        linearize_canonical_image, sampled_texture_view_descriptor, webgpu_viewport,
-        write_linear_image_to_canonical,
+        linearize_canonical_image, sampled_texture_view_descriptor, vertex_entry_point,
+        webgpu_viewport, write_linear_image_to_canonical,
     };
+
+    #[test]
+    fn vertex_entry_points_compose_pulling_and_rectangle_expansion() {
+        assert_eq!(
+            vertex_entry_point(false, TriangleRasterization::Fill),
+            "main"
+        );
+        assert_eq!(
+            vertex_entry_point(false, TriangleRasterization::FillRectangle),
+            "nixe_fill_rectangle"
+        );
+        assert_eq!(
+            vertex_entry_point(true, TriangleRasterization::Fill),
+            "nixe_vertex_pull"
+        );
+        assert_eq!(
+            vertex_entry_point(true, TriangleRasterization::FillRectangle),
+            "nixe_vertex_pull_fill_rectangle"
+        );
+    }
 
     #[test]
     fn two_dimensional_image_arrays_create_explicit_array_views() {

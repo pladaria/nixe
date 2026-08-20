@@ -24,7 +24,7 @@ use nixe_memory::{
 
 use crate::{
     MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDShaderStage, MaxwellThreeDState,
+    MaxwellThreeDShaderStage, MaxwellThreeDState, MaxwellThreeDVertexNumericalType,
 };
 
 /// NVIDIA specifies a version-3 Maxwell shader program header as 640 bits.
@@ -151,6 +151,7 @@ pub(crate) struct MaxwellShaderTranslationKey {
     staged_overlay: Box<[MaxwellStagedShaderWrite]>,
     resource_binding_remap: Box<[(u8, u8)]>,
     linked_output_interpolation: Box<[(ShaderIoLocation, ShaderInterpolation)]>,
+    vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
 }
 
 impl MaxwellShaderTranslationKey {
@@ -735,10 +736,11 @@ impl<'a> MaxwellShaderMemoryView<'a> {
 fn translate_shader_binary(
     binary: &MaxwellShaderBinary,
     register_count: u8,
+    vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
     let stage = binary.header.stage;
     let neutral_stage = neutral_stage(stage);
-    let mut inputs = decode_header_inputs(binary.header)?;
+    let mut inputs = decode_header_inputs(binary.header, vertex_input_types)?;
     let outputs = decode_header_outputs(binary.header)?;
     let mut instructions = preload_vertex_inputs(neutral_stage, &inputs);
     let mut constant_buffer_bindings = BTreeSet::new();
@@ -854,7 +856,13 @@ fn translate_shader_binary(
                     target: decode_shader_control_target(stage, offset, encoding, code_size)?,
                 }
             } else if is_attribute_load(encoding) {
-                let operations = decode_attribute_load(stage, offset, encoding, register_count)?;
+                let operations = decode_attribute_load(
+                    stage,
+                    offset,
+                    encoding,
+                    register_count,
+                    vertex_input_types,
+                )?;
                 for operation in &operations {
                     if let ShaderOperation::LoadInput {
                         location:
@@ -1189,6 +1197,7 @@ fn neutral_stage(stage: MaxwellThreeDShaderStage) -> ShaderStage {
 
 fn decode_header_inputs(
     header: MaxwellShaderProgramHeader,
+    vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<Vec<ShaderInterfaceElement>, MaxwellShaderTranslationError> {
     let mut inputs = Vec::new();
     if header.stage == MaxwellThreeDShaderStage::Pixel {
@@ -1231,11 +1240,19 @@ fn decode_header_inputs(
         for generic in 0..32_u8 {
             for component in 0..4_u8 {
                 if header.bit(192 + generic as usize * 4 + component as usize) {
-                    inputs.push(interface_element(
-                        ShaderIoLocation::Generic(generic),
-                        component,
-                        None,
-                    ));
+                    let location = ShaderIoLocation::Generic(generic);
+                    inputs.push(
+                        ShaderInterfaceElement::new(
+                            location,
+                            component,
+                            vertex_input_types
+                                .get(&location)
+                                .copied()
+                                .unwrap_or(ShaderScalarType::Float32),
+                            None,
+                        )
+                        .expect("decoded SPH component is bounded"),
+                    );
                 }
             }
         }
@@ -3147,6 +3164,7 @@ fn decode_attribute_load(
     offset: u32,
     encoding: u64,
     register_count: u8,
+    vertex_input_types: &BTreeMap<ShaderIoLocation, ShaderScalarType>,
 ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
     let destination = (encoding & 0xff) as u8;
     let components = (((encoding >> 47) & 0x3) + 1) as u8;
@@ -3180,8 +3198,12 @@ fn decode_attribute_load(
         let address = first_address
             .checked_add(u16::from(component) * 4)
             .ok_or_else(|| malformed(stage, offset, encoding, "ALD attribute address overflows"))?;
-        let (location, first_component, scalar_type, _) =
+        let (location, first_component, default_scalar_type, _) =
             input_attribute_location(stage, offset, encoding, address)?;
+        let scalar_type = vertex_input_types
+            .get(&location)
+            .copied()
+            .unwrap_or(default_scalar_type);
         let destination = ShaderRegister::new(u16::from(destination + component));
         if let Some(ShaderOperation::LoadInput {
             destinations,
@@ -3825,6 +3847,8 @@ pub(crate) fn translate_maxwell_shader_programs(
         .ok_or(MaxwellShaderTranslationError::MissingProgramRegion)?
         .get();
     let memory = MaxwellShaderMemoryView::new(address_space, staged_writes);
+    let vertex_input_types = maxwell_vertex_input_types(state);
+    let no_vertex_input_types = BTreeMap::new();
     let mut programs = Vec::new();
 
     for (pipeline_index, pipeline) in bindings.pipeline().iter().enumerate() {
@@ -3858,7 +3882,13 @@ pub(crate) fn translate_maxwell_shader_programs(
         let binary = read_shader_binary(&memory, stage, address)?;
         let header = binary.header();
         validate_program_header(stage, header)?;
-        let translated = translate_shader_binary(&binary, register_count)?;
+        let program_vertex_input_types = if neutral_stage(stage) == ShaderStage::Vertex {
+            &vertex_input_types
+        } else {
+            &no_vertex_input_types
+        };
+        let translated =
+            translate_shader_binary(&binary, register_count, program_vertex_input_types)?;
         let texture_constant_buffer_slot = if translated.texture_bindings.is_empty() {
             bindings
                 .bindless_texture_constant_buffer_slot()
@@ -3897,6 +3927,10 @@ pub(crate) fn translate_maxwell_shader_programs(
                 staged_overlay: binary.staged_overlay.clone(),
                 resource_binding_remap: Box::new([]),
                 linked_output_interpolation: Box::new([]),
+                vertex_input_types: program_vertex_input_types
+                    .iter()
+                    .map(|(location, scalar_type)| (*location, *scalar_type))
+                    .collect(),
             },
             stage: neutral_stage(stage),
             bind_group,
@@ -3919,6 +3953,41 @@ pub(crate) fn translate_maxwell_shader_programs(
     link_graphics_stage_interpolation(&mut programs)?;
 
     Ok(programs)
+}
+
+fn maxwell_vertex_input_types(
+    state: &MaxwellThreeDState,
+) -> BTreeMap<ShaderIoLocation, ShaderScalarType> {
+    // The SPH input map describes component occupancy; the vertex attribute's
+    // NUM_* field supplies the numerical interpretation. Field definitions:
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/cl9097.h#L1044-L1055
+    state
+        .vertex_input()
+        .attributes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, register)| {
+            let format = register.value().copied()?;
+            if !format.enabled() {
+                return None;
+            }
+            let scalar_type = match format.numerical_type()? {
+                MaxwellThreeDVertexNumericalType::SignedInteger => ShaderScalarType::Signed32,
+                MaxwellThreeDVertexNumericalType::UnsignedInteger => ShaderScalarType::Unsigned32,
+                MaxwellThreeDVertexNumericalType::SignedNormalized
+                | MaxwellThreeDVertexNumericalType::UnsignedNormalized
+                | MaxwellThreeDVertexNumericalType::UnsignedScaled
+                | MaxwellThreeDVertexNumericalType::SignedScaled
+                | MaxwellThreeDVertexNumericalType::Float => ShaderScalarType::Float32,
+            };
+            Some((
+                ShaderIoLocation::Generic(
+                    u8::try_from(index).expect("Maxwell vertex attribute count fits u8"),
+                ),
+                scalar_type,
+            ))
+        })
+        .collect()
 }
 
 /// Maxwell records interpolation on fragment `IPA` inputs. Copy that linked
@@ -4443,7 +4512,9 @@ mod tests {
         let memory = MaxwellShaderMemoryView::new(&address_space, &[]);
         let binary = read_shader_binary(&memory, stage, address).unwrap();
         validate_program_header(stage, binary.header()).unwrap();
-        translate_shader_binary(&binary, register_count).unwrap().ir
+        translate_shader_binary(&binary, register_count, &BTreeMap::new())
+            .unwrap()
+            .ir
     }
 
     fn validate_wgsl(module: &ShaderBackendModule) {
@@ -5088,6 +5159,7 @@ mod tests {
             8,
             0xefd8_ff80_2f87_ff00,
             4,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -5108,7 +5180,13 @@ mod tests {
             ] if instance[0].index() == 0 && vertex[0].index() == 1
         ));
         assert!(matches!(
-            decode_attribute_load(MaxwellThreeDShaderStage::Pixel, 8, 0xefd8_7f80_2fc7_ff00, 4,),
+            decode_attribute_load(
+                MaxwellThreeDShaderStage::Pixel,
+                8,
+                0xefd8_7f80_2fc7_ff00,
+                4,
+                &BTreeMap::new(),
+            ),
             Err(MaxwellShaderTranslationError::MalformedInstruction {
                 reason: "vertex system-value ALD is used outside a vertex shader",
                 ..
@@ -5123,6 +5201,7 @@ mod tests {
             8,
             0xefd8_ff80_08c7_ff02,
             8,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -6626,6 +6705,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn vertex_integer_formats_define_shader_input_scalar_types() {
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        program_three_d(
+            &mut channel,
+            0,
+            SWITCH_1_GM20B_PROFILE.classes().three_d().0,
+        );
+        // Attribute 1: stream 0, active, offset 2, R8_G8, NUM_UINT.
+        program_three_d(&mut channel, 0x1164, 0x2300_0100);
+
+        let types = maxwell_vertex_input_types(channel.three_d());
+        assert_eq!(
+            types.get(&ShaderIoLocation::Generic(1)),
+            Some(&ShaderScalarType::Unsigned32)
+        );
     }
 
     #[test]
