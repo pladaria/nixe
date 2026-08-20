@@ -324,6 +324,46 @@ pub enum VertexStepMode {
     Instance,
 }
 
+/// Physical width of one component in a scaled vertex attribute.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VertexComponentWidth {
+    Bits8,
+    Bits16,
+    Bits32,
+}
+
+impl VertexComponentWidth {
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Bits8 => 1,
+            Self::Bits16 => 2,
+            Self::Bits32 => 4,
+        }
+    }
+}
+
+/// Number of consecutive components in one scaled vertex attribute.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VertexComponentCount {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+impl VertexComponentCount {
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+        }
+    }
+}
+
 /// Exact host-independent storage format of one vertex attribute.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VertexFormat {
@@ -358,6 +398,16 @@ pub enum VertexFormat {
     Sint32x3,
     Sint32x4,
     Unorm10_10_10_2,
+    /// Unsigned integer storage converted to equal-magnitude floating point.
+    Uscaled {
+        width: VertexComponentWidth,
+        components: VertexComponentCount,
+    },
+    /// Signed integer storage converted to equal-magnitude floating point.
+    Sscaled {
+        width: VertexComponentWidth,
+        components: VertexComponentCount,
+    },
 }
 
 impl VertexFormat {
@@ -388,7 +438,53 @@ impl VertexFormat {
             | Self::Sint32x2 => 8,
             Self::Float32x3 | Self::Uint32x3 | Self::Sint32x3 => 12,
             Self::Float32x4 | Self::Uint32x4 | Self::Sint32x4 => 16,
+            Self::Uscaled { width, components } | Self::Sscaled { width, components } => {
+                width.bytes() * components.get() as u64
+            }
         }
+    }
+
+    #[must_use]
+    pub const fn scaled_layout(self) -> Option<(bool, VertexComponentWidth, VertexComponentCount)> {
+        match self {
+            Self::Uscaled { width, components } => Some((false, width, components)),
+            Self::Sscaled { width, components } => Some((true, width, components)),
+            _ => None,
+        }
+    }
+
+    /// Returns the signedness, storage width, and component count for integer
+    /// formats whose shader-visible vector must be reconstructed explicitly.
+    #[must_use]
+    pub const fn integer_layout(
+        self,
+    ) -> Option<(bool, VertexComponentWidth, VertexComponentCount)> {
+        use VertexComponentCount::{Four, One, Three, Two};
+        use VertexComponentWidth::{Bits8, Bits16, Bits32};
+        match self {
+            Self::Uint8x2 => Some((false, Bits8, Two)),
+            Self::Uint8x4 => Some((false, Bits8, Four)),
+            Self::Sint8x2 => Some((true, Bits8, Two)),
+            Self::Sint8x4 => Some((true, Bits8, Four)),
+            Self::Uint16x2 => Some((false, Bits16, Two)),
+            Self::Uint16x4 => Some((false, Bits16, Four)),
+            Self::Sint16x2 => Some((true, Bits16, Two)),
+            Self::Sint16x4 => Some((true, Bits16, Four)),
+            Self::Uint32 => Some((false, Bits32, One)),
+            Self::Uint32x2 => Some((false, Bits32, Two)),
+            Self::Uint32x3 => Some((false, Bits32, Three)),
+            Self::Uint32x4 => Some((false, Bits32, Four)),
+            Self::Sint32 => Some((true, Bits32, One)),
+            Self::Sint32x2 => Some((true, Bits32, Two)),
+            Self::Sint32x3 => Some((true, Bits32, Three)),
+            Self::Sint32x4 => Some((true, Bits32, Four)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_vertex_pulling(self) -> bool {
+        self.scaled_layout().is_some() || self.integer_layout().is_some()
     }
 }
 

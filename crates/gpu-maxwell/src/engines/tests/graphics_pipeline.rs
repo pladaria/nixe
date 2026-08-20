@@ -3601,6 +3601,69 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
 }
 
 #[test]
+fn begin_instance_modes_reset_advance_and_preserve_the_instance_sequence() {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+
+    // NVIDIA's public BEGIN layout defines FIRST=0, SUBSEQUENT=1 and
+    // UNCHANGED=2 in bits 27:26.
+    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3045-L3048
+    program_three_d(&mut channel, 0x1618, 4);
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .instance_index(),
+        0
+    );
+    let first_dependencies = channel.three_d().pipeline_dependencies(&[]);
+
+    program_three_d(&mut channel, 0x1618, 4 | (1 << 26));
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .instance_index(),
+        1
+    );
+    assert_eq!(
+        channel.three_d().pipeline_dependencies(&[]),
+        first_dependencies
+    );
+    program_three_d(&mut channel, 0x1618, 4 | (1 << 26));
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .instance_index(),
+        2
+    );
+
+    program_three_d(&mut channel, 0x1618, 4 | (2 << 26));
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .instance_index(),
+        2
+    );
+
+    program_three_d(&mut channel, 0x1618, 4);
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .instance_index(),
+        0
+    );
+}
+
+#[test]
 fn malformed_vertex_suffix_rejects_atomically_and_index_relationships_defer() {
     let mut channel = channel();
     bind_three_d(&mut channel);
