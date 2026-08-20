@@ -569,7 +569,7 @@ const fn bitfield_mask(raw: u32) -> u32 {
 /// The four load methods and their 32-bit fields are pinned to NVIDIA's public
 /// class header:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L55-L65>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDMmeState {
     instruction_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_instruction_address: Option<MaxwellThreeDMmeRamAddress>,
@@ -581,6 +581,36 @@ pub struct MaxwellThreeDMmeState {
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
     shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
     shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
+}
+
+impl Default for MaxwellThreeDMmeState {
+    fn default() -> Self {
+        // Maxwell's class register file is zero-initialized and its shadow
+        // file is copied from that state. NVIDIA assigns zero to METHOD_TRACK,
+        // so ordinary class writes must be shadowed before the guest's first
+        // explicit SET_MME_SHADOW_RAM_CONTROL. This is observable when NVN
+        // later switches through PASSTHROUGH and replays its initial state.
+        //
+        // NVIDIA encoding:
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L67-L72
+        // Register/shadow initialization:
+        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L34-L104
+        Self {
+            instruction_pointer: MaxwellThreeDRegister::default(),
+            next_instruction_address: None,
+            instructions: BTreeMap::new(),
+            start_address_pointer: MaxwellThreeDRegister::default(),
+            next_start_address_index: None,
+            start_addresses: BTreeMap::new(),
+            shadow_ram_control: MaxwellThreeDRegister::verified_reset(
+                MaxwellThreeDMmeShadowRamControl::MethodTrack.raw(),
+                Some(MaxwellThreeDMmeShadowRamControl::MethodTrack),
+            ),
+            mutable_method_control: MaxwellThreeDRegister::default(),
+            shadow_registers: BTreeMap::new(),
+            shadow_scratch: BTreeMap::new(),
+        }
+    }
 }
 
 impl MaxwellThreeDMmeState {

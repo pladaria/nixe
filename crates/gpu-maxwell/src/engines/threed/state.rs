@@ -11,7 +11,7 @@ use nixe_gpu::GpuMethodId;
 use crate::MaxwellMethodSource;
 
 use super::{
-    MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
+    MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
     MaxwellThreeDColorReductionStateWrite, MaxwellThreeDConstantColorRenderingState,
     MaxwellThreeDConstantColorRenderingStateWrite, MaxwellThreeDCounterState,
     MaxwellThreeDCounterStateWrite, MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite,
@@ -26,9 +26,15 @@ use super::{
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
     MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDTiledCacheState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDShaderStage, MaxwellThreeDTiledCacheState,
     MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDTirMode, MaxwellThreeDVertexInputState,
     MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
+    render_targets::{
+        MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
+        MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
+        MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET, MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET,
+        MAXWELL_THREE_D_COLOR_TARGET_STRIDE,
+    },
 };
 
 pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
@@ -88,6 +94,29 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
             Some(MAXWELL_THREE_D_POLYGON_MODE_RESET)
         }
         MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD => Some(MAXWELL_THREE_D_WINDOW_ORIGIN_RESET),
+        raw if raw >= MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
+            && raw
+                < MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
+                    + MAXWELL_COLOR_TARGET_COUNT as u32
+                        * MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE
+            && (raw - MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD)
+                .is_multiple_of(MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE) =>
+        {
+            Some(MAXWELL_THREE_D_COLOR_COMPRESSION_RESET)
+        }
+        raw if raw >= MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
+            && raw
+                < MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
+                    + MAXWELL_COLOR_TARGET_COUNT as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE =>
+        {
+            let register = (raw - MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD)
+                % MAXWELL_THREE_D_COLOR_TARGET_STRIDE;
+            if register == MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET {
+                Some(MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET)
+            } else {
+                None
+            }
+        }
         raw if raw >= MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD => {
             let offset = raw - MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD;
             let pipeline = offset / MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
@@ -852,6 +881,26 @@ impl Default for MaxwellThreeDState {
                 );
             }
         }
+        for target in 0..MAXWELL_COLOR_TARGET_COUNT {
+            let method = MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
+                + target as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE
+                + MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET;
+            let reset = verified_raw_register_reset(GpuMethodId(method))
+                .expect("listed Maxwell color-target layer reset must be verified");
+            raw_registers.insert(
+                method,
+                MaxwellThreeDRegister::verified_reset(reset, Some(reset)),
+            );
+
+            let compression_method = MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
+                + target as u32 * MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE;
+            let compression_reset = verified_raw_register_reset(GpuMethodId(compression_method))
+                .expect("listed Maxwell color-compression reset must be verified");
+            raw_registers.insert(
+                compression_method,
+                MaxwellThreeDRegister::verified_reset(compression_reset, Some(compression_reset)),
+            );
+        }
         Self {
             raw_registers,
             render_targets: Default::default(),
@@ -1009,7 +1058,6 @@ impl MaxwellThreeDState {
             .append_pipeline_dependencies(&mut dependencies);
         self.shader_bindings
             .append_pipeline_dependencies(&mut dependencies);
-        dependencies.push(self.shader_execution.l1_configuration().raw());
         if self.shader_bindings.has_enabled_pipeline() {
             self.shader_execution
                 .append_shader_pipeline_dependencies(&mut dependencies);
@@ -1074,7 +1122,12 @@ impl MaxwellThreeDState {
             .render_targets
             .render_target_layer()
             .value()
-            .is_some_and(|value| value.affects_draw_layering())
+            .is_some_and(|value| {
+                value.affects_draw_layering(
+                    self.shader_bindings
+                        .has_enabled_stage(MaxwellThreeDShaderStage::Geometry),
+                )
+            })
         {
             dependencies.push(self.render_targets.render_target_layer().raw());
         }
@@ -1279,6 +1332,7 @@ impl MaxwellThreeDState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::engines) fn validate_cross_registers(
         &self,
     ) -> Result<(), MaxwellThreeDStateValidationError> {
@@ -1446,6 +1500,7 @@ impl MaxwellThreeDState {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::engines) struct MaxwellThreeDStateValidationError {
     pub source: Option<MaxwellMethodSource>,

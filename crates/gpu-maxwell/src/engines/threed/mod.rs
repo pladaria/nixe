@@ -96,7 +96,8 @@ pub use operations::{
     MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
     MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
     MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
-    MaxwellThreeDTextureCacheTarget, lower_maxwell_three_d_synchronization,
+    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode,
+    lower_maxwell_three_d_synchronization,
 };
 
 pub use l2_cache::{
@@ -225,6 +226,7 @@ enum MethodAction {
     TiledCacheEnable,
     TiledCacheTileSize,
     TiledCacheUnknownConfig(u8),
+    TiledCacheFlush,
     ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget),
     L1Configuration,
     ColorReductionThresholdsEnable,
@@ -437,6 +439,15 @@ methods!(
         "SET_TILED_CACHE_UNKNOWN_CONFIG_3",
         u32::MAX,
         MethodAction::TiledCacheUnknownConfig(3)
+    ),
+    // NVIDIA's public class header omits this trigger; the pinned deko3d
+    // definition documents method 0x0f80 and both allocated values.
+    // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/engine_3d.def#L255-L258
+    TILED_CACHE_FLUSH => (
+        0x0f80,
+        "TILED_CACHE_FLUSH",
+        0x0000_0001,
+        MethodAction::TiledCacheFlush
     ),
     SET_MUTABLE_METHOD_CONTROL => (
         0x1134,
@@ -1392,6 +1403,18 @@ fn preflight_register(
                 );
                 candidate.apply(write);
                 MaxwellEngineMethodEffect::ThreeDState(write)
+            }
+            MethodAction::TiledCacheFlush => {
+                let mode = MaxwellThreeDTiledCacheFlushMode::parse(source.argument()).ok_or(
+                    MaxwellEngineDispatchError::InvalidMethodValue {
+                        source,
+                        metadata: declaration.metadata,
+                        defined_mask: declaration.defined_mask,
+                    },
+                )?;
+                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                    MaxwellThreeDSynchronizationTrigger::TiledCacheFlush { mode, source },
+                )
             }
             MethodAction::ShaderWatermarks(target) => {
                 let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());

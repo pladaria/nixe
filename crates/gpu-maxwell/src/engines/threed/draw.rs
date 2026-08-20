@@ -88,6 +88,55 @@ impl MaxwellThreeDOperationTrigger {
             Self::ClearSurface { source } | Self::DrawVertexArray { source, .. } => source,
         }
     }
+
+    /// Appends the resources consumed directly by this trigger.
+    ///
+    /// Shader translation contributes constant-buffer, texture, and sampler
+    /// roles separately. Keeping the trigger-specific selection exhaustive
+    /// ensures that future indexed draws cannot silently inherit non-indexed
+    /// resolution.
+    pub(crate) fn append_resource_roles(
+        self,
+        state: &MaxwellThreeDState,
+        roles: &mut Vec<MaxwellThreeDResourceRole>,
+    ) {
+        match self {
+            Self::ClearSurface { .. } => {
+                if let Some(surface) = state.render_targets().clear().last_surface().value() {
+                    if surface.color_mask() != 0 {
+                        roles.push(MaxwellThreeDResourceRole::ColorTarget(
+                            surface.color_target(),
+                        ));
+                    }
+                    if surface.depth() || surface.stencil() {
+                        roles.push(MaxwellThreeDResourceRole::DepthStencilTarget);
+                    }
+                }
+            }
+            Self::DrawVertexArray { .. } => {
+                for attribute in state.vertex_input().attributes() {
+                    if let Some(attribute) = attribute.value().filter(|value| value.enabled()) {
+                        let role = MaxwellThreeDResourceRole::VertexStream(attribute.stream());
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
+                    }
+                }
+                if let Some(selection) = state.render_targets().color_target_selection().value() {
+                    roles.extend(
+                        selection
+                            .active_targets()
+                            .iter()
+                            .copied()
+                            .map(MaxwellThreeDResourceRole::ColorTarget),
+                    );
+                }
+                if draw_depth_stencil_resource_required(state) {
+                    roles.push(MaxwellThreeDResourceRole::DepthStencilTarget);
+                }
+            }
+        }
+    }
 }
 
 /// Stable evidence that T10 translated one enabled Maxwell shader stage.
@@ -95,7 +144,7 @@ impl MaxwellThreeDOperationTrigger {
 pub struct MaxwellThreeDTranslatedShader {
     stage: ShaderStage,
     shader: ShaderId,
-    directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
+    directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
     maximum_api_visible_calls: u16,
 }
 
@@ -104,7 +153,7 @@ impl MaxwellThreeDTranslatedShader {
     pub(crate) const fn new(
         stage: ShaderStage,
         shader: ShaderId,
-        directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
+        directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
         maximum_api_visible_calls: u16,
     ) -> Self {
         Self {
@@ -122,10 +171,12 @@ impl MaxwellThreeDTranslatedShader {
     pub const fn shader(self) -> ShaderId {
         self.shader
     }
-    /// Guest shader-memory configuration for which T10 produced this shader.
-    /// This is never inferred from host cache topology.
+    /// Guest shader-memory configuration consumed by this shader, if any.
+    /// This is never inferred from host cache topology or unrelated state.
     #[must_use]
-    pub const fn directly_addressable_memory(self) -> MaxwellThreeDDirectlyAddressableMemory {
+    pub const fn directly_addressable_memory(
+        self,
+    ) -> Option<MaxwellThreeDDirectlyAddressableMemory> {
         self.directly_addressable_memory
     }
 
@@ -485,7 +536,6 @@ impl MaxwellThreeDLoweringCache {
     pub(crate) fn stage_shader_translations(
         &mut self,
         programs: &[MaxwellTranslatedShaderProgram],
-        directly_addressable_memory: MaxwellThreeDDirectlyAddressableMemory,
     ) -> Result<MaxwellThreeDTranslatedShaders, MaxwellThreeDLoweringError> {
         let mut shaders = Vec::with_capacity(programs.len());
         let mut resources: Vec<MaxwellThreeDShaderResourceUse> = Vec::new();
@@ -542,7 +592,7 @@ impl MaxwellThreeDLoweringCache {
             shaders.push(MaxwellThreeDTranslatedShader::new(
                 program.stage(),
                 id,
-                directly_addressable_memory,
+                program.directly_addressable_memory(),
                 program.maximum_api_visible_calls(),
             ));
             let stages = shader_pipeline_stages(program.stage())?;
@@ -891,11 +941,6 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     predecessors: Vec<FrontendSubmissionId>,
     cache: &MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDLoweringError> {
-    state.validate_cross_registers().map_err(|error| {
-        MaxwellThreeDLoweringError::ContradictoryState {
-            reason: error.reason,
-        }
-    })?;
     if let Some(mode) = state.render_enable().execution_mode()
         && mode != MaxwellThreeDRenderEnableMode::Enabled
     {
@@ -1375,7 +1420,13 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
                 .render_target_layer()
                 .value()
                 .copied()
-                .filter(|value| value.affects_draw_layering())
+                .filter(|value| {
+                    value.affects_draw_layering(
+                        state
+                            .shader_bindings()
+                            .has_enabled_stage(MaxwellThreeDShaderStage::Geometry),
+                    )
+                })
         {
             return Err(MaxwellThreeDLoweringError::UnsupportedRenderTargetLayerSemantics(value));
         }
@@ -1485,16 +1536,18 @@ fn validate_shader_memory_configuration(
     state: &MaxwellThreeDState,
     shaders: &MaxwellThreeDTranslatedShaders,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let configured = state
-        .shader_execution()
-        .l1_configuration()
-        .value()
-        .copied()
-        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
-            "SET_L1_CONFIGURATION",
-        ))?;
     for shader in shaders.shaders() {
-        let required = shader.directly_addressable_memory();
+        let Some(required) = shader.directly_addressable_memory() else {
+            continue;
+        };
+        let configured = state
+            .shader_execution()
+            .l1_configuration()
+            .value()
+            .copied()
+            .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
+                "SET_L1_CONFIGURATION",
+            ))?;
         if required != configured {
             return Err(
                 MaxwellThreeDLoweringError::TranslatedShaderMemoryConfigurationMismatch {
@@ -2006,25 +2059,10 @@ fn clear_fully_covers_image(
     state: &MaxwellThreeDState,
     image: &super::MaxwellThreeDResolvedImage,
 ) -> Result<bool, MaxwellThreeDLoweringError> {
-    let clear = state.render_targets().clear();
-    let control = clear.surface_control().value().copied();
-    if control.is_some_and(|control| control.use_scissor_zero() || control.use_viewport_clip_zero())
-    {
-        return Ok(false);
-    }
-    if control.is_some_and(|control| !control.use_clear_rect()) {
-        return Ok(true);
-    }
-    let Some(horizontal) = clear.horizontal().value() else {
-        return Ok(false);
-    };
-    let Some(vertical) = clear.vertical().value() else {
-        return Ok(false);
-    };
-    Ok(horizontal.min == 0
-        && vertical.min == 0
-        && u32::from(horizontal.max) == image.description().extent().width
-        && u32::from(vertical.max) == image.description().extent().height)
+    let extent = image.description().extent();
+    Ok(MaxwellThreeDClearRegions::from_state(state)?
+        .for_attachment(extent.width, extent.height)
+        .fully_covers(extent.width, extent.height))
 }
 
 fn record_clear_materialization(
@@ -2303,9 +2341,21 @@ fn draw_depth_stencil_attachment_required(state: &MaxwellThreeDState) -> bool {
     depth || stencil
 }
 
+/// Unknown test-enable state must still be validated by pipeline lowering, but
+/// it does not prove that this operation references depth/stencil memory.
+fn draw_depth_stencil_resource_required(state: &MaxwellThreeDState) -> bool {
+    let (depth, stencil) = draw_depth_stencil_enable_state(state);
+    depth == Some(true) || stencil == Some(true)
+}
+
 /// Returns the aspects that a draw may observe. Missing enable state remains
 /// conservative and therefore requires the corresponding guest contents.
 fn draw_depth_stencil_aspects(state: &MaxwellThreeDState) -> (bool, bool) {
+    let (depth, stencil) = draw_depth_stencil_enable_state(state);
+    (depth.unwrap_or(true), stencil.unwrap_or(true))
+}
+
+fn draw_depth_stencil_enable_state(state: &MaxwellThreeDState) -> (Option<bool>, Option<bool>) {
     let boolean = |register| {
         state
             .fixed_function()
@@ -2317,8 +2367,8 @@ fn draw_depth_stencil_aspects(state: &MaxwellThreeDState) -> (bool, bool) {
             })
     };
     (
-        boolean(MaxwellThreeDFixedFunctionRegister::DepthTestEnable).unwrap_or(true),
-        boolean(MaxwellThreeDFixedFunctionRegister::StencilTestEnable).unwrap_or(true),
+        boolean(MaxwellThreeDFixedFunctionRegister::DepthTestEnable),
+        boolean(MaxwellThreeDFixedFunctionRegister::StencilTestEnable),
     )
 }
 
@@ -2463,9 +2513,33 @@ fn draw_viewport_transform(
             "SET_VIEWPORT_OFFSET_X/Y/Z(0)",
         ));
     };
-    ViewportTransform::new([scale_x, scale_y, scale_z], [offset_x, offset_y, offset_z])
-        .map(Some)
-        .map_err(MaxwellThreeDLoweringError::Command)
+    let Some(clip_min_z) = viewport
+        .clip_min_z()
+        .value()
+        .copied()
+        .map(|value| f32::from_bits(value.get()))
+    else {
+        return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_VIEWPORT_CLIP_MIN_Z(0)",
+        ));
+    };
+    let Some(clip_max_z) = viewport
+        .clip_max_z()
+        .value()
+        .copied()
+        .map(|value| f32::from_bits(value.get()))
+    else {
+        return Err(MaxwellThreeDLoweringError::IncompleteDraw(
+            "SET_VIEWPORT_CLIP_MAX_Z(0)",
+        ));
+    };
+    ViewportTransform::new(
+        [scale_x, scale_y, scale_z],
+        [offset_x, offset_y, offset_z],
+        [clip_min_z, clip_max_z],
+    )
+    .map(Some)
+    .map_err(MaxwellThreeDLoweringError::Command)
 }
 
 fn prepare_resources(
@@ -2743,52 +2817,145 @@ fn shader_resource_dependency(
     binding_at(resources, bindings, index)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxwellThreeDClearRegion {
+    min_x: u32,
+    max_x: u32,
+    min_y: u32,
+    max_y: u32,
+}
+
+impl MaxwellThreeDClearRegion {
+    const fn attachment(width: u32, height: u32) -> Self {
+        Self {
+            min_x: 0,
+            max_x: width,
+            min_y: 0,
+            max_y: height,
+        }
+    }
+
+    fn intersect(
+        &mut self,
+        horizontal: super::MaxwellThreeDRectangle,
+        vertical: super::MaxwellThreeDRectangle,
+    ) {
+        self.min_x = self.min_x.max(u32::from(horizontal.min));
+        self.max_x = self.max_x.min(u32::from(horizontal.max));
+        self.min_y = self.min_y.max(u32::from(vertical.min));
+        self.max_y = self.max_y.min(u32::from(vertical.max));
+    }
+
+    const fn is_empty(self) -> bool {
+        self.min_x >= self.max_x || self.min_y >= self.max_y
+    }
+
+    const fn fully_covers(self, width: u32, height: u32) -> bool {
+        self.min_x == 0 && self.max_x == width && self.min_y == 0 && self.max_y == height
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MaxwellThreeDClearRegions {
+    clear: Option<(super::MaxwellThreeDRectangle, super::MaxwellThreeDRectangle)>,
+    scissor: Option<(super::MaxwellThreeDRectangle, super::MaxwellThreeDRectangle)>,
+    viewport_clip: Option<(super::MaxwellThreeDRectangle, super::MaxwellThreeDRectangle)>,
+}
+
+impl MaxwellThreeDClearRegions {
+    fn from_state(state: &MaxwellThreeDState) -> Result<Self, MaxwellThreeDLoweringError> {
+        let clear = state.render_targets().clear();
+        let control = clear.surface_control().value().copied();
+        let clear = control
+            .is_none_or(|control| control.use_clear_rect())
+            .then(|| {
+                Ok((
+                    clear.horizontal().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear("horizontal rectangle"),
+                    )?,
+                    clear.vertical().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear("vertical rectangle"),
+                    )?,
+                ))
+            })
+            .transpose()?;
+        let scissor = control
+            .is_some_and(|control| control.use_scissor_zero())
+            .then(|| {
+                let scissor = &state.fixed_function().scissor()[0];
+                Ok((
+                    scissor.horizontal().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear("SET_SCISSOR_HORIZONTAL(0)"),
+                    )?,
+                    scissor.vertical().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear("SET_SCISSOR_VERTICAL(0)"),
+                    )?,
+                ))
+            })
+            .transpose()?;
+        let viewport_clip = control
+            .is_some_and(|control| control.use_viewport_clip_zero())
+            .then(|| {
+                let viewport = &state.fixed_function().viewport()[0];
+                Ok((
+                    viewport.clip_horizontal().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear(
+                            "SET_VIEWPORT_CLIP_HORIZONTAL(0)",
+                        ),
+                    )?,
+                    viewport.clip_vertical().value().copied().ok_or(
+                        MaxwellThreeDLoweringError::IncompleteClear(
+                            "SET_VIEWPORT_CLIP_VERTICAL(0)",
+                        ),
+                    )?,
+                ))
+            })
+            .transpose()?;
+        Ok(Self {
+            clear,
+            scissor,
+            viewport_clip,
+        })
+    }
+
+    fn for_attachment(self, width: u32, height: u32) -> MaxwellThreeDClearRegion {
+        let mut region = MaxwellThreeDClearRegion::attachment(width, height);
+        for (horizontal, vertical) in [self.clear, self.scissor, self.viewport_clip]
+            .into_iter()
+            .flatten()
+        {
+            region.intersect(horizontal, vertical);
+        }
+        region
+    }
+}
+
 fn clear_image_region(
     image: ImageId,
     subresources: ImageSubresourceRange,
     attachment_width: u32,
     attachment_height: u32,
     array_layer: u16,
-    rectangle: Option<(super::MaxwellThreeDRectangle, super::MaxwellThreeDRectangle)>,
+    regions: MaxwellThreeDClearRegions,
 ) -> Result<ImageRegion, MaxwellThreeDLoweringError> {
     if array_layer != subresources.base_layer {
         return Err(MaxwellThreeDLoweringError::ClearOutsideAttachment);
     }
-    let (origin, width, height) = match rectangle {
-        Some((horizontal, vertical)) => {
-            let width = u32::from(horizontal.max.saturating_sub(horizontal.min));
-            let height = u32::from(vertical.max.saturating_sub(vertical.min));
-            if width == 0 || height == 0 {
-                return Err(MaxwellThreeDLoweringError::EmptyClearRectangle);
-            }
-            if u32::from(horizontal.max) > attachment_width
-                || u32::from(vertical.max) > attachment_height
-            {
-                return Err(MaxwellThreeDLoweringError::ClearOutsideAttachment);
-            }
-            (
-                ImageOrigin {
-                    x: u32::from(horizontal.min),
-                    y: u32::from(vertical.min),
-                    z: 0,
-                },
-                width,
-                height,
-            )
-        }
-        None => (
-            ImageOrigin { x: 0, y: 0, z: 0 },
-            attachment_width,
-            attachment_height,
-        ),
-    };
+    let region = regions.for_attachment(attachment_width, attachment_height);
+    if region.is_empty() {
+        return Err(MaxwellThreeDLoweringError::EmptyClearRectangle);
+    }
     Ok(ImageRegion {
         image,
         subresources,
-        origin,
+        origin: ImageOrigin {
+            x: region.min_x,
+            y: region.min_y,
+            z: 0,
+        },
         extent: nixe_gpu::ImageExtent {
-            width,
-            height,
+            width: region.max_x - region.min_x,
+            height: region.max_y - region.min_y,
             depth: 1,
         },
     })
@@ -2809,29 +2976,10 @@ fn lower_clear(
         return Err(MaxwellThreeDLoweringError::EmptyClearMask);
     }
     let control = clear.surface_control().value().copied();
-    if control.is_some_and(|control| control.use_scissor_zero()) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedClearScissorSemantics);
-    }
-    if control.is_some_and(|control| control.use_viewport_clip_zero()) {
-        return Err(MaxwellThreeDLoweringError::UnsupportedClearViewportClipSemantics);
-    }
     if surface.stencil() && control.is_some_and(|control| control.respect_stencil_mask()) {
         return Err(MaxwellThreeDLoweringError::UnsupportedClearStencilMaskSemantics);
     }
-    // An unprogrammed control retains the pre-existing explicit-rectangle
-    // contract without claiming an undocumented hardware reset value.
-    let rectangle = if control.is_none_or(|control| control.use_clear_rect()) {
-        Some((
-            clear.horizontal().value().copied().ok_or(
-                MaxwellThreeDLoweringError::IncompleteClear("horizontal rectangle"),
-            )?,
-            clear.vertical().value().copied().ok_or(
-                MaxwellThreeDLoweringError::IncompleteClear("vertical rectangle"),
-            )?,
-        ))
-    } else {
-        None
-    };
+    let regions = MaxwellThreeDClearRegions::from_state(state)?;
     let mut operations = Vec::new();
     let mut dirty = Vec::new();
     if surface.color_mask() != 0 {
@@ -2853,7 +3001,7 @@ fn lower_clear(
             image.description().extent().width,
             image.description().extent().height,
             surface.array_layer(),
-            rectangle,
+            regions,
         )?;
         let mut color = [0.0; 4];
         for (component, output) in clear.color().iter().zip(&mut color) {
@@ -2891,7 +3039,7 @@ fn lower_clear(
             image.description().extent().width,
             image.description().extent().height,
             surface.array_layer(),
-            rectangle,
+            regions,
         )?;
         let depth = surface
             .depth()
@@ -3064,10 +3212,6 @@ fn lower_draw(
             .map_err(MaxwellThreeDLoweringError::Command)?,
         );
     }
-    if vertex_buffers.is_empty() {
-        return Err(MaxwellThreeDLoweringError::IncompleteDraw("vertex stream"));
-    }
-
     let attachments = attachment_records(resources, bindings, attachment_selection)?;
     if attachments.is_empty() {
         return Err(MaxwellThreeDLoweringError::IncompleteDraw("render target"));
@@ -3740,8 +3884,6 @@ pub enum MaxwellThreeDLoweringError {
         two_sided: bool,
     },
     UnsupportedClearStencilMaskSemantics,
-    UnsupportedClearScissorSemantics,
-    UnsupportedClearViewportClipSemantics,
     UnsupportedAliasedLineWidthSemantics,
     UnsupportedAntiAliasedLineSemantics,
     UnsupportedLineStippleSemantics {
@@ -3999,12 +4141,6 @@ impl Display for MaxwellThreeDLoweringError {
             Self::UnsupportedClearStencilMaskSemantics => formatter.write_str(
                 "MAXWELL_B stencil-masked clear has no neutral backend representation",
             ),
-            Self::UnsupportedClearScissorSemantics => formatter.write_str(
-                "MAXWELL_B clear constrained by scissor 0 has no verified region-composition semantics",
-            ),
-            Self::UnsupportedClearViewportClipSemantics => formatter.write_str(
-                "MAXWELL_B clear constrained by viewport clip 0 has no verified region-composition semantics",
-            ),
             Self::UnsupportedAliasedLineWidthSemantics => formatter.write_str(
                 "MAXWELL_B aliased line-width selection has no represented width register or host rasterization semantics",
             ),
@@ -4204,7 +4340,9 @@ impl Display for MaxwellThreeDLoweringError {
             Self::EmptyClearMask => {
                 formatter.write_str("CLEAR_SURFACE selects no color, depth, or stencil component")
             }
-            Self::EmptyClearRectangle => formatter.write_str("clear rectangle is empty"),
+            Self::EmptyClearRectangle => formatter.write_str(
+                "clear rectangle, scissor, and viewport-clip intersection is empty",
+            ),
             Self::PartialColorClearUnsupported { mask } => write!(
                 formatter,
                 "partial color-channel clear is not represented yet: mask={mask:#x}"

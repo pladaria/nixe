@@ -21,7 +21,6 @@ use crate::{
     MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
-    resolve_maxwell_three_d_resources,
     shader::{MaxwellStagedShaderWrite, translate_maxwell_shader_programs},
 };
 
@@ -175,7 +174,6 @@ impl MaxwellSoftwareInitializationCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellSoftwareInitializationError {
     UnsupportedThreeDWork,
-    OperationAfterCompletionSignal,
     InconsistentHostSynchronizationPlan,
     InconsistentWaitForIdlePlan,
     InconsistentReportSemaphorePlan,
@@ -206,9 +204,6 @@ impl Display for MaxwellSoftwareInitializationError {
         match self {
             Self::UnsupportedThreeDWork => formatter.write_str(
                 "submission contains 3D work which requires shader translation and a neutral backend",
-            ),
-            Self::OperationAfterCompletionSignal => formatter.write_str(
-                "submission contains executable work after its completion signal",
             ),
             Self::InconsistentHostSynchronizationPlan => formatter.write_str(
                 "submission host cache-maintenance plan does not match its ordered execution prefix",
@@ -258,9 +253,13 @@ pub enum MaxwellSubmissionExecutionError {
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
     MissingCompletionSignal {
         reserved: GuestTimelinePoint,
+        expected: u32,
+        observed: u32,
     },
     DuplicateCompletionSignal {
         reserved: GuestTimelinePoint,
+        expected: u32,
+        observed: u32,
     },
 }
 
@@ -286,13 +285,21 @@ impl Display for MaxwellSubmissionExecutionError {
             Self::ThreeDLowering(error) => Display::fmt(error, formatter),
             Self::ShaderTranslation(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
-            Self::MissingCompletionSignal { reserved } => write!(
+            Self::MissingCompletionSignal {
+                reserved,
+                expected,
+                observed,
+            } => write!(
                 formatter,
-                "submission has reserved completion {reserved} but emitted no matching syncpoint increment"
+                "submission emitted too few syncpoint increments for reserved completion {reserved}: expected={expected} observed={observed}"
             ),
-            Self::DuplicateCompletionSignal { reserved } => write!(
+            Self::DuplicateCompletionSignal {
+                reserved,
+                expected,
+                observed,
+            } => write!(
                 formatter,
-                "submission emitted more than one syncpoint increment for reserved completion {reserved}"
+                "submission emitted too many syncpoint increments for reserved completion {reserved}: expected={expected} observed={observed}"
             ),
         }
     }
@@ -317,7 +324,7 @@ pub fn preflight_maxwell_submission_execution(
     let mut staged_cache = cache.clone();
     let mut steps = Vec::new();
     let mut prior_work_pending = false;
-    let mut completion_signal_count = 0_u8;
+    let mut completion_signal_count = 0_u32;
     let mut staged_shader_writes = Vec::new();
     let mut staged_memory_writes = CanonicalWriteBatch::new();
 
@@ -488,31 +495,23 @@ pub fn preflight_maxwell_submission_execution(
                         &staged_shader_writes,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
-                    let directly_addressable_memory = operation
-                        .state()
-                        .shader_execution()
-                        .l1_configuration()
-                        .value()
-                        .copied()
-                        .ok_or(MaxwellSubmissionExecutionError::ShaderTranslation(
-                            MaxwellShaderTranslationError::IncompletePipelineBinding {
-                                pipeline: 0,
-                                field: "SET_L1_CONFIGURATION",
-                            },
-                        ))?;
                     let translated = staged_cache
-                        .stage_shader_translations(&programs, directly_addressable_memory)
+                        .stage_shader_translations(&programs)
                         .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
-                    let required_roles = translated
+                    let mut required_roles = translated
                         .resources()
                         .iter()
                         .map(|resource| resource.role())
                         .collect::<Vec<_>>();
+                    operation
+                        .trigger()
+                        .append_resource_roles(operation.state(), &mut required_roles);
                     let resources = resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
                         operation.state(),
                         address_space,
                         &required_roles,
                         Some(&staged_memory_writes),
+                        false,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                     let plan = preflight_maxwell_three_d_operation_unnegotiated(
@@ -532,8 +531,18 @@ pub fn preflight_maxwell_submission_execution(
                     prior_work_pending = true;
                     continue;
                 }
-                let resources = resolve_maxwell_three_d_resources(operation.state(), address_space)
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                let mut required_roles = Vec::new();
+                operation
+                    .trigger()
+                    .append_resource_roles(operation.state(), &mut required_roles);
+                let resources = resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
+                    operation.state(),
+                    address_space,
+                    &required_roles,
+                    Some(&staged_memory_writes),
+                    false,
+                )
+                .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                 let plan = preflight_maxwell_three_d_operation_unnegotiated(
                     operation.state(),
                     &resources,
@@ -563,9 +572,12 @@ pub fn preflight_maxwell_submission_execution(
                 } = plan
                 {
                     completion_signal_count = completion_signal_count.saturating_add(1);
-                    if completion_signal_count > 1 {
+                    let expected = completion.map_or(0, ReservedTimelinePoint::increments);
+                    if completion_signal_count > expected {
                         return Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
                             reserved,
+                            expected,
+                            observed: completion_signal_count,
                         });
                     }
                 }
@@ -602,12 +614,15 @@ pub fn preflight_maxwell_submission_execution(
         }
     }
 
-    if completion_signal_count == 0
-        && let Some(completion) = completion
-    {
-        return Err(MaxwellSubmissionExecutionError::MissingCompletionSignal {
-            reserved: completion.point(),
-        });
+    if let Some(completion) = completion {
+        let expected = completion.increments();
+        if completion_signal_count < expected {
+            return Err(MaxwellSubmissionExecutionError::MissingCompletionSignal {
+                reserved: completion.point(),
+                expected,
+                observed: completion_signal_count,
+            });
+        }
     }
 
     Ok(MaxwellSubmissionExecutionPlan {
@@ -632,12 +647,8 @@ pub fn execute_maxwell_software_initialization(
     let mut writes = CanonicalWriteBatch::new();
     let mut write_source = None;
     let mut prior_work_pending = false;
-    let mut completion_seen = false;
 
     for step in &plan.steps {
-        if completion_seen {
-            return Err(MaxwellSoftwareInitializationError::OperationAfterCompletionSignal);
-        }
         match step {
             MaxwellSubmissionExecutionStep::HostSynchronization {
                 operation,
@@ -780,10 +791,12 @@ pub fn execute_maxwell_software_initialization(
                 prior_work_pending = false;
             }
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::TiledCacheFlush { .. },
+            ) => {}
+            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. },
             ) => {
                 prior_work_pending = false;
-                completion_seen = true;
             }
             MaxwellSubmissionExecutionStep::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_),
@@ -1002,6 +1015,10 @@ fn execute_maxwell_backend_steps<T>(
                         CacheMaintenanceOperation::FlushDirtyDeviceWrites,
                     ));
                 }
+                MaxwellThreeDSynchronizationPlan::TiledCacheFlush { maintenance, .. } => {
+                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
+                    operations.push(cache_maintenance_operation(*maintenance));
+                }
                 MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. } => {}
                 MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_) => {
                     return Err(MaxwellBackendExecutionError::Software(Box::new(
@@ -1110,6 +1127,7 @@ fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
                     | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { .. }
                     | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
                     | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+                    | MaxwellThreeDSynchronizationPlan::TiledCacheFlush { .. }
             )
     )
 }
@@ -1617,8 +1635,11 @@ mod tests {
                 Some(&reservation),
                 &MaxwellThreeDLoweringCache::default(),
             ),
-            Err(MaxwellSubmissionExecutionError::MissingCompletionSignal { reserved })
-                if reserved == reservation.point()
+            Err(MaxwellSubmissionExecutionError::MissingCompletionSignal {
+                reserved,
+                expected: 1,
+                observed: 0,
+            }) if reserved == reservation.point()
         ));
         assert_eq!(timeline.current_point(), before);
     }
@@ -1673,9 +1694,89 @@ mod tests {
                 Some(&reservation),
                 &MaxwellThreeDLoweringCache::default(),
             ),
-            Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal { reserved })
-                if reserved == reservation.point()
+            Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
+                reserved,
+                expected: 1,
+                observed: 2,
+            }) if reserved == reservation.point()
         ));
+    }
+
+    #[test]
+    fn multi_increment_reservation_requires_exact_count_and_allows_later_work() {
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &bind.packets()[0],
+        )
+        .unwrap();
+
+        let increment = packet(0, 0x02c8 / 4, &[1]);
+        let first_increment = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &increment.packets()[0],
+        )
+        .unwrap();
+        let second_increment = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &increment.packets()[0],
+        )
+        .unwrap();
+        let flush = packet(0, 0x1144 / 4, &[0]);
+        let later_flush = dispatch_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(2),
+            &flush.packets()[0],
+        )
+        .unwrap();
+
+        let owner = TimelineOwnerId::new(7);
+        let mut timeline = GuestTimeline::new(
+            GuestSyncpointId::new(1),
+            TimelineInstanceId::new(1),
+            owner,
+            GuestSyncpointValue::new(0),
+        );
+        let reservation = timeline.reserve(owner, 2).unwrap();
+        let before = timeline.current_point();
+        let address_space = address_space();
+        let plan = preflight_maxwell_submission_execution(
+            &[first_increment, second_increment, later_flush],
+            &address_space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            Some(&reservation),
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+
+        assert_eq!(reservation.increments(), 2);
+        assert_eq!(plan.completion(), Some(reservation.point()));
+        assert!(matches!(
+            plan.steps(),
+            [
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
+                ),
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
+                ),
+                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                    MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
+                ),
+            ]
+        ));
+        let completion = execute_maxwell_software_initialization(plan, &address_space).unwrap();
+        assert_eq!(completion.completion(), Some(reservation.point()));
+        assert_eq!(timeline.current_point(), before);
     }
 
     #[test]
@@ -1855,6 +1956,61 @@ mod tests {
         assert_eq!(completion.completion(), None);
         allocation.read(0, &mut bytes).unwrap();
         assert_eq!(bytes, 0xfeed_beef_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn tiled_cache_flush_reaches_the_backend_as_ordered_write_cache_maintenance() {
+        let frontend = FrontendSubmissionId::new(2);
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let bind = packet(0, 0, &[SWITCH_1_GM20B_PROFILE.classes().three_d().0]);
+        dispatch_maxwell_engine_packet(&mut channel, frontend, &bind.packets()[0]).unwrap();
+        let flush = packet(0, 0x0f80 / 4, &[0]);
+        let dispatch =
+            dispatch_maxwell_engine_packet(&mut channel, frontend, &flush.packets()[0]).unwrap();
+        let plan = preflight_maxwell_submission_execution(
+            &[dispatch],
+            &address_space(),
+            frontend,
+            Vec::new(),
+            None,
+            &MaxwellThreeDLoweringCache::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan.steps(),
+            [MaxwellSubmissionExecutionStep::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationPlan::TiledCacheFlush {
+                    mode: crate::MaxwellThreeDTiledCacheFlushMode::Flush,
+                    maintenance: CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+                }
+            )]
+        ));
+
+        let mut calls = 0;
+        let completion = execute_maxwell_backend_steps(
+            &plan,
+            &address_space(),
+            |creations, invalidations, submission| {
+                calls += 1;
+                assert!(creations.is_empty());
+                assert!(invalidations.is_empty());
+                assert_eq!(submission.id(), frontend);
+                assert_eq!(submission.operations().len(), 1);
+                assert!(matches!(
+                    submission.operations()[0].command(),
+                    GpuCommand::CacheMaintenance(CacheMaintenanceOperation::FlushDirtyDeviceWrites)
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(completion, Some(()));
     }
 
     #[test]

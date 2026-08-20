@@ -314,7 +314,11 @@ impl ShaderInterfaceElement {
         scalar_type: ShaderScalarType,
         interpolation: Option<ShaderInterpolation>,
     ) -> Result<Self, ShaderIrConstructionError> {
-        if component > 3 {
+        let vector_location = matches!(
+            location,
+            ShaderIoLocation::Position | ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_)
+        );
+        if component > 3 || (!vector_location && component != 0) {
             return Err(ShaderIrConstructionError::InvalidInterfaceComponent {
                 location,
                 component,
@@ -399,6 +403,12 @@ pub enum ShaderOperation {
         scalar_type: ShaderScalarType,
         float_control: ShaderFloatControl,
     },
+    ShiftLeft32 {
+        destination: ShaderRegister,
+        value: ShaderRegister,
+        amount: ShaderRegister,
+        wrap: bool,
+    },
     FloatMinMax32 {
         destination: ShaderRegister,
         left: ShaderRegister,
@@ -451,6 +461,13 @@ pub enum ShaderOperation {
         destination: ShaderRegister,
         binding: u8,
         byte_offset: u32,
+        scalar_type: ShaderScalarType,
+    },
+    LoadConstantBufferIndexed32 {
+        destination: ShaderRegister,
+        binding: u8,
+        base_byte_offset: i32,
+        dynamic_byte_offset: ShaderRegister,
         scalar_type: ShaderScalarType,
     },
     SampleTexture2D {
@@ -784,6 +801,23 @@ pub fn evaluate_shader_ir(
                 };
                 registers[destination.index() as usize] = Some(value);
             }
+            ShaderOperation::ShiftLeft32 {
+                destination,
+                value,
+                amount,
+                wrap,
+            } => {
+                let value = register_bits(&registers, *value)?;
+                let amount = register_bits(&registers, *amount)?;
+                let shifted = if *wrap {
+                    value.wrapping_shl(amount & 31)
+                } else if amount < 32 {
+                    value << amount
+                } else {
+                    0
+                };
+                registers[destination.index() as usize] = Some(shifted);
+            }
             ShaderOperation::FloatMinMax32 {
                 destination,
                 left,
@@ -930,6 +964,26 @@ pub fn evaluate_shader_ir(
                         .ok_or(ShaderEvaluationError::MissingConstantBufferWord {
                             binding: *binding,
                             byte_offset: *byte_offset,
+                        })?,
+                );
+            }
+            ShaderOperation::LoadConstantBufferIndexed32 {
+                destination,
+                binding,
+                base_byte_offset,
+                dynamic_byte_offset,
+                ..
+            } => {
+                let dynamic_byte_offset = register_bits(&registers, *dynamic_byte_offset)?;
+                let byte_offset = dynamic_byte_offset.wrapping_add(*base_byte_offset as u32) & !3;
+                registers[destination.index() as usize] = Some(
+                    inputs
+                        .constant_buffers
+                        .get(&(*binding, byte_offset))
+                        .copied()
+                        .ok_or(ShaderEvaluationError::MissingConstantBufferWord {
+                            binding: *binding,
+                            byte_offset,
                         })?,
                 );
             }
@@ -1614,7 +1668,10 @@ fn emit_wgsl_operation(
                         &format!(
                             "input.{}{}",
                             wgsl_field_name(*location),
-                            wgsl_component(first_component.saturating_add(index as u8))
+                            wgsl_interface_component(
+                                *location,
+                                first_component.saturating_add(index as u8),
+                            )
                         )
                     )
                 ));
@@ -1630,7 +1687,10 @@ fn emit_wgsl_operation(
                 source.push_str(&format!(
                     "  output.{}{} = {};\n",
                     wgsl_field_name(*location),
-                    wgsl_component(first_component.saturating_add(index as u8)),
+                    wgsl_interface_component(
+                        *location,
+                        first_component.saturating_add(index as u8),
+                    ),
                     wgsl_unpack_expression(*scalar_type, register.index())
                 ));
             }
@@ -1685,6 +1745,27 @@ fn emit_wgsl_operation(
                         instruction.source,
                     ));
                 }
+            };
+            source.push_str(&format!(
+                "  registers[{}] = {expression};\n",
+                destination.index()
+            ));
+        }
+        ShaderOperation::ShiftLeft32 {
+            destination,
+            value,
+            amount,
+            wrap,
+        } => {
+            let shifted = format!(
+                "registers[{}] << (registers[{}] & 31u)",
+                value.index(),
+                amount.index()
+            );
+            let expression = if *wrap {
+                shifted
+            } else {
+                format!("select(0u, {shifted}, registers[{}] < 32u)", amount.index())
             };
             source.push_str(&format!(
                 "  registers[{}] = {expression};\n",
@@ -1869,6 +1950,19 @@ fn emit_wgsl_operation(
             destination.index(),
             binding,
             byte_offset / 4
+        )),
+        ShaderOperation::LoadConstantBufferIndexed32 {
+            destination,
+            binding,
+            base_byte_offset,
+            dynamic_byte_offset,
+            ..
+        } => source.push_str(&format!(
+            "  registers[{}] = constant_buffer_{}[(registers[{}] + 0x{:08x}u) >> 2u];\n",
+            destination.index(),
+            binding,
+            dynamic_byte_offset.index(),
+            *base_byte_offset as u32,
         )),
         ShaderOperation::SampleTexture2D {
             outputs,
@@ -2055,6 +2149,18 @@ fn wgsl_component(component: u8) -> &'static str {
         2 => ".z",
         3 => ".w",
         _ => unreachable!("verified interface component"),
+    }
+}
+
+fn wgsl_interface_component(location: ShaderIoLocation, component: u8) -> &'static str {
+    if matches!(
+        location,
+        ShaderIoLocation::Position | ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_)
+    ) {
+        wgsl_component(component)
+    } else {
+        debug_assert_eq!(component, 0, "scalar interface location component");
+        ""
     }
 }
 
@@ -2283,11 +2389,13 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
             | ShaderOperation::FloatAbsolute32 { destination, .. }
             | ShaderOperation::FloatNegate32 { destination, .. }
             | ShaderOperation::LoadConstantBuffer32 { destination, .. }
+            | ShaderOperation::LoadConstantBufferIndexed32 { destination, .. }
             | ShaderOperation::Reciprocal32 { destination, .. }
             | ShaderOperation::ReciprocalSqrt32 { destination, .. }
             | ShaderOperation::SpecialFunction32 { destination, .. }
             | ShaderOperation::Multiply32 { destination, .. }
             | ShaderOperation::Add32 { destination, .. }
+            | ShaderOperation::ShiftLeft32 { destination, .. }
             | ShaderOperation::FusedMultiplyAdd32 { destination, .. }
             | ShaderOperation::InterpolateInput { destination, .. } => {
                 for source in operation_sources(&instruction.operation) {
@@ -2448,7 +2556,8 @@ fn verify_instructions(ir: &ShaderIr) -> Result<(), ShaderVerificationError> {
                 }
             }
         }
-        if let ShaderOperation::LoadConstantBuffer32 { binding, .. } = instruction.operation
+        if let ShaderOperation::LoadConstantBuffer32 { binding, .. }
+        | ShaderOperation::LoadConstantBufferIndexed32 { binding, .. } = instruction.operation
             && !ir.resources.iter().any(|resource| {
                 resource.binding == binding
                     && resource.kind == ShaderResourceKind::ConstantBuffer
@@ -2528,6 +2637,7 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::Multiply32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::Move32 { source, .. } => vec![*source],
         ShaderOperation::Add32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::ShiftLeft32 { value, amount, .. } => vec![*value, *amount],
         ShaderOperation::FloatMinMax32 { left, right, .. } => vec![*left, *right],
         ShaderOperation::FloatAbsolute32 { source, .. }
         | ShaderOperation::FloatNegate32 { source, .. } => vec![*source],
@@ -2541,6 +2651,10 @@ fn operation_sources(operation: &ShaderOperation) -> Vec<ShaderRegister> {
         ShaderOperation::ReciprocalSqrt32 { source, .. } => vec![*source],
         ShaderOperation::SpecialFunction32 { source, .. } => vec![*source],
         ShaderOperation::SetPredicateFloat32 { left, right, .. } => vec![*left, *right],
+        ShaderOperation::LoadConstantBufferIndexed32 {
+            dynamic_byte_offset,
+            ..
+        } => vec![*dynamic_byte_offset],
         ShaderOperation::SampleTexture2D { coordinates, .. } => coordinates.to_vec(),
         _ => Vec::new(),
     }
@@ -2638,6 +2752,18 @@ mod tests {
             Err(ShaderIrConstructionError::InvalidInterfaceComponent {
                 location: ShaderIoLocation::Position,
                 component: 4,
+            })
+        );
+        assert_eq!(
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::VertexId,
+                1,
+                ShaderScalarType::Unsigned32,
+                None,
+            ),
+            Err(ShaderIrConstructionError::InvalidInterfaceComponent {
+                location: ShaderIoLocation::VertexId,
+                component: 1,
             })
         );
     }
@@ -4001,5 +4127,172 @@ mod tests {
             .validate(&parsed)
             .unwrap();
         }
+    }
+
+    #[test]
+    fn shift_left_preserves_clamped_and_wrapped_maxwell_count_semantics() {
+        let make_shader = |amount, wrap| {
+            VerifiedShaderIr::verify(ShaderIr::new(
+                ShaderStage::Fragment,
+                Vec::new(),
+                vec![
+                    ShaderInterfaceElement::new(
+                        ShaderIoLocation::Color(0),
+                        0,
+                        ShaderScalarType::Unsigned32,
+                        None,
+                    )
+                    .unwrap(),
+                ],
+                Vec::new(),
+                vec![
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(8),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(0),
+                            bits: 3,
+                            scalar_type: ShaderScalarType::Unsigned32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(16),
+                        ShaderPredicate::Always,
+                        ShaderOperation::MoveImmediate32 {
+                            destination: ShaderRegister::new(1),
+                            bits: amount,
+                            scalar_type: ShaderScalarType::Unsigned32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(24),
+                        ShaderPredicate::Always,
+                        ShaderOperation::ShiftLeft32 {
+                            destination: ShaderRegister::new(2),
+                            value: ShaderRegister::new(0),
+                            amount: ShaderRegister::new(1),
+                            wrap,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(32),
+                        ShaderPredicate::Always,
+                        ShaderOperation::StoreOutput {
+                            sources: vec![ShaderRegister::new(2)].into_boxed_slice(),
+                            location: ShaderIoLocation::Color(0),
+                            first_component: 0,
+                            scalar_type: ShaderScalarType::Unsigned32,
+                        },
+                    ),
+                    ShaderInstruction::new(
+                        ShaderSourceLocation::new(40),
+                        ShaderPredicate::Always,
+                        ShaderOperation::Exit,
+                    ),
+                ],
+            ))
+            .unwrap()
+        };
+
+        for (amount, wrap, expected) in [(4, false, 48), (36, false, 0), (36, true, 48)] {
+            let shader = make_shader(amount, wrap);
+            assert_eq!(
+                evaluate_shader_ir(&shader, &ShaderEvaluationInputs::default(), 8)
+                    .unwrap()
+                    .output_bits(ShaderIoLocation::Color(0), 0),
+                Some(expected)
+            );
+            let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+            let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&parsed)
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn indexed_constant_buffer_load_uses_wrapping_byte_addressing() {
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Fragment,
+            Vec::new(),
+            vec![
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::Color(0),
+                    0,
+                    ShaderScalarType::Unsigned32,
+                    None,
+                )
+                .unwrap(),
+            ],
+            vec![
+                ShaderResourceAccess::new(1, ShaderResourceKind::ConstantBuffer, true, false)
+                    .unwrap(),
+            ],
+            vec![
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(8),
+                    ShaderPredicate::Always,
+                    ShaderOperation::MoveImmediate32 {
+                        destination: ShaderRegister::new(0),
+                        bits: 0x40,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(16),
+                    ShaderPredicate::Always,
+                    ShaderOperation::LoadConstantBufferIndexed32 {
+                        destination: ShaderRegister::new(1),
+                        binding: 1,
+                        base_byte_offset: -0x10,
+                        dynamic_byte_offset: ShaderRegister::new(0),
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(24),
+                    ShaderPredicate::Always,
+                    ShaderOperation::StoreOutput {
+                        sources: vec![ShaderRegister::new(1)].into_boxed_slice(),
+                        location: ShaderIoLocation::Color(0),
+                        first_component: 0,
+                        scalar_type: ShaderScalarType::Unsigned32,
+                    },
+                ),
+                ShaderInstruction::new(
+                    ShaderSourceLocation::new(32),
+                    ShaderPredicate::Always,
+                    ShaderOperation::Exit,
+                ),
+            ],
+        ))
+        .unwrap();
+        let result = evaluate_shader_ir(
+            &shader,
+            &ShaderEvaluationInputs::default().with_constant_buffer_bits(1, 0x30, 0x1234_5678),
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            result.output_bits(ShaderIoLocation::Color(0), 0),
+            Some(0x1234_5678)
+        );
+
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert!(
+            module
+                .source()
+                .contains("constant_buffer_1[(registers[0] + 0xfffffff0u) >> 2u]")
+        );
+        let parsed = naga::front::wgsl::parse_str(module.source()).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&parsed)
+        .unwrap();
     }
 }

@@ -6,6 +6,14 @@ use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_COLOR_TARGET_COUNT: usize = 8;
 
+pub(super) const MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD: u32 = 0x0800;
+pub(super) const MAXWELL_THREE_D_COLOR_TARGET_STRIDE: u32 = 0x40;
+pub(super) const MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET: u32 = 0x20;
+pub(super) const MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET: u32 = 0;
+pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD: u32 = 0x19e0;
+pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE: u32 = 4;
+pub(super) const MAXWELL_THREE_D_COLOR_COMPRESSION_RESET: u32 = 0;
+
 /// Whether the viewport index offsets the selected render-target index.
 ///
 /// This is layered/multiview routing rather than a change to the attachment's
@@ -95,12 +103,11 @@ impl MaxwellThreeDRenderTargetLayer {
     }
 
     #[must_use]
-    pub const fn affects_draw_layering(self) -> bool {
-        self.layer != 0
-            || matches!(
-                self.control,
-                MaxwellThreeDRenderTargetLayerControl::GeometryShader
-            )
+    pub const fn affects_draw_layering(self, geometry_shader_enabled: bool) -> bool {
+        match self.control {
+            MaxwellThreeDRenderTargetLayerControl::Fixed => self.layer != 0,
+            MaxwellThreeDRenderTargetLayerControl::GeometryShader => geometry_shader_enabled,
+        }
     }
 }
 
@@ -475,7 +482,7 @@ impl MaxwellThreeDColorCompressionMode {
 
 /// One unresolved color attachment. Every member remains explicitly unset
 /// until the guest programs it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDColorTargetState {
     address_upper: MaxwellThreeDRegister<u8>,
     address_lower: MaxwellThreeDRegister<u32>,
@@ -488,6 +495,41 @@ pub struct MaxwellThreeDColorTargetState {
     array_pitch: MaxwellThreeDRegister<u32>,
     layer: MaxwellThreeDRegister<u16>,
     compression: MaxwellThreeDRegister<MaxwellThreeDColorCompressionMode>,
+}
+
+impl Default for MaxwellThreeDColorTargetState {
+    fn default() -> Self {
+        // The Maxwell class register file is zero-initialized. In particular,
+        // omitted SET_COLOR_TARGET_LAYER and SET_COLOR_COMPRESSION methods
+        // select layer zero and disabled compression; deko3d relies on both
+        // resets before fully programming the attachment.
+        // Keep the reset explicit so Unset continues to mean unknown state.
+        //
+        // NVIDIA layer and compression zero encodings:
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L773-L774
+        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3575-L3578
+        // Zero-initialized live and shadow register files:
+        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L34-L104
+        Self {
+            address_upper: MaxwellThreeDRegister::default(),
+            address_lower: MaxwellThreeDRegister::default(),
+            width: MaxwellThreeDRegister::default(),
+            height: MaxwellThreeDRegister::default(),
+            format: MaxwellThreeDRegister::default(),
+            layout: MaxwellThreeDRegister::default(),
+            kind: MaxwellThreeDRegister::default(),
+            third_dimension: MaxwellThreeDRegister::default(),
+            array_pitch: MaxwellThreeDRegister::default(),
+            layer: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET,
+                Some(MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET as u16),
+            ),
+            compression: MaxwellThreeDRegister::verified_reset(
+                MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
+                Some(MaxwellThreeDColorCompressionMode::Disabled),
+            ),
+        }
+    }
 }
 
 impl MaxwellThreeDColorTargetState {

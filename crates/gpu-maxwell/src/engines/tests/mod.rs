@@ -170,6 +170,12 @@ fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) 
         .unwrap();
 }
 
+/// Isolates tests of state-neutral class methods from the architecturally
+/// separate shadow-register side effect of the reset `METHOD_TRACK` mode.
+fn use_mme_shadow_passthrough(channel: &mut MaxwellGpuChannel) {
+    program_three_d(channel, 0x0124, 2);
+}
+
 fn resource_address_space() -> MaxwellGpuAddressSpace {
     let mut address_space =
         MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(9), SWITCH_1_GM20B_PROFILE);
@@ -273,13 +279,13 @@ fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThre
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
-                MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+                Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
-                MaxwellThreeDDirectlyAddressableMemory::Size48KiB,
+                Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),
         ],

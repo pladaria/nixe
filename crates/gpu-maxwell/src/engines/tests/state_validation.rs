@@ -28,6 +28,7 @@ fn three_d_no_operation_is_named_and_implemented() {
 fn pipe_nop_accepts_its_full_payload_without_state_or_execution_effects() {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    use_mme_shadow_passthrough(&mut channel);
 
     for argument in [0, 1, 0x8000_0000, u32::MAX] {
         let frontend_before = channel.frontend();
@@ -1126,6 +1127,7 @@ fn invalid_raster_bounding_box_values_and_failed_packet_keeps_valid_prefix() {
 fn sph_version_check_is_typed_profile_validated_and_state_neutral() {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    use_mme_shadow_passthrough(&mut channel);
     let supported = channel.profile().shader().sph_versions();
 
     for (argument, current, oldest_supported) in [
@@ -1172,6 +1174,7 @@ fn sph_version_check_is_typed_profile_validated_and_state_neutral() {
 fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    use_mme_shadow_passthrough(&mut channel);
 
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
@@ -1242,6 +1245,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
 fn aam_version_check_is_typed_profile_validated_and_state_neutral() {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    use_mme_shadow_passthrough(&mut channel);
     let supported = channel.profile().aam_versions();
 
     for (argument, current, oldest_supported) in [
@@ -1288,6 +1292,7 @@ fn aam_version_check_is_typed_profile_validated_and_state_neutral() {
 fn malformed_incompatible_and_suffixed_aam_checks_are_rejected_atomically() {
     let mut channel = channel();
     bind_three_d(&mut channel);
+    use_mme_shadow_passthrough(&mut channel);
 
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
@@ -2966,7 +2971,7 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
         .shader_execution()
         .visible_call_limit()
         .to_owned();
-    let mut previous_dependencies = channel.three_d().pipeline_dependencies(&[]);
+    let pipeline_dependencies = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
         channel
             .three_d()
@@ -3024,9 +3029,10 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
         );
         assert_eq!(channel.two_d(), &two_d_before);
 
-        let dependencies = channel.three_d().pipeline_dependencies(&[]);
-        assert_ne!(dependencies, previous_dependencies);
-        previous_dependencies = dependencies;
+        assert_eq!(
+            channel.three_d().pipeline_dependencies(&[]),
+            pipeline_dependencies
+        );
     }
 
     let clear = packet(0x19d0 / 4, 0x3c);

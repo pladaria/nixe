@@ -430,6 +430,36 @@ impl MaxwellThreeDFlushPendingWrites {
     }
 }
 
+/// Operation selected by `MAXWELL_B::TILED_CACHE_FLUSH`.
+///
+/// NVIDIA's public `MAXWELL_B` header does not expose this method. The pinned
+/// deko3d Maxwell definition and command emission identify method `0x0f80`
+/// and its two allocated values:
+/// <https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/engine_3d.def#L255-L258>
+/// <https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_state.cpp#L320-L324>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MaxwellThreeDTiledCacheFlushMode {
+    Flush = 0,
+    Alternate = 1,
+}
+
+impl MaxwellThreeDTiledCacheFlushMode {
+    #[must_use]
+    pub const fn parse(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Flush),
+            1 => Some(Self::Alternate),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Decoded `INCREMENT_SYNC_POINT` request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDSyncpointIncrement {
@@ -498,6 +528,10 @@ pub enum MaxwellThreeDSynchronizationTrigger {
         request: MaxwellThreeDFlushPendingWrites,
         source: MaxwellMethodSource,
     },
+    TiledCacheFlush {
+        mode: MaxwellThreeDTiledCacheFlushMode,
+        source: MaxwellMethodSource,
+    },
     ReportSemaphore {
         control: MaxwellThreeDReportSemaphoreControl,
         source: MaxwellMethodSource,
@@ -519,6 +553,7 @@ impl MaxwellThreeDSynchronizationTrigger {
             | Self::InvalidateTextureCacheNoWfi { source, .. }
             | Self::InvalidateTextureCache { source, .. }
             | Self::FlushPendingWrites { source, .. }
+            | Self::TiledCacheFlush { source, .. }
             | Self::ReportSemaphore { source, .. }
             | Self::IncrementSyncpoint { source, .. } => source,
         }
@@ -585,6 +620,10 @@ pub enum MaxwellThreeDSynchronizationPlan {
     FlushPendingWrites {
         request: MaxwellThreeDFlushPendingWrites,
     },
+    TiledCacheFlush {
+        mode: MaxwellThreeDTiledCacheFlushMode,
+        maintenance: CacheMaintenanceOperation,
+    },
     ReportSemaphoreRelease(MaxwellThreeDReportSemaphoreRelease),
     IncrementSyncpoint {
         request: MaxwellThreeDSyncpointIncrement,
@@ -608,6 +647,10 @@ pub enum MaxwellThreeDSynchronizationError {
     },
     UnsupportedShaderDataCacheFlush {
         source: MaxwellMethodSource,
+    },
+    UnsupportedTiledCacheFlushMode {
+        source: MaxwellMethodSource,
+        mode: MaxwellThreeDTiledCacheFlushMode,
     },
     IncompleteReportSemaphoreState {
         source: MaxwellMethodSource,
@@ -649,6 +692,10 @@ impl Display for MaxwellThreeDSynchronizationError {
             Self::UnsupportedShaderDataCacheFlush { source } => write!(
                 formatter,
                 "MAXWELL_B shader-data cache flush is not represented by neutral cache maintenance: source=[{source}]"
+            ),
+            Self::UnsupportedTiledCacheFlushMode { source, mode } => write!(
+                formatter,
+                "MAXWELL_B tiled-cache flush mode has no verified neutral semantics: source=[{source}] mode={mode:?}"
             ),
             Self::IncompleteReportSemaphoreState { source } => write!(
                 formatter,
@@ -772,6 +819,17 @@ pub fn lower_maxwell_three_d_synchronization(
         MaxwellThreeDSynchronizationTrigger::FlushPendingWrites { request, .. } => {
             Ok(MaxwellThreeDSynchronizationPlan::FlushPendingWrites { request })
         }
+        MaxwellThreeDSynchronizationTrigger::TiledCacheFlush { mode, source } => match mode {
+            MaxwellThreeDTiledCacheFlushMode::Flush => {
+                Ok(MaxwellThreeDSynchronizationPlan::TiledCacheFlush {
+                    mode,
+                    maintenance: CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+                })
+            }
+            MaxwellThreeDTiledCacheFlushMode::Alternate => Err(
+                MaxwellThreeDSynchronizationError::UnsupportedTiledCacheFlushMode { source, mode },
+            ),
+        },
         MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, source } => {
             if !control.is_captured_release() {
                 return Err(

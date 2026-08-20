@@ -438,6 +438,12 @@ impl MaxwellThreeDShaderBindingState {
             .any(|pipeline| pipeline.enabled.value() == Some(&true))
     }
 
+    pub(super) fn has_enabled_stage(&self, stage: MaxwellThreeDShaderStage) -> bool {
+        self.pipeline.iter().any(|pipeline| {
+            pipeline.enabled.value() == Some(&true) && pipeline.stage.value() == Some(&stage)
+        })
+    }
+
     #[must_use]
     pub const fn pipeline(
         &self,
