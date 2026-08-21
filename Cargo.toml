@@ -74,6 +74,7 @@ nixe-video = { path = "crates/video" }
 nixe-video-winit = { path = "crates/video-winit" }
 wgpu = { version = "30", default-features = false, features = [
     "std",
+    "metal",
     "vulkan",
     "wgsl",
 ] }
