@@ -8,10 +8,10 @@ use super::{
     MaxwellComputeInlineToMemoryPendingTransfer, MaxwellComputeInlineToMemoryUpload,
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
+    MaxwellComputeTriggeredOperation,
 };
 use crate::engines::{
-    MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
-    MaxwellEngineMethodMetadata,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -123,7 +123,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellComputeState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -154,10 +154,12 @@ pub(super) fn preflight(
         _ => None,
     };
     if let Some(trigger) = trigger {
-        return Ok(MaxwellEngineMethodDispatch::new(
+        return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            MaxwellEngineMethodEffect::ComputeTrigger(trigger),
+            Some(MaxwellEngineOperation::ComputeSynchronization(Box::new(
+                MaxwellComputeTriggeredOperation::new(trigger, candidate.clone()),
+            ))),
         ));
     }
     if matches!(declaration.action, MethodAction::InlineToMemoryData) {
@@ -194,13 +196,10 @@ pub(super) fn preflight(
             source,
         );
         candidate.apply(write);
-        return Ok(MaxwellEngineMethodDispatch::new(
+        return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            MaxwellEngineMethodEffect::ComputeStateAndInlineToMemoryUpload {
-                state: write,
-                upload,
-            },
+            Some(MaxwellEngineOperation::ComputeInlineToMemory(upload)),
         ));
     }
     let write = match declaration.action {
@@ -380,11 +379,7 @@ pub(super) fn preflight(
         }
     };
     candidate.apply(write);
-    Ok(MaxwellEngineMethodDispatch::new(
-        method,
-        *declaration.metadata,
-        MaxwellEngineMethodEffect::ComputeState(write),
-    ))
+    Ok(AppliedMethod::new(method, *declaration.metadata, None))
 }
 
 fn invalid_encoding(

@@ -369,15 +369,7 @@ fn three_d_depth_layer_is_typed_source_preserving_and_rejects_reserved_bits_atom
             dispatch.methods()[0].metadata().method_name(),
             "SET_ZT_LAYER"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::DepthLayer {
-                    value: argument as u16,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(layer.raw(), Some(argument));
@@ -1115,21 +1107,6 @@ fn standalone_inline_to_memory_pitch_upload_tracks_state_words_and_ordered_effec
     assert_eq!(dispatch.ordered_operations().len(), 2);
     for (index, (offset, value)) in [(0, 0x1122_3344), (4, 0x5566_7788)].into_iter().enumerate() {
         assert!(matches!(
-            dispatch.methods()[index].effect(),
-            MaxwellEngineMethodEffect::InlineToMemoryStateAndUpload {
-                state: MaxwellInlineToMemoryStateWrite::Data {
-                    value: state_value,
-                    next_offset,
-                    ..
-                },
-                upload,
-            } if state_value == value
-                && next_offset == offset + 4
-                && upload.address().get() == address
-                && upload.offset() == offset
-                && upload.value() == value
-        ));
-        assert!(matches!(
             dispatch.ordered_operations()[index],
             MaxwellEngineOperation::InlineToMemory(upload)
                 if upload.address().get() == address
@@ -1212,27 +1189,9 @@ fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
         Some(dispatch.methods()[2].method().source())
     );
 
-    for (index, (offset, value)) in [(0, 0x1122_3344), (4, 0x5566_7788)].into_iter().enumerate() {
+    for index in 0..2 {
         let method = dispatch.methods()[index + 1];
         assert_eq!(method.metadata().method_name(), "LOAD_CONSTANT_BUFFER");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
-                state: MaxwellThreeDStateWrite::ShaderBinding(
-                    MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
-                        value,
-                        next_offset: offset + 4,
-                        source: method.method().source(),
-                    },
-                ),
-                upload: MaxwellThreeDInlineConstantBufferUpload::new(
-                    MaxwellThreeDUnresolvedAddress::new(0, 0x82c_3000),
-                    offset,
-                    value,
-                    method.method().source(),
-                ),
-            }
-        );
     }
     assert_eq!(
         channel.three_d().pipeline_dependencies(&[]),
@@ -1564,10 +1523,7 @@ fn clear_trigger_lowers_atomically_and_cache_publication_is_generation_checked()
         program_three_d(&mut channel, method, argument);
     }
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDStateAndTrigger { .. }
-    ));
+
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::CLEAR);
@@ -2487,15 +2443,7 @@ fn ct_mrt_enable_is_typed_source_preserving_and_atomic() {
         let register = channel.three_d().render_targets().separate_fragment_data();
 
         assert_eq!(method.metadata().method_name(), "SET_CT_MRT_ENABLE");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::SeparateFragmentData {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
@@ -2854,13 +2802,7 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_SHADER_LOCAL_MEMORY_A"
     );
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ComputeState(MaxwellComputeStateWrite::AddressUpper {
-            value: 4,
-            ..
-        })
-    ));
+
     let memory = channel.compute().shader_local_memory();
     assert_eq!(memory.address(), None);
     assert_eq!(memory.address_upper().raw(), Some(4));
@@ -2961,15 +2903,7 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_PROGRAM_REGION_B"
     );
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ComputeState(
-            MaxwellComputeStateWrite::ProgramRegionAddressLower {
-                value: 0x0123_4000,
-                ..
-            }
-        )
-    ));
+
     assert_eq!(channel.compute().program().region_address(), None);
 
     let upper = packet_on_subchannel(1, 0x1608 / 4, 4);
@@ -3049,12 +2983,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_TEX_HEADER_POOL_A"
     );
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ComputeState(
-            MaxwellComputeStateWrite::TextureHeaderAddressUpper { value: 4, .. }
-        )
-    ));
+
     let header_maximum = packet_on_subchannel(1, 0x157c / 4, 0x003f_ffff);
     dispatch_first(&mut channel, &header_maximum).unwrap();
     let headers = channel.compute().texture_headers();
@@ -3135,17 +3064,7 @@ fn compute_bindless_texture_slot_is_typed_source_preserving_and_atomic() {
         dispatch.methods()[1].metadata().method_name(),
         "SET_BINDLESS_TEXTURE"
     );
-    assert!(matches!(
-        dispatch.methods()[1].effect(),
-        MaxwellEngineMethodEffect::ComputeState(
-            MaxwellComputeStateWrite::BindlessTextureConstantBufferSlot {
-                value,
-                source,
-            }
-        ) if value.get() == 7
-            && source.method() == GpuMethodId(0x2608)
-            && source.argument() == 7
-    ));
+
     let slot = channel.compute().bindless_texture_constant_buffer_slot();
     assert_eq!(slot.value().unwrap().get(), 7);
     assert_eq!(slot.raw(), Some(7));
@@ -3205,39 +3124,10 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
 
     assert_eq!(dispatch.methods().len(), 17);
     assert_eq!(dispatch.methods()[0].metadata().method_name(), "LAUNCH_DMA");
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ComputeState(
-            MaxwellComputeStateWrite::InlineToMemoryLaunch {
-                value,
-                pending,
-                source,
-            }
-        ) if value.layout() == MaxwellComputeInlineToMemoryLayout::Pitch
-            && value.system_memory_barrier_disabled()
-            && pending.address().get() == 0x082b_30c0
-            && pending.byte_length() == 0x40
-            && source.argument() == 0x41
-    ));
-    for (index, expected) in data.into_iter().enumerate() {
+
+    for index in 0..data.len() {
         let method = dispatch.methods()[index + 1];
         assert_eq!(method.metadata().method_name(), "LOAD_INLINE_DATA");
-        assert!(matches!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ComputeStateAndInlineToMemoryUpload {
-                state: MaxwellComputeStateWrite::InlineToMemoryData {
-                    value,
-                    next_offset,
-                    ..
-                },
-                upload,
-            } if value == expected
-                && next_offset == (index as u32 + 1) * 4
-                && upload.address().get() == 0x082b_30c0
-                && upload.offset() == index as u32 * 4
-                && upload.value() == expected
-                && upload.source().method() == GpuMethodId(0x01b4)
-        ));
     }
     let inline = channel.compute().inline_to_memory();
     assert_eq!(inline.address().unwrap().get(), 0x082b_30c0);
@@ -3310,15 +3200,6 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
     .into_iter()
     .enumerate()
     {
-        assert!(matches!(
-            dispatch.methods()[index].effect(),
-            MaxwellEngineMethodEffect::ComputeTrigger(
-                MaxwellComputeOperationTrigger::InvalidateShaderCachesNoWfi {
-                    caches,
-                    source,
-                }
-            ) if caches == expected && source.method() == GpuMethodId(0x1698)
-        ));
         assert_eq!(
             dispatch.compute_operations()[index].state(),
             &compute_before
@@ -3369,16 +3250,6 @@ fn compute_cwd_reference_counter_bank_is_typed_source_preserving_and_atomic() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_CWD_REF_COUNTER"
     );
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ComputeState(
-            MaxwellComputeStateWrite::CwdReferenceCounter {
-                index,
-                value,
-                ..
-            }
-        ) if index.get() == 63 && value.get() == 0x0380
-    ));
 
     let bank = channel.compute().cwd_reference_counters();
     assert_eq!(bank.entries().len(), MAXWELL_COMPUTE_CWD_REF_COUNTER_COUNT);
@@ -3450,15 +3321,7 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
             dispatch.methods()[index].metadata().method_name(),
             "WAIT_FOR_IDLE"
         );
-        assert!(matches!(
-            dispatch.methods()[index].effect(),
-            MaxwellEngineMethodEffect::ComputeTrigger(
-                MaxwellComputeOperationTrigger::WaitForIdle {
-                    value: actual,
-                    source,
-                }
-            ) if actual == value && source.argument() == value
-        ));
+
         let operation = &dispatch.compute_operations()[index];
         assert!(matches!(
             operation.trigger(),
@@ -3506,15 +3369,7 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
             dispatch.methods()[index].metadata().method_name(),
             "WAIT_FOR_IDLE"
         );
-        assert!(matches!(
-            dispatch.methods()[index].effect(),
-            MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                MaxwellThreeDSynchronizationTrigger::WaitForIdle {
-                    value: actual,
-                    source,
-                }
-            ) if actual == value && source.argument() == value
-        ));
+
         let operation = &dispatch.synchronization_operations()[index];
         assert!(matches!(
             operation.trigger(),

@@ -997,21 +997,6 @@ impl MaxwellThreeDUnnegotiatedLoweringPlan {
             dirty_images: self.dirty_images,
         })
     }
-
-    pub(crate) fn stage_cache(
-        self,
-        cache: &mut MaxwellThreeDLoweringCache,
-    ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
-        commit_lowering_cache(
-            self.expected_revision,
-            self.candidate,
-            self.creations,
-            self.invalidations,
-            self.submission,
-            self.dirty_images,
-            cache,
-        )
-    }
 }
 
 /// Immutable preflight result negotiated with one backend capability set.
@@ -1068,7 +1053,7 @@ impl MaxwellThreeDLoweringPlan {
 #[allow(clippy::too_many_arguments)]
 fn commit_lowering_cache(
     expected_revision: u64,
-    mut candidate: MaxwellThreeDLoweringCache,
+    candidate: MaxwellThreeDLoweringCache,
     creations: Box<[BackendResourceCreateInfo]>,
     invalidations: Box<[ResourceDependency]>,
     submission: OperationSubmission,
@@ -1081,10 +1066,6 @@ fn commit_lowering_cache(
             actual: cache.revision,
         });
     }
-    candidate.revision = candidate
-        .revision
-        .checked_add(1)
-        .ok_or(MaxwellThreeDLoweringError::ResourceExhausted)?;
     *cache = candidate;
     Ok(MaxwellThreeDLoweredWork {
         creations,
@@ -1158,6 +1139,38 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     predecessors: Vec<FrontendSubmissionId>,
     cache: &MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDLoweringError> {
+    let expected_revision = cache.revision;
+    let mut candidate = cache.clone();
+    let work = lower_maxwell_three_d_operation_into_cache(
+        state,
+        resources,
+        trigger,
+        translated_shaders,
+        submission,
+        predecessors,
+        &mut candidate,
+    )?;
+    Ok(MaxwellThreeDUnnegotiatedLoweringPlan {
+        expected_revision,
+        candidate,
+        creations: work.creations,
+        invalidations: work.invalidations,
+        submission: work.submission,
+        dirty_images: work.dirty_images,
+    })
+}
+
+/// Lowers into a cache which is already isolated by the caller's transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_maxwell_three_d_operation_into_cache(
+    state: &MaxwellThreeDState,
+    resources: &MaxwellThreeDResolvedResources,
+    trigger: MaxwellThreeDOperationTrigger,
+    translated_shaders: Option<&MaxwellThreeDTranslatedShaders>,
+    submission: FrontendSubmissionId,
+    predecessors: Vec<FrontendSubmissionId>,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
     if let Some(mode) = state.render_enable().execution_mode()
         && mode != MaxwellThreeDRenderEnableMode::Enabled
     {
@@ -1692,26 +1705,20 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         draw_attachments.as_ref(),
         shaders,
     )?;
-    let mut candidate = cache.clone();
     let mut creations = Vec::new();
-    let mut invalidations = candidate.retired_shader_resources.take();
+    let mut invalidations = cache.retired_shader_resources.take();
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
-        &mut candidate,
+        cache,
         &mut creations,
         &mut invalidations,
     )?;
-    let sampler_bindings = prepare_samplers(
-        resources,
-        &mut candidate,
-        &mut creations,
-        &mut invalidations,
-    )?;
+    let sampler_bindings = prepare_samplers(resources, cache, &mut creations, &mut invalidations)?;
     let (commands, dirty_images) = match trigger {
         MaxwellThreeDOperationTrigger::ClearSurface { source: _ } => {
             let lowered = lower_clear(state, resources, &resource_bindings)?;
-            record_clear_materialization(state, resources, &mut candidate)?;
+            record_clear_materialization(state, resources, cache)?;
             lowered
         }
         MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1729,19 +1736,21 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
                 shaders.ok_or(MaxwellThreeDLoweringError::ShaderTranslationRequired)?,
                 attachments,
                 vertex_count,
-                &mut candidate,
+                cache,
                 &mut creations,
             )?;
-            record_draw_color_materializations(state, resources, attachments, &mut candidate)?;
+            record_draw_color_materializations(state, resources, attachments, cache)?;
             lowered
         }
     };
-    let operations = sequence_with_transitions(commands, &mut candidate)?;
+    let operations = sequence_with_transitions(commands, cache)?;
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellThreeDLoweringError::Command)?;
-    Ok(MaxwellThreeDUnnegotiatedLoweringPlan {
-        expected_revision: cache.revision,
-        candidate,
+    cache.revision = cache
+        .revision
+        .checked_add(1)
+        .ok_or(MaxwellThreeDLoweringError::ResourceExhausted)?;
+    Ok(MaxwellThreeDLoweredWork {
         creations: creations.into_boxed_slice(),
         invalidations: invalidations.into_boxed_slice(),
         submission,

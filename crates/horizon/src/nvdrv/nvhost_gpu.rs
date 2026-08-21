@@ -590,16 +590,18 @@ fn submit_gpfifo(
                 .complete_immediate_channel_submission(descriptor, request, reservation, || {
                     let executed =
                         execute_maxwell_backend_submission(plan, dispatch_address_space, backend)?;
-                    executed_cache = Some(executed.staged_cache().clone());
-                    executed_completion = executed.completion();
+                    let (cache, completion, _) = executed.into_parts();
+                    executed_cache = Some(cache);
+                    executed_completion = completion;
                     Ok(())
                 })?
                 .err(),
             None => match execute_maxwell_backend_submission(plan, dispatch_address_space, backend)
             {
                 Ok(executed) => {
-                    executed_cache = Some(executed.staged_cache().clone());
-                    executed_completion = executed.completion();
+                    let (cache, completion, _) = executed.into_parts();
+                    executed_cache = Some(cache);
+                    executed_completion = completion;
                     None
                 }
                 Err(error) => Some(error),
@@ -634,15 +636,17 @@ fn submit_gpfifo(
                     let executed =
                         execute_maxwell_software_initialization(plan, dispatch_address_space)
                             .map_err(Box::new)?;
-                    executed_cache = Some(executed.staged_cache().clone());
-                    executed_completion = executed.completion();
+                    let (cache, completion) = executed.into_parts();
+                    executed_cache = Some(cache);
+                    executed_completion = completion;
                     Ok(())
                 })?
                 .err(),
             None => match execute_maxwell_software_initialization(plan, dispatch_address_space) {
                 Ok(executed) => {
-                    executed_cache = Some(executed.staged_cache().clone());
-                    executed_completion = executed.completion();
+                    let (cache, completion) = executed.into_parts();
+                    executed_cache = Some(cache);
+                    executed_completion = completion;
                     None
                 }
                 Err(error) => Some(Box::new(error)),

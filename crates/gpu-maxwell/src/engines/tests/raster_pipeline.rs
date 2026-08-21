@@ -26,12 +26,7 @@ fn sm_timeout_counter_bit_is_bounded_source_preserving_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_SM_TIMEOUT_INTERVAL"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -124,15 +119,7 @@ fn csaa_enable_is_typed_source_preserving_state_isolated_from_multisample() {
             dispatch.methods()[0].metadata().method_name(),
             "CSAA_ENABLE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::CsaaEnable {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -159,12 +146,7 @@ fn hybrid_anti_alias_control_is_typed_source_preserving_and_atomic() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_HYBRID_ANTI_ALIAS_CONTROL"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(value.passes(), argument as u8 & 0xf);
         assert_eq!(
@@ -294,16 +276,7 @@ fn sample_location_family_preserves_all_coordinates_and_keeps_valid_prefix_on_fa
                 "SAMPLE_LOCATIONS(3)",
             ][group]
         );
-        assert_eq!(
-            dispatch.methods()[group].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::SampleLocations {
-                    group: group as u8,
-                    value,
-                    source,
-                }
-            ))
-        );
+
         assert_eq!(value.raw(), argument);
         for (index, location) in value.locations().iter().enumerate() {
             assert_eq!(location.x(), ((argument >> (index * 8)) & 0xf) as u8);
@@ -413,12 +386,7 @@ fn ps_output_sample_mask_usage_is_typed_source_preserving_coverage_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_PS_OUTPUT_SAMPLE_MASK_USAGE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source }
-            ))
-        );
+
         assert_eq!(value.enabled(), argument & 1 != 0);
         assert_eq!(value.qualify_by_anti_alias_enable(), argument & 2 != 0);
         assert_eq!(value.effective(Some(false)), Some(matches!(argument, 1)));
@@ -470,12 +438,7 @@ fn primitive_circular_buffer_throttle_is_typed_source_preserving_and_pipeline_ne
             dispatch.methods()[0].metadata().method_name(),
             "SET_PRIM_CIRCULAR_BUFFER_THROTTLE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-                MaxwellThreeDVertexInputWrite::PrimitiveCircularBufferThrottle { value, source }
-            ))
-        );
+
         assert_eq!(value.primitive_area(), argument);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.source(), Some(source));
@@ -522,12 +485,7 @@ fn unorm8_color_reduction_thresholds_are_typed_source_preserving_and_isolated() 
             dispatch.methods()[0].metadata().method_name(),
             "SET_REDUCE_COLOR_THRESHOLDS_UNORM8"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -589,12 +547,7 @@ fn unorm10_color_reduction_thresholds_are_typed_source_preserving_and_independen
             dispatch.methods()[0].metadata().method_name(),
             "SET_REDUCE_COLOR_THRESHOLDS_UNORM10"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -655,12 +608,7 @@ fn unorm16_color_reduction_thresholds_are_typed_source_preserving_and_independen
             dispatch.methods()[0].metadata().method_name(),
             "SET_REDUCE_COLOR_THRESHOLDS_UNORM16"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -734,12 +682,7 @@ fn fp16_color_reduction_thresholds_are_typed_source_preserving_and_independent()
             dispatch.methods()[0].metadata().method_name(),
             "SET_REDUCE_COLOR_THRESHOLDS_FP16"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -812,12 +755,7 @@ fn srgb8_color_reduction_thresholds_are_typed_source_preserving_and_independent(
             dispatch.methods()[0].metadata().method_name(),
             "SET_REDUCE_COLOR_THRESHOLDS_SRGB8"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -1096,12 +1034,7 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
         let register = channel.three_d().vertex_input().primitive().patch_size();
 
         assert_eq!(dispatch.methods()[0].metadata().method_name(), "SET_PATCH");
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-                MaxwellThreeDVertexInputWrite::PatchSize { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(value.control_points(), argument as u8);
         assert_eq!(value.raw(), argument);
@@ -1494,13 +1427,7 @@ fn triangle_fill_and_conservative_raster_controls_are_typed_and_atomic() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_FILL_VIA_TRIANGLE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FillViaTriangle {
-                value: expected,
-                source,
-            })
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
@@ -1517,13 +1444,7 @@ fn triangle_fill_and_conservative_raster_controls_are_typed_and_atomic() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_CONSERVATIVE_RASTER"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ConservativeRaster {
-                value: expected,
-                source,
-            })
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
@@ -1584,16 +1505,7 @@ fn polygon_smoothing_and_stipple_family_is_source_preserving_and_atomic() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_POLYGON_STIPPLE_PATTERN"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(
-                MaxwellThreeDStateWrite::PolygonStipplePattern {
-                    word: word as u8,
-                    value: argument,
-                    source,
-                }
-            )
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&argument));
         assert_eq!(register.source(), Some(source));
@@ -1631,13 +1543,7 @@ fn viewport_pixel_center_is_typed_source_preserving_and_atomic() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_VIEWPORT_PIXEL"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ViewportPixelCenter {
-                value: expected,
-                source,
-            })
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
@@ -2120,15 +2026,7 @@ fn vertex_array_restart_is_typed_source_preserving_and_isolated_from_indexed_res
             dispatch.methods()[0].metadata().method_name(),
             "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-                MaxwellThreeDVertexInputWrite::VertexArrayPrimitiveRestartEnable {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -2232,16 +2130,7 @@ fn shade_mode_is_typed_source_preserving_and_part_of_pipeline_identity() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_SHADE_MODE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::ShadeMode,
-                    value: MaxwellThreeDFixedFunctionValue::ShadeMode(expected),
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -2421,12 +2310,7 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_BLEND_PER_FORMAT_ENABLE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::BlendPerFormatEnable { value, source }
-            ))
-        );
+
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
@@ -2465,12 +2349,7 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_BLEND_OPT_CONTROL"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::BlendFloatPixelKillEnable { value, source }
-            ))
-        );
+
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
@@ -2509,12 +2388,7 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_BLEND_FLOAT_OPTION"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::BlendZeroTimesAnythingIsZero { value, source }
-            ))
-        );
+
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
@@ -2669,15 +2543,7 @@ fn common_blend_enable_is_typed_source_preserving_and_family_isolated() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_BLEND_ENABLE_COMMON"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::BlendEnableCommon {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -3252,16 +3118,7 @@ fn provoking_vertex_and_two_sided_light_are_typed_source_preserving_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_PROVOKING_VERTEX"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::ProvokingVertex,
-                    value: MaxwellThreeDFixedFunctionValue::ProvokingVertex(expected),
-                    source,
-                }
-            ))
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(
             register.value(),
@@ -3865,15 +3722,7 @@ fn aliased_line_width_selector_is_typed_source_preserving_isolated_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_ALIASED_LINE_WIDTH_ENABLE"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Line(
-                MaxwellThreeDLineStateWrite::AliasedLineWidthEnable {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -3912,15 +3761,7 @@ fn polygon_clip_generated_edge_is_typed_source_preserving_line_state() {
             method.metadata().method_name(),
             "SET_LINE_MODE_POLYGON_CLIP"
         );
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Line(
-                MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -4475,15 +4316,7 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
         let register = channel.three_d().coverage().tir_mode();
 
         assert_eq!(dispatch.methods()[0].metadata().method_name(), "SET_TIR");
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::TirMode {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
@@ -4529,15 +4362,7 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_TIR_MODULATION"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::TirModulation {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
@@ -4556,15 +4381,7 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_TIR_MODULATION_FUNCTION"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::TirModulationFunction {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
