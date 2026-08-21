@@ -555,12 +555,7 @@ mod tests {
             first.packets()[2].methods()[0].metadata().method_name(),
             "WAIT_FOR_IDLE"
         );
-        assert!(matches!(
-            first.packets()[2].methods()[0].effect(),
-            crate::MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                crate::MaxwellThreeDSynchronizationTrigger::WaitForIdle { value: 0, .. }
-            )
-        ));
+
         assert!(matches!(
             first.failure(),
             MaxwellFrontendFailure::ExecutionUnavailable

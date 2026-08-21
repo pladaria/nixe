@@ -10,10 +10,7 @@ use super::{
     MaxwellTwoDProcessingClusters, MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableStateWrite,
     MaxwellTwoDState, MaxwellTwoDStateWrite,
 };
-use crate::engines::{
-    MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
-    MaxwellEngineMethodMetadata,
-};
+use crate::engines::{AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata};
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
 const CLASS_NAME: &str = "FERMI_TWOD_A";
@@ -153,7 +150,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellTwoDState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -233,11 +230,7 @@ pub(super) fn preflight(
     };
 
     candidate.apply(write);
-    Ok(MaxwellEngineMethodDispatch::new(
-        method,
-        *declaration.metadata,
-        MaxwellEngineMethodEffect::TwoDState(write),
-    ))
+    Ok(AppliedMethod::new(method, *declaration.metadata, None))
 }
 
 fn invalid_value(

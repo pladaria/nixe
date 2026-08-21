@@ -10,51 +10,40 @@ use nixe_gpu::{
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
-use crate::engines::resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache;
+use crate::engines::{
+    lower_maxwell_three_d_operation_into_cache,
+    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache,
+};
 use crate::{
-    MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError,
-    MaxwellDmaCopyOperation, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
-    MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellHostMemoryOperation,
-    MaxwellInlineToMemoryUpload, MaxwellMethodSource, MaxwellResolvedRange,
-    MaxwellShaderTranslationError, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
-    MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
+    MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError, MaxwellDmaCopyOperation,
+    MaxwellEngineOperation, MaxwellEnginePacketDispatch, MaxwellGpuAccessError,
+    MaxwellGpuAddressSpace, MaxwellHostMemoryOperation, MaxwellMethodSource, MaxwellResolvedRange,
+    MaxwellShaderTranslationError, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
+    MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
-    lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
+    lower_maxwell_three_d_synchronization,
     shader::{MaxwellStagedShaderWrite, prepare_maxwell_shader_translation_inputs},
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
 pub enum MaxwellSubmissionExecutionStep {
-    HostSynchronization {
+    InlineWrite {
         source: MaxwellMethodSource,
-        operation: GpuOperation,
-        prior_work_pending: bool,
-    },
-    ComputeInlineToMemory {
-        upload: MaxwellComputeInlineToMemoryUpload,
         target: MaxwellResolvedRange,
-    },
-    InlineToMemory {
-        upload: MaxwellInlineToMemoryUpload,
-        target: MaxwellResolvedRange,
+        value: [u8; 4],
     },
     DmaCopy {
         operation: MaxwellDmaCopyOperation,
         source: MaxwellResolvedRange,
         destination: MaxwellResolvedRange,
     },
-    ComputeSynchronization(MaxwellComputeSynchronizationPlan),
-    ThreeDInlineConstantBuffer {
-        upload: MaxwellThreeDInlineConstantBufferUpload,
+    PostCompletionWrite {
+        source: MaxwellMethodSource,
         target: MaxwellResolvedRange,
+        value: [u8; 4],
     },
-    ThreeDReportSemaphoreRelease {
-        release: crate::MaxwellThreeDReportSemaphoreRelease,
-        target: MaxwellResolvedRange,
-    },
+    BackendOperation(GpuOperation),
     ThreeD(MaxwellThreeDLoweredWork),
-    ThreeDSynchronization(MaxwellThreeDSynchronizationPlan),
 }
 
 /// Complete neutral plan awaiting backend negotiation, execution, and completion.
@@ -66,6 +55,8 @@ pub struct MaxwellSubmissionExecutionPlan {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
     steps: Box<[MaxwellSubmissionExecutionStep]>,
+    staged_writes: CanonicalWriteBatch,
+    write_source: Option<CanonicalWriteSource>,
     staged_cache: MaxwellThreeDLoweringCache,
     completion: Option<GuestTimelinePoint>,
 }
@@ -121,11 +112,6 @@ pub struct MaxwellBackendExecutionCompletion {
 
 impl MaxwellBackendExecutionCompletion {
     #[must_use]
-    pub const fn staged_cache(&self) -> &MaxwellThreeDLoweringCache {
-        &self.staged_cache
-    }
-
-    #[must_use]
     pub const fn completion(&self) -> Option<GuestTimelinePoint> {
         self.completion
     }
@@ -133,6 +119,17 @@ impl MaxwellBackendExecutionCompletion {
     #[must_use]
     pub const fn backend(&self) -> BackendExecutionCompletion {
         self.backend
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        MaxwellThreeDLoweringCache,
+        Option<GuestTimelinePoint>,
+        BackendExecutionCompletion,
+    ) {
+        (self.staged_cache, self.completion, self.backend)
     }
 }
 
@@ -160,13 +157,13 @@ impl std::error::Error for MaxwellBackendExecutionError {}
 
 impl MaxwellSoftwareInitializationCompletion {
     #[must_use]
-    pub const fn staged_cache(&self) -> &MaxwellThreeDLoweringCache {
-        &self.staged_cache
+    pub const fn completion(&self) -> Option<GuestTimelinePoint> {
+        self.completion
     }
 
     #[must_use]
-    pub const fn completion(&self) -> Option<GuestTimelinePoint> {
-        self.completion
+    pub fn into_parts(self) -> (MaxwellThreeDLoweringCache, Option<GuestTimelinePoint>) {
+        (self.staged_cache, self.completion)
     }
 }
 
@@ -174,9 +171,6 @@ impl MaxwellSoftwareInitializationCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellSoftwareInitializationError {
     UnsupportedThreeDWork,
-    InconsistentHostSynchronizationPlan,
-    InconsistentWaitForIdlePlan,
-    InconsistentReportSemaphorePlan,
     StaleInlineTarget {
         source: MaxwellMethodSource,
         error: MaxwellGpuAccessError,
@@ -204,15 +198,6 @@ impl Display for MaxwellSoftwareInitializationError {
         match self {
             Self::UnsupportedThreeDWork => formatter.write_str(
                 "submission contains 3D work which requires shader translation and a neutral backend",
-            ),
-            Self::InconsistentHostSynchronizationPlan => formatter.write_str(
-                "submission host cache-maintenance plan does not match its ordered execution prefix",
-            ),
-            Self::InconsistentWaitForIdlePlan => formatter.write_str(
-                "submission WAIT_FOR_IDLE plan does not match its ordered execution prefix",
-            ),
-            Self::InconsistentReportSemaphorePlan => formatter.write_str(
-                "submission report-semaphore release does not match its ordered execution prefix",
             ),
             Self::StaleInlineTarget { source, error } => {
                 write!(formatter, "inline upload target changed before execution: {source}: {error}")
@@ -327,6 +312,7 @@ pub fn preflight_maxwell_submission_execution(
     let mut completion_signal_count = 0_u32;
     let mut staged_shader_writes = Vec::new();
     let mut staged_memory_writes = CanonicalWriteBatch::new();
+    let mut write_source = None;
 
     for operation in packets
         .iter()
@@ -346,11 +332,9 @@ pub fn preflight_maxwell_submission_execution(
                         )
                     }
                 };
-                steps.push(MaxwellSubmissionExecutionStep::HostSynchronization {
-                    source: operation.source(),
-                    operation: GpuOperation::new(command, [], [], CapabilityRequirements::none()),
-                    prior_work_pending,
-                });
+                steps.push(MaxwellSubmissionExecutionStep::BackendOperation(
+                    GpuOperation::new(command, [], [], CapabilityRequirements::none()),
+                ));
             }
             MaxwellEngineOperation::ComputeInlineToMemory(upload) => {
                 let target = resolve_inline_target(
@@ -371,9 +355,11 @@ pub fn preflight_maxwell_submission_execution(
                     &mut staged_memory_writes,
                 )
                 .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
-                steps.push(MaxwellSubmissionExecutionStep::ComputeInlineToMemory {
-                    upload: *upload,
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+                steps.push(MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: upload.source(),
                     target,
+                    value: upload.value().to_le_bytes(),
                 });
                 prior_work_pending = true;
             }
@@ -396,9 +382,11 @@ pub fn preflight_maxwell_submission_execution(
                     &mut staged_memory_writes,
                 )
                 .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
-                steps.push(MaxwellSubmissionExecutionStep::InlineToMemory {
-                    upload: *upload,
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+                steps.push(MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: upload.source(),
                     target,
+                    value: upload.value().to_le_bytes(),
                 });
                 prior_work_pending = true;
             }
@@ -445,6 +433,7 @@ pub fn preflight_maxwell_submission_execution(
                     &mut staged_memory_writes,
                 )
                 .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
+                write_source = Some(CanonicalWriteSource::Dma(operation.source()));
                 steps.push(MaxwellSubmissionExecutionStep::DmaCopy {
                     operation: *operation,
                     source,
@@ -454,10 +443,22 @@ pub fn preflight_maxwell_submission_execution(
             }
             MaxwellEngineOperation::ComputeSynchronization(operation) => {
                 let plan = lower_maxwell_compute_synchronization(operation, prior_work_pending);
-                if matches!(plan, MaxwellComputeSynchronizationPlan::WaitForIdle { .. }) {
-                    prior_work_pending = false;
+                match plan {
+                    MaxwellComputeSynchronizationPlan::WaitForIdle { .. } => {
+                        prior_work_pending = false;
+                    }
+                    MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches } => {
+                        steps.push(MaxwellSubmissionExecutionStep::BackendOperation(
+                            cache_maintenance_operation(
+                                CacheMaintenanceOperation::InvalidateShaderCaches {
+                                    instruction: caches.instruction(),
+                                    global_data: caches.global_data(),
+                                    constant: caches.constant(),
+                                },
+                            ),
+                        ));
+                    }
                 }
-                steps.push(MaxwellSubmissionExecutionStep::ComputeSynchronization(plan));
             }
             MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload) => {
                 let target = resolve_inline_target(
@@ -478,9 +479,11 @@ pub fn preflight_maxwell_submission_execution(
                     &mut staged_memory_writes,
                 )
                 .map_err(|error| MaxwellSubmissionExecutionError::StagedMemory(Box::new(error)))?;
-                steps.push(MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer {
-                    upload: *upload,
+                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+                steps.push(MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: upload.source(),
                     target,
+                    value: upload.value().to_le_bytes(),
                 });
                 prior_work_pending = true;
             }
@@ -519,19 +522,16 @@ pub fn preflight_maxwell_submission_execution(
                             Some(staged_cache.retained_backings_mut()),
                         )
                         .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                    let plan = preflight_maxwell_three_d_operation_unnegotiated(
+                    let work = lower_maxwell_three_d_operation_into_cache(
                         operation.state(),
                         &resources,
                         operation.trigger(),
                         Some(&translated),
                         frontend,
                         predecessors.clone(),
-                        &staged_cache,
+                        &mut staged_cache,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
-                    let work = plan
-                        .stage_cache(&mut staged_cache)
-                        .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
                     steps.push(MaxwellSubmissionExecutionStep::ThreeD(work));
                     prior_work_pending = true;
                     continue;
@@ -550,19 +550,16 @@ pub fn preflight_maxwell_submission_execution(
                         Some(staged_cache.retained_backings_mut()),
                     )
                     .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
-                let plan = preflight_maxwell_three_d_operation_unnegotiated(
+                let work = lower_maxwell_three_d_operation_into_cache(
                     operation.state(),
                     &resources,
                     operation.trigger(),
                     None,
                     frontend,
                     predecessors.clone(),
-                    &staged_cache,
+                    &mut staged_cache,
                 )
                 .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
-                let work = plan
-                    .stage_cache(&mut staged_cache)
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
                 steps.push(MaxwellSubmissionExecutionStep::ThreeD(work));
                 prior_work_pending = true;
             }
@@ -605,14 +602,13 @@ pub fn preflight_maxwell_submission_execution(
                         0,
                         release.source(),
                     )?;
-                    steps.push(
-                        MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
-                            release,
-                            target,
-                        },
-                    );
-                } else {
-                    steps.push(MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan));
+                    steps.push(MaxwellSubmissionExecutionStep::PostCompletionWrite {
+                        source: release.source(),
+                        target,
+                        value: release.payload().to_le_bytes(),
+                    });
+                } else if let Some(operation) = three_d_synchronization_operation(plan) {
+                    steps.push(MaxwellSubmissionExecutionStep::BackendOperation(operation));
                 }
                 if drains_prior_work {
                     prior_work_pending = false;
@@ -636,6 +632,8 @@ pub fn preflight_maxwell_submission_execution(
         frontend,
         predecessors: predecessors.into_boxed_slice(),
         steps: steps.into_boxed_slice(),
+        staged_writes: staged_memory_writes,
+        write_source,
         staged_cache,
         completion: completion.map(ReservedTimelinePoint::point),
     })
@@ -651,171 +649,22 @@ pub fn execute_maxwell_software_initialization(
     plan: MaxwellSubmissionExecutionPlan,
     address_space: &MaxwellGpuAddressSpace,
 ) -> Result<MaxwellSoftwareInitializationCompletion, MaxwellSoftwareInitializationError> {
-    let mut writes = CanonicalWriteBatch::new();
-    let mut write_source = None;
-    let mut prior_work_pending = false;
-
+    if plan.requires_backend() {
+        return Err(MaxwellSoftwareInitializationError::UnsupportedThreeDWork);
+    }
+    let mut writes = plan.staged_writes;
+    let mut write_source = plan.write_source;
     for step in &plan.steps {
-        match step {
-            MaxwellSubmissionExecutionStep::HostSynchronization {
-                operation,
-                prior_work_pending: planned,
-                ..
-            } => {
-                if *planned != prior_work_pending {
-                    return Err(
-                        MaxwellSoftwareInitializationError::InconsistentHostSynchronizationPlan,
-                    );
-                }
-                debug_assert!(matches!(
-                    operation.command(),
-                    GpuCommand::CacheMaintenance(_)
-                ));
-            }
-            MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut writes,
-                )?;
-                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
-                prior_work_pending = true;
-            }
-            MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut writes,
-                )?;
-                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
-                prior_work_pending = true;
-            }
-            MaxwellSubmissionExecutionStep::DmaCopy {
-                operation,
-                source,
-                destination,
-            } => {
-                stage_dma_copy(address_space, *operation, source, destination, &mut writes)?;
-                write_source = Some(CanonicalWriteSource::Dma(operation.source()));
-                prior_work_pending = true;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut writes,
-                )?;
-                write_source = Some(CanonicalWriteSource::Inline(upload.source()));
-                prior_work_pending = true;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
-                if release.prior_work_pending() != prior_work_pending {
-                    return Err(
-                        MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan,
-                    );
-                }
-                stage_inline_write(
-                    address_space,
-                    target,
-                    release.payload().to_le_bytes(),
-                    release.source(),
-                    &mut writes,
-                )?;
-                write_source = Some(CanonicalWriteSource::Inline(release.source()));
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ComputeSynchronization(
-                MaxwellComputeSynchronizationPlan::WaitForIdle {
-                    prior_work_pending: planned,
-                },
-            ) => {
-                if *planned != prior_work_pending {
-                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
-                }
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ComputeSynchronization(
-                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
-            ) => {}
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface {
-                    prior_work_pending: planned,
-                    ..
-                },
-            ) => {
-                if *planned != prior_work_pending {
-                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
-                }
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::WaitForIdle {
-                    prior_work_pending: planned,
-                },
-            ) => {
-                if *planned != prior_work_pending {
-                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
-                }
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. },
-            ) => {}
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
-                    prior_work_pending: planned,
-                    ..
-                },
-            ) => {
-                if *planned != prior_work_pending {
-                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
-                }
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { .. },
-            ) => {}
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
-                    prior_work_pending: planned,
-                    ..
-                },
-            ) => {
-                if *planned != prior_work_pending {
-                    return Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan);
-                }
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. },
-            ) => {
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::TiledCacheFlush { .. },
-            ) => {}
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. },
-            ) => {
-                prior_work_pending = false;
-            }
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_),
-            ) => {
-                return Err(MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan);
-            }
-            MaxwellSubmissionExecutionStep::ThreeD(_) => {
-                return Err(MaxwellSoftwareInitializationError::UnsupportedThreeDWork);
-            }
+        if let MaxwellSubmissionExecutionStep::PostCompletionWrite {
+            source,
+            target,
+            value,
+        } = step
+        {
+            stage_inline_write(address_space, target, *value, *source, &mut writes)?;
+            write_source = Some(CanonicalWriteSource::Inline(*source));
         }
     }
-
     commit_write_batch(writes, write_source)?;
 
     Ok(MaxwellSoftwareInitializationCompletion {
@@ -877,11 +726,15 @@ fn execute_maxwell_backend_steps<T>(
 
     for step in &plan.steps {
         match step {
-            MaxwellSubmissionExecutionStep::HostSynchronization { operation, .. } => {
+            MaxwellSubmissionExecutionStep::BackendOperation(operation) => {
                 commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
                 operations.push(operation.clone());
             }
-            MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target } => {
+            MaxwellSubmissionExecutionStep::InlineWrite {
+                source,
+                target,
+                value,
+            } => {
                 flush_maxwell_backend_segment(
                     plan,
                     &mut creations,
@@ -891,35 +744,9 @@ fn execute_maxwell_backend_steps<T>(
                     &mut execute_segment,
                     &mut last_completion,
                 )?;
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut pre_writes,
-                )
-                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
-            }
-            MaxwellSubmissionExecutionStep::InlineToMemory { upload, target } => {
-                flush_maxwell_backend_segment(
-                    plan,
-                    &mut creations,
-                    &mut invalidations,
-                    &mut operations,
-                    &mut segments,
-                    &mut execute_segment,
-                    &mut last_completion,
-                )?;
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut pre_writes,
-                )
-                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
+                stage_inline_write(address_space, target, *value, *source, &mut pre_writes)
+                    .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                pre_write_source = Some(CanonicalWriteSource::Inline(*source));
             }
             MaxwellSubmissionExecutionStep::DmaCopy {
                 operation,
@@ -945,36 +772,14 @@ fn execute_maxwell_backend_steps<T>(
                 .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
                 pre_write_source = Some(CanonicalWriteSource::Dma(operation.source()));
             }
-            MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { upload, target } => {
-                flush_maxwell_backend_segment(
-                    plan,
-                    &mut creations,
-                    &mut invalidations,
-                    &mut operations,
-                    &mut segments,
-                    &mut execute_segment,
-                    &mut last_completion,
-                )?;
-                stage_inline_write(
-                    address_space,
-                    target,
-                    upload.value().to_le_bytes(),
-                    upload.source(),
-                    &mut pre_writes,
-                )
-                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                pre_write_source = Some(CanonicalWriteSource::Inline(upload.source()));
-            }
-            MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease { release, target } => {
-                stage_inline_write(
-                    address_space,
-                    target,
-                    release.payload().to_le_bytes(),
-                    release.source(),
-                    &mut post_writes,
-                )
-                .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
-                post_write_source = Some(release.source());
+            MaxwellSubmissionExecutionStep::PostCompletionWrite {
+                source,
+                target,
+                value,
+            } => {
+                stage_inline_write(address_space, target, *value, *source, &mut post_writes)
+                    .map_err(|error| MaxwellBackendExecutionError::Software(Box::new(error)))?;
+                post_write_source = Some(*source);
             }
             MaxwellSubmissionExecutionStep::ThreeD(work) => {
                 commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
@@ -982,56 +787,6 @@ fn execute_maxwell_backend_steps<T>(
                 invalidations.extend_from_slice(work.resource_invalidations());
                 operations.extend_from_slice(work.submission().operations());
             }
-            MaxwellSubmissionExecutionStep::ComputeSynchronization(plan) => match plan {
-                MaxwellComputeSynchronizationPlan::WaitForIdle { .. } => {}
-                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches } => {
-                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
-                    operations.push(cache_maintenance_operation(
-                        CacheMaintenanceOperation::InvalidateShaderCaches {
-                            instruction: caches.instruction(),
-                            global_data: caches.global_data(),
-                            constant: caches.constant(),
-                        },
-                    ));
-                }
-            },
-            MaxwellSubmissionExecutionStep::ThreeDSynchronization(plan) => match plan {
-                MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
-                | MaxwellThreeDSynchronizationPlan::WaitForIdle { .. } => {}
-                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches {
-                    maintenance, ..
-                }
-                | MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
-                    maintenance,
-                    ..
-                }
-                | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi {
-                    maintenance,
-                    ..
-                }
-                | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
-                    maintenance, ..
-                } => {
-                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
-                    operations.push(cache_maintenance_operation(*maintenance));
-                }
-                MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
-                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
-                    operations.push(cache_maintenance_operation(
-                        CacheMaintenanceOperation::FlushDirtyDeviceWrites,
-                    ));
-                }
-                MaxwellThreeDSynchronizationPlan::TiledCacheFlush { maintenance, .. } => {
-                    commit_pending_backend_writes(&mut pre_writes, &mut pre_write_source)?;
-                    operations.push(cache_maintenance_operation(*maintenance));
-                }
-                MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. } => {}
-                MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_) => {
-                    return Err(MaxwellBackendExecutionError::Software(Box::new(
-                        MaxwellSoftwareInitializationError::InconsistentReportSemaphorePlan,
-                    )));
-                }
-            },
         }
     }
 
@@ -1112,29 +867,16 @@ impl BackendSegmentCursor {
 fn backend_step_is_canonical_write(step: &MaxwellSubmissionExecutionStep) -> bool {
     matches!(
         step,
-        MaxwellSubmissionExecutionStep::ComputeInlineToMemory { .. }
-            | MaxwellSubmissionExecutionStep::InlineToMemory { .. }
+        MaxwellSubmissionExecutionStep::InlineWrite { .. }
             | MaxwellSubmissionExecutionStep::DmaCopy { .. }
-            | MaxwellSubmissionExecutionStep::ThreeDInlineConstantBuffer { .. }
     )
 }
 
 fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
     matches!(
         step,
-        MaxwellSubmissionExecutionStep::HostSynchronization { .. }
+        MaxwellSubmissionExecutionStep::BackendOperation(_)
             | MaxwellSubmissionExecutionStep::ThreeD(_)
-            | MaxwellSubmissionExecutionStep::ComputeSynchronization(
-                MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { .. }
-            )
-            | MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { .. }
-                    | MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { .. }
-                    | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { .. }
-                    | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
-                    | MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
-                    | MaxwellThreeDSynchronizationPlan::TiledCacheFlush { .. }
-            )
     )
 }
 
@@ -1182,6 +924,26 @@ fn cache_maintenance_operation(maintenance: CacheMaintenanceOperation) -> GpuOpe
         [],
         CapabilityRequirements::none(),
     )
+}
+
+fn three_d_synchronization_operation(
+    plan: MaxwellThreeDSynchronizationPlan,
+) -> Option<GpuOperation> {
+    let maintenance = match plan {
+        MaxwellThreeDSynchronizationPlan::InvalidateShaderCaches { maintenance, .. }
+        | MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi { maintenance, .. }
+        | MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi { maintenance, .. }
+        | MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { maintenance, .. }
+        | MaxwellThreeDSynchronizationPlan::TiledCacheFlush { maintenance, .. } => maintenance,
+        MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. } => {
+            CacheMaintenanceOperation::FlushDirtyDeviceWrites
+        }
+        MaxwellThreeDSynchronizationPlan::DecompressUncompressedSurface { .. }
+        | MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }
+        | MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
+        | MaxwellThreeDSynchronizationPlan::ReportSemaphoreRelease(_) => return None,
+    };
+    Some(cache_maintenance_operation(maintenance))
 }
 
 #[derive(Clone, Copy)]
@@ -1534,26 +1296,6 @@ mod tests {
     }
 
     #[test]
-    fn three_d_wait_for_idle_rejects_an_inconsistent_ordering_plan() {
-        let plan = MaxwellSubmissionExecutionPlan {
-            frontend: FrontendSubmissionId::new(2),
-            predecessors: Box::new([]),
-            steps: Box::new([MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::WaitForIdle {
-                    prior_work_pending: true,
-                },
-            )]),
-            staged_cache: MaxwellThreeDLoweringCache::default(),
-            completion: None,
-        };
-
-        assert!(matches!(
-            execute_maxwell_software_initialization(plan, &address_space()),
-            Err(MaxwellSoftwareInitializationError::InconsistentWaitForIdlePlan)
-        ));
-    }
-
-    #[test]
     fn captured_three_d_report_semaphore_release_writes_payload_after_prior_work() {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         let mut address_space = address_space();
@@ -1613,12 +1355,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             plan.steps(),
-            [MaxwellSubmissionExecutionStep::ThreeDReportSemaphoreRelease {
-                release,
+            [MaxwellSubmissionExecutionStep::PostCompletionWrite {
+                source: _,
                 target,
-            }] if release.address().get() == address
-                && release.payload() == 0xcafe_babe
-                && !release.prior_work_pending()
+                value,
+            }] if *value == 0xcafe_babe_u32.to_le_bytes()
                 && target.offset().get() == address
         ));
 
@@ -1683,12 +1424,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.completion(), Some(reservation.point()));
-        assert!(matches!(
-            plan.steps(),
-            [MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { completion, .. }
-            )] if *completion == reservation.point()
-        ));
+        assert!(plan.steps().is_empty());
         assert_eq!(timeline.current_point(), before);
 
         assert!(matches!(
@@ -1766,20 +1502,7 @@ mod tests {
 
         assert_eq!(reservation.increments(), 2);
         assert_eq!(plan.completion(), Some(reservation.point()));
-        assert!(matches!(
-            plan.steps(),
-            [
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
-                ),
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { .. }
-                ),
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::FlushPendingWrites { .. }
-                ),
-            ]
-        ));
+        assert_eq!(plan.steps().len(), 1);
         let completion = execute_maxwell_software_initialization(plan, &address_space).unwrap();
         assert_eq!(completion.completion(), Some(reservation.point()));
         assert_eq!(timeline.current_point(), before);
@@ -1900,39 +1623,12 @@ mod tests {
         assert!(matches!(
             plan.steps(),
             [
-                MaxwellSubmissionExecutionStep::ComputeInlineToMemory { upload, target },
-                MaxwellSubmissionExecutionStep::HostSynchronization {
-                    operation: flush,
-                    prior_work_pending: true,
-                    ..
-                },
-                MaxwellSubmissionExecutionStep::HostSynchronization {
-                    operation: invalidate,
-                    prior_work_pending: true,
-                    ..
-                },
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::InvalidateTextureCacheNoWfi {
-                        request: texture_request,
-                        maintenance: CacheMaintenanceOperation::InvalidateTextureReadCaches,
-                    }
-                ),
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::InvalidateShaderCachesNoWfi {
-                        caches,
-                        maintenance: CacheMaintenanceOperation::InvalidateShaderCaches {
-                            instruction: true,
-                            global_data: true,
-                            constant: true,
-                        },
-                    }
-                ),
-                MaxwellSubmissionExecutionStep::ComputeSynchronization(
-                    MaxwellComputeSynchronizationPlan::WaitForIdle {
-                        prior_work_pending: true,
-                    }
-                ),
-            ] if upload.value() == 0xfeed_beef
+                MaxwellSubmissionExecutionStep::InlineWrite { value, target, .. },
+                MaxwellSubmissionExecutionStep::BackendOperation(flush),
+                MaxwellSubmissionExecutionStep::BackendOperation(invalidate),
+                MaxwellSubmissionExecutionStep::BackendOperation(texture),
+                MaxwellSubmissionExecutionStep::BackendOperation(shader),
+            ] if *value == 0xfeed_beef_u32.to_le_bytes()
                 && target.offset().get() == address
                 && matches!(
                     flush.command(),
@@ -1941,17 +1637,21 @@ mod tests {
                     )
                 )
                 && matches!(
-                    invalidate.command(),
+                    texture.command(),
                     GpuCommand::CacheMaintenance(
-                        CacheMaintenanceOperation::InvalidateDeviceReadCaches
+                        CacheMaintenanceOperation::InvalidateTextureReadCaches
                     )
                 )
-                && texture_request.lines() == crate::MaxwellThreeDTextureCacheLines::All
-                && texture_request.target() == crate::MaxwellThreeDTextureCacheTarget::Data
-                && texture_request.tag() == 0
-                && caches.instruction()
-                && caches.global_data()
-                && caches.constant()
+                && matches!(
+                    shader.command(),
+                    GpuCommand::CacheMaintenance(
+                        CacheMaintenanceOperation::InvalidateShaderCaches {
+                            instruction: true,
+                            global_data: true,
+                            constant: true,
+                        }
+                    )
+                )
         ));
 
         let mut bytes = [0xff; 4];
@@ -1989,12 +1689,10 @@ mod tests {
 
         assert!(matches!(
             plan.steps(),
-            [MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                MaxwellThreeDSynchronizationPlan::TiledCacheFlush {
-                    mode: crate::MaxwellThreeDTiledCacheFlushMode::Flush,
-                    maintenance: CacheMaintenanceOperation::FlushDirtyDeviceWrites,
-                }
-            )]
+            [MaxwellSubmissionExecutionStep::BackendOperation(operation)]
+                if matches!(operation.command(), GpuCommand::CacheMaintenance(
+                    CacheMaintenanceOperation::FlushDirtyDeviceWrites
+                ))
         ));
 
         let mut calls = 0;
@@ -2101,30 +1799,24 @@ mod tests {
         assert!(matches!(
             plan.steps(),
             [
-                MaxwellSubmissionExecutionStep::InlineToMemory {
-                    upload: first,
+                MaxwellSubmissionExecutionStep::InlineWrite {
+                    value: first,
                     target: first_target,
+                    ..
                 },
-                MaxwellSubmissionExecutionStep::InlineToMemory {
-                    upload: second,
+                MaxwellSubmissionExecutionStep::InlineWrite {
+                    value: second,
                     target: second_target,
+                    ..
                 },
-                MaxwellSubmissionExecutionStep::ThreeDSynchronization(
-                    MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
-                        request,
-                        maintenance: CacheMaintenanceOperation::InvalidateSamplerCaches,
-                        prior_work_pending: true,
-                    }
-                ),
-            ] if first.value() == 0x1122_3344
-                && first.offset() == 0
+                MaxwellSubmissionExecutionStep::BackendOperation(operation),
+            ] if *first == 0x1122_3344_u32.to_le_bytes()
                 && first_target.offset().get() == address
-                && second.value() == 0x5566_7788
-                && second.offset() == 4
+                && *second == 0x5566_7788_u32.to_le_bytes()
                 && second_target.offset().get() == address + 4
-                && request.target() == crate::MaxwellThreeDTextureCacheTarget::Sampler
-                && request.lines() == crate::MaxwellThreeDTextureCacheLines::All
-                && request.tag() == 0
+                && matches!(operation.command(), GpuCommand::CacheMaintenance(
+                    CacheMaintenanceOperation::InvalidateSamplerCaches
+                ))
         ));
 
         let mut bytes = [0xff; 8];

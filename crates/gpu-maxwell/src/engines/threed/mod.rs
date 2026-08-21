@@ -58,6 +58,7 @@ pub use coverage::{
     MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
     MaxwellThreeDTirModulationFunction,
 };
+pub(crate) use draw::lower_maxwell_three_d_operation_into_cache;
 pub use draw::{
     MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
     MaxwellThreeDLoweringPlan, MaxwellThreeDOperationTrigger, MaxwellThreeDShaderResourceUse,
@@ -87,10 +88,10 @@ pub use mme::{
     MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS, MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES,
     MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT, MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT,
     MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT, MaxwellThreeDMmeExecutionError,
-    MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
-    MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
-    MaxwellThreeDMmeShadowRamError, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDMutableMethodControl,
+    MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam,
+    MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeShadowRamError,
+    MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
+    MaxwellThreeDMutableMethodControl,
 };
 pub use operations::{
     MaxwellThreeDDecompressSurface, MaxwellThreeDFlushPendingWrites,
@@ -210,9 +211,9 @@ use nixe_gpu::{GpuClassId, GpuMethodId};
 use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 
 use super::{
-    MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodDispatch,
-    MaxwellEngineMethodEffect, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
-    MaxwellShaderCacheInvalidation, MaxwellThreeDTriggeredOperation,
+    AppliedMethod, MaxwellEngineCapability, MaxwellEngineDispatchError,
+    MaxwellEngineMethodDispatch, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
+    MaxwellInlineToMemoryUpload, MaxwellShaderCacheInvalidation, MaxwellThreeDTriggeredOperation,
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
@@ -221,6 +222,75 @@ use crate::{
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb197);
 const CLASS_NAME: &str = "MAXWELL_B";
+
+#[derive(Clone, Copy)]
+enum PendingOperation {
+    ThreeD(MaxwellThreeDOperationTrigger),
+    Synchronization(MaxwellThreeDSynchronizationTrigger),
+    InlineToMemory(MaxwellInlineToMemoryUpload),
+    InlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
+}
+
+struct PreparedMethod {
+    method: MaxwellMethodDispatch,
+    metadata: MaxwellEngineMethodMetadata,
+    operation: Option<PendingOperation>,
+    writes_state: bool,
+}
+
+impl PreparedMethod {
+    const fn new(
+        method: MaxwellMethodDispatch,
+        metadata: MaxwellEngineMethodMetadata,
+        operation: Option<PendingOperation>,
+        writes_state: bool,
+    ) -> Self {
+        Self {
+            method,
+            metadata,
+            operation,
+            writes_state,
+        }
+    }
+}
+
+const fn no_operation() -> (Option<PendingOperation>, bool) {
+    (None, false)
+}
+
+const fn state_write() -> (Option<PendingOperation>, bool) {
+    (None, true)
+}
+
+const fn three_d_operation(
+    trigger: MaxwellThreeDOperationTrigger,
+) -> (Option<PendingOperation>, bool) {
+    (Some(PendingOperation::ThreeD(trigger)), false)
+}
+
+const fn state_operation(
+    trigger: MaxwellThreeDOperationTrigger,
+) -> (Option<PendingOperation>, bool) {
+    (Some(PendingOperation::ThreeD(trigger)), true)
+}
+
+const fn synchronization_operation(
+    trigger: MaxwellThreeDSynchronizationTrigger,
+) -> (Option<PendingOperation>, bool) {
+    (Some(PendingOperation::Synchronization(trigger)), false)
+}
+
+const fn state_inline_to_memory(
+    upload: MaxwellInlineToMemoryUpload,
+) -> (Option<PendingOperation>, bool) {
+    (Some(PendingOperation::InlineToMemory(upload)), true)
+}
+
+const fn state_inline_constant_buffer(
+    upload: MaxwellThreeDInlineConstantBufferUpload,
+) -> (Option<PendingOperation>, bool) {
+    (Some(PendingOperation::InlineConstantBuffer(upload)), true)
+}
 
 #[derive(Clone, Copy)]
 enum MethodAction {
@@ -946,8 +1016,6 @@ pub(super) const fn is_mme_aperture(method: GpuMethodId) -> bool {
 
 pub(super) struct MaxwellThreeDMmePreflight {
     pub methods: Box<[MaxwellEngineMethodDispatch]>,
-    pub operations: Box<[MaxwellThreeDTriggeredOperation]>,
-    pub synchronization_operations: Box<[MaxwellThreeDSynchronizationOperation]>,
     pub ordered_operations: Box<[MaxwellEngineOperation]>,
 }
 
@@ -982,30 +1050,22 @@ pub(super) fn preflight_mme_call(
         .map(|method| method.source().argument())
         .collect::<Vec<_>>();
     let program = candidate.mme().clone();
-    let report = {
+    let ordered_operations = {
         let mut host = MmeDispatchHost {
             profile,
             source,
             candidate,
-            operations: Vec::new(),
-            synchronization_operations: Vec::new(),
             ordered_operations: Vec::new(),
         };
-        let report = match program.execute(macro_index, &parameters, &mut host) {
+        match program.execute(macro_index, &parameters, &mut host) {
             Ok(report) => report,
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
                 return Err(MaxwellEngineDispatchError::MmeExecution { source, error });
             }
             Err(MaxwellThreeDMmeRunError::Host(error)) => return Err(error),
         };
-        (
-            report,
-            host.operations,
-            host.synchronization_operations,
-            host.ordered_operations,
-        )
+        host.ordered_operations
     };
-    let (report, operations, synchronization_operations, ordered_operations) = report;
     let mut dispatches = Vec::new();
     dispatches
         .try_reserve_exact(methods.len())
@@ -1022,21 +1082,10 @@ pub(super) fn preflight_mme_call(
                 "CALL_MME_DATA"
             },
         );
-        let effect = if index == 0 {
-            MaxwellEngineMethodEffect::MmeMacroCall {
-                macro_index,
-                parameter_count: parameters.len() as u16,
-                report,
-            }
-        } else {
-            MaxwellEngineMethodEffect::MmeMacroData { macro_index }
-        };
-        dispatches.push(MaxwellEngineMethodDispatch::new(method, metadata, effect));
+        dispatches.push(MaxwellEngineMethodDispatch::new(method, metadata));
     }
     Ok(MaxwellThreeDMmePreflight {
         methods: dispatches.into_boxed_slice(),
-        operations: operations.into_boxed_slice(),
-        synchronization_operations: synchronization_operations.into_boxed_slice(),
         ordered_operations: ordered_operations.into_boxed_slice(),
     })
 }
@@ -1045,8 +1094,6 @@ struct MmeDispatchHost<'a> {
     profile: MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &'a mut MaxwellThreeDState,
-    operations: Vec<MaxwellThreeDTriggeredOperation>,
-    synchronization_operations: Vec<MaxwellThreeDSynchronizationOperation>,
     ordered_operations: Vec<MaxwellEngineOperation>,
 }
 
@@ -1076,60 +1123,12 @@ impl MaxwellThreeDMmeHost for MmeDispatchHost<'_> {
         let dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
         // MME-emitted methods target the live register file directly and do
         // not pass through pushbuffer shadow-RAM tracking/replay.
-        let preflight = preflight_with_shadow(self.profile, dispatch, self.candidate, false)?;
-        let trigger = match preflight.effect() {
-            MaxwellEngineMethodEffect::ThreeDTrigger(trigger)
-            | MaxwellEngineMethodEffect::ThreeDStateAndTrigger { trigger, .. } => Some(trigger),
-            _ => None,
-        };
-        let synchronization_trigger = match preflight.effect() {
-            MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(trigger) => Some(trigger),
-            _ => None,
-        };
-        let inline_upload = match preflight.effect() {
-            MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload { upload, .. } => {
-                Some(MaxwellEngineOperation::InlineToMemory(upload))
-            }
-            MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
-                upload, ..
-            } => Some(MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)),
-            _ => None,
-        };
-        if let Some(upload) = inline_upload {
+        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate, false)?;
+        if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
             self.ordered_operations
                 .try_reserve(1)
                 .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            self.ordered_operations.push(upload);
-        }
-        if let Some(trigger) = trigger {
-            self.operations
-                .try_reserve(1)
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            let operation = MaxwellThreeDTriggeredOperation {
-                trigger,
-                state: std::sync::Arc::new(self.candidate.clone()),
-            };
-            self.ordered_operations
-                .try_reserve(1)
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            self.ordered_operations
-                .push(MaxwellEngineOperation::ThreeD(Box::new(operation.clone())));
-            self.operations.push(operation);
-        }
-        if let Some(trigger) = synchronization_trigger {
-            self.synchronization_operations
-                .try_reserve(1)
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            let operation =
-                MaxwellThreeDSynchronizationOperation::new(trigger, self.candidate.clone());
-            self.ordered_operations
-                .try_reserve(1)
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            self.ordered_operations
-                .push(MaxwellEngineOperation::ThreeDSynchronization(Box::new(
-                    operation.clone(),
-                )));
-            self.synchronization_operations.push(operation);
+            self.ordered_operations.push(operation);
         }
         Ok(())
     }
@@ -1139,8 +1138,37 @@ pub(super) fn preflight(
     profile: MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
-    preflight_with_shadow(profile, method, candidate, true)
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
+    let prepared = preflight_with_shadow(profile, method, candidate, true)?;
+    let operation = lower_pending_operation(prepared.operation, candidate);
+    Ok(AppliedMethod::new(
+        prepared.method,
+        prepared.metadata,
+        operation,
+    ))
+}
+
+fn lower_pending_operation(
+    operation: Option<PendingOperation>,
+    state: &MaxwellThreeDState,
+) -> Option<MaxwellEngineOperation> {
+    operation.map(|operation| match operation {
+        PendingOperation::ThreeD(trigger) => {
+            MaxwellEngineOperation::ThreeD(Box::new(MaxwellThreeDTriggeredOperation {
+                trigger,
+                state: std::sync::Arc::new(state.clone()),
+            }))
+        }
+        PendingOperation::Synchronization(trigger) => {
+            MaxwellEngineOperation::ThreeDSynchronization(Box::new(
+                MaxwellThreeDSynchronizationOperation::new(trigger, state.clone()),
+            ))
+        }
+        PendingOperation::InlineToMemory(upload) => MaxwellEngineOperation::InlineToMemory(upload),
+        PendingOperation::InlineConstantBuffer(upload) => {
+            MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)
+        }
+    })
 }
 
 fn preflight_with_shadow(
@@ -1148,7 +1176,7 @@ fn preflight_with_shadow(
     mut method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDState,
     apply_shadow_ram: bool,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     if is_mme_aperture(source.method()) {
         return Err(MaxwellEngineDispatchError::MmeExecution {
@@ -1164,29 +1192,23 @@ fn preflight_with_shadow(
             .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
         method = method.with_effective_argument(effective_argument);
     }
-    let dispatch = preflight_register(profile, method, candidate)?;
-    if matches!(
-        dispatch.effect(),
-        MaxwellEngineMethodEffect::ThreeDState(_)
-            | MaxwellEngineMethodEffect::ThreeDStateAndTrigger { .. }
-            | MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload { .. }
-            | MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload { .. }
-    ) {
-        candidate.record_raw_register(dispatch.method().source());
+    let prepared = preflight_register(profile, method, candidate)?;
+    if prepared.writes_state {
+        candidate.record_raw_register(prepared.method.source());
     }
     if apply_shadow_ram {
         candidate
             .mme_mut()
-            .track_shadow_register(shadow_control, dispatch.method().source());
+            .track_shadow_register(shadow_control, prepared.method.source());
     }
-    Ok(dispatch)
+    Ok(prepared)
 }
 
 fn preflight_register(
     profile: MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     if let Some((write, method_name, upload)) =
         inline_to_memory::preflight(source, candidate.inline_to_memory())?
@@ -1194,64 +1216,60 @@ fn preflight_register(
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let effect = upload.map_or(MaxwellEngineMethodEffect::ThreeDState(write), |upload| {
-            MaxwellEngineMethodEffect::ThreeDStateAndInlineToMemoryUpload {
-                state: write,
-                upload,
-            }
-        });
-        return Ok(MaxwellEngineMethodDispatch::new(method, metadata, effect));
+        let (operation, writes_state) =
+            upload.map_or(state_write(), |upload| state_inline_to_memory(upload));
+        return Ok(PreparedMethod::new(
+            method,
+            metadata,
+            operation,
+            writes_state,
+        ));
     }
     if let Some((write, method_name)) = preflight_mme_state(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(MaxwellEngineMethodDispatch::new(
-            method,
-            metadata,
-            MaxwellEngineMethodEffect::ThreeDState(write),
-        ));
+        return Ok(PreparedMethod::new(method, metadata, None, true));
     }
     if let Some((write, method_name, upload)) = preflight_constant_buffer_load(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let effect = upload.map_or(MaxwellEngineMethodEffect::ThreeDState(write), |upload| {
-            MaxwellEngineMethodEffect::ThreeDStateAndInlineConstantBufferUpload {
-                state: write,
-                upload,
-            }
-        });
-        return Ok(MaxwellEngineMethodDispatch::new(method, metadata, effect));
+        let (operation, writes_state) =
+            upload.map_or(state_write(), |upload| state_inline_constant_buffer(upload));
+        return Ok(PreparedMethod::new(
+            method,
+            metadata,
+            operation,
+            writes_state,
+        ));
     }
     if let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(MaxwellEngineMethodDispatch::new(
-            method,
-            metadata,
-            MaxwellEngineMethodEffect::ThreeDState(write),
-        ));
+        return Ok(PreparedMethod::new(method, metadata, None, true));
     }
     if let Some((write, method_name)) = preflight_output_state(source)? {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let effect = if matches!(
+        let (operation, writes_state) = if matches!(
             write,
             MaxwellThreeDStateWrite::RenderTarget(
                 MaxwellThreeDRenderTargetWrite::ClearSurface { .. }
             )
         ) {
-            MaxwellEngineMethodEffect::ThreeDStateAndTrigger {
-                state: write,
-                trigger: MaxwellThreeDOperationTrigger::ClearSurface { source },
-            }
+            state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
         } else {
-            MaxwellEngineMethodEffect::ThreeDState(write)
+            state_write()
         };
-        return Ok(MaxwellEngineMethodDispatch::new(method, metadata, effect));
+        return Ok(PreparedMethod::new(
+            method,
+            metadata,
+            operation,
+            writes_state,
+        ));
     }
     let Some(declaration) = METHODS
         .iter()
@@ -1269,9 +1287,9 @@ fn preflight_register(
             defined_mask: declaration.defined_mask,
         });
     }
-    let effect =
+    let (operation, writes_state) =
         match declaration.action {
-            MethodAction::NoOperation => MaxwellEngineMethodEffect::NoOperation,
+            MethodAction::NoOperation => no_operation(),
             MethodAction::DecompressSurface => {
                 let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1280,9 +1298,10 @@ fn preflight_register(
                         defined_mask: declaration.defined_mask,
                     },
                 )?;
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                    MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source },
-                )
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::DecompressSurface {
+                    request,
+                    source,
+                })
             }
             MethodAction::InstrumentationHeader => {
                 let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
@@ -1290,7 +1309,7 @@ fn preflight_register(
                     MaxwellThreeDInstrumentationStateWrite::Header { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::InstrumentationData => {
                 let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
@@ -1298,7 +1317,7 @@ fn preflight_register(
                     MaxwellThreeDInstrumentationStateWrite::Data { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::IteratedBlend => {
                 let value = MaxwellThreeDIteratedBlend::parse(source.argument()).ok_or(
@@ -1312,7 +1331,7 @@ fn preflight_register(
                     MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::IteratedBlendPassCount => {
                 let value = MaxwellThreeDIteratedBlendPassCount::new(source.argument() as u8);
@@ -1320,14 +1339,14 @@ fn preflight_register(
                     MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
-            MethodAction::WaitForIdle => MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                MaxwellThreeDSynchronizationTrigger::WaitForIdle {
+            MethodAction::WaitForIdle => {
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::WaitForIdle {
                     value: source.argument(),
                     source,
-                },
-            ),
+                })
+            }
             MethodAction::MmeShadowRamControl => {
                 let value = MaxwellThreeDMmeShadowRamControl::parse(source.argument()).ok_or(
                     MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1342,7 +1361,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::MutableMethodControl => {
                 let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
@@ -1356,7 +1375,7 @@ fn preflight_register(
                     MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::FalconFirmwareCall4 => {
                 let address = MaxwellThreeDFalconRegisterAddress::try_new(source.argument())
@@ -1382,7 +1401,7 @@ fn preflight_register(
                     MaxwellThreeDFalconMaskedRegisterWrite::new(address, value, mask, source),
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::SubtilingPerfKnobA => {
                 let value = MaxwellThreeDSubtilingPerfKnobA::parse(source.argument());
@@ -1390,7 +1409,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::SubtilingPerfKnobB => {
                 let value = MaxwellThreeDSubtilingPerfKnobB::new(source.argument()).ok_or(
@@ -1404,7 +1423,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TiledCacheEnable => {
                 let value = source.argument() != 0;
@@ -1412,7 +1431,7 @@ fn preflight_register(
                     MaxwellThreeDTiledCacheStateWrite::Enable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TiledCacheTileSize => {
                 let value = MaxwellThreeDTiledCacheTileSize::parse(source.argument());
@@ -1420,7 +1439,7 @@ fn preflight_register(
                     MaxwellThreeDTiledCacheStateWrite::TileSize { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TiledCacheUnknownConfig(index) => {
                 let value = MaxwellThreeDTiledCacheUnknownConfig::from_bits(source.argument());
@@ -1432,7 +1451,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TiledCacheFlush => {
                 let mode = MaxwellThreeDTiledCacheFlushMode::parse(source.argument()).ok_or(
@@ -1442,9 +1461,10 @@ fn preflight_register(
                         defined_mask: declaration.defined_mask,
                     },
                 )?;
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                    MaxwellThreeDSynchronizationTrigger::TiledCacheFlush { mode, source },
-                )
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheFlush {
+                    mode,
+                    source,
+                })
             }
             MethodAction::ShaderWatermarks(target) => {
                 let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());
@@ -1456,7 +1476,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::L1Configuration => {
                 let value = MaxwellThreeDDirectlyAddressableMemory::parse(source.argument())
@@ -1469,7 +1489,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsEnable => {
                 let value = MaxwellThreeDColorReductionThresholdsEnable::parse(source.argument())
@@ -1482,7 +1502,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::Enable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsUnorm8 => {
                 let value = MaxwellThreeDColorReductionThresholdsUnorm8::parse(source.argument())
@@ -1495,7 +1515,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsUnorm10 => {
                 let value = MaxwellThreeDColorReductionThresholdsUnorm10::parse(source.argument())
@@ -1508,7 +1528,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsUnorm16 => {
                 let value = MaxwellThreeDColorReductionThresholdsUnorm16::parse(source.argument())
@@ -1521,7 +1541,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsFp16 => {
                 let value = MaxwellThreeDColorReductionThresholdsFp16::parse(source.argument())
@@ -1534,7 +1554,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ColorReductionThresholdsSrgb8 => {
                 let value = MaxwellThreeDColorReductionThresholdsSrgb8::parse(source.argument())
@@ -1547,7 +1567,7 @@ fn preflight_register(
                     MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ConstantColorRenderingEnable => {
                 let value = source.argument() != 0;
@@ -1555,7 +1575,7 @@ fn preflight_register(
                     MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ConstantColorRenderingComponent(component) => {
                 let value = MaxwellThreeDConstantColorValue::from_bits(source.argument());
@@ -1567,7 +1587,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ApiMandatedEarlyZ => {
                 let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
@@ -1581,7 +1601,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::PostZPixelShaderImask => {
                 let value = MaxwellThreeDPostZPixelShaderImask::parse(source.argument()).ok_or(
@@ -1595,7 +1615,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::PixelShaderInterlockControl => {
                 let value = MaxwellThreeDPixelShaderInterlockControl::parse(source.argument())
@@ -1611,7 +1631,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::AlphaFraction => {
                 let write = MaxwellThreeDStateWrite::AlphaFraction {
@@ -1619,7 +1639,7 @@ fn preflight_register(
                     source,
                 };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::RasterBoundingBox => {
                 let write = MaxwellThreeDStateWrite::RasterBoundingBox {
@@ -1627,7 +1647,7 @@ fn preflight_register(
                     source,
                 };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::CheckSphVersion => {
                 let requested = MaxwellShaderProgramHeaderVersionRange::new(
@@ -1651,10 +1671,7 @@ fn preflight_register(
                         },
                     );
                 }
-                MaxwellEngineMethodEffect::ShaderProgramHeaderCompatibilityCheck {
-                    requested,
-                    supported,
-                }
+                no_operation()
             }
             MethodAction::CheckAamVersion => {
                 let requested = MaxwellAamVersionRange::new(
@@ -1676,10 +1693,7 @@ fn preflight_register(
                         supported,
                     });
                 }
-                MaxwellEngineMethodEffect::AamCompatibilityCheck {
-                    requested,
-                    supported,
-                }
+                no_operation()
             }
             MethodAction::VafL2CacheControl => {
                 let value = MaxwellThreeDVafL2CacheControl::parse(source.argument()).ok_or(
@@ -1695,7 +1709,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::RopL2CacheControl(request) => {
                 let value = MaxwellThreeDL2CacheEvictionPolicy::parse(source.argument()).ok_or(
@@ -1712,7 +1726,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ReportSemaphoreAddressUpper => {
                 let write = MaxwellThreeDStateWrite::ReportSemaphore(
@@ -1722,7 +1736,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ReportSemaphoreAddressLower => {
                 let write = MaxwellThreeDStateWrite::ReportSemaphore(
@@ -1732,7 +1746,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ReportSemaphorePayload => {
                 let write = MaxwellThreeDStateWrite::ReportSemaphore(
@@ -1742,7 +1756,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ReportSemaphoreTrigger => {
                 let control = MaxwellThreeDReportSemaphoreControl::parse(source.argument())
@@ -1753,9 +1767,10 @@ fn preflight_register(
                             "control contains an unallocated enum value",
                         )
                     })?;
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                    MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, source },
-                )
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::ReportSemaphore {
+                    control,
+                    source,
+                })
             }
             MethodAction::PointSize => {
                 let write = MaxwellThreeDStateWrite::PointSize {
@@ -1763,7 +1778,7 @@ fn preflight_register(
                     source,
                 };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::PointSpriteSelect => {
                 let value = MaxwellThreeDPointSpriteSelect::parse(source.argument()).ok_or(
@@ -1775,7 +1790,7 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::PointSpriteSelect { value, source };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::PointCenterMode => {
                 let value = MaxwellThreeDPointCenterMode::parse(source.argument()).ok_or(
@@ -1787,7 +1802,7 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::PointCenterMode { value, source };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::EdgeFlag => {
                 let value = MaxwellThreeDEdgeFlag::parse(source.argument()).ok_or(
@@ -1799,7 +1814,7 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::EdgeFlag { value, source };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::InvalidateShaderCachesNoWfi => {
                 let caches = MaxwellShaderCacheInvalidation::new(
@@ -1807,7 +1822,7 @@ fn preflight_register(
                     source.argument() & (1 << 4) != 0,
                     source.argument() & (1 << 12) != 0,
                 );
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                synchronization_operation(
                     MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi {
                         caches,
                         source,
@@ -1825,7 +1840,7 @@ fn preflight_register(
                     source.argument() & (1 << 1) != 0,
                     source.argument() & (1 << 2) != 0,
                 );
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                synchronization_operation(
                     MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source },
                 )
             }
@@ -1839,7 +1854,7 @@ fn preflight_register(
                     },
                     (source.argument() >> 4) & 0x003f_ffff,
                 );
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                synchronization_operation(
                     MaxwellThreeDSynchronizationTrigger::InvalidateTextureCacheNoWfi {
                         request,
                         source,
@@ -1856,15 +1871,16 @@ fn preflight_register(
                     },
                     (source.argument() >> 4) & 0x003f_ffff,
                 );
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
+                synchronization_operation(
                     MaxwellThreeDSynchronizationTrigger::InvalidateTextureCache { request, source },
                 )
             }
             MethodAction::FlushPendingWrites => {
                 let request = MaxwellThreeDFlushPendingWrites::new(source.argument() != 0);
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                    MaxwellThreeDSynchronizationTrigger::FlushPendingWrites { request, source },
-                )
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::FlushPendingWrites {
+                    request,
+                    source,
+                })
             }
             MethodAction::IncrementSyncpoint => {
                 let request = MaxwellThreeDSyncpointIncrement::new(
@@ -1876,9 +1892,10 @@ fn preflight_register(
                         MaxwellThreeDSyncpointCondition::RopWritesDone
                     },
                 );
-                MaxwellEngineMethodEffect::ThreeDSynchronizationTrigger(
-                    MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint { request, source },
-                )
+                synchronization_operation(MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint {
+                    request,
+                    source,
+                })
             }
             MethodAction::ViewportZClip => {
                 let value = MaxwellThreeDViewportZClipRange::parse(source.argument()).ok_or(
@@ -1890,7 +1907,7 @@ fn preflight_register(
                 )?;
                 let write = MaxwellThreeDStateWrite::ViewportZClip { value, source };
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::RenderEnableMode => {
                 let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
@@ -1904,7 +1921,7 @@ fn preflight_register(
                     MaxwellThreeDRenderEnableStateWrite::Mode { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::PsOutputSampleMaskUsage => {
                 let value = MaxwellThreeDPsOutputSampleMaskUsage::parse(source.argument()).ok_or(
@@ -1918,7 +1935,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::HybridAntiAliasControl => {
                 let value = MaxwellThreeDHybridAntiAliasControl::parse(source.argument()).ok_or(
@@ -1932,7 +1949,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TirMode => {
                 let value = MaxwellThreeDTirMode::parse(source.argument()).ok_or(
@@ -1948,7 +1965,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TirControl => {
                 let value = MaxwellThreeDTirControl::parse(source.argument()).ok_or(
@@ -1962,7 +1979,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::TirControl { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TirModulation => {
                 let value = MaxwellThreeDTirModulationComponentSelect::parse(source.argument())
@@ -1975,7 +1992,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::TirModulation { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::TirModulationFunction => {
                 let value = MaxwellThreeDTirModulationFunction::parse(source.argument()).ok_or(
@@ -1989,7 +2006,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::CoverageToColor => {
                 let value = MaxwellThreeDCoverageToColor::parse(source.argument()).ok_or(
@@ -2003,7 +2020,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::AlphaToCoverageOverride => {
                 let value = MaxwellThreeDAlphaToCoverageOverride::parse(source.argument()).ok_or(
@@ -2017,7 +2034,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::SampleLocations(group) => {
                 let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
@@ -2029,7 +2046,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::RenderEnableControl => {
                 let value = MaxwellThreeDConditionalLoadConstantBuffer::parse(source.argument())
@@ -2045,7 +2062,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::VisibleCallLimit => {
                 let value = MaxwellThreeDVisibleCallLimit::parse(source.argument()).ok_or(
@@ -2059,7 +2076,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::SmTimeoutCounterBit => {
                 let value = MaxwellThreeDSmTimeoutCounterBit::new(source.argument()).ok_or(
@@ -2073,7 +2090,7 @@ fn preflight_register(
                     MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderExceptionsEnable => {
                 let value = MaxwellThreeDShaderExceptionsEnable::parse(source.argument()).ok_or(
@@ -2090,7 +2107,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemoryWindowBaseAddress => {
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
@@ -2100,7 +2117,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemoryAddressUpper => {
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
@@ -2110,7 +2127,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemoryAddressLower => {
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
@@ -2120,7 +2137,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemorySizeUpper => {
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
@@ -2130,7 +2147,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemorySizeLower => {
                 let write = MaxwellThreeDStateWrite::ShaderExecution(
@@ -2140,7 +2157,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ShaderLocalMemoryDefaultSizePerWarp => {
                 let value = MaxwellThreeDShaderLocalMemoryPerWarpSize::new(source.argument())
@@ -2156,7 +2173,7 @@ fn preflight_register(
                     },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::CsaaEnable => {
                 let value = MaxwellThreeDCsaaEnable::parse(source.argument()).ok_or(
@@ -2170,7 +2187,7 @@ fn preflight_register(
                     MaxwellThreeDCoverageStateWrite::CsaaEnable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::AliasedLineWidthEnable => {
                 let value = MaxwellThreeDAliasedLineWidthEnable::parse(source.argument()).ok_or(
@@ -2184,7 +2201,7 @@ fn preflight_register(
                     MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ActiveZCullRegion => {
                 let value = MaxwellThreeDZCullRegionId::new(source.argument()).ok_or(
@@ -2200,7 +2217,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ZCullStatsEnable => {
                 let value = MaxwellThreeDZCullStatsEnable::parse(source.argument()).ok_or(
@@ -2216,7 +2233,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ZPassPixelCountEnable => {
                 let value = MaxwellThreeDZPassPixelCountEnable::parse(source.argument()).ok_or(
@@ -2230,7 +2247,7 @@ fn preflight_register(
                     MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source },
                 );
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ZCullCriterion => {
                 let value = MaxwellThreeDZCullCriterion::parse(source.argument()).ok_or(
@@ -2246,7 +2263,7 @@ fn preflight_register(
                         source,
                     });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ZCullEnable => {
                 let value = MaxwellThreeDZCullEnable::parse(source.argument()).ok_or(
@@ -2261,7 +2278,7 @@ fn preflight_register(
                     source,
                 });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::ZCullBounds => {
                 let value = MaxwellThreeDZCullBounds::parse(source.argument()).ok_or(
@@ -2276,7 +2293,7 @@ fn preflight_register(
                     source,
                 });
                 candidate.apply(write);
-                MaxwellEngineMethodEffect::ThreeDState(write)
+                state_write()
             }
             MethodAction::DrawVertexArray => {
                 if source.argument() == 0 {
@@ -2286,12 +2303,10 @@ fn preflight_register(
                         "vertex count is zero",
                     ));
                 }
-                MaxwellEngineMethodEffect::ThreeDTrigger(
-                    MaxwellThreeDOperationTrigger::DrawVertexArray {
-                        source,
-                        vertex_count: source.argument(),
-                    },
-                )
+                three_d_operation(MaxwellThreeDOperationTrigger::DrawVertexArray {
+                    source,
+                    vertex_count: source.argument(),
+                })
             }
             MethodAction::Unsupported => {
                 return Err(MaxwellEngineDispatchError::UnsupportedMethod {
@@ -2307,10 +2322,11 @@ fn preflight_register(
                 });
             }
         };
-    Ok(MaxwellEngineMethodDispatch::new(
+    Ok(PreparedMethod::new(
         method,
         *declaration.metadata,
-        effect,
+        operation,
+        writes_state,
     ))
 }
 

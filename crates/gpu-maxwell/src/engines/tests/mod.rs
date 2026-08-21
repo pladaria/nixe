@@ -60,6 +60,48 @@ fn dispatch_increment_once(
     dispatch_first(channel, &increment_once_packet(method_dword, arguments))
 }
 
+trait PacketDispatchOperations {
+    fn operations(&self) -> Vec<&MaxwellThreeDTriggeredOperation>;
+    fn compute_operations(&self) -> Vec<&MaxwellComputeTriggeredOperation>;
+    fn synchronization_operations(&self) -> Vec<&MaxwellThreeDSynchronizationOperation>;
+}
+
+impl PacketDispatchOperations for MaxwellEnginePacketDispatch {
+    fn operations(&self) -> Vec<&MaxwellThreeDTriggeredOperation> {
+        self.ordered_operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                MaxwellEngineOperation::ThreeD(operation) => Some(operation.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn compute_operations(&self) -> Vec<&MaxwellComputeTriggeredOperation> {
+        self.ordered_operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                MaxwellEngineOperation::ComputeSynchronization(operation) => {
+                    Some(operation.as_ref())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn synchronization_operations(&self) -> Vec<&MaxwellThreeDSynchronizationOperation> {
+        self.ordered_operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                MaxwellEngineOperation::ThreeDSynchronization(operation) => {
+                    Some(operation.as_ref())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 fn word(value: u32, index: u32) -> Result<MaxwellPushbufferWord, crate::MaxwellGpfifoSourceError> {
     Ok(MaxwellPushbufferWord::new(
         value,

@@ -3,8 +3,7 @@
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
 use super::{
-    MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
-    MaxwellEngineMethodMetadata,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -389,7 +388,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellInlineToMemoryState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -441,13 +440,10 @@ pub(super) fn preflight(
             source,
         };
         candidate.apply(write);
-        return Ok(MaxwellEngineMethodDispatch::new(
+        return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            MaxwellEngineMethodEffect::InlineToMemoryStateAndUpload {
-                state: write,
-                upload,
-            },
+            Some(MaxwellEngineOperation::InlineToMemory(upload)),
         ));
     }
 
@@ -556,11 +552,7 @@ pub(super) fn preflight(
         MethodAction::Data => unreachable!("LOAD_INLINE_DATA returns before state decoding"),
     };
     candidate.apply(write);
-    Ok(MaxwellEngineMethodDispatch::new(
-        method,
-        *declaration.metadata,
-        MaxwellEngineMethodEffect::InlineToMemoryState(write),
-    ))
+    Ok(AppliedMethod::new(method, *declaration.metadata, None))
 }
 
 fn invalid_encoding(

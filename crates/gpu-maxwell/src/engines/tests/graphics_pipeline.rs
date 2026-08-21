@@ -57,15 +57,7 @@ fn z_compression_selector_is_typed_depth_state_without_an_operation() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_Z_COMPRESSION"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::DepthCompression {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -184,16 +176,7 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
                 dispatch.methods()[0].metadata().method_name(),
                 "SET_COLOR_COMPRESSION"
             );
-            assert_eq!(
-                dispatch.methods()[0].effect(),
-                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                    MaxwellThreeDRenderTargetWrite::ColorCompression {
-                        target,
-                        value: expected,
-                        source,
-                    }
-                ))
-            );
+
             assert!(dispatch.operations().is_empty());
             assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
             assert_eq!(register.raw(), Some(argument));
@@ -282,15 +265,7 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
         let register = channel.three_d().render_targets().compression_threshold();
 
         assert_eq!(method.metadata().method_name(), "SET_COMPRESSION_THRESHOLD");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::CompressionThreshold {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -699,12 +674,7 @@ fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_RT_LAYER"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::RenderTargetLayer { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(value.layer(), layer);
         assert_eq!(value.control(), control);
@@ -910,7 +880,7 @@ fn three_d_register_write_applies_immediately() {
     let decoded = packet(0x1518 / 4, 0x3fc0_0000);
     let before = channel.three_d().clone();
 
-    let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
+    dispatch_first(&mut channel, &decoded).unwrap();
     assert_eq!(
         channel.three_d().raster().point_size().origin(),
         MaxwellThreeDRegisterOrigin::Programmed
@@ -923,13 +893,7 @@ fn three_d_register_write_applies_immediately() {
         channel.three_d().raster().point_size().value().copied(),
         Some(MaxwellThreeDPointSize::from_bits(0x3fc0_0000))
     );
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::PointSize {
-            value: MaxwellThreeDPointSize::from_bits(0x3fc0_0000),
-            source: dispatch.methods()[0].method().source(),
-        })
-    );
+
     assert_ne!(channel.three_d(), &before);
 }
 
@@ -1104,12 +1068,7 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
         let value = register.value().copied().unwrap();
 
         assert_eq!(method.metadata().method_name(), "SET_CLEAR_SURFACE_CONTROL");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { value, source }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(value.raw(), argument);
         assert_eq!(value.respect_stencil_mask(), combination & 1 != 0);
@@ -1357,17 +1316,7 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
             };
 
             assert_eq!(method.metadata().method_name(), method_name);
-            assert_eq!(
-                method.effect(),
-                MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::WindowClipRectangle {
-                        region: region_index as u8,
-                        vertical,
-                        value: expected,
-                        source,
-                    }
-                ))
-            );
+
             assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
             assert_eq!(register.raw(), Some(arguments[word]));
             assert_eq!(register.value(), Some(&expected));
@@ -1504,16 +1453,7 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
         let value = MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(expected);
 
         assert_eq!(method.metadata().method_name(), "SET_CLIP_ID_TEST");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable,
-                    value,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
@@ -1659,16 +1599,7 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
         let value = MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(expected);
 
         assert_eq!(method.metadata().method_name(), "SET_VIEWPORT_SCALE_OFFSET");
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
-                    value,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
@@ -1818,7 +1749,6 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     let start_dispatch = dispatch_incrementing(&mut channel, 0x011c / 4, &[5, 7]).unwrap();
-    let start_pointer_source = start_dispatch.methods()[0].method().source();
     let start_source = start_dispatch.methods()[1].method().source();
     assert_eq!(
         start_dispatch.methods()[0].metadata().method_name(),
@@ -1827,25 +1757,6 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     assert_eq!(
         start_dispatch.methods()[1].metadata().method_name(),
         "LOAD_MME_START_ADDRESS_RAM"
-    );
-    assert_eq!(
-        start_dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Mme(
-            MaxwellThreeDMmeStateWrite::StartAddressPointer {
-                value: MaxwellThreeDMmeRamAddress::new(5),
-                source: start_pointer_source,
-            }
-        ))
-    );
-    assert_eq!(
-        start_dispatch.methods()[1].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Mme(
-            MaxwellThreeDMmeStateWrite::StartAddress {
-                index: MaxwellThreeDMmeRamAddress::new(5),
-                address: MaxwellThreeDMmeRamAddress::new(7),
-                source: start_source,
-            }
-        ))
     );
 
     let instruction_words = [0x0000_0301, 0x0000_0211, 0x0588_0021];
@@ -2003,17 +1914,7 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
         dispatch.methods()[0].metadata().method_name(),
         "CALL_MME_MACRO"
     );
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::MmeMacroCall {
-            macro_index,
-            parameter_count: 1,
-            report: MaxwellThreeDMmeExecutionReport {
-                instructions: 3,
-                emitted_methods: 1,
-            },
-        }
-    );
+
     let point_size = channel.three_d().raster().point_size();
     assert_eq!(point_size.raw(), Some(argument));
     let source = point_size.source().unwrap();
@@ -2064,10 +1965,7 @@ fn mme_call_data_supplies_additional_parameters() {
         dispatch.methods()[1].metadata().method_name(),
         "CALL_MME_DATA"
     );
-    assert_eq!(
-        dispatch.methods()[1].effect(),
-        MaxwellEngineMethodEffect::MmeMacroData { macro_index }
-    );
+
     assert_eq!(
         channel.three_d().raster().point_size().raw(),
         Some(argument)
@@ -2104,19 +2002,8 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
         &[read_front, read_back_and_exit, 0x11],
     );
     let before_call = channel.three_d().clone();
-    let dispatch =
-        dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::MmeMacroCall {
-            macro_index,
-            parameter_count: 1,
-            report: MaxwellThreeDMmeExecutionReport {
-                instructions: 3,
-                emitted_methods: 0,
-            },
-        }
-    );
+    dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
+
     assert_eq!(channel.three_d(), &before_call);
 
     program_three_d(&mut channel, 0x0dac, 0x1b02);
@@ -2205,19 +2092,8 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         &[read_pipeline_three, read_pipeline_four_and_exit, 0x11],
     );
     let before_call = channel.three_d().clone();
-    let dispatch =
-        dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::MmeMacroCall {
-            macro_index,
-            parameter_count: 1,
-            report: MaxwellThreeDMmeExecutionReport {
-                instructions: 3,
-                emitted_methods: 0,
-            },
-        }
-    );
+    dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
+
     assert_eq!(channel.three_d(), &before_call);
 
     let before_invalid = channel.three_d().clone();
@@ -2506,16 +2382,7 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_MME_SHADOW_SCRATCH"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::Mme(
-                MaxwellThreeDMmeStateWrite::ShadowScratch {
-                    index: MaxwellThreeDMmeShadowScratchIndex::new(index),
-                    value,
-                    source,
-                }
-            ))
-        );
+
         let scratch = channel
             .three_d()
             .mme()
@@ -2541,16 +2408,8 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
     let read_scratch_and_exit = 5 | (1 << 4) | (1 << 7) | (2 << 8) | ((0x3400 / 4) << 14);
     load_mme_program(&mut channel, macro_index, &[read_scratch_and_exit, 0x11]);
     let before_call = channel.three_d().clone();
-    let dispatch =
-        dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
-    assert!(matches!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::MmeMacroCall {
-            macro_index: 5,
-            parameter_count: 1,
-            ..
-        }
-    ));
+    dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
+
     assert_eq!(channel.three_d(), &before_call);
 
     let before_invalid = channel.clone();
@@ -2580,12 +2439,7 @@ fn falcon_call_four_applies_masked_pgraph_writes_and_signals_completion() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_FALCON04"
     );
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::FalconMaskedRegister(
-            expected
-        ))
-    );
+
     assert_eq!(
         channel.three_d().falcon().last_masked_write(),
         Some(expected)
@@ -2842,19 +2696,12 @@ fn mme_finite_loop_may_retire_more_instructions_than_the_method_output_limit() {
             delay_slot,
         ],
     );
-    let dispatch = dispatch_method(
+    dispatch_method(
         &mut channel,
         (0x3800 + u32::from(macro_index) * 8) / 4,
         20_000,
     )
     .unwrap();
-
-    let MaxwellEngineMethodEffect::MmeMacroCall { report, .. } = dispatch.methods()[0].effect()
-    else {
-        panic!("expected an MME macro call");
-    };
-    assert!(report.instructions > MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT);
-    assert_eq!(report.emitted_methods, 0);
 }
 
 #[test]
@@ -2879,19 +2726,12 @@ fn mme_finite_loop_may_emit_more_than_the_old_host_budget() {
             delay_slot,
         ],
     );
-    let dispatch = dispatch_method(
+    dispatch_method(
         &mut channel,
         (0x3800 + u32::from(macro_index) * 8) / 4,
         5_000,
     )
     .unwrap();
-
-    let MaxwellEngineMethodEffect::MmeMacroCall { report, .. } = dispatch.methods()[0].effect()
-    else {
-        panic!("expected an MME macro call");
-    };
-    assert_eq!(report.emitted_methods, 5_000);
-    assert!(report.emitted_methods > 4096);
 }
 
 #[test]
@@ -2913,15 +2753,7 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_ATTRIBUTE_DEFAULT"
     );
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-            MaxwellThreeDVertexInputWrite::AttributeDefaults {
-                value,
-                source: defaults_source,
-            }
-        ))
-    );
+
     assert_eq!(defaults.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(defaults.raw(), Some(0x0e));
     assert_eq!(defaults.source(), Some(defaults_source));
@@ -2967,15 +2799,7 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
         dispatch.methods()[0].metadata().method_name(),
         "SET_DA_OUTPUT"
     );
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-            MaxwellThreeDVertexInputWrite::VertexIdUsesArrayStart {
-                value: MaxwellThreeDVertexIdUsesArrayStart::Enabled,
-                source: vertex_id_source,
-            }
-        ))
-    );
+
     assert_eq!(vertex_id.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(vertex_id.raw(), Some(0x1000));
     assert_eq!(
@@ -3108,15 +2932,7 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     let dispatch = dispatch_method(&mut channel, 0x1614 / 4, 0).unwrap();
     let source = dispatch.methods()[0].method().source();
     assert_eq!(dispatch.methods()[0].metadata().method_name(), "END");
-    assert_eq!(
-        dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-            MaxwellThreeDVertexInputWrite::End {
-                value: false,
-                source,
-            }
-        ))
-    );
+
     assert!(dispatch.operations().is_empty());
 
     let primitive = channel.three_d().vertex_input().primitive();
@@ -3326,15 +3142,7 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
         lower_dispatch.methods()[0].metadata().method_name(),
         "SET_PROGRAM_REGION_B"
     );
-    assert_eq!(
-        lower_dispatch.methods()[0].effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
-            MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower {
-                value: 0,
-                source: lower_source,
-            }
-        ))
-    );
+
     assert!(region.address().is_none());
     assert_eq!(region.address_lower().raw(), Some(0));
     assert_eq!(region.address_lower().source(), Some(lower_source));
@@ -3386,12 +3194,7 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
     let _: MaxwellComputeSpaVersion = value;
 
     assert_eq!(method.metadata().method_name(), "SET_SPA_VERSION");
-    assert_eq!(
-        method.effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
-            MaxwellThreeDShaderBindingWrite::SpaVersion { value, source }
-        ))
-    );
+
     assert!(dispatch.operations().is_empty());
     assert_eq!(value.major(), 5);
     assert_eq!(value.minor(), 3);
@@ -3506,15 +3309,7 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
         lower_method.metadata().method_name(),
         "SET_VERTEX_STREAM_SUBSTITUTE_B"
     );
-    assert_eq!(
-        lower_method.effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressLower {
-                value: 0x082c_3000,
-                source: lower_source,
-            }
-        ))
-    );
+
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert!(substitute.address().is_none());
     assert_eq!(substitute.address_lower().raw(), Some(0x082c_3000));
@@ -3527,15 +3322,7 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
         upper_method.metadata().method_name(),
         "SET_VERTEX_STREAM_SUBSTITUTE_A"
     );
-    assert_eq!(
-        upper_method.effect(),
-        MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::VertexInput(
-            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressUpper {
-                value: 0x7f,
-                source: upper_source,
-            }
-        ))
-    );
+
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert_eq!(substitute.address_upper().raw(), Some(0x7f));
     assert_eq!(substitute.address_upper().source(), Some(upper_source));
@@ -3676,16 +3463,6 @@ fn pipeline_program_offsets_and_register_counts_are_indexed_and_atomic() {
             program_dispatch.methods()[0].metadata().method_name(),
             "SET_PIPELINE_PROGRAM"
         );
-        assert_eq!(
-            program_dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
-                MaxwellThreeDShaderBindingWrite::PipelineProgram {
-                    pipeline: pipeline as u8,
-                    offset,
-                    source: program_source,
-                }
-            ))
-        );
 
         let count_dispatch = dispatch_method(&mut channel, count_method / 4, count).unwrap();
         let count_source = count_dispatch.methods()[0].method().source();
@@ -3782,16 +3559,7 @@ fn tessellation_lod_family_is_source_preserving_and_stage_conditional() {
             dispatch.methods()[0].metadata().method_name(),
             "SET_TESSELLATION_LOD"
         );
-        assert_eq!(
-            dispatch.methods()[0].effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::ShaderBinding(
-                MaxwellThreeDShaderBindingWrite::TessellationLod {
-                    level,
-                    value: argument,
-                    source,
-                }
-            ))
-        );
+
         let register = channel.three_d().shader_bindings().tessellation_lod(level);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&argument));
@@ -3846,15 +3614,7 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
             method.metadata().method_name(),
             "SET_OFFSET_RENDER_TARGET_INDEX"
         );
-        assert_eq!(
-            method.effect(),
-            MaxwellEngineMethodEffect::ThreeDState(MaxwellThreeDStateWrite::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset {
-                    value: expected,
-                    source,
-                }
-            ))
-        );
+
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
         assert_eq!(expected.enabled(), enabled);

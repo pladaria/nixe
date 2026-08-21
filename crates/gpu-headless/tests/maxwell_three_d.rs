@@ -108,7 +108,13 @@ fn dispatch_stream(
     dispatch_maxwell_engine_pushbuffer(channel, FRONTEND_STATE, &method_stream(methods))
         .unwrap()
         .iter()
-        .flat_map(|packet| packet.operations().iter().cloned())
+        .flat_map(|packet| packet.ordered_operations())
+        .filter_map(|operation| match operation {
+            nixe_gpu_maxwell::MaxwellEngineOperation::ThreeD(operation) => {
+                Some(operation.as_ref().clone())
+            }
+            _ => None,
+        })
         .collect()
 }
 

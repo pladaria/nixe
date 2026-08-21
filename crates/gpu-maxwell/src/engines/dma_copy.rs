@@ -5,8 +5,7 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
 use super::{
-    MaxwellEngineDispatchError, MaxwellEngineMethodDispatch, MaxwellEngineMethodEffect,
-    MaxwellEngineMethodMetadata,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -109,23 +108,6 @@ pub struct MaxwellDmaCopyStateWrite {
     register: MaxwellDmaCopyRegisterName,
     value: u32,
     source: MaxwellMethodSource,
-}
-
-impl MaxwellDmaCopyStateWrite {
-    #[must_use]
-    pub const fn register(self) -> MaxwellDmaCopyRegisterName {
-        self.register
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u32 {
-        self.value
-    }
-
-    #[must_use]
-    pub const fn source(self) -> MaxwellMethodSource {
-        self.source
-    }
 }
 
 /// Memory organization selected for one side of a DMA copy.
@@ -355,7 +337,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellDmaCopyState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -383,13 +365,10 @@ pub(super) fn preflight(
         None
     };
     candidate.apply(write);
-    Ok(MaxwellEngineMethodDispatch::new(
+    Ok(AppliedMethod::new(
         method,
         *declaration.metadata,
-        operation.map_or(
-            MaxwellEngineMethodEffect::DmaCopyState(write),
-            |operation| MaxwellEngineMethodEffect::DmaCopyStateAndLaunch { write, operation },
-        ),
+        operation.map(MaxwellEngineOperation::DmaCopy),
     ))
 }
 

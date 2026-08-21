@@ -30,7 +30,7 @@ pub use state::{
 
 use nixe_gpu::GpuClassId;
 
-use super::{MaxwellEngineDispatchError, MaxwellEngineMethodDispatch};
+use super::{AppliedMethod, MaxwellEngineDispatchError};
 use crate::MaxwellMethodDispatch;
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0x902d);
@@ -38,6 +38,6 @@ pub(super) const CLASS: GpuClassId = GpuClassId(0x902d);
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellTwoDState,
-) -> Result<MaxwellEngineMethodDispatch, MaxwellEngineDispatchError> {
+) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     methods::preflight(method, candidate)
 }
