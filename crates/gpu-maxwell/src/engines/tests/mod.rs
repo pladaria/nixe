@@ -23,6 +23,43 @@ fn channel() -> MaxwellGpuChannel {
     )
 }
 
+fn three_d_channel() -> MaxwellGpuChannel {
+    let mut channel = channel();
+    bind_three_d(&mut channel);
+    channel
+}
+
+fn dispatch_first(
+    channel: &mut MaxwellGpuChannel,
+    decoded: &MaxwellDecodedPushbuffer,
+) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
+    dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
+}
+
+fn dispatch_method(
+    channel: &mut MaxwellGpuChannel,
+    method_dword: u32,
+    argument: u32,
+) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
+    dispatch_first(channel, &packet(method_dword, argument))
+}
+
+fn dispatch_incrementing(
+    channel: &mut MaxwellGpuChannel,
+    method_dword: u32,
+    arguments: &[u32],
+) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
+    dispatch_first(channel, &incrementing_packet(method_dword, arguments))
+}
+
+fn dispatch_increment_once(
+    channel: &mut MaxwellGpuChannel,
+    method_dword: u32,
+    arguments: &[u32],
+) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
+    dispatch_first(channel, &increment_once_packet(method_dword, arguments))
+}
+
 fn word(value: u32, index: u32) -> Result<MaxwellPushbufferWord, crate::MaxwellGpfifoSourceError> {
     Ok(MaxwellPushbufferWord::new(
         value,
@@ -83,23 +120,11 @@ fn increment_once_packet_on_subchannel(
 
 fn load_mme_program(channel: &mut MaxwellGpuChannel, macro_index: u8, code: &[u32]) {
     let start = 0x100 + u32::from(macro_index) * 0x10;
-    let start_packet = incrementing_packet(0x011c / 4, &[u32::from(macro_index), start]);
-    dispatch_maxwell_engine_packet(
-        channel,
-        FrontendSubmissionId::new(3),
-        &start_packet.packets()[0],
-    )
-    .unwrap();
+    dispatch_incrementing(channel, 0x011c / 4, &[u32::from(macro_index), start]).unwrap();
     let mut arguments = Vec::with_capacity(code.len() + 1);
     arguments.push(start);
     arguments.extend_from_slice(code);
-    let instruction_packet = increment_once_packet(0x0114 / 4, &arguments);
-    dispatch_maxwell_engine_packet(
-        channel,
-        FrontendSubmissionId::new(3),
-        &instruction_packet.packets()[0],
-    )
-    .unwrap();
+    dispatch_increment_once(channel, 0x0114 / 4, &arguments).unwrap();
 }
 
 fn incrementing_packet_on_subchannel(
@@ -146,16 +171,34 @@ fn bind_two_d(channel: &mut MaxwellGpuChannel) {
         .unwrap();
 }
 
+fn two_d_channel() -> MaxwellGpuChannel {
+    let mut channel = channel();
+    bind_two_d(&mut channel);
+    channel
+}
+
 fn bind_compute(channel: &mut MaxwellGpuChannel) {
     let decoded = packet_on_subchannel(1, 0, compute::CLASS.0);
     dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
         .unwrap();
 }
 
+fn compute_channel() -> MaxwellGpuChannel {
+    let mut channel = channel();
+    bind_compute(&mut channel);
+    channel
+}
+
 fn bind_inline_to_memory(channel: &mut MaxwellGpuChannel) {
     let decoded = packet_on_subchannel(2, 0, inline_to_memory::CLASS.0);
     dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
         .unwrap();
+}
+
+fn inline_to_memory_channel() -> MaxwellGpuChannel {
+    let mut channel = channel();
+    bind_inline_to_memory(&mut channel);
+    channel
 }
 
 fn bind_three_d(channel: &mut MaxwellGpuChannel) {
@@ -165,9 +208,7 @@ fn bind_three_d(channel: &mut MaxwellGpuChannel) {
 }
 
 fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
-    let decoded = packet(method / 4, argument);
-    dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
-        .unwrap();
+    dispatch_method(channel, method / 4, argument).unwrap();
 }
 
 /// Isolates tests of state-neutral class methods from the architecturally
