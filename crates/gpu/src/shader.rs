@@ -4,7 +4,7 @@
 //! only verified programs and never need to understand Maxwell, SPH headers,
 //! guest virtual addresses, or console command streams.
 
-use std::{collections::BTreeSet, fmt::Display};
+use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
 use crate::{ShaderStage, VertexBufferLayout, VertexComponentWidth, VertexStepMode};
 
@@ -1255,7 +1255,10 @@ impl ShaderBackendSourceMapEntry {
 
 /// Backend-consumable module with no guest-ISA objects or addresses.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShaderBackendModule {
+pub struct ShaderBackendModule(Arc<ShaderBackendModuleInner>);
+
+#[derive(Debug, Eq, PartialEq)]
+struct ShaderBackendModuleInner {
     stage: ShaderStage,
     language: ShaderBackendLanguage,
     source: Box<str>,
@@ -1265,28 +1268,28 @@ pub struct ShaderBackendModule {
 
 impl ShaderBackendModule {
     #[must_use]
-    pub const fn stage(&self) -> ShaderStage {
-        self.stage
+    pub fn stage(&self) -> ShaderStage {
+        self.0.stage
     }
 
     #[must_use]
-    pub const fn language(&self) -> ShaderBackendLanguage {
-        self.language
+    pub fn language(&self) -> ShaderBackendLanguage {
+        self.0.language
     }
 
     #[must_use]
-    pub const fn source(&self) -> &str {
-        &self.source
+    pub fn source(&self) -> &str {
+        &self.0.source
     }
 
     #[must_use]
     pub fn source_map(&self) -> &[ShaderBackendSourceMapEntry] {
-        &self.source_map
+        &self.0.source_map
     }
 
     #[must_use]
-    pub const fn ir(&self) -> &VerifiedShaderIr {
-        &self.ir
+    pub fn ir(&self) -> &VerifiedShaderIr {
+        &self.0.ir
     }
 }
 
@@ -1300,6 +1303,7 @@ pub enum ShaderBackendLoweringError {
     ResourceAccess(ShaderSourceLocation),
     NumericControl(ShaderSourceLocation),
     VertexFetch(&'static str),
+    SourceMapTooLarge,
 }
 
 impl Display for ShaderBackendLoweringError {
@@ -1315,6 +1319,39 @@ struct InterfaceGroup {
     components: u8,
     scalar_type: ShaderScalarType,
     interpolation: Option<ShaderInterpolation>,
+}
+
+#[derive(Clone, Copy)]
+struct WgslSourceMapCursor {
+    next_line: u32,
+}
+
+impl WgslSourceMapCursor {
+    fn after(source: &str) -> Result<Self, ShaderBackendLoweringError> {
+        debug_assert!(source.is_empty() || source.ends_with('\n'));
+        let completed_lines = source.bytes().filter(|byte| *byte == b'\n').count();
+        let next_line = u32::try_from(completed_lines)
+            .ok()
+            .and_then(|lines| lines.checked_add(1))
+            .ok_or(ShaderBackendLoweringError::SourceMapTooLarge)?;
+        Ok(Self { next_line })
+    }
+
+    const fn next_line(self) -> u32 {
+        self.next_line
+    }
+
+    fn advance(&mut self, appended: &str) -> Result<(), ShaderBackendLoweringError> {
+        debug_assert!(appended.is_empty() || appended.ends_with('\n'));
+        let completed_lines = appended.bytes().filter(|byte| *byte == b'\n').count();
+        let completed_lines = u32::try_from(completed_lines)
+            .map_err(|_| ShaderBackendLoweringError::SourceMapTooLarge)?;
+        self.next_line = self
+            .next_line
+            .checked_add(completed_lines)
+            .ok_or(ShaderBackendLoweringError::SourceMapTooLarge)?;
+        Ok(())
+    }
 }
 
 /// Lowers verified neutral IR to a standalone WGSL module.
@@ -1409,26 +1446,30 @@ fn lower_shader_ir_to_wgsl_impl(
     source.push_str("  var predicates: array<bool, 7>;\n");
     source.push_str("  var output: ShaderOutput;\n");
     let mut source_map = Vec::new();
+    let mut source_map_cursor = WgslSourceMapCursor::after(&source)?;
     if ir
         .instructions
         .iter()
         .any(|instruction| matches!(instruction.operation, ShaderOperation::Branch { .. }))
     {
-        emit_wgsl_control_flow(&mut source, ir, &mut source_map)?;
+        emit_wgsl_control_flow(&mut source, ir, &mut source_map, &mut source_map_cursor)?;
         source.push_str("}\n");
     } else {
         for instruction in &ir.instructions {
-            let line = source.lines().count() as u32 + 1;
             source_map.push(ShaderBackendSourceMapEntry {
-                backend_line: line,
+                backend_line: source_map_cursor.next_line(),
                 source: instruction.source,
             });
+            let appended_at = source.len();
             source.push_str(&format!(
                 "  // Maxwell code byte offset 0x{:x}\n",
                 instruction.source.byte_offset()
             ));
             let conditional = match instruction.predicate {
-                ShaderPredicate::Never => continue,
+                ShaderPredicate::Never => {
+                    source_map_cursor.advance(&source[appended_at..])?;
+                    continue;
+                }
                 ShaderPredicate::Register { register, inverted } => {
                     source.push_str(&format!(
                         "  if ({}predicates[{register}]) {{\n",
@@ -1442,6 +1483,7 @@ fn lower_shader_ir_to_wgsl_impl(
             if conditional {
                 source.push_str("  }\n");
             }
+            source_map_cursor.advance(&source[appended_at..])?;
         }
         source.push_str("}\n");
     }
@@ -1474,13 +1516,13 @@ fn lower_shader_ir_to_wgsl_impl(
             supports_fill_rectangle,
         )?;
     }
-    Ok(ShaderBackendModule {
+    Ok(ShaderBackendModule(Arc::new(ShaderBackendModuleInner {
         stage: ir.stage,
         language: ShaderBackendLanguage::Wgsl,
         source: source.into_boxed_str(),
         source_map: source_map.into_boxed_slice(),
         ir: shader.clone(),
-    })
+    })))
 }
 
 fn emit_wgsl_vertex_pull_resources(
@@ -1795,6 +1837,7 @@ fn emit_wgsl_control_flow(
     source: &mut String,
     ir: &ShaderIr,
     source_map: &mut Vec<ShaderBackendSourceMapEntry>,
+    source_map_cursor: &mut WgslSourceMapCursor,
 ) -> Result<(), ShaderBackendLoweringError> {
     let locations = shader_instruction_entry_points(ir);
     let mut leaders = BTreeSet::from([0_usize]);
@@ -1820,23 +1863,27 @@ fn emit_wgsl_control_flow(
         instruction_blocks[start..end].fill(block);
     }
 
+    let control_flow_at = source.len();
     source.push_str("  var nixe_block = 0u;\n");
     source.push_str("  loop {\n");
     source.push_str("    switch nixe_block {\n");
+    source_map_cursor.advance(&source[control_flow_at..])?;
     for (block, start) in leaders.iter().copied().enumerate() {
         let end = leaders
             .get(block + 1)
             .copied()
             .unwrap_or(ir.instructions.len());
+        let block_at = source.len();
         source.push_str(&format!("      case {block}u: {{\n"));
+        source_map_cursor.advance(&source[block_at..])?;
         let mut terminated = false;
         for (index, instruction) in ir.instructions[start..end].iter().enumerate() {
             let instruction_index = start + index;
-            let line = source.lines().count() as u32 + 1;
             source_map.push(ShaderBackendSourceMapEntry {
-                backend_line: line,
+                backend_line: source_map_cursor.next_line(),
                 source: instruction.source,
             });
+            let instruction_at = source.len();
             source.push_str(&format!(
                 "        // Maxwell code byte offset 0x{:x}\n",
                 instruction.source.byte_offset()
@@ -1863,7 +1910,9 @@ fn emit_wgsl_control_flow(
                 }
                 _ => emit_wgsl_nested_operation(source, instruction)?,
             }
+            source_map_cursor.advance(&source[instruction_at..])?;
         }
+        let block_end_at = source.len();
         if !terminated {
             if let Some(next) = leaders.get(block + 1) {
                 source.push_str(&format!(
@@ -1875,6 +1924,7 @@ fn emit_wgsl_control_flow(
             }
         }
         source.push_str("      }\n");
+        source_map_cursor.advance(&source[block_end_at..])?;
     }
     source.push_str("      default: { return output; }\n");
     source.push_str("    }\n");
@@ -3462,6 +3512,44 @@ fn verify_interface_range(
 mod tests {
     use super::*;
 
+    fn assert_source_map_points_at_instruction_comments(module: &ShaderBackendModule) {
+        let lines = module.source().lines().collect::<Vec<_>>();
+        for entry in module.source_map() {
+            let line = lines
+                .get(entry.backend_line() as usize - 1)
+                .expect("source-map line belongs to the generated WGSL");
+            assert!(
+                line.contains(&format!(
+                    "Maxwell code byte offset 0x{:x}",
+                    entry.source().byte_offset()
+                )),
+                "source-map entry {entry:?} points at {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloning_a_backend_module_shares_verified_immutable_storage() {
+        let shader = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Fragment,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ShaderInstruction::new(
+                ShaderSourceLocation::new(0),
+                ShaderPredicate::Always,
+                ShaderOperation::Exit,
+            )],
+        ))
+        .unwrap();
+        let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+
+        let cloned = module.clone();
+
+        assert!(Arc::ptr_eq(&module.0, &cloned.0));
+        assert_eq!(module, cloned);
+    }
+
     #[test]
     fn interface_components_are_bounded_to_one_vector_lane() {
         assert!(
@@ -3746,6 +3834,7 @@ mod tests {
         );
 
         let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert_source_map_points_at_instruction_comments(&module);
         assert!(module.source().contains("var nixe_block = 0u"));
         assert!(module.source().contains("nixe_block = 2u"));
         naga::front::wgsl::parse_str(module.source()).unwrap();
@@ -4044,6 +4133,7 @@ mod tests {
         ))
         .unwrap();
         let module = lower_shader_ir_to_wgsl(&shader).unwrap();
+        assert_source_map_points_at_instruction_comments(&module);
         assert!(
             module
                 .source()

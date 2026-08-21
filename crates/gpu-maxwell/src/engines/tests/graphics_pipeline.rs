@@ -388,7 +388,10 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 
 #[test]
 fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes() {
-    let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
+    // Keep one canonical page outside the image so the regression can exhaust
+    // bounded store-wide CPU-write provenance without touching represented
+    // color bytes.
+    let allocation = CanonicalAllocation::zeroed(0x11000, 0x1000).unwrap();
     let mut address_space = resource_address_space();
     let mapping = map_resource(
         &mut address_space,
@@ -627,6 +630,25 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         })
     );
 
+    // The canonical store retains 256 exact write records; one additional
+    // write forces validation through authoritative page generations.
+    for value in 0..=256 {
+        allocation.write(0x10000, &[value as u8]).unwrap();
+    }
+    let resources_after_disjoint_journal_overflow =
+        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
+    preflight_maxwell_three_d_operation(
+        triggered.state(),
+        &resources_after_disjoint_journal_overflow,
+        triggered.trigger(),
+        None,
+        FrontendSubmissionId::new(17),
+        Vec::new(),
+        &lowering_capabilities(BackendFeatures::CLEAR),
+        &cache,
+    )
+    .unwrap();
+
     allocation.write(0, &[0xa5]).unwrap();
     let resources_after_cpu_write =
         resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
@@ -636,7 +658,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             &resources_after_cpu_write,
             triggered.trigger(),
             None,
-            FrontendSubmissionId::new(17),
+            FrontendSubmissionId::new(18),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::CLEAR),
             &cache,

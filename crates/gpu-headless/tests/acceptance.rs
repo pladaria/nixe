@@ -9,8 +9,8 @@ use nixe_gpu::{
 };
 use nixe_gpu_headless::backend as headless_backend;
 use nixe_memory::{
-    BackingStoreId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageId, ContentGeneration, GuestPhysicalPageId, MappingGeneration, MemoryPermissions,
+    CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
+    ContentGeneration, GuestPhysicalPageId, MappingGeneration, MemoryPermissions,
 };
 
 fn capabilities(features: BackendFeatures, formats: &[ImageFormat]) -> BackendCapabilities {
@@ -29,11 +29,10 @@ fn capabilities(features: BackendFeatures, formats: &[ImageFormat]) -> BackendCa
 }
 
 fn page() -> CanonicalBackingPage {
+    let store = CanonicalBackingStore::allocate().unwrap();
     CanonicalBackingPage::zeroed(
-        CanonicalPageId::new(
-            BackingStoreId::allocate().unwrap(),
-            GuestPhysicalPageId::new(1),
-        ),
+        &store,
+        GuestPhysicalPageId::new(1),
         0x1000,
         ContentGeneration::INITIAL,
     )

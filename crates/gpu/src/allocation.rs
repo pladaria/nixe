@@ -1,8 +1,11 @@
 //! Neutral allocation identities and retained canonical backing views.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
-use nixe_memory::{CanonicalBackingRange, CanonicalBackingSegment};
+use nixe_memory::{CanonicalBackingRange, CanonicalPageId};
 
 /// Backend-independent identity of one logical GPU backing allocation.
 ///
@@ -103,6 +106,14 @@ pub struct BackingView {
     allocation: GpuAllocationId,
     allocation_offset: u64,
     range: CanonicalBackingRange,
+    canonical_intervals: Arc<[CanonicalByteInterval]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalByteInterval {
+    page: CanonicalPageId,
+    start: u64,
+    end: u64,
 }
 
 impl BackingView {
@@ -123,13 +134,18 @@ impl BackingView {
                 allocation_size: description.size,
             });
         }
-        if canonical_range_overlaps_itself(&range) {
+        let canonical_intervals = canonical_intervals(&range);
+        if canonical_intervals
+            .windows(2)
+            .any(|pair| pair[0].page == pair[1].page && pair[1].start < pair[0].end)
+        {
             return Err(BackingViewError::OverlappingCanonicalBytes);
         }
         Ok(Self {
             allocation,
             allocation_offset,
             range,
+            canonical_intervals: canonical_intervals.into(),
         })
     }
 
@@ -157,14 +173,13 @@ impl BackingView {
         self.range.size()
     }
 
-    pub(crate) fn overlaps(&self, other: &Self) -> bool {
-        self.range.segments().iter().any(|left| {
-            other
-                .range
-                .segments()
-                .iter()
-                .any(|right| canonical_segments_overlap(left, right))
-        })
+    /// Returns whether both views retain any of the same canonical bytes.
+    ///
+    /// Each constructor creates a page-ordered interval index once, so this
+    /// comparison is linear in the number of segments rather than quadratic.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        sorted_intervals_overlap(&self.canonical_intervals, &other.canonical_intervals)
     }
 }
 
@@ -204,41 +219,52 @@ impl Display for BackingViewError {
 
 impl std::error::Error for BackingViewError {}
 
-fn canonical_range_overlaps_itself(range: &CanonicalBackingRange) -> bool {
-    range.segments().iter().enumerate().any(|(index, left)| {
-        range.segments()[index + 1..]
-            .iter()
-            .any(|right| canonical_segments_overlap(left, right))
-    })
+fn canonical_intervals(range: &CanonicalBackingRange) -> Vec<CanonicalByteInterval> {
+    let mut intervals = range
+        .segments()
+        .iter()
+        .map(|segment| CanonicalByteInterval {
+            page: segment.page(),
+            start: segment.offset(),
+            end: segment.offset() + segment.size(),
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_unstable_by_key(|interval| (interval.page, interval.start, interval.end));
+    intervals
 }
 
-fn canonical_segments_overlap(
-    left: &CanonicalBackingSegment,
-    right: &CanonicalBackingSegment,
+fn sorted_intervals_overlap(
+    left: &[CanonicalByteInterval],
+    right: &[CanonicalByteInterval],
 ) -> bool {
-    if left.page() != right.page() {
-        return false;
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
+        if left.page < right.page || (left.page == right.page && left.end <= right.start) {
+            left_index += 1;
+        } else if right.page < left.page || right.end <= left.start {
+            right_index += 1;
+        } else {
+            return true;
+        }
     }
-    let left_end = left.offset() + left.size();
-    let right_end = right.offset() + right.size();
-    left.offset() < right_end && right.offset() < left_end
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use nixe_memory::{
-        BackingStoreId, CanonicalBackingPage, CanonicalBackingSegment, CanonicalPageId,
-        ContentGeneration, GuestPhysicalPageId, MappingGeneration, MemoryPermissions,
+        CanonicalBackingPage, CanonicalBackingSegment, CanonicalBackingStore, ContentGeneration,
+        GuestPhysicalPageId, MappingGeneration, MemoryPermissions,
     };
 
     use super::*;
 
     fn page() -> CanonicalBackingPage {
+        let store = CanonicalBackingStore::allocate().unwrap();
         CanonicalBackingPage::zeroed(
-            CanonicalPageId::new(
-                BackingStoreId::allocate().unwrap(),
-                GuestPhysicalPageId::new(1),
-            ),
+            &store,
+            GuestPhysicalPageId::new(1),
             0x1000,
             ContentGeneration::INITIAL,
         )
@@ -304,5 +330,41 @@ mod tests {
             BackingView::new(GpuAllocationId::new(1), description, 0, range),
             Err(BackingViewError::OverlappingCanonicalBytes)
         );
+    }
+
+    #[test]
+    fn backing_view_overlap_index_preserves_exact_interval_semantics() {
+        let page = page();
+        let description = GpuAllocationDescription::new(0x2000, 1).unwrap();
+        let first = BackingView::new(
+            GpuAllocationId::new(1),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![
+                segment(&page, 0x800, 0x100),
+                segment(&page, 0, 0x100),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let overlapping = BackingView::new(
+            GpuAllocationId::new(2),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![segment(&page, 0x80, 0x40)]).unwrap(),
+        )
+        .unwrap();
+        let adjacent = BackingView::new(
+            GpuAllocationId::new(3),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![segment(&page, 0x100, 0x100)]).unwrap(),
+        )
+        .unwrap();
+
+        assert!(first.overlaps(&overlapping));
+        assert!(overlapping.overlaps(&first));
+        assert!(!first.overlaps(&adjacent));
+        assert!(!adjacent.overlaps(&first));
     }
 }

@@ -269,7 +269,7 @@ impl ProcessExecutionControl {
             end_exclusive: address_space_end,
             memory,
             invalidation_generation: memory.mapping_epoch().get(),
-            dirty_generation: memory.content_generation_watermark(),
+            dirty_generation: memory.content_mutation_epoch().get(),
         };
         if let Err(fault) = domain.bind_memory(binding) {
             let _ = domain.shutdown();
@@ -808,7 +808,7 @@ impl VcpuExecutionState {
                     end_exclusive: self.address_space_end,
                     memory: self.memory.as_ref(),
                     invalidation_generation: memory_lease.epoch().get(),
-                    dirty_generation: self.memory.content_generation_watermark(),
+                    dirty_generation: self.memory.content_mutation_epoch().get(),
                 },
                 &self.thread,
             )

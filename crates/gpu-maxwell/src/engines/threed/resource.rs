@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
+    sync::Arc,
 };
 
 use nixe_gpu::{
@@ -16,8 +17,8 @@ use nixe_gpu::{
     ImageSubresourceRange, ImageView, SampleCount, SamplerDescription, Swizzle,
 };
 use nixe_memory::{
-    CanonicalBackingRange, CanonicalRangeAccessError, CanonicalRangeError, CanonicalWriteBatch,
-    CanonicalWriteBatchError, MemoryPermissions,
+    CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalRangeAccessError,
+    CanonicalRangeError, CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions,
 };
 
 use crate::{
@@ -156,7 +157,7 @@ pub struct MaxwellThreeDResolvedBuffer {
     allocation_description: GpuAllocationDescription,
     view: BufferView,
     source: MaxwellResolvedRange,
-    mappings: Box<[MaxwellThreeDMappingReference]>,
+    mappings: Arc<[MaxwellThreeDMappingReference]>,
 }
 
 impl MaxwellThreeDResolvedBuffer {
@@ -187,6 +188,10 @@ impl MaxwellThreeDResolvedBuffer {
     #[must_use]
     pub fn mappings(&self) -> &[MaxwellThreeDMappingReference] {
         &self.mappings
+    }
+
+    pub(super) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
+        Arc::clone(&self.mappings)
     }
 }
 
@@ -274,7 +279,8 @@ pub struct MaxwellThreeDResolvedImage {
     allocation_description: GpuAllocationDescription,
     view: ImageView,
     source: MaxwellResolvedRange,
-    mappings: Box<[MaxwellThreeDMappingReference]>,
+    mappings: Arc<[MaxwellThreeDMappingReference]>,
+    cpu_writes: Option<CanonicalCpuWriteDependency>,
     guest_layout: MaxwellThreeDPreservedImageLayout,
     guest_format: MaxwellThreeDGuestImageFormat,
 }
@@ -308,6 +314,12 @@ impl MaxwellThreeDResolvedImage {
     pub fn mappings(&self) -> &[MaxwellThreeDMappingReference] {
         &self.mappings
     }
+    pub(super) fn shared_mappings(&self) -> Arc<[MaxwellThreeDMappingReference]> {
+        Arc::clone(&self.mappings)
+    }
+    pub(super) fn cpu_write_dependency(&self) -> Option<&CanonicalCpuWriteDependency> {
+        self.cpu_writes.as_ref()
+    }
     #[must_use]
     pub const fn guest_layout(&self) -> MaxwellThreeDPreservedImageLayout {
         self.guest_layout
@@ -334,10 +346,10 @@ impl MaxwellThreeDResolvedResource {
         }
     }
 
-    fn backing(&self) -> &CanonicalBackingRange {
+    fn backing_view(&self) -> &BackingView {
         match self {
-            Self::Buffer(value) => value.view.backing().range(),
-            Self::Image(value) => value.view.bindings()[0].backing().range(),
+            Self::Buffer(value) => value.view.backing(),
+            Self::Image(value) => value.view.bindings()[0].backing(),
         }
     }
 
@@ -529,6 +541,24 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
     staged_writes: Option<&CanonicalWriteBatch>,
     inspect_complete_state: bool,
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
+    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+        state,
+        address_space,
+        required_roles,
+        staged_writes,
+        inspect_complete_state,
+        None,
+    )
+}
+
+pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+    state: &MaxwellThreeDState,
+    address_space: &MaxwellGpuAddressSpace,
+    required_roles: &[MaxwellThreeDResourceRole],
+    staged_writes: Option<&CanonicalWriteBatch>,
+    inspect_complete_state: bool,
+    retained_backings: Option<&mut MaxwellThreeDRetainedBackingCache>,
+) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
     let sample_mode = state
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::SampleMode)
@@ -537,7 +567,8 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
             MaxwellThreeDFixedFunctionValue::SampleMode(value) => Some(*value),
             _ => None,
         });
-    let mut builder = ResourceBuilder::new(address_space, sample_mode, staged_writes);
+    let mut builder =
+        ResourceBuilder::new(address_space, sample_mode, staged_writes, retained_backings);
 
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
         let role = MaxwellThreeDResourceRole::VertexStream(index as u8);
@@ -688,16 +719,86 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
 struct ResourceBuilder<'a> {
     address_space: &'a MaxwellGpuAddressSpace,
     staged_writes: Option<&'a CanonicalWriteBatch>,
+    retained_backings: Option<&'a mut MaxwellThreeDRetainedBackingCache>,
     sample_mode: Option<MaxwellThreeDSampleMode>,
     resources: Vec<MaxwellThreeDResolvedResource>,
     samplers: Vec<MaxwellThreeDResolvedSampler>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RetainedBackingKey {
+    address_space: crate::MaxwellAddressSpaceId,
+    offset: GpuVirtualAddress,
+    size: u64,
+    permissions: u8,
+}
+
+impl From<&MaxwellResolvedRange> for RetainedBackingKey {
+    fn from(source: &MaxwellResolvedRange) -> Self {
+        Self {
+            address_space: source.address_space(),
+            offset: source.offset(),
+            size: source.size(),
+            permissions: source.permissions().bits(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedBackingCacheEntry {
+    source: MaxwellResolvedRange,
+    retained: RetainedResourceBacking,
+}
+
+/// Transactional cache for page-versioned backing views derived from stable
+/// Maxwell mappings. CPU-write epochs make the common validation path O(1)
+/// per backing store. Lost journal history conservatively rebuilds the entry
+/// from authoritative page generations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MaxwellThreeDRetainedBackingCache {
+    entries: Arc<BTreeMap<RetainedBackingKey, Arc<RetainedBackingCacheEntry>>>,
+}
+
+impl MaxwellThreeDRetainedBackingCache {
+    fn retain(
+        &mut self,
+        source: &MaxwellResolvedRange,
+        role: MaxwellThreeDResourceRole,
+    ) -> Result<RetainedResourceBacking, MaxwellThreeDResourceError> {
+        let key = RetainedBackingKey::from(source);
+        if let Some(entry) = self.entries.get(&key)
+            && entry.source == *source
+            && entry
+                .retained
+                .cpu_writes
+                .as_ref()
+                .is_some_and(CanonicalCpuWriteDependency::remains_current)
+        {
+            return Ok(entry.retained.clone());
+        }
+
+        let retained = retained_backing(source, role)?;
+        if retained.cpu_writes.is_none() {
+            Arc::make_mut(&mut self.entries).remove(&key);
+            return Ok(retained);
+        }
+        Arc::make_mut(&mut self.entries).insert(
+            key,
+            Arc::new(RetainedBackingCacheEntry {
+                source: source.clone(),
+                retained: retained.clone(),
+            }),
+        );
+        Ok(retained)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RetainedResourceBacking {
-    range: CanonicalBackingRange,
-    allocation: MaxwellAllocationId,
-    allocation_offset: u64,
-    mappings: Box<[MaxwellThreeDMappingReference]>,
+    backing: BackingView,
+    allocation_description: GpuAllocationDescription,
+    mappings: Arc<[MaxwellThreeDMappingReference]>,
+    cpu_writes: Option<CanonicalCpuWriteDependency>,
 }
 
 struct MaxwellImageDescriptionRequest {
@@ -714,13 +815,26 @@ impl<'a> ResourceBuilder<'a> {
         address_space: &'a MaxwellGpuAddressSpace,
         sample_mode: Option<MaxwellThreeDSampleMode>,
         staged_writes: Option<&'a CanonicalWriteBatch>,
+        retained_backings: Option<&'a mut MaxwellThreeDRetainedBackingCache>,
     ) -> Self {
         Self {
             address_space,
             staged_writes,
+            retained_backings,
             sample_mode,
             resources: Vec::new(),
             samplers: Vec::new(),
+        }
+    }
+
+    fn retained_backing(
+        &mut self,
+        source: &MaxwellResolvedRange,
+        role: MaxwellThreeDResourceRole,
+    ) -> Result<RetainedResourceBacking, MaxwellThreeDResourceError> {
+        match self.retained_backings.as_deref_mut() {
+            Some(cache) => cache.retain(source, role),
+            None => retained_backing(source, role),
         }
     }
 
@@ -731,20 +845,12 @@ impl<'a> ResourceBuilder<'a> {
         size: u64,
     ) -> Result<(), MaxwellThreeDResourceError> {
         let source = self.resolve(address, size, MemoryPermissions::READ, role)?;
-        let retained = retained_backing(&source)?;
-        let allocation_description = GpuAllocationDescription::new(allocation_size(&source)?, 1)
-            .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        let backing = BackingView::new(
-            GpuAllocationId::new(retained.allocation.get()),
-            allocation_description,
-            retained.allocation_offset,
-            retained.range,
-        )
-        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        let retained = self.retained_backing(&source, role)?;
+        let allocation_description = retained.allocation_description;
         let description = BufferDescription::new(size)
             .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
         let id = BufferId::new(resource_id(self.resources.len())?);
-        let view = BufferView::new(id, description, 0, backing)
+        let view = BufferView::new(id, description, 0, retained.backing)
             .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
         self.resources.push(MaxwellThreeDResolvedResource::Buffer(
             MaxwellThreeDResolvedBuffer {
@@ -1008,16 +1114,9 @@ impl<'a> ResourceBuilder<'a> {
             layers,
             role,
         })?;
-        let retained = retained_backing(&source)?;
-        let allocation_description = GpuAllocationDescription::new(allocation_size(&source)?, 1)
-            .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        let backing = BackingView::new(
-            GpuAllocationId::new(retained.allocation.get()),
-            allocation_description,
-            retained.allocation_offset,
-            retained.range,
-        )
-        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        let retained = self.retained_backing(&source, role)?;
+        let allocation_description = retained.allocation_description;
+        let cpu_writes = retained.cpu_writes.clone();
         let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
             block_width_log2,
             block_height_log2,
@@ -1037,7 +1136,7 @@ impl<'a> ResourceBuilder<'a> {
                     layer_count: layers,
                 },
                 layout,
-                backing,
+                retained.backing,
             )],
         )
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
@@ -1050,6 +1149,7 @@ impl<'a> ResourceBuilder<'a> {
                 view,
                 source,
                 mappings: retained.mappings,
+                cpu_writes,
                 guest_layout: MaxwellThreeDPreservedImageLayout {
                     layout,
                     pte_kind: actual_kind,
@@ -1386,16 +1486,9 @@ impl<'a> ResourceBuilder<'a> {
                     .kind(),
             });
         }
-        let retained = retained_backing(&source)?;
-        let allocation_description = GpuAllocationDescription::new(allocation_size(&source)?, 1)
-            .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        let backing = BackingView::new(
-            GpuAllocationId::new(retained.allocation.get()),
-            allocation_description,
-            retained.allocation_offset,
-            retained.range,
-        )
-        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+        let retained = self.retained_backing(&source, role)?;
+        let allocation_description = retained.allocation_description;
+        let cpu_writes = retained.cpu_writes.clone();
         let image_id = ImageId::new(resource_id(self.resources.len())?);
         let view = ImageView::new(
             image_id,
@@ -1409,7 +1502,7 @@ impl<'a> ResourceBuilder<'a> {
                     layer_count,
                 },
                 neutral_layout,
-                backing,
+                retained.backing,
             )],
         )
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
@@ -1422,6 +1515,7 @@ impl<'a> ResourceBuilder<'a> {
                 view,
                 source,
                 mappings: retained.mappings,
+                cpu_writes,
                 guest_layout: MaxwellThreeDPreservedImageLayout {
                     layout: neutral_layout,
                     pte_kind: actual_kind,
@@ -1461,10 +1555,10 @@ impl<'a> ResourceBuilder<'a> {
         let mut aliases = Vec::new();
         for right in 0..self.resources.len() {
             for left in 0..right {
-                if ranges_overlap(
-                    self.resources[left].backing(),
-                    self.resources[right].backing(),
-                ) {
+                if self.resources[left]
+                    .backing_view()
+                    .overlaps(self.resources[right].backing_view())
+                {
                     if contradictory_image_alias(&self.resources[left], &self.resources[right]) {
                         return Err(MaxwellThreeDResourceError::ContradictoryAlias {
                             first: self.resources[left].role(),
@@ -1543,6 +1637,7 @@ fn decode_sampled_texture_format(
 
 fn retained_backing(
     source: &MaxwellResolvedRange,
+    role: MaxwellThreeDResourceRole,
 ) -> Result<RetainedResourceBacking, MaxwellThreeDResourceError> {
     let first = source
         .segments()
@@ -1558,11 +1653,10 @@ fn retained_backing(
         if mapping.allocation() != allocation || segment.backing_offset() != expected_offset {
             return Err(MaxwellThreeDResourceError::DiscontiguousAllocation);
         }
-        let range = mapping
+        mapping
             .backing()
-            .snapshot_subrange(segment.backing_offset(), segment.size())
+            .snapshot_subrange_into(segment.backing_offset(), segment.size(), &mut canonical)
             .map_err(MaxwellThreeDResourceError::Canonical)?;
-        canonical.extend_from_slice(range.segments());
         mappings.push(MaxwellThreeDMappingReference {
             mapping: mapping.id(),
             generation: mapping.generation(),
@@ -1575,12 +1669,23 @@ fn retained_backing(
             .checked_add(segment.size())
             .ok_or(MaxwellThreeDResourceError::ResourceExhausted)?;
     }
-    Ok(RetainedResourceBacking {
-        range: CanonicalBackingRange::new(canonical)
-            .map_err(MaxwellThreeDResourceError::Canonical)?,
-        allocation,
+    let range =
+        CanonicalBackingRange::new(canonical).map_err(MaxwellThreeDResourceError::Canonical)?;
+    let cpu_writes = CanonicalCpuWriteDependency::capture(&range);
+    let allocation_description = GpuAllocationDescription::new(allocation_size(source)?, 1)
+        .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+    let backing = BackingView::new(
+        GpuAllocationId::new(allocation.get()),
+        allocation_description,
         allocation_offset,
-        mappings: mappings.into_boxed_slice(),
+        range,
+    )
+    .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
+    Ok(RetainedResourceBacking {
+        backing,
+        allocation_description,
+        mappings: mappings.into(),
+        cpu_writes,
     })
 }
 
@@ -1830,16 +1935,6 @@ fn depth_is_programmed(target: &MaxwellThreeDDepthStencilTargetState) -> bool {
     .any(Option::is_some)
 }
 
-fn ranges_overlap(first: &CanonicalBackingRange, second: &CanonicalBackingRange) -> bool {
-    first.segments().iter().any(|left| {
-        second.segments().iter().any(|right| {
-            left.page() == right.page()
-                && left.offset() < right.offset() + right.size()
-                && right.offset() < left.offset() + left.size()
-        })
-    })
-}
-
 fn contradictory_image_alias(
     first: &MaxwellThreeDResolvedResource,
     second: &MaxwellThreeDResolvedResource,
@@ -2065,15 +2160,23 @@ impl std::error::Error for MaxwellThreeDResourceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use nixe_gpu::{AddressMode, BlockLinearLayout, FilterMode, ImageMemoryLayout};
     use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
+
+    use crate::{
+        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
+        MaxwellGpuAddressSpace, MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
+    };
 
     use super::{
         MAXWELL_C32_2CRA_KIND, MAXWELL_C64_2CRA_KIND, MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
         MaxwellThreeDPreservedImageLayout, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
-        MaxwellThreeDTextureDimension, constant_buffer_is_required, decode_sampled_texture_format,
-        decode_sampler, image_kind_matches, read_backing_bytes, read_descriptor_bytes,
-        texture_descriptor_pair, uses_maxwell_texture_headers,
+        MaxwellThreeDRetainedBackingCache, MaxwellThreeDTextureDimension,
+        constant_buffer_is_required, decode_sampled_texture_format, decode_sampler,
+        image_kind_matches, read_backing_bytes, read_descriptor_bytes, texture_descriptor_pair,
+        uses_maxwell_texture_headers,
     };
 
     fn descriptor_bytes(words: [u32; 8]) -> [u8; 32] {
@@ -2308,5 +2411,103 @@ mod tests {
             decode_sampled_texture_format(0x0f, [7; 4], [2, 0, 0, 7], false, 1),
             None
         );
+    }
+
+    #[test]
+    fn retained_backing_cache_uses_store_epoch_then_exact_page_overlap() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let mut address_space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        address_space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let backing = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let mapping = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                size: backing.size(),
+                backing,
+                backing_offset: 0,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let source = address_space
+            .resolve_range(mapping.offset(), 0x1000, MemoryPermissions::READ)
+            .unwrap();
+        let role = MaxwellThreeDResourceRole::VertexStream(0);
+        let mut cache = MaxwellThreeDRetainedBackingCache::default();
+
+        let first = cache.retain(&source, role).unwrap();
+        let staged_descriptor = [0x5a; 32];
+        let mut staged_writes = CanonicalWriteBatch::new();
+        staged_writes
+            .stage(
+                source.segments()[0].mapping().backing(),
+                0,
+                &staged_descriptor,
+            )
+            .unwrap();
+        assert_eq!(
+            read_descriptor_bytes(first.backing.range(), 0, Some(&staged_writes)).unwrap(),
+            staged_descriptor
+        );
+        assert_eq!(
+            read_descriptor_bytes(first.backing.range(), 0, None).unwrap(),
+            [0; 32]
+        );
+
+        allocation.write(0x1000, &[1]).unwrap();
+        let after_disjoint_write = cache.retain(&source, role).unwrap();
+        assert!(Arc::ptr_eq(&first.mappings, &after_disjoint_write.mappings));
+
+        allocation.write(0, &[2]).unwrap();
+        let after_overlapping_write = cache.retain(&source, role).unwrap();
+        assert!(!Arc::ptr_eq(
+            &after_disjoint_write.mappings,
+            &after_overlapping_write.mappings
+        ));
+        assert_eq!(
+            after_overlapping_write.backing.range().segments()[0].content_generation(),
+            source.segments()[0].mapping().backing().segments()[0]
+                .content_generation()
+                .next()
+                .unwrap()
+        );
+
+        address_space.unmap(mapping.offset()).unwrap();
+        let replacement = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let replacement_backing = replacement
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let remapped = address_space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(2),
+                size: replacement_backing.size(),
+                backing: replacement_backing,
+                backing_offset: 0,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        assert_eq!(remapped.offset(), mapping.offset());
+        let remapped_source = address_space
+            .resolve_range(remapped.offset(), 0x1000, MemoryPermissions::READ)
+            .unwrap();
+        let after_remap = cache.retain(&remapped_source, role).unwrap();
+        assert!(!Arc::ptr_eq(
+            &after_overlapping_write.mappings,
+            &after_remap.mappings
+        ));
     }
 }

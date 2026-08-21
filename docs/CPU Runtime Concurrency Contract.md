@@ -23,10 +23,12 @@ Code which needs more than one shared resource acquires locks in this order:
 1. execution-domain lifecycle and mapping-mutation gate;
 2. process-memory mapping table;
 3. canonical allocation transaction;
-4. canonical page state, in ascending canonical page identity;
-5. process object state (handle/session/port/event);
-6. device timeline or backend state;
-7. external-inbox watcher registration.
+4. canonical backing-store content-publication transaction, in ascending store
+   identity;
+5. canonical page state, in ascending canonical page identity;
+6. process object state (handle/session/port/event);
+7. device timeline or backend state;
+8. external-inbox watcher registration.
 
 Scheduler and process registries are coordinator-owned rather than locked and
 therefore never appear inside this hierarchy. External callbacks may acquire
@@ -46,6 +48,38 @@ all execution leases to reach a safepoint, applies one failure-atomic update,
 increments the epoch, and then allows new leases. Content generations remain
 canonical-page properties and invalidate exclusive reservations through every
 virtual alias.
+
+Every canonical page owned by one execution-memory instance also retains the
+same backing-store authority. That authority publishes a monotonically
+increasing content-mutation epoch after each successful logical CPU write,
+device-write completion, or failure-atomic write batch. Engines read this epoch
+with one acquire operation; its cost is independent of the number of resident
+pages. Failed transactions do not advance it, and making an already-published
+device write CPU-visible does not publish the same mutation a second time.
+
+The store epoch is only an address-space-wide change detector. It neither
+replaces nor summarizes per-page content generations: retained ranges, code
+dependencies, aliases, and exclusive reservations continue to validate the
+generation of each canonical page. In particular, implementations must not use
+the maximum page generation as a dirty watermark, because a mutation to a page
+below that maximum would be invisible.
+
+The same store also publishes a CPU-write-only epoch and retains a bounded
+journal of the canonical page intervals published by CPU writes. Consumers
+which care specifically about host writes may capture a fixed canonical byte
+dependency, compare the coarse epoch first, and consult the store journal only
+after it changes. Lost journal history must invalidate conservatively. Per-page
+generations and journals remain authoritative, and consumers may fall back to
+them when rebuilding a dependency. Device writes do not advance this
+specialized epoch, and an equal epoch is therefore an exact proof that no CPU
+write was published anywhere in that store.
+
+A captured byte dependency belongs to the retained derived object which uses
+it. Cache lookup compares stable structural identity before creating new
+derived state, and successful entries share their dependency observation with
+transactional clones. Implementations must not rebuild a dependency by walking
+all represented pages before every cache lookup; reconstruction occurs only
+when an entry is created or its retained provenance is invalidated.
 
 The mutation intent closes admission before waiting for active leases, so a
 stream of new slices cannot starve a pending mapping change. Runtime mapping

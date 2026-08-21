@@ -1,6 +1,9 @@
 //! Host-independent `MAXWELL_B` ordering and completion operations.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use nixe_gpu::{
     CacheMaintenanceOperation, GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint,
@@ -564,15 +567,18 @@ impl MaxwellThreeDSynchronizationTrigger {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDSynchronizationOperation {
     trigger: MaxwellThreeDSynchronizationTrigger,
-    state: MaxwellThreeDState,
+    state: Arc<MaxwellThreeDState>,
 }
 
 impl MaxwellThreeDSynchronizationOperation {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         trigger: MaxwellThreeDSynchronizationTrigger,
         state: MaxwellThreeDState,
     ) -> Self {
-        Self { trigger, state }
+        Self {
+            trigger,
+            state: Arc::new(state),
+        }
     }
 
     #[must_use]
@@ -581,7 +587,7 @@ impl MaxwellThreeDSynchronizationOperation {
     }
 
     #[must_use]
-    pub const fn state(&self) -> &MaxwellThreeDState {
+    pub fn state(&self) -> &MaxwellThreeDState {
         &self.state
     }
 }

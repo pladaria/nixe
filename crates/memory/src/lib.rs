@@ -17,12 +17,13 @@ pub use access::{
     MemoryPermissions, NonCpuDeviceId,
 };
 pub use backing::{
-    CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalCpuWriteOverlap,
-    CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
+    CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
+    CanonicalCpuWriteOverlap, CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
 };
 pub use range::{
-    CanonicalBackingRange, CanonicalBackingSegment, CanonicalRangeAccessError, CanonicalRangeError,
-    CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
+    CanonicalBackingRange, CanonicalBackingSegment, CanonicalCpuWriteDependency,
+    CanonicalRangeAccessError, CanonicalRangeError, CanonicalRangeTranslationError,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
 };
 pub use visibility::{
     CpuVisibilityRequest, DeviceVisibilityRequest, VisibilityCoordinator,
@@ -229,6 +230,10 @@ impl fmt::Display for CanonicalPageId {
 pub enum GenerationKind {
     /// Version of bytes in canonical backing.
     Content,
+    /// Store-wide publication epoch for canonical content mutations.
+    ContentMutation,
+    /// Store-wide publication epoch for CPU-originated writes.
+    CpuWrite,
     /// Version of a virtual-to-backing mapping and its access metadata.
     Mapping,
 }
@@ -237,6 +242,8 @@ impl fmt::Display for GenerationKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Content => "content",
+            Self::ContentMutation => "content mutation",
+            Self::CpuWrite => "CPU write",
             Self::Mapping => "mapping",
         })
     }
@@ -311,6 +318,18 @@ generation!(
     ContentGeneration,
     GenerationKind::Content,
     "generation="
+);
+generation!(
+    /// Store-wide epoch advanced whenever canonical content is published.
+    ContentMutationEpoch,
+    GenerationKind::ContentMutation,
+    "content-mutation-epoch="
+);
+generation!(
+    /// Store-wide epoch advanced only by CPU-originated canonical writes.
+    CpuWriteEpoch,
+    GenerationKind::CpuWrite,
+    "cpu-write-epoch="
 );
 /// Version of a virtual mapping and its access metadata.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -400,6 +419,11 @@ mod tests {
             Ok(MappingGeneration::new(1))
         );
         assert_eq!(
+            ContentMutationEpoch::INITIAL.next(),
+            Ok(ContentMutationEpoch::new(1))
+        );
+        assert_eq!(CpuWriteEpoch::INITIAL.next(), Ok(CpuWriteEpoch::new(1)));
+        assert_eq!(
             ContentGeneration::MAX.next(),
             Err(GenerationExhausted {
                 kind: GenerationKind::Content
@@ -409,6 +433,18 @@ mod tests {
             MappingGeneration::MAX.next(),
             Err(GenerationExhausted {
                 kind: GenerationKind::Mapping
+            })
+        );
+        assert_eq!(
+            ContentMutationEpoch::MAX.next(),
+            Err(GenerationExhausted {
+                kind: GenerationKind::ContentMutation
+            })
+        );
+        assert_eq!(
+            CpuWriteEpoch::MAX.next(),
+            Err(GenerationExhausted {
+                kind: GenerationKind::CpuWrite
             })
         );
     }

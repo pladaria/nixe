@@ -38,7 +38,9 @@ pub use inline_to_memory::{
     MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
     MaxwellInlineToMemoryStateWrite, MaxwellInlineToMemoryUpload,
 };
-pub(crate) use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
+#[cfg(test)]
+use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
+pub(crate) use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache;
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT,
@@ -175,7 +177,10 @@ pub use twod::{
     MaxwellTwoDState, MaxwellTwoDStateWrite,
 };
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
@@ -392,7 +397,7 @@ pub struct MaxwellEnginePacketDispatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDTriggeredOperation {
     trigger: MaxwellThreeDOperationTrigger,
-    state: MaxwellThreeDState,
+    state: Arc<MaxwellThreeDState>,
 }
 
 impl MaxwellThreeDTriggeredOperation {
@@ -402,7 +407,7 @@ impl MaxwellThreeDTriggeredOperation {
     }
 
     #[must_use]
-    pub const fn state(&self) -> &MaxwellThreeDState {
+    pub fn state(&self) -> &MaxwellThreeDState {
         &self.state
     }
 }
@@ -806,7 +811,7 @@ pub fn dispatch_maxwell_engine_packet(
                 let state = channel.three_d();
                 let operation = MaxwellThreeDTriggeredOperation {
                     trigger,
-                    state: state.clone(),
+                    state: Arc::new(state.clone()),
                 };
                 ordered_operations
                     .try_reserve(1)

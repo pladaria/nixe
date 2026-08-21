@@ -2,14 +2,265 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageId, ContentGeneration, CpuVisibilityRequest, DeviceAccessDeclaration,
-    DeviceVisibilityRequest, GenerationExhausted, GuestPhysicalPageId, MappingGeneration,
-    MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator, VisibilityError, VisibilityState,
+    CanonicalPageId, ContentGeneration, ContentMutationEpoch, CpuVisibilityRequest, CpuWriteEpoch,
+    DeviceAccessDeclaration, DeviceVisibilityRequest, GenerationExhausted, GuestPhysicalPageId,
+    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator, VisibilityError,
+    VisibilityState,
 };
+
+struct CanonicalBackingStoreInner {
+    identity: BackingStoreId,
+    content_epoch: AtomicU64,
+    cpu_write_epoch: AtomicU64,
+    mutation: Mutex<CanonicalStoreMutationState>,
+}
+
+#[derive(Debug, Default)]
+struct CanonicalStoreMutationState {
+    cpu_writes: StoreCpuWriteJournal,
+}
+
+pub(crate) const STORE_CPU_WRITE_JOURNAL_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoreCpuWriteRecord {
+    epoch: CpuWriteEpoch,
+    page: CanonicalPageId,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Default)]
+struct StoreCpuWriteJournal {
+    records: VecDeque<StoreCpuWriteRecord>,
+    lost_through: Option<CpuWriteEpoch>,
+}
+
+impl StoreCpuWriteJournal {
+    fn prepare(&mut self) -> Result<(), CanonicalContentMutationError> {
+        if self.records.capacity() < STORE_CPU_WRITE_JOURNAL_CAPACITY {
+            self.records
+                .try_reserve_exact(STORE_CPU_WRITE_JOURNAL_CAPACITY - self.records.len())
+                .map_err(|_| CanonicalContentMutationError::ResourceExhausted)?;
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, epoch: CpuWriteEpoch, page: CanonicalPageId, start: u64, end: u64) {
+        if start == end {
+            return;
+        }
+        if self.records.len() == STORE_CPU_WRITE_JOURNAL_CAPACITY {
+            let removed = self
+                .records
+                .pop_front()
+                .expect("a full store CPU-write journal has a front record");
+            self.lost_through = Some(
+                self.lost_through
+                    .map_or(removed.epoch, |current| current.max(removed.epoch)),
+            );
+        }
+        self.records.push_back(StoreCpuWriteRecord {
+            epoch,
+            page,
+            start,
+            end,
+        });
+    }
+
+    fn overlap_since(
+        &self,
+        epoch: CpuWriteEpoch,
+        intervals: &[(CanonicalPageId, u64, u64)],
+    ) -> CanonicalCpuWriteOverlap {
+        if self
+            .lost_through
+            .is_some_and(|lost_through| epoch < lost_through)
+        {
+            return CanonicalCpuWriteOverlap::Unknown;
+        }
+        if self
+            .records
+            .iter()
+            .rev()
+            .take_while(|record| record.epoch > epoch)
+            .any(|record| store_record_overlaps_intervals(*record, intervals))
+        {
+            CanonicalCpuWriteOverlap::Yes
+        } else {
+            CanonicalCpuWriteOverlap::No
+        }
+    }
+}
+
+fn store_record_overlaps_intervals(
+    record: StoreCpuWriteRecord,
+    intervals: &[(CanonicalPageId, u64, u64)],
+) -> bool {
+    let mut index = intervals.partition_point(|(page, _, _)| *page < record.page);
+    while let Some((page, start, end)) = intervals.get(index) {
+        if *page != record.page {
+            break;
+        }
+        if record.start < *end && *start < record.end {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalContentMutationError {
+    GenerationExhausted(GenerationExhausted),
+    ResourceExhausted,
+}
+
+/// Shared authority for every canonical page in one backing store.
+///
+/// Per-page content generations remain authoritative for aliases and retained
+/// ranges. This store-wide epoch is only a monotonic O(1) change detector for
+/// CPU-engine memory synchronization.
+#[derive(Clone)]
+pub struct CanonicalBackingStore {
+    inner: Arc<CanonicalBackingStoreInner>,
+}
+
+impl CanonicalBackingStore {
+    /// Allocates a new globally unambiguous backing store.
+    pub fn allocate() -> Result<Self, BackingIdentityExhausted> {
+        Ok(Self {
+            inner: Arc::new(CanonicalBackingStoreInner {
+                identity: BackingStoreId::allocate()?,
+                content_epoch: AtomicU64::new(ContentMutationEpoch::INITIAL.get()),
+                cpu_write_epoch: AtomicU64::new(CpuWriteEpoch::INITIAL.get()),
+                mutation: Mutex::new(CanonicalStoreMutationState::default()),
+            }),
+        })
+    }
+
+    /// Returns the stable pointer-free store identity.
+    #[must_use]
+    pub fn identity(&self) -> BackingStoreId {
+        self.inner.identity
+    }
+
+    /// Returns the latest completely published content mutation in O(1).
+    #[must_use]
+    pub fn content_epoch(&self) -> ContentMutationEpoch {
+        ContentMutationEpoch::new(self.inner.content_epoch.load(Ordering::Acquire))
+    }
+
+    /// Returns the latest completely published CPU-originated write in O(1).
+    #[must_use]
+    pub fn cpu_write_epoch(&self) -> CpuWriteEpoch {
+        CpuWriteEpoch::new(self.inner.cpu_write_epoch.load(Ordering::Acquire))
+    }
+
+    fn begin_content_mutation(
+        &self,
+        cpu_write: bool,
+    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
+        let mut guard = self
+            .inner
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = self
+            .content_epoch()
+            .next()
+            .map_err(CanonicalContentMutationError::GenerationExhausted)?;
+        let next_cpu_write = cpu_write
+            .then(|| self.cpu_write_epoch().next())
+            .transpose()
+            .map_err(CanonicalContentMutationError::GenerationExhausted)?;
+        if cpu_write {
+            guard.cpu_writes.prepare()?;
+        }
+        Ok(CanonicalContentMutation {
+            store: self,
+            guard,
+            next,
+            next_cpu_write,
+        })
+    }
+
+    fn begin_cpu_write(
+        &self,
+    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
+        self.begin_content_mutation(true)
+    }
+
+    fn begin_device_write(&self) -> Result<CanonicalContentMutation<'_>, GenerationExhausted> {
+        self.begin_content_mutation(false)
+            .map_err(|error| match error {
+                CanonicalContentMutationError::GenerationExhausted(error) => error,
+                CanonicalContentMutationError::ResourceExhausted => {
+                    unreachable!("device mutations do not reserve CPU-write journal storage")
+                }
+            })
+    }
+
+    pub(crate) fn cpu_write_overlap_since(
+        &self,
+        epoch: CpuWriteEpoch,
+        intervals: &[(CanonicalPageId, u64, u64)],
+    ) -> (CpuWriteEpoch, CanonicalCpuWriteOverlap) {
+        let mutation = self
+            .inner
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.cpu_write_epoch();
+        let overlap = mutation.cpu_writes.overlap_since(epoch, intervals);
+        (current, overlap)
+    }
+}
+
+impl std::fmt::Debug for CanonicalBackingStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalBackingStore")
+            .field("identity", &self.identity())
+            .field("content_epoch", &self.content_epoch())
+            .field("cpu_write_epoch", &self.cpu_write_epoch())
+            .finish()
+    }
+}
+
+struct CanonicalContentMutation<'a> {
+    store: &'a CanonicalBackingStore,
+    guard: std::sync::MutexGuard<'a, CanonicalStoreMutationState>,
+    next: ContentMutationEpoch,
+    next_cpu_write: Option<CpuWriteEpoch>,
+}
+
+impl CanonicalContentMutation<'_> {
+    fn record_cpu_write(&mut self, page: CanonicalPageId, start: u64, end: u64) {
+        if let Some(epoch) = self.next_cpu_write {
+            self.guard.cpu_writes.record(epoch, page, start, end);
+        }
+    }
+
+    fn commit(self) {
+        self.store
+            .inner
+            .content_epoch
+            .store(self.next.get(), Ordering::Release);
+        if let Some(next) = self.next_cpu_write {
+            self.store
+                .inner
+                .cpu_write_epoch
+                .store(next.get(), Ordering::Release);
+        }
+        drop(self.guard);
+    }
+}
 
 enum PageVisibility {
     Clean,
@@ -108,6 +359,7 @@ pub enum CanonicalCpuWriteOverlap {
 }
 
 struct CanonicalPageInner {
+    store: CanonicalBackingStore,
     identity: CanonicalPageId,
     size: usize,
     state: Mutex<CanonicalPageState>,
@@ -145,7 +397,8 @@ impl Eq for CanonicalBackingPage {}
 impl CanonicalBackingPage {
     /// Creates a lazily materialized, zero-filled canonical page.
     pub fn zeroed(
-        identity: CanonicalPageId,
+        store: &CanonicalBackingStore,
+        page: GuestPhysicalPageId,
         size: usize,
         generation: ContentGeneration,
     ) -> Result<Self, CanonicalPageError> {
@@ -154,7 +407,8 @@ impl CanonicalBackingPage {
         }
         Ok(Self {
             inner: Arc::new(CanonicalPageInner {
-                identity,
+                store: store.clone(),
+                identity: CanonicalPageId::new(store.identity(), page),
                 size,
                 state: Mutex::new(CanonicalPageState {
                     bytes: None,
@@ -169,7 +423,8 @@ impl CanonicalBackingPage {
 
     /// Creates a canonical page initialized from exactly one page of bytes.
     pub fn initialized(
-        identity: CanonicalPageId,
+        store: &CanonicalBackingStore,
+        page: GuestPhysicalPageId,
         bytes: &[u8],
         generation: ContentGeneration,
     ) -> Result<Self, CanonicalPageError> {
@@ -183,7 +438,8 @@ impl CanonicalBackingPage {
         contents.extend_from_slice(bytes);
         Ok(Self {
             inner: Arc::new(CanonicalPageInner {
-                identity,
+                store: store.clone(),
+                identity: CanonicalPageId::new(store.identity(), page),
                 size: bytes.len(),
                 state: Mutex::new(CanonicalPageState {
                     bytes: Some(contents.into_boxed_slice()),
@@ -200,6 +456,14 @@ impl CanonicalBackingPage {
     #[must_use]
     pub fn identity(&self) -> CanonicalPageId {
         self.inner.identity
+    }
+
+    pub(crate) fn store(&self) -> &CanonicalBackingStore {
+        &self.inner.store
+    }
+
+    pub(crate) fn cpu_write_epoch(&self) -> CpuWriteEpoch {
+        self.store().cpu_write_epoch()
     }
 
     /// Returns the byte size of this backing page.
@@ -235,8 +499,6 @@ impl CanonicalBackingPage {
     ) -> Result<ContentGeneration, CanonicalPageError> {
         let end = self.checked_end(offset, output.len())?;
         loop {
-            self.ensure_cpu_visible()
-                .map_err(CanonicalPageError::Visibility)?;
             let state = self.lock_state();
             match state.visibility {
                 PageVisibility::Clean | PageVisibility::CpuNewer => {
@@ -248,9 +510,12 @@ impl CanonicalBackingPage {
                     return Ok(state.generation);
                 }
                 PageVisibility::GpuNewer { .. } => {
-                    // A device published newer contents after the slow path
-                    // returned but before this lock was acquired. Retry rather
-                    // than exposing the now-stale canonical bytes.
+                    // Device reconciliation cannot run while the observation
+                    // lock is held. CPU-visible pages complete above with one
+                    // lock acquisition; only this uncommon path retries.
+                    drop(state);
+                    self.ensure_cpu_visible()
+                        .map_err(CanonicalPageError::Visibility)?;
                 }
                 PageVisibility::Conflicting => {
                     return Err(CanonicalPageError::Visibility(
@@ -355,6 +620,17 @@ impl CanonicalBackingPage {
         if expected.next() != Ok(next) {
             return Err(CanonicalPageError::InvalidGenerationTransition);
         }
+        let mut mutation = self
+            .store()
+            .begin_cpu_write()
+            .map_err(|error| match error {
+                CanonicalContentMutationError::GenerationExhausted(error) => {
+                    CanonicalPageError::MutationEpochExhausted(error)
+                }
+                CanonicalContentMutationError::ResourceExhausted => {
+                    CanonicalPageError::ResourceExhausted
+                }
+            })?;
         let mut state = self.lock_state();
         state.cpu_writes.prepare()?;
         if state.generation != expected {
@@ -383,6 +659,8 @@ impl CanonicalBackingPage {
         }
         state.generation = next;
         state.cpu_writes.record(next, offset as u64, end as u64);
+        mutation.record_cpu_write(self.identity(), offset as u64, end as u64);
+        mutation.commit();
         Ok(())
     }
 
@@ -398,6 +676,17 @@ impl CanonicalBackingPage {
         generation: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
+        let mut mutation = self
+            .store()
+            .begin_cpu_write()
+            .map_err(|error| match error {
+                CanonicalContentMutationError::GenerationExhausted(error) => {
+                    CanonicalPageError::MutationEpochExhausted(error)
+                }
+                CanonicalContentMutationError::ResourceExhausted => {
+                    CanonicalPageError::ResourceExhausted
+                }
+            })?;
         let mut state = self.lock_state();
         state.cpu_writes.prepare()?;
         if state.generation != generation {
@@ -427,6 +716,8 @@ impl CanonicalBackingPage {
         state
             .cpu_writes
             .record(generation, offset as u64, end as u64);
+        mutation.record_cpu_write(self.identity(), offset as u64, end as u64);
+        mutation.commit();
         Ok(())
     }
 
@@ -506,6 +797,10 @@ impl CanonicalBackingPage {
         let Some(visible_at) = declaration.cpu_visible_at() else {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         };
+        let mutation = self
+            .store()
+            .begin_device_write()
+            .map_err(VisibilityError::GenerationExhausted)?;
         let mut state = self.lock_state();
         match &state.visibility {
             PageVisibility::Clean => {}
@@ -529,7 +824,9 @@ impl CanonicalBackingPage {
                 visible_at,
                 coordinator,
             },
-        )
+        )?;
+        mutation.commit();
+        Ok(())
     }
 
     pub(crate) fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
@@ -883,6 +1180,26 @@ impl CanonicalWriteBatch {
             });
         }
 
+        let mut stores = backings
+            .iter()
+            .map(|backing| backing.store().clone())
+            .collect::<Vec<_>>();
+        stores.sort_by_key(CanonicalBackingStore::identity);
+        stores.dedup_by_key(|store| store.identity());
+        let mut mutations = stores
+            .iter()
+            .map(|store| {
+                store.begin_cpu_write().map_err(|error| match error {
+                    CanonicalContentMutationError::GenerationExhausted(error) => {
+                        CanonicalWriteBatchError::GenerationExhausted(error)
+                    }
+                    CanonicalContentMutationError::ResourceExhausted => {
+                        CanonicalWriteBatchError::ResourceExhausted
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let mut states = backings
             .iter()
             .map(CanonicalBackingPage::lock_state)
@@ -906,6 +1223,18 @@ impl CanonicalWriteBatch {
             for &(start, end) in &write.dirty_ranges {
                 state.cpu_writes.record(write.next_generation, start, end);
             }
+        }
+        for (backing, write) in backings.iter().zip(&writes) {
+            let mutation = mutations
+                .iter_mut()
+                .find(|mutation| mutation.store.identity() == backing.identity().store())
+                .expect("every written backing store has a prepared mutation");
+            for &(start, end) in &write.dirty_ranges {
+                mutation.record_cpu_write(backing.identity(), start, end);
+            }
+        }
+        for mutation in mutations {
+            mutation.commit();
         }
         Ok(())
     }
@@ -989,6 +1318,8 @@ pub enum CanonicalPageError {
     },
     /// The supplied next generation was not the exact successor.
     InvalidGenerationTransition,
+    /// The store-wide content mutation epoch cannot advance without wrapping.
+    MutationEpochExhausted(GenerationExhausted),
     /// Required CPU/device visibility work could not be completed.
     Visibility(VisibilityError),
 }
@@ -1008,6 +1339,7 @@ impl Display for CanonicalPageError {
             Self::InvalidGenerationTransition => {
                 formatter.write_str("canonical page generation transition is not consecutive")
             }
+            Self::MutationEpochExhausted(error) => error.fmt(formatter),
             Self::Visibility(error) => error.fmt(formatter),
         }
     }
@@ -1017,7 +1349,7 @@ impl std::error::Error for CanonicalPageError {}
 
 #[derive(Debug)]
 struct CanonicalAllocationInner {
-    store: BackingStoreId,
+    store: CanonicalBackingStore,
     size: usize,
     page_size: usize,
     pages: Box<[CanonicalBackingPage]>,
@@ -1037,8 +1369,8 @@ impl CanonicalAllocation {
         if size == 0 || page_size == 0 || !page_size.is_power_of_two() {
             return Err(CanonicalAllocationError::InvalidSize);
         }
-        let store =
-            BackingStoreId::allocate().map_err(CanonicalAllocationError::IdentityExhausted)?;
+        let store = CanonicalBackingStore::allocate()
+            .map_err(CanonicalAllocationError::IdentityExhausted)?;
         let page_count = size.div_ceil(page_size);
         let mut pages = Vec::new();
         pages
@@ -1053,7 +1385,8 @@ impl CanonicalAllocation {
                 ))?;
             pages.push(
                 CanonicalBackingPage::zeroed(
-                    CanonicalPageId::new(store, GuestPhysicalPageId::new(local_id)),
+                    &store,
+                    GuestPhysicalPageId::new(local_id),
                     page_size,
                     ContentGeneration::INITIAL,
                 )
@@ -1074,7 +1407,7 @@ impl CanonicalAllocation {
     /// Returns the stable ownership-domain identity.
     #[must_use]
     pub fn store(&self) -> BackingStoreId {
-        self.inner.store
+        self.inner.store.identity()
     }
 
     /// Returns the logical byte size, excluding padding in the final page.
@@ -1307,6 +1640,106 @@ mod tests {
     }
 
     #[test]
+    fn store_epoch_detects_a_mutation_when_the_max_page_generation_does_not_change() {
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let dominant = CanonicalBackingPage::zeroed(
+            &store,
+            GuestPhysicalPageId::new(1),
+            0x1000,
+            ContentGeneration::new(100),
+        )
+        .unwrap();
+        let changed = CanonicalBackingPage::zeroed(
+            &store,
+            GuestPhysicalPageId::new(2),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+
+        assert_eq!(store.content_epoch(), ContentMutationEpoch::INITIAL);
+        changed
+            .write_preflighted(
+                0,
+                &[0x5a],
+                ContentGeneration::INITIAL,
+                ContentGeneration::new(1),
+            )
+            .unwrap();
+
+        assert_eq!(dominant.content_generation(), ContentGeneration::new(100));
+        assert_eq!(changed.content_generation(), ContentGeneration::new(1));
+        assert_eq!(store.content_epoch(), ContentMutationEpoch::new(1));
+    }
+
+    #[test]
+    fn rejected_page_write_does_not_advance_the_store_epoch() {
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let page = CanonicalBackingPage::zeroed(
+            &store,
+            GuestPhysicalPageId::new(1),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            page.write_preflighted(
+                0,
+                &[0x5a],
+                ContentGeneration::new(7),
+                ContentGeneration::new(8),
+            ),
+            Err(CanonicalPageError::StaleGeneration { .. })
+        ));
+        assert_eq!(store.content_epoch(), ContentMutationEpoch::INITIAL);
+    }
+
+    #[test]
+    fn concurrent_page_publications_do_not_lose_store_epoch_updates() {
+        const WRITES_PER_PAGE: u64 = 64;
+
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let pages = [
+            CanonicalBackingPage::zeroed(
+                &store,
+                GuestPhysicalPageId::new(1),
+                1,
+                ContentGeneration::INITIAL,
+            )
+            .unwrap(),
+            CanonicalBackingPage::zeroed(
+                &store,
+                GuestPhysicalPageId::new(2),
+                1,
+                ContentGeneration::INITIAL,
+            )
+            .unwrap(),
+        ];
+        let workers = pages.map(|page| {
+            thread::spawn(move || {
+                for generation in 0..WRITES_PER_PAGE {
+                    page.write_preflighted(
+                        0,
+                        &[generation as u8],
+                        ContentGeneration::new(generation),
+                        ContentGeneration::new(generation + 1),
+                    )
+                    .unwrap();
+                }
+            })
+        });
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            store.content_epoch(),
+            ContentMutationEpoch::new(WRITES_PER_PAGE * 2)
+        );
+    }
+
+    #[test]
     fn retained_allocation_spans_pages_and_versions_written_contents() {
         let allocation = CanonicalAllocation::zeroed(0x1800, 0x1000).unwrap();
         let before = allocation
@@ -1359,6 +1792,9 @@ mod tests {
     fn device_visibility_round_trip_uses_injected_slow_path() {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(4, &[0x11]).unwrap();
+        let content_epoch_after_cpu_write = allocation.inner.store.content_epoch();
+        let cpu_write_epoch = allocation.inner.store.cpu_write_epoch();
+        assert_eq!(cpu_write_epoch, CpuWriteEpoch::new(1));
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
@@ -1392,6 +1828,16 @@ mod tests {
         range
             .complete_device_write(declaration, Arc::clone(&erased))
             .unwrap();
+        let device_write_epoch = allocation.inner.store.content_epoch();
+        assert_eq!(
+            device_write_epoch,
+            content_epoch_after_cpu_write.next().unwrap()
+        );
+        assert_eq!(
+            allocation.inner.store.cpu_write_epoch(),
+            cpu_write_epoch,
+            "device writes do not invalidate the CPU-write-only fast path"
+        );
         assert_eq!(
             range.segments()[0].visibility_state(),
             VisibilityState::GpuNewer {
@@ -1404,6 +1850,7 @@ mod tests {
         let mut observed = [0; 1];
         allocation.read(4, &mut observed).unwrap();
         assert_eq!(observed, [0x5a]);
+        assert_eq!(allocation.inner.store.content_epoch(), device_write_epoch);
         assert_eq!(coordinator.downloads.lock().unwrap().len(), 1);
         assert_eq!(
             range.segments()[0].visibility_state(),
@@ -1487,11 +1934,10 @@ mod tests {
 
     #[test]
     fn exhausted_device_writeback_generation_invalidates_without_downloading() {
+        let store = CanonicalBackingStore::allocate().unwrap();
         let page = CanonicalBackingPage::initialized(
-            CanonicalPageId::new(
-                BackingStoreId::allocate().unwrap(),
-                GuestPhysicalPageId::new(1),
-            ),
+            &store,
+            GuestPhysicalPageId::new(1),
             &[0x11; 0x1000],
             ContentGeneration::MAX,
         )
@@ -1554,6 +2000,11 @@ mod tests {
         allocation.read(0x0ffe, &mut before).unwrap();
         assert_eq!(before, [0; 4]);
         batch.commit().unwrap();
+        assert_eq!(
+            allocation.inner.store.content_epoch(),
+            ContentMutationEpoch::new(1),
+            "one failure-atomic batch publishes one store mutation"
+        );
 
         allocation.read(0x0ffe, &mut before).unwrap();
         assert_eq!(before, [1, 2, 3, 4]);
@@ -1569,6 +2020,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_write_batch_publishes_once_to_each_distinct_store() {
+        let first_store = CanonicalBackingStore::allocate().unwrap();
+        let second_store = CanonicalBackingStore::allocate().unwrap();
+        let first = CanonicalBackingPage::zeroed(
+            &first_store,
+            GuestPhysicalPageId::new(1),
+            4,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let second = CanonicalBackingPage::zeroed(
+            &second_store,
+            GuestPhysicalPageId::new(1),
+            4,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let range = CanonicalBackingRange::new(vec![
+            CanonicalBackingSegment::new(
+                first,
+                0,
+                4,
+                MemoryPermissions::READ_WRITE,
+                ContentGeneration::INITIAL,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap(),
+            CanonicalBackingSegment::new(
+                second,
+                0,
+                4,
+                MemoryPermissions::READ_WRITE,
+                ContentGeneration::INITIAL,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 2, &[1, 2, 3, 4]).unwrap();
+
+        batch.commit().unwrap();
+
+        assert_eq!(first_store.content_epoch(), ContentMutationEpoch::new(1));
+        assert_eq!(second_store.content_epoch(), ContentMutationEpoch::new(1));
+    }
+
+    #[test]
     fn canonical_write_batch_rejects_every_page_after_a_concurrent_mutation() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let range = allocation
@@ -1577,10 +2076,16 @@ mod tests {
         let mut batch = CanonicalWriteBatch::new();
         batch.stage(&range, 0x0fff, &[0xaa, 0xbb]).unwrap();
         allocation.write(0x1000, &[0x55]).unwrap();
+        let epoch_after_concurrent_write = allocation.inner.store.content_epoch();
 
         assert_eq!(
             batch.commit(),
             Err(CanonicalWriteBatchError::ConcurrentMutation)
+        );
+        assert_eq!(
+            allocation.inner.store.content_epoch(),
+            epoch_after_concurrent_write,
+            "a rejected batch must not publish another mutation"
         );
         let mut first = [0xff; 1];
         let mut second = [0xff; 1];

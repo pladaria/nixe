@@ -156,9 +156,11 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
                 }
             };
             for backing in &resource.backings {
-                let current = backing
-                    .snapshot_subrange(0, backing.size())
-                    .map_err(|error| BackendRuntimeError::Visibility(error.to_string().into()))?;
+                // Visibility is owned by the retained canonical pages, not by
+                // the content generations captured in a range. Keep the exact
+                // range alive for completion without rebuilding a versioned
+                // snapshot on every submission.
+                let current = backing.clone();
                 if let Err(error) =
                     current.prepare_device_access(declaration, Arc::clone(&self.visibility))
                 {

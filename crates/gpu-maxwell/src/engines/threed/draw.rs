@@ -4,7 +4,11 @@
 //! operations. Shader translation is supplied as typed T10 evidence; this
 //! module never treats Maxwell code as a neutral or host shader.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    ops::Deref,
+    sync::Arc,
+};
 
 use nixe_gpu::{
     AccessMode, AccessScope, AccessTarget, AlphaCompareOperation, AlphaTest, AttachmentLoad,
@@ -21,10 +25,13 @@ use nixe_gpu::{
     TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
     VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
-use nixe_memory::{CanonicalCpuWriteOverlap, CanonicalPageId, ContentGeneration};
+use nixe_memory::CanonicalCpuWriteDependency;
 
 use crate::MaxwellMethodSource;
-use crate::shader::{MaxwellShaderTranslationKey, MaxwellTranslatedShaderProgram};
+use crate::shader::{
+    MaxwellShaderTranslationError, MaxwellShaderTranslationInputs, MaxwellShaderTranslationKey,
+    MaxwellTranslatedShaderProgram, translate_prepared_maxwell_shader_programs,
+};
 
 use super::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaToCoverageOverride,
@@ -278,7 +285,7 @@ enum ViewKey {
         description: nixe_gpu::BufferDescription,
         buffer_offset: u64,
         backing: nixe_gpu::BackingView,
-        mappings: Box<[super::MaxwellThreeDMappingReference]>,
+        mappings: Arc<[super::MaxwellThreeDMappingReference]>,
     },
     Image {
         description: nixe_gpu::ImageDescription,
@@ -293,43 +300,143 @@ enum ViewKey {
                 nixe_gpu::BackingView,
             )],
         >,
-        mappings: Box<[super::MaxwellThreeDMappingReference]>,
+        mappings: Arc<[super::MaxwellThreeDMappingReference]>,
     },
 }
 
 impl ViewKey {
+    fn matches_resource(&self, resource: &MaxwellThreeDResolvedResource) -> bool {
+        match (self, resource) {
+            (
+                Self::Buffer {
+                    description,
+                    buffer_offset,
+                    backing,
+                    mappings,
+                },
+                MaxwellThreeDResolvedResource::Buffer(current),
+            ) => {
+                *description == current.description()
+                    && *buffer_offset == current.view().buffer_offset()
+                    && backing == current.view().backing()
+                    && mappings.as_ref() == current.mappings()
+            }
+            (
+                Self::Image {
+                    description,
+                    swizzle,
+                    guest_format,
+                    guest_pte_kind,
+                    guest_compression_enabled,
+                    bindings,
+                    mappings,
+                },
+                MaxwellThreeDResolvedResource::Image(current),
+            ) => {
+                *description == current.description()
+                    && *swizzle == current.view().swizzle()
+                    && *guest_format == current.guest_format()
+                    && *guest_pte_kind == current.guest_layout().pte_kind()
+                    && *guest_compression_enabled
+                        == current.guest_layout().requires_materialization()
+                    && mappings.as_ref() == current.mappings()
+                    && bindings.len() == current.view().bindings().len()
+                    && bindings.iter().zip(current.view().bindings()).all(
+                        |((subresources, layout, backing), current)| {
+                            *subresources == current.subresources()
+                                && *layout == current.layout()
+                                && backing == current.backing()
+                        },
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn overlaps(&self, other: &Self) -> bool {
-        self.backings().iter().any(|left| {
-            other
-                .backings()
-                .iter()
-                .any(|right| canonical_backings_overlap(left, right))
+        (0..self.backing_count()).any(|left| {
+            (0..other.backing_count()).any(|right| {
+                self.backing(left)
+                    .expect("backing index is bounded by backing_count")
+                    .overlaps(
+                        other
+                            .backing(right)
+                            .expect("backing index is bounded by backing_count"),
+                    )
+            })
         })
     }
 
-    fn backings(&self) -> Vec<&nixe_gpu::BackingView> {
+    fn backing_count(&self) -> usize {
         match self {
-            Self::Buffer { backing, .. } => vec![backing],
-            Self::Image { bindings, .. } => {
-                bindings.iter().map(|(_, _, backing)| backing).collect()
-            }
+            Self::Buffer { .. } => 1,
+            Self::Image { bindings, .. } => bindings.len(),
         }
+    }
+
+    fn backing(&self, index: usize) -> Option<&nixe_gpu::BackingView> {
+        match self {
+            Self::Buffer { backing, .. } => (index == 0).then_some(backing),
+            Self::Image { bindings, .. } => bindings.get(index).map(|(_, _, backing)| backing),
+        }
+    }
+
+    /// Returns whether an already-created backend image still represents the
+    /// same guest image bytes after a mapping-only identity change.
+    ///
+    /// Mapping identifiers are deliberately excluded: Maxwell may bind the
+    /// same canonical pages through another GPU virtual mapping without
+    /// changing their contents. Any overlapping CPU write, layout change, or
+    /// physical backing change makes the representation non-reusable.
+    fn same_domain_as_image(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
+        let Self::Image {
+            description,
+            swizzle,
+            guest_format,
+            guest_pte_kind,
+            guest_compression_enabled,
+            bindings,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        *description == image.description()
+            && *swizzle == image.view().swizzle()
+            && *guest_format == image.guest_format()
+            && *guest_pte_kind == image.guest_layout().pte_kind()
+            && *guest_compression_enabled == image.guest_layout().requires_materialization()
+            && bindings.len() == image.view().bindings().len()
+            && bindings.iter().zip(image.view().bindings()).all(
+                |((recorded_subresources, recorded_layout, recorded_backing), current)| {
+                    *recorded_subresources == current.subresources()
+                        && *recorded_layout == current.layout()
+                        && same_canonical_backing(recorded_backing, current.backing())
+                },
+            )
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ColorRepresentationSegment {
-    page: CanonicalPageId,
-    offset: u64,
-    size: u64,
-    generation: ContentGeneration,
+fn same_canonical_backing(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
+    left.range() == right.range()
+        || (left.range().segments().len() == right.range().segments().len()
+            && left
+                .range()
+                .segments()
+                .iter()
+                .zip(right.range().segments())
+                .all(|(left, right)| {
+                    left.page() == right.page()
+                        && left.offset() == right.offset()
+                        && left.size() == right.size()
+                }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ColorRepresentationBinding {
     subresources: ImageSubresourceRange,
     layout: nixe_gpu::ImageMemoryLayout,
-    segments: Box<[ColorRepresentationSegment]>,
+    backing: nixe_gpu::BackingView,
 }
 
 /// Stable neutral representation state. GPU virtual mappings and backend view
@@ -343,53 +450,36 @@ struct ColorRepresentationRecord {
     guest_pte_kind: u8,
     guest_compression_enabled: bool,
     bindings: Box<[ColorRepresentationBinding]>,
+    cpu_writes: Option<CanonicalCpuWriteDependency>,
 }
 
 impl ColorRepresentationRecord {
-    fn same_domain(&self, other: &Self) -> bool {
-        self.description == other.description
-            && self.swizzle == other.swizzle
-            && self.guest_format == other.guest_format
-            && self.guest_pte_kind == other.guest_pte_kind
-            && self.guest_compression_enabled == other.guest_compression_enabled
-            && self.bindings.len() == other.bindings.len()
-            && self
-                .bindings
-                .iter()
-                .zip(&other.bindings)
-                .all(|(left, right)| {
-                    left.subresources == right.subresources
-                        && left.layout == right.layout
-                        && left.segments.len() == right.segments.len()
-                        && left
-                            .segments
-                            .iter()
-                            .zip(&right.segments)
-                            .all(|(left, right)| {
-                                left.page == right.page
-                                    && left.offset == right.offset
-                                    && left.size == right.size
-                            })
-                })
+    fn same_domain_as_image(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
+        self.description == image.description()
+            && self.swizzle == image.view().swizzle()
+            && self.guest_format == image.guest_format()
+            && self.guest_pte_kind == image.guest_layout().pte_kind()
+            && self.guest_compression_enabled == image.guest_layout().requires_materialization()
+            && self.bindings.len() == image.view().bindings().len()
+            && self.bindings.iter().zip(image.view().bindings()).all(
+                |(recorded_binding, current_binding)| {
+                    recorded_binding.subresources == current_binding.subresources()
+                        && recorded_binding.layout == current_binding.layout()
+                        && same_canonical_backing(
+                            &recorded_binding.backing,
+                            current_binding.backing(),
+                        )
+                },
+            )
     }
 
     fn remains_materialized_for(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
-        let current = color_representation_record(image);
-        self.same_domain(&current)
-            && image.view().bindings().iter().zip(&self.bindings).all(
-                |(current_binding, recorded_binding)| {
-                    current_binding
-                        .backing()
-                        .range()
-                        .segments()
-                        .iter()
-                        .zip(&recorded_binding.segments)
-                        .all(|(current_segment, recorded_segment)| {
-                            current_segment.cpu_write_overlap_since(recorded_segment.generation)
-                                == Ok(CanonicalCpuWriteOverlap::No)
-                        })
-                },
-            )
+        if !self.same_domain_as_image(image) {
+            return false;
+        }
+        self.cpu_writes
+            .as_ref()
+            .is_some_and(CanonicalCpuWriteDependency::remains_current)
     }
 }
 
@@ -398,6 +488,17 @@ struct ViewRecord {
     key: ViewKey,
     dependency: ResourceDependency,
     materialization: ViewMaterialization,
+    cpu_writes: Option<CanonicalCpuWriteDependency>,
+}
+
+impl ViewRecord {
+    fn remains_current_for_image(&self, image: &super::MaxwellThreeDResolvedImage) -> bool {
+        self.key.same_domain_as_image(image)
+            && self
+                .cpu_writes
+                .as_ref()
+                .is_some_and(CanonicalCpuWriteDependency::remains_current)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,25 +570,87 @@ struct ShaderTranslationRecord {
     published: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShaderTranslationSetRecord {
+    inputs: MaxwellShaderTranslationInputs,
+    programs: Arc<[MaxwellTranslatedShaderProgram]>,
+}
+
+/// Copy-on-write storage for transactional cache collections.
+///
+/// Lowering plans retain a candidate cache until backend work succeeds. A
+/// candidate therefore shares every untouched collection with the committed
+/// cache and copies only the collections it actually changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SharedCacheVec<T>(Arc<Vec<T>>);
+
+impl<T> Default for SharedCacheVec<T> {
+    fn default() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+}
+
+impl<T> Deref for SharedCacheVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Clone> SharedCacheVec<T> {
+    fn push(&mut self, value: T) {
+        Arc::make_mut(&mut self.0).push(value);
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        Arc::make_mut(&mut self.0).clear();
+    }
+
+    fn retain(&mut self, predicate: impl FnMut(&T) -> bool) {
+        Arc::make_mut(&mut self.0).retain(predicate);
+    }
+
+    fn extend(&mut self, values: impl IntoIterator<Item = T>) {
+        Arc::make_mut(&mut self.0).extend(values);
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+        Arc::make_mut(&mut self.0).iter_mut()
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        Arc::make_mut(&mut self.0).get_mut(index)
+    }
+
+    fn take(&mut self) -> Vec<T> {
+        let retained = std::mem::take(&mut self.0);
+        Arc::try_unwrap(retained).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
 /// Frontend-owned derived identity cache. It contains no backend handles and
 /// changes only through [`MaxwellThreeDLoweringPlan::commit_cache`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDLoweringCache {
     revision: u64,
     next_identity: u64,
-    allocations: Vec<(
+    allocations: SharedCacheVec<(
         nixe_gpu::GpuAllocationId,
         nixe_gpu::GpuAllocationDescription,
     )>,
-    views: Vec<ViewRecord>,
-    color_materializations: Vec<ColorRepresentationRecord>,
-    pipelines: Vec<PipelineRecord>,
-    render_passes: Vec<RenderPassRecord>,
-    descriptors: Vec<DescriptorRecord>,
-    samplers: Vec<SamplerRecord>,
-    shader_translations: Vec<ShaderTranslationRecord>,
-    retired_shader_resources: Vec<ResourceDependency>,
-    accesses: Vec<(AccessTarget, AccessScope)>,
+    views: SharedCacheVec<ViewRecord>,
+    color_materializations: SharedCacheVec<ColorRepresentationRecord>,
+    pipelines: SharedCacheVec<PipelineRecord>,
+    render_passes: SharedCacheVec<RenderPassRecord>,
+    descriptors: SharedCacheVec<DescriptorRecord>,
+    samplers: SharedCacheVec<SamplerRecord>,
+    shader_translation_sets: SharedCacheVec<ShaderTranslationSetRecord>,
+    shader_translations: SharedCacheVec<ShaderTranslationRecord>,
+    retired_shader_resources: SharedCacheVec<ResourceDependency>,
+    accesses: SharedCacheVec<(AccessTarget, AccessScope)>,
+    retained_backings: super::MaxwellThreeDRetainedBackingCache,
 }
 
 impl Default for MaxwellThreeDLoweringCache {
@@ -495,16 +658,18 @@ impl Default for MaxwellThreeDLoweringCache {
         Self {
             revision: 0,
             next_identity: 1,
-            allocations: Vec::new(),
-            views: Vec::new(),
-            color_materializations: Vec::new(),
-            pipelines: Vec::new(),
-            render_passes: Vec::new(),
-            descriptors: Vec::new(),
-            samplers: Vec::new(),
-            shader_translations: Vec::new(),
-            retired_shader_resources: Vec::new(),
-            accesses: Vec::new(),
+            allocations: SharedCacheVec::default(),
+            views: SharedCacheVec::default(),
+            color_materializations: SharedCacheVec::default(),
+            pipelines: SharedCacheVec::default(),
+            render_passes: SharedCacheVec::default(),
+            descriptors: SharedCacheVec::default(),
+            samplers: SharedCacheVec::default(),
+            shader_translation_sets: SharedCacheVec::default(),
+            shader_translations: SharedCacheVec::default(),
+            retired_shader_resources: SharedCacheVec::default(),
+            accesses: SharedCacheVec::default(),
+            retained_backings: super::MaxwellThreeDRetainedBackingCache::default(),
         }
     }
 }
@@ -523,6 +688,12 @@ impl MaxwellThreeDLoweringCache {
         self.pipelines.len()
     }
 
+    pub(crate) fn retained_backings_mut(
+        &mut self,
+    ) -> &mut super::MaxwellThreeDRetainedBackingCache {
+        &mut self.retained_backings
+    }
+
     #[cfg(test)]
     pub(crate) fn evict_views_for_test(&mut self) {
         self.views.clear();
@@ -531,6 +702,38 @@ impl MaxwellThreeDLoweringCache {
     #[cfg(test)]
     pub(crate) fn shader_translation_count(&self) -> usize {
         self.shader_translations.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shader_translation_set_count(&self) -> usize {
+        self.shader_translation_sets.len()
+    }
+
+    /// Reuses a complete translation before rebuilding verified IR or WGSL.
+    /// The versioned input snapshot is frontend-owned and remains transactional
+    /// with the rest of the lowering cache.
+    pub(crate) fn resolve_shader_translation_inputs(
+        &mut self,
+        inputs: MaxwellShaderTranslationInputs,
+    ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
+        if let Some(record) = self
+            .shader_translation_sets
+            .iter()
+            .find(|record| record.inputs == inputs)
+        {
+            return Ok(Arc::clone(&record.programs));
+        }
+
+        let programs: Arc<[MaxwellTranslatedShaderProgram]> =
+            translate_prepared_maxwell_shader_programs(&inputs)?.into();
+        self.shader_translation_sets
+            .retain(|record| !record.inputs.same_program_bindings(&inputs));
+        self.shader_translation_sets
+            .push(ShaderTranslationSetRecord {
+                inputs,
+                programs: Arc::clone(&programs),
+            });
+        Ok(programs)
     }
 
     /// Resolves immutable T10 products to stable logical shader identities.
@@ -1491,7 +1694,7 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
     )?;
     let mut candidate = cache.clone();
     let mut creations = Vec::new();
-    let mut invalidations = std::mem::take(&mut candidate.retired_shader_resources);
+    let mut invalidations = candidate.retired_shader_resources.take();
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
@@ -2040,9 +2243,8 @@ fn validate_compressed_depth_materialization(
     if !consumes_depth && !consumes_stencil {
         return Ok(());
     }
-    let key = view_key(&resources.resources()[index]);
     if cache.views.iter().any(|record| {
-        record.key == key
+        record.remains_current_for_image(image)
             && record
                 .materialization
                 .supports_depth_stencil(consumes_depth, consumes_stencil)
@@ -2115,11 +2317,10 @@ fn record_clear_materialization(
     }
     if surface.depth() || surface.stencil() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
-        let key = view_key(&resources.resources()[index]);
         let record = cache
             .views
             .iter_mut()
-            .find(|record| record.key == key)
+            .find(|record| record.key.matches_resource(&resources.resources()[index]))
             .ok_or(MaxwellThreeDLoweringError::InvalidResolvedView {
                 role: MaxwellThreeDResourceRole::DepthStencilTarget,
             })?;
@@ -2155,11 +2356,24 @@ fn record_color_materialization(
     image: &super::MaxwellThreeDResolvedImage,
     cache: &mut MaxwellThreeDLoweringCache,
 ) {
-    let current = color_representation_record(image);
+    if let Some(position) = cache
+        .color_materializations
+        .iter()
+        .position(|previous| previous.same_domain_as_image(image))
+    {
+        if cache.color_materializations[position].remains_materialized_for(image) {
+            return;
+        }
+        *cache
+            .color_materializations
+            .get_mut(position)
+            .expect("materialization position came from the same cache") =
+            color_representation_record(image);
+        return;
+    }
     cache
         .color_materializations
-        .retain(|previous| !previous.same_domain(&current));
-    cache.color_materializations.push(current);
+        .push(color_representation_record(image));
 }
 
 fn validate_compressed_color_materialization(
@@ -2605,11 +2819,36 @@ fn prepare_resources(
             }
         }
 
-        let key = view_key(resource);
-        if let Some(record) = cache.views.iter().find(|record| record.key == key) {
+        if let Some(record) = cache
+            .views
+            .iter()
+            .find(|record| record.key.matches_resource(resource))
+        {
             result[*index] = Some(record.dependency);
             continue;
         }
+        // A compressed attachment initialized by a previous complete clear is
+        // represented by its retained backend texture, not by importable guest
+        // bytes. Preserve that texture across mapping-only identity changes;
+        // validation above has already rejected any operation requiring an
+        // unmaterialized aspect, and remains_current_for_image rejects CPU
+        // writes or a changed image domain.
+        if let MaxwellThreeDResolvedResource::Image(image) = resource
+            && image.guest_layout().requires_materialization()
+            && let Some(position) = cache
+                .views
+                .iter()
+                .position(|record| record.remains_current_for_image(image))
+        {
+            let record = cache
+                .views
+                .get_mut(position)
+                .expect("materialized view position came from the same cache");
+            record.key = view_key(resource);
+            result[*index] = Some(record.dependency);
+            continue;
+        }
+        let key = view_key(resource);
         let invalidated = cache
             .views
             .iter()
@@ -2690,6 +2929,10 @@ fn prepare_resources(
             }
             MaxwellThreeDResolvedResource::Image(_) => ViewMaterialization::CompressedColor,
         };
+        let cpu_writes = match resource {
+            MaxwellThreeDResolvedResource::Buffer(_) => None,
+            MaxwellThreeDResolvedResource::Image(value) => value.cpu_write_dependency().cloned(),
+        };
         let dependency = match resource {
             MaxwellThreeDResolvedResource::Buffer(value) => {
                 let id = BufferId::new(take_identity(cache)?);
@@ -2743,6 +2986,7 @@ fn prepare_resources(
             key,
             dependency,
             materialization,
+            cpu_writes,
         });
         result[*index] = Some(dependency);
     }
@@ -3127,11 +3371,12 @@ fn lower_draw(
     }
     validate_shader_stages(state, shaders)?;
     for translated in &shaders.shaders {
-        let record = cache
+        let record_index = cache
             .shader_translations
-            .iter_mut()
-            .find(|record| record.id == translated.shader)
+            .iter()
+            .position(|record| record.id == translated.shader)
             .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
+        let record = &cache.shader_translations[record_index];
         if record.module.stage() != translated.stage {
             return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders);
         }
@@ -3143,7 +3388,11 @@ fn lower_draw(
                 },
                 module: record.module.clone(),
             });
-            record.published = true;
+            cache
+                .shader_translations
+                .get_mut(record_index)
+                .expect("validated shader translation index exists")
+                .published = true;
         }
     }
     let topology = primitive_topology(
@@ -3810,7 +4059,7 @@ fn view_key(resource: &MaxwellThreeDResolvedResource) -> ViewKey {
             description: value.description(),
             buffer_offset: value.view().buffer_offset(),
             backing: value.view().backing().clone(),
-            mappings: value.mappings().to_vec().into_boxed_slice(),
+            mappings: value.shared_mappings(),
         },
         MaxwellThreeDResolvedResource::Image(value) => ViewKey::Image {
             description: value.description(),
@@ -3831,7 +4080,7 @@ fn view_key(resource: &MaxwellThreeDResolvedResource) -> ViewKey {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            mappings: value.mappings().to_vec().into_boxed_slice(),
+            mappings: value.shared_mappings(),
         },
     }
 }
@@ -3852,36 +4101,12 @@ fn color_representation_record(
             .map(|binding| ColorRepresentationBinding {
                 subresources: binding.subresources(),
                 layout: binding.layout(),
-                segments: binding
-                    .backing()
-                    .range()
-                    .segments()
-                    .iter()
-                    .map(|segment| ColorRepresentationSegment {
-                        page: segment.page(),
-                        offset: segment.offset(),
-                        size: segment.size(),
-                        generation: segment.content_generation(),
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+                backing: binding.backing().clone(),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice(),
+        cpu_writes: image.cpu_write_dependency().cloned(),
     }
-}
-
-fn canonical_backings_overlap(left: &nixe_gpu::BackingView, right: &nixe_gpu::BackingView) -> bool {
-    left.range().segments().iter().any(|left| {
-        right.range().segments().iter().any(|right| {
-            if left.page() != right.page() {
-                return false;
-            }
-            let left_end = left.offset() + left.size();
-            let right_end = right.offset() + right.size();
-            left.offset() < right_end && right.offset() < left_end
-        })
-    })
 }
 
 fn resource_index(
@@ -4538,17 +4763,45 @@ impl std::error::Error for MaxwellThreeDLoweringError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use nixe_gpu::{
-        DepthCompareOperation, PrimitiveTopology, VertexComponentCount, VertexComponentWidth,
-        VertexFormat,
+        BufferId, DepthCompareOperation, PrimitiveTopology, ResourceDependency,
+        VertexComponentCount, VertexComponentWidth, VertexFormat,
     };
 
     use crate::{MaxwellThreeDBegin, MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
     use super::{
-        MaxwellThreeDLoweringError, depth_stencil_attachment_required, neutral_depth_compare,
-        neutral_first_instance, neutral_vertex_format, primitive_topology,
+        MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, depth_stencil_attachment_required,
+        neutral_depth_compare, neutral_first_instance, neutral_vertex_format, primitive_topology,
     };
+
+    #[test]
+    fn lowering_cache_candidates_copy_only_modified_collections() {
+        let cache = MaxwellThreeDLoweringCache::default();
+        let mut candidate = cache.clone();
+
+        assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
+        assert!(Arc::ptr_eq(
+            &cache.shader_translations.0,
+            &candidate.shader_translations.0
+        ));
+        candidate
+            .retired_shader_resources
+            .push(ResourceDependency::Buffer(BufferId::new(7)));
+
+        assert!(cache.retired_shader_resources.is_empty());
+        assert!(!Arc::ptr_eq(
+            &cache.retired_shader_resources.0,
+            &candidate.retired_shader_resources.0
+        ));
+        assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
+        assert!(Arc::ptr_eq(
+            &cache.shader_translations.0,
+            &candidate.shader_translations.0
+        ));
+    }
 
     #[test]
     fn every_maxwell_depth_comparison_has_an_exact_neutral_mapping() {

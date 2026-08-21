@@ -122,6 +122,43 @@ pub(crate) struct MaxwellShaderBinary {
     staged_overlay: Box<[MaxwellStagedShaderWrite]>,
 }
 
+/// Immutable inputs captured before semantic translation and backend lowering.
+///
+/// Reading guest code is deliberately separate from translating it: callers
+/// can compare this exact, versioned snapshot with a retained cache entry
+/// before rebuilding IR or WGSL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MaxwellShaderTranslationInputs {
+    options: MaxwellShaderTranslationOptions,
+    programs: Box<[MaxwellShaderProgramTranslationInput]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MaxwellShaderProgramTranslationInput {
+    pipeline: u8,
+    stage: MaxwellThreeDShaderStage,
+    register_count: u8,
+    effective_group: Option<u8>,
+    texture_constant_buffer_slot: Option<u8>,
+    vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
+    binary: MaxwellShaderBinary,
+}
+
+impl MaxwellShaderTranslationInputs {
+    pub(crate) fn same_program_bindings(&self, other: &Self) -> bool {
+        self.programs.len() == other.programs.len()
+            && self
+                .programs
+                .iter()
+                .zip(other.programs.iter())
+                .all(|(left, right)| {
+                    left.pipeline == right.pipeline
+                        && left.stage == right.stage
+                        && left.binary.address == right.binary.address
+                })
+    }
+}
+
 const MAXWELL_SHADER_TRANSLATOR_REVISION: u32 = 2;
 
 /// Semantics-affecting translation choices included in cache identity.
@@ -146,6 +183,7 @@ const MAXWELL_SHADER_TRANSLATION_OPTIONS: MaxwellShaderTranslationOptions =
 pub(crate) struct MaxwellShaderTranslationKey {
     stage: MaxwellThreeDShaderStage,
     entry_point: u64,
+    register_count: u8,
     options: MaxwellShaderTranslationOptions,
     source_segments: Box<[MaxwellShaderSourceSegment]>,
     staged_overlay: Box<[MaxwellStagedShaderWrite]>,
@@ -3828,11 +3866,21 @@ pub(crate) fn preflight_maxwell_shader_translation(
     translate_maxwell_shader_programs(state, address_space, staged_writes).map(|_| ())
 }
 
+#[cfg(test)]
 pub(crate) fn translate_maxwell_shader_programs(
     state: &MaxwellThreeDState,
     address_space: &MaxwellGpuAddressSpace,
     staged_writes: &[MaxwellStagedShaderWrite],
 ) -> Result<Vec<MaxwellTranslatedShaderProgram>, MaxwellShaderTranslationError> {
+    let inputs = prepare_maxwell_shader_translation_inputs(state, address_space, staged_writes)?;
+    translate_prepared_maxwell_shader_programs(&inputs)
+}
+
+pub(crate) fn prepare_maxwell_shader_translation_inputs(
+    state: &MaxwellThreeDState,
+    address_space: &MaxwellGpuAddressSpace,
+    staged_writes: &[MaxwellStagedShaderWrite],
+) -> Result<MaxwellShaderTranslationInputs, MaxwellShaderTranslationError> {
     let bindings = state.shader_bindings();
     if !bindings
         .pipeline()
@@ -3887,32 +3935,54 @@ pub(crate) fn translate_maxwell_shader_programs(
         } else {
             &no_vertex_input_types
         };
-        let translated =
-            translate_shader_binary(&binary, register_count, program_vertex_input_types)?;
-        let texture_constant_buffer_slot = if translated.texture_bindings.is_empty() {
-            bindings
+        programs.push(MaxwellShaderProgramTranslationInput {
+            pipeline: pipeline_index,
+            stage,
+            register_count,
+            effective_group: pipeline.effective_group(),
+            texture_constant_buffer_slot: bindings
                 .bindless_texture_constant_buffer_slot()
                 .value()
-                .copied()
+                .copied(),
+            vertex_input_types: program_vertex_input_types
+                .iter()
+                .map(|(location, scalar_type)| (*location, *scalar_type))
+                .collect(),
+            binary,
+        });
+    }
+
+    Ok(MaxwellShaderTranslationInputs {
+        options: MAXWELL_SHADER_TRANSLATION_OPTIONS,
+        programs: programs.into_boxed_slice(),
+    })
+}
+
+pub(crate) fn translate_prepared_maxwell_shader_programs(
+    inputs: &MaxwellShaderTranslationInputs,
+) -> Result<Vec<MaxwellTranslatedShaderProgram>, MaxwellShaderTranslationError> {
+    let mut programs = Vec::with_capacity(inputs.programs.len());
+    for input in &inputs.programs {
+        let vertex_input_types = input.vertex_input_types.iter().copied().collect();
+        let translated =
+            translate_shader_binary(&input.binary, input.register_count, &vertex_input_types)?;
+        let texture_constant_buffer_slot = if translated.texture_bindings.is_empty() {
+            input.texture_constant_buffer_slot
         } else {
-            Some(
-                bindings
-                    .bindless_texture_constant_buffer_slot()
-                    .value()
-                    .copied()
-                    .ok_or(MaxwellShaderTranslationError::IncompletePipelineBinding {
-                        pipeline: pipeline_index,
-                        field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
-                    })?,
-            )
+            Some(input.texture_constant_buffer_slot.ok_or(
+                MaxwellShaderTranslationError::IncompletePipelineBinding {
+                    pipeline: input.pipeline,
+                    field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
+                },
+            )?)
         };
         let ir = translated.ir;
         let bind_group = if ir.ir().resources().is_empty() {
-            pipeline.effective_group()
+            input.effective_group
         } else {
-            Some(pipeline.effective_group().ok_or(
+            Some(input.effective_group.ok_or(
                 MaxwellShaderTranslationError::IncompletePipelineBinding {
-                    pipeline: pipeline_index,
+                    pipeline: input.pipeline,
                     field: "SET_PIPELINE_BINDING group",
                 },
             )?)
@@ -3920,19 +3990,17 @@ pub(crate) fn translate_maxwell_shader_programs(
         let module = lower_shader_ir_to_wgsl(&ir)?;
         programs.push(MaxwellTranslatedShaderProgram {
             key: MaxwellShaderTranslationKey {
-                stage,
-                entry_point: address,
-                options: MAXWELL_SHADER_TRANSLATION_OPTIONS,
-                source_segments: binary.source_segments.clone(),
-                staged_overlay: binary.staged_overlay.clone(),
+                stage: input.stage,
+                entry_point: input.binary.address,
+                register_count: input.register_count,
+                options: inputs.options,
+                source_segments: input.binary.source_segments.clone(),
+                staged_overlay: input.binary.staged_overlay.clone(),
                 resource_binding_remap: Box::new([]),
                 linked_output_interpolation: Box::new([]),
-                vertex_input_types: program_vertex_input_types
-                    .iter()
-                    .map(|(location, scalar_type)| (*location, *scalar_type))
-                    .collect(),
+                vertex_input_types: input.vertex_input_types.clone(),
             },
-            stage: neutral_stage(stage),
+            stage: neutral_stage(input.stage),
             bind_group,
             ir,
             module,
@@ -6759,16 +6827,53 @@ mod tests {
         program_three_d(&mut channel, 0x200c, 4);
 
         let mut cache = MaxwellThreeDLoweringCache::default();
-        let first =
-            translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+        let first_inputs =
+            prepare_maxwell_shader_translation_inputs(channel.three_d(), &address_space, &[])
+                .unwrap();
+        let first = cache
+            .resolve_shader_translation_inputs(first_inputs.clone())
+            .unwrap();
+        let repeated = cache
+            .resolve_shader_translation_inputs(first_inputs)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&repeated, &first));
+        assert_eq!(cache.shader_translation_set_count(), 1);
         let first_id = cache.stage_shader_translations(&first).unwrap().shaders()[0].shader();
-        let repeated_id = cache.stage_shader_translations(&first).unwrap().shaders()[0].shader();
+        let repeated_id = cache
+            .stage_shader_translations(&repeated)
+            .unwrap()
+            .shaders()[0]
+            .shader();
         assert_eq!(repeated_id, first_id);
         assert_eq!(cache.shader_translation_count(), 1);
 
+        program_three_d(&mut channel, 0x200c, 5);
+        let changed_register_inputs =
+            prepare_maxwell_shader_translation_inputs(channel.three_d(), &address_space, &[])
+                .unwrap();
+        let changed_registers = cache
+            .resolve_shader_translation_inputs(changed_register_inputs)
+            .unwrap();
+        let changed_register_id = cache
+            .stage_shader_translations(&changed_registers)
+            .unwrap()
+            .shaders()[0]
+            .shader();
+        assert!(!std::sync::Arc::ptr_eq(&changed_registers, &first));
+        assert_ne!(changed_register_id, first_id);
+        assert_eq!(cache.shader_translation_set_count(), 1);
+        assert_eq!(cache.shader_translation_count(), 1);
+        program_three_d(&mut channel, 0x200c, 4);
+
         allocation.write(0, &bytes[..4]).unwrap();
-        let after_cpu_write =
-            translate_maxwell_shader_programs(channel.three_d(), &address_space, &[]).unwrap();
+        let after_cpu_write_inputs =
+            prepare_maxwell_shader_translation_inputs(channel.three_d(), &address_space, &[])
+                .unwrap();
+        let after_cpu_write = cache
+            .resolve_shader_translation_inputs(after_cpu_write_inputs)
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&after_cpu_write, &first));
+        assert_eq!(cache.shader_translation_set_count(), 1);
         let after_cpu_write_id = cache
             .stage_shader_translations(&after_cpu_write)
             .unwrap()
@@ -6778,8 +6883,12 @@ mod tests {
         assert_eq!(cache.shader_translation_count(), 1);
 
         let staged = [MaxwellStagedShaderWrite::new(address, header[0])];
-        let after_staged_write =
-            translate_maxwell_shader_programs(channel.three_d(), &address_space, &staged).unwrap();
+        let after_staged_write_inputs =
+            prepare_maxwell_shader_translation_inputs(channel.three_d(), &address_space, &staged)
+                .unwrap();
+        let after_staged_write = cache
+            .resolve_shader_translation_inputs(after_staged_write_inputs)
+            .unwrap();
         let after_staged_write_id = cache
             .stage_shader_translations(&after_staged_write)
             .unwrap()
@@ -6796,12 +6905,24 @@ mod tests {
             MaxwellStagedShaderWrite::new(address + 4, 2),
             MaxwellStagedShaderWrite::new(address + 4, 1),
         ];
-        let forward =
-            translate_maxwell_shader_programs(channel.three_d(), &address_space, &ordered_forward)
-                .unwrap();
-        let reverse =
-            translate_maxwell_shader_programs(channel.three_d(), &address_space, &ordered_reverse)
-                .unwrap();
+        let forward_inputs = prepare_maxwell_shader_translation_inputs(
+            channel.three_d(),
+            &address_space,
+            &ordered_forward,
+        )
+        .unwrap();
+        let forward = cache
+            .resolve_shader_translation_inputs(forward_inputs)
+            .unwrap();
+        let reverse_inputs = prepare_maxwell_shader_translation_inputs(
+            channel.three_d(),
+            &address_space,
+            &ordered_reverse,
+        )
+        .unwrap();
+        let reverse = cache
+            .resolve_shader_translation_inputs(reverse_inputs)
+            .unwrap();
         let forward_id = cache.stage_shader_translations(&forward).unwrap().shaders()[0].shader();
         let reverse_id = cache.stage_shader_translations(&reverse).unwrap().shaders()[0].shader();
         assert_ne!(forward_id, reverse_id);

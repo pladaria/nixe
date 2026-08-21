@@ -787,6 +787,86 @@ fn three_d_s8z24_2cz_full_clear_materializes_without_importing_compressed_bytes(
             .resource_creations()
             .is_empty()
     );
+
+    // Rebinding the same canonical depth pages through another GPU virtual
+    // mapping must retain the materialized backend texture. PTE kind 0x17 has
+    // no directly importable canonical representation, so recreating the
+    // texture here would lose its depth contents.
+    let remapping = map_resource(
+        &mut address_space,
+        allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+        17,
+        0x17,
+    );
+    let remapped_address = remapping.offset().get();
+    program_three_d(&mut channel, 0x0fe0, (remapped_address >> 32) as u32);
+    program_three_d(&mut channel, 0x0fe4, remapped_address as u32);
+    program_three_d(&mut channel, 0x10f8, 0x10);
+    let remapped_partial = packet(0x19d0 / 4, 3);
+    let remapped_dispatch = dispatch_maxwell_engine_packet(
+        &mut channel,
+        FrontendSubmissionId::new(3),
+        &remapped_partial.packets()[0],
+    )
+    .unwrap();
+    let remapped = &remapped_dispatch.operations()[0];
+    let remapped_resources =
+        resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
+    let remapped_plan = preflight_maxwell_three_d_operation(
+        remapped.state(),
+        &remapped_resources,
+        remapped.trigger(),
+        None,
+        FrontendSubmissionId::new(13),
+        Vec::new(),
+        &capabilities,
+        &cache,
+    )
+    .unwrap();
+    assert!(
+        !remapped_plan.resource_creations().iter().any(|creation| {
+            matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. })
+        })
+    );
+    assert!(remapped_plan.resource_invalidations().is_empty());
+
+    // A large submission may overflow the store-wide CPU-write journal with
+    // command-buffer or semaphore writes on unrelated canonical pages. The
+    // unchanged depth pages remain authoritative evidence that the retained
+    // 2CZ representation is current.
+    for value in 0..=256_u16 {
+        allocation.write(0xf000, &[value as u8]).unwrap();
+    }
+    preflight_maxwell_three_d_operation(
+        remapped.state(),
+        &resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap(),
+        remapped.trigger(),
+        None,
+        FrontendSubmissionId::new(14),
+        Vec::new(),
+        &capabilities,
+        &cache,
+    )
+    .unwrap();
+
+    allocation.write(0, &[1]).unwrap();
+    let cpu_modified_resources =
+        resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
+    assert!(matches!(
+        preflight_maxwell_three_d_operation(
+            remapped.state(),
+            &cpu_modified_resources,
+            remapped.trigger(),
+            None,
+            FrontendSubmissionId::new(15),
+            Vec::new(),
+            &capabilities,
+            &cache,
+        ),
+        Err(MaxwellThreeDLoweringError::CompressedDepthImportRequired { kind: 0x17 })
+    ));
 }
 
 #[test]

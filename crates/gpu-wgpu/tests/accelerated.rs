@@ -17,18 +17,16 @@ use nixe_gpu::{
 };
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, WgpuVisibilityCoordinator, initialize_backend};
 use nixe_memory::{
-    BackingStoreId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageId, ContentGeneration, DeviceAccessDeclaration, DeviceVisibilityPoint,
-    GuestPhysicalPageId, MappingGeneration, MemoryPermissions, NonCpuDeviceId,
-    VisibilityCoordinator,
+    CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
+    ContentGeneration, DeviceAccessDeclaration, DeviceVisibilityPoint, GuestPhysicalPageId,
+    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator,
 };
 
 fn initialized_page(bytes: &[u8]) -> CanonicalBackingPage {
+    let store = CanonicalBackingStore::allocate().unwrap();
     CanonicalBackingPage::initialized(
-        CanonicalPageId::new(
-            BackingStoreId::allocate().unwrap(),
-            GuestPhysicalPageId::new(1),
-        ),
+        &store,
+        GuestPhysicalPageId::new(1),
         bytes,
         ContentGeneration::INITIAL,
     )

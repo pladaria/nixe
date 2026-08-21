@@ -10,7 +10,7 @@ use nixe_gpu::{
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
-use crate::engines::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
+use crate::engines::resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache;
 use crate::{
     MaxwellComputeInlineToMemoryUpload, MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError,
     MaxwellDmaCopyOperation, MaxwellEngineOperation, MaxwellEnginePacketDispatch,
@@ -21,7 +21,7 @@ use crate::{
     MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization, preflight_maxwell_three_d_operation_unnegotiated,
-    shader::{MaxwellStagedShaderWrite, translate_maxwell_shader_programs},
+    shader::{MaxwellStagedShaderWrite, prepare_maxwell_shader_translation_inputs},
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
@@ -489,12 +489,15 @@ pub fn preflight_maxwell_submission_execution(
                     operation.trigger(),
                     crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
                 ) {
-                    let programs = translate_maxwell_shader_programs(
+                    let inputs = prepare_maxwell_shader_translation_inputs(
                         operation.state(),
                         address_space,
                         &staged_shader_writes,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
+                    let programs = staged_cache
+                        .resolve_shader_translation_inputs(inputs)
+                        .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
                     let translated = staged_cache
                         .stage_shader_translations(&programs)
                         .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
@@ -506,14 +509,16 @@ pub fn preflight_maxwell_submission_execution(
                     operation
                         .trigger()
                         .append_resource_roles(operation.state(), &mut required_roles);
-                    let resources = resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
-                        operation.state(),
-                        address_space,
-                        &required_roles,
-                        Some(&staged_memory_writes),
-                        false,
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                    let resources =
+                        resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+                            operation.state(),
+                            address_space,
+                            &required_roles,
+                            Some(&staged_memory_writes),
+                            false,
+                            Some(staged_cache.retained_backings_mut()),
+                        )
+                        .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                     let plan = preflight_maxwell_three_d_operation_unnegotiated(
                         operation.state(),
                         &resources,
@@ -535,14 +540,16 @@ pub fn preflight_maxwell_submission_execution(
                 operation
                     .trigger()
                     .append_resource_roles(operation.state(), &mut required_roles);
-                let resources = resolve_maxwell_three_d_resources_for_roles_with_staged_writes(
-                    operation.state(),
-                    address_space,
-                    &required_roles,
-                    Some(&staged_memory_writes),
-                    false,
-                )
-                .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                let resources =
+                    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+                        operation.state(),
+                        address_space,
+                        &required_roles,
+                        Some(&staged_memory_writes),
+                        false,
+                        Some(staged_cache.retained_backings_mut()),
+                    )
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
                 let plan = preflight_maxwell_three_d_operation_unnegotiated(
                     operation.state(),
                     &resources,
@@ -842,7 +849,6 @@ pub fn execute_maxwell_backend_submission(
     .ok_or(MaxwellBackendExecutionError::InvalidSubmission(
         CommandDescriptionError::EmptySubmission,
     ))?;
-
     Ok(MaxwellBackendExecutionCompletion {
         staged_cache: plan.staged_cache,
         completion: plan.completion,
