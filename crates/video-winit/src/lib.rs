@@ -172,7 +172,14 @@ impl Presenter {
 
     async fn new_async(window: Arc<Window>) -> Result<Self, WindowError> {
         let mut instance_descriptor = InstanceDescriptor::new_without_display_handle();
-        instance_descriptor.backends = Backends::VULKAN;
+        #[cfg(target_os = "macos")]
+        {
+            instance_descriptor.backends = Backends::METAL;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            instance_descriptor.backends = Backends::VULKAN;
+        }
         let instance = Instance::new(instance_descriptor);
         let surface = instance
             .create_surface(Arc::clone(&window))

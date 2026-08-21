@@ -56,10 +56,21 @@ pub struct WgpuBackendConfiguration {
 impl Default for WgpuBackendConfiguration {
     fn default() -> Self {
         Self {
-            host_backend: HostBackend::Vulkan,
+            host_backend: default_host_backend(),
             power_preference: WgpuPowerPreference::HighPerformance,
             force_fallback_adapter: false,
         }
+    }
+}
+
+const fn default_host_backend() -> HostBackend {
+    #[cfg(target_os = "macos")]
+    {
+        HostBackend::Metal
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        HostBackend::Vulkan
     }
 }
 
@@ -130,7 +141,10 @@ async fn initialize_backend_async(
     device_id: NonCpuDeviceId,
     configuration: WgpuBackendConfiguration,
 ) -> Result<InitializedWgpuBackend, WgpuBackendInitializationError> {
-    if configuration.host_backend != HostBackend::Vulkan {
+    if !matches!(
+        configuration.host_backend,
+        HostBackend::Vulkan | HostBackend::Metal
+    ) {
         return Err(WgpuBackendInitializationError::BackendNotCompiled(
             configuration.host_backend,
         ));
@@ -298,20 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn non_vulkan_selection_is_explicitly_rejected_in_this_build() {
+    fn unsupported_backend_selection_is_explicitly_rejected_in_this_build() {
         let error = initialize_backend(
             BackendInstanceId::new(1),
             NonCpuDeviceId::new(1),
             WgpuBackendConfiguration {
-                host_backend: HostBackend::Metal,
+                host_backend: HostBackend::Direct3D12,
                 ..WgpuBackendConfiguration::default()
             },
         )
         .err()
-        .expect("Metal is intentionally not compiled");
+        .expect("Direct3D 12 is intentionally not compiled");
         assert_eq!(
             error,
-            WgpuBackendInitializationError::BackendNotCompiled(HostBackend::Metal)
+            WgpuBackendInitializationError::BackendNotCompiled(HostBackend::Direct3D12)
         );
     }
 }
