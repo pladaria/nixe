@@ -80,3 +80,9 @@ wgpu = { version = "30", default-features = false, features = [
 winit = "0.30"
 toml = "0.8"
 zstd = { version = "0.13", default-features = false }
+
+[profile.profiling]
+inherits = "release"
+# Line tables retain source attribution for profilers without embedding the
+# much larger full DWARF type and variable information used by debuggers.
+debug = 1

@@ -38,7 +38,7 @@ fn fake_nce_uses_the_generic_memory_and_lifecycle_contract() {
         end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
         memory: &memory,
         invalidation_generation: memory.mapping_epoch().get(),
-        dirty_generation: memory.content_generation_watermark(),
+        dirty_generation: memory.content_mutation_epoch().get(),
     };
     let mut domain = provider.create_nce_domain(DomainRequest {
         domain: EngineDomainId::new(7),

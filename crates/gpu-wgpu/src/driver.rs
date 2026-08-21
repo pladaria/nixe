@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use nixe_gpu::{
     AcceptedBackendSubmission, AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore,
     BackendDriver, BackendDriverError, BackendResourceCreateInfo, BackendResourceHandle,
-    BackendSubmissionToken, BackingView, ClearOperation, ClearValue, CopyOperation,
-    DepthCompareOperation, DepthState, DrawArguments, DrawOperation, GpuCommand, ImageDescription,
-    ImageDimension, ImageFormat, ImageMemoryLayout, ImageOrigin, ImageRegion,
+    BackendSubmissionToken, BackingView, BlockLinearLayout, ClearOperation, ClearValue,
+    CopyOperation, DepthCompareOperation, DepthState, DrawArguments, DrawOperation, GpuCommand,
+    ImageDescription, ImageDimension, ImageFormat, ImageMemoryLayout, ImageOrigin, ImageRegion,
     ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind, PrimitiveTopology,
     RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage, TriangleRasterization,
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
@@ -1864,94 +1864,177 @@ fn copy_image_layout(
     shape: ImageCopyShape,
     to_canonical: bool,
 ) -> Result<(), BackendDriverError> {
-    for layer in 0..shape.layers {
-        for y in 0..shape.height {
-            for x in 0..shape.width {
-                let linear = usize::try_from(
-                    u64::from(layer * shape.height + y) * u64::from(shape.host_row_pitch)
-                        + u64::from(x)
-                            * u64::try_from(shape.bytes_per_texel)
-                                .map_err(|_| unsupported("image texel size"))?,
-                )
-                .map_err(|_| unsupported("linear image offset"))?;
-                let canonical = canonical_texel_offset(
-                    layout,
-                    shape.width,
-                    layer,
-                    x,
-                    y,
-                    shape.bytes_per_texel,
-                )?;
-                let (from, to) = if to_canonical {
-                    (
-                        source
-                            .get(linear..linear + shape.bytes_per_texel)
-                            .ok_or_else(|| unsupported("linear image source exceeds backing"))?,
-                        canonical,
-                    )
-                } else {
-                    (
-                        source
-                            .get(canonical..canonical + shape.bytes_per_texel)
-                            .ok_or_else(|| unsupported("canonical image source exceeds backing"))?,
+    let row_bytes = u64::from(shape.width)
+        .checked_mul(
+            u64::try_from(shape.bytes_per_texel).map_err(|_| unsupported("image texel size"))?,
+        )
+        .ok_or_else(|| unsupported("image row size overflow"))?;
+    match layout {
+        ImageMemoryLayout::PitchLinear {
+            row_pitch,
+            layer_stride,
+        } => {
+            for layer in 0..shape.layers {
+                for y in 0..shape.height {
+                    let linear = image_copy_row_offset(
+                        layer,
+                        y,
+                        u64::from(shape.host_row_pitch),
+                        u64::from(shape.host_row_pitch) * u64::from(shape.height),
+                    )?;
+                    let canonical = image_copy_row_offset(layer, y, row_pitch, layer_stride)?;
+                    copy_image_bytes(
+                        source,
+                        destination,
                         linear,
-                    )
-                };
-                destination
-                    .get_mut(to..to + shape.bytes_per_texel)
-                    .ok_or_else(|| unsupported("image destination exceeds backing"))?
-                    .copy_from_slice(from);
+                        canonical,
+                        usize_from_u64(row_bytes, "image row size")?,
+                        to_canonical,
+                    )?;
+                }
+            }
+        }
+        ImageMemoryLayout::BlockLinear(blocks) => {
+            if blocks.block_width_log2 != 0 || blocks.block_depth_log2 != 0 {
+                return Err(unsupported("wide or deep block-linear image layout"));
+            }
+            let width_in_gobs = align_u64(row_bytes, 64)? / 64;
+            let block_height_gobs = 1_u64 << blocks.block_height_log2;
+            for layer in 0..shape.layers {
+                for y in 0..shape.height {
+                    let linear = image_copy_row_offset(
+                        layer,
+                        y,
+                        u64::from(shape.host_row_pitch),
+                        u64::from(shape.host_row_pitch) * u64::from(shape.height),
+                    )?;
+                    let mut byte_x = 0_u64;
+                    while byte_x < row_bytes {
+                        let chunk = (16 - byte_x % 16).min(row_bytes - byte_x);
+                        let canonical = block_linear_byte_offset(
+                            blocks,
+                            width_in_gobs,
+                            block_height_gobs,
+                            layer,
+                            y,
+                            byte_x,
+                        )?;
+                        copy_image_bytes(
+                            source,
+                            destination,
+                            linear
+                                .checked_add(usize_from_u64(byte_x, "linear image offset")?)
+                                .ok_or_else(|| unsupported("linear image offset"))?,
+                            canonical,
+                            usize_from_u64(chunk, "image copy size")?,
+                            to_canonical,
+                        )?;
+                        byte_x += chunk;
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
-fn canonical_texel_offset(
-    layout: ImageMemoryLayout,
-    width: u32,
+fn image_copy_row_offset(
     layer: u32,
-    x: u32,
     y: u32,
-    bytes_per_texel: usize,
+    row_pitch: u64,
+    layer_stride: u64,
 ) -> Result<usize, BackendDriverError> {
-    let bytes_per_texel =
-        u64::try_from(bytes_per_texel).map_err(|_| unsupported("image texel size"))?;
-    let byte_x = u64::from(x)
-        .checked_mul(bytes_per_texel)
-        .ok_or_else(|| unsupported("image X offset"))?;
-    let offset = match layout {
-        ImageMemoryLayout::PitchLinear {
-            row_pitch,
-            layer_stride,
-        } => u64::from(layer) * layer_stride + u64::from(y) * row_pitch + byte_x,
-        ImageMemoryLayout::BlockLinear(blocks) => {
-            if blocks.block_width_log2 != 0 || blocks.block_depth_log2 != 0 {
-                return Err(unsupported("wide or deep block-linear image layout"));
-            }
-            // Tegra's generic 16Bx2 GOB addressing, also used by pinned libnx
-            // framebuffer conversion:
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/framebuffer.c
-            let row_pitch = align_u64(
-                u64::from(width)
-                    .checked_mul(bytes_per_texel)
-                    .ok_or_else(|| unsupported("block-linear row size"))?,
-                64,
-            )?;
-            let width_in_gobs = row_pitch / 64;
-            let block_height_gobs = 1_u64 << blocks.block_height_log2;
-            u64::from(layer) * blocks.layer_stride
-                + (u64::from(y) / (8 * block_height_gobs)) * 512 * block_height_gobs * width_in_gobs
-                + (byte_x / 64) * 512 * block_height_gobs
-                + ((u64::from(y) % (8 * block_height_gobs)) / 8) * 512
-                + ((byte_x % 64) / 32) * 256
-                + ((u64::from(y) % 8) / 2) * 64
-                + ((byte_x % 32) / 16) * 32
-                + (u64::from(y) % 2) * 16
-                + byte_x % 16
-        }
-    };
+    let offset = u64::from(layer)
+        .checked_mul(layer_stride)
+        .and_then(|offset| {
+            u64::from(y)
+                .checked_mul(row_pitch)
+                .and_then(|row| offset.checked_add(row))
+        })
+        .ok_or_else(|| unsupported("image row offset"))?;
     usize_from_u64(offset, "canonical image offset")
+}
+
+fn block_linear_byte_offset(
+    blocks: BlockLinearLayout,
+    width_in_gobs: u64,
+    block_height_gobs: u64,
+    layer: u32,
+    y: u32,
+    byte_x: u64,
+) -> Result<usize, BackendDriverError> {
+    // Tegra's generic 16Bx2 GOB addressing, also used by pinned libnx
+    // framebuffer conversion:
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/display/framebuffer.c
+    let y = u64::from(y);
+    let block_rows = 8_u64
+        .checked_mul(block_height_gobs)
+        .ok_or_else(|| unsupported("block-linear block height"))?;
+    let terms = [
+        u64::from(layer)
+            .checked_mul(blocks.layer_stride)
+            .ok_or_else(|| unsupported("block-linear layer offset"))?,
+        (y / block_rows)
+            .checked_mul(512)
+            .and_then(|value| value.checked_mul(block_height_gobs))
+            .and_then(|value| value.checked_mul(width_in_gobs))
+            .ok_or_else(|| unsupported("block-linear Y offset"))?,
+        (byte_x / 64)
+            .checked_mul(512)
+            .and_then(|value| value.checked_mul(block_height_gobs))
+            .ok_or_else(|| unsupported("block-linear X offset"))?,
+        ((y % block_rows) / 8) * 512,
+        ((byte_x % 64) / 32) * 256,
+        ((y % 8) / 2) * 64,
+        ((byte_x % 32) / 16) * 32,
+        (y % 2) * 16,
+        byte_x % 16,
+    ];
+    let offset = terms.into_iter().try_fold(0_u64, |offset, term| {
+        offset
+            .checked_add(term)
+            .ok_or_else(|| unsupported("block-linear image offset"))
+    })?;
+    usize_from_u64(offset, "canonical image offset")
+}
+
+fn copy_image_bytes(
+    source: &[u8],
+    destination: &mut [u8],
+    linear: usize,
+    canonical: usize,
+    size: usize,
+    to_canonical: bool,
+) -> Result<(), BackendDriverError> {
+    let linear_end = linear
+        .checked_add(size)
+        .ok_or_else(|| unsupported("linear image range"))?;
+    let canonical_end = canonical
+        .checked_add(size)
+        .ok_or_else(|| unsupported("canonical image range"))?;
+    let (from, to) = if to_canonical {
+        (
+            source
+                .get(linear..linear_end)
+                .ok_or_else(|| unsupported("linear image source exceeds backing"))?,
+            canonical,
+        )
+    } else {
+        (
+            source
+                .get(canonical..canonical_end)
+                .ok_or_else(|| unsupported("canonical image source exceeds backing"))?,
+            linear,
+        )
+    };
+    let to_end = to
+        .checked_add(size)
+        .ok_or_else(|| unsupported("image destination range"))?;
+    destination
+        .get_mut(to..to_end)
+        .ok_or_else(|| unsupported("image destination exceeds backing"))?
+        .copy_from_slice(from);
+    Ok(())
 }
 
 fn align_u64(value: u64, alignment: u64) -> Result<u64, BackendDriverError> {
@@ -2189,6 +2272,78 @@ mod tests {
             linearize_canonical_image(&canonical, layout, shape).unwrap(),
             host
         );
+    }
+
+    #[test]
+    fn block_linear_bulk_copy_matches_independent_texel_addressing() {
+        let blocks = BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: 2,
+            block_depth_log2: 0,
+            layer_stride: 0x1000,
+        };
+        let layout = ImageMemoryLayout::BlockLinear(blocks);
+        let shape = ImageCopyShape {
+            width: 19,
+            height: 17,
+            layers: 2,
+            bytes_per_texel: 4,
+            host_row_pitch: 256,
+        };
+        let reference_offset = |layer: u32, x: u32, y: u32| {
+            let byte_x = u64::from(x) * 4;
+            let block_height_gobs = 4_u64;
+            usize::try_from(
+                u64::from(layer) * blocks.layer_stride
+                    + (u64::from(y) / (8 * block_height_gobs)) * 512 * block_height_gobs * 2
+                    + (byte_x / 64) * 512 * block_height_gobs
+                    + ((u64::from(y) % (8 * block_height_gobs)) / 8) * 512
+                    + ((byte_x % 64) / 32) * 256
+                    + ((u64::from(y) % 8) / 2) * 64
+                    + ((byte_x % 32) / 16) * 32
+                    + (u64::from(y) % 2) * 16
+                    + byte_x % 16,
+            )
+            .unwrap()
+        };
+        let linear_offset = |layer: u32, x: u32, y: u32| {
+            usize::try_from(u64::from(layer * shape.height + y) * 256 + u64::from(x) * 4).unwrap()
+        };
+        let canonical = (0..0x2000)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let mut expected_host = vec![0_u8; 256 * 17 * 2];
+        for layer in 0..shape.layers {
+            for y in 0..shape.height {
+                for x in 0..shape.width {
+                    let canonical_offset = reference_offset(layer, x, y);
+                    let linear_offset = linear_offset(layer, x, y);
+                    expected_host[linear_offset..linear_offset + 4]
+                        .copy_from_slice(&canonical[canonical_offset..canonical_offset + 4]);
+                }
+            }
+        }
+
+        assert_eq!(
+            linearize_canonical_image(&canonical, layout, shape).unwrap(),
+            expected_host
+        );
+
+        let mut expected_canonical = vec![0xa5_u8; canonical.len()];
+        for layer in 0..shape.layers {
+            for y in 0..shape.height {
+                for x in 0..shape.width {
+                    let canonical_offset = reference_offset(layer, x, y);
+                    let linear_offset = linear_offset(layer, x, y);
+                    expected_canonical[canonical_offset..canonical_offset + 4]
+                        .copy_from_slice(&expected_host[linear_offset..linear_offset + 4]);
+                }
+            }
+        }
+        let mut observed_canonical = vec![0xa5_u8; canonical.len()];
+        write_linear_image_to_canonical(&expected_host, &mut observed_canonical, layout, shape)
+            .unwrap();
+        assert_eq!(observed_canonical, expected_canonical);
     }
 
     #[test]

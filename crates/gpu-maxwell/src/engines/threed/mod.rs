@@ -143,6 +143,8 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
     MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
+#[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use resource::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
 pub use resource::{
     MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDGuestImageFormat,
@@ -152,6 +154,10 @@ pub use resource::{
     MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureDimension,
     MaxwellThreeDTextureReference, resolve_maxwell_three_d_resources,
     resolve_maxwell_three_d_resources_for_roles,
+};
+pub(crate) use resource::{
+    MaxwellThreeDRetainedBackingCache,
+    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache,
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
@@ -1101,7 +1107,7 @@ impl MaxwellThreeDMmeHost for MmeDispatchHost<'_> {
                 .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
             let operation = MaxwellThreeDTriggeredOperation {
                 trigger,
-                state: self.candidate.clone(),
+                state: std::sync::Arc::new(self.candidate.clone()),
             };
             self.ordered_operations
                 .try_reserve(1)

@@ -113,7 +113,7 @@ impl RunnableProcess {
             ),
             memory: self.memory.as_ref(),
             invalidation_generation: self.memory.mapping_epoch().get(),
-            dirty_generation: self.memory.content_generation_watermark(),
+            dirty_generation: self.memory.content_mutation_epoch().get(),
         };
         self.execution
             .prepare_provider_switch(self.cpu, memory, vcpus, provider)
@@ -130,7 +130,7 @@ impl RunnableProcess {
             ),
             memory: self.memory.as_ref(),
             invalidation_generation: self.memory.mapping_epoch().get(),
-            dirty_generation: self.memory.content_generation_watermark(),
+            dirty_generation: self.memory.content_mutation_epoch().get(),
         };
         self.execution.complete_provider_switch(prepared, memory)
     }

@@ -139,11 +139,12 @@ fn registered_engine_handoff_replaces_worker_resident_executors_at_a_real_barrie
         .unwrap();
     let old_domain = coordinator.process(process).unwrap().engine_domain_id();
     let mapping_epoch = coordinator.process(process).unwrap().mapping_epoch().get();
-    let dirty_generation = coordinator
+    let content_epoch = coordinator
         .process(process)
         .unwrap()
         .memory()
-        .content_generation_watermark();
+        .content_mutation_epoch()
+        .get();
 
     let barrier = coordinator
         .switch_process_engine(process, &nixe_cpu_engine_interpreter::InterpreterProvider)
@@ -153,7 +154,7 @@ fn registered_engine_handoff_replaces_worker_resident_executors_at_a_real_barrie
     assert_ne!(new_domain, old_domain);
     assert_eq!(barrier.quiescence.domain, old_domain);
     assert_eq!(barrier.memory.invalidation_generation, mapping_epoch);
-    assert_eq!(barrier.memory.dirty_generation, dirty_generation);
+    assert_eq!(barrier.memory.dirty_generation, content_epoch);
     assert_eq!(barrier.state, nixe_cpu_engine::StateCommitStatus::Canonical);
     assert_eq!(
         coordinator

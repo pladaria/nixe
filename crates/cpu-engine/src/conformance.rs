@@ -146,7 +146,7 @@ impl Suite {
             end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
             memory: &self.binding_memory,
             invalidation_generation: self.binding_memory.mapping_epoch().get(),
-            dirty_generation: self.binding_memory.content_generation_watermark(),
+            dirty_generation: self.binding_memory.content_mutation_epoch().get(),
         };
         domain
             .bind_memory(binding)

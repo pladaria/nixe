@@ -1,15 +1,19 @@
 //! Checked, retained and pointer-free canonical backing ranges.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{
     AddressSpaceId, CanonicalBackingPage, CanonicalCpuWriteOverlap, CanonicalPageError,
-    CanonicalPageId, ContentGeneration, DeviceAccessDeclaration, GuestVirtualAddress,
-    MappingGeneration, MemoryPermissions, VisibilityCoordinator, VisibilityError, VisibilityState,
+    CanonicalPageId, ContentGeneration, CpuWriteEpoch, DeviceAccessDeclaration,
+    GuestVirtualAddress, MappingGeneration, MemoryPermissions, VisibilityCoordinator,
+    VisibilityError, VisibilityState,
 };
 
 /// One contiguous segment of a translated canonical backing range.
@@ -20,6 +24,7 @@ pub struct CanonicalBackingSegment {
     size: u64,
     permissions: MemoryPermissions,
     content_generation: ContentGeneration,
+    cpu_write_epoch: CpuWriteEpoch,
     mapping_generation: MappingGeneration,
 }
 
@@ -37,14 +42,58 @@ impl CanonicalBackingSegment {
         content_generation: ContentGeneration,
         mapping_generation: MappingGeneration,
     ) -> Result<Self, CanonicalRangeError> {
+        let cpu_write_epoch = backing.cpu_write_epoch();
+        if content_generation != backing.content_generation() {
+            return Err(CanonicalRangeError::StaleContentGeneration);
+        }
+        Self::new_captured(
+            backing,
+            offset,
+            size,
+            permissions,
+            content_generation,
+            cpu_write_epoch,
+            mapping_generation,
+        )
+    }
+
+    fn snapshot(
+        backing: CanonicalBackingPage,
+        offset: u64,
+        size: u64,
+        permissions: MemoryPermissions,
+        mapping_generation: MappingGeneration,
+    ) -> Result<Self, CanonicalRangeError> {
+        // Capture the coarse epoch before the page generation. If a write
+        // races this snapshot, an older epoch can only force the exact slow
+        // path; it can never hide the write.
+        let cpu_write_epoch = backing.cpu_write_epoch();
+        let content_generation = backing.content_generation();
+        Self::new_captured(
+            backing,
+            offset,
+            size,
+            permissions,
+            content_generation,
+            cpu_write_epoch,
+            mapping_generation,
+        )
+    }
+
+    fn new_captured(
+        backing: CanonicalBackingPage,
+        offset: u64,
+        size: u64,
+        permissions: MemoryPermissions,
+        content_generation: ContentGeneration,
+        cpu_write_epoch: CpuWriteEpoch,
+        mapping_generation: MappingGeneration,
+    ) -> Result<Self, CanonicalRangeError> {
         let end = offset
             .checked_add(size)
             .ok_or(CanonicalRangeError::SegmentOverflow)?;
         if size == 0 || end > backing.size() as u64 {
             return Err(CanonicalRangeError::InvalidSegmentBounds);
-        }
-        if content_generation != backing.content_generation() {
-            return Err(CanonicalRangeError::StaleContentGeneration);
         }
         Ok(Self {
             backing,
@@ -52,6 +101,7 @@ impl CanonicalBackingSegment {
             size,
             permissions,
             content_generation,
+            cpu_write_epoch,
             mapping_generation,
         })
     }
@@ -86,6 +136,18 @@ impl CanonicalBackingSegment {
         self.content_generation
     }
 
+    /// Returns the store CPU-write epoch captured before generation validation.
+    #[must_use]
+    pub const fn captured_cpu_write_epoch(&self) -> CpuWriteEpoch {
+        self.cpu_write_epoch
+    }
+
+    /// Returns the latest published CPU-write epoch for this segment's store.
+    #[must_use]
+    pub fn current_cpu_write_epoch(&self) -> CpuWriteEpoch {
+        self.backing.cpu_write_epoch()
+    }
+
     /// Returns the mapping generation captured during translation.
     #[must_use]
     pub const fn mapping_generation(&self) -> MappingGeneration {
@@ -117,9 +179,217 @@ impl CanonicalBackingSegment {
 /// A validated logical byte range represented by retained page segments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalBackingRange {
-    segments: Box<[CanonicalBackingSegment]>,
+    segments: Arc<[CanonicalBackingSegment]>,
     size: u64,
 }
+
+struct CpuWriteDependencyStore {
+    store: crate::CanonicalBackingStore,
+    observed_epoch: AtomicU64,
+    intervals: Box<[(CanonicalPageId, u64, u64)]>,
+    pages: Box<[(CanonicalBackingPage, ContentGeneration)]>,
+}
+
+struct CanonicalCpuWriteDependencyInner {
+    stores: Box<[CpuWriteDependencyStore]>,
+}
+
+/// Cloneable observation of CPU writes relevant to fixed canonical intervals.
+///
+/// Clones share only monotonic validation metadata. Canonical page generations
+/// remain authoritative; this dependency is an exact fast rejection filter
+/// backed by the store's bounded CPU-write provenance journal.
+#[derive(Clone)]
+pub struct CanonicalCpuWriteDependency {
+    inner: Arc<CanonicalCpuWriteDependencyInner>,
+}
+
+impl CanonicalCpuWriteDependency {
+    /// Captures one range if every segment from a store observed one coherent
+    /// CPU-write epoch while its page generations were snapshotted.
+    #[must_use]
+    pub fn capture(range: &CanonicalBackingRange) -> Option<Self> {
+        Self::capture_ranges([range])
+    }
+
+    /// Captures several ranges as one dependency domain.
+    #[must_use]
+    pub fn capture_ranges<'a>(
+        ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
+    ) -> Option<Self> {
+        struct StoreBuilder {
+            store: crate::CanonicalBackingStore,
+            observed_epoch: CpuWriteEpoch,
+            intervals: Vec<(CanonicalPageId, u64, u64)>,
+            pages: Vec<(CanonicalBackingPage, ContentGeneration)>,
+        }
+
+        let mut stores = BTreeMap::<crate::BackingStoreId, StoreBuilder>::new();
+        for range in ranges {
+            for segment in range.segments() {
+                let store_id = segment.page().store();
+                let observed_epoch = segment.captured_cpu_write_epoch();
+                let end = segment.offset().checked_add(segment.size())?;
+                if let Some(current) = stores.get_mut(&store_id) {
+                    if current.observed_epoch != observed_epoch {
+                        return None;
+                    }
+                    current
+                        .intervals
+                        .push((segment.page(), segment.offset(), end));
+                    current
+                        .pages
+                        .push((segment.backing().clone(), segment.content_generation()));
+                } else {
+                    stores.insert(
+                        store_id,
+                        StoreBuilder {
+                            store: segment.backing.store().clone(),
+                            observed_epoch,
+                            intervals: vec![(segment.page(), segment.offset(), end)],
+                            pages: vec![(segment.backing().clone(), segment.content_generation())],
+                        },
+                    );
+                }
+            }
+        }
+        if stores.is_empty() {
+            return None;
+        }
+        let mut dependencies = Vec::new();
+        dependencies.try_reserve_exact(stores.len()).ok()?;
+        for mut store in stores.into_values() {
+            normalize_cpu_write_intervals(&mut store.intervals);
+            store
+                .pages
+                .sort_unstable_by_key(|(page, _)| page.identity());
+            if store
+                .pages
+                .windows(2)
+                .any(|pair| pair[0].0.identity() == pair[1].0.identity() && pair[0].1 != pair[1].1)
+            {
+                return None;
+            }
+            store.pages.dedup_by_key(|(page, _)| page.identity());
+            dependencies.push(CpuWriteDependencyStore {
+                store: store.store,
+                observed_epoch: AtomicU64::new(store.observed_epoch.get()),
+                intervals: store.intervals.into_boxed_slice(),
+                pages: store.pages.into_boxed_slice(),
+            });
+        }
+        let stores = dependencies.into_boxed_slice();
+        Some(Self {
+            inner: Arc::new(CanonicalCpuWriteDependencyInner { stores }),
+        })
+    }
+
+    /// Returns whether no CPU write since the last successful observation
+    /// overlaps any captured canonical byte. If the bounded store journal no
+    /// longer covers the observation, authoritative page provenance is checked
+    /// with logarithmic page lookup. Exhausting both levels invalidates
+    /// conservatively.
+    #[must_use]
+    pub fn remains_current(&self) -> bool {
+        for dependency in &self.inner.stores {
+            let observed = CpuWriteEpoch::new(dependency.observed_epoch.load(Ordering::Acquire));
+            if dependency.store.cpu_write_epoch() == observed {
+                continue;
+            }
+            let (current, overlap) = dependency
+                .store
+                .cpu_write_overlap_since(observed, &dependency.intervals);
+            match overlap {
+                CanonicalCpuWriteOverlap::Yes => return false,
+                CanonicalCpuWriteOverlap::Unknown
+                    if page_local_cpu_write_overlap(dependency) != CanonicalCpuWriteOverlap::No =>
+                {
+                    return false;
+                }
+                CanonicalCpuWriteOverlap::No | CanonicalCpuWriteOverlap::Unknown => {}
+            }
+            dependency
+                .observed_epoch
+                .fetch_max(current.get(), Ordering::AcqRel);
+        }
+        true
+    }
+}
+
+fn page_local_cpu_write_overlap(dependency: &CpuWriteDependencyStore) -> CanonicalCpuWriteOverlap {
+    for (page_id, start, end) in &dependency.intervals {
+        let Ok(index) = dependency
+            .pages
+            .binary_search_by_key(page_id, |(page, _)| page.identity())
+        else {
+            return CanonicalCpuWriteOverlap::Unknown;
+        };
+        let (page, generation) = &dependency.pages[index];
+        match page.cpu_write_overlap_since(*generation, *start, end - start) {
+            Ok(CanonicalCpuWriteOverlap::No) => {}
+            Ok(overlap) => return overlap,
+            Err(_) => return CanonicalCpuWriteOverlap::Unknown,
+        }
+    }
+    CanonicalCpuWriteOverlap::No
+}
+
+fn normalize_cpu_write_intervals(intervals: &mut Vec<(CanonicalPageId, u64, u64)>) {
+    intervals.sort_unstable();
+    let mut output = 0_usize;
+    for input in 0..intervals.len() {
+        let current = intervals[input];
+        if output != 0 {
+            let previous = &mut intervals[output - 1];
+            if previous.0 == current.0 && current.1 <= previous.2 {
+                previous.2 = previous.2.max(current.2);
+                continue;
+            }
+        }
+        intervals[output] = current;
+        output += 1;
+    }
+    intervals.truncate(output);
+}
+
+impl std::fmt::Debug for CanonicalCpuWriteDependency {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let stores = self
+            .inner
+            .stores
+            .iter()
+            .map(|store| {
+                (
+                    store.store.identity(),
+                    CpuWriteEpoch::new(store.observed_epoch.load(Ordering::Acquire)),
+                    store.intervals.len(),
+                    store.pages.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("CanonicalCpuWriteDependency")
+            .field("stores", &stores)
+            .finish()
+    }
+}
+
+impl PartialEq for CanonicalCpuWriteDependency {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.stores.len() == other.inner.stores.len()
+            && self
+                .inner
+                .stores
+                .iter()
+                .zip(&other.inner.stores)
+                .all(|(left, right)| {
+                    left.store.identity() == right.store.identity()
+                        && left.intervals == right.intervals
+                })
+    }
+}
+
+impl Eq for CanonicalCpuWriteDependency {}
 
 impl CanonicalBackingRange {
     /// Creates a non-empty range and checks its total length.
@@ -134,7 +404,7 @@ impl CanonicalBackingRange {
                 .ok_or(CanonicalRangeError::RangeOverflow)?;
         }
         Ok(Self {
-            segments: segments.into_boxed_slice(),
+            segments: segments.into(),
             size,
         })
     }
@@ -159,6 +429,22 @@ impl CanonicalBackingRange {
     /// content writes do not invalidate the mapping, while the derived view
     /// still needs an exact version key for later invalidation.
     pub fn snapshot_subrange(&self, offset: u64, size: u64) -> Result<Self, CanonicalRangeError> {
+        let mut captured = Vec::new();
+        self.snapshot_subrange_into(offset, size, &mut captured)?;
+        Self::new(captured)
+    }
+
+    /// Appends a versioned subrange directly to an existing segment builder.
+    ///
+    /// The output is unchanged on failure. Resource resolvers use this to
+    /// assemble one canonical range across mappings without allocating and
+    /// cloning an intermediate range for every mapping fragment.
+    pub fn snapshot_subrange_into(
+        &self,
+        offset: u64,
+        size: u64,
+        output: &mut Vec<CanonicalBackingSegment>,
+    ) -> Result<(), CanonicalRangeError> {
         let end = offset
             .checked_add(size)
             .ok_or(CanonicalRangeError::RangeOverflow)?;
@@ -166,35 +452,40 @@ impl CanonicalBackingRange {
             return Err(CanonicalRangeError::InvalidSubrange);
         }
 
+        let original_len = output.len();
         let mut logical_start = 0_u64;
-        let mut captured = Vec::new();
-        for segment in &self.segments {
-            let logical_end = logical_start
-                .checked_add(segment.size)
-                .ok_or(CanonicalRangeError::RangeOverflow)?;
-            let capture_start = offset.max(logical_start);
-            let capture_end = end.min(logical_end);
-            if capture_start < capture_end {
-                let within_segment = capture_start - logical_start;
-                let page_offset = segment
-                    .offset
-                    .checked_add(within_segment)
-                    .ok_or(CanonicalRangeError::SegmentOverflow)?;
-                captured.push(CanonicalBackingSegment::new(
-                    segment.backing.clone(),
-                    page_offset,
-                    capture_end - capture_start,
-                    segment.permissions,
-                    segment.backing.content_generation(),
-                    segment.mapping_generation,
-                )?);
+        let result = (|| {
+            for segment in self.segments.iter() {
+                let logical_end = logical_start
+                    .checked_add(segment.size)
+                    .ok_or(CanonicalRangeError::RangeOverflow)?;
+                let capture_start = offset.max(logical_start);
+                let capture_end = end.min(logical_end);
+                if capture_start < capture_end {
+                    let within_segment = capture_start - logical_start;
+                    let page_offset = segment
+                        .offset
+                        .checked_add(within_segment)
+                        .ok_or(CanonicalRangeError::SegmentOverflow)?;
+                    output.push(CanonicalBackingSegment::snapshot(
+                        segment.backing.clone(),
+                        page_offset,
+                        capture_end - capture_start,
+                        segment.permissions,
+                        segment.mapping_generation,
+                    )?);
+                }
+                logical_start = logical_end;
+                if logical_start >= end {
+                    break;
+                }
             }
-            logical_start = logical_end;
-            if logical_start >= end {
-                break;
-            }
+            Ok(())
+        })();
+        if result.is_err() {
+            output.truncate(original_len);
         }
-        Self::new(captured)
+        result
     }
 
     /// Copies a checked logical subrange from retained canonical storage.
@@ -221,7 +512,7 @@ impl CanonicalBackingRange {
 
         let mut logical_start = 0_u64;
         let mut copied = 0_usize;
-        for segment in &self.segments {
+        for segment in self.segments.iter() {
             let logical_end = logical_start
                 .checked_add(segment.size)
                 .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
@@ -268,7 +559,7 @@ impl CanonicalBackingRange {
         coordinator: Arc<dyn VisibilityCoordinator>,
     ) -> Result<(), VisibilityError> {
         let mut visited = BTreeSet::new();
-        for segment in &self.segments {
+        for segment in self.segments.iter() {
             if visited.insert(segment.page()) {
                 segment
                     .backing
@@ -292,7 +583,7 @@ impl CanonicalBackingRange {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         }
         let mut visited = BTreeSet::new();
-        for segment in &self.segments {
+        for segment in self.segments.iter() {
             if visited.insert(segment.page()) {
                 segment
                     .backing
@@ -306,7 +597,7 @@ impl CanonicalBackingRange {
     /// visibility failure.
     pub fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
         let mut visited = BTreeSet::new();
-        for segment in &self.segments {
+        for segment in self.segments.iter() {
             if visited.insert(segment.page()) {
                 segment.backing.invalidate_visibility()?;
             }
@@ -426,15 +717,16 @@ pub trait CanonicalRangeTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackingStoreId, GuestPhysicalPageId};
+    use crate::{
+        CanonicalAllocation, CanonicalBackingStore, CanonicalWriteBatch, GuestPhysicalPageId,
+    };
 
     #[test]
     fn segment_construction_checks_bounds_and_generation() {
+        let store = CanonicalBackingStore::allocate().unwrap();
         let page = CanonicalBackingPage::zeroed(
-            CanonicalPageId::new(
-                BackingStoreId::allocate().unwrap(),
-                GuestPhysicalPageId::new(1),
-            ),
+            &store,
+            GuestPhysicalPageId::new(1),
             0x1000,
             ContentGeneration::INITIAL,
         )
@@ -466,15 +758,17 @@ mod tests {
 
     #[test]
     fn retained_range_reads_checked_subranges_across_pages() {
-        let store = BackingStoreId::allocate().unwrap();
+        let store = CanonicalBackingStore::allocate().unwrap();
         let first = CanonicalBackingPage::initialized(
-            CanonicalPageId::new(store, GuestPhysicalPageId::new(1)),
+            &store,
+            GuestPhysicalPageId::new(1),
             &[0x10, 0x11, 0x12, 0x13],
             ContentGeneration::INITIAL,
         )
         .unwrap();
         let second = CanonicalBackingPage::initialized(
-            CanonicalPageId::new(store, GuestPhysicalPageId::new(2)),
+            &store,
+            GuestPhysicalPageId::new(2),
             &[0x20, 0x21, 0x22, 0x23],
             ContentGeneration::INITIAL,
         )
@@ -516,15 +810,17 @@ mod tests {
 
     #[test]
     fn snapshot_subrange_retains_exact_bytes_and_current_content_generations() {
-        let store = BackingStoreId::allocate().unwrap();
+        let store = CanonicalBackingStore::allocate().unwrap();
         let first = CanonicalBackingPage::zeroed(
-            CanonicalPageId::new(store, GuestPhysicalPageId::new(1)),
+            &store,
+            GuestPhysicalPageId::new(1),
             0x1000,
             ContentGeneration::INITIAL,
         )
         .unwrap();
         let second = CanonicalBackingPage::zeroed(
-            CanonicalPageId::new(store, GuestPhysicalPageId::new(2)),
+            &store,
+            GuestPhysicalPageId::new(2),
             0x1000,
             ContentGeneration::INITIAL,
         )
@@ -570,6 +866,14 @@ mod tests {
             )
             .unwrap();
         let snapshot = range.snapshot_subrange(0xff0, 0x20).unwrap();
+        let mut appended = Vec::new();
+        range
+            .snapshot_subrange_into(0xff0, 0x20, &mut appended)
+            .unwrap();
+        assert_eq!(
+            CanonicalBackingRange::new(appended.clone()).unwrap(),
+            snapshot
+        );
 
         assert_eq!(snapshot.size(), 0x20);
         assert_eq!(snapshot.segments().len(), 2);
@@ -595,5 +899,128 @@ mod tests {
             range.snapshot_subrange(0x1ff0, 0x20),
             Err(CanonicalRangeError::InvalidSubrange)
         );
+        let original = appended.clone();
+        assert_eq!(
+            range.snapshot_subrange_into(0x1ff0, 0x20, &mut appended),
+            Err(CanonicalRangeError::InvalidSubrange)
+        );
+        assert_eq!(appended, original);
+    }
+
+    #[test]
+    fn cloning_a_canonical_range_shares_its_immutable_segments() {
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let page = CanonicalBackingPage::zeroed(
+            &store,
+            GuestPhysicalPageId::new(1),
+            0x1000,
+            ContentGeneration::INITIAL,
+        )
+        .unwrap();
+        let range = CanonicalBackingRange::new(vec![
+            CanonicalBackingSegment::new(
+                page,
+                0,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+                ContentGeneration::INITIAL,
+                MappingGeneration::INITIAL,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let cloned = range.clone();
+
+        assert!(Arc::ptr_eq(&range.segments, &cloned.segments));
+        assert_eq!(range, cloned);
+    }
+
+    #[test]
+    fn cpu_write_dependency_advances_only_past_disjoint_writes() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observed = mapped.snapshot_subrange(0x100, 0x100).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&observed).unwrap();
+
+        assert!(dependency.remains_current());
+        allocation.write(0x300, &[1]).unwrap();
+        assert!(dependency.remains_current());
+        allocation.write(0x1100, &[2]).unwrap();
+        assert!(dependency.remains_current());
+        allocation.write(0x180, &[3]).unwrap();
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn cpu_write_dependency_normalizes_repeated_page_segments() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let first = mapped.snapshot_subrange(0x100, 0x100).unwrap();
+        let second = mapped.snapshot_subrange(0x300, 0x100).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture_ranges([&first, &second]).unwrap();
+
+        allocation.write(0x280, &[1]).unwrap();
+        assert!(dependency.remains_current());
+        allocation.write(0x380, &[2]).unwrap();
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn cpu_write_dependency_observes_only_committed_batch_ranges() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observed = mapped.snapshot_subrange(0x100, 0x100).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&observed).unwrap();
+
+        let mut disjoint = CanonicalWriteBatch::new();
+        disjoint.stage(&mapped, 0x300, &[1]).unwrap();
+        assert!(dependency.remains_current());
+        disjoint.commit().unwrap();
+        assert!(dependency.remains_current());
+
+        let mut overlapping = CanonicalWriteBatch::new();
+        overlapping.stage(&mapped, 0x180, &[2]).unwrap();
+        assert!(dependency.remains_current());
+        overlapping.commit().unwrap();
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn cpu_write_dependency_uses_page_local_provenance_after_lost_store_history() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observed = mapped.snapshot_subrange(0, 0x1000).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&observed).unwrap();
+
+        for value in 0..=super::super::backing::STORE_CPU_WRITE_JOURNAL_CAPACITY {
+            allocation.write(0x1000, &[value as u8]).unwrap();
+        }
+
+        assert!(dependency.remains_current());
+    }
+
+    #[test]
+    fn cpu_write_dependency_rejects_lost_overlapping_history() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observed = mapped.snapshot_subrange(0, 0x1000).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&observed).unwrap();
+
+        for value in 0..=super::super::backing::STORE_CPU_WRITE_JOURNAL_CAPACITY {
+            allocation.write(0, &[value as u8]).unwrap();
+        }
+
+        assert!(!dependency.remains_current());
     }
 }

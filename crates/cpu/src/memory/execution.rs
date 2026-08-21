@@ -11,9 +11,9 @@ use std::{
 };
 
 use nixe_memory::{
-    BackingStoreId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalPageError, CanonicalPageId, CanonicalRangeTranslationError,
-    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
+    CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
+    CanonicalPageError, CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason,
+    CanonicalRangeTranslator, ContentMutationEpoch,
 };
 
 use crate::{
@@ -146,23 +146,11 @@ struct ExecutionMemoryInner {
     physical_slots: Vec<Option<ExecutionPhysicalPage>>,
     free_physical_slots: Vec<usize>,
     slots_by_id: BTreeMap<GuestPhysicalPageId, usize>,
-    backing_store_id: Option<BackingStoreId>,
     next_page_id: u64,
     next_mapping_generation: Option<MappingGeneration>,
 }
 
 impl ExecutionMemoryInner {
-    fn backing_store_id(&mut self) -> Option<BackingStoreId> {
-        if self.backing_store_id.is_none() {
-            self.backing_store_id = BackingStoreId::allocate().ok();
-        }
-        self.backing_store_id
-    }
-
-    fn canonical_page_id(&mut self, page: GuestPhysicalPageId) -> Option<CanonicalPageId> {
-        Some(CanonicalPageId::new(self.backing_store_id()?, page))
-    }
-
     fn take_mapping_generation(&mut self) -> Option<MappingGeneration> {
         let generation = self.next_mapping_generation?;
         self.next_mapping_generation = generation.next().ok();
@@ -251,6 +239,7 @@ impl ExecutionMemoryInner {
 /// indivisible operation while permitting the memory object to be shared by
 /// future vCPU workers.
 pub struct ExecutionMemory {
+    backing_store: Option<CanonicalBackingStore>,
     inner: Mutex<ExecutionMemoryInner>,
     lease_state: Mutex<ExecutionLeaseState>,
     lease_changed: Condvar,
@@ -344,6 +333,7 @@ impl ExecutionMemory {
             ..ExecutionMemoryInner::default()
         };
         Self {
+            backing_store: CanonicalBackingStore::allocate().ok(),
             inner: Mutex::new(inner),
             lease_state: Mutex::new(ExecutionLeaseState {
                 active: 0,
@@ -432,6 +422,7 @@ impl ExecutionMemory {
         address_space: AddressSpaceId,
         requests: &[SyntheticRamPage<'_>],
     ) -> Result<(), SyntheticInstallError> {
+        let backing_store = self.backing_store.clone();
         let inner = self.inner_mut();
         let mut virtual_pages = Vec::with_capacity(requests.len());
         let mut unique_virtual_pages = BTreeSet::new();
@@ -485,7 +476,7 @@ impl ExecutionMemory {
             return Ok(());
         }
 
-        let backing_store_id = inner.backing_store_id().ok_or_else(|| {
+        let backing_store = backing_store.ok_or_else(|| {
             install_error(
                 SyntheticInstallStage::Allocation,
                 requests.first().map(|request| request.virtual_address),
@@ -523,7 +514,8 @@ impl ExecutionMemory {
                 )
             })?;
             let backing = CanonicalBackingPage::initialized(
-                CanonicalPageId::new(backing_store_id, physical_page),
+                &backing_store,
+                physical_page,
                 request.bytes,
                 ContentGeneration::new(1),
             )
@@ -647,31 +639,27 @@ impl ExecutionMemory {
         self.lock_inner().slots_by_id.len()
     }
 
-    /// Returns a deterministic watermark covering every resident canonical RAM
-    /// page. Engine handoff uses it to detect dirty-state reconciliation.
+    /// Returns the store-wide epoch of the latest published content mutation.
+    ///
+    /// This is an O(1) change detector. Per-page content generations remain
+    /// authoritative for code dependencies, aliases, and retained ranges.
     #[must_use]
-    pub fn content_generation_watermark(&self) -> u64 {
-        self.lock_inner()
-            .physical_slots
-            .iter()
-            .filter_map(|slot| match slot.as_ref() {
-                Some(ExecutionPhysicalPage::Ram(backing)) => {
-                    Some(backing.content_generation().get())
-                }
-                Some(ExecutionPhysicalPage::Mmio(_)) | None => None,
-            })
-            .max()
-            .unwrap_or_default()
+    pub fn content_mutation_epoch(&self) -> ContentMutationEpoch {
+        self.backing_store.as_ref().map_or(
+            ContentMutationEpoch::INITIAL,
+            CanonicalBackingStore::content_epoch,
+        )
     }
 
     /// Creates a zero-filled RAM page for explicit runtime or differential setup.
     pub fn add_ram_page(&mut self, page: GuestPhysicalPageId) -> bool {
-        let inner = self.inner_mut();
-        let Some(identity) = inner.canonical_page_id(page) else {
+        let Some(store) = self.backing_store.clone() else {
             return false;
         };
+        let inner = self.inner_mut();
         let Ok(backing) = CanonicalBackingPage::initialized(
-            identity,
+            &store,
+            page,
             &[0; SYNTHETIC_PAGE_SIZE],
             ContentGeneration::INITIAL,
         ) else {
@@ -902,8 +890,8 @@ impl ExecutionMemory {
             ));
         };
         let mut bytes = [0; N];
-        backing
-            .read(page_offset(address), &mut bytes)
+        let generation = backing
+            .read_with_generation(page_offset(address), &mut bytes)
             .map_err(|reason| {
                 InstructionFetchFault::new(
                     address_space,
@@ -915,7 +903,7 @@ impl ExecutionMemory {
             bytes,
             CodeDependencies::one(CodePageDependency {
                 page: mapping.physical_page,
-                generation: backing.content_generation(),
+                generation,
                 mapping_generation: mapping.mapping_generation,
             }),
         ))
@@ -1745,6 +1733,7 @@ impl ProcessMemory for ExecutionMemory {
         let first_page = start.get() >> PAGE_SHIFT;
         let old_end_page = first_page + old_size / page_size;
         let new_end_page = first_page + new_size / page_size;
+        let backing_store = self.backing_store.clone();
         let mut mutation = self.begin_mapping_mutation();
         let mut inner = self.lock_inner();
         for page in first_page..old_end_page {
@@ -1797,6 +1786,8 @@ impl ProcessMemory for ExecutionMemory {
             return Ok(());
         }
 
+        let backing_store = backing_store
+            .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
         let additional_pages = new_end_page - old_end_page;
         let capacity = usize::try_from(additional_pages)
             .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
@@ -1809,9 +1800,6 @@ impl ProcessMemory for ExecutionMemory {
             .physical_slots
             .try_reserve(additional_slots)
             .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
-        let backing_store_id = inner
-            .backing_store_id()
-            .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
         let mut next_page_id = inner.next_page_id;
         for page in old_end_page..new_end_page {
             while inner
@@ -1827,7 +1815,8 @@ impl ProcessMemory for ExecutionMemory {
                 .checked_add(1)
                 .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
             let backing = CanonicalBackingPage::zeroed(
-                CanonicalPageId::new(backing_store_id, physical_page),
+                &backing_store,
+                physical_page,
                 SYNTHETIC_PAGE_SIZE,
                 ContentGeneration::new(1),
             )
@@ -2194,6 +2183,10 @@ mod tests {
     fn cpu_read_reconciles_gpu_newer_backing_through_neutral_slow_path() {
         let memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(10);
+        assert_eq!(
+            memory.content_mutation_epoch(),
+            ContentMutationEpoch::INITIAL
+        );
         memory
             .resize_zeroed_mapping(
                 space,
@@ -2229,6 +2222,10 @@ mod tests {
         retained
             .complete_device_write(declaration, Arc::clone(&coordinator))
             .unwrap();
+        assert_eq!(
+            memory.content_mutation_epoch(),
+            ContentMutationEpoch::new(1)
+        );
         assert!(matches!(
             retained.segments()[0].visibility_state(),
             VisibilityState::GpuNewer { .. }
@@ -2242,6 +2239,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.value, MemoryValue::U8(0xa5));
+        assert_eq!(
+            memory.content_mutation_epoch(),
+            ContentMutationEpoch::new(1),
+            "downloading an already-published device write is not a second mutation"
+        );
         assert_eq!(
             retained.segments()[0].visibility_state(),
             VisibilityState::Clean
@@ -2259,6 +2261,10 @@ mod tests {
         retained
             .complete_device_write(second_write, coordinator)
             .unwrap();
+        assert_eq!(
+            memory.content_mutation_epoch(),
+            ContentMutationEpoch::new(2)
+        );
         memory
             .write(
                 space,
@@ -2267,6 +2273,10 @@ mod tests {
                 MemoryValue::U8(0x33),
             )
             .unwrap();
+        assert_eq!(
+            memory.content_mutation_epoch(),
+            ContentMutationEpoch::new(3)
+        );
         assert_eq!(
             retained.segments()[0].visibility_state(),
             VisibilityState::CpuNewer

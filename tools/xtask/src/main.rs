@@ -14,11 +14,50 @@ fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     match arguments.next().as_deref() {
         Some(command) if command == "fuzz" => run_fuzz(arguments.collect()),
+        Some(command) if command == "profile" => run_profile(arguments.collect()),
         Some(command) => fail(format!(
             "unknown xtask command: {}",
             command.to_string_lossy()
         )),
         None => fail("missing xtask command"),
+    }
+}
+
+fn run_profile(arguments: Vec<OsString>) -> ExitCode {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profiling_directory = repository_root.join("target/profiling");
+    let binary = profiling_directory.join("nixe-cli");
+    let mut library_path = OsString::from("LD_LIBRARY_PATH=");
+    library_path.push(&profiling_directory);
+    match Command::new("sudo")
+        .arg("env")
+        .arg(library_path)
+        .args([
+            "perf",
+            "record",
+            "--no-buildid",
+            "-F",
+            "99",
+            "--call-graph",
+            "dwarf,4096",
+            "-o",
+            "perf.data",
+            "--",
+            "timeout",
+            "-s",
+            "INT",
+            "-k",
+            "5s",
+            "30s",
+        ])
+        .arg(binary)
+        .args(["--headless", "run"])
+        .args(arguments)
+        .current_dir(repository_root)
+        .status()
+    {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => fail(format!("failed to start perf: {error}")),
     }
 }
 

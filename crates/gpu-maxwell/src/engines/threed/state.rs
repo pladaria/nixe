@@ -4,7 +4,7 @@
 //! In particular, an undocumented hardware reset must stay `Unset`: zero is
 //! not a reset value unless a pinned public source establishes that fact.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use nixe_gpu::GpuMethodId;
 
@@ -832,11 +832,11 @@ impl MaxwellThreeDViewportState {
 /// Complete currently modeled state of one channel's `MAXWELL_B` engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
-    raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
-    render_targets: Box<MaxwellThreeDRenderTargetState>,
-    fixed_function: Box<MaxwellThreeDFixedFunctionState>,
-    vertex_input: Box<MaxwellThreeDVertexInputState>,
-    shader_bindings: Box<MaxwellThreeDShaderBindingState>,
+    raw_registers: Arc<BTreeMap<u32, MaxwellThreeDRegister<u32>>>,
+    render_targets: Arc<MaxwellThreeDRenderTargetState>,
+    fixed_function: Arc<MaxwellThreeDFixedFunctionState>,
+    vertex_input: Arc<MaxwellThreeDVertexInputState>,
+    shader_bindings: Arc<MaxwellThreeDShaderBindingState>,
     raster: MaxwellThreeDRasterState,
     viewport: MaxwellThreeDViewportState,
     render_enable: MaxwellThreeDRenderEnableState,
@@ -904,7 +904,7 @@ impl Default for MaxwellThreeDState {
             );
         }
         Self {
-            raw_registers,
+            raw_registers: Arc::new(raw_registers),
             render_targets: Default::default(),
             fixed_function: Default::default(),
             vertex_input: Default::default(),
@@ -1052,7 +1052,7 @@ impl MaxwellThreeDState {
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
-        self.raw_registers.insert(
+        Arc::make_mut(&mut self.raw_registers).insert(
             source.method().0,
             MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
         );
@@ -1308,10 +1308,18 @@ impl MaxwellThreeDState {
                 self.viewport.pixel_center =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
-            MaxwellThreeDStateWrite::RenderTarget(write) => self.render_targets.apply(write),
-            MaxwellThreeDStateWrite::FixedFunction(write) => self.fixed_function.apply(write),
-            MaxwellThreeDStateWrite::VertexInput(write) => self.vertex_input.apply(write),
-            MaxwellThreeDStateWrite::ShaderBinding(write) => self.shader_bindings.apply(write),
+            MaxwellThreeDStateWrite::RenderTarget(write) => {
+                Arc::make_mut(&mut self.render_targets).apply(write);
+            }
+            MaxwellThreeDStateWrite::FixedFunction(write) => {
+                Arc::make_mut(&mut self.fixed_function).apply(write);
+            }
+            MaxwellThreeDStateWrite::VertexInput(write) => {
+                Arc::make_mut(&mut self.vertex_input).apply(write);
+            }
+            MaxwellThreeDStateWrite::ShaderBinding(write) => {
+                Arc::make_mut(&mut self.shader_bindings).apply(write);
+            }
             MaxwellThreeDStateWrite::RenderEnable(write) => self.render_enable.apply(write),
             MaxwellThreeDStateWrite::ShaderExecution(write) => self.shader_execution.apply(write),
             MaxwellThreeDStateWrite::ColorReduction(write) => self.color_reduction.apply(write),
@@ -1334,7 +1342,7 @@ impl MaxwellThreeDState {
                     source: write.source(),
                 };
                 self.mme.apply(completion);
-                self.raw_registers.insert(
+                Arc::make_mut(&mut self.raw_registers).insert(
                     0x3400,
                     MaxwellThreeDRegister::programmed(1, 1, write.source()),
                 );
