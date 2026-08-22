@@ -255,7 +255,7 @@ impl std::error::Error for InstructionContextTooLarge {}
 pub struct MissingInstructionObservation {
     pub coverage_id: CoverageId,
     pub encoding: InstructionEncoding,
-    pub pc: crate::address::GuestVirtualAddress,
+    pub pc: nixe_memory::GuestVirtualAddress,
     pub module: ModuleIdentity,
     pub execution_state: ExecutionState,
     surrounding_bytes: Box<[u8]>,
@@ -265,7 +265,7 @@ impl MissingInstructionObservation {
     pub fn new(
         coverage_id: CoverageId,
         encoding: InstructionEncoding,
-        pc: crate::address::GuestVirtualAddress,
+        pc: nixe_memory::GuestVirtualAddress,
         module: ModuleIdentity,
         execution_state: ExecutionState,
         surrounding_bytes: impl Into<Box<[u8]>>,
@@ -608,8 +608,9 @@ impl fmt::Debug for MissingInstructionTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
+
     use crate::{
-        address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
         ir::{print::print_block, terminator::Terminator},
         memory::{MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory},
         translate::{BlockTranslationConfig, translate_block},

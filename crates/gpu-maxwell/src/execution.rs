@@ -63,16 +63,6 @@ pub struct MaxwellSubmissionExecutionPlan {
 
 impl MaxwellSubmissionExecutionPlan {
     #[must_use]
-    pub const fn frontend(&self) -> FrontendSubmissionId {
-        self.frontend
-    }
-
-    #[must_use]
-    pub fn predecessors(&self) -> &[FrontendSubmissionId] {
-        &self.predecessors
-    }
-
-    #[must_use]
     pub fn steps(&self) -> &[MaxwellSubmissionExecutionStep] {
         &self.steps
     }

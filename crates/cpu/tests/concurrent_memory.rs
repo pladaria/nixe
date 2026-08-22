@@ -2,12 +2,12 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use nixe_cpu::address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 use nixe_cpu::memory::{
     CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment,
     MemoryMappingPurpose, MemoryOrdering, MemoryPermissions, MemoryValue, ProcessMemory,
     SYNTHETIC_PAGE_SIZE,
 };
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 const PRIMARY: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);

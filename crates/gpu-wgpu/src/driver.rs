@@ -151,11 +151,6 @@ impl WgpuBackendDriver {
         }
     }
 
-    #[must_use]
-    pub fn live_resource_count(&self) -> usize {
-        self.resources.len()
-    }
-
     fn require_device(&mut self) -> Result<(), BackendDriverError> {
         let loss = self
             .device_loss

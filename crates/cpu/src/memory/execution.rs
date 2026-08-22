@@ -11,16 +11,13 @@ use std::{
 };
 
 use nixe_memory::{
-    CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
-    CanonicalPageError, CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason,
-    CanonicalRangeTranslator, ContentMutationEpoch,
+    AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
+    CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, ContentGeneration,
+    ContentMutationEpoch, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
 };
 
 use crate::{
-    address::{
-        AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress,
-        MappingGeneration,
-    },
     error::{InstructionFetchFault, InstructionFetchFaultReason},
     exclusive::ExclusiveReservation,
 };

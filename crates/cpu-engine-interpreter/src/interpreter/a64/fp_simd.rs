@@ -1,5 +1,4 @@
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{
         DecodedOpcode,
         a64::fp_simd::{
@@ -22,6 +21,7 @@ use nixe_cpu::{
     },
     state::a64::{A64State, Nzcv},
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use super::{advance, read, register_offset_address, resume, sign_extend, write};
 use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
@@ -588,7 +588,7 @@ fn pair_access_size(size: u8) -> MemoryAccessSize {
 
 fn vector_pair(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
 ) -> MemoryStep {
@@ -632,7 +632,7 @@ fn ld1_st1_register_count(opcode: u8) -> Option<u8> {
 
 fn vector_multiple_structures(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     register_count: u8,
@@ -673,7 +673,7 @@ fn vector_multiple_structures(
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ST1--single-structure---Store-one-single-element-structure-from-one-lane-of-one-register-
 fn vector_single_structure(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     post_index: bool,
@@ -727,7 +727,7 @@ fn single_structure_shape(
 
 fn write_lane(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     value: u128,
@@ -3535,7 +3535,7 @@ fn vector_access_size(
 
 fn vector_transfer(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     address: GuestVirtualAddress,
@@ -3552,7 +3552,7 @@ fn vector_transfer(
 
 fn read_vector(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
 ) -> Result<u128, DataAccessFault> {
@@ -3570,7 +3570,7 @@ fn read_vector(
 
 fn write_vector(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     state: &A64State,

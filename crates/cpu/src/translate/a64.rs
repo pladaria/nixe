@@ -5,9 +5,9 @@ mod fp_simd;
 mod integer;
 mod memory;
 mod system;
+use nixe_memory::GuestVirtualAddress;
 
 use crate::{
-    address::GuestVirtualAddress,
     decode::{DecodedOpcode, a64::A64Instruction},
     ir::{
         builder::{BuildError, IrBuilder},
@@ -364,8 +364,9 @@ fn helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{AddressSpaceId, GuestPhysicalPageId};
+
     use crate::{
-        address::{AddressSpaceId, GuestPhysicalPageId},
         ir::{block::BlockExitKind, op::OperationKind},
         location::ExecutionState,
         memory::{MemoryPermissions, SyntheticMemory},

@@ -4,7 +4,6 @@
 //! instructions to a shared IR. Runtime orchestration, executable loading,
 //! graphics APIs, and host-specific code generation live outside this crate.
 
-pub mod address;
 pub mod coverage;
 pub mod decode;
 pub mod error;

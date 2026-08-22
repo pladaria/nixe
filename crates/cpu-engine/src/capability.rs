@@ -1,4 +1,4 @@
-//! Host discovery and engine capability declarations.
+//! Engine capability declarations.
 
 use core::num::{NonZeroU64, NonZeroUsize};
 
@@ -14,40 +14,6 @@ pub enum EngineKind {
     BlockJit,
     NativeCodeExecution,
     Test,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum HostArchitecture {
-    Aarch64,
-    X86_64,
-    Other,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct HostCapabilities {
-    pub architecture: HostArchitecture,
-    pub logical_parallelism: Option<usize>,
-}
-
-impl HostCapabilities {
-    /// Discovers only portable host facts. Privileged virtualization features
-    /// remain provider-specific probes and are never guessed from the ISA.
-    #[must_use]
-    pub fn discover() -> Self {
-        let architecture = if cfg!(target_arch = "aarch64") {
-            HostArchitecture::Aarch64
-        } else if cfg!(target_arch = "x86_64") {
-            HostArchitecture::X86_64
-        } else {
-            HostArchitecture::Other
-        };
-        Self {
-            architecture,
-            logical_parallelism: std::thread::available_parallelism()
-                .ok()
-                .map(std::num::NonZero::get),
-        }
-    }
 }
 
 /// Capabilities offered by one provider on the current host.

@@ -310,29 +310,6 @@ impl Display for DisplayClockError {
 
 impl std::error::Error for DisplayClockError {}
 
-/// Deterministic sink retaining every submitted frame for assertions.
-#[derive(Clone, Debug, Default)]
-pub struct HeadlessFrameSink {
-    frames: Arc<Mutex<Vec<Arc<Frame>>>>,
-}
-
-impl HeadlessFrameSink {
-    pub fn submit(&self, frame: Arc<Frame>) {
-        self.frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(frame);
-    }
-
-    #[must_use]
-    pub fn frames(&self) -> Vec<Arc<Frame>> {
-        self.frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};

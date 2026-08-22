@@ -478,8 +478,9 @@ pub fn validate_t32(id: CoverageId, bits: u32) -> AllocationStatus {
 
 #[cfg(test)]
 mod tests {
+    use nixe_memory::GuestVirtualAddress;
+
     use crate::{
-        address::GuestVirtualAddress,
         decode::{DecodeResult, decode},
         location::{ExecutionState, InstructionEncoding, LocationDescriptor},
         profile::GuestCpuProfile,

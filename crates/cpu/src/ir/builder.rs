@@ -159,8 +159,11 @@ impl IrBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{
+        ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    };
+
     use crate::{
-        address::{CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
         ir::{
             block::{BlockExit, BlockExitKind, InstructionSource},
             op::{IntegerBinaryKind, ScalarOperation},
@@ -183,8 +186,8 @@ mod tests {
     fn metadata() -> BlockMetadata {
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(7),
-            generation: CodeGeneration::new(3),
-            mapping_generation: crate::address::MappingGeneration::new(1),
+            generation: ContentGeneration::new(3),
+            mapping_generation: MappingGeneration::new(1),
         };
         BlockMetadata::new(
             location(),

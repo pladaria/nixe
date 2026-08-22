@@ -5,7 +5,6 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nixe_cpu::address::AddressSpaceId;
 use nixe_cpu::location::ExecutionState;
 use nixe_cpu::memory::{
     CpuMemory, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingPurpose,
@@ -21,6 +20,7 @@ use nixe_horizon::{
     switch_1_scheduler_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
     Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExitCause,
@@ -325,9 +325,8 @@ fn blocking_wait_suspends_and_retries_in_each_execution_state() {
         // The fixture swaps a Homebrew A64 thread for A32/T32 architectural
         // states; use its low writable data mapping rather than the genuine
         // 64-bit Homebrew stack region for the AArch32 pointer ABI.
-        let handles_address = nixe_cpu::address::GuestVirtualAddress::new(
-            process.entry_module().image_base() + 0x2000,
-        );
+        let handles_address =
+            GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
         let (writable, readable) = EventObject::create_pair();
         let read_handle = process.handles_mut().insert(readable).unwrap();
         process
@@ -927,10 +926,7 @@ fn normal_session_copies_input_handles_without_consuming_the_source() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     );
-    let received_handle = read_guest_u32(
-        &process,
-        nixe_cpu::address::GuestVirtualAddress::new(tls.get() + 12),
-    );
+    let received_handle = read_guest_u32(&process, GuestVirtualAddress::new(tls.get() + 12));
     assert_ne!(received_handle, source_handle);
     assert!(
         process
@@ -2738,11 +2734,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     );
 }
 
-fn write_guest_bytes(
-    process: &RunnableProcess,
-    start: nixe_cpu::address::GuestVirtualAddress,
-    bytes: &[u8],
-) {
+fn write_guest_bytes(process: &RunnableProcess, start: GuestVirtualAddress, bytes: &[u8]) {
     for (index, byte) in bytes.iter().copied().enumerate() {
         process
             .memory()
@@ -2756,11 +2748,7 @@ fn write_guest_bytes(
     }
 }
 
-fn read_guest_bytes(
-    process: &RunnableProcess,
-    start: nixe_cpu::address::GuestVirtualAddress,
-    size: usize,
-) -> Vec<u8> {
+fn read_guest_bytes(process: &RunnableProcess, start: GuestVirtualAddress, size: usize) -> Vec<u8> {
     (0..size)
         .map(|index| {
             let MemoryValue::U8(value) = process
@@ -2780,10 +2768,7 @@ fn read_guest_bytes(
         .collect()
 }
 
-fn read_guest_u32(
-    process: &RunnableProcess,
-    address: nixe_cpu::address::GuestVirtualAddress,
-) -> u32 {
+fn read_guest_u32(process: &RunnableProcess, address: GuestVirtualAddress) -> u32 {
     let MemoryValue::U32(value) = process
         .memory()
         .read(
@@ -3117,14 +3102,13 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
         .query_memory(
             process.cpu_context().address_space_id(),
             layout.heap().base(),
-            nixe_cpu::address::GuestVirtualAddress::new(process.address_space().exclusive_limit()),
+            GuestVirtualAddress::new(process.address_space().exclusive_limit()),
         )
         .unwrap();
     assert_eq!(heap.size, 0x20_0000);
     assert_eq!(heap.purpose, MemoryMappingPurpose::Heap);
 
-    let code =
-        nixe_cpu::address::GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
+    let code = GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
     state(&mut process).write_x(x(0), code.get());
     state(&mut process).write_x(x(1), 0x1000);
     state(&mut process).write_w(x(2), 1);

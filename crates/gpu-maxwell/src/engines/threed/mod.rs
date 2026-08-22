@@ -1058,7 +1058,7 @@ pub(super) fn preflight_mme_call(
             ordered_operations: Vec::new(),
         };
         match program.execute(macro_index, &parameters, &mut host) {
-            Ok(report) => report,
+            Ok(()) => {}
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
                 return Err(MaxwellEngineDispatchError::MmeExecution { source, error });
             }
@@ -1216,8 +1216,7 @@ fn preflight_register(
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) =
-            upload.map_or(state_write(), |upload| state_inline_to_memory(upload));
+        let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
         return Ok(PreparedMethod::new(
             method,
             metadata,
@@ -1235,8 +1234,7 @@ fn preflight_register(
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) =
-            upload.map_or(state_write(), |upload| state_inline_constant_buffer(upload));
+        let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
         return Ok(PreparedMethod::new(
             method,
             metadata,

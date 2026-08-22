@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use crate::{address::AddressSpaceId, location::ExecutionState};
+use nixe_memory::AddressSpaceId;
+
+use crate::location::ExecutionState;
 
 /// Stable identity of an immutable guest CPU profile.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -463,11 +465,6 @@ impl GuestCpuProfile {
     #[must_use]
     pub const fn instruction_feature_status(self, feature: InstructionFeature) -> CapabilityStatus {
         self.instruction_features.status(feature)
-    }
-
-    #[must_use]
-    pub const fn supports_instruction_feature(self, feature: InstructionFeature) -> bool {
-        self.instruction_features.supports(feature)
     }
 
     /// Applies the decoder's common capability gate.

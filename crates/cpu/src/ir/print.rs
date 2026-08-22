@@ -155,8 +155,11 @@ const fn type_name(ty: IrType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{
+        ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    };
+
     use crate::{
-        address::{CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
         ir::{
             block::{BlockExit, BlockExitKind, BlockMetadata, InstructionSource},
             op::{IrOperation, OperationKind, OperationResults},
@@ -176,8 +179,8 @@ mod tests {
         );
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(2),
-            generation: CodeGeneration::new(3),
-            mapping_generation: crate::address::MappingGeneration::new(1),
+            generation: ContentGeneration::new(3),
+            mapping_generation: MappingGeneration::new(1),
         };
         IrBlock::new(
             BlockMetadata::new(

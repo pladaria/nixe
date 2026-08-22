@@ -102,11 +102,6 @@ impl PortObject {
     }
 
     #[must_use]
-    pub fn same_port(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
-    }
-
-    #[must_use]
     pub fn server_is_open(&self) -> bool {
         self.identity
             .state

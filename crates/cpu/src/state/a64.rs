@@ -123,7 +123,7 @@ impl A64State {
         super::A64RegisterContext {
             x: self.x,
             sp: self.sp,
-            pc: crate::address::GuestVirtualAddress::new(self.pc),
+            pc: nixe_memory::GuestVirtualAddress::new(self.pc),
             nzcv: self.nzcv,
         }
     }

@@ -39,7 +39,7 @@ fn lift_branch(
     displacement: i32,
 ) -> LiftOutcome {
     let target = ControlTarget::Direct {
-        pc: crate::address::GuestVirtualAddress::new(u64::from(
+        pc: nixe_memory::GuestVirtualAddress::new(u64::from(
             (decoded.location.pc.get() as u32)
                 .wrapping_add(8)
                 .wrapping_add_signed(displacement),

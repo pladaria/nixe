@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 
-use nixe_cpu::address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::location::InstructionEncoding;
 use nixe_cpu::memory::{
@@ -9,6 +8,7 @@ use nixe_cpu::memory::{
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister};
 use nixe_cpu_engine_interpreter::{InterpreterContext, execute_one_with_context};
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(7);
 const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(9);

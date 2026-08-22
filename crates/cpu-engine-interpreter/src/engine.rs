@@ -17,14 +17,12 @@ use nixe_cpu_engine::{
     EngineCapabilities, EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor,
     EngineExecutorId, EngineFault, EngineFaultKind, EngineId, EngineKind, EngineProvider,
     ExecutionReport, ExecutorRequest, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest, TimerSnapshot,
-    TracePolicy,
+    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest, TracePolicy,
 };
 use nixe_memory::GuestVirtualAddress;
 
 use crate::interpreter::{
-    ArchitecturalTimer, ArchitecturalTimerSnapshot, InterpreterContext, InterpreterError,
-    InterpreterOutcome, execute_one_with_context,
+    InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
 };
 
 pub const INTERPRETER_ENGINE_ID: EngineId = EngineId::new(1);
@@ -210,11 +208,10 @@ impl EngineExecutor for InterpreterExecutor {
                 }
             };
             let source = current_location(request.cpu, request.state);
-            let timer = InterpreterTimer(request.timer);
             let context = InterpreterContext::new(request.cpu)
                 .with_memory(request.memory)
                 .with_exclusive_monitor(&self.exclusive_monitor)
-                .with_architectural_timer_provider(&timer);
+                .with_architectural_timer_provider(request.timer);
             let outcome = match execute_one_with_context(context, request.state, encoding) {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UnsupportedInstruction {
@@ -314,14 +311,6 @@ impl InterpreterExecutor {
             context: state.register_context(),
             trace: self.trace.snapshot(),
         }
-    }
-}
-
-struct InterpreterTimer<'a>(&'a dyn nixe_cpu_engine::EngineTimer);
-impl ArchitecturalTimer for InterpreterTimer<'_> {
-    fn snapshot(&self) -> ArchitecturalTimerSnapshot {
-        let TimerSnapshot { counter, frequency } = self.0.snapshot();
-        ArchitecturalTimerSnapshot { counter, frequency }
     }
 }
 

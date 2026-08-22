@@ -2,11 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use nixe_cpu::{
-    address::{AddressSpaceId, GuestVirtualAddress},
-    memory::ExecutionMemory,
-};
+use nixe_cpu::memory::ExecutionMemory;
 use nixe_input::EmulatedControllerState;
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{HandleError, SharedMemoryObject};
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;

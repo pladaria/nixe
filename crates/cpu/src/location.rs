@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use crate::{address::GuestVirtualAddress, profile::CpuProfileId};
+use nixe_memory::GuestVirtualAddress;
+
+use crate::profile::CpuProfileId;
 
 /// Arm instruction-set execution state active at an instruction location.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

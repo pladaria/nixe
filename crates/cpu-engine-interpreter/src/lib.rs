@@ -11,7 +11,6 @@ pub use engine::{
     INTERPRETER_ENGINE_ID, InterpreterDomain, InterpreterExecutor, InterpreterProvider,
 };
 pub use interpreter::{
-    ArchitecturalTimer, ArchitecturalTimerSnapshot, InterpreterContext, InterpreterError,
-    InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_fallback_with_context,
-    execute_one, execute_one_with_context,
+    InterpreterContext, InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback,
+    execute_fallback_with_context, execute_one, execute_one_with_context,
 };

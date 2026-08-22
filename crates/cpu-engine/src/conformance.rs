@@ -3,7 +3,6 @@
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use nixe_cpu::address::GuestPhysicalPageId;
 use nixe_cpu::location::ExecutionState;
 use nixe_cpu::memory::{
     CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
@@ -11,6 +10,7 @@ use nixe_cpu::memory::{
 };
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a64::A64GeneralRegister, a64::A64Register, a64::A64State};
+use nixe_memory::GuestPhysicalPageId;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{

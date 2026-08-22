@@ -1,9 +1,9 @@
 //! Structured CPU frontend diagnostics.
 
 use core::fmt;
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{
-    address::{AddressSpaceId, GuestVirtualAddress},
     location::{InstructionEncoding, LocationDescriptor},
     profile::{CapabilityStatus, InstructionFeature, InstructionFeatureRejection},
 };

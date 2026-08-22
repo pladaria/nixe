@@ -671,12 +671,11 @@ pub(crate) fn resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and
     }
     let mut descriptors = BTreeMap::new();
     for role in required_roles {
-        if let MaxwellThreeDResourceRole::SampledImage { texture, dimension } = role {
-            if let Some(previous) = descriptors.insert(*texture, *dimension)
-                && previous != *dimension
-            {
-                return Err(MaxwellThreeDResourceError::ContradictoryState { role: *role });
-            }
+        if let MaxwellThreeDResourceRole::SampledImage { texture, dimension } = role
+            && let Some(previous) = descriptors.insert(*texture, *dimension)
+            && previous != *dimension
+        {
+            return Err(MaxwellThreeDResourceError::ContradictoryState { role: *role });
         }
     }
     for (texture_reference, dimension) in descriptors {

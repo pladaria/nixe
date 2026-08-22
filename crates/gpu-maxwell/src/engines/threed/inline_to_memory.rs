@@ -277,17 +277,19 @@ const SET_DST_ORIGIN_SAMPLES_Y: u32 = 0x01ac;
 const LAUNCH_DMA: u32 = 0x01b0;
 const LOAD_INLINE_DATA: u32 = 0x01b4;
 
-pub(super) fn preflight(
-    source: MaxwellMethodSource,
-    state: &MaxwellThreeDInlineToMemoryState,
-) -> Result<
+type PreflightResult = Result<
     Option<(
         MaxwellThreeDStateWrite,
         &'static str,
         Option<MaxwellInlineToMemoryUpload>,
     )>,
     MaxwellEngineDispatchError,
-> {
+>;
+
+pub(super) fn preflight(
+    source: MaxwellMethodSource,
+    state: &MaxwellThreeDInlineToMemoryState,
+) -> PreflightResult {
     let raw = source.argument();
     let write = match source.method().0 {
         LINE_LENGTH_IN => MaxwellThreeDInlineToMemoryStateWrite::LineLength { value: raw, source },
@@ -354,14 +356,7 @@ pub(super) fn preflight(
 fn preflight_launch(
     source: MaxwellMethodSource,
     state: &MaxwellThreeDInlineToMemoryState,
-) -> Result<
-    Option<(
-        MaxwellThreeDStateWrite,
-        &'static str,
-        Option<MaxwellInlineToMemoryUpload>,
-    )>,
-    MaxwellEngineDispatchError,
-> {
+) -> PreflightResult {
     let raw = source.argument();
     if raw & !0x51 != 0 {
         return Err(invalid(
@@ -462,14 +457,7 @@ fn preflight_launch(
 fn preflight_data(
     source: MaxwellMethodSource,
     state: &MaxwellThreeDInlineToMemoryState,
-) -> Result<
-    Option<(
-        MaxwellThreeDStateWrite,
-        &'static str,
-        Option<MaxwellInlineToMemoryUpload>,
-    )>,
-    MaxwellEngineDispatchError,
-> {
+) -> PreflightResult {
     let pending = state.pending.ok_or_else(|| {
         invalid(
             source,

@@ -3205,7 +3205,7 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
             &compute_before
         );
         assert_eq!(
-            lower_maxwell_compute_synchronization(&dispatch.compute_operations()[index], true),
+            lower_maxwell_compute_synchronization(dispatch.compute_operations()[index], true),
             MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches: expected }
         );
     }
@@ -3439,7 +3439,7 @@ fn decompress_surface_is_ordered_for_reset_or_programmed_uncompressed_targets() 
     let dispatch = dispatch_first(&mut compressed, &decoded).unwrap();
     assert!(matches!(
         lower_maxwell_three_d_synchronization(
-            &dispatch.synchronization_operations()[0],
+            dispatch.synchronization_operations()[0],
             None,
             false
         ),
@@ -3624,11 +3624,7 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
     }
 
     assert_eq!(
-        lower_maxwell_three_d_synchronization(
-            &dispatch.synchronization_operations()[0],
-            None,
-            true,
-        ),
+        lower_maxwell_three_d_synchronization(dispatch.synchronization_operations()[0], None, true,),
         Ok(MaxwellThreeDSynchronizationPlan::TiledCacheFlush {
             mode: MaxwellThreeDTiledCacheFlushMode::Flush,
             maintenance: nixe_gpu::CacheMaintenanceOperation::FlushDirtyDeviceWrites,
@@ -3636,7 +3632,7 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
     );
     assert!(matches!(
         lower_maxwell_three_d_synchronization(
-            &dispatch.synchronization_operations()[1],
+            dispatch.synchronization_operations()[1],
             None,
             true,
         ),

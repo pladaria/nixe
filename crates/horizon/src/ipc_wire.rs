@@ -6,12 +6,12 @@
 
 use chrono::{Datelike, Offset, Timelike};
 use chrono_tz::OffsetComponents;
-use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::memory::{
     DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAccessSize,
     MemoryPermissions, MemoryRegionKind, MemoryValue,
 };
 use nixe_memory::CanonicalRangeAccessError;
+use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
 
 use crate::ipc_message::{

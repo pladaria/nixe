@@ -133,10 +133,9 @@ pub fn table() -> &'static DecoderTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        address::GuestVirtualAddress,
-        profile::{CapabilityStatus, InstructionFeature},
-    };
+    use nixe_memory::GuestVirtualAddress;
+
+    use crate::profile::{CapabilityStatus, InstructionFeature};
 
     fn decoded_name(profile: GuestCpuProfile, bits: u32) -> &'static str {
         let location = LocationDescriptor::new(

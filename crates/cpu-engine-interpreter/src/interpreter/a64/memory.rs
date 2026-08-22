@@ -1,5 +1,4 @@
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{
         DecodedOpcode,
         a64::memory::{Instruction, Operands},
@@ -14,6 +13,7 @@ use nixe_cpu::{
     },
     state::a64::A64State,
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use super::{advance, read, register_offset_address, resume, sign_extend, write};
 use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
@@ -62,7 +62,7 @@ pub(super) fn execute(
 fn exclusive(
     context: InterpreterContext<'_>,
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     instruction: Instruction,
@@ -130,7 +130,7 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
 
 fn literal(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: Operands,
@@ -153,7 +153,7 @@ fn literal(
 
 fn unsigned(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
@@ -175,7 +175,7 @@ fn unsigned(
 
 fn indexed(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     instruction: Instruction,
@@ -216,7 +216,7 @@ fn indexed(
 
 fn register_offset(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
@@ -244,7 +244,7 @@ fn register_offset(
 
 fn pair(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
@@ -297,7 +297,7 @@ fn pair(
 
 fn acquire_release(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     instruction: Instruction,
@@ -327,7 +327,7 @@ fn acquire_release(
 
 fn transfer(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     address: GuestVirtualAddress,

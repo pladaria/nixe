@@ -1,10 +1,10 @@
 //! IR structural and semantic verification.
 
 use core::fmt;
+use nixe_memory::GuestVirtualAddress;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    address::GuestVirtualAddress,
     location::{ExecutionState, InstructionSize, LocationDescriptor},
     memory::MemoryAccessClass,
 };
@@ -1286,8 +1286,11 @@ fn verify_state_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{
+        ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    };
+
     use crate::{
-        address::{CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
         ir::{
             block::{BlockMetadata, InstructionSource},
             op::{
@@ -1317,8 +1320,8 @@ mod tests {
     fn dependency() -> CodePageDependency {
         CodePageDependency {
             page: GuestPhysicalPageId::new(2),
-            generation: CodeGeneration::new(4),
-            mapping_generation: crate::address::MappingGeneration::new(1),
+            generation: ContentGeneration::new(4),
+            mapping_generation: MappingGeneration::new(1),
         }
     }
 

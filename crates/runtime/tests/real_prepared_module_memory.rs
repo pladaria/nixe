@@ -5,7 +5,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
     MemoryPermissions as CpuPermissions, MemoryValue, SYNTHETIC_PAGE_SIZE, SyntheticMemory,
@@ -18,6 +17,7 @@ use nixe_loader_executable::{
     PreparedModule, SymbolResolution,
 };
 use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::install_prepared_module;
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(0x100);

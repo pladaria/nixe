@@ -1,15 +1,6 @@
 use super::*;
 
 #[test]
-fn builder_propagates_runtime_diagnostics_to_cpu_resources() {
-    let builder = reference_process_builder();
-    assert_eq!(
-        builder.cpu_diagnostics().report_detail,
-        nixe_cpu::coverage::MissingInstructionReportDetail::Detailed
-    );
-}
-
-#[test]
 fn npdm_address_space_values_keep_distinct_runtime_meanings() {
     assert_eq!(
         ProcessAddressSpace::from_npdm(AddressSpaceType::AddressSpace32Bit),

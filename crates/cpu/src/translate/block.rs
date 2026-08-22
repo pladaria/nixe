@@ -1,9 +1,9 @@
 //! State-independent translation-block formation and cut policy.
 
 use core::{fmt, num::NonZeroU32};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{
-    address::{AddressSpaceId, GuestVirtualAddress},
     decode::{DecodeResult, DecodedOpcode, OperandId, OperandValue},
     error::{FrontendError, FrontendInternalError, InvalidIr},
     ir::{
@@ -592,8 +592,9 @@ fn internal(reason: impl Into<Box<str>>) -> FrontendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{ContentGeneration, GuestPhysicalPageId, MappingGeneration};
+
     use crate::{
-        address::{CodeGeneration, GuestPhysicalPageId},
         ir::{
             op::{Condition, FlagOperation, OperationKind, StateRegister},
             terminator::ControlTarget,
@@ -1287,8 +1288,8 @@ mod tests {
         let source = start(profile, 0x1000, ExecutionState::T32);
         let dependency = CodePageDependency {
             page: GuestPhysicalPageId::new(1),
-            generation: CodeGeneration::new(2),
-            mapping_generation: crate::address::MappingGeneration::new(1),
+            generation: ContentGeneration::new(2),
+            mapping_generation: MappingGeneration::new(1),
         };
         let return_address = GuestVirtualAddress::new(0x1004);
         let target = ControlTarget::Direct {

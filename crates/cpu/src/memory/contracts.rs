@@ -2,12 +2,11 @@
 
 use std::fmt::{Display, Formatter};
 
-use crate::{
-    address::{
-        AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
-    },
-    error::{InstructionFetchFault, InstructionFetchFaultReason},
+use nixe_memory::{
+    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
 };
+
+use crate::error::{InstructionFetchFault, InstructionFetchFaultReason};
 
 pub use nixe_memory::MemoryPermissions;
 
@@ -82,7 +81,7 @@ pub struct CodePageDependency {
     /// Stable physical-page identity, shared by virtual aliases.
     pub page: GuestPhysicalPageId,
     /// Monotonic content generation observed during the fetch.
-    pub generation: CodeGeneration,
+    pub generation: ContentGeneration,
     /// Generation of the virtual mapping used for the fetch.
     pub mapping_generation: MappingGeneration,
 }

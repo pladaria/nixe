@@ -72,23 +72,6 @@ pub enum FpOperation {
     RoundToIntegral { exact: bool },
 }
 
-impl FpOperation {
-    /// Only sign-bit transforms are intrinsically exact without host FP state.
-    #[must_use]
-    pub const fn execution_path(self) -> FpExecutionPath {
-        match self {
-            Self::Abs | Self::Negate => FpExecutionPath::BitExact,
-            _ => FpExecutionPath::ArchitecturalProvider,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FpExecutionPath {
-    BitExact,
-    ArchitecturalProvider,
-}
-
 /// A semantic request carrying raw operands, including NaN payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FpRequest {

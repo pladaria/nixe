@@ -228,13 +228,6 @@ pub enum MaxwellThreeDMmeExecutionError {
     },
 }
 
-/// Successful, bounded execution statistics for one MME invocation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellThreeDMmeExecutionReport {
-    pub instructions: u32,
-    pub emitted_methods: u32,
-}
-
 /// Host services used by the ISA interpreter.
 pub(super) trait MaxwellThreeDMmeHost {
     type Error;
@@ -276,7 +269,7 @@ impl MaxwellThreeDMmeState {
         macro_index: u8,
         parameters: &[u32],
         host: &mut H,
-    ) -> Result<MaxwellThreeDMmeExecutionReport, MaxwellThreeDMmeRunError<H::Error>> {
+    ) -> Result<(), MaxwellThreeDMmeRunError<H::Error>> {
         let start = self
             .start_address(MaxwellThreeDMmeRamAddress::new(u32::from(macro_index)))
             .and_then(MaxwellThreeDRegister::value)
@@ -313,10 +306,7 @@ impl MaxwellThreeDMmeState {
                 },
             ));
         }
-        Ok(MaxwellThreeDMmeExecutionReport {
-            instructions: interpreter.instructions,
-            emitted_methods: interpreter.emitted_methods,
-        })
+        Ok(())
     }
 }
 

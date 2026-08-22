@@ -1,7 +1,6 @@
 //! Encoding-independent AArch32 reference semantics shared by A32 and T32.
 
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestVirtualAddress},
     decode::aarch32::{
         DataOperation, DataProcessing, MemoryOffset, MemorySize, MultipleTransfer, ShiftAmount,
         ShifterOperand, SingleTransfer,
@@ -17,6 +16,7 @@ use nixe_cpu::{
     },
     state::a32::{A32GeneralRegister, A32State, Cpsr},
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SemanticControl {

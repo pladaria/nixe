@@ -7,7 +7,6 @@ mod memory;
 
 use super::{InterpreterContext, InterpreterError, InterpreterOutcome};
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{
         DecodedOpcode,
         a32::{A32Instruction, normalize},
@@ -16,6 +15,7 @@ use nixe_cpu::{
     semantics::conditions::evaluate_a32,
     state::a32::A32State,
 };
+use nixe_memory::GuestVirtualAddress;
 
 pub(super) fn execute(
     context: InterpreterContext<'_>,

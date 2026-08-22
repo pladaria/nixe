@@ -137,14 +137,6 @@ impl RuntimeCoordinator {
         Ok(report)
     }
 
-    /// Blocks only at the external ingress when no guest thread is runnable.
-    pub fn wait_for_external_event(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
-        let event = self.inbox.recv_sequenced()?;
-        let mut report = CoordinatorDrainReport::default();
-        self.apply_external_event(event, &mut report)?;
-        Ok(report)
-    }
-
     /// Waits for external ingress only until the composition root must service
     /// another host-owned deadline. Expiry is observable as `None` and never
     /// manufactures guest readiness or advances virtual time.

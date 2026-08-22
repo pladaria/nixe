@@ -142,12 +142,6 @@ impl CanonicalBackingSegment {
         self.cpu_write_epoch
     }
 
-    /// Returns the latest published CPU-write epoch for this segment's store.
-    #[must_use]
-    pub fn current_cpu_write_epoch(&self) -> CpuWriteEpoch {
-        self.backing.cpu_write_epoch()
-    }
-
     /// Returns the mapping generation captured during translation.
     #[must_use]
     pub const fn mapping_generation(&self) -> MappingGeneration {

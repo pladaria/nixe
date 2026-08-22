@@ -92,11 +92,6 @@ impl ExeFsArchive {
     pub const fn as_pfs0(&self) -> &Pfs0Archive {
         &self.pfs0
     }
-
-    /// Converts this semantic ExeFS view back into its generic PFS0 view.
-    pub fn into_pfs0(self) -> Pfs0Archive {
-        self.pfs0
-    }
 }
 
 #[cfg(test)]

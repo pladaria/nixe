@@ -51,15 +51,6 @@ impl<B> InputManager<B> {
     pub const fn backend(&self) -> &B {
         &self.backend
     }
-
-    pub const fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
-    }
-
-    #[must_use]
-    pub fn into_backend(self) -> B {
-        self.backend
-    }
 }
 
 impl<B: HostInputBackend> InputManager<B> {

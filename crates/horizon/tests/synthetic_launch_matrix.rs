@@ -326,7 +326,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .memory()
         .mapping_info(
             process.cpu_context().address_space_id(),
-            nixe_cpu::address::GuestVirtualAddress::new(process.entry_module().entry_address()),
+            nixe_memory::GuestVirtualAddress::new(process.entry_module().entry_address()),
         )
         .unwrap();
     assert_eq!(entry_mapping.purpose, MemoryMappingPurpose::CodeStatic);

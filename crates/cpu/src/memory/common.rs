@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
 
 use super::{
     DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAttributes,

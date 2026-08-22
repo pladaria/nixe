@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
-use nixe_cpu::address::GuestVirtualAddress;
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{
     DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAttributes,
@@ -19,6 +18,7 @@ use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_memory::CanonicalRangeTranslationError;
+use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -1724,6 +1724,7 @@ fn query_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::AddressSpaceId;
     use nixe_runtime::EventObject;
 
     #[test]
@@ -1867,7 +1868,7 @@ mod tests {
 
     #[test]
     fn emulator_generation_exhaustion_is_never_fabricated_as_a_guest_result() {
-        let address_space = nixe_cpu::address::AddressSpaceId::new(1);
+        let address_space = AddressSpaceId::new(1);
         let address = GuestVirtualAddress::new(0x1000);
         let faults = [
             HorizonSvcFault::GuestMemory {
@@ -1902,7 +1903,7 @@ mod tests {
 
     #[test]
     fn canonical_backing_failures_are_never_fabricated_as_guest_results() {
-        let address_space = nixe_cpu::address::AddressSpaceId::new(1);
+        let address_space = AddressSpaceId::new(1);
         let address = GuestVirtualAddress::new(0x1000);
         let faults = [
             HorizonSvcFault::GuestMemory {

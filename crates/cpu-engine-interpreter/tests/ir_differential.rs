@@ -3,7 +3,6 @@ mod support;
 use std::num::NonZeroU32;
 
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     ir::terminator::ExceptionKind,
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{
@@ -21,6 +20,7 @@ use nixe_cpu::{
 use nixe_cpu_engine_interpreter::{
     InterpreterContext, InterpreterOutcome, execute_one_with_context,
 };
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 use support::ir_evaluator::{IrReferenceEvaluator, ReferenceOutcome};
 
 const ADDRESS_SPACE: AddressSpaceId = AddressSpaceId::new(0x4449_4646);

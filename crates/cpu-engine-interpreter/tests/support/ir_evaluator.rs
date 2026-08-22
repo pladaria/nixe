@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestVirtualAddress},
     ir::{
         block::IrBlock,
         op::{
@@ -21,6 +20,7 @@ use nixe_cpu::{
         a64::{A64Register, Nzcv},
     },
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReferenceOutcome {

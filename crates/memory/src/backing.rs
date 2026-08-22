@@ -571,11 +571,6 @@ impl CanonicalBackingPage {
         }
     }
 
-    /// Computes the next content generation without modifying bytes.
-    pub fn next_content_generation(&self) -> Result<ContentGeneration, GenerationExhausted> {
-        self.content_generation().next()
-    }
-
     /// Materializes zero storage before a multi-page write is published.
     ///
     /// Allocation may fail, but a successful call does not change guest bytes
