@@ -472,7 +472,6 @@ impl Presenter {
         self.queue.submit([encoder.finish()]);
         self.queue.present(surface_texture);
         let now = Instant::now();
-        self.frame_rate.record_present();
         self.refresh_title(now);
         if reconfigure_after_present {
             self.surface
@@ -506,7 +505,7 @@ const FRAME_RATE_SMOOTHING_WEIGHT: f64 = 0.35;
 #[derive(Clone, Copy, Debug)]
 struct FrameRateTracker {
     sample_started: Instant,
-    presented_frames: u32,
+    guest_frames: u32,
     frames_per_second: Option<f64>,
 }
 
@@ -514,13 +513,13 @@ impl FrameRateTracker {
     fn new(now: Instant) -> Self {
         Self {
             sample_started: now,
-            presented_frames: 0,
+            guest_frames: 0,
             frames_per_second: None,
         }
     }
 
-    fn record_present(&mut self) {
-        self.presented_frames = self.presented_frames.saturating_add(1);
+    fn record_frame(&mut self) {
+        self.guest_frames = self.guest_frames.saturating_add(1);
     }
 
     fn refresh(&mut self, now: Instant) -> bool {
@@ -528,7 +527,7 @@ impl FrameRateTracker {
         if elapsed < TITLE_REFRESH_INTERVAL {
             return false;
         }
-        let sample = f64::from(self.presented_frames) / elapsed.as_secs_f64();
+        let sample = f64::from(self.guest_frames) / elapsed.as_secs_f64();
         self.frames_per_second = Some(match self.frames_per_second {
             Some(previous) => {
                 previous * (1.0 - FRAME_RATE_SMOOTHING_WEIGHT)
@@ -537,7 +536,7 @@ impl FrameRateTracker {
             None => sample,
         });
         self.sample_started = now;
-        self.presented_frames = 0;
+        self.guest_frames = 0;
         true
     }
 
@@ -586,6 +585,7 @@ impl PresenterApplication {
         };
         if let Some(frame) = self.mailbox.take_latest() {
             presenter.upload(&frame);
+            presenter.frame_rate.record_frame();
         }
         presenter.redraw()
     }
@@ -802,11 +802,11 @@ mod tests {
     }
 
     #[test]
-    fn frame_rate_uses_presented_frames_and_smoothed_half_second_samples() {
+    fn frame_rate_uses_guest_frames_and_smoothed_half_second_samples() {
         let started = Instant::now();
         let mut tracker = FrameRateTracker::new(started);
         for _ in 0..30 {
-            tracker.record_present();
+            tracker.record_frame();
         }
         assert!(!tracker.refresh(started + Duration::from_millis(499)));
         assert!(tracker.frames_per_second().is_none());
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(tracker.frames_per_second(), Some(60.0));
 
         for _ in 0..20 {
-            tracker.record_present();
+            tracker.record_frame();
         }
         assert!(tracker.refresh(started + Duration::from_millis(1000)));
         assert_eq!(tracker.frames_per_second(), Some(53.0));
