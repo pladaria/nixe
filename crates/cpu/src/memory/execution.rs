@@ -25,7 +25,12 @@ use crate::{
     exclusive::ExclusiveReservation,
 };
 
-use super::common::{install_error, page_offset};
+use super::common::{
+    MappingState, PAGE_SIZE, PageRange, ResolvedDataAccess, allocate_page_id,
+    coalesce_mapped_pages, install_error, masked_attributes, memory_query_result, page_address,
+    page_offset, resolve_data_access, take_mapping_generation, validate_install_request,
+    virtual_page, writable_executable,
+};
 use super::{
     CodeDependencies, CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault,
     DataAccessFaultReason, DataAccessKind, DataReadResult, DataWriteResult, FetchedCode,
@@ -36,11 +41,9 @@ use super::{
     SyntheticMmio, SyntheticRamPage,
 };
 
-const PAGE_SHIFT: u32 = SYNTHETIC_PAGE_SIZE.trailing_zeros();
 const LEAF_BITS: u32 = 9;
 const LEAF_ENTRY_COUNT: usize = 1 << LEAF_BITS;
 const LEAF_INDEX_MASK: u64 = (LEAF_ENTRY_COUNT as u64) - 1;
-const _: () = assert!(SYNTHETIC_PAGE_SIZE.is_power_of_two());
 
 #[derive(Clone, Copy)]
 struct ExecutionMapping {
@@ -151,12 +154,6 @@ struct ExecutionMemoryInner {
 }
 
 impl ExecutionMemoryInner {
-    fn take_mapping_generation(&mut self) -> Option<MappingGeneration> {
-        let generation = self.next_mapping_generation?;
-        self.next_mapping_generation = generation.next().ok();
-        Some(generation)
-    }
-
     fn page(&self, slot: usize) -> Option<&ExecutionPhysicalPage> {
         self.physical_slots.get(slot)?.as_ref()
     }
@@ -199,20 +196,14 @@ impl ExecutionMemoryInner {
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Option<ExecutionMapping> {
-        self.mappings
-            .get(address_space, address.get() >> PAGE_SHIFT)
+        self.mappings.get(address_space, virtual_page(address))
     }
 
     fn mapping_state(
         &self,
         address_space: AddressSpaceId,
         virtual_page: u64,
-    ) -> Option<(
-        MemoryRegionKind,
-        MemoryPermissions,
-        MemoryMappingPurpose,
-        MemoryAttributes,
-    )> {
+    ) -> Option<MappingState> {
         let mapping = self.mappings.get(address_space, virtual_page)?;
         let region = match self.page(mapping.physical_slot)? {
             ExecutionPhysicalPage::Ram(_) => MemoryRegionKind::Ram,
@@ -427,42 +418,7 @@ impl ExecutionMemory {
         let mut virtual_pages = Vec::with_capacity(requests.len());
         let mut unique_virtual_pages = BTreeSet::new();
         for request in requests {
-            if !request
-                .virtual_address
-                .is_aligned_to(SYNTHETIC_PAGE_SIZE as u64)
-            {
-                return Err(install_error(
-                    SyntheticInstallStage::Preflight,
-                    Some(request.virtual_address),
-                    "virtual address is not page aligned",
-                ));
-            }
-            if request.bytes.len() != SYNTHETIC_PAGE_SIZE {
-                return Err(install_error(
-                    SyntheticInstallStage::Preflight,
-                    Some(request.virtual_address),
-                    "page contents do not match the synthetic page size",
-                ));
-            }
-            if request
-                .virtual_address
-                .checked_add((SYNTHETIC_PAGE_SIZE - 1) as u64)
-                .is_none()
-            {
-                return Err(install_error(
-                    SyntheticInstallStage::Preflight,
-                    Some(request.virtual_address),
-                    "virtual page range overflows",
-                ));
-            }
-            let virtual_page = request.virtual_address.get() >> PAGE_SHIFT;
-            if !unique_virtual_pages.insert(virtual_page) {
-                return Err(install_error(
-                    SyntheticInstallStage::Preflight,
-                    Some(request.virtual_address),
-                    "request contains a duplicate virtual page",
-                ));
-            }
+            let virtual_page = validate_install_request(*request, &mut unique_virtual_pages)?;
             if inner.mappings.get(address_space, virtual_page).is_some() {
                 return Err(install_error(
                     SyntheticInstallStage::Preflight,
@@ -493,20 +449,10 @@ impl ExecutionMemory {
             )
         })?;
         for (index, request) in requests.iter().enumerate() {
-            while inner
-                .slots_by_id
-                .contains_key(&GuestPhysicalPageId::new(next_page_id))
-            {
-                next_page_id = next_page_id.checked_add(1).ok_or_else(|| {
-                    install_error(
-                        SyntheticInstallStage::Allocation,
-                        Some(request.virtual_address),
-                        "physical-page identities are exhausted",
-                    )
-                })?;
-            }
-            let physical_page = GuestPhysicalPageId::new(next_page_id);
-            next_page_id = next_page_id.checked_add(1).ok_or_else(|| {
+            let physical_page = allocate_page_id(&mut next_page_id, |page| {
+                inner.slots_by_id.contains_key(&page)
+            })
+            .ok_or_else(|| {
                 install_error(
                     SyntheticInstallStage::Allocation,
                     Some(request.virtual_address),
@@ -550,7 +496,7 @@ impl ExecutionMemory {
         let mapping_generation = if pending.is_empty() {
             MappingGeneration::INITIAL
         } else {
-            inner.take_mapping_generation().ok_or_else(|| {
+            take_mapping_generation(&mut inner.next_mapping_generation).ok_or_else(|| {
                 install_error(
                     SyntheticInstallStage::Allocation,
                     requests.first().map(|request| request.virtual_address),
@@ -606,23 +552,18 @@ impl ExecutionMemory {
         size: u64,
         purpose: MemoryMappingPurpose,
     ) -> bool {
-        let page_size = SYNTHETIC_PAGE_SIZE as u64;
-        if size == 0 || !start.is_aligned_to(page_size) || !size.is_multiple_of(page_size) {
-            return false;
-        }
-        let Some(end) = start.get().checked_add(size) else {
+        let Some(range) = PageRange::new(start, size).filter(|range| !range.is_empty()) else {
             return false;
         };
-        let first_page = start.get() >> PAGE_SHIFT;
-        let end_page = end >> PAGE_SHIFT;
         let inner = self.inner_mut();
-        if !(first_page..end_page).all(|page| inner.mappings.get(address_space, page).is_some()) {
+        if !(range.first..range.end).all(|page| inner.mappings.get(address_space, page).is_some()) {
             return false;
         }
-        let Some(mapping_generation) = inner.take_mapping_generation() else {
+        let Some(mapping_generation) = take_mapping_generation(&mut inner.next_mapping_generation)
+        else {
             return false;
         };
-        for page in first_page..end_page {
+        for page in range.first..range.end {
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
@@ -816,18 +757,19 @@ impl ExecutionMemory {
         physical_page: GuestPhysicalPageId,
         permissions: MemoryPermissions,
     ) -> bool {
-        if !virtual_address.is_aligned_to(SYNTHETIC_PAGE_SIZE as u64) {
+        if !virtual_address.is_aligned_to(PAGE_SIZE) {
             return false;
         }
         let inner = self.inner_mut();
         let Some(&physical_slot) = inner.slots_by_id.get(&physical_page) else {
             return false;
         };
-        let virtual_page = virtual_address.get() >> PAGE_SHIFT;
+        let virtual_page = virtual_page(virtual_address);
         if inner.mappings.get(address_space, virtual_page).is_some() {
             return false;
         }
-        let Some(mapping_generation) = inner.take_mapping_generation() else {
+        let Some(mapping_generation) = take_mapping_generation(&mut inner.next_mapping_generation)
+        else {
             return false;
         };
         let previous = inner.mappings.insert(
@@ -916,7 +858,7 @@ impl InstructionMemory for ExecutionMemory {
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Result<CodePageSpan, InstructionFetchFault> {
-        let page_start = GuestVirtualAddress::new(address.get() >> PAGE_SHIFT << PAGE_SHIFT);
+        let page_start = page_address(virtual_page(address));
         let inner = self.lock_inner();
         let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
             InstructionFetchFault::new(
@@ -1077,104 +1019,21 @@ impl CanonicalRangeTranslator for ExecutionMemory {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ResolvedExecutionAccess {
-    first: ExecutionMapping,
-    second: Option<ExecutionMapping>,
-    first_bytes: usize,
-    region: MemoryRegionKind,
-}
-
-fn resolve_data_access(
+fn resolve_access(
     inner: &ExecutionMemoryInner,
     address_space: AddressSpaceId,
     address: GuestVirtualAddress,
     access: MemoryAccess,
     kind: DataAccessKind,
-) -> Result<ResolvedExecutionAccess, DataAccessFault> {
-    let required_alignment = access.alignment.bytes(access.size);
-    if !address.is_aligned_to(u64::from(required_alignment)) {
-        return Err(DataAccessFault::new(
-            address_space,
-            address,
-            kind,
-            DataAccessFaultReason::Misaligned { required_alignment },
-        ));
-    }
-    let byte_count = access.size.bytes();
-    if address.checked_add((byte_count - 1) as u64).is_none() {
-        return Err(DataAccessFault::new(
-            address_space,
-            address,
-            kind,
-            DataAccessFaultReason::AddressOverflow,
-        ));
-    }
-    let first_bytes = (SYNTHETIC_PAGE_SIZE - page_offset(address)).min(byte_count);
-    let second_address = (first_bytes < byte_count).then_some(
-        address
-            .checked_add(first_bytes as u64)
-            .expect("validated access end contains its second page"),
-    );
-    let required = match kind {
-        DataAccessKind::Read => MemoryPermissions::READ,
-        DataAccessKind::Write => MemoryPermissions::WRITE,
-    };
-    let resolve = |current| {
-        let mapping = inner.mapping_at(address_space, current).ok_or_else(|| {
-            DataAccessFault::new(
-                address_space,
-                current,
-                kind,
-                DataAccessFaultReason::Unmapped,
-            )
-        })?;
-        if !mapping.permissions.contains(required) {
-            let permission_fault = match kind {
-                DataAccessKind::Read => DataAccessFaultReason::ReadPermissionDenied,
-                DataAccessKind::Write => DataAccessFaultReason::WritePermissionDenied,
-            };
-            return Err(DataAccessFault::new(
-                address_space,
-                current,
-                kind,
-                permission_fault,
-            ));
-        }
+) -> Result<ResolvedDataAccess<ExecutionMapping>, DataAccessFault> {
+    resolve_data_access(address_space, address, access, kind, |current| {
+        let mapping = inner.mapping_at(address_space, current)?;
         let region = match inner.page(mapping.physical_slot) {
             Some(ExecutionPhysicalPage::Ram(_)) => MemoryRegionKind::Ram,
             Some(ExecutionPhysicalPage::Mmio(_)) => MemoryRegionKind::Device,
-            None => {
-                return Err(DataAccessFault::new(
-                    address_space,
-                    current,
-                    kind,
-                    DataAccessFaultReason::Unmapped,
-                ));
-            }
+            None => return None,
         };
-        Ok((mapping, region))
-    };
-    let (first, region) = resolve(address)?;
-    let second = if let Some(second_address) = second_address {
-        let (second, second_region) = resolve(second_address)?;
-        if region != second_region {
-            return Err(DataAccessFault::new(
-                address_space,
-                second_address,
-                kind,
-                DataAccessFaultReason::MixedRegions,
-            ));
-        }
-        Some(second)
-    } else {
-        None
-    };
-    Ok(ResolvedExecutionAccess {
-        first,
-        second,
-        first_bytes,
-        region,
+        Some((mapping, mapping.permissions, region))
     })
 }
 
@@ -1187,7 +1046,7 @@ impl CpuMemory for ExecutionMemory {
     ) -> Result<DataReadResult, DataAccessFault> {
         let mut inner = self.lock_inner();
         let resolved =
-            resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+            resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
         if resolved.region == MemoryRegionKind::Device {
             if resolved.second.is_some() {
                 return Err(DataAccessFault::new(
@@ -1297,7 +1156,7 @@ impl CpuMemory for ExecutionMemory {
             ));
         }
         let mut inner = self.lock_inner();
-        let resolved = resolve_data_access(
+        let resolved = resolve_access(
             &inner,
             address_space,
             address,
@@ -1480,21 +1339,14 @@ impl CpuMemory for ExecutionMemory {
             return None;
         }
         let inner = self.lock_inner();
-        let page_size = SYNTHETIC_PAGE_SIZE as u64;
-        let page = address.get() >> PAGE_SHIFT;
-        let end_page = end_exclusive.get() >> PAGE_SHIFT;
+        let page = virtual_page(address);
+        let end_page = virtual_page(end_exclusive);
         let state = inner.mapping_state(address_space, page);
 
         let (first_page, last_page_exclusive) = if let Some(state) = state {
-            let mut first = page;
-            while first > 0 && inner.mapping_state(address_space, first - 1) == Some(state) {
-                first -= 1;
-            }
-            let mut last = page + 1;
-            while last < end_page && inner.mapping_state(address_space, last) == Some(state) {
-                last += 1;
-            }
-            (first, last)
+            coalesce_mapped_pages(page, end_page, state, |page| {
+                inner.mapping_state(address_space, page)
+            })
         } else {
             let mut previous = 0;
             let mut next = end_page;
@@ -1510,26 +1362,7 @@ impl CpuMemory for ExecutionMemory {
             }
             (previous.min(page), next.max(page + 1))
         };
-        let base = first_page.checked_mul(page_size)?;
-        let end = last_page_exclusive.checked_mul(page_size)?;
-        let (region, permissions, purpose, attributes) = state
-            .map(|(region, permissions, purpose, attributes)| {
-                (Some(region), permissions, purpose, attributes)
-            })
-            .unwrap_or((
-                None,
-                MemoryPermissions::NONE,
-                MemoryMappingPurpose::Normal,
-                MemoryAttributes::NONE,
-            ));
-        Some(MemoryQueryResult {
-            base: GuestVirtualAddress::new(base),
-            size: end.checked_sub(base)?,
-            region,
-            permissions,
-            purpose,
-            attributes,
-        })
+        memory_query_result(first_page, last_page_exclusive, state)
     }
 
     fn load_exclusive(
@@ -1540,7 +1373,7 @@ impl CpuMemory for ExecutionMemory {
     ) -> Result<(DataReadResult, ExclusiveReservation), DataAccessFault> {
         let inner = self.lock_inner();
         let resolved =
-            resolve_data_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+            resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
         if resolved.second.is_some() {
             return Err(DataAccessFault::new(
                 address_space,
@@ -1604,7 +1437,7 @@ impl CpuMemory for ExecutionMemory {
             ));
         }
         let inner = self.lock_inner();
-        let resolved = resolve_data_access(
+        let resolved = resolve_access(
             &inner,
             address_space,
             address,
@@ -1711,41 +1544,37 @@ impl ProcessMemory for ExecutionMemory {
         permissions: MemoryPermissions,
         purpose: MemoryMappingPurpose,
     ) -> Result<(), MemoryMappingError> {
-        let page_size = SYNTHETIC_PAGE_SIZE as u64;
         let error = |address, reason| MemoryMappingError {
             address_space,
             address,
             reason,
         };
-        if !start.is_aligned_to(page_size)
-            || !old_size.is_multiple_of(page_size)
-            || !new_size.is_multiple_of(page_size)
-            || start.get().checked_add(old_size.max(new_size)).is_none()
-        {
+        let (Some(old_range), Some(new_range)) = (
+            PageRange::new(start, old_size),
+            PageRange::new(start, new_size),
+        ) else {
             return Err(error(start, MemoryMappingErrorReason::InvalidRange));
-        }
-        if permissions.contains(MemoryPermissions::WRITE)
-            && permissions.contains(MemoryPermissions::EXECUTE)
-        {
+        };
+        if writable_executable(permissions) {
             return Err(error(start, MemoryMappingErrorReason::WritableExecutable));
         }
 
-        let first_page = start.get() >> PAGE_SHIFT;
-        let old_end_page = first_page + old_size / page_size;
-        let new_end_page = first_page + new_size / page_size;
+        let first_page = old_range.first;
+        let old_end_page = old_range.end;
+        let new_end_page = new_range.end;
         let backing_store = self.backing_store.clone();
         let mut mutation = self.begin_mapping_mutation();
         let mut inner = self.lock_inner();
         for page in first_page..old_end_page {
             let Some(mapping) = inner.mappings.get(address_space, page) else {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryMappingErrorReason::MappingStateMismatch,
                 ));
             };
             if mapping.purpose != purpose || mapping.permissions != permissions {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryMappingErrorReason::MappingStateMismatch,
                 ));
             }
@@ -1753,7 +1582,7 @@ impl ProcessMemory for ExecutionMemory {
         for page in old_end_page..new_end_page {
             if inner.mappings.get(address_space, page).is_some() {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryMappingErrorReason::AlreadyMapped,
                 ));
             }
@@ -1802,18 +1631,10 @@ impl ProcessMemory for ExecutionMemory {
             .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
         let mut next_page_id = inner.next_page_id;
         for page in old_end_page..new_end_page {
-            while inner
-                .slots_by_id
-                .contains_key(&GuestPhysicalPageId::new(next_page_id))
-            {
-                next_page_id = next_page_id
-                    .checked_add(1)
-                    .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
-            }
-            let physical_page = GuestPhysicalPageId::new(next_page_id);
-            next_page_id = next_page_id
-                .checked_add(1)
-                .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+            let physical_page = allocate_page_id(&mut next_page_id, |page| {
+                inner.slots_by_id.contains_key(&page)
+            })
+            .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
             let backing = CanonicalBackingPage::zeroed(
                 &backing_store,
                 physical_page,
@@ -1826,8 +1647,7 @@ impl ProcessMemory for ExecutionMemory {
         let mapping_generation = if pending.is_empty() {
             MappingGeneration::INITIAL
         } else {
-            inner
-                .take_mapping_generation()
+            take_mapping_generation(&mut inner.next_mapping_generation)
                 .ok_or_else(|| error(start, MemoryMappingErrorReason::GenerationExhausted))?
         };
         for (page, physical_page, backing) in pending {
@@ -1860,35 +1680,26 @@ impl ProcessMemory for ExecutionMemory {
         size: u64,
         permissions: MemoryPermissions,
     ) -> Result<(), MemoryProtectionError> {
-        let page_size = SYNTHETIC_PAGE_SIZE as u64;
         let error = |address, reason| MemoryProtectionError {
             address_space,
             address,
             reason,
         };
-        if size == 0 || !start.is_aligned_to(page_size) || !size.is_multiple_of(page_size) {
+        let Some(range) = PageRange::new(start, size).filter(|range| !range.is_empty()) else {
             return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
-        }
-        if permissions.contains(MemoryPermissions::WRITE)
-            && permissions.contains(MemoryPermissions::EXECUTE)
-        {
+        };
+        if writable_executable(permissions) {
             return Err(error(
                 start,
                 MemoryProtectionErrorReason::WritableExecutable,
             ));
         }
-        let end = start
-            .get()
-            .checked_add(size)
-            .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
-        let first_page = start.get() >> PAGE_SHIFT;
-        let end_page = end >> PAGE_SHIFT;
         let mut mutation = self.begin_mapping_mutation();
         let mut inner = self.lock_inner();
-        for page in first_page..end_page {
+        for page in range.first..range.end {
             let Some(mapping) = inner.mappings.get(address_space, page) else {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryProtectionErrorReason::Unmapped,
                 ));
             };
@@ -1898,12 +1709,12 @@ impl ProcessMemory for ExecutionMemory {
                 && mapping.permissions != permissions
             {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryProtectionErrorReason::PermissionLocked,
                 ));
             }
         }
-        let changed = (first_page..end_page).any(|page| {
+        let changed = (range.first..range.end).any(|page| {
             inner
                 .mappings
                 .get(address_space, page)
@@ -1912,10 +1723,9 @@ impl ProcessMemory for ExecutionMemory {
         if !changed {
             return Ok(());
         }
-        let mapping_generation = inner
-            .take_mapping_generation()
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
-        for page in first_page..end_page {
+        for page in range.first..range.end {
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
@@ -1935,57 +1745,46 @@ impl ProcessMemory for ExecutionMemory {
         mask: MemoryAttributes,
         value: MemoryAttributes,
     ) -> Result<(), MemoryProtectionError> {
-        let page_size = SYNTHETIC_PAGE_SIZE as u64;
         let error = |address, reason| MemoryProtectionError {
             address_space,
             address,
             reason,
         };
-        if size == 0
-            || !start.is_aligned_to(page_size)
-            || !size.is_multiple_of(page_size)
-            || value.bits() & !mask.bits() != 0
-        {
+        let Some(range) = PageRange::new(start, size).filter(|range| !range.is_empty()) else {
+            return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
+        };
+        if masked_attributes(MemoryAttributes::NONE, mask, value).is_none() {
             return Err(error(start, MemoryProtectionErrorReason::InvalidRange));
         }
-        let end = start
-            .get()
-            .checked_add(size)
-            .ok_or_else(|| error(start, MemoryProtectionErrorReason::InvalidRange))?;
-        let first_page = start.get() >> PAGE_SHIFT;
-        let end_page = end >> PAGE_SHIFT;
         let mut mutation = self.begin_mapping_mutation();
         let mut inner = self.lock_inner();
-        for page in first_page..end_page {
+        for page in range.first..range.end {
             if inner.mappings.get(address_space, page).is_none() {
                 return Err(error(
-                    GuestVirtualAddress::new(page * page_size),
+                    page_address(page),
                     MemoryProtectionErrorReason::Unmapped,
                 ));
             }
         }
-        let changed = (first_page..end_page).any(|page| {
+        let changed = (range.first..range.end).any(|page| {
             let mapping = inner
                 .mappings
                 .get(address_space, page)
                 .expect("attribute range was preflighted");
-            let bits = (mapping.attributes.bits() & !mask.bits()) | value.bits();
-            mapping.attributes.bits() != bits
+            mapping.attributes != masked_attributes(mapping.attributes, mask, value).unwrap()
         });
         if !changed {
             return Ok(());
         }
-        let mapping_generation = inner
-            .take_mapping_generation()
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
-        for page in first_page..end_page {
+        for page in range.first..range.end {
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
                 .expect("attribute range was preflighted");
-            let bits = (mapping.attributes.bits() & !mask.bits()) | value.bits();
-            mapping.attributes = MemoryAttributes::from_bits(bits)
-                .expect("existing, masked, and replacement attributes are bounded");
+            mapping.attributes = masked_attributes(mapping.attributes, mask, value)
+                .expect("attribute mask was validated");
             mapping.mapping_generation = mapping_generation;
         }
         mutation.commit();
