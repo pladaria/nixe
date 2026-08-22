@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
+    sync::Arc,
 };
 
 use nixe_gpu::{
@@ -79,7 +80,7 @@ impl MaxwellShaderExecutableRange {
 // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L3407-L3448
 
 /// Common fields decoded from one version-3 Maxwell shader program header.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MaxwellShaderProgramHeader {
     words: [u32; MAXWELL_SHADER_PROGRAM_HEADER_SIZE / 4],
     sph_type: u8,
@@ -105,7 +106,7 @@ pub(crate) struct MaxwellShaderSourceSegment {
 }
 
 /// One scheduling-control word and its three SM50 instruction slots.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MaxwellShaderInstructionBundle {
     offset: u32,
     control: u64,
@@ -113,7 +114,7 @@ pub(crate) struct MaxwellShaderInstructionBundle {
 }
 
 /// Immutable, bounded Maxwell program snapshot before semantic translation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MaxwellShaderBinary {
     address: u64,
     header: MaxwellShaderProgramHeader,
@@ -129,14 +130,12 @@ pub(crate) struct MaxwellShaderBinary {
 /// before rebuilding IR or WGSL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellShaderTranslationInputs {
-    options: MaxwellShaderTranslationOptions,
-    programs: Box<[MaxwellShaderProgramTranslationInput]>,
+    programs: Box<[Arc<MaxwellShaderProgramTranslationInput>]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct MaxwellShaderProgramTranslationInput {
     pipeline: u8,
-    stage: MaxwellThreeDShaderStage,
     register_count: u8,
     effective_group: Option<u8>,
     texture_constant_buffer_slot: Option<u8>,
@@ -153,50 +152,24 @@ impl MaxwellShaderTranslationInputs {
                 .zip(other.programs.iter())
                 .all(|(left, right)| {
                     left.pipeline == right.pipeline
-                        && left.stage == right.stage
+                        && left.binary.header.stage == right.binary.header.stage
                         && left.binary.address == right.binary.address
                 })
     }
 }
 
-const MAXWELL_SHADER_TRANSLATOR_REVISION: u32 = 2;
-
-/// Semantics-affecting translation choices included in cache identity.
-///
-/// Adding a mode here is intentionally a cache-breaking change: a module
-/// produced under one numeric or validation policy must never be reused under
-/// another policy merely because the guest bytes are unchanged.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct MaxwellShaderTranslationOptions {
-    translator_revision: u32,
-    require_structured_exit: bool,
-}
-
-const MAXWELL_SHADER_TRANSLATION_OPTIONS: MaxwellShaderTranslationOptions =
-    MaxwellShaderTranslationOptions {
-        translator_revision: MAXWELL_SHADER_TRANSLATOR_REVISION,
-        require_structured_exit: true,
-    };
-
 /// Complete identity of one translation input, independent from GPU VA reuse.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MaxwellShaderTranslationKey {
-    stage: MaxwellThreeDShaderStage,
-    entry_point: u64,
-    register_count: u8,
-    options: MaxwellShaderTranslationOptions,
-    source_segments: Box<[MaxwellShaderSourceSegment]>,
-    staged_overlay: Box<[MaxwellStagedShaderWrite]>,
+    input: Arc<MaxwellShaderProgramTranslationInput>,
     resource_binding_remap: Box<[(u8, u8)]>,
     linked_output_interpolation: Box<[(ShaderIoLocation, ShaderInterpolation)]>,
-    vertex_input_types: Box<[(ShaderIoLocation, ShaderScalarType)]>,
 }
 
 impl MaxwellShaderTranslationKey {
     pub(crate) fn same_program_binding(&self, other: &Self) -> bool {
-        self.stage == other.stage
-            && self.entry_point == other.entry_point
-            && self.options == other.options
+        self.input.binary.header.stage == other.input.binary.header.stage
+            && self.input.binary.address == other.input.binary.address
     }
 }
 
@@ -204,13 +177,9 @@ impl MaxwellShaderTranslationKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellTranslatedShaderProgram {
     key: MaxwellShaderTranslationKey,
-    stage: ShaderStage,
-    bind_group: Option<u8>,
-    ir: VerifiedShaderIr,
     module: ShaderBackendModule,
     directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
     maximum_api_visible_calls: u16,
-    texture_constant_buffer_slot: Option<u8>,
     texture_bindings: Box<[MaxwellTextureResourceBinding]>,
 }
 
@@ -227,16 +196,16 @@ impl MaxwellTranslatedShaderProgram {
         &self.key
     }
 
-    pub(crate) const fn stage(&self) -> ShaderStage {
-        self.stage
+    pub(crate) fn stage(&self) -> ShaderStage {
+        self.module.stage()
     }
 
-    pub(crate) const fn bind_group(&self) -> Option<u8> {
-        self.bind_group
+    pub(crate) fn bind_group(&self) -> Option<u8> {
+        self.key.input.effective_group
     }
 
     pub(crate) fn resources(&self) -> &[ShaderResourceAccess] {
-        self.ir.ir().resources()
+        self.module.ir().ir().resources()
     }
 
     pub(crate) fn local_resource_binding(&self, neutral_binding: u8) -> Option<u8> {
@@ -263,8 +232,8 @@ impl MaxwellTranslatedShaderProgram {
         self.directly_addressable_memory
     }
 
-    pub(crate) const fn texture_constant_buffer_slot(&self) -> Option<u8> {
-        self.texture_constant_buffer_slot
+    pub(crate) fn texture_constant_buffer_slot(&self) -> Option<u8> {
+        self.key.input.texture_constant_buffer_slot
     }
 
     pub(crate) fn texture_bindings(&self) -> &[MaxwellTextureResourceBinding] {
@@ -288,7 +257,7 @@ impl MaxwellTextureResourceBinding {
 }
 
 struct TranslatedShaderIr {
-    ir: VerifiedShaderIr,
+    ir: ShaderIr,
     texture_bindings: Box<[MaxwellTextureResourceBinding]>,
 }
 
@@ -1182,14 +1151,7 @@ fn translate_shader_binary(
             .expect("read-only sampler access is valid"),
         );
     }
-    let ir = VerifiedShaderIr::verify(ShaderIr::new(
-        neutral_stage,
-        inputs,
-        outputs,
-        resources,
-        instructions,
-    ))
-    .map_err(MaxwellShaderTranslationError::from)?;
+    let ir = ShaderIr::new(neutral_stage, inputs, outputs, resources, instructions);
     Ok(TranslatedShaderIr {
         ir,
         texture_bindings: texture_bindings.values().copied().collect(),
@@ -3937,7 +3899,6 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs(
         };
         programs.push(MaxwellShaderProgramTranslationInput {
             pipeline: pipeline_index,
-            stage,
             register_count,
             effective_group: pipeline.effective_group(),
             texture_constant_buffer_slot: bindings
@@ -3953,56 +3914,53 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs(
     }
 
     Ok(MaxwellShaderTranslationInputs {
-        options: MAXWELL_SHADER_TRANSLATION_OPTIONS,
-        programs: programs.into_boxed_slice(),
+        programs: programs.into_iter().map(Arc::new).collect(),
     })
 }
 
 pub(crate) fn translate_prepared_maxwell_shader_programs(
     inputs: &MaxwellShaderTranslationInputs,
 ) -> Result<Vec<MaxwellTranslatedShaderProgram>, MaxwellShaderTranslationError> {
-    let mut programs = Vec::with_capacity(inputs.programs.len());
+    let mut translated = Vec::with_capacity(inputs.programs.len());
     for input in &inputs.programs {
         let vertex_input_types = input.vertex_input_types.iter().copied().collect();
-        let translated =
-            translate_shader_binary(&input.binary, input.register_count, &vertex_input_types)?;
-        let texture_constant_buffer_slot = if translated.texture_bindings.is_empty() {
-            input.texture_constant_buffer_slot
-        } else {
-            Some(input.texture_constant_buffer_slot.ok_or(
-                MaxwellShaderTranslationError::IncompletePipelineBinding {
-                    pipeline: input.pipeline,
-                    field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
-                },
-            )?)
-        };
-        let ir = translated.ir;
-        let bind_group = if ir.ir().resources().is_empty() {
-            input.effective_group
-        } else {
-            Some(input.effective_group.ok_or(
-                MaxwellShaderTranslationError::IncompletePipelineBinding {
-                    pipeline: input.pipeline,
-                    field: "SET_PIPELINE_BINDING group",
-                },
-            )?)
-        };
+        translated.push(translate_shader_binary(
+            &input.binary,
+            input.register_count,
+            &vertex_input_types,
+        )?);
+    }
+
+    validate_graphics_stage_interfaces(&translated)?;
+    let global_bindings = graphics_resource_bindings(inputs, &translated)?;
+    let linked_interpolation = graphics_output_interpolation(&translated);
+    let mut programs = Vec::with_capacity(translated.len());
+    for (input, mut translated) in inputs.programs.iter().zip(translated) {
+        let stage = input.binary.header.stage;
+        let local_bindings = program_resource_bindings(input, &translated, &global_bindings)?;
+        for texture in &mut translated.texture_bindings {
+            texture.image_binding =
+                remapped_binding(&local_bindings, stage, texture.image_binding)?;
+            texture.sampler_binding =
+                remapped_binding(&local_bindings, stage, texture.sampler_binding)?;
+        }
+        let output_interpolation = (neutral_stage(stage) == ShaderStage::Vertex)
+            .then_some(linked_interpolation.as_slice())
+            .unwrap_or_default();
+        let ir = finalize_shader_ir(translated.ir, stage, &local_bindings, output_interpolation)?;
+        if !translated.texture_bindings.is_empty() && input.texture_constant_buffer_slot.is_none() {
+            return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {
+                pipeline: input.pipeline,
+                field: "SET_BINDLESS_TEXTURE_CONSTANT_BUFFER_SLOT",
+            });
+        }
         let module = lower_shader_ir_to_wgsl(&ir)?;
         programs.push(MaxwellTranslatedShaderProgram {
             key: MaxwellShaderTranslationKey {
-                stage: input.stage,
-                entry_point: input.binary.address,
-                register_count: input.register_count,
-                options: inputs.options,
-                source_segments: input.binary.source_segments.clone(),
-                staged_overlay: input.binary.staged_overlay.clone(),
-                resource_binding_remap: Box::new([]),
-                linked_output_interpolation: Box::new([]),
-                vertex_input_types: input.vertex_input_types.clone(),
+                input: Arc::clone(input),
+                resource_binding_remap: local_bindings.into_iter().collect(),
+                linked_output_interpolation: output_interpolation.into(),
             },
-            stage: neutral_stage(input.stage),
-            bind_group,
-            ir,
             module,
             // No currently translated SASS operation addresses Maxwell
             // local/shared memory. Keep this explicit so adding that family
@@ -4010,16 +3968,9 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             // silently consuming unrelated or absent class state.
             directly_addressable_memory: None,
             maximum_api_visible_calls: 0,
-            texture_constant_buffer_slot,
             texture_bindings: translated.texture_bindings,
         });
     }
-
-    remap_graphics_resource_bindings(&mut programs)?;
-
-    validate_graphics_stage_interfaces(&programs)?;
-    link_graphics_stage_interpolation(&mut programs)?;
-
     Ok(programs)
 }
 
@@ -4061,16 +4012,15 @@ fn maxwell_vertex_input_types(
 /// Maxwell records interpolation on fragment `IPA` inputs. Copy that linked
 /// contract onto matching vertex outputs before backend lowering so derived
 /// rasterization paths can preserve the same interpolation planes.
-fn link_graphics_stage_interpolation(
-    programs: &mut [MaxwellTranslatedShaderProgram],
-) -> Result<(), MaxwellShaderTranslationError> {
-    let fragment_inputs = programs
+fn graphics_output_interpolation(
+    programs: &[TranslatedShaderIr],
+) -> Vec<(ShaderIoLocation, ShaderInterpolation)> {
+    programs
         .iter()
-        .find(|program| program.stage == ShaderStage::Fragment)
+        .find(|program| program.ir.stage() == ShaderStage::Fragment)
         .map(|fragment| {
             fragment
                 .ir
-                .ir()
                 .inputs()
                 .iter()
                 .filter_map(|input| {
@@ -4079,61 +4029,32 @@ fn link_graphics_stage_interpolation(
                         .map(|interpolation| (input.location(), interpolation))
                 })
                 .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect()
         })
-        .unwrap_or_default();
-    let Some(vertex) = programs
-        .iter_mut()
-        .find(|program| program.stage == ShaderStage::Vertex)
-    else {
-        return Ok(());
-    };
-    let outputs = vertex
-        .ir
-        .ir()
-        .outputs()
-        .iter()
-        .map(|output| {
-            ShaderInterfaceElement::new(
-                output.location(),
-                output.component(),
-                output.scalar_type(),
-                fragment_inputs.get(&output.location()).copied(),
-            )
-            .expect("linking preserves the verified interface shape")
-        })
-        .collect::<Vec<_>>();
-    vertex.ir = VerifiedShaderIr::verify(ShaderIr::new(
-        vertex.ir.ir().stage(),
-        vertex.ir.ir().inputs().to_vec(),
-        outputs,
-        vertex.ir.ir().resources().to_vec(),
-        vertex.ir.ir().instructions().to_vec(),
-    ))?;
-    vertex.key.linked_output_interpolation = fragment_inputs.into_iter().collect();
-    vertex.module = lower_shader_ir_to_wgsl(&vertex.ir)?;
-    Ok(())
+        .unwrap_or_default()
 }
 
 /// Maxwell resource numbers are local to a shader binding group, whereas the
 /// neutral backend exposes one descriptor namespace shared by all stages.
 /// Allocate one stable host binding for each `(group, kind, local binding)` and
 /// rewrite both the verified IR and texture metadata before WGSL lowering.
-fn remap_graphics_resource_bindings(
-    programs: &mut [MaxwellTranslatedShaderProgram],
-) -> Result<(), MaxwellShaderTranslationError> {
+fn graphics_resource_bindings(
+    inputs: &MaxwellShaderTranslationInputs,
+    programs: &[TranslatedShaderIr],
+) -> Result<BTreeMap<(u8, ShaderResourceKind, u8), u8>, MaxwellShaderTranslationError> {
     let mut global = BTreeMap::<(u8, ShaderResourceKind, u8), u8>::new();
-
-    for program in programs.iter() {
-        let Some(group) = program.bind_group else {
-            if program.ir.ir().resources().is_empty() {
+    for (input, program) in inputs.programs.iter().zip(programs) {
+        let Some(group) = input.effective_group else {
+            if program.ir.resources().is_empty() {
                 continue;
             }
             return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {
-                pipeline: program.key.stage as u8,
+                pipeline: input.pipeline,
                 field: "effective shader binding group",
             });
         };
-        for resource in program.ir.ir().resources() {
+        for resource in program.ir.resources() {
             let identity = (group, resource.kind(), resource.binding());
             if global.contains_key(&identity) {
                 continue;
@@ -4143,44 +4064,41 @@ fn remap_graphics_resource_bindings(
             global.insert(identity, binding);
         }
     }
+    Ok(global)
+}
 
-    for program in programs {
-        let Some(group) = program.bind_group else {
-            continue;
-        };
-        let mut local = BTreeMap::new();
-        for resource in program.ir.ir().resources() {
-            let binding = global
+fn program_resource_bindings(
+    input: &MaxwellShaderProgramTranslationInput,
+    program: &TranslatedShaderIr,
+    global: &BTreeMap<(u8, ShaderResourceKind, u8), u8>,
+) -> Result<BTreeMap<u8, u8>, MaxwellShaderTranslationError> {
+    let Some(group) = input.effective_group else {
+        return Ok(BTreeMap::new());
+    };
+    program
+        .ir
+        .resources()
+        .iter()
+        .map(|resource| {
+            global
                 .get(&(group, resource.kind(), resource.binding()))
                 .copied()
                 .ok_or(MaxwellShaderTranslationError::MissingResourceBindingRemap {
-                    stage: program.key.stage,
+                    stage: input.binary.header.stage,
                     binding: resource.binding(),
-                })?;
-            local.insert(resource.binding(), binding);
-        }
-
-        program.ir = remap_verified_shader_ir(&program.ir, program.key.stage, &local)?;
-        for texture in &mut program.texture_bindings {
-            texture.image_binding =
-                remapped_binding(&local, program.key.stage, texture.image_binding)?;
-            texture.sampler_binding =
-                remapped_binding(&local, program.key.stage, texture.sampler_binding)?;
-        }
-        program.key.resource_binding_remap = local.into_iter().collect();
-        program.module = lower_shader_ir_to_wgsl(&program.ir)?;
-    }
-
-    Ok(())
+                })
+                .map(|binding| (resource.binding(), binding))
+        })
+        .collect()
 }
 
-fn remap_verified_shader_ir(
-    ir: &VerifiedShaderIr,
+fn finalize_shader_ir(
+    ir: ShaderIr,
     stage: MaxwellThreeDShaderStage,
     bindings: &BTreeMap<u8, u8>,
+    output_interpolation: &[(ShaderIoLocation, ShaderInterpolation)],
 ) -> Result<VerifiedShaderIr, MaxwellShaderTranslationError> {
     let resources = ir
-        .ir()
         .resources()
         .iter()
         .map(|resource| {
@@ -4194,7 +4112,6 @@ fn remap_verified_shader_ir(
         })
         .collect::<Result<Vec<_>, MaxwellShaderTranslationError>>()?;
     let instructions = ir
-        .ir()
         .instructions()
         .iter()
         .map(|instruction| {
@@ -4257,10 +4174,27 @@ fn remap_verified_shader_ir(
         })
         .collect::<Result<Vec<_>, MaxwellShaderTranslationError>>()?;
 
+    let interpolation = output_interpolation
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    let outputs = ir
+        .outputs()
+        .iter()
+        .map(|output| {
+            ShaderInterfaceElement::new(
+                output.location(),
+                output.component(),
+                output.scalar_type(),
+                interpolation.get(&output.location()).copied(),
+            )
+            .expect("linking preserves the decoded interface shape")
+        })
+        .collect();
     VerifiedShaderIr::verify(ShaderIr::new(
-        ir.ir().stage(),
-        ir.ir().inputs().to_vec(),
-        ir.ir().outputs().to_vec(),
+        ir.stage(),
+        ir.inputs().to_vec(),
+        outputs,
         resources,
         instructions,
     ))
@@ -4279,25 +4213,25 @@ fn remapped_binding(
 }
 
 fn validate_graphics_stage_interfaces(
-    programs: &[MaxwellTranslatedShaderProgram],
+    programs: &[TranslatedShaderIr],
 ) -> Result<(), MaxwellShaderTranslationError> {
     let vertex = programs
         .iter()
-        .find(|program| program.stage == ShaderStage::Vertex);
+        .find(|program| program.ir.stage() == ShaderStage::Vertex);
     let fragment = programs
         .iter()
-        .find(|program| program.stage == ShaderStage::Fragment);
+        .find(|program| program.ir.stage() == ShaderStage::Fragment);
     let (Some(vertex), Some(fragment)) = (vertex, fragment) else {
         return Ok(());
     };
-    for input in fragment.ir.ir().inputs() {
+    for input in fragment.ir.inputs() {
         if !matches!(
             input.location(),
             ShaderIoLocation::Generic(_) | ShaderIoLocation::Color(_)
         ) {
             continue;
         }
-        let Some(output) = vertex.ir.ir().outputs().iter().find(|output| {
+        let Some(output) = vertex.ir.outputs().iter().find(|output| {
             output.location() == input.location() && output.component() == input.component()
         }) else {
             return Err(MaxwellShaderTranslationError::StageInterfaceMismatch {
@@ -4580,9 +4514,12 @@ mod tests {
         let memory = MaxwellShaderMemoryView::new(&address_space, &[]);
         let binary = read_shader_binary(&memory, stage, address).unwrap();
         validate_program_header(stage, binary.header()).unwrap();
-        translate_shader_binary(&binary, register_count, &BTreeMap::new())
-            .unwrap()
-            .ir
+        VerifiedShaderIr::verify(
+            translate_shader_binary(&binary, register_count, &BTreeMap::new())
+                .unwrap()
+                .ir,
+        )
+        .unwrap()
     }
 
     fn validate_wgsl(module: &ShaderBackendModule) {
