@@ -76,7 +76,7 @@ fn coordinator_preserves_external_event_sequence_boundaries() {
 #[test]
 fn bounded_external_wait_expires_without_fabricating_guest_readiness() {
     let mut coordinator = RuntimeCoordinator::new(profile());
-    let process_id = coordinator
+    let _process_id = coordinator
         .register_process(
             synthetic_process_for_coordinator(1),
             registration(&coordinator),
@@ -94,15 +94,6 @@ fn bounded_external_wait_expires_without_fabricating_guest_readiness() {
     );
     assert_eq!(
         coordinator.scheduler().thread(thread).unwrap().lifecycle,
-        nixe_scheduler::ThreadLifecycle::Waiting
-    );
-    assert_eq!(
-        coordinator
-            .process(process_id)
-            .unwrap()
-            .thread(thread)
-            .unwrap()
-            .lifecycle(),
         nixe_scheduler::ThreadLifecycle::Waiting
     );
 }
@@ -153,9 +144,9 @@ fn guest_thread_ids_are_unique_across_live_processes() {
     assert_ne!(first_object, second_object);
     assert_eq!(
         coordinator
-            .thread_scheduling_info(second, first_object.thread_id())
+            .thread_scheduling_info(first_object.thread_id())
             .unwrap()
-            .id,
+            .thread,
         first_thread,
         "a copied thread object resolves globally instead of aliasing a local ID"
     );
@@ -181,7 +172,7 @@ fn guest_thread_ids_are_unique_across_live_processes() {
 fn external_wakes_are_generation_safe_and_idempotent() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process = synthetic_process_for_coordinator(1);
-    let id = coordinator
+    let _id = coordinator
         .register_process(process, registration(&coordinator))
         .unwrap();
     let execution = coordinator.run_next(2).unwrap().unwrap();
@@ -205,8 +196,8 @@ fn external_wakes_are_generation_safe_and_idempotent() {
     assert_eq!(report.woken, 1);
     assert_eq!(report.stale, 1);
     assert_eq!(
-        coordinator.process(id).unwrap().execution_status(),
-        crate::ProcessExecutionStatus::Ready
+        coordinator.scheduler().thread(thread).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
     );
 }
 
@@ -228,7 +219,7 @@ impl crate::ExceptionDispatcher for ResumeDispatcher {
 fn exception_resume_updates_runtime_and_scheduler_as_one_coordinator_operation() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process = synthetic_svc_process_for_coordinator(1);
-    let process_id = coordinator
+    let _process_id = coordinator
         .register_process(process, registration(&coordinator))
         .unwrap();
     let execution = coordinator.run_next(1).unwrap().unwrap();
@@ -252,15 +243,6 @@ fn exception_resume_updates_runtime_and_scheduler_as_one_coordinator_operation()
             .thread(execution.lease.thread)
             .unwrap()
             .lifecycle,
-        nixe_scheduler::ThreadLifecycle::Ready
-    );
-    assert_eq!(
-        coordinator
-            .process(process_id)
-            .unwrap()
-            .thread(execution.lease.thread)
-            .unwrap()
-            .lifecycle(),
         nixe_scheduler::ThreadLifecycle::Ready
     );
 }
@@ -339,15 +321,6 @@ fn thread_construction_is_created_and_failure_atomic() {
             .lifecycle,
         nixe_scheduler::ThreadLifecycle::Created
     );
-    assert_eq!(
-        coordinator
-            .process(process)
-            .unwrap()
-            .thread(creation.id)
-            .unwrap()
-            .lifecycle(),
-        nixe_scheduler::ThreadLifecycle::Created
-    );
     let object_id = coordinator
         .process(process)
         .unwrap()
@@ -355,10 +328,7 @@ fn thread_construction_is_created_and_failure_atomic() {
         .unwrap()
         .object()
         .thread_id();
-    assert_eq!(
-        coordinator.start_thread(process, object_id),
-        Ok(creation.id)
-    );
+    assert_eq!(coordinator.start_thread(object_id), Ok(creation.id));
     assert_eq!(
         coordinator
             .scheduler()
@@ -368,7 +338,7 @@ fn thread_construction_is_created_and_failure_atomic() {
         nixe_scheduler::ThreadLifecycle::Ready
     );
     assert_eq!(
-        coordinator.start_thread(process, object_id),
+        coordinator.start_thread(object_id),
         Err(ThreadOperationError::InvalidState)
     );
 }
@@ -484,7 +454,7 @@ fn thread_exit_preserves_other_threads_and_process_exit_terminates_all() {
             .unwrap()
             .object();
         assert!(!join_object.is_signalled());
-        coordinator.start_thread(process_id, object_id).unwrap();
+        coordinator.start_thread(object_id).unwrap();
         let execution = coordinator.run_next(1).unwrap().unwrap();
         assert_eq!(execution.lease.thread, creation.id);
         coordinator
@@ -496,7 +466,11 @@ fn thread_exit_preserves_other_threads_and_process_exit_terminates_all() {
             .unwrap();
         let process = coordinator.process(process_id).unwrap();
         assert_eq!(
-            process.thread(creation.id).unwrap().lifecycle(),
+            coordinator
+                .scheduler()
+                .thread(creation.id)
+                .unwrap()
+                .lifecycle,
             nixe_scheduler::ThreadLifecycle::Exited
         );
         assert!(join_object.is_signalled());
@@ -563,11 +537,9 @@ fn priority_and_affinity_updates_use_the_machine_profile() {
         .main_thread()
         .object()
         .thread_id();
+    coordinator.set_thread_priority(object_id, 5).unwrap();
     coordinator
-        .set_thread_priority(process_id, object_id, 5)
-        .unwrap();
-    coordinator
-        .inherit_thread_priority(process_id, main_object_id, object_id, 0x1000)
+        .inherit_thread_priority(main_object_id, object_id, 0x1000)
         .unwrap();
     let main_id = coordinator.process(process_id).unwrap().main_thread_id();
     assert_eq!(
@@ -579,7 +551,7 @@ fn priority_and_affinity_updates_use_the_machine_profile() {
         5
     );
     coordinator
-        .restore_thread_priority(process_id, main_object_id, 0x1000)
+        .restore_thread_priority(main_object_id, 0x1000)
         .unwrap();
     let affinity = coordinator
         .scheduler()
@@ -587,39 +559,28 @@ fn priority_and_affinity_updates_use_the_machine_profile() {
         .core_set([VirtualCpuId::new(7)])
         .unwrap();
     coordinator
-        .set_thread_affinity(
-            process_id,
-            object_id,
-            Some(VirtualCpuId::new(7)),
-            affinity.clone(),
-        )
+        .set_thread_affinity(object_id, Some(VirtualCpuId::new(7)), affinity.clone())
         .unwrap();
-    let info = coordinator
-        .thread_scheduling_info(process_id, object_id)
-        .unwrap();
-    assert_eq!(info.priority, 5);
+    let info = coordinator.thread_scheduling_info(object_id).unwrap();
+    assert_eq!(info.base_priority, 5);
     assert_eq!(info.ideal_vcpu, Some(VirtualCpuId::new(7)));
     assert_eq!(info.affinity, affinity);
     assert_eq!(
-        coordinator.set_thread_priority(process_id, object_id, 64),
+        coordinator.set_thread_priority(object_id, 64),
         Err(ThreadOperationError::InvalidState)
     );
-    coordinator.start_thread(process_id, object_id).unwrap();
-    coordinator
-        .set_thread_activity(process_id, object_id, true)
-        .unwrap();
+    coordinator.start_thread(object_id).unwrap();
+    coordinator.set_thread_activity(object_id, true).unwrap();
     assert!(
         coordinator
-            .thread_scheduling_info(process_id, object_id)
+            .thread_scheduling_info(object_id)
             .unwrap()
             .paused
     );
-    coordinator
-        .set_thread_activity(process_id, object_id, false)
-        .unwrap();
+    coordinator.set_thread_activity(object_id, false).unwrap();
     assert!(
         !coordinator
-            .thread_scheduling_info(process_id, object_id)
+            .thread_scheduling_info(object_id)
             .unwrap()
             .paused
     );
@@ -644,51 +605,45 @@ fn priority_donations_are_multi_source_transitive_and_keyed() {
             .thread_id();
         processes.push((process, object));
     }
+    coordinator.set_thread_priority(processes[0].1, 40).unwrap();
+    coordinator.set_thread_priority(processes[1].1, 30).unwrap();
+    coordinator.set_thread_priority(processes[2].1, 5).unwrap();
     coordinator
-        .set_thread_priority(processes[0].0, processes[0].1, 40)
+        .inherit_thread_priority(processes[0].1, processes[1].1, 0x1000)
         .unwrap();
     coordinator
-        .set_thread_priority(processes[1].0, processes[1].1, 30)
-        .unwrap();
-    coordinator
-        .set_thread_priority(processes[2].0, processes[2].1, 5)
-        .unwrap();
-    coordinator
-        .inherit_thread_priority(processes[0].0, processes[0].1, processes[1].1, 0x1000)
-        .unwrap();
-    coordinator
-        .inherit_thread_priority(processes[1].0, processes[1].1, processes[2].1, 0x2000)
+        .inherit_thread_priority(processes[1].1, processes[2].1, 0x2000)
         .unwrap();
     assert_eq!(
         coordinator
-            .thread_scheduling_info(processes[0].0, processes[0].1)
+            .thread_scheduling_info(processes[0].1)
             .unwrap()
             .effective_priority,
         5
     );
     assert_eq!(
         coordinator
-            .thread_scheduling_info(processes[1].0, processes[1].1)
+            .thread_scheduling_info(processes[1].1)
             .unwrap()
             .effective_priority,
         5
     );
     coordinator
-        .restore_thread_priority(processes[1].0, processes[1].1, 0x2000)
+        .restore_thread_priority(processes[1].1, 0x2000)
         .unwrap();
     assert_eq!(
         coordinator
-            .thread_scheduling_info(processes[0].0, processes[0].1)
+            .thread_scheduling_info(processes[0].1)
             .unwrap()
             .effective_priority,
         30
     );
     coordinator
-        .restore_thread_priority(processes[0].0, processes[0].1, 0x1000)
+        .restore_thread_priority(processes[0].1, 0x1000)
         .unwrap();
     assert_eq!(
         coordinator
-            .thread_scheduling_info(processes[0].0, processes[0].1)
+            .thread_scheduling_info(processes[0].1)
             .unwrap()
             .effective_priority,
         40
@@ -735,7 +690,7 @@ fn process_exit_terminates_created_threads_before_start() {
 #[test]
 fn virtual_deadlines_are_deterministic_and_do_not_sleep_the_host() {
     let mut coordinator = RuntimeCoordinator::new(profile());
-    let process_id = coordinator
+    let _process_id = coordinator
         .register_process(
             synthetic_process_for_coordinator(1),
             registration(&coordinator),
@@ -758,15 +713,6 @@ fn virtual_deadlines_are_deterministic_and_do_not_sleep_the_host() {
     assert_eq!(coordinator.virtual_time_ns(), 100);
     assert_eq!(
         coordinator.scheduler().thread(thread).unwrap().lifecycle,
-        nixe_scheduler::ThreadLifecycle::Ready
-    );
-    assert_eq!(
-        coordinator
-            .process(process_id)
-            .unwrap()
-            .thread(thread)
-            .unwrap()
-            .lifecycle(),
         nixe_scheduler::ThreadLifecycle::Ready
     );
 }
@@ -911,7 +857,7 @@ fn parallel_wave_assigns_at_most_one_thread_to_each_vcpu() {
     assert_eq!(executions.len(), 2);
     assert_ne!(executions[0].lease.thread, executions[1].lease.thread);
     assert_ne!(executions[0].lease.vcpu, executions[1].lease.vcpu);
-    assert!(coordinator.in_flight.is_empty());
+    assert!(coordinator.scheduler().active_leases().next().is_none());
 }
 
 #[test]
@@ -950,7 +896,7 @@ fn parallel_wave_runs_distinct_threads_from_one_process() {
         .unwrap()
         .object()
         .thread_id();
-    coordinator.start_thread(process_id, object_id).unwrap();
+    coordinator.start_thread(object_id).unwrap();
 
     let executions = coordinator.run_parallel_wave(1).unwrap();
     assert_eq!(executions.len(), 2);

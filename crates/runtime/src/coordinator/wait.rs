@@ -17,24 +17,11 @@ impl RuntimeCoordinator {
         thread: GuestThreadId,
         readiness: Readiness,
     ) -> Result<Option<WakeToken>, CoordinatorError> {
-        let process = self
-            .scheduler
-            .thread(thread)
-            .ok_or(SchedulerError::UnknownThread(thread))?
-            .process;
         let decision = self
             .scheduler
             .apply(SchedulerCommand::RegisterWait { thread, readiness })?;
         match decision {
-            SchedulerDecision::ReadyImmediately(_) => {
-                let resumed = self
-                    .processes
-                    .get_mut(&process)
-                    .expect("scheduled thread has an owning process")
-                    .resume_thread(thread);
-                debug_assert!(resumed);
-                Ok(None)
-            }
+            SchedulerDecision::ReadyImmediately(_) => Ok(None),
             SchedulerDecision::WaitRegistered(token) => Ok(Some(token)),
             _ => unreachable!("wait registration has a dedicated decision"),
         }
@@ -79,7 +66,6 @@ impl RuntimeCoordinator {
         let token = self
             .register_wait(thread, Readiness::Pending)?
             .expect("a pending wait returns a wake token");
-        self.active_waits.insert(thread, token);
         if let Some(deadline) = deadline {
             self.deadlines.insert(deadline, token);
         }
@@ -209,31 +195,27 @@ impl RuntimeCoordinator {
         cancelled: bool,
     ) -> Result<bool, CoordinatorError> {
         self.release_wait_resources_if_current(token);
-        let Some(view) = self.scheduler.thread(token.thread) else {
+        if self.scheduler.thread(token.thread).is_none() {
             return Ok(false);
-        };
+        }
         let command = if cancelled {
             SchedulerCommand::CancelWait(token)
         } else {
             SchedulerCommand::Wake(token)
         };
         match self.scheduler.apply(command) {
-            Ok(_) => {
-                let resumed = self
-                    .processes
-                    .get_mut(&view.process)
-                    .expect("scheduled thread has an owning process")
-                    .resume_thread(token.thread);
-                debug_assert!(resumed);
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(SchedulerError::StaleWake(_)) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
 
     pub(super) fn release_wait_resources_if_current(&mut self, token: WakeToken) {
-        if self.active_waits.get(&token.thread).copied() == Some(token) {
+        if self
+            .scheduler
+            .thread(token.thread)
+            .is_some_and(|thread| thread.active_wait == Some(token))
+        {
             self.release_wait_resources(token.thread);
         } else {
             self.inbox.sender().cancel_watchers(token);
@@ -241,7 +223,11 @@ impl RuntimeCoordinator {
     }
 
     pub(super) fn release_wait_resources(&mut self, thread: GuestThreadId) {
-        let Some(token) = self.active_waits.remove(&thread) else {
+        let Some(token) = self
+            .scheduler
+            .thread(thread)
+            .and_then(|thread| thread.active_wait)
+        else {
             return;
         };
         self.inbox.sender().cancel_watchers(token);

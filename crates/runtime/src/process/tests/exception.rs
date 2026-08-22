@@ -85,40 +85,24 @@ impl crate::ExceptionDispatcher for IdentityOutcomeDispatcher {
 #[test]
 fn every_supervisor_outcome_targets_an_explicit_second_thread() {
     let cases = [
-        (
-            crate::ExceptionDispatchOutcome::Resume(crate::ExceptionResume::Next),
-            nixe_scheduler::ThreadLifecycle::Ready,
-        ),
-        (
-            crate::ExceptionDispatchOutcome::Suspend(crate::ExceptionResume::Retry),
-            nixe_scheduler::ThreadLifecycle::Waiting,
-        ),
-        (
-            crate::ExceptionDispatchOutcome::Reject {
-                diagnostic: "guest",
-            },
-            nixe_scheduler::ThreadLifecycle::Ready,
-        ),
-        (
-            crate::ExceptionDispatchOutcome::Terminate {
-                scope: crate::ExceptionTerminationScope::CurrentThread,
-                exit_code: 9,
-                reason: crate::ExceptionTerminationReason::Requested,
-            },
-            nixe_scheduler::ThreadLifecycle::Exited,
-        ),
-        (
-            crate::ExceptionDispatchOutcome::Fault("host"),
-            nixe_scheduler::ThreadLifecycle::Faulted,
-        ),
+        crate::ExceptionDispatchOutcome::Resume(crate::ExceptionResume::Next),
+        crate::ExceptionDispatchOutcome::Suspend(crate::ExceptionResume::Retry),
+        crate::ExceptionDispatchOutcome::Reject {
+            diagnostic: "guest",
+        },
+        crate::ExceptionDispatchOutcome::Terminate {
+            scope: crate::ExceptionTerminationScope::CurrentThread,
+            exit_code: 9,
+            reason: crate::ExceptionTerminationReason::Requested,
+        },
+        crate::ExceptionDispatchOutcome::Fault("host"),
     ];
-    for (outcome, expected_lifecycle) in cases {
+    for outcome in cases {
         let (mut process, report, _) = process_stopped_at_svc(ExecutionState::A64);
         let second_id = nixe_scheduler::GuestThreadId::new(2);
         let mut second = process.main_thread().clone();
         second.id = second_id;
         second.object = crate::ThreadObject::new(second_id.get());
-        second.lifecycle = nixe_scheduler::ThreadLifecycle::Waiting;
         process.threads.insert(second).unwrap();
         let vcpu = nixe_scheduler::VirtualCpuId::new(3);
         let mut dispatcher = IdentityOutcomeDispatcher {
@@ -127,21 +111,8 @@ fn every_supervisor_outcome_targets_an_explicit_second_thread() {
             outcome: Some(outcome),
         };
         process
-            .route_supervisor_call_for(second_id, vcpu, &report.stop, &mut dispatcher)
+            .route_supervisor_call_for(second_id, vcpu, &report.stop, &mut dispatcher, true)
             .unwrap();
-        assert_eq!(
-            process.thread(second_id).unwrap().lifecycle(),
-            expected_lifecycle
-        );
-        if matches!(
-            expected_lifecycle,
-            nixe_scheduler::ThreadLifecycle::Exited | nixe_scheduler::ThreadLifecycle::Faulted
-        ) {
-            assert_eq!(
-                process.lifecycle(),
-                nixe_scheduler::ProcessLifecycle::Running
-            );
-        }
     }
 }
 
@@ -166,7 +137,6 @@ fn handled_supervisor_calls_advance_once_in_a64_a32_and_t32() {
             .unwrap();
 
         assert_eq!(result, crate::ExceptionHandlingResult::Resumed);
-        assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
         assert_eq!(
             instruction_address(process.main_thread_mut().state_mut()),
             entry + width
@@ -212,7 +182,7 @@ fn supervisor_call_retry_is_explicit_and_reexecutes_the_source() {
 }
 
 #[test]
-fn suspended_supervisor_call_installs_continuation_without_becoming_runnable() {
+fn suspended_supervisor_call_applies_its_resume_target() {
     let (mut process, report, entry) = process_stopped_at_svc(ExecutionState::A64);
     let mut dispatcher = FixedSupervisorCallDispatcher {
         outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Suspend(
@@ -230,26 +200,10 @@ fn suspended_supervisor_call_installs_continuation_without_becoming_runnable() {
         instruction_address(process.main_thread_mut().state_mut()),
         entry + 4
     );
-    assert_eq!(
-        process.execution_status(),
-        ProcessExecutionStatus::Suspended
-    );
-    assert!(matches!(
-        process.run(1),
-        Err(crate::ProcessExecutionError::NotRunnable {
-            status: ProcessExecutionStatus::Suspended,
-            ..
-        })
-    ));
-    assert!(process.resume_thread(process.main_thread_id()));
-    assert_eq!(
-        instruction_address(process.main_thread_mut().state_mut()),
-        entry + 4
-    );
 }
 
 #[test]
-fn faulted_supervisor_call_retains_source_and_cannot_run() {
+fn faulted_supervisor_call_retains_source_and_faults_the_process() {
     let (mut process, report, entry) = process_stopped_at_svc(ExecutionState::A64);
     let mut dispatcher = PcMutatingSupervisorCallDispatcher {
         outcome: Some(crate::ExceptionDispatchOutcome::Fault(
@@ -267,15 +221,10 @@ fn faulted_supervisor_call_retains_source_and_cannot_run() {
         instruction_address(process.main_thread_mut().state_mut()),
         entry
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
-    assert!(matches!(
-        process.run(1),
-        Err(crate::ProcessExecutionError::NotRunnable {
-            status: ProcessExecutionStatus::Faulted,
-            ..
-        })
-    ));
-    assert!(!process.resume_thread(process.main_thread_id()));
+    assert_eq!(
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Faulted
+    );
 }
 
 #[test]
@@ -311,20 +260,18 @@ fn supervisor_call_termination_scope_is_preserved_through_teardown() {
                 reason: crate::ExceptionTerminationReason::Requested,
             }
         );
-        assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+        assert_eq!(
+            process.lifecycle(),
+            nixe_scheduler::ProcessLifecycle::Exited
+        );
         assert_eq!(process.exit().unwrap().cause, expected_cause);
         assert_eq!(process.exit().unwrap().source.unwrap().pc.get(), entry);
         assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
-        assert!(matches!(
-            process.run(1),
-            Err(crate::ProcessExecutionError::NotRunnable {
-                status: ProcessExecutionStatus::Exited,
-                ..
-            })
-        ));
-
         let teardown = process.try_teardown().unwrap();
-        assert_eq!(teardown.previous_status, ProcessExecutionStatus::Exited);
+        assert_eq!(
+            teardown.previous_lifecycle,
+            nixe_scheduler::ProcessLifecycle::Exited
+        );
         assert_eq!(teardown.exit.unwrap().cause, expected_cause);
         assert_eq!(teardown.threads_released, 1);
     }
@@ -341,9 +288,17 @@ fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
         .build(&plan)
         .unwrap();
     replace_entry_instruction(&mut process, 0x1400_0000); // B #0
+    let mut executor = process
+        .execution
+        .create_worker_executors(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap()
+        .primary;
 
     let first = process
-        .run(crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3)
+        .run_with_executor(
+            executor.as_mut(),
+            crate::MAX_INSTRUCTION_TRACE_ENTRIES as u64 + 3,
+        )
         .unwrap();
     assert!(first.trace.enabled());
     assert_eq!(
@@ -365,7 +320,7 @@ fn detailed_instruction_trace_is_opt_in_bounded_and_persistent_across_slices() {
     );
     assert!(first.trace.to_string().len() <= crate::MAX_INSTRUCTION_TRACE_EXPORT_BYTES);
 
-    let second = process.run(1).unwrap();
+    let second = process.run_with_executor(executor.as_mut(), 1).unwrap();
     assert_eq!(second.trace.discarded(), 4);
     assert_eq!(second.trace.entries()[0].sequence, 4);
     assert_eq!(
@@ -408,8 +363,8 @@ fn teardown_reports_resources_owned_by_the_process() {
 
     let report = process.try_teardown().unwrap();
     assert_eq!(
-        report.previous_status,
-        crate::ProcessExecutionStatus::Exited
+        report.previous_lifecycle,
+        nixe_scheduler::ProcessLifecycle::Exited
     );
     assert_eq!(
         report.exit.unwrap().cause,

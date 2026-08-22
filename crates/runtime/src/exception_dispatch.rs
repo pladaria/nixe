@@ -18,8 +18,7 @@ use nixe_memory::CanonicalRangeTranslator;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
-    AddressWaitRegistry, HandleTable, ProcessExecutionStatus, ProcessMemoryLayout,
-    ProcessMountNamespace, ThreadObject,
+    AddressWaitRegistry, HandleTable, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
 };
 
 /// Maximum number of guest bytes retained from a fatal break payload.
@@ -479,7 +478,7 @@ pub enum ExceptionRouteError {
     NotSupervisorCall,
     UnknownThread(GuestThreadId),
     ProcessNotSuspended {
-        status: ProcessExecutionStatus,
+        lifecycle: nixe_scheduler::ThreadLifecycle,
     },
     SourceMismatch {
         requested: LocationDescriptor,
@@ -511,10 +510,10 @@ impl std::fmt::Display for ExceptionRouteError {
                 formatter.write_str("execution stop is not a supervisor call")
             }
             Self::UnknownThread(id) => write!(formatter, "guest thread {id} does not exist"),
-            Self::ProcessNotSuspended { status } => {
+            Self::ProcessNotSuspended { lifecycle } => {
                 write!(
                     formatter,
-                    "cannot route exception while process is {status:?}"
+                    "cannot route exception while thread is {lifecycle:?}"
                 )
             }
             Self::SourceMismatch { requested, current } => write!(

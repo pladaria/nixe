@@ -327,10 +327,6 @@ fn runtime_orchestration_accepts_an_engine_neutral_fake_domain() {
         crate::ExecutionStop::PendingEvent { mask: 0x80 }
     );
     assert_eq!(report.context, before);
-    assert_eq!(
-        process.execution_status(),
-        crate::ProcessExecutionStatus::Ready
-    );
 }
 
 #[test]
@@ -345,8 +341,8 @@ fn worker_slice_moves_thread_state_out_of_the_process_until_reconciliation() {
     process.abort_thread_execution(thread, vcpu, execution);
     assert!(process.main_thread().state.is_some());
     assert_eq!(
-        process.main_thread().lifecycle(),
-        nixe_scheduler::ThreadLifecycle::Faulted
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Faulted
     );
 }
 

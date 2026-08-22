@@ -12,10 +12,6 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     assert!(report.stop.exception_dispatch_request().is_none());
     assert!(!report.trace.enabled());
     assert!(report.trace.entries().is_empty());
-    assert_eq!(
-        process.execution_status(),
-        crate::ProcessExecutionStatus::Ready
-    );
     let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
         panic!("homebrew fixture must report A64 context");
     };
@@ -51,8 +47,13 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
         panic!("homebrew fixture must initialize A64");
     };
     state.write_x(A64Register::General(a64_register(0)), 0);
+    let mut executor = process
+        .execution
+        .create_worker_executors(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap()
+        .primary;
 
-    let first = process.run(1).unwrap();
+    let first = process.run_with_executor(executor.as_mut(), 1).unwrap();
     assert_eq!(first.instructions_executed, 1);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -61,7 +62,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
     assert_eq!(state.pc(), entry + 4);
 
-    let second = process.run(1).unwrap();
+    let second = process.run_with_executor(executor.as_mut(), 1).unwrap();
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -70,7 +71,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
     assert_eq!(state.pc(), entry + 8);
 
-    let svc = process.run(1).unwrap();
+    let svc = process.run_with_executor(executor.as_mut(), 1).unwrap();
     assert_eq!(svc.instructions_executed, 1);
     assert!(matches!(
         svc.stop,
@@ -98,7 +99,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
             .unwrap(),
         crate::ExceptionHandlingResult::Resumed
     );
-    let resumed = process.run(1).unwrap();
+    let resumed = process.run_with_executor(executor.as_mut(), 1).unwrap();
     assert_eq!(resumed.instructions_executed, 1);
     assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -183,9 +184,17 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             MemoryValue::U32(7),
         )
         .unwrap();
+    let mut executor = process
+        .execution
+        .create_worker_executors(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap()
+        .primary;
 
     assert_eq!(
-        process.run(1).unwrap().stop,
+        process
+            .run_with_executor(executor.as_mut(), 1)
+            .unwrap()
+            .stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
@@ -194,7 +203,10 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     assert_eq!(state.read_w(A64Register::General(a64_register(0))), 7);
     state.write_x(A64Register::General(a64_register(0)), 9);
     assert_eq!(
-        process.run(1).unwrap().stop,
+        process
+            .run_with_executor(executor.as_mut(), 1)
+            .unwrap()
+            .stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -219,7 +231,10 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     };
     state.set_pc(entry);
     assert_eq!(
-        process.run(1).unwrap().stop,
+        process
+            .run_with_executor(executor.as_mut(), 1)
+            .unwrap()
+            .stop,
         crate::ExecutionStop::BudgetExhausted
     );
     process
@@ -236,7 +251,10 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     };
     state.write_x(A64Register::General(a64_register(0)), 13);
     assert_eq!(
-        process.run(1).unwrap().stop,
+        process
+            .run_with_executor(executor.as_mut(), 1)
+            .unwrap()
+            .stop,
         crate::ExecutionStop::BudgetExhausted
     );
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -316,38 +334,6 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     };
     assert_eq!(context.pc.get(), 0x1000);
     assert!(report.to_string().contains("fetch-fault"));
-    assert_eq!(
-        process.execution_status(),
-        crate::ProcessExecutionStatus::Faulted
-    );
-}
-
-#[test]
-fn unallocated_encoding_suspends_until_runtime_resumes_thread() {
-    let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-
-    let report = process.run(2).unwrap();
-    assert!(matches!(
-        report.stop,
-        crate::ExecutionStop::UnallocatedEncoding { .. }
-    ));
-    assert_eq!(
-        process.execution_status(),
-        crate::ProcessExecutionStatus::Suspended
-    );
-    assert!(matches!(
-        process.run(1),
-        Err(crate::ProcessExecutionError::NotRunnable {
-            status: crate::ProcessExecutionStatus::Suspended,
-            ..
-        })
-    ));
-    assert!(process.resume_thread(process.main_thread_id()));
-    assert_eq!(
-        process.execution_status(),
-        crate::ProcessExecutionStatus::Ready
-    );
 }
 
 #[test]
@@ -361,10 +347,6 @@ fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() 
         report.stop,
         crate::ExecutionStop::UnsupportedSemantics { .. }
     ));
-    assert_eq!(
-        unsupported.execution_status(),
-        ProcessExecutionStatus::Faulted
-    );
     assert!(report.to_string().contains("unsupported-semantics"));
 
     let mut profile_disabled = reference_process_builder()

@@ -20,7 +20,7 @@ pub use address_wait::AddressWaitRegistry;
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
     CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
-    ThreadSchedulingInfo, VcpuExecutionMode, WorkerFailure,
+    VcpuExecutionMode, WorkerFailure,
 };
 pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use exception_dispatch::{
@@ -54,12 +54,13 @@ pub use module_memory::{
     BackendInstallError, InstallStage, ModuleInstallError, ModuleMemoryBackend, PageRequest,
     install_prepared_module,
 };
+pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use process::{
     ExecutionReport, ExecutionStop, GuestThread, InstructionTrace, InstructionTraceEntry,
     MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
     ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
-    ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
-    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
+    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryLayout,
+    ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
     ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
     ThreadExit, ThreadTable, ThreadTableError,
 };

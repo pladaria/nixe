@@ -17,12 +17,10 @@ use crate::{
 mod execution;
 mod identity;
 mod thread;
-mod vcpu;
 mod wait;
 mod worker;
 
 use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
-use vcpu::RuntimeVcpuSlot;
 pub use worker::WorkerFailure;
 use worker::{VcpuWorkerPool, WorkerExecutorKey, WorkerRequest, WorkerRunFailure};
 
@@ -45,18 +43,6 @@ pub enum ThreadOperationError {
     InvalidHandle,
     InvalidState,
     Internal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ThreadSchedulingInfo {
-    pub id: GuestThreadId,
-    pub priority: i32,
-    pub effective_priority: i32,
-    pub ideal_vcpu: Option<VirtualCpuId>,
-    pub affinity: CoreSet,
-    pub lifecycle: nixe_scheduler::ThreadLifecycle,
-    pub last_vcpu: Option<VirtualCpuId>,
-    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,8 +69,6 @@ pub struct RuntimeCoordinator {
     scheduler: SchedulerState,
     processes: BTreeMap<ProcessId, RunnableProcess>,
     process_ids: ProcessIdAllocator,
-    in_flight: BTreeMap<VirtualCpuId, Lease>,
-    vcpu_slots: BTreeMap<VirtualCpuId, RuntimeVcpuSlot>,
     workers: VcpuWorkerPool,
     execution_mode: VcpuExecutionMode,
     execution_record: Option<crate::ExecutionRecord>,
@@ -98,7 +82,6 @@ pub struct RuntimeCoordinator {
     virtual_clock: crate::VirtualClock,
     deadlines: BTreeMap<(u64, u64), WakeToken>,
     next_deadline_sequence: u64,
-    active_waits: BTreeMap<GuestThreadId, WakeToken>,
     priority_donations: BTreeSet<PriorityDonation>,
 }
 
@@ -125,11 +108,6 @@ impl RuntimeCoordinator {
         virtual_clock: crate::VirtualClock,
         execution_mode: VcpuExecutionMode,
     ) -> Result<Self, CoordinatorError> {
-        let vcpu_slots = profile
-            .vcpus()
-            .iter()
-            .map(|descriptor| (descriptor.id(), RuntimeVcpuSlot::default()))
-            .collect();
         let workers = VcpuWorkerPool::start(
             profile.vcpus().iter().map(|descriptor| descriptor.id()),
             execution_mode == VcpuExecutionMode::Deterministic,
@@ -139,8 +117,6 @@ impl RuntimeCoordinator {
             scheduler: SchedulerState::new(profile),
             processes: BTreeMap::new(),
             process_ids: ProcessIdAllocator::new(),
-            in_flight: BTreeMap::new(),
-            vcpu_slots,
             workers,
             execution_mode,
             execution_record: None,
@@ -155,7 +131,6 @@ impl RuntimeCoordinator {
             virtual_clock,
             deadlines: BTreeMap::new(),
             next_deadline_sequence: 1,
-            active_waits: BTreeMap::new(),
             priority_donations: BTreeSet::new(),
         })
     }
@@ -233,13 +208,17 @@ impl RuntimeCoordinator {
     /// Stops worker activity after requesting a bounded engine safepoint.
     /// Repeated shutdown calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
-        if let Some(lease) = self.in_flight.values().next().copied() {
+        if let Some(lease) = self.scheduler.active_leases().next() {
             return Err(CoordinatorError::ShutdownWithOutstandingLease(lease));
         }
         for process in self.processes.values() {
             process.request_execution_safepoint();
         }
-        let waiting_threads: Vec<_> = self.active_waits.keys().copied().collect();
+        let waiting_threads: Vec<_> = self
+            .scheduler
+            .active_waits()
+            .map(|token| token.thread)
+            .collect();
         for thread in waiting_threads {
             self.release_wait_resources(thread);
         }
@@ -310,7 +289,8 @@ impl RuntimeCoordinator {
         if self.execution_mode == VcpuExecutionMode::Parallel {
             let descriptor = process.engine_descriptor();
             let capabilities = descriptor.capabilities;
-            let required = process.engine_requirements(true, self.vcpu_slots.len());
+            let required =
+                process.engine_requirements(true, self.scheduler.profile().vcpus().len());
             if !capabilities.contains(required)
                 || !capabilities.supports_profile(process.cpu_context().profile(), required)
             {
@@ -397,10 +377,9 @@ impl RuntimeCoordinator {
     /// and records a host-requested process exit without releasing resources.
     pub fn terminate_process(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
         if let Some(lease) = self
-            .in_flight
-            .values()
+            .scheduler
+            .active_leases()
             .find(|lease| lease.process == id)
-            .copied()
         {
             return Err(CoordinatorError::InFlightLease(lease));
         }
@@ -444,66 +423,40 @@ impl RuntimeCoordinator {
                 process: process_id,
                 domain,
             });
-        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let vcpus: Vec<_> = self
+            .scheduler
+            .profile()
+            .vcpus()
+            .iter()
+            .map(|descriptor| descriptor.id())
+            .collect();
         let mut installed = Vec::new();
         for vcpu in vcpus {
-            let executor = process.take_worker_executor(vcpu).map_err(|fault| {
+            let executors = process.create_worker_executors(vcpu).map_err(|fault| {
                 CoordinatorError::Execution {
                     process: process_id,
                     thread,
                     error: ProcessExecutionError::Engine { fault },
                 }
             })?;
-            if let Err(failure) = self.workers.install_executor(vcpu, key, executor) {
+            if let Err(failure) = self.workers.install_executor(vcpu, key, executors.primary) {
                 for installed_vcpu in installed {
-                    if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key) {
-                        process.restore_worker_executor(installed_vcpu, executor);
+                    let _ = self.workers.remove_executor(installed_vcpu, key);
+                    if let Some(fallback_key) = fallback_key {
+                        let _ = self.workers.remove_executor(installed_vcpu, fallback_key);
                     }
                 }
                 return Err(CoordinatorError::Worker(failure));
             }
-            if let Some(fallback_key) = fallback_key {
-                let fallback = match process.take_worker_fallback_executor(vcpu) {
-                    Ok(Some(executor)) => executor,
-                    Ok(None) => unreachable!("a configured fallback domain creates executors"),
-                    Err(fault) => {
-                        if let Ok(executor) = self.workers.remove_executor(vcpu, key) {
-                            process.restore_worker_executor(vcpu, executor);
-                        }
-                        for installed_vcpu in installed {
-                            if let Ok(executor) =
-                                self.workers.remove_executor(installed_vcpu, fallback_key)
-                            {
-                                process.restore_worker_fallback_executor(installed_vcpu, executor);
-                            }
-                            if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key)
-                            {
-                                process.restore_worker_executor(installed_vcpu, executor);
-                            }
-                        }
-                        return Err(CoordinatorError::Execution {
-                            process: process_id,
-                            thread,
-                            error: ProcessExecutionError::Engine { fault },
-                        });
-                    }
-                };
-                if let Err(failure) = self.workers.install_executor(vcpu, fallback_key, fallback) {
-                    if let Ok(executor) = self.workers.remove_executor(vcpu, key) {
-                        process.restore_worker_executor(vcpu, executor);
-                    }
-                    for installed_vcpu in installed {
-                        if let Ok(executor) =
-                            self.workers.remove_executor(installed_vcpu, fallback_key)
-                        {
-                            process.restore_worker_fallback_executor(installed_vcpu, executor);
-                        }
-                        if let Ok(executor) = self.workers.remove_executor(installed_vcpu, key) {
-                            process.restore_worker_executor(installed_vcpu, executor);
-                        }
-                    }
-                    return Err(CoordinatorError::Worker(failure));
+            if let (Some(fallback_key), Some(fallback)) = (fallback_key, executors.fallback)
+                && let Err(failure) = self.workers.install_executor(vcpu, fallback_key, fallback)
+            {
+                let _ = self.workers.remove_executor(vcpu, key);
+                for installed_vcpu in installed {
+                    let _ = self.workers.remove_executor(installed_vcpu, fallback_key);
+                    let _ = self.workers.remove_executor(installed_vcpu, key);
                 }
+                return Err(CoordinatorError::Worker(failure));
             }
             installed.push(vcpu);
         }
@@ -514,7 +467,13 @@ impl RuntimeCoordinator {
         self.processes
             .get(&process_id)
             .ok_or(CoordinatorError::UnknownProcess(process_id))?;
-        let vcpus: Vec<_> = self.vcpu_slots.keys().copied().collect();
+        let vcpus: Vec<_> = self
+            .scheduler
+            .profile()
+            .vcpus()
+            .iter()
+            .map(|descriptor| descriptor.id())
+            .collect();
         for vcpu in vcpus {
             if self
                 .workers
@@ -533,31 +492,9 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    /// Makes one waiting guest thread ready in both scheduler and process state.
+    /// Makes one waiting guest thread ready.
     pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
-        let view = self
-            .scheduler
-            .thread(thread)
-            .ok_or(SchedulerError::UnknownThread(thread))?;
-        let runtime_lifecycle = self
-            .processes
-            .get(&view.process)
-            .ok_or(CoordinatorError::UnknownProcess(view.process))?
-            .thread(thread)
-            .ok_or(CoordinatorError::UnknownThread {
-                process: view.process,
-                thread,
-            })?
-            .lifecycle();
         self.scheduler.apply(SchedulerCommand::MakeReady(thread))?;
-        if runtime_lifecycle == nixe_scheduler::ThreadLifecycle::Waiting {
-            let resumed = self
-                .processes
-                .get_mut(&view.process)
-                .expect("the owning process was validated")
-                .resume_thread(thread);
-            debug_assert!(resumed);
-        }
         Ok(())
     }
 
@@ -567,12 +504,41 @@ impl RuntimeCoordinator {
         stop: &ExecutionStop,
         dispatcher: &mut D,
     ) -> Result<ExceptionHandlingResult<D::Fault>, CoordinatorRouteError> {
+        let thread =
+            self.scheduler
+                .thread(lease.thread)
+                .ok_or(CoordinatorRouteError::Scheduler(
+                    SchedulerError::UnknownThread(lease.thread),
+                ))?;
+        if thread.lifecycle != nixe_scheduler::ThreadLifecycle::Waiting {
+            return Err(CoordinatorRouteError::Route(
+                ExceptionRouteError::ProcessNotSuspended {
+                    lifecycle: thread.lifecycle,
+                },
+            ));
+        }
+        let other_live = self
+            .processes
+            .get(&lease.process)
+            .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?
+            .threads()
+            .iter()
+            .filter(|(id, _)| **id != lease.thread)
+            .any(|(id, _)| {
+                self.scheduler.thread(*id).is_some_and(|thread| {
+                    !matches!(
+                        thread.lifecycle,
+                        nixe_scheduler::ThreadLifecycle::Exited
+                            | nixe_scheduler::ThreadLifecycle::Faulted
+                    )
+                })
+            });
         let process = self
             .processes
             .get_mut(&lease.process)
             .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?;
         let result = process
-            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher)
+            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher, other_live)
             .map_err(CoordinatorRouteError::Route)?;
         let command = match &result {
             ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_) => {
@@ -650,7 +616,7 @@ impl RuntimeCoordinator {
         CoordinatorResourceCounts {
             processes: self.processes.len(),
             scheduled_threads: self.scheduler.thread_count(),
-            active_waits: self.active_waits.len(),
+            active_waits: self.scheduler.active_wait_count(),
             deadlines: self.deadlines.len(),
             external_watcher_groups: self.inbox.sender().watcher_group_count(),
             priority_donations: self.priority_donations.len(),

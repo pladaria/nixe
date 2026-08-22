@@ -7,8 +7,8 @@ mod topology;
 
 pub use identity::{GuestThreadId, ProcessId, SchedulerSequence, VirtualCpuId, WakeGeneration};
 pub use lifecycle::{
-    Continuation, LifecycleTransitionError, ProcessLifecycle, ThreadExitRecord, ThreadLifecycle,
-    WaitReason, transition_process, transition_thread,
+    LifecycleTransitionError, ProcessLifecycle, ThreadLifecycle, transition_process,
+    transition_thread,
 };
 pub use scheduler::{
     Completion, Lease, LeaseGeneration, MigrationEffect, Readiness, ScheduledThreadConfig,

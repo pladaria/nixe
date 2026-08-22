@@ -4,9 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use nixe_cpu::state::ThreadCpuState;
 use nixe_memory::GuestVirtualAddress;
-use nixe_scheduler::{
-    Continuation, CoreSet, GuestThreadId, ThreadLifecycle, VirtualCpuId, WaitReason,
-};
+use nixe_scheduler::{CoreSet, GuestThreadId, VirtualCpuId};
 
 use crate::{ThreadExit, ThreadObject};
 
@@ -53,9 +51,6 @@ pub struct GuestThread {
     pub(crate) id: GuestThreadId,
     pub(crate) object: ThreadObject,
     pub(crate) exit: Option<ThreadExit>,
-    pub(crate) lifecycle: ThreadLifecycle,
-    pub(crate) wait_reason: Option<WaitReason>,
-    pub(crate) continuation: Option<Continuation>,
     pub(crate) state: Option<ThreadCpuState>,
     pub handle: u32,
     pub stack_bottom: GuestVirtualAddress,
@@ -84,21 +79,6 @@ impl GuestThread {
     #[must_use]
     pub const fn exit(&self) -> Option<ThreadExit> {
         self.exit
-    }
-
-    #[must_use]
-    pub const fn lifecycle(&self) -> ThreadLifecycle {
-        self.lifecycle
-    }
-
-    #[must_use]
-    pub const fn wait_reason(&self) -> Option<WaitReason> {
-        self.wait_reason
-    }
-
-    #[must_use]
-    pub const fn continuation(&self) -> Option<Continuation> {
-        self.continuation
     }
 
     #[must_use]
@@ -222,9 +202,6 @@ mod tests {
             id: GuestThreadId::new(id),
             object: ThreadObject::new(id),
             exit: None,
-            lifecycle: ThreadLifecycle::Created,
-            wait_reason: None,
-            continuation: None,
             state: Some(ThreadCpuState::A64(Box::default())),
             handle: 0,
             stack_bottom: GuestVirtualAddress::new(0),

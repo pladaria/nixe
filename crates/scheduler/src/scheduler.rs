@@ -29,6 +29,7 @@ pub struct ScheduledThreadView {
     pub affinity: CoreSet,
     pub last_vcpu: Option<VirtualCpuId>,
     pub paused: bool,
+    pub active_wait: Option<WakeToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -229,6 +230,7 @@ impl SchedulerState {
             affinity: thread.config.affinity.clone(),
             last_vcpu: thread.last_vcpu,
             paused: thread.lifecycle == ThreadLifecycle::Suspended,
+            active_wait: thread.active_wait,
         })
     }
 
@@ -243,9 +245,27 @@ impl SchedulerState {
             .filter_map(|(id, slot)| slot.lease.is_none().then_some(*id))
     }
 
+    pub fn active_leases(&self) -> impl Iterator<Item = Lease> + '_ {
+        self.vcpus.values().filter_map(|slot| slot.lease)
+    }
+
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.threads.len()
+    }
+
+    #[must_use]
+    pub fn active_wait_count(&self) -> usize {
+        self.threads
+            .values()
+            .filter(|thread| thread.active_wait.is_some())
+            .count()
+    }
+
+    pub fn active_waits(&self) -> impl Iterator<Item = WakeToken> + '_ {
+        self.threads
+            .values()
+            .filter_map(|thread| thread.active_wait)
     }
 
     fn register(

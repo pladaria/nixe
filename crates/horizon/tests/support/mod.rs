@@ -18,6 +18,21 @@ pub struct ScheduledProcess {
 }
 
 impl ScheduledProcess {
+    pub fn thread_lifecycle(
+        &self,
+        thread: nixe_scheduler::GuestThreadId,
+    ) -> nixe_scheduler::ThreadLifecycle {
+        self.coordinator
+            .scheduler()
+            .thread(thread)
+            .expect("scheduled process owns the requested thread")
+            .lifecycle
+    }
+
+    pub fn main_thread_lifecycle(&self) -> nixe_scheduler::ThreadLifecycle {
+        self.thread_lifecycle(self.main_thread_id())
+    }
+
     pub fn new(process: RunnableProcess) -> Self {
         let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
         let registration = ProcessRegistration {

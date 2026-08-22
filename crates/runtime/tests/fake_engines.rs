@@ -190,7 +190,7 @@ fn fake_nce_uses_common_scheduler_mapping_migration_and_teardown_paths() {
         .core_set([VirtualCpuId::new(3)])
         .unwrap();
     coordinator
-        .set_thread_affinity(process, thread_object, Some(VirtualCpuId::new(3)), vcpu3)
+        .set_thread_affinity(thread_object, Some(VirtualCpuId::new(3)), vcpu3)
         .unwrap();
 
     let entry = coordinator
