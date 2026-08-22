@@ -355,10 +355,12 @@ impl HorizonSvcDispatcher {
         }
         let mut message = Vec::new();
         if message.try_reserve_exact(size).is_err() {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcHostResourceExhausted {
+            return ipc_fault(
                 immediate,
-                operation: "allocating a generic session IPC command buffer",
-            });
+                IpcWireError::HostResourceExhausted(
+                    "allocating a generic session IPC command buffer",
+                ),
+            );
         }
         message.resize(size, 0);
         if let Err(error) = crate::ipc_wire::read_bytes(context.process(), address, &mut message) {
@@ -425,10 +427,7 @@ pub(super) fn finish_sync_response(
         close_encoded_handles(context.process_mut().handles_mut(), &response);
         return match error {
             IpcWireError::GuestMemory(fault) => {
-                ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcResponseCommit {
-                    immediate,
-                    fault,
-                })
+                ipc_fault(immediate, IpcWireError::ResponseCommit(fault))
             }
             error => reject_ipc(context, immediate, error),
         };
@@ -645,48 +644,13 @@ pub(super) fn reject_ipc(
         IpcWireError::GuestMemory(fault) => {
             reject(context, HorizonSvcFault::GuestMemory { immediate, fault })
         }
-        IpcWireError::Malformed(reason) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::MalformedIpc { immediate, reason })
-        }
-        IpcWireError::Internal(reason) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc { immediate, reason })
-        }
-        IpcWireError::HostResourceExhausted(operation) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcHostResourceExhausted {
-                immediate,
-                operation,
-            })
-        }
-        IpcWireError::ResponseCommit(fault) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::IpcResponseCommit { immediate, fault })
-        }
-        IpcWireError::CanonicalBacking(fault) => reject(
-            context,
-            HorizonSvcFault::CanonicalBacking { immediate, fault },
-        ),
-        IpcWireError::ErrorApplet(diagnostic) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::ErrorApplet {
-                immediate,
-                diagnostic,
-            })
-        }
-        IpcWireError::UnsupportedNvDrv(operation) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedNvDrv {
-                immediate,
-                operation,
-            })
-        }
-        IpcWireError::UnsupportedService(operation) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedService {
-                immediate,
-                operation,
-            })
-        }
-        IpcWireError::PendingNvDrv(_) => {
-            ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalIpc {
-                immediate,
-                reason: "pending nvdrv wait escaped the scheduler boundary",
-            })
-        }
+        error => ipc_fault(immediate, error),
     }
+}
+
+fn ipc_fault(immediate: u32, error: IpcWireError) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    ExceptionDispatchOutcome::Fault(HorizonSvcFault::Ipc {
+        immediate,
+        fault: Box::new(crate::ipc_wire::HorizonIpcFault::from_wire(error)),
+    })
 }

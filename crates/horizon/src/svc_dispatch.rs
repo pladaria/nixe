@@ -18,7 +18,7 @@ use nixe_cpu::memory::{
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_memory::{CanonicalRangeAccessError, CanonicalRangeTranslationError};
+use nixe_memory::CanonicalRangeTranslationError;
 use nixe_runtime::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionResume, ExceptionTerminationReason, ExceptionTerminationScope,
@@ -30,7 +30,7 @@ use nixe_runtime::{
 use nixe_scheduler::{GuestThreadId, ProcessId, VirtualCpuId};
 
 use crate::ipc_message::HipcRequest;
-use crate::ipc_wire::{IpcWireError, NamedPortResult, SyncRequestResult};
+use crate::ipc_wire::{HorizonIpcFault, IpcWireError, NamedPortResult, SyncRequestResult};
 use crate::{UnsupportedHorizonSvc, decode_horizon_svc};
 
 mod ipc;
@@ -166,40 +166,12 @@ pub enum HorizonSvcFault {
         immediate: u32,
         fault: CanonicalRangeTranslationError,
     },
-    CanonicalBacking {
+    Ipc {
         immediate: u32,
-        fault: CanonicalRangeAccessError,
-    },
-    MalformedIpc {
-        immediate: u32,
-        reason: &'static str,
-    },
-    InternalIpc {
-        immediate: u32,
-        reason: &'static str,
-    },
-    IpcHostResourceExhausted {
-        immediate: u32,
-        operation: &'static str,
-    },
-    IpcResponseCommit {
-        immediate: u32,
-        fault: DataAccessFault,
-    },
-    ErrorApplet {
-        immediate: u32,
-        diagnostic: Box<crate::ErrorAppletDiagnostic>,
+        fault: Box<HorizonIpcFault>,
     },
     InternalRuntime {
         operation: &'static str,
-    },
-    UnsupportedNvDrv {
-        immediate: u32,
-        operation: crate::nvdrv::UnsupportedNvDrvOperation,
-    },
-    UnsupportedService {
-        immediate: u32,
-        operation: crate::ipc_wire::UnsupportedServiceOperation,
     },
 }
 
@@ -243,15 +215,7 @@ impl HorizonSvcFault {
                 }
                 MemoryMappingErrorReason::GenerationExhausted => None,
             },
-            Self::CanonicalMemory { .. }
-            | Self::CanonicalBacking { .. }
-            | Self::MalformedIpc { .. }
-            | Self::InternalIpc { .. }
-            | Self::IpcHostResourceExhausted { .. }
-            | Self::IpcResponseCommit { .. }
-            | Self::ErrorApplet { .. }
-            | Self::InternalRuntime { .. } => None,
-            Self::UnsupportedNvDrv { .. } | Self::UnsupportedService { .. } => None,
+            Self::CanonicalMemory { .. } | Self::Ipc { .. } | Self::InternalRuntime { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -301,58 +265,15 @@ impl Display for HorizonSvcFault {
                 formatter,
                 "Horizon SVC {immediate:#x} cannot retain canonical memory: {fault}"
             ),
-            Self::CanonicalBacking { immediate, fault } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} cannot access retained canonical backing: {fault}"
-            ),
-            Self::MalformedIpc { immediate, reason } => {
-                write!(
-                    formatter,
-                    "Horizon SVC {immediate:#x} rejected malformed IPC: {reason}"
-                )
+            Self::Ipc { immediate, fault } => {
+                write!(formatter, "Horizon SVC {immediate:#x} {fault}")
             }
-            Self::InternalIpc { immediate, reason } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} reached invalid emulator IPC state: {reason}"
-            ),
-            Self::IpcHostResourceExhausted {
-                immediate,
-                operation,
-            } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} exhausted host resources while {operation}"
-            ),
-            Self::IpcResponseCommit { immediate, fault } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} could not commit a prevalidated IPC response: {fault:?}"
-            ),
-            Self::ErrorApplet {
-                immediate,
-                diagnostic,
-            } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} launched the unimplemented Error library applet: {diagnostic}"
-            ),
             Self::InternalRuntime { operation } => {
                 write!(
                     formatter,
                     "Horizon runtime operation {operation} violated an invariant"
                 )
             }
-            Self::UnsupportedNvDrv {
-                immediate,
-                operation,
-            } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} reached unsupported emulator semantics: {operation}"
-            ),
-            Self::UnsupportedService {
-                immediate,
-                operation,
-            } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} reached unsupported emulator semantics: {operation}"
-            ),
         }
     }
 }
@@ -618,6 +539,35 @@ impl HorizonSvcDispatcher {
         self.virtual_clock.scheduler_time_ns()
     }
 
+    fn queue_runtime_request(
+        &mut self,
+        thread: GuestThreadId,
+        request: PendingRuntimeRequest,
+        operation: &'static str,
+    ) -> Result<(), HorizonSvcFault> {
+        if self
+            .pending_runtime_requests
+            .insert(thread, request)
+            .is_some()
+        {
+            Err(runtime_fault(operation))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn suspend_for_runtime_request(
+        &mut self,
+        thread: GuestThreadId,
+        request: PendingRuntimeRequest,
+        operation: &'static str,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        match self.queue_runtime_request(thread, request, operation) {
+            Ok(()) => ExceptionDispatchOutcome::Suspend(ExceptionResume::Next),
+            Err(fault) => ExceptionDispatchOutcome::Fault(fault),
+        }
+    }
+
     /// Applies one Horizon-to-runtime scheduler operation staged during SVC
     /// dispatch. Returns `Ok(false)` when the calling thread staged none.
     pub fn apply_pending_runtime_request(
@@ -700,18 +650,14 @@ impl HorizonSvcDispatcher {
                         });
                     }
                 };
-                let caller = coordinator
-                    .process_mut(process_id)
-                    .and_then(|process| process.thread_mut(thread_id))
-                    .ok_or(HorizonSvcFault::InternalRuntime {
-                        operation: "StartThread",
-                    })?;
-                write_register(caller.state_mut(), 0, u64::from(code.raw()));
-                coordinator.make_thread_ready(thread_id).map_err(|_| {
-                    HorizonSvcFault::InternalRuntime {
-                        operation: "StartThread",
-                    }
-                })?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "StartThread",
+                    code,
+                    |_| {},
+                )?;
             }
             PendingRuntimeRequest::GetThreadPriority { object_id } => {
                 let info = coordinator.thread_scheduling_info(object_id);
@@ -722,13 +668,18 @@ impl HorizonSvcDispatcher {
                     }
                     Err(_) => return Err(runtime_fault("GetThreadPriority")),
                 };
-                let state =
-                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadPriority")?;
-                write_register(state, 0, u64::from(code.raw()));
-                if let Some(priority) = priority {
-                    write_register(state, 1, priority as u32 as u64);
-                }
-                resume_pending_caller(coordinator, thread_id, "GetThreadPriority")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "GetThreadPriority",
+                    code,
+                    |state| {
+                        if let Some(priority) = priority {
+                            write_register(state, 1, priority as u32 as u64);
+                        }
+                    },
+                )?;
             }
             PendingRuntimeRequest::SetThreadPriority {
                 object_id,
@@ -738,12 +689,14 @@ impl HorizonSvcDispatcher {
                     coordinator.set_thread_priority(object_id, priority),
                     "SetThreadPriority",
                 )?;
-                write_register(
-                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadPriority")?,
-                    0,
-                    u64::from(code.raw()),
-                );
-                resume_pending_caller(coordinator, thread_id, "SetThreadPriority")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "SetThreadPriority",
+                    code,
+                    |_| {},
+                )?;
             }
             PendingRuntimeRequest::GetThreadCoreMask { object_id } => {
                 let info = coordinator.thread_scheduling_info(object_id);
@@ -762,14 +715,19 @@ impl HorizonSvcDispatcher {
                     }
                     Err(_) => return Err(runtime_fault("GetThreadCoreMask")),
                 };
-                let state =
-                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadCoreMask")?;
-                write_register(state, 0, u64::from(code.raw()));
-                if let Some((ideal, mask)) = values {
-                    write_register(state, 1, ideal as u32 as u64);
-                    write_u64(state, 2, mask);
-                }
-                resume_pending_caller(coordinator, thread_id, "GetThreadCoreMask")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "GetThreadCoreMask",
+                    code,
+                    |state| {
+                        if let Some((ideal, mask)) = values {
+                            write_register(state, 1, ideal as u32 as u64);
+                            write_u64(state, 2, mask);
+                        }
+                    },
+                )?;
             }
             PendingRuntimeRequest::SetThreadCoreMask {
                 object_id,
@@ -801,17 +759,14 @@ impl HorizonSvcDispatcher {
                     } else if let Ok(core) = u32::try_from(ideal_core) {
                         Some(VirtualCpuId::new(core))
                     } else {
-                        write_register(
-                            pending_caller_state(
-                                coordinator,
-                                process_id,
-                                thread_id,
-                                "SetThreadCoreMask",
-                            )?,
-                            0,
-                            u64::from(HorizonKernelResult::OUT_OF_RANGE.raw()),
-                        );
-                        resume_pending_caller(coordinator, thread_id, "SetThreadCoreMask")?;
+                        finish_pending_caller(
+                            coordinator,
+                            process_id,
+                            thread_id,
+                            "SetThreadCoreMask",
+                            HorizonKernelResult::OUT_OF_RANGE,
+                            |_| {},
+                        )?;
                         return Ok(true);
                     };
                     map_thread_operation(
@@ -819,12 +774,14 @@ impl HorizonSvcDispatcher {
                         "SetThreadCoreMask",
                     )?
                 };
-                write_register(
-                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadCoreMask")?,
-                    0,
-                    u64::from(code.raw()),
-                );
-                resume_pending_caller(coordinator, thread_id, "SetThreadCoreMask")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "SetThreadCoreMask",
+                    code,
+                    |_| {},
+                )?;
             }
             PendingRuntimeRequest::SleepThread { nanoseconds } => {
                 coordinator
@@ -848,12 +805,14 @@ impl HorizonSvcDispatcher {
                         "SetThreadActivity",
                     )?
                 };
-                write_register(
-                    pending_caller_state(coordinator, process_id, thread_id, "SetThreadActivity")?,
-                    0,
-                    u64::from(code.raw()),
-                );
-                resume_pending_caller(coordinator, thread_id, "SetThreadActivity")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "SetThreadActivity",
+                    code,
+                    |_| {},
+                )?;
             }
             PendingRuntimeRequest::GetThreadContext { object_id, address } => {
                 let info = coordinator
@@ -878,12 +837,14 @@ impl HorizonSvcDispatcher {
                     }
                     HorizonKernelResult::SUCCESS
                 };
-                write_register(
-                    pending_caller_state(coordinator, process_id, thread_id, "GetThreadContext3")?,
-                    0,
-                    u64::from(code.raw()),
-                );
-                resume_pending_caller(coordinator, thread_id, "GetThreadContext3")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "GetThreadContext3",
+                    code,
+                    |_| {},
+                )?;
             }
             PendingRuntimeRequest::InheritPriority {
                 owner_object_id,
@@ -908,7 +869,14 @@ impl HorizonSvcDispatcher {
                 coordinator
                     .reap_thread(object_id)
                     .map_err(|_| runtime_fault("CloseHandle thread reaping"))?;
-                resume_pending_caller(coordinator, thread_id, "CloseHandle thread reaping")?;
+                finish_pending_caller(
+                    coordinator,
+                    process_id,
+                    thread_id,
+                    "CloseHandle thread reaping",
+                    HorizonKernelResult::SUCCESS,
+                    |_| {},
+                )?;
             }
         }
         Ok(fully_handled)
@@ -938,26 +906,18 @@ impl HorizonSvcDispatcher {
                 });
             }
         };
-        let state = coordinator
-            .process_mut(process_id)
-            .ok_or(HorizonSvcFault::InternalRuntime {
-                operation: "CreateThread",
-            })?
-            .thread_mut(caller)
-            .ok_or(HorizonSvcFault::InternalRuntime {
-                operation: "CreateThread",
-            })?
-            .state_mut();
-        write_register(state, 0, u64::from(code.raw()));
-        if let Some(handle) = handle {
-            write_register(state, 1, u64::from(handle));
-        }
-        coordinator
-            .make_thread_ready(caller)
-            .map_err(|_| HorizonSvcFault::InternalRuntime {
-                operation: "CreateThread",
-            })?;
-        Ok(())
+        finish_pending_caller(
+            coordinator,
+            process_id,
+            caller,
+            "CreateThread",
+            code,
+            |state| {
+                if let Some(handle) = handle {
+                    write_register(state, 1, u64::from(handle));
+                }
+            },
+        )
     }
 
     fn observe(&mut self, immediate: u32, outcome: &ExceptionDispatchOutcome<HorizonSvcFault>) {
@@ -1236,24 +1196,21 @@ const fn runtime_fault(operation: &'static str) -> HorizonSvcFault {
     HorizonSvcFault::InternalRuntime { operation }
 }
 
-fn pending_caller_state<'a>(
-    coordinator: &'a mut nixe_runtime::RuntimeCoordinator,
+fn finish_pending_caller(
+    coordinator: &mut nixe_runtime::RuntimeCoordinator,
     process_id: ProcessId,
     thread_id: GuestThreadId,
     operation: &'static str,
-) -> Result<&'a mut ThreadCpuState, HorizonSvcFault> {
-    coordinator
+    code: HorizonKernelResult,
+    write_output: impl FnOnce(&mut ThreadCpuState),
+) -> Result<(), HorizonSvcFault> {
+    let state = coordinator
         .process_mut(process_id)
         .and_then(|process| process.thread_mut(thread_id))
         .map(nixe_runtime::GuestThread::state_mut)
-        .ok_or_else(|| runtime_fault(operation))
-}
-
-fn resume_pending_caller(
-    coordinator: &mut nixe_runtime::RuntimeCoordinator,
-    thread_id: GuestThreadId,
-    operation: &'static str,
-) -> Result<(), HorizonSvcFault> {
+        .ok_or_else(|| runtime_fault(operation))?;
+    write_register(state, 0, u64::from(code.raw()));
+    write_output(state);
     coordinator
         .make_thread_ready(thread_id)
         .map_err(|_| runtime_fault(operation))
@@ -1467,12 +1424,12 @@ fn close_handle(
         result(context, HorizonKernelResult::SUCCESS);
         return resume();
     };
-    if dispatcher
-        .pending_runtime_requests
-        .insert(caller, PendingRuntimeRequest::ReapThread { object_id })
-        .is_some()
-    {
-        return ExceptionDispatchOutcome::Fault(runtime_fault("CloseHandle thread reaping"));
+    if let Err(fault) = dispatcher.queue_runtime_request(
+        caller,
+        PendingRuntimeRequest::ReapThread { object_id },
+        "CloseHandle thread reaping",
+    ) {
+        return ExceptionDispatchOutcome::Fault(fault);
     }
     result(context, HorizonKernelResult::SUCCESS);
     ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
@@ -1832,9 +1789,11 @@ mod tests {
 
     #[test]
     fn invalid_emulator_ipc_state_has_no_guest_result() {
-        let fault = HorizonSvcFault::InternalIpc {
+        let fault = HorizonSvcFault::Ipc {
             immediate: 0x21,
-            reason: "synthetic internal invariant",
+            fault: Box::new(HorizonIpcFault::from_wire(IpcWireError::Internal(
+                "synthetic internal invariant",
+            ))),
         };
 
         assert_eq!(fault.guest_result(), None);
@@ -1842,9 +1801,9 @@ mod tests {
 
     #[test]
     fn malformed_ipc_has_no_unverified_guest_result() {
-        let fault = HorizonSvcFault::MalformedIpc {
+        let fault = HorizonSvcFault::Ipc {
             immediate: 0x21,
-            reason: "synthetic malformed request",
+            fault: Box::new(HorizonIpcFault::malformed("synthetic malformed request")),
         };
 
         assert_eq!(fault.guest_result(), None);
@@ -1853,9 +1812,11 @@ mod tests {
     #[test]
     fn error_applet_content_is_reported_as_a_fatal_host_fault() {
         let diagnostic = crate::ErrorAppletDiagnostic::decode(&[]).with_launch_mode(0);
-        let fault = HorizonSvcFault::ErrorApplet {
+        let fault = HorizonSvcFault::Ipc {
             immediate: 0x21,
-            diagnostic: Box::new(diagnostic),
+            fault: Box::new(HorizonIpcFault::from_wire(IpcWireError::ErrorApplet(
+                Box::new(diagnostic),
+            ))),
         };
 
         assert_eq!(fault.guest_result(), None);
@@ -1868,9 +1829,11 @@ mod tests {
 
     #[test]
     fn host_ipc_resource_exhaustion_has_no_guest_result() {
-        let fault = HorizonSvcFault::IpcHostResourceExhausted {
+        let fault = HorizonSvcFault::Ipc {
             immediate: 0x21,
-            operation: "allocating a synthetic response",
+            fault: Box::new(HorizonIpcFault::from_wire(
+                IpcWireError::HostResourceExhausted("allocating a synthetic response"),
+            )),
         };
 
         assert_eq!(fault.guest_result(), None);
@@ -1878,17 +1841,19 @@ mod tests {
 
     #[test]
     fn unsupported_nvdrv_semantics_have_no_guest_result() {
-        let fault = HorizonSvcFault::UnsupportedNvDrv {
+        let fault = HorizonSvcFault::Ipc {
             immediate: 0x21,
-            operation: crate::nvdrv::UnsupportedNvDrvOperation::Ioctl {
-                context: crate::nvdrv::NvDrvErrorContext::new(
-                    crate::nvdrv::NvDrvDeviceKind::HostControlGpu,
-                    0xc018_4706,
-                    crate::nvdrv::NvDrvFileDescriptor::new(3),
-                    None,
-                    crate::nvdrv::NvDrvValidationReason::UnsupportedOperation,
-                ),
-            },
+            fault: Box::new(HorizonIpcFault::from_wire(IpcWireError::UnsupportedNvDrv(
+                crate::nvdrv::UnsupportedNvDrvOperation::Ioctl {
+                    context: crate::nvdrv::NvDrvErrorContext::new(
+                        crate::nvdrv::NvDrvDeviceKind::HostControlGpu,
+                        0xc018_4706,
+                        crate::nvdrv::NvDrvFileDescriptor::new(3),
+                        None,
+                        crate::nvdrv::NvDrvValidationReason::UnsupportedOperation,
+                    ),
+                },
+            ))),
         };
 
         assert_eq!(fault.guest_result(), None);

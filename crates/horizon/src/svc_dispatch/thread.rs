@@ -18,16 +18,7 @@ impl HorizonSvcDispatcher {
             priority: read_register(context.thread().state(), priority_register) as u32 as i32,
             core_id: read_register(context.thread().state(), core_register) as u32 as i32,
         };
-        if self
-            .pending_runtime_requests
-            .insert(context.thread().id(), request)
-            .is_some()
-        {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalRuntime {
-                operation: "CreateThread",
-            });
-        }
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+        self.suspend_for_runtime_request(context.thread().id(), request, "CreateThread")
     }
 
     pub(super) fn start_thread(
@@ -45,19 +36,11 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         };
-        if self
-            .pending_runtime_requests
-            .insert(
-                context.thread().id(),
-                PendingRuntimeRequest::StartThread { object_id },
-            )
-            .is_some()
-        {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalRuntime {
-                operation: "StartThread",
-            });
-        }
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+        self.suspend_for_runtime_request(
+            context.thread().id(),
+            PendingRuntimeRequest::StartThread { object_id },
+            "StartThread",
+        )
     }
 
     pub(super) fn stage_thread_object_request(
@@ -80,14 +63,7 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         };
-        if self
-            .pending_runtime_requests
-            .insert(context.thread().id(), build(object_id))
-            .is_some()
-        {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::InternalRuntime { operation });
-        }
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+        self.suspend_for_runtime_request(context.thread().id(), build(object_id), operation)
     }
 
     pub(super) fn get_thread_priority(
@@ -158,17 +134,11 @@ impl HorizonSvcDispatcher {
                     | (read_register(context.thread().state(), 1) << 32)) as i64
             }
         };
-        if self
-            .pending_runtime_requests
-            .insert(
-                context.thread().id(),
-                PendingRuntimeRequest::SleepThread { nanoseconds },
-            )
-            .is_some()
-        {
-            return ExceptionDispatchOutcome::Fault(runtime_fault("SleepThread"));
-        }
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+        self.suspend_for_runtime_request(
+            context.thread().id(),
+            PendingRuntimeRequest::SleepThread { nanoseconds },
+            "SleepThread",
+        )
     }
 
     pub(super) fn set_thread_activity(
