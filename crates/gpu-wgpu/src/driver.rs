@@ -46,8 +46,7 @@ enum Resource {
     },
     Shader {
         module: ShaderModule,
-        stage: ShaderStage,
-        ir: nixe_gpu::VerifiedShaderIr,
+        neutral: nixe_gpu::ShaderBackendModule,
     },
     Pipeline {
         description: PipelineDescription,
@@ -893,7 +892,7 @@ impl WgpuBackendDriver {
             let group = u32::try_from(draw.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
             let module = nixe_gpu::lower_shader_ir_to_wgsl_with_vertex_pulling(
-                &vertex_ir,
+                vertex_ir.ir(),
                 &draw.vertex_buffers,
                 group,
             )
@@ -1035,23 +1034,19 @@ impl WgpuBackendDriver {
         (
             BackendResourceHandle,
             ShaderModule,
-            nixe_gpu::VerifiedShaderIr,
+            nixe_gpu::ShaderBackendModule,
         ),
         BackendDriverError,
     > {
         let mut found = None;
         for handle in dependencies.values().copied() {
-            if let Some(Resource::Shader {
-                module,
-                stage: candidate,
-                ir,
-            }) = self.resources.get(&handle)
-                && *candidate == stage
+            if let Some(Resource::Shader { module, neutral }) = self.resources.get(&handle)
+                && neutral.stage() == stage
             {
                 if found.is_some() {
                     return Err(unsupported("multiple shaders for one pipeline stage"));
                 }
-                found = Some((handle, module.clone(), ir.clone()));
+                found = Some((handle, module.clone(), neutral.clone()));
             }
         }
         found.ok_or_else(|| unsupported("missing shader stage"))
@@ -1398,17 +1393,12 @@ impl BackendDriver for WgpuBackendDriver {
                     ..Default::default()
                 }),
             },
-            BackendResourceCreateInfo::Shader {
-                description,
-                module,
-                ..
-            } => Resource::Shader {
+            BackendResourceCreateInfo::Shader { module, .. } => Resource::Shader {
                 module: self.device.create_shader_module(ShaderModuleDescriptor {
                     label: Some("Nixe translated shader"),
                     source: ShaderSource::Wgsl(module.source().into()),
                 }),
-                stage: description.stage,
-                ir: module.ir().clone(),
+                neutral: module.clone(),
             },
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
                 description: *description,

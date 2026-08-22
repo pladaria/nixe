@@ -68,8 +68,7 @@ pub use runtime::{
     SynchronousBackendRuntime,
 };
 pub use shader::{
-    ShaderBackendLanguage, ShaderBackendLoweringError, ShaderBackendModule,
-    ShaderBackendSourceMapEntry, ShaderEvaluationError, ShaderEvaluationInputs,
+    ShaderBackendLoweringError, ShaderBackendModule, ShaderEvaluationError, ShaderEvaluationInputs,
     ShaderEvaluationResult, ShaderFloatComparison, ShaderFloatControl, ShaderInstruction,
     ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
     ShaderIrConstructionError, ShaderMathAccuracy, ShaderNanMode, ShaderOperation, ShaderPredicate,
