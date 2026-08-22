@@ -1,6 +1,6 @@
 //! Immutable SSA-like IR values and typed immediates.
 
-use crate::address::GuestVirtualAddress;
+use nixe_memory::GuestVirtualAddress;
 
 use super::types::IrType;
 

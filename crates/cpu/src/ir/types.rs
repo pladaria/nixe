@@ -60,12 +60,6 @@ impl IrType {
     pub const fn is_float(self) -> bool {
         matches!(self, Self::F16 | Self::F32 | Self::F64)
     }
-
-    /// Returns whether this is a semantic vector type.
-    #[must_use]
-    pub const fn is_vector(self) -> bool {
-        matches!(self, Self::V64 | Self::V128)
-    }
 }
 
 #[cfg(test)]

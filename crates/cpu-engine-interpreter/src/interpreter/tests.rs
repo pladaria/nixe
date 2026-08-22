@@ -1,7 +1,6 @@
 use core::cell::Cell;
 
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
     ir::terminator::Terminator,
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{
@@ -14,10 +13,12 @@ use nixe_cpu::{
         a64::{A64GeneralRegister, A64Register, Nzcv},
     },
 };
+use nixe_cpu_engine::{EngineTimer, TimerSnapshot};
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 
 use super::{
-    ArchitecturalTimer, ArchitecturalTimerSnapshot, InterpreterContext, InterpreterError,
-    InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one, execute_one_with_context,
+    InterpreterContext, InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback,
+    execute_one, execute_one_with_context,
 };
 
 fn source(
@@ -509,7 +510,7 @@ fn a64_system_register_reference_semantics_preserve_thread_state() {
 fn a64_architectural_timer_registers_use_the_runtime_snapshot() {
     let profile = GuestCpuProfile::switch_1();
     let context = InterpreterContext::new(ProcessCpuContext::new(profile, AddressSpaceId::new(0)))
-        .with_architectural_timer(ArchitecturalTimerSnapshot {
+        .with_architectural_timer(TimerSnapshot {
             counter: 0x1234_5678_9abc_def0,
             frequency: 19_200_000,
         });
@@ -531,10 +532,10 @@ fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
         samples: Cell<u32>,
     }
 
-    impl ArchitecturalTimer for CountingTimer {
-        fn snapshot(&self) -> ArchitecturalTimerSnapshot {
+    impl EngineTimer for CountingTimer {
+        fn snapshot(&self) -> TimerSnapshot {
             self.samples.set(self.samples.get() + 1);
-            ArchitecturalTimerSnapshot {
+            TimerSnapshot {
                 counter: 42,
                 frequency: 19_200_000,
             }

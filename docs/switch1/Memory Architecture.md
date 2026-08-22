@@ -769,8 +769,8 @@ The device-neutral `nixe-memory` crate owns domain-specific integer wrappers:
   metadata.
 
 They are deliberately not host pointers. Checked arithmetic is the default for
-guest addresses. `nixe-cpu::address` remains a compatibility facade for
-existing CPU callers; `CodeGeneration` is an alias for `ContentGeneration`.
+guest addresses. CPU frontends and engines import these identities directly
+from `nixe-memory`.
 
 ### Retained canonical ranges
 
@@ -781,10 +781,10 @@ Removing the final CPU alias releases process ownership, but an `nvmap`
 allocation or in-flight device range which already retained the page remains
 valid until that reference is dropped.
 
-`CanonicalRangeTranslator` is the temporary production CPU adapter into the
-neutral contract. A complete translation validates the requested CPU virtual
-range before returning ordered `CanonicalBackingSegment` values. Each segment
-contains:
+`CanonicalRangeTranslator` is the neutral translation contract between CPU
+virtual memory and canonical backing. A complete translation validates the
+requested CPU virtual range before returning ordered
+`CanonicalBackingSegment` values. Each segment contains:
 
 - `CanonicalPageId`;
 - page-relative byte offset and size;
@@ -1513,11 +1513,10 @@ retained during scheduler migration as a permanent deterministic policy, which
 models all configured vCPUs while permitting only one guest slice to execute at
 once. Parallel policy will instead use at most one long-lived host worker per
 active vCPU; guest threads remain scheduler-owned runtime objects rather than
-dedicated host threads. Canonical backing now records conservative CPU/device
-visibility authority and can invoke an injected reconciliation slow path, but
-no GPU backend is connected yet. Nixe does not reproduce the complete
-multicore Arm memory model, cache hierarchy, device coherence, or all
-cache-maintenance effects.
+dedicated host threads. Canonical backing records conservative CPU/device
+visibility authority and can invoke an injected reconciliation slow path. Nixe
+does not reproduce the complete multicore Arm memory model, cache hierarchy,
+device coherence, or all cache-maintenance effects.
 
 ## Planned dynamic-recompiler memory path
 

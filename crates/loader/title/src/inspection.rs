@@ -324,11 +324,6 @@ impl PackageInspection {
             total.saturating_add(entry.stored_size.unwrap_or(entry.size))
         })
     }
-
-    /// Returns bytes occupied by the PFS0 header, tables, and any padding.
-    pub fn container_overhead(&self) -> u64 {
-        self.size.saturating_sub(self.payload_size())
-    }
 }
 
 /// Best-effort inspection report for a file or directory supplied by the user.
@@ -377,18 +372,6 @@ impl TitleInspector {
     }
 
     /// Inspects multiple paths with one shared caller-owned key set.
-    pub fn inspect_paths_with_key_set<P, I>(
-        paths: I,
-        keys: &mut NcaKeySet,
-    ) -> Result<Vec<TitleInspection>, InspectError>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = P>,
-    {
-        Self::inspect_paths_with_key_set_and_options(paths, keys, DirectoryScanOptions::default())
-    }
-
-    /// Inspects multiple paths with one shared caller-owned key set.
     ///
     /// Ticket keys imported while inspecting an earlier path remain available
     /// to every later path in the caller-provided order.
@@ -419,15 +402,6 @@ impl TitleInspector {
         options: DirectoryScanOptions,
     ) -> Result<TitleInspection, InspectError> {
         Self::inspect_impl(path.as_ref(), None, options)
-    }
-
-    /// Inspects title packages and decrypts their NCAs with caller-owned keys.
-    /// Encrypted title keys present in NSP tickets are imported into the key set.
-    pub fn inspect_with_key_set(
-        path: impl AsRef<Path>,
-        keys: &mut NcaKeySet,
-    ) -> Result<TitleInspection, InspectError> {
-        Self::inspect_with_key_set_and_options(path, keys, DirectoryScanOptions::default())
     }
 
     /// Inspects a package path with keys and the supplied directory options.

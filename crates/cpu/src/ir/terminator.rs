@@ -1,9 +1,8 @@
 //! Explicit control-flow terminators for one translation unit.
 
-use crate::{
-    address::GuestVirtualAddress,
-    location::{ExecutionState, InstructionEncoding, LocationDescriptor},
-};
+use nixe_memory::GuestVirtualAddress;
+
+use crate::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
 
 // Preserve the original public path while the architectural type lives outside
 // the IR. New engine-independent code should import `crate::exception`.
@@ -110,7 +109,9 @@ impl Terminator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{address::GuestVirtualAddress, profile::CpuProfileId};
+    use nixe_memory::GuestVirtualAddress;
+
+    use crate::profile::CpuProfileId;
 
     fn location() -> LocationDescriptor {
         LocationDescriptor::new(

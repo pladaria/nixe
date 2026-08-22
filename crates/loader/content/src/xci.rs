@@ -146,10 +146,6 @@ impl XciPartition {
     pub fn open(&self, name: &str) -> Result<Option<StorageRef>, LoadError> {
         self.archive.open(name)
     }
-
-    pub fn validate_entries(&self) -> Result<Vec<Hfs0HashResult>, LoadError> {
-        self.archive.validate_all()
-    }
 }
 
 /// Parsed, bounded view of an XCI image and its HFS0 partitions.
@@ -184,26 +180,9 @@ impl XciArchive {
             .find(|partition| partition.kind() == kind)
     }
 
-    pub fn partition_by_name(&self, name: &str) -> Option<&XciPartition> {
-        self.partitions
-            .iter()
-            .find(|partition| partition.name() == name)
-    }
-
     pub fn secure_partition(&self) -> Result<&XciPartition, LoadError> {
         self.partition(&XciPartitionKind::Secure)
             .ok_or_else(|| LoadError::invalid("XCI", "title loading requires a secure partition"))
-    }
-
-    pub fn open_partition_file(
-        &self,
-        partition: &XciPartitionKind,
-        name: &str,
-    ) -> Result<Option<StorageRef>, LoadError> {
-        self.partition(partition)
-            .map(|partition| partition.open(name))
-            .transpose()
-            .map(Option::flatten)
     }
 }
 

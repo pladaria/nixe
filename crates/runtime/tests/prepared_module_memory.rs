@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use nixe_cpu::address::{AddressSpaceId, GuestVirtualAddress};
 use nixe_cpu::error::InstructionFetchFaultReason;
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
@@ -10,6 +9,7 @@ use nixe_loader_executable::{
     ExternalSymbol, NroLoader, NsoLoader, PreparationConfig, PreparedModule, SymbolResolution,
 };
 use nixe_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{
     BackendInstallError, InstallStage, ModuleMemoryBackend, PageRequest, install_prepared_module,
 };

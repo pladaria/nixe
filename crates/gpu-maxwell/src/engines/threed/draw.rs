@@ -3510,7 +3510,7 @@ fn lower_draw(
                     "primitive topology is not a triangle list",
                 ));
             }
-            if first_vertex % 3 != 0 || vertex_count % 3 != 0 {
+            if !first_vertex.is_multiple_of(3) || !vertex_count.is_multiple_of(3) {
                 return Err(MaxwellThreeDLoweringError::UnsupportedFillRectangleDraw(
                     "vertex range is not aligned to complete triangles",
                 ));

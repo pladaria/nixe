@@ -93,16 +93,6 @@ impl ProcessBuilder {
         self
     }
 
-    #[must_use]
-    pub const fn diagnostics(&self) -> crate::DiagnosticsPolicy {
-        self.diagnostics
-    }
-
-    #[must_use]
-    pub const fn cpu_diagnostics(&self) -> nixe_cpu::coverage::CpuDiagnosticsConfig {
-        self.diagnostics.cpu()
-    }
-
     /// Prepares, maps, and initializes one runnable process.
     ///
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.

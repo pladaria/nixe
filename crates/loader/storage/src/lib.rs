@@ -79,8 +79,6 @@ impl From<std::io::Error> for StorageError {
 /// Errors shared by all format loaders.
 #[derive(Debug)]
 pub enum LoadError {
-    /// The loader exists, but parsing has not been implemented yet.
-    NotImplemented { format: &'static str },
     /// Reading from the underlying data source failed.
     Storage(StorageError),
     /// The source does not contain a valid instance of the requested format.
@@ -105,9 +103,6 @@ impl LoadError {
 impl Display for LoadError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotImplemented { format } => {
-                write!(formatter, "loading {format} files is not implemented")
-            }
             Self::Storage(error) => Display::fmt(error, formatter),
             Self::InvalidFormat { format, reason } => {
                 write!(formatter, "invalid {format}: {reason}")
@@ -121,9 +116,7 @@ impl Error for LoadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::NotImplemented { .. } | Self::InvalidFormat { .. } | Self::MissingKey { .. } => {
-                None
-            }
+            Self::InvalidFormat { .. } | Self::MissingKey { .. } => None,
         }
     }
 }

@@ -904,30 +904,13 @@ fn memory_effects(base: EffectSet, descriptor: MemoryDescriptor) -> OperationEff
     OperationEffects::new(side_effects, true)
 }
 
-/// Generic envelope retained for frontend components which need to attach a
-/// precise source before converting a payload into [`IrOperation`].
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct FaultingOperation<T> {
-    pub location: LocationDescriptor,
-    pub operation: T,
-}
-
-impl<T> FaultingOperation<T> {
-    #[must_use]
-    pub const fn new(location: LocationDescriptor, operation: T) -> Self {
-        Self {
-            location,
-            operation,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::value::{Immediate, ValueId};
     use super::*;
+    use nixe_memory::GuestVirtualAddress;
+
     use crate::{
-        address::GuestVirtualAddress,
         location::ExecutionState,
         memory::{MemoryAccessClass, MemoryAlignment, MemoryOrdering},
         profile::CpuProfileId,

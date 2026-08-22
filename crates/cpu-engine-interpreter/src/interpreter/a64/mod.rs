@@ -7,12 +7,12 @@ mod memory;
 mod system;
 
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{DecodedOpcode, a64::A64Instruction},
     location::{DecodedInstruction, ExecutionState, LocationDescriptor},
     semantics::a64::signed_immediate as sign_extend,
     state::a64::{A64GeneralRegister, A64Register, A64State},
 };
+use nixe_memory::GuestVirtualAddress;
 
 use super::{InterpreterContext, InterpreterError, InterpreterOutcome};
 

@@ -41,17 +41,6 @@ impl ControlMetadata {
     pub fn icon(&self, language: NacpLanguage) -> Option<&ControlIcon> {
         self.icons.iter().find(|icon| icon.language == language)
     }
-
-    /// Chooses the first requested icon, then American English, then the first
-    /// icon in canonical language order.
-    pub fn preferred_icon(&self, preferences: &[NacpLanguage]) -> Option<&ControlIcon> {
-        preferences
-            .iter()
-            .copied()
-            .chain([NacpLanguage::AmericanEnglish])
-            .chain(NacpLanguage::ALL)
-            .find_map(|language| self.icon(language))
-    }
 }
 
 impl PartialEq for ControlMetadata {

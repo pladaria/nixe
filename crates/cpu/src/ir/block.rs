@@ -1,7 +1,8 @@
 //! Manually constructible typed IR blocks and translation metadata.
 
+use nixe_memory::GuestVirtualAddress;
+
 use crate::{
-    address::GuestVirtualAddress,
     location::{InstructionEncoding, LocationDescriptor},
     memory::{CodeDependencies, CodePageDependency},
 };
@@ -217,8 +218,9 @@ impl IrBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_memory::{ContentGeneration, GuestPhysicalPageId, MappingGeneration};
+
     use crate::{
-        address::{CodeGeneration, GuestPhysicalPageId},
         ir::{
             op::{
                 ByteOrder, Condition, FlagOperation, IntegerBinaryKind, IrOperation, LaneType,
@@ -253,8 +255,8 @@ mod tests {
             }],
             vec![CodePageDependency {
                 page: GuestPhysicalPageId::new(5),
-                generation: CodeGeneration::new(9),
-                mapping_generation: crate::address::MappingGeneration::new(1),
+                generation: ContentGeneration::new(9),
+                mapping_generation: MappingGeneration::new(1),
             }],
             vec![
                 InstructionSource::new(
@@ -262,8 +264,8 @@ mod tests {
                     InstructionEncoding::from_u32(0x8b02_0020),
                     CodeDependencies::one(CodePageDependency {
                         page: GuestPhysicalPageId::new(5),
-                        generation: CodeGeneration::new(9),
-                        mapping_generation: crate::address::MappingGeneration::new(1),
+                        generation: ContentGeneration::new(9),
+                        mapping_generation: MappingGeneration::new(1),
                     }),
                 ),
                 InstructionSource::new(
@@ -271,8 +273,8 @@ mod tests {
                     InstructionEncoding::from_u32(0x5400_0020),
                     CodeDependencies::one(CodePageDependency {
                         page: GuestPhysicalPageId::new(5),
-                        generation: CodeGeneration::new(9),
-                        mapping_generation: crate::address::MappingGeneration::new(1),
+                        generation: ContentGeneration::new(9),
+                        mapping_generation: MappingGeneration::new(1),
                     }),
                 ),
             ],

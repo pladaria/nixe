@@ -1,7 +1,6 @@
 use super::{InterpreterContext, InterpreterError};
 use crate::interpreter::aarch32::SemanticControl;
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{
         DecodedOpcode,
         a32::fp_simd::Instruction,
@@ -14,6 +13,7 @@ use nixe_cpu::{
     },
     state::a32::A32State,
 };
+use nixe_memory::GuestVirtualAddress;
 
 pub(super) enum Execution {
     Control(SemanticControl),

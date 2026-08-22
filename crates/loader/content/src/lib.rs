@@ -53,10 +53,3 @@ pub use xci::{
     XciArchive, XciHeader, XciLoader, XciPartition, XciPartitionKind, XciRootHeaderIntegrity,
 };
 pub use xcz::{XczArchive, XczLoader, XczPartition};
-
-/// Placeholder representation of content exposed by a parsed container.
-///
-/// Named entries, nested storage regions, integrity metadata, and content type
-/// information will be added as the individual formats are implemented.
-#[derive(Debug)]
-pub struct LoadedContent;

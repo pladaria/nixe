@@ -427,15 +427,6 @@ impl HandleTable {
         ReadableEventObject(self.changed.clone())
     }
 
-    #[must_use]
-    pub fn contains_thread_object(&self, target: &ThreadObject) -> bool {
-        self.objects.values().any(|object| {
-            object
-                .downcast_ref::<ThreadObject>()
-                .is_some_and(|thread| thread == target)
-        })
-    }
-
     /// Moves one object to another process table without cloning its runtime state.
     pub fn transfer_to(&mut self, destination: &mut Self, handle: u32) -> Result<u32, HandleError> {
         if !self.objects.contains_key(&handle) {

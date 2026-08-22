@@ -10,8 +10,8 @@ pub mod a64;
 
 use core::fmt;
 
-use crate::address::GuestVirtualAddress;
 use crate::{location::ExecutionState, profile::ThreadCpuConfiguration};
+use nixe_memory::GuestVirtualAddress;
 
 pub use a32::{A32State, Cpsr};
 pub use a64::{A64State, Nzcv};
@@ -144,7 +144,9 @@ impl ThreadCpuState {
 
 #[cfg(test)]
 mod tests {
-    use crate::{address::AddressSpaceId, profile::GuestCpuProfile};
+    use nixe_memory::AddressSpaceId;
+
+    use crate::profile::GuestCpuProfile;
 
     use super::*;
 

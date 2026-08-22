@@ -151,21 +151,6 @@ impl LaunchError {
     pub const fn stage(&self) -> LaunchStage {
         self.stage
     }
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-    pub const fn application_id(&self) -> Option<ApplicationId> {
-        self.application_id
-    }
-    pub const fn title_id_value(&self) -> Option<TitleId> {
-        self.title_id
-    }
-    pub const fn content_id(&self) -> Option<&[u8; 16]> {
-        self.content_id.as_ref()
-    }
-    pub fn module_name(&self) -> Option<&str> {
-        self.module.as_deref()
-    }
 }
 
 impl Display for LaunchError {

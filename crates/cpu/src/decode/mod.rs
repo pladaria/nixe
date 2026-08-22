@@ -95,8 +95,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use nixe_memory::GuestVirtualAddress;
+
     use crate::{
-        address::GuestVirtualAddress,
         coverage::CoverageId,
         location::InstructionSize,
         profile::{CapabilityStatus, InstructionFeature},

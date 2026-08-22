@@ -12,7 +12,6 @@ mod t32;
 use core::{cell::RefCell, fmt};
 
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestVirtualAddress},
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
     error::{ProfileDisabledInstruction, UnallocatedEncoding},
@@ -23,6 +22,8 @@ use nixe_cpu::{
     profile::{GuestCpuProfile, ProcessCpuContext},
     state::ThreadCpuState,
 };
+use nixe_cpu_engine::{EngineTimer, TimerSnapshot};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 /// Policy applied when dispatch reaches an `InterpretOne` terminator.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -73,26 +74,10 @@ pub struct InterpreterContext<'a> {
     architectural_timer: Option<ArchitecturalTimerSource<'a>>,
 }
 
-/// One immutable architectural-timer observation supplied by the runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ArchitecturalTimerSnapshot {
-    pub counter: u64,
-    pub frequency: u64,
-}
-
-/// Runtime provider for architectural timer observations.
-///
-/// The interpreter requests a snapshot only when an instruction actually
-/// reads an architectural timer register. This keeps host clock access out of
-/// the common instruction path.
-pub trait ArchitecturalTimer {
-    fn snapshot(&self) -> ArchitecturalTimerSnapshot;
-}
-
 #[derive(Clone, Copy)]
 enum ArchitecturalTimerSource<'a> {
-    Snapshot(ArchitecturalTimerSnapshot),
-    Provider(&'a dyn ArchitecturalTimer),
+    Snapshot(TimerSnapshot),
+    Provider(&'a dyn EngineTimer),
 }
 
 impl<'a> InterpreterContext<'a> {
@@ -122,10 +107,7 @@ impl<'a> InterpreterContext<'a> {
     }
 
     #[must_use]
-    pub const fn with_architectural_timer(
-        mut self,
-        architectural_timer: ArchitecturalTimerSnapshot,
-    ) -> Self {
+    pub const fn with_architectural_timer(mut self, architectural_timer: TimerSnapshot) -> Self {
         self.architectural_timer = Some(ArchitecturalTimerSource::Snapshot(architectural_timer));
         self
     }
@@ -133,14 +115,14 @@ impl<'a> InterpreterContext<'a> {
     #[must_use]
     pub const fn with_architectural_timer_provider(
         mut self,
-        architectural_timer: &'a dyn ArchitecturalTimer,
+        architectural_timer: &'a dyn EngineTimer,
     ) -> Self {
         self.architectural_timer = Some(ArchitecturalTimerSource::Provider(architectural_timer));
         self
     }
 
     #[must_use]
-    pub fn architectural_timer(self) -> Option<ArchitecturalTimerSnapshot> {
+    pub fn architectural_timer(self) -> Option<TimerSnapshot> {
         match self.architectural_timer? {
             ArchitecturalTimerSource::Snapshot(snapshot) => Some(snapshot),
             ArchitecturalTimerSource::Provider(provider) => Some(provider.snapshot()),

@@ -3944,9 +3944,11 @@ pub(crate) fn translate_prepared_maxwell_shader_programs(
             texture.sampler_binding =
                 remapped_binding(&local_bindings, stage, texture.sampler_binding)?;
         }
-        let output_interpolation = (neutral_stage(stage) == ShaderStage::Vertex)
-            .then_some(linked_interpolation.as_slice())
-            .unwrap_or_default();
+        let output_interpolation = if neutral_stage(stage) == ShaderStage::Vertex {
+            linked_interpolation.as_slice()
+        } else {
+            &[]
+        };
         let ir = finalize_shader_ir(translated.ir, stage, &local_bindings, output_interpolation)?;
         if !translated.texture_bindings.is_empty() && input.texture_constant_buffer_slot.is_none() {
             return Err(MaxwellShaderTranslationError::IncompletePipelineBinding {

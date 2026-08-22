@@ -566,11 +566,11 @@ pub trait ExceptionDispatcher {
 #[cfg(test)]
 mod tests {
     use nixe_cpu::{
-        address::GuestVirtualAddress,
         exception::ExceptionKind,
         location::{ExecutionState, LocationDescriptor},
         profile::CpuProfileId,
     };
+    use nixe_memory::GuestVirtualAddress;
 
     use super::*;
 

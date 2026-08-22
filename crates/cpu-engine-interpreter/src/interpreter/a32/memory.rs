@@ -3,7 +3,6 @@ use crate::interpreter::aarch32::{
     SemanticControl, execute_multiple, execute_single, read_register, write_register,
 };
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{DecodedOpcode, a32::memory::Instruction, aarch32::ExclusiveTransfer},
     location::DecodedInstruction,
     memory::{
@@ -12,6 +11,7 @@ use nixe_cpu::{
     },
     state::a32::A32State,
 };
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 pub(super) enum Execution {
     Control(SemanticControl),
@@ -51,7 +51,7 @@ pub(super) fn execute(
 fn exclusive(
     context: InterpreterContext<'_>,
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A32State,
     transfer: ExclusiveTransfer,
 ) -> Result<SemanticControl, nixe_cpu::memory::DataAccessFault> {
@@ -112,7 +112,7 @@ fn exclusive(
 
 fn acquire_release(
     memory: &dyn CpuMemory,
-    address_space: nixe_cpu::address::AddressSpaceId,
+    address_space: AddressSpaceId,
     state: &mut A32State,
     transfer: ExclusiveTransfer,
 ) -> Result<SemanticControl, nixe_cpu::memory::DataAccessFault> {

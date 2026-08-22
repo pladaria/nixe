@@ -584,7 +584,9 @@ mod tests {
     use core::mem::size_of;
 
     use super::*;
-    use crate::{address::GuestVirtualAddress, profile::CapabilityStatus};
+    use nixe_memory::GuestVirtualAddress;
+
+    use crate::profile::CapabilityStatus;
 
     const EMPTY_FIELDS: &[OperandField] = &[];
     const EMPTY_FEATURES: &[InstructionFeature] = &[];

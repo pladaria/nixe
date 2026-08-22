@@ -749,7 +749,7 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
     let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, 0).unwrap();
     assert!(matches!(
         lower_maxwell_three_d_synchronization(
-            &dispatch.synchronization_operations()[0],
+            dispatch.synchronization_operations()[0],
             None,
             false
         ),

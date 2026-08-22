@@ -518,21 +518,6 @@ impl RenderPassDescription {
     pub fn attachments(&self) -> &[RenderPassAttachmentDescription] {
         &self.attachments
     }
-
-    #[must_use]
-    pub fn color_attachment_count(&self) -> usize {
-        self.attachments
-            .iter()
-            .filter(|attachment| attachment.kind == ImageKind::Color)
-            .count()
-    }
-
-    #[must_use]
-    pub fn has_depth_stencil(&self) -> bool {
-        self.attachments
-            .last()
-            .is_some_and(|attachment| attachment.kind == ImageKind::DepthStencil)
-    }
 }
 
 /// Type of values stored by a query pool.

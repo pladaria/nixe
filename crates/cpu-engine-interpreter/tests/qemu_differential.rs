@@ -518,7 +518,7 @@ fn allocated_register_encoding(
         };
         let encoding = pattern_value | (variable & !pattern_mask);
         let location = LocationDescriptor::new(
-            nixe_cpu::address::GuestVirtualAddress::new(0x1000),
+            nixe_memory::GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
             profile.id(),
         );
@@ -633,7 +633,7 @@ fn compare_a64_register_case(
         unreachable!()
     };
     let location = LocationDescriptor::new(
-        nixe_cpu::address::GuestVirtualAddress::new(slot),
+        nixe_memory::GuestVirtualAddress::new(slot),
         ExecutionState::A64,
         profile.id(),
     );

@@ -219,7 +219,7 @@ impl A32State {
     pub fn register_context(&self) -> super::A32RegisterContext {
         super::A32RegisterContext {
             r: self.r,
-            pc: crate::address::GuestVirtualAddress::new(u64::from(self.pc)),
+            pc: nixe_memory::GuestVirtualAddress::new(u64::from(self.pc)),
             cpsr: self.cpsr,
         }
     }

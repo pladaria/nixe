@@ -1,17 +1,14 @@
 //! Deterministic memory backend for frontend and runtime tests.
 
+use nixe_memory::{
+    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-use crate::{
-    address::{
-        AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress,
-        MappingGeneration,
-    },
-    error::{InstructionFetchFault, InstructionFetchFaultReason},
-};
+use crate::error::{InstructionFetchFault, InstructionFetchFaultReason};
 
 use super::common::{
     MappingState, PAGE_SIZE, PageRange, ResolvedDataAccess, allocate_page_id,

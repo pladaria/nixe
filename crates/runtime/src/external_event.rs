@@ -265,12 +265,6 @@ impl ExternalEventInbox {
         }
     }
 
-    pub(crate) fn recv_sequenced(&self) -> Result<SequencedExternalEvent, ExternalEventSendError> {
-        self.receiver
-            .recv()
-            .map_err(|_| ExternalEventSendError::Closed)
-    }
-
     pub(crate) fn recv_sequenced_timeout(
         &self,
         timeout: Duration,

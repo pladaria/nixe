@@ -379,13 +379,6 @@ impl MaxwellScheduler {
             .map(|scheduled| scheduled.submission.address_space())
     }
 
-    #[must_use]
-    pub fn next_dependency(&self) -> Option<GuestTimelinePoint> {
-        self.queued
-            .front()
-            .and_then(|scheduled| scheduled.dependency)
-    }
-
     /// Preflights semantic state and host capacity before a timeline mutates.
     ///
     /// The caller may reserve the T5 fence after this returns. With exclusive

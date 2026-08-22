@@ -687,11 +687,6 @@ impl<D: BackendDriver> Backend<D> {
         }
     }
 
-    #[must_use]
-    pub fn into_driver(self) -> D {
-        self.driver
-    }
-
     fn require_active(&self) -> Result<(), BackendError> {
         match self.state {
             BackendState::Active => Ok(()),

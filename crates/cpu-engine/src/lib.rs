@@ -21,7 +21,7 @@ mod conformance;
 mod control;
 pub use capability::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, EngineCapabilities,
-    EngineDescriptor, EngineKind, HostArchitecture, HostCapabilities,
+    EngineDescriptor, EngineKind,
 };
 pub use conformance::{
     CONFORMANCE_FALLBACK_ENCODING, ConformanceCase, ConformanceFailure, ConformanceReport,

@@ -1,9 +1,10 @@
 //! Opt-in deterministic reports for one frontend translation block.
 
+use nixe_memory::{
+    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+};
+
 use crate::{
-    address::{
-        AddressSpaceId, CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
-    },
     error::{
         FrontendError, FrontendInternalError, InstructionFetchFault, InstructionFetchFaultReason,
     },
@@ -338,7 +339,7 @@ fn dependencies(first: GuestVirtualAddress, last: GuestVirtualAddress) -> CodeDe
 fn dependency(address: GuestVirtualAddress) -> CodePageDependency {
     CodePageDependency {
         page: GuestPhysicalPageId::new(address.get() / SYNTHETIC_PAGE_SIZE as u64),
-        generation: CodeGeneration::new(1),
+        generation: ContentGeneration::new(1),
         mapping_generation: MappingGeneration::new(1),
     }
 }

@@ -1,4 +1,3 @@
-use nixe_cpu::address::GuestPhysicalPageId;
 use nixe_cpu::location::InstructionEncoding;
 use nixe_cpu::memory::{MemoryPermissions, SyntheticMemory};
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
@@ -11,6 +10,7 @@ use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_cpu_engine_interpreter::{
     InterpreterContext, InterpreterOutcome, execute_one_with_context,
 };
+use nixe_memory::GuestPhysicalPageId;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 const CODE: u64 = 0x1000;
