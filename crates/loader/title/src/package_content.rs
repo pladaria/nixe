@@ -11,6 +11,8 @@ use crate::{ContentType, PackageFormat, PackageMetadata};
 use crate::{ControlIcon, ControlMetadata};
 
 pub(crate) trait PackageContent {
+    const FORMAT: PackageFormat;
+
     fn entry_count(&self) -> usize;
     fn entry_name(&self, index: usize) -> &str;
     fn entry_size(&self, index: usize) -> u64;
@@ -18,6 +20,8 @@ pub(crate) trait PackageContent {
 }
 
 impl PackageContent for NspArchive {
+    const FORMAT: PackageFormat = PackageFormat::Nsp;
+
     fn entry_count(&self) -> usize {
         self.entries().len()
     }
@@ -36,6 +40,8 @@ impl PackageContent for NspArchive {
 }
 
 impl PackageContent for NszArchive {
+    const FORMAT: PackageFormat = PackageFormat::Nsz;
+
     fn entry_count(&self) -> usize {
         self.entries().len()
     }
@@ -54,6 +60,8 @@ impl PackageContent for NszArchive {
 }
 
 impl PackageContent for XczPartition {
+    const FORMAT: PackageFormat = PackageFormat::Xcz;
+
     fn entry_count(&self) -> usize {
         self.entries().len()
     }
@@ -72,6 +80,8 @@ impl PackageContent for XczPartition {
 }
 
 impl PackageContent for Hfs0Archive {
+    const FORMAT: PackageFormat = PackageFormat::Xci;
+
     fn entry_count(&self) -> usize {
         self.entries().len()
     }
@@ -92,46 +102,19 @@ impl PackageContent for Hfs0Archive {
     }
 }
 
-pub(crate) fn load_canonical_content_meta<C: PackageContent + ?Sized>(
-    archive: &C,
-    keys: Option<&dyn NcaKeyProvider>,
-) -> Result<CnmtContentMeta, LoadError> {
-    let metadata = load_canonical_content_metas(archive, keys)?;
-    if metadata.len() != 1 {
-        return Err(LoadError::invalid(
-            "CNMT",
-            format!(
-                "package contains {} .cnmt.nca entries; expected exactly one",
-                metadata.len()
-            ),
-        ));
-    }
-    Ok(metadata
-        .into_iter()
-        .next()
-        .expect("validated metadata count"))
-}
-
 pub(crate) fn load_canonical_content_metas<C: PackageContent + ?Sized>(
     archive: &C,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Vec<CnmtContentMeta>, LoadError> {
-    let meta_entries: Vec<_> = (0..archive.entry_count())
-        .filter(|index| {
-            archive
-                .entry_name(*index)
-                .to_ascii_lowercase()
-                .ends_with(".cnmt.nca")
-        })
-        .collect();
-    if meta_entries.is_empty() {
-        return Err(LoadError::invalid(
-            "CNMT",
-            "package contains no .cnmt.nca entries",
-        ));
-    }
-    let mut metadata = Vec::with_capacity(meta_entries.len());
-    for index in meta_entries {
+    let mut metadata = Vec::new();
+    let mut found_entry = false;
+    for index in (0..archive.entry_count()).filter(|index| {
+        archive
+            .entry_name(*index)
+            .to_ascii_lowercase()
+            .ends_with(".cnmt.nca")
+    }) {
+        found_entry = true;
         let content_meta = load_content_meta_entry(archive, index, keys).map_err(|error| {
             LoadError::invalid(
                 "CNMT",
@@ -157,6 +140,12 @@ pub(crate) fn load_canonical_content_metas<C: PackageContent + ?Sized>(
             ));
         }
         metadata.push(content_meta);
+    }
+    if !found_entry {
+        return Err(LoadError::invalid(
+            "CNMT",
+            "package contains no .cnmt.nca entries",
+        ));
     }
     Ok(metadata)
 }
@@ -230,42 +219,33 @@ pub(crate) fn load_control_metadata<C: PackageContent + ?Sized>(
     content_meta: &CnmtContentMeta,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Option<ControlMetadata>, LoadError> {
-    let controls: Vec<_> = content_meta
+    let mut controls = content_meta
         .contents
         .iter()
-        .filter(|content| content.content_type == CnmtContentType::Control)
-        .collect();
-    let content = match controls.as_slice() {
-        [] => return Ok(None),
-        [content] => *content,
-        _ => {
-            return Err(LoadError::invalid(
-                "Control NCA",
-                format!(
-                    "canonical CNMT contains {} Control records; expected at most one",
-                    controls.len()
-                ),
-            ));
-        }
+        .filter(|content| content.content_type == CnmtContentType::Control);
+    let Some(content) = controls.next() else {
+        return Ok(None);
     };
+    if controls.next().is_some() {
+        return Err(LoadError::invalid(
+            "Control NCA",
+            format!(
+                "canonical CNMT contains {} Control records; expected at most one",
+                2 + controls.count()
+            ),
+        ));
+    }
 
     let expected_name = format!("{}.nca", hex(&content.content_id));
-    let entries: Vec<_> = (0..archive.entry_count())
-        .filter(|index| {
-            archive
-                .entry_name(*index)
-                .eq_ignore_ascii_case(&expected_name)
-        })
-        .collect();
-    let entry_index = match entries.as_slice() {
-        [index] => *index,
-        [] => {
+    let entry_index = match unique_entry_index(archive, &expected_name) {
+        UniqueEntry::One(index) => index,
+        UniqueEntry::Missing => {
             return Err(LoadError::invalid(
                 "Control NCA",
                 format!("canonical content {expected_name} is missing from the package"),
             ));
         }
-        _ => {
+        UniqueEntry::Ambiguous => {
             return Err(LoadError::invalid(
                 "Control NCA",
                 format!("multiple package entries match {expected_name}"),
@@ -446,22 +426,15 @@ fn open_canonical_entry<C: PackageContent + ?Sized>(
     expected_name: &str,
     expected_size: u64,
 ) -> Result<StorageRef, LoadError> {
-    let matches = (0..archive.entry_count())
-        .filter(|index| {
-            archive
-                .entry_name(*index)
-                .eq_ignore_ascii_case(expected_name)
-        })
-        .collect::<Vec<_>>();
-    let index = match matches.as_slice() {
-        [index] => *index,
-        [] => {
+    let index = match unique_entry_index(archive, expected_name) {
+        UniqueEntry::One(index) => index,
+        UniqueEntry::Missing => {
             return Err(LoadError::invalid(
                 "canonical package content",
                 format!("{expected_name} is missing"),
             ));
         }
-        _ => {
+        UniqueEntry::Ambiguous => {
             return Err(LoadError::invalid(
                 "canonical package content",
                 format!("{expected_name} is duplicated or case-ambiguous"),
@@ -476,6 +449,25 @@ fn open_canonical_entry<C: PackageContent + ?Sized>(
         ));
     }
     archive.open_entry_at(index)
+}
+
+fn unique_entry_index<C: PackageContent + ?Sized>(archive: &C, name: &str) -> UniqueEntry {
+    let mut matches = (0..archive.entry_count())
+        .filter(|index| archive.entry_name(*index).eq_ignore_ascii_case(name));
+    let first = matches.next();
+    if matches.next().is_some() {
+        UniqueEntry::Ambiguous
+    } else if let Some(index) = first {
+        UniqueEntry::One(index)
+    } else {
+        UniqueEntry::Missing
+    }
+}
+
+enum UniqueEntry {
+    Missing,
+    One(usize),
+    Ambiguous,
 }
 
 pub(crate) fn import_ticket_keys<C: PackageContent + ?Sized>(

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef, SubStorage};
 
+use crate::binary::{read_i32, read_u32};
 use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, ExecutableSegmentKind, MemoryPermissions,
 };
@@ -678,12 +679,6 @@ fn read_range(bytes: &[u8], offset: usize) -> NsoRange {
         u64::from(read_u32(bytes, offset)),
         u64::from(read_u32(bytes, offset + 4)),
     )
-}
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed field"))
-}
-fn read_i32(bytes: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed field"))
 }
 fn checked_align_up(value: u64, alignment: u64) -> Option<u64> {
     value

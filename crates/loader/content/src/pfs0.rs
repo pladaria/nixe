@@ -4,6 +4,8 @@ use std::sync::Arc;
 use nixe_loader_storage::FormatLoader;
 use nixe_loader_storage::{LoadError, StorageRef, SubStorage};
 
+use crate::binary::{read_u32, read_u64};
+
 const HEADER_SIZE: u64 = 0x10;
 const ENTRY_SIZE: u64 = 0x18;
 const MAX_FILE_COUNT: u64 = 65_536;
@@ -228,20 +230,4 @@ impl std::fmt::Debug for Pfs0Archive {
             .field("data_offset", &self.data_offset)
             .finish_non_exhaustive()
     }
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("validated PFS0 metadata range"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated PFS0 metadata range"),
-    )
 }

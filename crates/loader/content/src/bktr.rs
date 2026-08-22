@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef, SubStorage};
 
+use crate::binary::{read_i32, read_i64, read_u32, read_u64};
 use crate::crypto::apply_ctr;
 use crate::{
     BktrPatchInfo, NcaEncryptionType, NcaSection, NcaSectionType, RomFsArchive, RomFsLoader,
@@ -626,22 +627,6 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, StorageError> {
         .checked_add(alignment - 1)
         .map(|value| value / alignment * alignment)
         .ok_or(StorageError::OutOfBounds)
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 #[cfg(test)]

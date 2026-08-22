@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
+use crate::binary::{read_u32, read_u64};
+
 const HEADER_SIZE: u64 = 0x50;
 const DIRECTORY_ENTRY_SIZE: u64 = 0x18;
 const FILE_ENTRY_SIZE: u64 = 0x20;
@@ -443,14 +445,6 @@ fn join_path(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed range"))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed range"))
 }
 
 #[cfg(test)]

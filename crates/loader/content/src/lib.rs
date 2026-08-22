@@ -1,5 +1,6 @@
 //! Loaders for Nintendo Switch content containers and file-system images.
 
+mod binary;
 mod bktr;
 mod cnmt;
 mod compressed_package;
