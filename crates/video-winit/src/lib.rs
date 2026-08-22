@@ -337,7 +337,7 @@ impl Presenter {
         let dimensions = (frame.width(), frame.height());
         if self.frame_dimensions != Some(dimensions) {
             log::info!(
-                "Vulkan framebuffer texture configured at {}x{}",
+                "guest framebuffer texture configured at {}x{}",
                 frame.width(),
                 frame.height()
             );
@@ -490,10 +490,7 @@ impl Presenter {
     fn update_title(&mut self) {
         let title = window_title(
             self.backend_name,
-            (
-                self.surface_configuration.width,
-                self.surface_configuration.height,
-            ),
+            self.frame_dimensions,
             self.frame_rate.frames_per_second(),
         );
         if title != self.displayed_title {
@@ -564,9 +561,13 @@ const fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-fn window_title(backend: &str, output: (u32, u32), fps: Option<f64>) -> String {
+fn window_title(backend: &str, output: Option<(u32, u32)>, fps: Option<f64>) -> String {
+    let output = output.map_or_else(
+        || "-".to_owned(),
+        |(width, height)| format!("{width}×{height}"),
+    );
     let fps = fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps:.1} FPS"));
-    format!("nixe - {backend} | {}×{} | {fps}", output.0, output.1)
+    format!("nixe - {backend} | {output} | {fps}")
 }
 
 struct PresenterApplication {
@@ -787,12 +788,16 @@ mod tests {
     #[test]
     fn title_reports_backend_output_size_and_optional_frame_rate() {
         assert_eq!(
-            window_title("Vulkan", (1280, 720), None),
+            window_title("Vulkan", Some((1280, 720)), None),
             "nixe - Vulkan | 1280×720 | -- FPS"
         );
         assert_eq!(
-            window_title("Direct3D 12", (1920, 1080), Some(59.94)),
+            window_title("Direct3D 12", Some((1920, 1080)), Some(59.94)),
             "nixe - Direct3D 12 | 1920×1080 | 59.9 FPS"
+        );
+        assert_eq!(
+            window_title("Metal", None, None),
+            "nixe - Metal | - | -- FPS"
         );
     }
 
