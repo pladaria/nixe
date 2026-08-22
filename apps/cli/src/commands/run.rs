@@ -316,18 +316,13 @@ fn select_cpu_engine(
                 a64: true,
                 a32: false,
                 t32: false,
-                precise_instruction_budget: true,
                 instruction_trace: diagnostics.instruction_trace,
                 interpret_one_fallback: false,
-                native_execution: false,
                 concurrent_executors: parallel_vcpus,
                 max_safepoint_instructions: parallel_vcpus
                     .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
                 acknowledged_invalidation: parallel_vcpus,
-                canonical_state_version: 1,
                 deterministic_execution: !parallel_vcpus,
-                precise_exceptions: true,
-                engine_handoff: true,
                 canonical_memory_binding: false,
                 max_concurrent_executors: parallel_vcpus.then(|| {
                     std::num::NonZeroUsize::new(vcpu_count)

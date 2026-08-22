@@ -71,7 +71,7 @@ fn cpu_frontend_does_not_own_a_concrete_interpreter_engine() {
 
     for relative in [
         "src/coverage.rs",
-        "src/decode/registry.rs",
+        "src/decode/allocation.rs",
         "src/decode/table.rs",
         "src/translate/block.rs",
     ] {

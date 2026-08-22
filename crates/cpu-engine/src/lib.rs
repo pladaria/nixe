@@ -14,12 +14,11 @@ use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{CpuMemory, DataAccessFault};
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
-use nixe_memory::GuestVirtualAddress;
+use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
 
 mod capability;
 mod conformance;
 mod control;
-mod handoff;
 pub use capability::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, EngineCapabilities,
     EngineDescriptor, EngineKind, HostArchitecture, HostCapabilities,
@@ -29,10 +28,6 @@ pub use conformance::{
     run_provider_conformance,
 };
 pub use control::{ControlSnapshot, CrossVcpuRequest, EngineControl, EngineExecutionGuard};
-pub use handoff::{
-    DomainMemory, DomainMemoryBinding, DomainQuiescenceToken, HandoffFailure, HandoffFailureStage,
-    MemorySynchronizationRecord, StateCommitBarrier, prepare_handoff,
-};
 
 pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
 pub const MAX_TRACE_DISASSEMBLY_BYTES: usize = 96;
@@ -60,23 +55,6 @@ macro_rules! identity {
 identity!(EngineId);
 identity!(EngineDomainId);
 identity!(EngineExecutorId);
-identity!(EngineGeneration);
-identity!(ControlEpoch);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SafepointReason {
-    Requested,
-    PendingEvent { mask: u32 },
-    Timer,
-    MappingChanged,
-    EngineHandoff,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum StateCommitStatus {
-    Canonical,
-    BackendPrivate,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TimerSnapshot {
@@ -342,15 +320,14 @@ pub struct ExecutionReport {
     pub stop: EngineExit,
     pub context: RegisterContext,
     pub trace: InstructionTrace,
-    pub state_commit: StateCommitStatus,
 }
 
 impl Display for ExecutionReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "instructions={} stop=[{}] registers=[{}] trace=[{}] commit={:?}",
-            self.instructions_executed, self.stop, self.context, self.trace, self.state_commit
+            "instructions={} stop=[{}] registers=[{}] trace=[{}]",
+            self.instructions_executed, self.stop, self.context, self.trace
         )
     }
 }
@@ -359,9 +336,6 @@ impl Display for ExecutionReport {
 pub enum EngineFaultKind {
     InvalidRequest,
     Internal,
-    StateImport,
-    StateExport,
-    Synchronization,
     Unavailable,
 }
 
@@ -394,6 +368,21 @@ impl std::error::Error for EngineFault {}
 pub struct DomainRequest {
     pub domain: EngineDomainId,
     pub cpu: ProcessCpuContext,
+}
+
+/// Memory surface available to domains which retain native mappings.
+pub trait DomainMemory: CpuMemory + CanonicalRangeTranslator {}
+
+impl<T> DomainMemory for T where T: CpuMemory + CanonicalRangeTranslator {}
+
+/// Complete canonical address-space view supplied at domain creation and
+/// before executor re-entry after mapping changes.
+#[derive(Clone, Copy)]
+pub struct DomainMemoryBinding<'a> {
+    pub address_space: AddressSpaceId,
+    pub end_exclusive: GuestVirtualAddress,
+    pub memory: &'a dyn DomainMemory,
+    pub invalidation_generation: u64,
 }
 
 /// Construction parameters for one worker-owned vCPU executor.
@@ -495,9 +484,7 @@ impl EngineRegistry {
 pub trait EngineDomain: Send {
     fn descriptor(&self) -> EngineDescriptor;
     fn domain_id(&self) -> EngineDomainId;
-    /// Creates executor-local state for an already-bound domain. Transactional
-    /// replacement may create executors before [`Self::activate`]; they cannot
-    /// enter guest execution until activation succeeds.
+    /// Creates executor-local state for an already-bound domain.
     fn create_executor(
         &mut self,
         request: ExecutorRequest,
@@ -508,27 +495,10 @@ pub trait EngineDomain: Send {
     fn bind_memory(&mut self, _binding: DomainMemoryBinding<'_>) -> Result<(), EngineFault> {
         Ok(())
     }
-    /// Flushes backend-private writes and acknowledges the current mapping
-    /// generation before an engine handoff or teardown.
-    fn synchronize_memory(
-        &mut self,
-        binding: DomainMemoryBinding<'_>,
-    ) -> Result<MemorySynchronizationRecord, EngineFault> {
-        Ok(binding.synchronization_record())
-    }
-    /// Imports the synchronization point exported by the previous domain.
-    fn import_memory(&mut self, _record: MemorySynchronizationRecord) -> Result<(), EngineFault> {
-        Ok(())
-    }
-    /// Makes a bound, synchronized domain available for executor entry.
-    fn activate(&mut self) -> Result<(), EngineFault> {
-        Ok(())
-    }
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault>;
     /// Permanently releases domain resources after every executor was dropped.
     /// Implementations with external resources must make this idempotent.
     fn shutdown(&mut self) -> Result<(), EngineFault> {
-        self.quiesce().map(|_| ())
+        Ok(())
     }
 }
 
@@ -536,6 +506,7 @@ pub trait EngineDomain: Send {
 pub trait EngineExecutor: Send {
     fn descriptor(&self) -> EngineDescriptor;
     fn executor_id(&self) -> EngineExecutorId;
+    /// Runs a bounded slice and commits canonical thread state before returning.
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault>;
     /// Applies mapping/code invalidation before guest re-entry. Providers which
     /// advertise acknowledged invalidation must override this method.

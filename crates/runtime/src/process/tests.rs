@@ -116,11 +116,7 @@ impl nixe_cpu_engine::EngineProvider for RuntimeFakeProvider {
             kind: nixe_cpu_engine::EngineKind::Test,
             capabilities: nixe_cpu_engine::EngineCapabilities {
                 a64: true,
-                precise_instruction_budget: true,
-                canonical_state_version: 1,
                 deterministic_execution: true,
-                precise_exceptions: true,
-                engine_handoff: true,
                 ..Default::default()
             },
         }
@@ -153,14 +149,10 @@ fn control_lying_descriptor() -> nixe_cpu_engine::EngineDescriptor {
         kind: nixe_cpu_engine::EngineKind::Test,
         capabilities: nixe_cpu_engine::EngineCapabilities {
             a64: true,
-            precise_instruction_budget: true,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
             acknowledged_invalidation: true,
-            canonical_state_version: 1,
             deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
             ..Default::default()
         },
     }
@@ -212,15 +204,6 @@ impl nixe_cpu_engine::EngineDomain for ControlLyingDomain {
             id: request.executor,
         }))
     }
-
-    fn quiesce(
-        &mut self,
-    ) -> Result<nixe_cpu_engine::DomainQuiescenceToken, nixe_cpu_engine::EngineFault> {
-        Ok(nixe_cpu_engine::DomainQuiescenceToken {
-            domain: self.id,
-            generation: nixe_cpu_engine::EngineGeneration::new(0),
-        })
-    }
 }
 
 struct RuntimeFakeDomain {
@@ -241,15 +224,6 @@ impl nixe_cpu_engine::EngineDomain for RuntimeFakeDomain {
         Ok(Box::new(RuntimeFakeExecutor {
             id: request.executor,
         }))
-    }
-
-    fn quiesce(
-        &mut self,
-    ) -> Result<nixe_cpu_engine::DomainQuiescenceToken, nixe_cpu_engine::EngineFault> {
-        Ok(nixe_cpu_engine::DomainQuiescenceToken {
-            domain: self.id,
-            generation: nixe_cpu_engine::EngineGeneration::new(0),
-        })
     }
 }
 
@@ -279,7 +253,6 @@ impl nixe_cpu_engine::EngineExecutor for RuntimeFakeExecutor {
                 entries: Box::new([]),
                 discarded: 0,
             },
-            state_commit: nixe_cpu_engine::StateCommitStatus::Canonical,
         })
     }
     fn clear_local_exclusive_reservation(&mut self) {}

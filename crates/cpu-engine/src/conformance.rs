@@ -15,8 +15,7 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{
     CrossVcpuRequest, DomainRequest, EngineDomain, EngineExecutor, EngineExecutorId, EngineExit,
-    EngineProvider, EngineTimer, ExecutorRequest, RunRequest, StateCommitStatus, TimerSnapshot,
-    TracePolicy,
+    EngineProvider, EngineTimer, ExecutorRequest, RunRequest, TimerSnapshot, TracePolicy,
 };
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
@@ -146,11 +145,9 @@ impl Suite {
             end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
             memory: &self.binding_memory,
             invalidation_generation: self.binding_memory.mapping_epoch().get(),
-            dirty_generation: self.binding_memory.content_mutation_epoch().get(),
         };
         domain
             .bind_memory(binding)
-            .and_then(|()| domain.activate())
             .map_err(|error| Self::fail(case, error.to_string()))?;
         if domain.domain_id() != id {
             return Err(Self::fail(
@@ -251,7 +248,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -302,7 +299,6 @@ impl Suite {
             .map_err(|error| Self::fail(case, error))?;
         if report.instructions_executed != 1
             || report.stop != EngineExit::BudgetExhausted
-            || report.state_commit != StateCommitStatus::Canonical
             || report.context != state.register_context()
             || instruction_address(&state) != CODE.get() + 4
         {
@@ -313,7 +309,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -337,7 +333,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -373,7 +369,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -397,7 +393,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -425,7 +421,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -447,7 +443,7 @@ impl Suite {
             .control()
             .ok_or_else(|| Self::fail(case, "invalidation capability has no control path"))?;
         let mut state = state_at(CODE);
-        let _ = control.request_invalidation(9);
+        control.request_invalidation(9);
         executor
             .synchronize_invalidation(9, &state, &fixture_memory(&[0xd503_201f], 0))
             .map_err(|error| Self::fail(case, error.to_string()))?;
@@ -459,7 +455,7 @@ impl Suite {
             .map_err(|error| Self::fail(case, error))?;
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -499,7 +495,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -533,7 +529,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -562,7 +558,7 @@ impl Suite {
         }
         drop((first, second));
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -575,7 +571,7 @@ impl Suite {
             self.skipped.push(case);
             return Ok(());
         };
-        let _ = control.request(CrossVcpuRequest::Preempt);
+        control.request(CrossVcpuRequest::Preempt);
         let memory = fixture_memory(&[0xd503_201f], 0);
         let mut state = state_at(CODE);
         let report = run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
@@ -588,7 +584,7 @@ impl Suite {
         }
         drop(executor);
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())
@@ -599,18 +595,6 @@ impl Suite {
         let mut domain = self.domain(case)?;
         let executor = self.executor(domain.as_mut(), case)?;
         drop(executor);
-        let first = domain
-            .quiesce()
-            .map_err(|error| Self::fail(case, error.to_string()))?;
-        let second = domain
-            .quiesce()
-            .map_err(|error| Self::fail(case, error.to_string()))?;
-        if first.domain != domain.domain_id()
-            || second.domain != domain.domain_id()
-            || second.generation.get() <= first.generation.get()
-        {
-            return Err(Self::fail(case, "quiescence tokens were not monotonic"));
-        }
         domain
             .shutdown()
             .and_then(|()| domain.shutdown())
@@ -631,7 +615,7 @@ impl Suite {
             observations.push((state, report));
             drop(executor);
             domain
-                .quiesce()
+                .shutdown()
                 .map_err(|error| Self::fail(case, error.to_string()))?;
         }
         if observations[0] != observations[1] {
@@ -676,7 +660,7 @@ impl Suite {
             }
         }
         domain
-            .quiesce()
+            .shutdown()
             .map_err(|error| Self::fail(case, error.to_string()))?;
         self.passed.push(case);
         Ok(())

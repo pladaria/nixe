@@ -20,7 +20,7 @@ use nixe_cpu::{
         a64::{A64GeneralRegister, A64Register, Nzcv},
     },
 };
-use nixe_cpu_engine_interpreter::{InterpreterOutcome, execute_one, has_semantics};
+use nixe_cpu_engine_interpreter::{InterpreterOutcome, execute_one};
 
 const RUNNER_SOURCE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -45,6 +45,37 @@ struct OracleConfiguration {
     emulator_environment: &'static str,
 }
 
+struct A64OracleFixture {
+    _serial: MutexGuard<'static, ()>,
+    temporary: TestDirectory,
+    slot: u64,
+    oracle: QemuA64Oracle,
+}
+
+impl A64OracleFixture {
+    fn new() -> Self {
+        let configuration = configurations()[0];
+        let compiler = configured_tool(
+            configuration.compiler_environment,
+            configuration.compiler_default,
+        );
+        let emulator = configured_tool(
+            configuration.emulator_environment,
+            configuration.emulator_default,
+        );
+        let temporary = TestDirectory::new(ExecutionState::A64);
+        let runner = temporary.path().join("a64-oracle-runner");
+        compile_runner(&compiler, ExecutionState::A64, &runner);
+        let slot = symbol_address(&runner, "nixe_oracle_slot");
+        Self {
+            _serial: qemu_gdb_test_guard(),
+            temporary,
+            slot,
+            oracle: QemuA64Oracle::start(&emulator, &runner),
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires the optional QEMU user-mode and Arm cross-toolchain dependencies"]
 fn qemu_user_mode_matches_adds_for_a64_a32_and_t32() {
@@ -56,50 +87,31 @@ fn qemu_user_mode_matches_adds_for_a64_a32_and_t32() {
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_single_step_oracle_preserves_bfm_destination_bits() {
-    let _serial = qemu_gdb_test_guard();
-    let configuration = configurations()[0];
-    let compiler = configured_tool(
-        configuration.compiler_environment,
-        configuration.compiler_default,
-    );
-    let emulator = configured_tool(
-        configuration.emulator_environment,
-        configuration.emulator_default,
-    );
-    let temporary = TestDirectory::new(ExecutionState::A64);
-    let runner = temporary.path().join("a64-state-oracle-runner");
-    compile_runner(&compiler, ExecutionState::A64, &runner);
-    let slot = symbol_address(&runner, "nixe_oracle_slot");
-
-    let mut oracle = QemuA64Oracle::start(&emulator, &runner);
-    oracle.write_instruction(slot, 0x331b_0c20); // BFI W0,W1,#5,#4
-    oracle.write_register(0, 0xa5a5_a5a5);
-    oracle.write_register(1, 0xf);
-    oracle.write_register(A64_PC_REGISTER, slot);
-    oracle.step("BFI W0,W1,#5,#4", 0x331b_0c20);
-
-    assert_eq!(oracle.read_register(0), 0xa5a5_a5e5);
-    assert_eq!(oracle.read_register(A64_PC_REGISTER), slot + 4);
+    let mut fixture = A64OracleFixture::new();
+    for (encoding, destination, source, expected, name) in [
+        (0x331b_0c20, 0xa5a5_a5a5, 0xf, 0xa5a5_a5e5, "BFI"),
+        (0x3300_1020, 0xdead_bee0, 0x1234_567f, 0xdead_beff, "BFXIL"),
+    ] {
+        fixture.oracle.write_instruction(fixture.slot, encoding);
+        fixture.oracle.write_register(0, destination);
+        fixture.oracle.write_register(1, source);
+        fixture.oracle.write_register(A64_PC_REGISTER, fixture.slot);
+        fixture.oracle.step(name, encoding);
+        assert_eq!(fixture.oracle.read_register(0), expected, "{name}");
+        assert_eq!(
+            fixture.oracle.read_register(A64_PC_REGISTER),
+            fixture.slot + 4,
+            "{name} PC"
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_matches_control_and_stateless_system_semantics() {
-    let _serial = qemu_gdb_test_guard();
-    let configuration = configurations()[0];
-    let compiler = configured_tool(
-        configuration.compiler_environment,
-        configuration.compiler_default,
-    );
-    let emulator = configured_tool(
-        configuration.emulator_environment,
-        configuration.emulator_default,
-    );
-    let temporary = TestDirectory::new(ExecutionState::A64);
-    let runner = temporary.path().join("a64-control-oracle-runner");
-    compile_runner(&compiler, ExecutionState::A64, &runner);
-    let slot = symbol_address(&runner, "nixe_oracle_slot");
-    let mut oracle = QemuA64Oracle::start(&emulator, &runner);
+    let mut fixture = A64OracleFixture::new();
+    let slot = fixture.slot;
+    let oracle = &mut fixture.oracle;
     let cases = [
         (0xd503_201f, "NOP"),
         (0x1400_0002, "B +8"),
@@ -161,22 +173,9 @@ fn qemu_a64_matches_control_and_stateless_system_semantics() {
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_matches_every_register_semantic_family() {
-    let _serial = qemu_gdb_test_guard();
     let filter = DifferentialFilter::from_environment();
-    let configuration = configurations()[0];
-    let compiler = configured_tool(
-        configuration.compiler_environment,
-        configuration.compiler_default,
-    );
-    let emulator = configured_tool(
-        configuration.emulator_environment,
-        configuration.emulator_default,
-    );
-    let temporary = TestDirectory::new(ExecutionState::A64);
-    let runner = temporary.path().join("a64-register-oracle-runner");
-    compile_runner(&compiler, ExecutionState::A64, &runner);
-    let slot = symbol_address(&runner, "nixe_oracle_slot");
-    let mut oracle = QemuA64Oracle::start(&emulator, &runner);
+    let mut fixture = A64OracleFixture::new();
+    let slot = fixture.slot;
     let objdump = configured_tool("NIXE_AARCH64_OBJDUMP", "aarch64-linux-gnu-objdump");
 
     let profile = GuestCpuProfile::switch_1();
@@ -194,7 +193,7 @@ fn qemu_a64_matches_every_register_semantic_family() {
             pattern.mask,
             pattern.value,
             &objdump,
-            temporary.path(),
+            fixture.temporary.path(),
         ) else {
             continue;
         };
@@ -401,12 +400,14 @@ fn qemu_a64_matches_every_register_semantic_family() {
         );
     }
     for (index, (encoding, _)) in cases.iter().enumerate() {
-        oracle.write_instruction(slot + index as u64 * 4, *encoding);
+        fixture
+            .oracle
+            .write_instruction(slot + index as u64 * 4, *encoding);
     }
     for (index, (encoding, name)) in cases.into_iter().enumerate() {
         compare_a64_register_case(
             &profile,
-            &mut oracle,
+            &mut fixture.oracle,
             slot + index as u64 * 4,
             encoding,
             name,
@@ -526,7 +527,7 @@ fn allocated_register_encoding(
         else {
             continue;
         };
-        if decoded.instruction.coverage_id().get() != coverage_id || !has_semantics(&decoded) {
+        if decoded.instruction.coverage_id().get() != coverage_id {
             continue;
         }
         let (A64Instruction::Integer(_) | A64Instruction::FpSimd(_)) =

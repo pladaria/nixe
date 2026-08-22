@@ -24,21 +24,6 @@ use nixe_cpu::{
     state::ThreadCpuState,
 };
 
-/// Coverage state of one recognized architectural instruction.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum InstructionSupport {
-    /// The frontend can lower the instruction to IR.
-    Lifted,
-    /// Only the reference interpreter currently implements the instruction.
-    InterpreterOnly,
-    /// The encoding is known but neither execution engine implements it.
-    RecognizedUnsupported,
-    /// The selected CPU profile disables a required feature.
-    ProfileDisabled,
-    /// The architecture classifies the encoding as unallocated or reserved.
-    Unallocated,
-}
-
 /// Policy applied when dispatch reaches an `InterpretOne` terminator.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct InterpreterPolicy {
@@ -235,48 +220,6 @@ impl fmt::Display for InterpreterError {
 }
 
 impl std::error::Error for InterpreterError {}
-
-/// Returns the independently tracked engine coverage for a decoded opcode.
-#[must_use]
-pub fn instruction_support(decoded: &DecodedInstruction<DecodedOpcode>) -> InstructionSupport {
-    let interpreter = crate::support::semantic_availability(
-        decoded.location.execution_state,
-        decoded.instruction.coverage_id(),
-    );
-    let lifter = nixe_cpu::coverage::lifter_coverage(
-        decoded.location.execution_state,
-        decoded.instruction.coverage_id(),
-    );
-    match (interpreter, lifter) {
-        (
-            crate::support::SemanticAvailability::Implemented,
-            nixe_cpu::coverage::LoweringCoverage::Implemented,
-        ) => InstructionSupport::Lifted,
-        (
-            crate::support::SemanticAvailability::Implemented,
-            nixe_cpu::coverage::LoweringCoverage::Missing,
-        ) => InstructionSupport::InterpreterOnly,
-        (
-            crate::support::SemanticAvailability::Implemented,
-            nixe_cpu::coverage::LoweringCoverage::EncodingDependent,
-        ) => InstructionSupport::Lifted,
-        (crate::support::SemanticAvailability::EncodingDependent, _) => {
-            InstructionSupport::InterpreterOnly
-        }
-        (crate::support::SemanticAvailability::Missing, _) => {
-            InstructionSupport::RecognizedUnsupported
-        }
-    }
-}
-
-/// Returns whether the reference engine has executable semantics for this ID.
-#[must_use]
-pub fn has_semantics(decoded: &DecodedInstruction<DecodedOpcode>) -> bool {
-    crate::support::semantic_availability(
-        decoded.location.execution_state,
-        decoded.instruction.coverage_id(),
-    ) != crate::support::SemanticAvailability::Missing
-}
 
 /// Executes the instruction represented by one JIT fallback terminator.
 ///

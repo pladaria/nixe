@@ -51,7 +51,8 @@ pub static PATTERNS: &[InstructionPattern] = &[
         25,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .recognized_unimplemented(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

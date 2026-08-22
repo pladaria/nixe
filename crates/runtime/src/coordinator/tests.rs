@@ -129,45 +129,6 @@ fn one_slice_flows_through_a_scheduler_lease() {
 }
 
 #[test]
-fn registered_engine_handoff_replaces_worker_resident_executors_at_a_real_barrier() {
-    let mut coordinator = RuntimeCoordinator::new(two_core_profile());
-    let process = coordinator
-        .register_process(
-            synthetic_process_for_coordinator(1),
-            registration(&coordinator),
-        )
-        .unwrap();
-    let old_domain = coordinator.process(process).unwrap().engine_domain_id();
-    let mapping_epoch = coordinator.process(process).unwrap().mapping_epoch().get();
-    let content_epoch = coordinator
-        .process(process)
-        .unwrap()
-        .memory()
-        .content_mutation_epoch()
-        .get();
-
-    let barrier = coordinator
-        .switch_process_engine(process, &nixe_cpu_engine_interpreter::InterpreterProvider)
-        .unwrap();
-    let new_domain = coordinator.process(process).unwrap().engine_domain_id();
-
-    assert_ne!(new_domain, old_domain);
-    assert_eq!(barrier.quiescence.domain, old_domain);
-    assert_eq!(barrier.memory.invalidation_generation, mapping_epoch);
-    assert_eq!(barrier.memory.dirty_generation, content_epoch);
-    assert_eq!(barrier.state, nixe_cpu_engine::StateCommitStatus::Canonical);
-    assert_eq!(
-        coordinator
-            .run_next(1)
-            .unwrap()
-            .unwrap()
-            .report
-            .instructions_executed,
-        1
-    );
-}
-
-#[test]
 fn guest_thread_ids_are_unique_across_live_processes() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let first = coordinator

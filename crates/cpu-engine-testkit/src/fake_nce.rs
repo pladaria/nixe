@@ -9,10 +9,9 @@ use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu_engine::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, DomainMemoryBinding,
-    DomainQuiescenceToken, DomainRequest, EngineCapabilities, EngineControl, EngineDescriptor,
-    EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind,
-    EngineGeneration, EngineId, EngineKind, EngineProvider, ExecutionReport, ExecutorRequest,
-    InstructionTrace, MemorySynchronizationRecord, RunRequest, StateCommitStatus,
+    DomainRequest, EngineCapabilities, EngineControl, EngineDescriptor, EngineDomain,
+    EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind, EngineId,
+    EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace, RunRequest,
 };
 use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
@@ -23,7 +22,6 @@ pub const FAKE_NCE_ENGINE_ID: EngineId = EngineId::new(0xf200);
 pub struct FakeNceMetrics {
     mapping_notifications: AtomicU64,
     invalidation_syncs: AtomicU64,
-    reconciliations: AtomicU64,
     teardowns: AtomicU64,
     normalized_traps: AtomicU64,
 }
@@ -37,11 +35,6 @@ impl FakeNceMetrics {
     #[must_use]
     pub fn invalidation_syncs(&self) -> u64 {
         self.invalidation_syncs.load(Ordering::Acquire)
-    }
-
-    #[must_use]
-    pub fn reconciliations(&self) -> u64 {
-        self.reconciliations.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -181,9 +174,6 @@ pub struct FakeNceDomain {
     mappings: Arc<Mutex<Vec<MirroredMapping>>>,
     address_space: Option<AddressSpaceId>,
     mapping_generation: u64,
-    dirty_generation: Arc<AtomicU64>,
-    generation: EngineGeneration,
-    active: bool,
     torn_down: bool,
 }
 
@@ -198,9 +188,6 @@ impl FakeNceDomain {
             mappings: Arc::new(Mutex::new(Vec::new())),
             address_space: None,
             mapping_generation: 0,
-            dirty_generation: Arc::new(AtomicU64::new(0)),
-            generation: EngineGeneration::new(0),
-            active: false,
             torn_down: false,
         }
     }
@@ -253,40 +240,6 @@ impl EngineDomain for FakeNceDomain {
         self.mirror(binding)
     }
 
-    fn synchronize_memory(
-        &mut self,
-        binding: DomainMemoryBinding<'_>,
-    ) -> Result<MemorySynchronizationRecord, EngineFault> {
-        self.mirror(binding)?;
-        self.metrics.reconciliations.fetch_add(1, Ordering::AcqRel);
-        Ok(MemorySynchronizationRecord {
-            address_space: binding.address_space,
-            invalidation_generation: self.mapping_generation,
-            dirty_generation: self.dirty_generation.load(Ordering::Acquire),
-        })
-    }
-
-    fn import_memory(&mut self, record: MemorySynchronizationRecord) -> Result<(), EngineFault> {
-        if self.address_space != Some(record.address_space) {
-            return Err(self.fault("handoff record belongs to another address space"));
-        }
-        if record.invalidation_generation < self.mapping_generation {
-            return Err(self.fault("handoff mapping generation moved backwards"));
-        }
-        self.mapping_generation = record.invalidation_generation;
-        self.dirty_generation
-            .fetch_max(record.dirty_generation, Ordering::AcqRel);
-        Ok(())
-    }
-
-    fn activate(&mut self) -> Result<(), EngineFault> {
-        if self.torn_down || self.address_space.is_none() {
-            return Err(self.fault("fake NCE domain is not bound"));
-        }
-        self.active = true;
-        Ok(())
-    }
-
     fn create_executor(
         &mut self,
         request: ExecutorRequest,
@@ -299,27 +252,14 @@ impl EngineDomain for FakeNceDomain {
             id: request.executor,
             oracle,
             shadow: Arc::clone(&self.shadow),
-            dirty_generation: Arc::clone(&self.dirty_generation),
             metrics: Arc::clone(&self.metrics),
             mappings: Arc::clone(&self.mappings),
             acknowledged_epoch: self.mapping_generation,
         }))
     }
 
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        self.active = false;
-        let _ = self.oracle.quiesce()?;
-        let token = DomainQuiescenceToken {
-            domain: self.id,
-            generation: self.generation,
-        };
-        self.generation = EngineGeneration::new(self.generation.get().saturating_add(1));
-        Ok(token)
-    }
-
     fn shutdown(&mut self) -> Result<(), EngineFault> {
         if !self.torn_down {
-            self.active = false;
             self.torn_down = true;
             self.mappings
                 .lock()
@@ -345,7 +285,6 @@ struct FakeNceExecutor {
     id: EngineExecutorId,
     oracle: Box<dyn EngineExecutor>,
     shadow: Arc<Mutex<BTreeMap<EngineExecutorId, ThreadCpuState>>>,
-    dirty_generation: Arc<AtomicU64>,
     metrics: Arc<FakeNceMetrics>,
     mappings: Arc<Mutex<Vec<MirroredMapping>>>,
     acknowledged_epoch: u64,
@@ -393,7 +332,6 @@ impl EngineExecutor for FakeNceExecutor {
                         entries: Box::new([]),
                         discarded: 0,
                     },
-                    state_commit: StateCommitStatus::Canonical,
                 })
             }
             Some(bits) if bits & 0xffe0_001f == 0xd420_0000 => {
@@ -411,7 +349,6 @@ impl EngineExecutor for FakeNceExecutor {
                         entries: Box::new([]),
                         discarded: 0,
                     },
-                    state_commit: StateCommitStatus::Canonical,
                 })
             }
             _ => self.oracle.run_slice(RunRequest {
@@ -423,9 +360,7 @@ impl EngineExecutor for FakeNceExecutor {
                 timer,
             }),
         };
-        if let Ok(report) = &result {
-            self.dirty_generation
-                .fetch_add(report.instructions_executed, Ordering::AcqRel);
+        if result.is_ok() {
             state.clone_from(&shadow);
         }
         self.shadow
@@ -488,17 +423,12 @@ fn descriptor() -> EngineDescriptor {
             a64: true,
             a32: false,
             t32: false,
-            precise_instruction_budget: true,
             instruction_trace: false,
             interpret_one_fallback: false,
-            native_execution: true,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
             acknowledged_invalidation: true,
-            canonical_state_version: 1,
             deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
             canonical_memory_binding: true,
             max_concurrent_executors: None,
         },

@@ -23,10 +23,12 @@ while the virtualization facility exposes a virtual machine, not a direct
 user-mode process executor.
 
 Canonical `ExecutionMemory` remains semantic authority. A backend may mirror or
-map its pages only while it tracks invalidation and dirty generations. A domain
-must quiesce all vCPUs, export canonical state, reconcile writes, and discard
-stale translations before handoff or teardown. Protected VM memory that the host
-cannot read cannot satisfy this contract without an explicit shared-memory and
+map its pages only while it tracks invalidation and dirty generations. Every
+bounded `run_slice` must return canonical thread state; mapping changes reach
+each executor through `synchronize_address_space`, and executors acknowledge an
+invalidation only after stale translations cannot be re-entered. Domain shutdown
+runs after its executors are released. Protected VM memory that the host cannot
+read cannot satisfy this contract without an explicit shared-memory and
 reconciliation design.
 
 ## Apple silicon Hypervisor.framework
@@ -131,10 +133,10 @@ Versioned basis: Android Open Source Project
 | VM creation and destruction         | `create_domain` / `EngineDomain::shutdown`       |
 | vCPU creation, migration, registers | `create_executor` / canonical `RunRequest` state |
 | Map, unmap, protect                 | `DomainMemoryBinding` and executor synchronization |
-| Dirty pages and invalidation        | `synchronize_memory` and handoff record          |
+| Dirty pages and invalidation        | canonical generations and executor synchronization |
 | SVC, abort, timer, interrupt exit   | normalized `EngineExit`                          |
 | Virtual interrupt delivery          | `EngineControl`                                  |
-| Stable stop boundary                | `quiesce` and `StateCommitBarrier`               |
+| Stable stop boundary                | canonical state on every `run_slice` return      |
 
 HVF and Linux KVM map to the common contracts without exposing backend handles.
 Android currently maps only at the conceptual VM lifecycle level and therefore

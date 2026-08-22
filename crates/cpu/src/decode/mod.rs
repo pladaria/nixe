@@ -3,7 +3,7 @@
 pub mod a32;
 pub mod a64;
 pub mod aarch32;
-pub(crate) mod registry;
+mod allocation;
 pub mod t32;
 pub mod table;
 
@@ -16,7 +16,7 @@ use crate::{
 
 pub use table::{
     DecodeSupport, DecodedOpcode, DecodedOperands, InstructionPattern, OperandField, OperandId,
-    OperandKind, OperandValue, RegisterClass, ReservedConstraint,
+    OperandKind, OperandValue, RegisterClass,
 };
 
 /// Exhaustive architectural classification returned by the decoder layer.
@@ -272,7 +272,6 @@ mod tests {
             t32::patterns_32(),
         ];
         let mut coverage = BTreeSet::new();
-        let mut semantics = BTreeSet::new();
         for patterns in tables {
             let table = table::DecoderTable::compile(patterns).expect("consistent table");
             assert!(table.candidate_count(0) <= patterns.len());
@@ -280,10 +279,6 @@ mod tests {
                 assert!(
                     coverage.insert(pattern.coverage_id),
                     "duplicate coverage ID"
-                );
-                assert!(
-                    semantics.insert(pattern.semantic_id),
-                    "duplicate semantic ID"
                 );
             }
         }

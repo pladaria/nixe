@@ -48,9 +48,6 @@ impl EngineProvider for FakeProvider {
         Ok(Box::new(FakeDomain {
             id: request.domain,
             executor_budget: Arc::new(AtomicU64::new(0)),
-            fail_quiesce: !self.available,
-            fail_activate: false,
-            generation: 0,
         }))
     }
 }
@@ -64,17 +61,12 @@ fn descriptor(id: EngineId) -> EngineDescriptor {
             a64: true,
             a32: true,
             t32: true,
-            precise_instruction_budget: true,
             instruction_trace: false,
             interpret_one_fallback: false,
-            native_execution: false,
             concurrent_executors: false,
             max_safepoint_instructions: None,
             acknowledged_invalidation: false,
-            canonical_state_version: 1,
             deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
             canonical_memory_binding: false,
             max_concurrent_executors: Some(NonZeroUsize::new(1).unwrap()),
         },
@@ -95,12 +87,11 @@ fn safepoint_capability_reports_a_verifiable_instruction_bound() {
     assert!(!relaxed_requirement.contains(offered));
     assert!(offered.requires_control_path());
 
-    let native_without_memory = EngineCapabilities {
-        native_execution: true,
-        acknowledged_invalidation: true,
+    let retained_memory_without_invalidation = EngineCapabilities {
+        canonical_memory_binding: true,
         ..EngineCapabilities::default()
     };
-    assert!(!native_without_memory.is_coherent());
+    assert!(!retained_memory_without_invalidation.is_coherent());
     let four_executors = EngineCapabilities {
         concurrent_executors: true,
         max_safepoint_instructions: NonZeroU64::new(1),
@@ -140,7 +131,7 @@ fn independent_worker_controls_acknowledge_cross_vcpu_invalidation() {
                     assert_eq!(snapshot.invalidation_epoch, 7);
                     assert!(!control.acknowledged_invalidation(7));
                     control.acknowledge(snapshot);
-                    acknowledged_tx.send(snapshot.epoch).unwrap();
+                    acknowledged_tx.send(()).unwrap();
                     break;
                 }
                 thread::yield_now();
@@ -149,7 +140,7 @@ fn independent_worker_controls_acknowledge_cross_vcpu_invalidation() {
     }
 
     for control in &controls {
-        let _ = control.request_invalidation(7);
+        control.request_invalidation(7);
     }
     start.wait();
     for _ in 0..2 {
@@ -168,9 +159,6 @@ fn independent_worker_controls_acknowledge_cross_vcpu_invalidation() {
 struct FakeDomain {
     id: EngineDomainId,
     executor_budget: Arc<AtomicU64>,
-    fail_quiesce: bool,
-    fail_activate: bool,
-    generation: u64,
 }
 impl EngineDomain for FakeDomain {
     fn descriptor(&self) -> EngineDescriptor {
@@ -188,26 +176,6 @@ impl EngineDomain for FakeDomain {
             id: request.executor,
             budget: Arc::clone(&self.executor_budget),
         }))
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        if self.fail_quiesce {
-            return Err(fault(self.id));
-        }
-        let token = DomainQuiescenceToken {
-            domain: self.id,
-            generation: EngineGeneration::new(self.generation),
-        };
-        self.generation += 1;
-        Ok(token)
-    }
-
-    fn activate(&mut self) -> Result<(), EngineFault> {
-        if self.fail_activate {
-            Err(fault(self.id))
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -237,7 +205,6 @@ impl EngineExecutor for FakeExecutor {
                 entries: Box::new([]),
                 discarded: 0,
             },
-            state_commit: StateCommitStatus::Canonical,
         })
     }
 
@@ -257,17 +224,6 @@ impl EngineTimer for Timer {
             counter: 1,
             frequency: 2,
         }
-    }
-}
-
-fn fault(domain: EngineDomainId) -> EngineFault {
-    let (_, state) = cpu_and_state();
-    EngineFault {
-        engine: EngineId::new(domain.get()),
-        kind: EngineFaultKind::Synchronization,
-        instructions_executed: 0,
-        message: "synthetic fault".into(),
-        context: Box::new(state.register_context()),
     }
 }
 
@@ -364,7 +320,7 @@ fn selection_is_deterministic_and_explicit_unavailability_is_typed() {
 }
 
 #[test]
-fn interpret_one_forces_one_instruction_and_handoff_failure_keeps_old_domain() {
+fn interpret_one_forces_one_instruction() {
     let (cpu, mut state) = cpu_and_state();
     let memory = SyntheticMemory::new();
     let budget = Arc::new(AtomicU64::new(0));
@@ -386,41 +342,11 @@ fn interpret_one_forces_one_instruction_and_handoff_failure_keeps_old_domain() {
     .unwrap();
     assert_eq!(report.instructions_executed, 1);
     assert_eq!(budget.load(Ordering::Acquire), 1);
-
-    let mut domain = FakeDomain {
-        id: EngineDomainId::new(1),
-        executor_budget: Arc::new(AtomicU64::new(0)),
-        fail_quiesce: false,
-        fail_activate: false,
-        generation: 0,
-    };
-
-    let mut replacement: Box<dyn EngineDomain> = Box::new(FakeDomain {
-        id: EngineDomainId::new(2),
-        executor_budget: Arc::new(AtomicU64::new(0)),
-        fail_quiesce: false,
-        fail_activate: true,
-        generation: 0,
-    });
-    let memory = ExecutionMemory::new();
-    let binding = DomainMemoryBinding {
-        address_space: cpu.address_space_id(),
-        end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
-        memory: &memory,
-        invalidation_generation: 4,
-        dirty_generation: 5,
-    };
-    let Err(error) = prepare_handoff(&mut domain, replacement.as_mut(), binding) else {
-        panic!("failing replacement must not commit");
-    };
-    assert_eq!(error.stage, HandoffFailureStage::Import);
-    assert_eq!(domain.quiesce().unwrap().domain, EngineDomainId::new(1));
 }
 
 struct RecordingDomain {
     base: FakeDomain,
     bound: Option<AddressSpaceId>,
-    synchronized: Option<MemorySynchronizationRecord>,
     shutdown: bool,
 }
 
@@ -447,24 +373,6 @@ impl EngineDomain for RecordingDomain {
         Ok(())
     }
 
-    fn synchronize_memory(
-        &mut self,
-        binding: DomainMemoryBinding<'_>,
-    ) -> Result<MemorySynchronizationRecord, EngineFault> {
-        let record = binding.synchronization_record();
-        self.synchronized = Some(record);
-        Ok(record)
-    }
-
-    fn import_memory(&mut self, record: MemorySynchronizationRecord) -> Result<(), EngineFault> {
-        self.synchronized = Some(record);
-        Ok(())
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        self.base.quiesce()
-    }
-
     fn shutdown(&mut self) -> Result<(), EngineFault> {
         self.shutdown = true;
         Ok(())
@@ -472,7 +380,7 @@ impl EngineDomain for RecordingDomain {
 }
 
 #[test]
-fn generic_domain_contract_binds_reconciles_imports_and_shuts_down_memory() {
+fn generic_domain_contract_binds_and_shuts_down_memory() {
     let (cpu, _) = cpu_and_state();
     let memory = ExecutionMemory::new();
     let binding = DomainMemoryBinding {
@@ -480,25 +388,17 @@ fn generic_domain_contract_binds_reconciles_imports_and_shuts_down_memory() {
         end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
         memory: &memory,
         invalidation_generation: 8,
-        dirty_generation: 9,
     };
     let mut domain = RecordingDomain {
         base: FakeDomain {
             id: EngineDomainId::new(5),
             executor_budget: Arc::new(AtomicU64::new(0)),
-            fail_quiesce: false,
-            fail_activate: false,
-            generation: 0,
         },
         bound: None,
-        synchronized: None,
         shutdown: false,
     };
     domain.bind_memory(binding).unwrap();
-    let record = domain.synchronize_memory(binding).unwrap();
-    domain.import_memory(record).unwrap();
     assert_eq!(domain.bound, Some(cpu.address_space_id()));
-    assert_eq!(domain.synchronized, Some(binding.synchronization_record()));
     domain.shutdown().unwrap();
     assert!(domain.shutdown);
 }

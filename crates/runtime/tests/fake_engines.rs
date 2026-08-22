@@ -4,11 +4,7 @@ use std::sync::Arc;
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{CpuMemory, MemoryAccess, MemoryAccessSize, MemoryValue};
 use nixe_cpu::state::ThreadCpuState;
-use nixe_cpu_engine::{
-    CONFORMANCE_FALLBACK_ENCODING, CapabilityReport, DomainQuiescenceToken, DomainRequest,
-    EngineCapabilities, EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor,
-    EngineFault, EngineFaultKind, EngineId, EngineKind, EngineProvider, ExecutorRequest,
-};
+use nixe_cpu_engine::{CONFORMANCE_FALLBACK_ENCODING, EngineKind, EngineProvider};
 use nixe_cpu_engine_interpreter::InterpreterProvider;
 use nixe_cpu_engine_testkit::{FakeJitProvider, FakeNceProvider};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
@@ -36,10 +32,6 @@ fn registration(coordinator: &RuntimeCoordinator) -> ProcessRegistration {
         ideal_vcpu: Some(VirtualCpuId::new(7)),
         affinity: coordinator.scheduler().profile().all_cores(),
     }
-}
-
-fn process_with_instruction(process_id: u64, encoding: u32) -> RunnableProcess {
-    process_with_provider(process_id, encoding, Arc::new(InterpreterProvider))
 }
 
 fn process_with_provider(
@@ -84,19 +76,15 @@ fn process_with_provider(
 }
 
 #[test]
-fn fake_jit_handoff_and_interpret_one_fallback_preserve_canonical_state() {
+fn fake_jit_interpret_one_fallback_preserves_canonical_state() {
     let mut coordinator = RuntimeCoordinator::new(profile());
-    let process = coordinator
-        .register_process(
-            process_with_instruction(1, 0xd503_201f),
-            registration(&coordinator),
-        )
-        .unwrap();
     let provider = FakeJitProvider::new();
     let metrics = provider.metrics();
-
-    coordinator
-        .switch_process_engine(process, &provider)
+    let process = coordinator
+        .register_process(
+            process_with_provider(1, 0xd503_201f, Arc::new(provider)),
+            registration(&coordinator),
+        )
         .unwrap();
     assert_eq!(
         coordinator
@@ -171,25 +159,6 @@ fn fake_jit_handoff_and_interpret_one_fallback_preserve_canonical_state() {
         execution.report.stop,
         ExecutionStop::ArchitecturalException { .. }
     ));
-    let after_fallback = coordinator
-        .process(process)
-        .unwrap()
-        .main_thread()
-        .state()
-        .register_context();
-
-    coordinator
-        .switch_process_engine(process, &InterpreterProvider)
-        .unwrap();
-    assert_eq!(
-        coordinator
-            .process(process)
-            .unwrap()
-            .main_thread()
-            .state()
-            .register_context(),
-        after_fallback
-    );
     assert!(metrics.compiled_blocks() >= 2);
     assert!(metrics.invalidations() > 0);
 }
@@ -197,16 +166,13 @@ fn fake_jit_handoff_and_interpret_one_fallback_preserve_canonical_state() {
 #[test]
 fn fake_nce_uses_common_scheduler_mapping_migration_and_teardown_paths() {
     let mut coordinator = RuntimeCoordinator::new(profile());
-    let process = coordinator
-        .register_process(
-            process_with_instruction(1, 0xd503_201f),
-            registration(&coordinator),
-        )
-        .unwrap();
     let provider = FakeNceProvider::new();
     let metrics = provider.metrics();
-    coordinator
-        .switch_process_engine(process, &provider)
+    let process = coordinator
+        .register_process(
+            process_with_provider(1, 0xd503_201f, Arc::new(provider)),
+            registration(&coordinator),
+        )
         .unwrap();
     let initial_mapping_notifications = metrics.mapping_notifications();
 
@@ -244,15 +210,11 @@ fn fake_nce_uses_common_scheduler_mapping_migration_and_teardown_paths() {
     assert!(metrics.invalidation_syncs() > 0);
     assert!(metrics.mapping_notifications() > initial_mapping_notifications);
     coordinator
-        .switch_process_engine(process, &InterpreterProvider)
-        .unwrap();
-    assert!(metrics.reconciliations() > 0);
-    assert_eq!(metrics.teardowns(), 1);
-    coordinator
         .remove_process(process)
         .unwrap()
         .try_teardown()
         .unwrap();
+    assert_eq!(metrics.teardowns(), 1);
 }
 
 #[test]
@@ -262,16 +224,13 @@ fn fake_nce_normalizes_supervisor_and_fault_exits_through_common_runtime_reports
         (2, 0xd420_2460, ExceptionKind::Breakpoint),
     ] {
         let mut coordinator = RuntimeCoordinator::new(profile());
-        let process = coordinator
-            .register_process(
-                process_with_instruction(process_id, encoding),
-                registration(&coordinator),
-            )
-            .unwrap();
         let provider = FakeNceProvider::new();
         let metrics = provider.metrics();
-        coordinator
-            .switch_process_engine(process, &provider)
+        let _process = coordinator
+            .register_process(
+                process_with_provider(process_id, encoding, Arc::new(provider)),
+                registration(&coordinator),
+            )
             .unwrap();
         let execution = coordinator.run_next(1).unwrap().unwrap();
         assert_eq!(
@@ -284,251 +243,5 @@ fn fake_nce_normalizes_supervisor_and_fault_exits_through_common_runtime_reports
             expected
         );
         assert!(metrics.normalized_traps() > 0);
-    }
-}
-
-#[test]
-fn failed_handoff_reactivates_the_old_domain_and_restores_its_exact_executors() {
-    let mut coordinator = RuntimeCoordinator::new(profile());
-    let process = coordinator
-        .register_process(
-            process_with_instruction(1, 0xd503_201f),
-            registration(&coordinator),
-        )
-        .unwrap();
-    let old_engine = coordinator.process(process).unwrap().engine_descriptor().id;
-    let error = coordinator
-        .switch_process_engine(process, &FailingActivationProvider)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        nixe_runtime::CoordinatorError::Handoff(nixe_cpu_engine::HandoffFailure {
-            stage: nixe_cpu_engine::HandoffFailureStage::Import,
-            ..
-        })
-    ));
-    assert_eq!(
-        coordinator.process(process).unwrap().engine_descriptor().id,
-        old_engine
-    );
-    assert_eq!(
-        coordinator.run_next(1).unwrap().unwrap().report.stop,
-        ExecutionStop::BudgetExhausted
-    );
-}
-
-#[test]
-fn retired_domain_teardown_failure_reports_that_the_replacement_is_committed() {
-    let mut coordinator = RuntimeCoordinator::new(profile());
-    let process = coordinator
-        .register_process(
-            process_with_provider(1, 0xd503_201f, Arc::new(FailingTeardownProvider)),
-            registration(&coordinator),
-        )
-        .unwrap();
-    let error = coordinator
-        .switch_process_engine(process, &InterpreterProvider)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        nixe_runtime::CoordinatorError::CommittedHandoffTeardown { .. }
-    ));
-    assert_eq!(
-        coordinator
-            .process(process)
-            .unwrap()
-            .engine_descriptor()
-            .kind,
-        EngineKind::Interpreter
-    );
-    assert_eq!(
-        coordinator.run_next(1).unwrap().unwrap().report.stop,
-        ExecutionStop::BudgetExhausted
-    );
-}
-
-struct FailingActivationProvider;
-
-struct FailingTeardownProvider;
-
-impl EngineProvider for FailingTeardownProvider {
-    fn descriptor(&self) -> EngineDescriptor {
-        failing_teardown_descriptor()
-    }
-
-    fn probe(
-        &self,
-        profile: nixe_cpu::profile::GuestCpuProfile,
-        required: EngineCapabilities,
-    ) -> CapabilityReport {
-        let descriptor = failing_teardown_descriptor();
-        CapabilityReport {
-            available: descriptor.capabilities.supports_profile(profile, required)
-                && descriptor.capabilities.contains(required),
-            descriptor,
-            rejections: Box::new([]),
-        }
-    }
-
-    fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
-        Ok(Box::new(FailingTeardownDomain {
-            id: request.domain,
-            cpu: request.cpu,
-            oracle: nixe_cpu_engine_interpreter::InterpreterDomain::new(request.domain),
-        }))
-    }
-}
-
-struct FailingTeardownDomain {
-    id: EngineDomainId,
-    cpu: nixe_cpu::profile::ProcessCpuContext,
-    oracle: nixe_cpu_engine_interpreter::InterpreterDomain,
-}
-
-impl EngineDomain for FailingTeardownDomain {
-    fn descriptor(&self) -> EngineDescriptor {
-        failing_teardown_descriptor()
-    }
-
-    fn domain_id(&self) -> EngineDomainId {
-        self.id
-    }
-
-    fn create_executor(
-        &mut self,
-        request: ExecutorRequest,
-    ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        self.oracle.create_executor(request)
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        self.oracle.quiesce()
-    }
-
-    fn shutdown(&mut self) -> Result<(), EngineFault> {
-        Err(EngineFault {
-            engine: failing_teardown_descriptor().id,
-            kind: EngineFaultKind::Internal,
-            instructions_executed: 0,
-            message: "injected retired-domain teardown failure".into(),
-            context: Box::new(
-                ThreadCpuState::new(
-                    self.cpu
-                        .thread_configuration(nixe_cpu::location::ExecutionState::A64)
-                        .unwrap(),
-                )
-                .register_context(),
-            ),
-        })
-    }
-}
-
-impl EngineProvider for FailingActivationProvider {
-    fn descriptor(&self) -> EngineDescriptor {
-        failing_descriptor()
-    }
-
-    fn probe(
-        &self,
-        profile: nixe_cpu::profile::GuestCpuProfile,
-        required: EngineCapabilities,
-    ) -> CapabilityReport {
-        let descriptor = failing_descriptor();
-        CapabilityReport {
-            available: descriptor.capabilities.supports_profile(profile, required)
-                && descriptor.capabilities.contains(required),
-            descriptor,
-            rejections: Box::new([]),
-        }
-    }
-
-    fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
-        Ok(Box::new(FailingActivationDomain {
-            id: request.domain,
-            cpu: request.cpu,
-            oracle: nixe_cpu_engine_interpreter::InterpreterDomain::new(request.domain),
-        }))
-    }
-}
-
-struct FailingActivationDomain {
-    id: EngineDomainId,
-    cpu: nixe_cpu::profile::ProcessCpuContext,
-    oracle: nixe_cpu_engine_interpreter::InterpreterDomain,
-}
-
-impl EngineDomain for FailingActivationDomain {
-    fn descriptor(&self) -> EngineDescriptor {
-        failing_descriptor()
-    }
-
-    fn domain_id(&self) -> EngineDomainId {
-        self.id
-    }
-
-    fn create_executor(
-        &mut self,
-        request: ExecutorRequest,
-    ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        self.oracle.create_executor(request)
-    }
-
-    fn activate(&mut self) -> Result<(), EngineFault> {
-        Err(EngineFault {
-            engine: failing_descriptor().id,
-            kind: EngineFaultKind::StateImport,
-            instructions_executed: 0,
-            message: "injected replacement activation failure".into(),
-            context: Box::new(
-                ThreadCpuState::new(
-                    self.cpu
-                        .thread_configuration(nixe_cpu::location::ExecutionState::A64)
-                        .unwrap(),
-                )
-                .register_context(),
-            ),
-        })
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        self.oracle.quiesce()
-    }
-}
-
-fn failing_descriptor() -> EngineDescriptor {
-    EngineDescriptor {
-        id: EngineId::new(0xf300),
-        name: "failing-activation-engine".into(),
-        kind: EngineKind::Test,
-        capabilities: EngineCapabilities {
-            a64: true,
-            a32: true,
-            t32: true,
-            precise_instruction_budget: true,
-            canonical_state_version: 1,
-            deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
-            ..Default::default()
-        },
-    }
-}
-
-fn failing_teardown_descriptor() -> EngineDescriptor {
-    EngineDescriptor {
-        id: EngineId::new(0xf301),
-        name: "failing-teardown-engine".into(),
-        kind: EngineKind::Test,
-        capabilities: EngineCapabilities {
-            a64: true,
-            a32: true,
-            t32: true,
-            precise_instruction_budget: true,
-            canonical_state_version: 1,
-            deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
-            ..Default::default()
-        },
     }
 }

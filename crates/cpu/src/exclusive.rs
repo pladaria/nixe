@@ -15,7 +15,7 @@ pub struct ExclusiveReservation {
     pub generation: CodeGeneration,
 }
 
-/// Portable local-monitor state used by interpreter and engine handoff code.
+/// Portable local-monitor state used by CPU execution engines.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ExclusiveMonitorState {
     reservation: Option<ExclusiveReservation>,

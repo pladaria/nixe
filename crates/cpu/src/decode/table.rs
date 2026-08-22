@@ -17,23 +17,6 @@ use super::DecodeResult;
 const BUCKET_COUNT: usize = 256;
 const MAX_OPERANDS: usize = 8;
 
-/// Stable semantic dispatch identity, separate from a table index.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct SemanticId(u32);
-
-impl SemanticId {
-    #[must_use]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
 /// Whether downstream semantics currently exist for a recognized entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DecodeSupport {
@@ -55,39 +38,12 @@ pub struct RegressionFixture {
     pub encoding: InstructionEncoding,
 }
 
-/// Authoritative frontend and evidence metadata for one instruction.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct InstructionRegistration {
-    pub decoder: DecodeSupport,
-    pub lifter: LoweringAvailability,
-    pub regression_fixture: Option<RegressionFixture>,
-}
-
 /// Result of applying instruction-specific architectural allocation rules.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AllocationStatus {
     Allocated,
     Reserved(&'static str),
     Unallocated(&'static str),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum AllocationValidator {
-    A64,
-    A32,
-    T32,
-    AlwaysAllocated,
-}
-
-impl AllocationValidator {
-    fn validate(self, id: SemanticId, bits: u32) -> AllocationStatus {
-        match self {
-            Self::A64 => super::registry::validate_a64(id, bits),
-            Self::A32 => super::registry::validate_a32(id, bits),
-            Self::T32 => super::registry::validate_t32(id, bits),
-            Self::AlwaysAllocated => AllocationStatus::Allocated,
-        }
-    }
 }
 
 /// Architectural register namespace used by an extracted operand.
@@ -136,14 +92,6 @@ pub struct OperandField {
     pub kind: OperandKind,
 }
 
-/// Architectural condition which must hold after a mask/value family matches.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ReservedConstraint {
-    pub mask: u32,
-    pub value: u32,
-    pub reason: &'static str,
-}
-
 /// One declarative instruction entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InstructionPattern {
@@ -153,14 +101,49 @@ pub struct InstructionPattern {
     pub mask: u32,
     pub value: u32,
     pub operands: &'static [OperandField],
-    pub reserved_constraints: &'static [ReservedConstraint],
     pub required_features: &'static [InstructionFeature],
-    pub semantic_id: SemanticId,
     pub coverage_id: CoverageId,
     /// Higher values win intentional overlaps; equal values remain an error.
     pub priority: u16,
-    pub registration: InstructionRegistration,
-    pub allocation_validator: AllocationValidator,
+    pub decoder: DecodeSupport,
+    pub lowering: LoweringAvailability,
+    pub regression_fixture: Option<RegressionFixture>,
+}
+
+impl InstructionPattern {
+    #[must_use]
+    pub const fn lowered(mut self) -> Self {
+        self.lowering = LoweringAvailability::Implemented;
+        self
+    }
+
+    #[must_use]
+    pub const fn encoding_dependent_lowering(mut self) -> Self {
+        self.lowering = LoweringAvailability::EncodingDependent;
+        self
+    }
+
+    #[must_use]
+    pub const fn fixture32(mut self, bits: u32) -> Self {
+        self.regression_fixture = Some(RegressionFixture {
+            encoding: InstructionEncoding::from_u32(bits),
+        });
+        self
+    }
+
+    #[must_use]
+    pub const fn fixture16(mut self, bits: u16) -> Self {
+        self.regression_fixture = Some(RegressionFixture {
+            encoding: InstructionEncoding::from_u16(bits),
+        });
+        self
+    }
+
+    #[must_use]
+    pub const fn recognized_unimplemented(mut self) -> Self {
+        self.decoder = DecodeSupport::RecognizedUnimplemented;
+        self
+    }
 }
 
 /// A typed value extracted from an instruction encoding.
@@ -236,11 +219,6 @@ impl DecodedOpcode {
     }
 
     #[must_use]
-    pub const fn semantic_id(&self) -> SemanticId {
-        self.pattern.semantic_id
-    }
-
-    #[must_use]
     pub const fn coverage_id(&self) -> CoverageId {
         self.pattern.coverage_id
     }
@@ -281,7 +259,6 @@ pub enum TableError {
         second: &'static str,
     },
     DuplicateCoverageId(CoverageId),
-    DuplicateSemanticId(SemanticId),
 }
 
 /// Precompiled byte-indexed decoder. Compilation occurs once per static ISA table.
@@ -365,10 +342,7 @@ impl DecoderTable {
             if bits & pattern.mask != pattern.value {
                 continue;
             }
-            match pattern
-                .allocation_validator
-                .validate(pattern.semantic_id, bits)
-            {
+            match super::allocation::validate(pattern.execution_state, pattern.coverage_id, bits) {
                 AllocationStatus::Allocated => {}
                 AllocationStatus::Reserved(reason) => {
                     allocation_rejection.get_or_insert((true, pattern.name, reason));
@@ -378,14 +352,6 @@ impl DecoderTable {
                     allocation_rejection.get_or_insert((false, pattern.name, reason));
                     continue;
                 }
-            }
-            if let Some(constraint) = pattern
-                .reserved_constraints
-                .iter()
-                .find(|constraint| bits & constraint.mask != constraint.value)
-            {
-                allocation_rejection.get_or_insert((true, pattern.name, constraint.reason));
-                continue;
             }
             if let Some(rejection) = pattern
                 .required_features
@@ -400,7 +366,7 @@ impl DecoderTable {
             }
             let decoded =
                 DecodedInstruction::new(location, encoding, DecodedOpcode { pattern, bits });
-            return match pattern.registration.decoder {
+            return match pattern.decoder {
                 DecodeSupport::Ready => DecodeResult::Decoded(decoded),
                 DecodeSupport::RecognizedUnimplemented => {
                     DecodeResult::RecognizedUnimplemented(decoded)
@@ -558,21 +524,7 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
             }
             seen[id] = true;
         }
-        for constraint in pattern.reserved_constraints {
-            if constraint.value & !constraint.mask != 0 || constraint.mask & !width_mask != 0 {
-                return Err(TableError::InvalidPattern {
-                    name: pattern.name,
-                    reason: "invalid reserved constraint",
-                });
-            }
-            if (constraint.value ^ pattern.value) & (constraint.mask & pattern.mask) != 0 {
-                return Err(TableError::InvalidPattern {
-                    name: pattern.name,
-                    reason: "reserved constraint contradicts fixed pattern bits",
-                });
-            }
-        }
-        if let Some(fixture) = pattern.registration.regression_fixture
+        if let Some(fixture) = pattern.regression_fixture
             && (fixture.encoding.size() != pattern.size
                 || fixture.encoding.bits() & pattern.mask != pattern.value)
         {
@@ -586,9 +538,6 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
         for right in &patterns[index + 1..] {
             if left.coverage_id == right.coverage_id {
                 return Err(TableError::DuplicateCoverageId(left.coverage_id));
-            }
-            if left.semantic_id == right.semantic_id {
-                return Err(TableError::DuplicateSemanticId(left.semantic_id));
             }
             let overlap = ((left.value ^ right.value) & (left.mask & right.mask)) == 0;
             if overlap && left.priority == right.priority {
@@ -638,7 +587,6 @@ mod tests {
     use crate::{address::GuestVirtualAddress, profile::CapabilityStatus};
 
     const EMPTY_FIELDS: &[OperandField] = &[];
-    const EMPTY_CONSTRAINTS: &[ReservedConstraint] = &[];
     const EMPTY_FEATURES: &[InstructionFeature] = &[];
 
     const fn pattern(name: &'static str, mask: u32, value: u32, id: u32) -> InstructionPattern {
@@ -649,17 +597,12 @@ mod tests {
             mask,
             value,
             operands: EMPTY_FIELDS,
-            reserved_constraints: EMPTY_CONSTRAINTS,
             required_features: EMPTY_FEATURES,
-            semantic_id: SemanticId::new(id),
             coverage_id: CoverageId::new(id),
             priority: 0,
-            registration: InstructionRegistration {
-                decoder: DecodeSupport::Ready,
-                lifter: LoweringAvailability::Missing,
-                regression_fixture: None,
-            },
-            allocation_validator: AllocationValidator::AlwaysAllocated,
+            decoder: DecodeSupport::Ready,
+            lowering: LoweringAvailability::Missing,
+            regression_fixture: None,
         }
     }
 
@@ -760,15 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_feature_disabled_are_distinct() {
-        static CONSTRAINTS: [ReservedConstraint; 1] = [ReservedConstraint {
-            mask: 1,
-            value: 0,
-            reason: "bit zero is reserved",
-        }];
+    fn disabled_features_are_reported_by_the_decoder() {
         static FEATURES: [InstructionFeature; 1] = [InstructionFeature::Crc32];
         static PATTERNS: [InstructionPattern; 1] = [InstructionPattern {
-            reserved_constraints: &CONSTRAINTS,
             required_features: &FEATURES,
             ..pattern("feature", 0xff00_0000, 0x1200_0000, 1)
         }];
@@ -780,10 +717,6 @@ mod tests {
             ExecutionState::A64,
             disabled.id(),
         );
-        assert!(matches!(
-            table.decode(&disabled, location, 0x1200_0001_u32.into()),
-            DecodeResult::Reserved { .. }
-        ));
         assert!(matches!(
             table.decode(&disabled, location, 0x1200_0000_u32.into()),
             DecodeResult::ProfileDisabled { .. }

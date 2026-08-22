@@ -56,12 +56,10 @@ pub struct EngineCapabilities {
     pub a64: bool,
     pub a32: bool,
     pub t32: bool,
-    pub precise_instruction_budget: bool,
     pub instruction_trace: bool,
     /// The engine can stop at a canonical boundary and request that the
     /// reference engine execute exactly one guest instruction.
     pub interpret_one_fallback: bool,
-    pub native_execution: bool,
     /// Distinct executors may run concurrently without sharing mutable state.
     pub concurrent_executors: bool,
     /// Maximum guest instructions between control-path polls. `None` means the
@@ -69,12 +67,7 @@ pub struct EngineCapabilities {
     pub max_safepoint_instructions: Option<NonZeroU64>,
     /// Mapping and code invalidation epochs are acknowledged before reuse.
     pub acknowledged_invalidation: bool,
-    /// Portable canonical-state ABI implemented by the provider. Zero means
-    /// that no interchange contract is advertised.
-    pub canonical_state_version: u16,
     pub deterministic_execution: bool,
-    pub precise_exceptions: bool,
-    pub engine_handoff: bool,
     /// The domain can bind retained canonical backing ranges for native access.
     pub canonical_memory_binding: bool,
     /// Finite executor limit. `None` is unbounded when concurrency is offered.
@@ -106,10 +99,8 @@ impl EngineCapabilities {
         (!required.a64 || self.a64)
             && (!required.a32 || self.a32)
             && (!required.t32 || self.t32)
-            && (!required.precise_instruction_budget || self.precise_instruction_budget)
             && (!required.instruction_trace || self.instruction_trace)
             && (!required.interpret_one_fallback || self.interpret_one_fallback)
-            && (!required.native_execution || self.native_execution)
             && (!required.concurrent_executors || self.concurrent_executors)
             && match (
                 self.max_safepoint_instructions,
@@ -120,10 +111,7 @@ impl EngineCapabilities {
                 (None, Some(_)) => false,
             }
             && (!required.acknowledged_invalidation || self.acknowledged_invalidation)
-            && self.canonical_state_version >= required.canonical_state_version
             && (!required.deterministic_execution || self.deterministic_execution)
-            && (!required.precise_exceptions || self.precise_exceptions)
-            && (!required.engine_handoff || self.engine_handoff)
             && (!required.canonical_memory_binding || self.canonical_memory_binding)
             && match (
                 self.max_concurrent_executors,
@@ -147,9 +135,7 @@ impl EngineCapabilities {
     /// independently of a particular guest request.
     #[must_use]
     pub const fn is_coherent(self) -> bool {
-        (!self.native_execution
-            || (self.canonical_memory_binding && self.acknowledged_invalidation))
-            && (!self.engine_handoff || self.canonical_state_version != 0)
+        (!self.canonical_memory_binding || self.acknowledged_invalidation)
             && (!self.concurrent_executors || self.max_safepoint_instructions.is_some())
     }
 }

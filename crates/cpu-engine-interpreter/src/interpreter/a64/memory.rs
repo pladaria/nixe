@@ -9,6 +9,9 @@ use nixe_cpu::{
         CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
         MemoryAlignment, MemoryOrdering, MemoryValue,
     },
+    semantics::a64::{
+        LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
+    },
     state::a64::A64State,
 };
 
@@ -67,7 +70,7 @@ fn exclusive(
     let Some(monitor) = context.exclusive_monitor() else {
         return Ok(None);
     };
-    let size = size_from_bits(fields.size);
+    let size = memory_size(fields.size);
     let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
     let load = matches!(instruction, Instruction::LoadExclusive(_));
     let ordering = match (load, fields.ordered) {
@@ -84,7 +87,13 @@ fn exclusive(
     if load {
         let (value, reservation) = memory.load_exclusive(address_space, address, descriptor)?;
         monitor.borrow_mut().reserve(reservation);
-        write_loaded(state, fields.rt, size, 1, false, value.value);
+        write_loaded(
+            state,
+            fields.rt,
+            size,
+            LoadSpec::unsigned(size),
+            value.value,
+        );
     } else {
         let reservation = monitor.borrow().reservation();
         monitor.borrow_mut().clear();
@@ -119,16 +128,6 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
     )
 }
 
-fn size_from_bits(size: u8) -> MemoryAccessSize {
-    match size {
-        0 => MemoryAccessSize::Byte,
-        1 => MemoryAccessSize::Halfword,
-        2 => MemoryAccessSize::Word,
-        3 => MemoryAccessSize::Doubleword,
-        _ => unreachable!(),
-    }
-}
-
 fn literal(
     memory: &dyn CpuMemory,
     address_space: nixe_cpu::address::AddressSpaceId,
@@ -136,11 +135,8 @@ fn literal(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: Operands,
 ) -> MemoryStep {
-    let (size, signed) = match fields.size {
-        0 => (MemoryAccessSize::Word, false),
-        1 => (MemoryAccessSize::Doubleword, false),
-        2 => (MemoryAccessSize::Word, true),
-        _ => return Ok(None),
+    let Some((size, load)) = literal_load(fields.size) else {
+        return Ok(None);
     };
     let address = decoded
         .location
@@ -151,7 +147,7 @@ fn literal(
         address,
         access(size, MemoryOrdering::Relaxed, false),
     )?;
-    write_loaded(state, fields.rt, size, fields.opc, signed, value.value);
+    write_loaded(state, fields.rt, size, load, value.value);
     Ok(Some(()))
 }
 
@@ -161,7 +157,7 @@ fn unsigned(
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
-    let size = size_from_bits(fields.size);
+    let size = memory_size(fields.size);
     let base = read(state, fields.rn, 64, true);
     let address = GuestVirtualAddress::new(
         base.wrapping_add(u64::from(fields.immediate_12) * size.bytes() as u64),
@@ -188,7 +184,7 @@ fn indexed(
     {
         return Ok(None);
     }
-    let size = size_from_bits(fields.size);
+    let size = memory_size(fields.size);
     let base = read(state, fields.rn, 64, true);
     let offset = sign_extend(u64::from(fields.immediate_9), 9);
     let address = if matches!(
@@ -224,7 +220,7 @@ fn register_offset(
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
-    let size = size_from_bits(fields.size);
+    let size = memory_size(fields.size);
     let Some(address) = register_offset_address(
         state,
         fields.rn,
@@ -252,11 +248,8 @@ fn pair(
     state: &mut A64State,
     fields: Operands,
 ) -> MemoryStep {
-    let (size, signed) = match fields.size {
-        0 => (MemoryAccessSize::Word, false),
-        1 if fields.load => (MemoryAccessSize::Word, true),
-        2 => (MemoryAccessSize::Doubleword, false),
-        _ => return Ok(None),
+    let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
+        return Ok(None);
     };
     if (fields.load && fields.rt == fields.rt2)
         || (matches!(fields.mode, 1 | 3)
@@ -280,22 +273,8 @@ fn pair(
         // state for synthetic faults in the reference engine.
         let first_value = memory.read(address_space, first, descriptor)?.value;
         let second_value = memory.read(address_space, second, descriptor)?.value;
-        write_loaded(
-            state,
-            fields.rt,
-            size,
-            u8::from(signed) * 2 + 1,
-            signed,
-            first_value,
-        );
-        write_loaded(
-            state,
-            fields.rt2,
-            size,
-            u8::from(signed) * 2 + 1,
-            signed,
-            second_value,
-        );
+        write_loaded(state, fields.rt, size, load_spec, first_value);
+        write_loaded(state, fields.rt2, size, load_spec, second_value);
     } else {
         memory.write(
             address_space,
@@ -329,12 +308,12 @@ fn acquire_release(
     } else {
         MemoryOrdering::Release
     };
-    let size = size_from_bits(fields.size);
+    let size = memory_size(fields.size);
     let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
     let descriptor = access(size, ordering, true);
     if load {
         let value = memory.read(address_space, address, descriptor)?.value;
-        write_loaded(state, fields.rt, size, 1, false, value);
+        write_loaded(state, fields.rt, size, LoadSpec::unsigned(size), value);
     } else {
         memory.write(
             address_space,
@@ -355,8 +334,8 @@ fn transfer(
     size: MemoryAccessSize,
     descriptor: MemoryAccess,
 ) -> MemoryStep {
-    match fields.opc {
-        0 => {
+    match scalar_transfer(fields.opc, size) {
+        Some(ScalarTransfer::Store) => {
             memory.write(
                 address_space,
                 address,
@@ -364,19 +343,11 @@ fn transfer(
                 register_value(state, fields.rt, size),
             )?;
         }
-        1 => {
+        Some(ScalarTransfer::Load(load)) => {
             let value = memory.read(address_space, address, descriptor)?.value;
-            write_loaded(state, fields.rt, size, fields.opc, false, value);
+            write_loaded(state, fields.rt, size, load, value);
         }
-        2 if size != MemoryAccessSize::Doubleword => {
-            let value = memory.read(address_space, address, descriptor)?.value;
-            write_loaded(state, fields.rt, size, fields.opc, true, value);
-        }
-        3 if !matches!(size, MemoryAccessSize::Word | MemoryAccessSize::Doubleword) => {
-            let value = memory.read(address_space, address, descriptor)?.value;
-            write_loaded(state, fields.rt, size, fields.opc, true, value);
-        }
-        _ => return Ok(None),
+        None => return Ok(None),
     }
     Ok(Some(()))
 }
@@ -405,8 +376,7 @@ fn write_loaded(
     state: &mut A64State,
     register: u8,
     size: MemoryAccessSize,
-    opc: u8,
-    signed: bool,
+    load: LoadSpec,
     value: MemoryValue,
 ) {
     let raw = match value {
@@ -416,15 +386,10 @@ fn write_loaded(
         MemoryValue::U64(value) => value,
         MemoryValue::U128(_) => unreachable!("A64 scalar transfer is at most 64 bits"),
     };
-    let destination_width = if opc == 2 || size == MemoryAccessSize::Doubleword || signed {
-        64
-    } else {
-        32
-    };
-    let result = if signed {
+    let result = if load.signed {
         sign_extend(raw, (size.bytes() * 8) as u8) as u64
     } else {
         raw
     };
-    write(state, register, destination_width, false, result);
+    write(state, register, load.destination_bits, false, result);
 }

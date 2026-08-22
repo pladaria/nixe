@@ -436,12 +436,8 @@ fn engine_requirements(
         a64: state == ExecutionState::A64,
         a32: state == ExecutionState::A32,
         t32: state == ExecutionState::T32,
-        precise_instruction_budget: true,
         instruction_trace,
-        precise_exceptions: true,
-        canonical_state_version: 1,
         deterministic_execution: true,
-        engine_handoff: true,
         ..Default::default()
     }
 }

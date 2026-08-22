@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{DecodeSupport, DecoderTable, InstructionPattern, LoweringAvailability, OperandField},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +34,7 @@ pub struct NormalizedA32 {
 
 #[must_use]
 pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> NormalizedA32 {
-    let id = opcode.semantic_id().get();
+    let id = opcode.coverage_id().get();
     let bits = encoding.bits();
     let instruction = match id {
         0x0001_0001..=0x0001_0008 => A32Instruction::Control(control::normalize(id, bits)),
@@ -73,13 +73,12 @@ pub(super) const fn pattern(
         mask,
         value,
         operands,
-        reserved_constraints: &[],
         required_features,
-        semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        registration: super::registry::registration(ExecutionState::A32, id),
-        allocation_validator: AllocationValidator::A32,
+        decoder: DecodeSupport::Ready,
+        lowering: LoweringAvailability::Missing,
+        regression_fixture: None,
     }
 }
 

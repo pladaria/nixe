@@ -25,7 +25,7 @@ use crate::{
     },
     location::{DecodedInstruction, ExecutionState, LocationDescriptor},
     memory::{MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryOrdering},
-    semantics::immediate::decode_a64_logical_immediate,
+    semantics::{a64::signed_immediate as sign_extend, immediate::decode_a64_logical_immediate},
     state::a64::A64GeneralRegister,
 };
 
@@ -76,11 +76,6 @@ fn direct_target(source: LocationDescriptor, displacement: i64) -> ControlTarget
         pc: source.pc.wrapping_offset(displacement),
         execution_state: ExecutionState::A64,
     }
-}
-
-fn sign_extend(value: u64, bits: u8) -> i64 {
-    let shift = 64 - bits;
-    ((value << shift) as i64) >> shift
 }
 
 fn emit_one(

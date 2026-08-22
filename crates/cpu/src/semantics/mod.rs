@@ -4,6 +4,7 @@
 //! primitives independent from either execution engine gives tests one source
 //! of truth without turning the interpreter into an IR evaluator.
 
+pub mod a64;
 pub mod arithmetic;
 pub mod bits;
 pub mod conditions;
