@@ -7,6 +7,7 @@ use crate::{
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
+    semantics::{a64::shift_kind, shifts::ShiftKind as SemanticShiftKind},
 };
 
 use super::LiftOutcome;
@@ -224,12 +225,14 @@ fn shifted_register(
     if width == IrType::I32 && amount >= 32 {
         return Ok(None);
     }
-    let kind = match u32::from(fields.shift_kind) {
-        0 => ShiftKind::LogicalLeft,
-        1 => ShiftKind::LogicalRight,
-        2 => ShiftKind::ArithmeticRight,
-        3 => ShiftKind::RotateRight,
-        _ => unreachable!(),
+    let Some(kind) = shift_kind(fields.shift_kind, true) else {
+        return Ok(None);
+    };
+    let kind = match kind {
+        SemanticShiftKind::LogicalLeft => ShiftKind::LogicalLeft,
+        SemanticShiftKind::LogicalRight => ShiftKind::LogicalRight,
+        SemanticShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight,
+        SemanticShiftKind::RotateRight => ShiftKind::RotateRight,
     };
     let value = read_gpr(builder, source, index, width, Register31::Zero)?;
     if amount == 0 {

@@ -17,7 +17,7 @@ fn fake_nce_passes_portable_engine_conformance() {
 }
 
 #[test]
-fn fake_nce_uses_the_generic_memory_and_lifecycle_contract() {
+fn fake_nce_binds_memory_and_tears_down_once() {
     let provider = FakeNceProvider::new();
     let metrics = provider.metrics();
     let space = AddressSpaceId::new(9);
@@ -38,7 +38,6 @@ fn fake_nce_uses_the_generic_memory_and_lifecycle_contract() {
         end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
         memory: &memory,
         invalidation_generation: memory.mapping_epoch().get(),
-        dirty_generation: memory.content_mutation_epoch().get(),
     };
     let mut domain = provider.create_nce_domain(DomainRequest {
         domain: EngineDomainId::new(7),
@@ -46,12 +45,8 @@ fn fake_nce_uses_the_generic_memory_and_lifecycle_contract() {
     });
     domain.bind_memory(binding).unwrap();
     assert_eq!(domain.mirrored_binding_count(), 1);
-    domain.activate().unwrap();
-    let synchronization = domain.synchronize_memory(binding).unwrap();
-    assert_eq!(synchronization.address_space, space);
     domain.shutdown().unwrap();
     domain.shutdown().unwrap();
     assert!(metrics.mapping_notifications() > 0);
-    assert_eq!(metrics.reconciliations(), 1);
     assert_eq!(metrics.teardowns(), 1);
 }

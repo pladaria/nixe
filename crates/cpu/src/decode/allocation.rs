@@ -1,98 +1,24 @@
-//! Authoritative decoder and IR-lowering registry.
+//! Architectural allocation rules for decoded instruction families.
 
 use crate::{
-    location::{ExecutionState, InstructionEncoding},
+    coverage::CoverageId, location::ExecutionState,
     semantics::immediate::decode_a64_logical_immediate,
 };
 
-use super::table::{
-    AllocationStatus, DecodeSupport, InstructionRegistration, LoweringAvailability,
-    RegressionFixture, SemanticId,
-};
+use super::table::AllocationStatus;
 
-const IMPLEMENTED: LoweringAvailability = LoweringAvailability::Implemented;
-const ENCODING_DEPENDENT: LoweringAvailability = LoweringAvailability::EncodingDependent;
-const MISSING: LoweringAvailability = LoweringAvailability::Missing;
-
-/// Returns the sole implementation record associated with a decoder identity.
 #[must_use]
-pub const fn registration(state: ExecutionState, id: u32) -> InstructionRegistration {
-    let decoder = if matches!(id, 0x0000_0038 | 0x0000_0039 | 0x0001_0022 | 0x0001_0030) {
-        DecodeSupport::RecognizedUnimplemented
-    } else {
-        DecodeSupport::Ready
-    };
-    let mut lifter = match state {
-        ExecutionState::A64
-            if matches!(
-                id,
-                0x0000_0001..=0x0000_000f
-                    | 0x0000_0010..=0x0000_001d
-                    | 0x0000_0020..=0x0000_002c
-                    | 0x0000_0030..=0x0000_0037
-                    | 0x0000_003a..=0x0000_003b
-                    | 0x0000_003e..=0x0000_0043
-                    | 0x0000_0044..=0x0000_0045
-                    | 0x0000_0089
-            ) =>
-        {
-            IMPLEMENTED
-        }
-        ExecutionState::A32 if matches!(id, 0x0001_0001 | 0x0001_0002) => IMPLEMENTED,
-        ExecutionState::T32
-            if matches!(id, 0x0002_0001 | 0x0002_0002 | 0x0002_0004 | 0x0002_0005) =>
-        {
-            IMPLEMENTED
-        }
-        _ => MISSING,
-    };
-    if matches!(state, ExecutionState::A64)
-        && matches!(
-            id,
-            0x0000_000b..=0x0000_000f
-                | 0x0000_0010..=0x0000_001d
-                | 0x0000_0022..=0x0000_002c
-                | 0x0000_0030..=0x0000_0037
-                | 0x0000_003a..=0x0000_003b
-                | 0x0000_003e..=0x0000_0043
-        )
-    {
-        lifter = ENCODING_DEPENDENT;
+pub fn validate(state: ExecutionState, id: CoverageId, bits: u32) -> AllocationStatus {
+    match state {
+        ExecutionState::A64 => validate_a64(id, bits),
+        ExecutionState::A32 => validate_a32(id, bits),
+        ExecutionState::T32 => validate_t32(id, bits),
     }
-    InstructionRegistration {
-        decoder,
-        lifter,
-        regression_fixture: regression_fixture(state, id),
-    }
-}
-
-const fn regression_fixture(state: ExecutionState, id: u32) -> Option<RegressionFixture> {
-    let encoding = match (state, id) {
-        (ExecutionState::A64, 0x0000_0001) => InstructionEncoding::from_u32(0xd503_201f),
-        (ExecutionState::A64, 0x0000_0002) => InstructionEncoding::from_u32(0x1400_0000),
-        (ExecutionState::A64, 0x0000_0004) => InstructionEncoding::from_u32(0x9400_0000),
-        (ExecutionState::A64, 0x0000_0005) => InstructionEncoding::from_u32(0xd61f_0000),
-        (ExecutionState::A64, 0x0000_0044) => InstructionEncoding::from_u32(0xd63f_0000),
-        (ExecutionState::A64, 0x0000_0045) => InstructionEncoding::from_u32(0xd65f_03c0),
-        (ExecutionState::A64, 0x0000_0006) => InstructionEncoding::from_u32(0x5400_0000),
-        (ExecutionState::A64, 0x0000_0007) => InstructionEncoding::from_u32(0x3400_0000),
-        (ExecutionState::A64, 0x0000_0008) => InstructionEncoding::from_u32(0x3600_0000),
-        (ExecutionState::A64, 0x0000_0009) => InstructionEncoding::from_u32(0xd400_0001),
-        (ExecutionState::A64, 0x0000_000a) => InstructionEncoding::from_u32(0xd420_0000),
-        (ExecutionState::A32, 0x0001_0001) => InstructionEncoding::from_u32(0xe320_f000),
-        (ExecutionState::A32, 0x0001_0002) => InstructionEncoding::from_u32(0xea00_0000),
-        (ExecutionState::T32, 0x0002_0001) => InstructionEncoding::from_u16(0xbf00),
-        (ExecutionState::T32, 0x0002_0002) => InstructionEncoding::from_u16(0xe000),
-        (ExecutionState::T32, 0x0002_0005) => InstructionEncoding::from_u16(0xbf08),
-        (ExecutionState::T32, 0x0002_0004) => InstructionEncoding::from_u32(0xf3af_8000),
-        _ => return None,
-    };
-    Some(RegressionFixture { encoding })
 }
 
 /// Applies all known A64 allocation constraints before typed normalization.
 #[must_use]
-pub fn validate_a64(id: SemanticId, bits: u32) -> AllocationStatus {
+pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
     let id = id.get();
     let sf = bits >> 31 != 0;
     let immr = ((bits >> 16) & 0x3f) as u8;
@@ -523,7 +449,7 @@ fn validate_a64_simd_permute_two_source(bits: u32) -> AllocationStatus {
 }
 
 #[must_use]
-pub fn validate_a32(id: SemanticId, bits: u32) -> AllocationStatus {
+pub fn validate_a32(id: CoverageId, bits: u32) -> AllocationStatus {
     if bits >> 28 != 0xf || matches!(id.get(), 0x0001_0006 | 0x0001_0031..=0x0001_0033) {
         AllocationStatus::Allocated
     } else {
@@ -532,7 +458,7 @@ pub fn validate_a32(id: SemanticId, bits: u32) -> AllocationStatus {
 }
 
 #[must_use]
-pub fn validate_t32(id: SemanticId, bits: u32) -> AllocationStatus {
+pub fn validate_t32(id: CoverageId, bits: u32) -> AllocationStatus {
     match id.get() {
         0x0002_0005 => {
             let condition = ((bits >> 4) & 0xf) as u8;
@@ -552,11 +478,10 @@ pub fn validate_t32(id: SemanticId, bits: u32) -> AllocationStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{
         address::GuestVirtualAddress,
         decode::{DecodeResult, decode},
-        location::LocationDescriptor,
+        location::{ExecutionState, InstructionEncoding, LocationDescriptor},
         profile::GuestCpuProfile,
     };
 

@@ -13,7 +13,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         190,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "mrs",
         0xfff0_0000,
@@ -22,7 +23,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         70,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "msr-register",
         0xfff0_0000,
@@ -31,7 +33,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         69,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "barrier",
         0xffff_f01f,
@@ -40,7 +43,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         189,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "system",
         0xffc0_0000,
@@ -49,7 +53,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         20,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +88,7 @@ impl Instruction {
     }
 }
 
-pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
+pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rt: (bits & 0x1f) as u8,
         hint: ((bits >> 5) & 0x7f) as u8,
@@ -91,7 +96,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         barrier_option: ((bits >> 8) & 0xf) as u8,
         system_key: bits & 0xffff_ffe0,
     };
-    match semantic_id {
+    match instruction_id {
         0x0000_000b => Instruction::Hint(operands),
         0x0000_000c => Instruction::ReadRegister(operands),
         0x0000_000d => Instruction::WriteRegister(operands),

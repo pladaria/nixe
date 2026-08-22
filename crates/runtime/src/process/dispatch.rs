@@ -36,12 +36,8 @@ impl RunnableProcess {
         vcpu_count: usize,
     ) -> nixe_cpu_engine::EngineCapabilities {
         let mut required = nixe_cpu_engine::EngineCapabilities {
-            precise_instruction_budget: true,
             instruction_trace: self.execution.instruction_trace_enabled(),
-            canonical_state_version: 1,
             deterministic_execution: !parallel,
-            precise_exceptions: true,
-            engine_handoff: true,
             concurrent_executors: parallel,
             max_safepoint_instructions: parallel
                 .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
@@ -99,56 +95,6 @@ impl RunnableProcess {
         executor: Box<dyn nixe_cpu_engine::EngineExecutor>,
     ) {
         self.execution.restore_fallback_executor(vcpu, executor);
-    }
-
-    pub(crate) fn prepare_engine_switch(
-        &mut self,
-        vcpus: impl IntoIterator<Item = nixe_scheduler::VirtualCpuId>,
-        provider: &dyn nixe_cpu_engine::EngineProvider,
-    ) -> Result<execution::PreparedEngineSwitch, nixe_cpu_engine::HandoffFailure> {
-        let memory = nixe_cpu_engine::DomainMemoryBinding {
-            address_space: self.cpu.address_space_id(),
-            end_exclusive: nixe_memory::GuestVirtualAddress::new(
-                self.address_space.exclusive_limit(),
-            ),
-            memory: self.memory.as_ref(),
-            invalidation_generation: self.memory.mapping_epoch().get(),
-            dirty_generation: self.memory.content_mutation_epoch().get(),
-        };
-        self.execution
-            .prepare_provider_switch(self.cpu, memory, vcpus, provider)
-    }
-
-    pub(crate) fn complete_engine_switch(
-        &mut self,
-        prepared: &mut execution::PreparedEngineSwitch,
-    ) -> Result<(), nixe_cpu_engine::HandoffFailure> {
-        let memory = nixe_cpu_engine::DomainMemoryBinding {
-            address_space: self.cpu.address_space_id(),
-            end_exclusive: nixe_memory::GuestVirtualAddress::new(
-                self.address_space.exclusive_limit(),
-            ),
-            memory: self.memory.as_ref(),
-            invalidation_generation: self.memory.mapping_epoch().get(),
-            dirty_generation: self.memory.content_mutation_epoch().get(),
-        };
-        self.execution.complete_provider_switch(prepared, memory)
-    }
-
-    pub(crate) fn reactivate_engine_after_switch_failure(
-        &mut self,
-    ) -> Result<(), nixe_cpu_engine::EngineFault> {
-        self.execution.reactivate_after_switch_failure()
-    }
-
-    pub(crate) fn commit_engine_switch(
-        &mut self,
-        prepared: execution::PreparedEngineSwitch,
-    ) -> (
-        nixe_cpu_engine::StateCommitBarrier,
-        Box<dyn nixe_cpu_engine::EngineDomain>,
-    ) {
-        self.execution.commit_provider_switch(prepared)
     }
 
     #[cfg(test)]

@@ -169,7 +169,7 @@ impl Display for ProcessTeardownFailure {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "CPU engine domain failed to quiesce during teardown: {}",
+            "CPU engine domain failed to shut down during teardown: {}",
             self.fault
         )
     }
@@ -187,9 +187,7 @@ pub(crate) struct ProcessExecutionControl {
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
     address_space_end: nixe_memory::GuestVirtualAddress,
-    quiesced: bool,
-    quiesce_attempted: bool,
-    quiesce_failure: Option<EngineFault>,
+    shutdown_result: Option<Result<(), EngineFault>>,
     pending_safepoint: AtomicBool,
     pending_events: AtomicU32,
 }
@@ -205,40 +203,6 @@ pub(crate) struct ProcessExecutionConfiguration {
     pub(crate) timer_frequency: u64,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) address_space_end: nixe_memory::GuestVirtualAddress,
-}
-
-pub(crate) struct PreparedEngineSwitch {
-    executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
-    controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
-    replacement: Box<dyn EngineDomain>,
-    cpu: ProcessCpuContext,
-    barrier: Option<nixe_cpu_engine::StateCommitBarrier>,
-}
-
-impl PreparedEngineSwitch {
-    pub(crate) fn domain_id(&self) -> EngineDomainId {
-        self.replacement.domain_id()
-    }
-
-    pub(crate) fn take_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Option<Box<dyn EngineExecutor>> {
-        self.executors.remove(&vcpu)
-    }
-
-    pub(crate) fn restore_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        executor: Box<dyn EngineExecutor>,
-    ) {
-        debug_assert!(self.executors.insert(vcpu, executor).is_none());
-    }
-
-    pub(crate) fn shutdown(mut self) -> Result<(), EngineFault> {
-        self.executors.clear();
-        self.replacement.shutdown()
-    }
 }
 
 impl ProcessExecutionControl {
@@ -269,13 +233,8 @@ impl ProcessExecutionControl {
             end_exclusive: address_space_end,
             memory,
             invalidation_generation: memory.mapping_epoch().get(),
-            dirty_generation: memory.content_mutation_epoch().get(),
         };
         if let Err(fault) = domain.bind_memory(binding) {
-            let _ = domain.shutdown();
-            return Err(fault);
-        }
-        if let Err(fault) = domain.activate() {
             let _ = domain.shutdown();
             return Err(fault);
         }
@@ -344,9 +303,7 @@ impl ProcessExecutionControl {
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
             address_space_end,
-            quiesced: false,
-            quiesce_attempted: false,
-            quiesce_failure: None,
+            shutdown_result: None,
             pending_safepoint: AtomicBool::new(false),
             pending_events: AtomicU32::new(0),
         })
@@ -375,21 +332,14 @@ impl ProcessExecutionControl {
             return;
         }
         for control in self.controls.values() {
-            let _ = control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+            control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
         }
     }
 
-    pub(crate) fn quiesce(&mut self) -> Result<(), EngineFault> {
-        if self.quiesced {
-            return Ok(());
+    pub(crate) fn shutdown(&mut self) -> Result<(), EngineFault> {
+        if let Some(result) = &self.shutdown_result {
+            return result.clone();
         }
-        if self.quiesce_attempted {
-            return Err(self
-                .quiesce_failure
-                .clone()
-                .expect("an unsuccessful quiescence attempt retains its fault"));
-        }
-        self.quiesce_attempted = true;
         self.request_safepoint();
         self.executors.clear();
         if let Some(fallback) = &mut self.fallback {
@@ -400,23 +350,20 @@ impl ProcessExecutionControl {
             .fallback
             .as_mut()
             .map_or(Ok(()), |fallback| fallback.domain.shutdown());
-        if let Err(fault) = primary_result.and(fallback_result) {
-            self.quiesce_failure = Some(fault.clone());
-            return Err(fault);
-        }
-        self.quiesced = true;
-        Ok(())
+        let result = primary_result.and(fallback_result);
+        self.shutdown_result = Some(result.clone());
+        result
     }
     pub(crate) fn request_mapping_safepoint(&self) {
         for control in self.controls.values() {
             if control.execution_active() {
-                let _ = control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+                control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
             }
         }
     }
     pub(crate) fn publish_mapping_invalidation(&self, epoch: nixe_cpu::memory::MappingEpoch) {
         for control in self.controls.values() {
-            let _ = control.request_invalidation(epoch.get());
+            control.request_invalidation(epoch.get());
         }
     }
     pub(crate) fn mapping_invalidation_acknowledged(
@@ -525,7 +472,7 @@ impl ProcessExecutionControl {
 
     fn publish_pending_control(&self, control: &nixe_cpu_engine::EngineControl) {
         if self.pending_safepoint.swap(false, Ordering::AcqRel) {
-            let _ = control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+            control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
         }
         let events = self.pending_events.swap(0, Ordering::AcqRel);
         if events != 0 {
@@ -548,141 +495,6 @@ impl ProcessExecutionControl {
             self.address_space_end,
         )
     }
-
-    pub(crate) fn prepare_provider_switch(
-        &mut self,
-        cpu: ProcessCpuContext,
-        memory: nixe_cpu_engine::DomainMemoryBinding<'_>,
-        vcpus: impl IntoIterator<Item = nixe_scheduler::VirtualCpuId>,
-        provider: &dyn EngineProvider,
-    ) -> Result<PreparedEngineSwitch, nixe_cpu_engine::HandoffFailure> {
-        let replacement_domain =
-            allocate_engine_domain_id().ok_or_else(|| nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                fault: engine_fault(
-                    cpu,
-                    provider.descriptor().id,
-                    nixe_cpu_engine::EngineFaultKind::Unavailable,
-                    "engine domain identity exhausted",
-                ),
-            })?;
-        let mut replacement = provider
-            .create_domain(DomainRequest {
-                domain: replacement_domain,
-                cpu,
-            })
-            .map_err(|fault| nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                fault,
-            })?;
-        if let Err(fault) = replacement.bind_memory(memory) {
-            let _ = replacement.shutdown();
-            return Err(nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                fault,
-            });
-        }
-        if replacement.descriptor().capabilities.interpret_one_fallback && self.fallback.is_none() {
-            let fault = nixe_cpu_engine::HandoffFailure {
-                stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                fault: engine_fault(
-                    cpu,
-                    replacement.descriptor().id,
-                    nixe_cpu_engine::EngineFaultKind::InvalidRequest,
-                    "replacement engine requires an unconfigured InterpretOne fallback",
-                ),
-            };
-            let _ = replacement.shutdown();
-            return Err(fault);
-        }
-        let mut executors = BTreeMap::new();
-        let mut controls = BTreeMap::new();
-        for vcpu in vcpus {
-            let executor = match replacement.create_executor(ExecutorRequest {
-                executor: Self::executor_id(vcpu),
-                trace: self.trace_policy,
-            }) {
-                Ok(executor) => executor,
-                Err(fault) => {
-                    executors.clear();
-                    let _ = replacement.shutdown();
-                    return Err(nixe_cpu_engine::HandoffFailure {
-                        stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                        fault,
-                    });
-                }
-            };
-            if let Some(control) = executor.control() {
-                if controls.is_empty() {
-                    self.publish_pending_control(&control);
-                }
-                controls.insert(vcpu, control);
-            } else if replacement
-                .descriptor()
-                .capabilities
-                .requires_control_path()
-            {
-                let fault = nixe_cpu_engine::HandoffFailure {
-                    stage: nixe_cpu_engine::HandoffFailureStage::Import,
-                    fault: missing_control_path_fault(cpu, replacement.descriptor().id),
-                };
-                drop(executor);
-                executors.clear();
-                let _ = replacement.shutdown();
-                return Err(fault);
-            }
-            executors.insert(vcpu, executor);
-        }
-        Ok(PreparedEngineSwitch {
-            replacement,
-            executors,
-            controls,
-            cpu,
-            barrier: None,
-        })
-    }
-
-    pub(crate) fn complete_provider_switch(
-        &mut self,
-        prepared: &mut PreparedEngineSwitch,
-        memory: nixe_cpu_engine::DomainMemoryBinding<'_>,
-    ) -> Result<(), nixe_cpu_engine::HandoffFailure> {
-        let barrier = nixe_cpu_engine::prepare_handoff(
-            self.domain.as_mut(),
-            prepared.replacement.as_mut(),
-            memory,
-        )?;
-        prepared.barrier = Some(barrier);
-        Ok(())
-    }
-
-    pub(crate) fn reactivate_after_switch_failure(&mut self) -> Result<(), EngineFault> {
-        self.domain.activate()
-    }
-
-    pub(crate) fn commit_provider_switch(
-        &mut self,
-        prepared: PreparedEngineSwitch,
-    ) -> (nixe_cpu_engine::StateCommitBarrier, Box<dyn EngineDomain>) {
-        debug_assert!(prepared.executors.is_empty());
-        let PreparedEngineSwitch {
-            replacement,
-            controls,
-            cpu,
-            barrier,
-            ..
-        } = prepared;
-        let old = std::mem::replace(&mut self.domain, replacement);
-        self.controls = controls;
-        self.cpu = cpu;
-        self.quiesced = false;
-        self.quiesce_attempted = false;
-        self.quiesce_failure = None;
-        (
-            barrier.expect("a committed provider switch completed its handoff"),
-            old,
-        )
-    }
 }
 
 fn create_fallback_domain(
@@ -695,20 +507,17 @@ fn create_fallback_domain(
         domain: domain_id,
         cpu,
     })?;
-    let result = domain
-        .bind_memory(binding)
-        .and_then(|()| domain.activate())
-        .and_then(|()| {
-            domain
-                .create_executor(ExecutorRequest {
-                    executor: EngineExecutorId::new(1),
-                    trace: TracePolicy {
-                        enabled: false,
-                        detailed: false,
-                    },
-                })
-                .map(drop)
-        });
+    let result = domain.bind_memory(binding).and_then(|()| {
+        domain
+            .create_executor(ExecutorRequest {
+                executor: EngineExecutorId::new(1),
+                trace: TracePolicy {
+                    enabled: false,
+                    detailed: false,
+                },
+            })
+            .map(drop)
+    });
     if let Err(fault) = result {
         let _ = domain.shutdown();
         return Err(fault);
@@ -721,8 +530,8 @@ fn create_fallback_domain(
 
 impl Drop for ProcessExecutionControl {
     fn drop(&mut self) {
-        if !self.quiesce_attempted {
-            let _ = self.quiesce();
+        if self.shutdown_result.is_none() {
+            let _ = self.shutdown();
         }
     }
 }
@@ -808,7 +617,6 @@ impl VcpuExecutionState {
                     end_exclusive: self.address_space_end,
                     memory: self.memory.as_ref(),
                     invalidation_generation: memory_lease.epoch().get(),
-                    dirty_generation: self.memory.content_mutation_epoch().get(),
                 },
                 &self.thread,
             )
@@ -826,29 +634,7 @@ impl VcpuExecutionState {
             loader_return: self.loader_return,
             timer: &timer,
         });
-        normalize_engine_result(executor, result)
-    }
-}
-
-fn normalize_engine_result(
-    executor: &dyn EngineExecutor,
-    result: Result<ExecutionReport, EngineFault>,
-) -> Result<ExecutionReport, ProcessExecutionError> {
-    match result {
-        Ok(report) => {
-            if report.state_commit != nixe_cpu_engine::StateCommitStatus::Canonical {
-                let fault = EngineFault {
-                    engine: executor.descriptor().id,
-                    kind: nixe_cpu_engine::EngineFaultKind::StateExport,
-                    instructions_executed: report.instructions_executed,
-                    message: "engine returned before committing canonical thread state".into(),
-                    context: Box::new(report.context),
-                };
-                return Err(ProcessExecutionError::Engine { fault });
-            }
-            Ok(report)
-        }
-        Err(fault) => Err(ProcessExecutionError::Engine { fault }),
+        result.map_err(|fault| ProcessExecutionError::Engine { fault })
     }
 }
 impl EngineTimer for RuntimeTimer<'_> {
@@ -879,8 +665,7 @@ mod tests {
 
     use super::*;
     use nixe_cpu_engine::{
-        CapabilityReport, DomainQuiescenceToken, EngineCapabilities, EngineDescriptor, EngineId,
-        EngineKind,
+        CapabilityReport, EngineCapabilities, EngineDescriptor, EngineId, EngineKind,
     };
     use nixe_memory::AddressSpaceId;
 
@@ -889,7 +674,7 @@ mod tests {
     fn descriptor() -> EngineDescriptor {
         EngineDescriptor {
             id: ENGINE_ID,
-            name: "quiesce-failure-test".into(),
+            name: "shutdown-failure-test".into(),
             kind: EngineKind::Test,
             capabilities: EngineCapabilities {
                 a64: true,
@@ -951,13 +736,13 @@ mod tests {
             Ok(Box::new(InertExecutor(request.executor)))
         }
 
-        fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
+        fn shutdown(&mut self) -> Result<(), EngineFault> {
             self.attempts.fetch_add(1, Ordering::AcqRel);
             Err(engine_fault(
                 self.cpu,
                 ENGINE_ID,
                 nixe_cpu_engine::EngineFaultKind::Internal,
-                "injected quiesce failure",
+                "injected shutdown failure",
             ))
         }
     }
@@ -974,14 +759,14 @@ mod tests {
         }
 
         fn run_slice(&mut self, _request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault> {
-            unreachable!("the quiesce test never enters guest execution")
+            unreachable!("the shutdown test never enters guest execution")
         }
 
         fn clear_local_exclusive_reservation(&mut self) {}
     }
 
     #[test]
-    fn failed_quiescence_is_reported_once_and_drop_does_not_retry() {
+    fn failed_shutdown_is_reported_once_and_drop_does_not_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let cpu = ProcessCpuContext::new(
             crate::ProcessBuildConfig::default().cpu_profile,
@@ -1004,8 +789,8 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(execution.quiesce().is_err());
-            assert!(execution.quiesce().is_err());
+            assert!(execution.shutdown().is_err());
+            assert!(execution.shutdown().is_err());
         }
         assert_eq!(attempts.load(Ordering::Acquire), 1);
     }

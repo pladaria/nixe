@@ -615,7 +615,7 @@ impl RunnableProcess {
             address_waiters_released: self.address_waits.waiter_count(),
         };
         self.execution
-            .quiesce()
+            .shutdown()
             .map_err(|fault| ProcessTeardownFailure {
                 report: Box::new(report),
                 fault: Box::new(fault),

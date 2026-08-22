@@ -10,6 +10,7 @@ use nixe_cpu::{
     address::GuestVirtualAddress,
     decode::{DecodedOpcode, a64::A64Instruction},
     location::{DecodedInstruction, ExecutionState, LocationDescriptor},
+    semantics::a64::signed_immediate as sign_extend,
     state::a64::{A64GeneralRegister, A64Register, A64State},
 };
 
@@ -113,9 +114,4 @@ fn register_offset_address(
     Some(GuestVirtualAddress::new(
         read(state, base_register, 64, true).wrapping_add(offset),
     ))
-}
-
-fn sign_extend(value: u64, bits: u8) -> i64 {
-    let shift = 64 - bits;
-    ((value << shift) as i64) >> shift
 }

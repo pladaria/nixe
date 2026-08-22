@@ -13,7 +13,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         61,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-unsigned",
         0x3f00_0000,
@@ -22,7 +23,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         60,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-unscaled",
         0x3f20_0c00,
@@ -31,7 +33,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         120,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-post-index",
         0x3f20_0c00,
@@ -40,7 +43,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         119,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-pre-index",
         0x3f20_0c00,
@@ -49,7 +53,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         118,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-register",
         0x3f20_0c00,
@@ -58,7 +63,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         117,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-store-pair",
         0x3e00_0000,
@@ -67,7 +73,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         59,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-acquire",
         0x3fe0_fc00,
@@ -76,7 +83,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         147,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "store-release",
         0x3fe0_fc00,
@@ -85,7 +93,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         146,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "load-exclusive",
         0x3fe0_7c00,
@@ -94,7 +103,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         145,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "store-exclusive",
         0x3f20_7c00,
@@ -103,7 +113,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         144,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,7 +164,7 @@ instructions!(
     StoreExclusive,
 );
 
-pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
+pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rt: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -171,7 +182,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         ordered: bits & (1 << 15) != 0,
         scaled: bits & (1 << 12) != 0,
     };
-    match semantic_id {
+    match instruction_id {
         0x0000_0022 => Instruction::Literal(operands),
         0x0000_0023 => Instruction::Unsigned(operands),
         0x0000_0024 => Instruction::Unscaled(operands),

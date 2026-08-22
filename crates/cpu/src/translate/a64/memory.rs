@@ -7,6 +7,7 @@ use crate::{
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
+    semantics::a64::{ScalarTransfer, memory_size, pair_transfer, scalar_transfer},
 };
 
 use super::LiftOutcome;
@@ -59,16 +60,6 @@ fn aligned_descriptor(
     descriptor
 }
 
-pub(super) fn size_from_bits(size: u32) -> MemoryAccessSize {
-    match size {
-        0 => MemoryAccessSize::Byte,
-        1 => MemoryAccessSize::Halfword,
-        2 => MemoryAccessSize::Word,
-        3 => MemoryAccessSize::Doubleword,
-        _ => unreachable!(),
-    }
-}
-
 fn address_add(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
@@ -94,26 +85,24 @@ fn memory_transfer(
     address: Operand,
     descriptor: MemoryDescriptor,
 ) -> Result<bool, BuildError> {
-    let opc = u32::from(fields.opc);
     let rt = fields.rt;
-    if opc == 0 {
-        let value = read_store_value(builder, source, rt, descriptor)?;
-        builder.emit(
-            source,
-            &[],
-            OperationKind::Memory(MemoryOperation::Store {
-                address,
-                value,
-                descriptor,
-            }),
-        )?;
-        return Ok(true);
-    }
-    if (opc >= 2 && descriptor.access.size == MemoryAccessSize::Doubleword)
-        || (opc == 3 && descriptor.access.size == MemoryAccessSize::Word)
-    {
-        return Ok(false);
-    }
+    let load = match scalar_transfer(fields.opc, descriptor.access.size) {
+        Some(ScalarTransfer::Store) => {
+            let value = read_store_value(builder, source, rt, descriptor)?;
+            builder.emit(
+                source,
+                &[],
+                OperationKind::Memory(MemoryOperation::Store {
+                    address,
+                    value,
+                    descriptor,
+                }),
+            )?;
+            return Ok(true);
+        }
+        Some(ScalarTransfer::Load(load)) => load,
+        None => return Ok(false),
+    };
     let loaded = emit_one(
         builder,
         source,
@@ -123,7 +112,7 @@ fn memory_transfer(
             descriptor,
         }),
     )?;
-    let destination_width = if opc == 2 || descriptor.access.size == MemoryAccessSize::Doubleword {
+    let destination_width = if load.destination_bits == 64 {
         IrType::I64
     } else {
         IrType::I32
@@ -134,7 +123,7 @@ fn memory_transfer(
             builder,
             source,
             destination_width,
-            if matches!(opc, 2 | 3) {
+            if load.signed {
                 ScalarOperation::SignExtend {
                     value,
                     to: destination_width,
@@ -182,15 +171,8 @@ fn lift_literal_load(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let opc = u32::from(fields.size);
-    if opc == 3 {
-        return Ok(interpret(decoded)); // PRFM literal
-    }
-    let size = match opc {
-        0 | 2 => MemoryAccessSize::Word,
-        1 => MemoryAccessSize::Doubleword,
-        3 => return Ok(interpret(decoded)), // PRFM literal
-        _ => unreachable!(),
+    let Some((size, load)) = crate::semantics::a64::literal_load(fields.size) else {
+        return Ok(interpret(decoded));
     };
     let address = Immediate::Address(
         decoded
@@ -209,7 +191,7 @@ fn lift_literal_load(
             descriptor,
         }),
     )?;
-    let value = if opc == 2 {
+    let value = if load.signed {
         scalar(
             builder,
             decoded.location,
@@ -237,7 +219,7 @@ fn lift_load_store_unsigned(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let size = size_from_bits(u32::from(fields.size));
+    let size = memory_size(fields.size);
     let base = base_address(builder, decoded.location, fields.rn)?;
     let address = address_add(
         builder,
@@ -263,7 +245,7 @@ fn lift_load_store_indexed(
     fields: MemoryOperands,
     instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let size = size_from_bits(u32::from(fields.size));
+    let size = memory_size(fields.size);
     let rn = fields.rn;
     let rt = fields.rt;
     if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) && rn != 31 && rn == rt {
@@ -307,7 +289,7 @@ fn lift_load_store_register(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let size = size_from_bits(u32::from(fields.size));
+    let size = memory_size(fields.size);
     let base = base_address(builder, decoded.location, fields.rn)?;
     let offset = read_gpr(
         builder,
@@ -355,14 +337,8 @@ fn lift_load_store_pair(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let opc = u32::from(fields.size);
-    if opc == 3 {
+    let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
         return Ok(interpret(decoded));
-    }
-    let size = if matches!(opc, 0 | 1) {
-        MemoryAccessSize::Word
-    } else {
-        MemoryAccessSize::Doubleword
     };
     let width = if size == MemoryAccessSize::Word {
         IrType::I32
@@ -391,9 +367,6 @@ fn lift_load_store_pair(
         transfer_base,
         size.bytes() as i64,
     )?;
-    if opc == 1 && !load {
-        return Ok(interpret(decoded));
-    }
     let descriptor = descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal);
     for (rt, address) in [(fields.rt, first_address), (fields.rt2, second_address)] {
         if load {
@@ -407,7 +380,7 @@ fn lift_load_store_pair(
                 }),
             )?
             .into();
-            if opc == 1 {
+            if load_spec.signed {
                 value = scalar(
                     builder,
                     decoded.location,
@@ -452,7 +425,7 @@ fn lift_acquire_release(
     fields: MemoryOperands,
     instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let size = size_from_bits(u32::from(fields.size));
+    let size = memory_size(fields.size);
     let base = base_address(builder, decoded.location, fields.rn)?;
     let address = base;
     let load = matches!(instruction, A64MemoryInstruction::LoadAcquire(_));
@@ -501,7 +474,7 @@ fn lift_exclusive(
     fields: MemoryOperands,
     instruction: A64MemoryInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let size = size_from_bits(u32::from(fields.size));
+    let size = memory_size(fields.size);
     let base = base_address(builder, decoded.location, fields.rn)?;
     let address = base;
     let ordered = fields.ordered;

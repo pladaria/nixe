@@ -6,11 +6,12 @@ use nixe_cpu::{
     ir::op::Condition,
     location::{DecodedInstruction, LocationDescriptor},
     semantics::{
+        a64::shift_kind,
         arithmetic::{add_with_carry, subtract_with_carry},
         bits::{BitWidth, rotate_right},
         conditions::evaluate_a64,
         immediate::{decode_a64_bit_masks, decode_a64_logical_immediate},
-        shifts::{ShiftKind, a64_shift_with_carry},
+        shifts::a64_shift_with_carry,
     },
     state::a64::{A64State, Nzcv},
 };
@@ -141,13 +142,7 @@ fn shifted(value: u64, fields: Operands, allow_rotate: bool) -> Option<u64> {
     if width(fields) == 32 && fields.shift_amount >= 32 {
         return None;
     }
-    let kind = match fields.shift_kind {
-        0 => ShiftKind::LogicalLeft,
-        1 => ShiftKind::LogicalRight,
-        2 => ShiftKind::ArithmeticRight,
-        3 if allow_rotate => ShiftKind::RotateRight,
-        _ => return None,
-    };
+    let kind = shift_kind(fields.shift_kind, allow_rotate)?;
     Some(
         a64_shift_with_carry(
             u128::from(value),
@@ -590,24 +585,17 @@ mod tests {
     }
 
     #[test]
-    fn bfi_preserves_destination_bits_outside_inserted_field() {
-        let mut state = A64State::default();
-        state.write_w(register(0), 0xa5a5_a5a5);
-        state.write_w(register(1), 0x0000_000f);
-
-        assert!(bitfield(&mut state, bitfield_operands(0x331b_0c20))); // BFI W0,W1,#5,#4
-
-        assert_eq!(state.read_w(register(0)), 0xa5a5_a5e5);
-    }
-
-    #[test]
-    fn bfxil_preserves_destination_bits_above_extracted_field() {
-        let mut state = A64State::default();
-        state.write_w(register(0), 0xdead_bee0);
-        state.write_w(register(1), 0x1234_567f);
-
-        assert!(bitfield(&mut state, bitfield_operands(0x3300_1020))); // BFXIL W0,W1,#0,#5
-
-        assert_eq!(state.read_w(register(0)), 0xdead_beff);
+    fn bitfield_preserves_unmodified_destination_bits() {
+        let cases = [
+            (0xa5a5_a5a5, 0x0000_000f, 0x331b_0c20, 0xa5a5_a5e5), // BFI W0,W1,#5,#4
+            (0xdead_bee0, 0x1234_567f, 0x3300_1020, 0xdead_beff), // BFXIL W0,W1,#0,#5
+        ];
+        for (destination, source, encoding, expected) in cases {
+            let mut state = A64State::default();
+            state.write_w(register(0), destination);
+            state.write_w(register(1), source);
+            assert!(bitfield(&mut state, bitfield_operands(encoding)));
+            assert_eq!(state.read_w(register(0)), expected);
+        }
     }
 }

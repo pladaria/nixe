@@ -32,16 +32,12 @@ impl EngineProvider for LyingProvider {
     }
 
     fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
-        Ok(Box::new(LyingDomain {
-            id: request.domain,
-            generation: 0,
-        }))
+        Ok(Box::new(LyingDomain { id: request.domain }))
     }
 }
 
 struct LyingDomain {
     id: EngineDomainId,
-    generation: u64,
 }
 
 impl EngineDomain for LyingDomain {
@@ -60,15 +56,6 @@ impl EngineDomain for LyingDomain {
         Ok(Box::new(LyingExecutor {
             id: request.executor,
         }))
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        let token = DomainQuiescenceToken {
-            domain: self.id,
-            generation: EngineGeneration::new(self.generation),
-        };
-        self.generation += 1;
-        Ok(token)
     }
 }
 
@@ -95,7 +82,6 @@ impl EngineExecutor for LyingExecutor {
                 entries: Box::new([]),
                 discarded: 0,
             },
-            state_commit: StateCommitStatus::Canonical,
         })
     }
 
@@ -109,7 +95,6 @@ fn descriptor() -> EngineDescriptor {
         kind: EngineKind::Test,
         capabilities: EngineCapabilities {
             a64: true,
-            precise_instruction_budget: true,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
             acknowledged_invalidation: true,

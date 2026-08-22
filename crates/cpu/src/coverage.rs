@@ -98,7 +98,7 @@ pub enum CompletionCoverage {
     Unavailable,
 }
 
-/// One row generated from the declarative decoder and IR-lowering registries.
+/// One row generated from the declarative instruction catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoverageEntry {
     pub profile_id: CpuProfileId,
@@ -113,9 +113,7 @@ pub struct CoverageEntry {
 
 /// Builds a deterministic coverage table for every decoder entry and state.
 ///
-/// The table is generated from the implementation registration attached to
-/// every declarative pattern, so adding a decoder rule cannot silently
-/// disappear from coverage output or disagree with a parallel ID list.
+/// Decoder, lowering, and fixture status come directly from each pattern.
 #[must_use]
 pub fn coverage_table(profile: &GuestCpuProfile) -> Vec<CoverageEntry> {
     let mut result = Vec::new();
@@ -139,14 +137,14 @@ fn all_pattern_tables() -> [&'static [InstructionPattern]; 4] {
 
 fn entry_for_pattern(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> CoverageEntry {
     let decoder = decoder_coverage(profile, pattern);
-    let lifter = lowering_coverage(pattern.registration.lifter);
+    let lifter = lowering_coverage(pattern.lowering);
     let enabled = matches!(decoder, DecoderCoverage::Available);
     let evidence = CompletionEvidence {
         decoder_classified: enabled,
         explicit_exception: false,
         ir_lowering: lifter == LoweringCoverage::Implemented,
         printer_output: enabled,
-        regression_fixture: enabled && pattern.registration.regression_fixture.is_some(),
+        regression_fixture: enabled && pattern.regression_fixture.is_some(),
     };
     let completion = if !enabled {
         CompletionCoverage::Unavailable
@@ -183,7 +181,7 @@ fn decoder_coverage(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> 
             };
         }
     }
-    match pattern.registration.decoder {
+    match pattern.decoder {
         DecodeSupport::Ready => DecoderCoverage::Available,
         DecodeSupport::RecognizedUnimplemented => DecoderCoverage::RecognizedUnimplemented,
     }
@@ -197,14 +195,7 @@ const fn lowering_coverage(availability: LoweringAvailability) -> LoweringCovera
     }
 }
 
-/// Returns the registered IR-lifter coverage for one instruction.
-#[must_use]
-pub fn lifter_coverage(state: ExecutionState, coverage_id: CoverageId) -> LoweringCoverage {
-    registered_pattern(state, coverage_id).map_or(LoweringCoverage::Missing, |pattern| {
-        lowering_coverage(pattern.registration.lifter)
-    })
-}
-
+#[cfg(test)]
 fn registered_pattern(
     state: ExecutionState,
     coverage_id: CoverageId,
@@ -656,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn every_registry_entry_routes_through_decode_normalization_and_disassembly() {
+    fn every_catalog_entry_routes_through_decode_normalization_and_disassembly() {
         let profile = GuestCpuProfile::switch_1()
             .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled)
             .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
@@ -668,16 +659,9 @@ mod tests {
         assert_eq!(table.len(), expected_entries);
 
         for pattern in all_pattern_tables().into_iter().flatten() {
-            assert_eq!(
-                pattern.registration,
-                crate::decode::registry::registration(
-                    pattern.execution_state,
-                    pattern.coverage_id.get()
-                )
-            );
             let decoded = find_registered_encoding(&profile, pattern).unwrap_or_else(|| {
                 panic!(
-                    "registry entry {} {} has no accepted encoding",
+                    "catalog entry {} {} has no accepted encoding",
                     pattern.execution_state, pattern.coverage_id
                 )
             });
@@ -696,18 +680,15 @@ mod tests {
             }
 
             let coverage = entry(&table, pattern.coverage_id);
-            assert_eq!(
-                coverage.lifter,
-                lowering_coverage(pattern.registration.lifter)
-            );
+            assert_eq!(coverage.lifter, lowering_coverage(pattern.lowering));
             assert_eq!(
                 coverage.evidence.regression_fixture,
-                pattern.registration.regression_fixture.is_some()
+                pattern.regression_fixture.is_some()
                     && matches!(coverage.decoder, DecoderCoverage::Available)
             );
 
             let block = translate_registered_encoding(&profile, &decoded);
-            match pattern.registration.lifter {
+            match pattern.lowering {
                 LoweringAvailability::Implemented => assert!(
                     !matches!(
                         block.terminator,
@@ -812,9 +793,9 @@ mod tests {
         for pattern in all_pattern_tables()
             .into_iter()
             .flatten()
-            .filter(|pattern| pattern.registration.regression_fixture.is_some())
+            .filter(|pattern| pattern.regression_fixture.is_some())
         {
-            let fixture = pattern.registration.regression_fixture.unwrap();
+            let fixture = pattern.regression_fixture.unwrap();
             let decoded = match decode::decode(
                 &profile,
                 crate::location::LocationDescriptor::new(
@@ -882,7 +863,6 @@ mod tests {
             assert!(
                 registered_pattern(entry.execution_state, entry.coverage_id)
                     .unwrap()
-                    .registration
                     .regression_fixture
                     .is_some()
             );

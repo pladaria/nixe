@@ -13,12 +13,12 @@ use nixe_cpu::memory::InstructionMemory;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu_engine::{
-    CapabilityRejection, CapabilityRejectionReason, CapabilityReport, DomainQuiescenceToken,
-    DomainRequest, EngineCapabilities, EngineDescriptor, EngineDomain, EngineDomainId,
-    EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind, EngineGeneration, EngineId,
-    EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace,
-    InstructionTraceEntry, MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest,
-    StateCommitStatus, TimerSnapshot, TracePolicy,
+    CapabilityRejection, CapabilityRejectionReason, CapabilityReport, DomainRequest,
+    EngineCapabilities, EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor,
+    EngineExecutorId, EngineFault, EngineFaultKind, EngineId, EngineKind, EngineProvider,
+    ExecutionReport, ExecutorRequest, InstructionTrace, InstructionTraceEntry,
+    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest, TimerSnapshot,
+    TracePolicy,
 };
 use nixe_memory::GuestVirtualAddress;
 
@@ -28,49 +28,6 @@ use crate::interpreter::{
 };
 
 pub const INTERPRETER_ENGINE_ID: EngineId = EngineId::new(1);
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DispatchState {
-    budget: u64,
-}
-
-impl DispatchState {
-    const fn budget(self) -> u64 {
-        self.budget
-    }
-    const fn set_budget(&mut self, budget: u64) {
-        self.budget = budget;
-    }
-}
-
-/// Transient state owned by one interpreter executor, never by a guest thread.
-struct InterpreterExecutionState {
-    exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
-    control: nixe_cpu_engine::EngineControl,
-    dispatch: DispatchState,
-}
-
-impl InterpreterExecutionState {
-    fn new() -> Self {
-        Self {
-            exclusive_monitor: RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default()),
-            control: nixe_cpu_engine::EngineControl::default(),
-            dispatch: DispatchState { budget: 0 },
-        }
-    }
-    const fn dispatch(&self) -> &DispatchState {
-        &self.dispatch
-    }
-    const fn dispatch_mut(&mut self) -> &mut DispatchState {
-        &mut self.dispatch
-    }
-    const fn exclusive_monitor_cell(&self) -> &RefCell<nixe_cpu::exclusive::ExclusiveMonitorState> {
-        &self.exclusive_monitor
-    }
-    fn clear_local_exclusive_reservation(&mut self) {
-        *self.exclusive_monitor.get_mut() = nixe_cpu::exclusive::ExclusiveMonitorState::default();
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InterpreterProvider;
@@ -128,18 +85,13 @@ const fn capabilities() -> EngineCapabilities {
         a64: true,
         a32: true,
         t32: true,
-        precise_instruction_budget: true,
         instruction_trace: true,
         interpret_one_fallback: false,
-        native_execution: false,
         concurrent_executors: true,
         max_safepoint_instructions: std::num::NonZeroU64::new(1),
         // The interpreter retains neither translated code nor TLB entries.
         acknowledged_invalidation: true,
-        canonical_state_version: 1,
         deterministic_execution: true,
-        precise_exceptions: true,
-        engine_handoff: true,
         canonical_memory_binding: false,
         max_concurrent_executors: None,
     }
@@ -147,16 +99,12 @@ const fn capabilities() -> EngineCapabilities {
 
 pub struct InterpreterDomain {
     id: EngineDomainId,
-    generation: EngineGeneration,
 }
 
 impl InterpreterDomain {
     #[must_use]
     pub const fn new(id: EngineDomainId) -> Self {
-        Self {
-            id,
-            generation: EngineGeneration::new(0),
-        }
+        Self { id }
     }
 }
 
@@ -177,20 +125,12 @@ impl EngineDomain for InterpreterDomain {
             request.trace,
         )))
     }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        let token = DomainQuiescenceToken {
-            domain: self.id,
-            generation: self.generation,
-        };
-        self.generation = EngineGeneration::new(self.generation.get().saturating_add(1));
-        Ok(token)
-    }
 }
 
 pub struct InterpreterExecutor {
     id: EngineExecutorId,
-    execution: InterpreterExecutionState,
+    exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
+    control: nixe_cpu_engine::EngineControl,
     trace: TraceRecorder,
 }
 
@@ -198,7 +138,8 @@ impl InterpreterExecutor {
     fn new(id: EngineExecutorId, trace: TracePolicy) -> Self {
         Self {
             id,
-            execution: InterpreterExecutionState::new(),
+            exclusive_monitor: RefCell::new(Default::default()),
+            control: nixe_cpu_engine::EngineControl::default(),
             trace: TraceRecorder::new(trace),
         }
     }
@@ -214,9 +155,7 @@ impl EngineExecutor for InterpreterExecutor {
     }
 
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault> {
-        self.execution
-            .dispatch_mut()
-            .set_budget(request.instruction_budget);
+        let mut remaining = request.instruction_budget;
         let mut executed = 0_u64;
         loop {
             if let Some((source, result_code)) =
@@ -231,10 +170,10 @@ impl EngineExecutor for InterpreterExecutor {
                     request.state,
                 ));
             }
-            if let Some(control) = self.execution.control.take_pending() {
+            if let Some(control) = self.control.take_pending() {
                 // The interpreter retains no code cache or TLB. Observing the
                 // request at this instruction boundary completes every effect.
-                self.execution.control.acknowledge(control);
+                self.control.acknowledge(control);
                 if control.event_mask != 0 {
                     return Ok(self.report(
                         executed,
@@ -244,15 +183,7 @@ impl EngineExecutor for InterpreterExecutor {
                         request.state,
                     ));
                 }
-                let must_stop = [
-                    nixe_cpu_engine::CrossVcpuRequest::Preempt,
-                    nixe_cpu_engine::CrossVcpuRequest::ProcessStop,
-                    nixe_cpu_engine::CrossVcpuRequest::DebuggerStop,
-                    nixe_cpu_engine::CrossVcpuRequest::EngineHandoff,
-                ]
-                .into_iter()
-                .any(|request| control.contains(request));
-                if must_stop {
+                if control.contains(nixe_cpu_engine::CrossVcpuRequest::Preempt) {
                     return Ok(self.report(
                         executed,
                         nixe_cpu_engine::EngineExit::Safepoint,
@@ -261,7 +192,7 @@ impl EngineExecutor for InterpreterExecutor {
                 }
                 continue;
             }
-            if self.execution.dispatch().budget() == 0 {
+            if remaining == 0 {
                 return Ok(self.report(
                     executed,
                     nixe_cpu_engine::EngineExit::BudgetExhausted,
@@ -282,7 +213,7 @@ impl EngineExecutor for InterpreterExecutor {
             let timer = InterpreterTimer(request.timer);
             let context = InterpreterContext::new(request.cpu)
                 .with_memory(request.memory)
-                .with_exclusive_monitor(self.execution.exclusive_monitor_cell())
+                .with_exclusive_monitor(&self.exclusive_monitor)
                 .with_architectural_timer_provider(&timer);
             let outcome = match execute_one_with_context(context, request.state, encoding) {
                 Ok(outcome) => outcome,
@@ -315,8 +246,7 @@ impl EngineExecutor for InterpreterExecutor {
             };
             self.trace.record(request.cpu, source, encoding);
             executed += 1;
-            let remaining = self.execution.dispatch().budget() - 1;
-            self.execution.dispatch_mut().set_budget(remaining);
+            remaining -= 1;
             let stop = match outcome {
                 InterpreterOutcome::Resume(_) => continue,
                 InterpreterOutcome::Exception {
@@ -353,7 +283,7 @@ impl EngineExecutor for InterpreterExecutor {
     }
 
     fn clear_local_exclusive_reservation(&mut self) {
-        self.execution.clear_local_exclusive_reservation();
+        *self.exclusive_monitor.get_mut() = Default::default();
     }
 
     fn synchronize_invalidation(
@@ -363,11 +293,11 @@ impl EngineExecutor for InterpreterExecutor {
         _memory: &dyn nixe_cpu::memory::CpuMemory,
     ) -> Result<(), EngineFault> {
         // The interpreter retains no translation cache or TLB.
-        self.execution.control.acknowledge_invalidation(epoch);
+        self.control.acknowledge_invalidation(epoch);
         Ok(())
     }
     fn control(&self) -> Option<nixe_cpu_engine::EngineControl> {
-        Some(self.execution.control.clone())
+        Some(self.control.clone())
     }
 }
 
@@ -383,7 +313,6 @@ impl InterpreterExecutor {
             stop,
             context: state.register_context(),
             trace: self.trace.snapshot(),
-            state_commit: StateCommitStatus::Canonical,
         }
     }
 }

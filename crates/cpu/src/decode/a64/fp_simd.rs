@@ -56,7 +56,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         110,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 ADD (vector) and SUB (vector) allocation and operation,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADD--vector---Add-vector-
@@ -69,7 +70,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         58,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 Advanced SIMD pairwise integer operations,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
@@ -286,7 +288,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-simd-load-store-unsigned",
         0x3f00_0000,
@@ -295,7 +298,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         122,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-simd-load-store-unscaled",
         0x3f20_0c00,
@@ -304,7 +308,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         121,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-scalar-move",
         0xffbf_fc00,
@@ -313,7 +318,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         109,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 FMOV (register), optional half-precision form. The base S/D
     // forms above remain available with Advanced SIMD while H is explicitly
     // gated by FEAT_FP16. Arm ARM DDI 0602 (2025-12):
@@ -326,7 +332,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         110,
         &[],
         SIMD_FP16,
-    ),
+    )
+    .lowered(),
     // Arm A64 FABS/FNEG (scalar) only transform the sign bit. Base S/D and
     // optional FP16 forms are kept as distinct feature-gated patterns. Arm ARM
     // DDI 0602 (2025-12):
@@ -413,7 +420,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         108,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-compare-zero",
         0xffbf_fc0f,
@@ -422,7 +430,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         107,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 FCCMP/FCCMPE conditionally compare scalar S/D operands or copy
     // an immediate NZCV value. FCCMPE signals every NaN while FCCMP signals
     // only signaling NaNs. Optional half precision remains feature-gated
@@ -954,7 +963,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         2,
         &[],
         SIMD,
-    ),
+    )
+    .recognized_unimplemented(),
     pattern(
         "floating-point-fallback",
         0x1f00_0000,
@@ -963,7 +973,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         1,
         &[],
         SIMD,
-    ),
+    )
+    .recognized_unimplemented(),
     // Arm A64 SCVTF/UCVTF (scalar, integer), restricted here to the base
     // W/X-to-S/D forms used by Switch1. Optional FP16 forms remain behind the
     // recognized floating-point fallback until their feature-gated semantics
@@ -978,7 +989,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         106,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-unsigned-int-to-float",
         0x5fbf_fc00,
@@ -987,7 +999,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         105,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 FCVTZS/FCVTZU (scalar, integer), covering the base S/D-to-W/X
     // forms. Both operations round toward zero and return a saturated integer
     // for an out-of-range operand. Arm ARM DDI 0602 (2025-12):
@@ -1126,7 +1139,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         102,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-move-from-general",
         0x5f37_fc00,
@@ -1135,7 +1149,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         101,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     // Arm A64 LDR/STR (immediate, SIMD&FP) allocation and operation,
     // including the signed pre-index and post-index forms, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LDR--immediate--SIMD-FP---Load-SIMD-FP-register--immediate-offset--
@@ -1148,7 +1163,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         120,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-simd-load-store-pre-index",
         0x3f20_0c00,
@@ -1157,7 +1173,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         119,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-simd-load-store-register",
         0x3f20_0c00,
@@ -1166,7 +1183,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         118,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "fp-simd-load-literal",
         0x3f00_0000,
@@ -1175,7 +1193,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         123,
         &[],
         SIMD,
-    ),
+    )
+    .encoding_dependent_lowering(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1394,7 +1413,7 @@ instructions!(
     ScalarFloatConditionalSelect,
 );
 
-pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
+pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rd: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -1419,17 +1438,17 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
         cmode: ((bits >> 12) & 0xf) as u8,
         structure_opcode: ((bits >> 12) & 0xf) as u8,
-        bitwise_operation: (semantic_id == 0x0000_0030).then(|| {
+        bitwise_operation: (instruction_id == 0x0000_0030).then(|| {
             bitwise_operation(bits)
                 .expect("the SIMD bitwise pattern only contains allocated operations")
         }),
-        integer_comparison: integer_comparison(semantic_id),
-        pairwise_operation: pairwise_operation(semantic_id),
-        permute_operation: (semantic_id == 0x0000_0064).then(|| {
+        integer_comparison: integer_comparison(instruction_id),
+        pairwise_operation: pairwise_operation(instruction_id),
+        permute_operation: (instruction_id == 0x0000_0064).then(|| {
             permute_operation(bits)
                 .expect("allocation validation rejects invalid SIMD two-source permutes")
         }),
-        compare_with_zero: matches!(semantic_id, 0x0000_0054..=0x0000_0058),
+        compare_with_zero: matches!(instruction_id, 0x0000_0054..=0x0000_0058),
         signaling_compare: bits & (1 << 4) != 0,
         operation_bit: bits & (1 << 29) != 0,
         immediate_4: ((bits >> 11) & 0xf) as u8,
@@ -1437,12 +1456,12 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         condition: ((bits >> 12) & 0xf) as u8,
         element_size: ((bits >> 10) & 3) as u8,
         fp_immediate_8: ((bits >> 13) & 0xff) as u8,
-        float_conversion: match semantic_id {
+        float_conversion: match instruction_id {
             0x0000_006f => Some(FloatConversion::SingleToDouble),
             0x0000_0070 => Some(FloatConversion::DoubleToSingle),
             _ => None,
         },
-        float_to_integer_rounding: match semantic_id {
+        float_to_integer_rounding: match instruction_id {
             0x0000_007d | 0x0000_007e => Some(FloatToIntegerRounding::NearestEven),
             0x0000_007f | 0x0000_0080 => Some(FloatToIntegerRounding::NearestAway),
             0x0000_0081 | 0x0000_0082 => Some(FloatToIntegerRounding::TowardPositive),
@@ -1452,9 +1471,9 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
             }
             _ => None,
         },
-        fixed_point_fraction_bits: matches!(semantic_id, 0x0000_009e | 0x0000_009f)
+        fixed_point_fraction_bits: matches!(instruction_id, 0x0000_009e | 0x0000_009f)
             .then(|| 64 - ((bits >> 10) & 0x3f) as u8),
-        float_round_operation: match semantic_id {
+        float_round_operation: match instruction_id {
             0x0000_0072 => Some(FloatRoundOperation::NearestEven),
             0x0000_0073 => Some(FloatRoundOperation::TowardPositive),
             0x0000_0074 => Some(FloatRoundOperation::TowardNegative),
@@ -1464,17 +1483,17 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
             0x0000_0078 => Some(FloatRoundOperation::CurrentMode),
             _ => None,
         },
-        float_add_operation: match semantic_id {
+        float_add_operation: match instruction_id {
             0x0000_0079 => Some(FloatAddOperation::Add),
             0x0000_007a => Some(FloatAddOperation::Subtract),
             _ => None,
         },
-        float_multiply_operation: match semantic_id {
+        float_multiply_operation: match instruction_id {
             0x0000_007b => Some(FloatMultiplyOperation::Multiply),
             0x0000_007c => Some(FloatMultiplyOperation::NegatedMultiply),
             _ => None,
         },
-        float_fused_multiply_operation: (semantic_id == 0x0000_0097).then(|| {
+        float_fused_multiply_operation: (instruction_id == 0x0000_0097).then(|| {
             match ((bits >> 20) & 2) | ((bits >> 15) & 1) {
                 0 => FloatFusedMultiplyOperation::MultiplyAdd,
                 1 => FloatFusedMultiplyOperation::MultiplySubtract,
@@ -1484,7 +1503,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
             }
         }),
     };
-    match semantic_id {
+    match instruction_id {
         0x0000_0048 => Instruction::DuplicateGeneral(operands),
         0x0000_008c => Instruction::DuplicateElement(operands),
         0x0000_0049 => Instruction::MemoryPair(operands),
@@ -1585,8 +1604,8 @@ const fn bitwise_operation(bits: u32) -> Option<BitwiseOperation> {
 }
 
 #[must_use]
-pub(super) const fn integer_comparison(semantic_id: u32) -> Option<IntegerComparison> {
-    match semantic_id {
+pub(super) const fn integer_comparison(instruction_id: u32) -> Option<IntegerComparison> {
+    match instruction_id {
         0x0000_004e => Some(IntegerComparison::SignedGreaterThan),
         0x0000_004f => Some(IntegerComparison::UnsignedGreaterThan),
         0x0000_0050 => Some(IntegerComparison::SignedGreaterThanOrEqual),
@@ -1603,8 +1622,8 @@ pub(super) const fn integer_comparison(semantic_id: u32) -> Option<IntegerCompar
 }
 
 #[must_use]
-const fn pairwise_operation(semantic_id: u32) -> Option<PairwiseOperation> {
-    match semantic_id {
+const fn pairwise_operation(instruction_id: u32) -> Option<PairwiseOperation> {
+    match instruction_id {
         0x0000_0059 => Some(PairwiseOperation::Add),
         0x0000_005a => Some(PairwiseOperation::SignedMaximum),
         0x0000_005b => Some(PairwiseOperation::SignedMinimum),

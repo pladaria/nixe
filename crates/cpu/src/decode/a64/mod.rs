@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{DecodeSupport, DecoderTable, InstructionPattern, LoweringAvailability, OperandField},
 };
 
 /// Opaque payload forwarded to exact helpers without being decoded by a
@@ -47,21 +47,25 @@ pub enum A64Instruction {
 #[must_use]
 pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64Instruction {
     let bits = encoding.bits();
-    let semantic_id = opcode.semantic_id().get();
-    match semantic_id {
+    let instruction_id = opcode.coverage_id().get();
+    match instruction_id {
         0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a | 0x0000_0044..=0x0000_0047 => {
-            A64Instruction::Control(control::normalize(semantic_id, bits))
+            A64Instruction::Control(control::normalize(instruction_id, bits))
         }
-        0x0000_000b..=0x0000_000f => A64Instruction::System(system::normalize(semantic_id, bits)),
+        0x0000_000b..=0x0000_000f => {
+            A64Instruction::System(system::normalize(instruction_id, bits))
+        }
         0x0000_0003 | 0x0000_0010..=0x0000_001d | 0x0000_0020..=0x0000_0021 => {
-            A64Instruction::Integer(integer::normalize(semantic_id, bits))
+            A64Instruction::Integer(integer::normalize(instruction_id, bits))
         }
-        0x0000_0022..=0x0000_002c => A64Instruction::Memory(memory::normalize(semantic_id, bits)),
+        0x0000_0022..=0x0000_002c => {
+            A64Instruction::Memory(memory::normalize(instruction_id, bits))
+        }
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
             coverage_id: opcode.coverage_id(),
         },
         0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_009f => {
-            A64Instruction::FpSimd(fp_simd::normalize(semantic_id, bits))
+            A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
         _ => unreachable!("A64 table contains an instruction without a typed family"),
     }
@@ -86,20 +90,19 @@ pub(super) const fn pattern(
         mask,
         value,
         operands,
-        reserved_constraints: &[],
         required_features,
-        semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        registration: super::registry::registration(ExecutionState::A64, id),
-        allocation_validator: AllocationValidator::A64,
+        decoder: DecodeSupport::Ready,
+        lowering: LoweringAvailability::Missing,
+        regression_fixture: None,
     }
 }
 
 static PATTERNS: OnceLock<Box<[InstructionPattern]>> = OnceLock::new();
 static TABLE: OnceLock<DecoderTable> = OnceLock::new();
 
-/// Returns the stable aggregate registry compiled from family-owned patterns.
+/// Returns the stable aggregate catalog compiled from family-owned patterns.
 #[must_use]
 pub fn patterns() -> &'static [InstructionPattern] {
     PATTERNS.get_or_init(|| {
@@ -317,33 +320,19 @@ mod tests {
             ExecutionState::A64,
             base_profile.id(),
         );
-        assert!(matches!(
-            decode(&base_profile, location, 0x1eee_1000_u32.into()),
-            DecodeResult::ProfileDisabled { .. }
-        ));
-        assert!(matches!(
-            decode(&base_profile, location, 0x1ee0_4205_u32.into()),
-            DecodeResult::ProfileDisabled { .. }
-        ));
-        assert!(matches!(
-            decode(&base_profile, location, 0x1ee0_c0a4_u32.into()),
-            DecodeResult::ProfileDisabled { .. }
-        ));
-
         let fp16_profile = base_profile
             .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
-        assert_eq!(
-            decoded_name(fp16_profile, 0x1eee_1000),
-            "fp-scalar-immediate-half"
-        );
-        assert_eq!(
-            decoded_name(fp16_profile, 0x1ee0_4205),
-            "fp-scalar-move-half"
-        );
-        assert_eq!(
-            decoded_name(fp16_profile, 0x1ee0_c0a4),
-            "fp-scalar-absolute-half"
-        );
+        for (bits, name) in [
+            (0x1eee_1000, "fp-scalar-immediate-half"),
+            (0x1ee0_4205, "fp-scalar-move-half"),
+            (0x1ee0_c0a4, "fp-scalar-absolute-half"),
+        ] {
+            assert!(matches!(
+                decode(&base_profile, location, bits.into()),
+                DecodeResult::ProfileDisabled { .. }
+            ));
+            assert_eq!(decoded_name(fp16_profile, bits), name);
+        }
     }
 
     #[test]

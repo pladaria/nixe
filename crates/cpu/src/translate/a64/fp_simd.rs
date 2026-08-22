@@ -383,7 +383,7 @@ fn lift_fp_simd_memory(
     } else if fields.quad {
         MemoryAccessSize::Quadword
     } else {
-        memory::size_from_bits(u32::from(fields.size))
+        crate::semantics::a64::memory_size(fields.size)
     };
     let rn = fields.rn;
     let mut writeback = None;

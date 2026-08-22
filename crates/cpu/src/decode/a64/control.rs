@@ -20,7 +20,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         200,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd503201f),
     pattern(
         "b",
         0xfc00_0000,
@@ -29,7 +31,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         199,
         B_FIELDS,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0x14000000),
     pattern(
         "bl",
         0xfc00_0000,
@@ -38,7 +42,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         198,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0x94000000),
     pattern(
         "br",
         0xffff_fc1f,
@@ -47,7 +53,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         194,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd61f0000),
     pattern(
         "blr",
         0xffff_fc1f,
@@ -56,7 +64,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         194,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd63f0000),
     pattern(
         "ret",
         0xffff_fc1f,
@@ -65,7 +75,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         194,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd65f03c0),
     pattern(
         "eret",
         u32::MAX,
@@ -92,7 +104,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         197,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0x54000000),
     pattern(
         "compare-branch",
         0x7e00_0000,
@@ -101,7 +115,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         78,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0x34000000),
     pattern(
         "test-branch",
         0x7e00_0000,
@@ -110,7 +126,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         77,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0x36000000),
     pattern(
         "svc",
         0xffe0_001f,
@@ -119,7 +137,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         196,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd4000001),
     pattern(
         "brk",
         0xffe0_001f,
@@ -128,7 +148,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         195,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xd4200000),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +198,7 @@ impl Instruction {
     }
 }
 
-pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
+pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rd: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -190,7 +212,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         nonzero: bits & (1 << 24) != 0,
         width_64: bits & (1 << 31) != 0,
     };
-    match semantic_id {
+    match instruction_id {
         0x0000_0001 => Instruction::Nop(operands),
         0x0000_0002 => Instruction::BranchImmediate(operands),
         0x0000_0004 => Instruction::BranchLinkImmediate(operands),

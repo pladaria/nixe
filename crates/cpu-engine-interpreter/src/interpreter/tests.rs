@@ -2,7 +2,6 @@ use core::cell::Cell;
 
 use nixe_cpu::{
     address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
-    coverage::CoverageId,
     ir::terminator::Terminator,
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{
@@ -17,9 +16,8 @@ use nixe_cpu::{
 };
 
 use super::{
-    ArchitecturalTimer, ArchitecturalTimerSnapshot, InstructionSupport, InterpreterContext,
-    InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one,
-    execute_one_with_context, has_semantics, instruction_support,
+    ArchitecturalTimer, ArchitecturalTimerSnapshot, InterpreterContext, InterpreterError,
+    InterpreterOutcome, InterpreterPolicy, execute_fallback, execute_one, execute_one_with_context,
 };
 
 fn source(
@@ -630,17 +628,6 @@ fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
 fn a64_simd_duplicate_element_covers_all_arrangements_and_captured_alias() {
     let profile = GuestCpuProfile::switch_1();
     let captured = InstructionEncoding::from_u32(0x0e04_07ff); // DUP V31.2S,V31.S[0]
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded DUP element, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let source_value = 0x8877_6655_4433_2211_fedc_ba98_7654_3210_u128;
     let ThreadCpuState::A64(a64) = &mut state else {
@@ -1433,14 +1420,6 @@ fn a64_scalar_fmov_register_copies_exact_bits_for_all_precisions() {
     let profile = GuestCpuProfile::switch_1()
         .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
     let captured = InstructionEncoding::from_u32(0x1e20_41c3); // FMOV S3,S14
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FMOV, got {other:?}"),
-        };
-    assert!(has_semantics(&decoded));
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -1477,17 +1456,6 @@ fn a64_scalar_fabs_fneg_transform_only_the_sign_bit_for_all_precisions() {
     let profile = GuestCpuProfile::switch_1()
         .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
     let captured = InstructionEncoding::from_u32(0x1e20_c3fe); // FABS S30,S31
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FABS, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -1829,17 +1797,6 @@ fn a64_simd_extract_narrow_covers_all_lane_widths_and_upper_half_forms() {
 fn a64_simd_extract_narrow_executes_captured_aliasing_encoding() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x0ea1_2bde); // XTN V30.2S,V30.2D
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded XTN, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2285,17 +2242,7 @@ fn a64_simd_integer_to_float_obeys_fpcr_rounding_direction() {
 #[test]
 fn a64_simd_integer_to_float_trap_boundary_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
-    let location = source(profile, 0, ExecutionState::A64);
     let encoding = InstructionEncoding::from_u32(0x4e21_dbfc);
-    let decoded = match nixe_cpu::decode::decode(&profile, location, encoding) {
-        nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-        other => panic!("expected decoded SCVTF vector, got {other:?}"),
-    };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2322,17 +2269,6 @@ fn a64_simd_integer_to_float_trap_boundary_is_atomic_and_interpreter_only() {
 fn a64_scalar_simd_integer_to_float_covers_signed_unsigned_and_captured_alias() {
     let profile = GuestCpuProfile::switch_1();
     let captured = InstructionEncoding::from_u32(0x7e21_d9ad); // UCVTF S13,S13
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar SIMD UCVTF, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2439,14 +2375,6 @@ fn a64_scalar_integer_to_float_obeys_fpcr_rounding_and_trap_is_atomic() {
     }
 
     let encoding = InstructionEncoding::from_u32(0x9e23_0020); // UCVTF S0,X1
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar UCVTF, got {other:?}"),
-        };
-    assert_eq!(instruction_support(&decoded), InstructionSupport::Lifted);
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2505,10 +2433,6 @@ fn a64_scalar_fixed_point_float_to_integer_converts_the_complete_scalar_family()
             nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
             other => panic!("expected decoded fixed-point FCVTZU, got {other:?}"),
         };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
     let nixe_cpu::decode::a64::A64Instruction::FpSimd(instruction) =
         nixe_cpu::decode::a64::normalize(&decoded.instruction, captured)
     else {
@@ -2578,17 +2502,6 @@ fn a64_scalar_float_to_integer_saturates_and_handles_subnormal_inputs() {
 fn a64_scalar_float_to_integer_enabled_exception_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x9e79_03a2); // FCVTZU X2,D29
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FCVTZU, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2666,17 +2579,6 @@ fn a64_scalar_unsigned_rounding_checks_range_after_rounding() {
 fn a64_scalar_float_to_integer_directional_trap_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x9e71_0381); // FCVTMU X1,D28
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FCVTMU, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2794,16 +2696,6 @@ fn a64_simd_float_divide_supports_all_arrangements_and_fpcr_rounding() {
 fn a64_simd_float_divide_nan_controls_and_trap_boundary_are_precise() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x2e22_fc20); // FDIV V0.2S,V1.2S,V2.2S
-    let location = source(profile, 0, ExecutionState::A64);
-    let decoded = match nixe_cpu::decode::decode(&profile, location, encoding) {
-        nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-        other => panic!("expected decoded FDIV vector, got {other:?}"),
-    };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -2897,18 +2789,6 @@ fn a64_scalar_fmov_immediate_executes_all_allocated_precisions() {
 #[test]
 fn a64_scalar_fmov_immediate_is_interpreter_only_and_profile_gating_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
-    let encoding = InstructionEncoding::from_u32(0x1e2e_101f);
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded FMOV immediate, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3014,17 +2894,6 @@ fn a64_scalar_fcvt_obeys_rounding_and_reports_special_value_status() {
 fn a64_scalar_fcvt_enabled_exception_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e22_c020); // FCVT D0,S1
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FCVT, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3075,17 +2944,6 @@ fn a64_scalar_fdiv_executes_single_double_family_and_clears_upper_bits() {
 fn a64_scalar_fdiv_enabled_exception_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_1820); // FDIV D0,D1,D2
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FDIV, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3316,17 +3174,6 @@ fn a64_scalar_frint_current_rounding_distinguishes_exact_status() {
 fn a64_scalar_frint_enabled_exceptions_are_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e67_4020); // FRINTX D0,D1
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FRINTX, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3412,17 +3259,6 @@ fn a64_scalar_fadd_obeys_rounding_and_signed_zero_rules() {
 fn a64_scalar_fadd_enabled_invalid_exception_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_2820); // FADD D0,D1,D2
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FADD, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3513,17 +3349,6 @@ fn a64_scalar_fmul_obeys_rounding_and_flush_to_zero_controls() {
 fn a64_scalar_fmul_enabled_invalid_exception_is_atomic_and_interpreter_only() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_0820); // FMUL D0,D1,D2
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), encoding)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FMUL, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -3690,17 +3515,6 @@ fn a64_scalar_square_root_enabled_invalid_exception_is_atomic() {
 fn a64_scalar_fcsel_selects_exact_single_and_double_bits() {
     let profile = GuestCpuProfile::switch_1();
     let captured = InstructionEncoding::from_u32(0x1e3e_cffe); // FCSEL S30,S31,S30,GT
-    let decoded =
-        match nixe_cpu::decode::decode(&profile, source(profile, 0, ExecutionState::A64), captured)
-        {
-            nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-            other => panic!("expected decoded scalar FCSEL, got {other:?}"),
-        };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
@@ -4596,27 +4410,6 @@ fn a64_unscaled_load_applies_a_negative_signed_offset_without_writeback() {
     };
     assert_eq!(a64.read_x(x(16)), 0x1122_3344_5566_7788);
     assert_eq!(a64.read_x(x(12)), 0x1008);
-}
-
-#[test]
-fn coverage_distinguishes_lifted_and_interpreter_only_instructions() {
-    let profile = GuestCpuProfile::switch_1();
-    let decoded = match nixe_cpu::decode::decode(
-        &profile,
-        source(profile, 0, ExecutionState::T32),
-        InstructionEncoding::from_u16(0x2001),
-    ) {
-        nixe_cpu::decode::DecodeResult::Decoded(decoded) => decoded,
-        other => panic!("expected decoded MOVS, got {other:?}"),
-    };
-    assert_eq!(
-        instruction_support(&decoded),
-        InstructionSupport::InterpreterOnly
-    );
-    assert_eq!(
-        decoded.instruction.coverage_id(),
-        CoverageId::new(0x0002_0003)
-    );
 }
 
 #[test]

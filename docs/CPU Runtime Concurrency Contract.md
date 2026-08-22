@@ -113,8 +113,8 @@ concurrent-executor safety, bounded control polling, and acknowledged mapping
 invalidation. Safepoint latency is declared as a maximum guest-instruction poll
 interval rather than a boolean. Every provider advertising one of these
 capabilities must return an out-of-band control path for every executor or
-process construction fails. Control epochs and request bits are published in
-one atomic word; consuming a request is distinct from acknowledging its applied
-effects. A provider which cannot meet one of these contracts reports the missing
-capability before guest execution. Deterministic serialized execution remains
-the default and correctness oracle.
+process construction fails. Preemption and invalidation requests are coalesced;
+an invalidation is acknowledged separately, after its stale mappings and code
+can no longer be re-entered. A provider which cannot meet one of these contracts
+reports the missing capability before guest execution. Deterministic serialized
+execution remains the default and correctness oracle.

@@ -14,7 +14,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         80,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered(),
     pattern(
         "move-wide",
         0x1f80_0000,
@@ -23,7 +24,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         79,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "add-sub-shifted",
         0x1f20_0000,
@@ -32,7 +34,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         66,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "add-sub-extended",
         0x1f20_0000,
@@ -41,7 +44,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         67,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "add-sub-carry",
         0x1fe0_fc00,
@@ -50,7 +54,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         150,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "logical-immediate",
         0x1f80_0000,
@@ -59,7 +64,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         75,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "logical-shifted",
         0x1f00_0000,
@@ -68,7 +74,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         65,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "bitfield",
         0x1f80_0000,
@@ -77,7 +84,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         74,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "extract",
         0x1f80_0000,
@@ -86,7 +94,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         73,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "data-processing-two-source",
         0x1fe0_0000,
@@ -95,7 +104,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         72,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "conditional-compare-register",
         0x1fe0_0c00,
@@ -104,7 +114,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         149,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "conditional-compare-immediate",
         0x1fe0_0c00,
@@ -113,7 +124,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         148,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "conditional-select",
         0x1fe0_0000,
@@ -122,7 +134,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         71,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "data-processing-three-source",
         0x1f00_0000,
@@ -131,7 +144,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         64,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "data-processing-one-source",
         0x5fe0_0000,
@@ -140,7 +154,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         76,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .encoding_dependent_lowering(),
     pattern(
         "adr",
         0x9f00_0000,
@@ -149,7 +164,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         63,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered(),
     pattern(
         "adrp",
         0x9f00_0000,
@@ -158,7 +174,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         62,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,7 +240,7 @@ instructions!(
     Adrp,
 );
 
-pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
+pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rd: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -250,7 +267,7 @@ pub(super) fn normalize(semantic_id: u32, bits: u32) -> Instruction {
         width_64: bits & (1 << 31) != 0,
         adr_immediate: ((bits >> 3) & 0x1f_fffc) | ((bits >> 29) & 3),
     };
-    match semantic_id {
+    match instruction_id {
         0x0000_0010 => Instruction::MoveWide(operands),
         0x0000_0003 => Instruction::AddSubImmediate(operands),
         0x0000_0011 => Instruction::AddSubShifted(operands),

@@ -8,10 +8,10 @@ use nixe_cpu::profile::{CpuProfileId, GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a64::A64GeneralRegister, a64::A64Register};
 use nixe_cpu_engine::{
     CONFORMANCE_FALLBACK_ENCODING, CapabilityRejection, CapabilityRejectionReason,
-    CapabilityReport, CrossVcpuRequest, DomainQuiescenceToken, DomainRequest, EngineCapabilities,
-    EngineControl, EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor,
-    EngineExecutorId, EngineFault, EngineGeneration, EngineId, EngineKind, EngineProvider,
-    ExecutionReport, ExecutorRequest, InstructionTrace, RunRequest, StateCommitStatus,
+    CapabilityReport, CrossVcpuRequest, DomainRequest, EngineCapabilities, EngineControl,
+    EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault,
+    EngineId, EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace,
+    RunRequest,
 };
 use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
@@ -88,7 +88,6 @@ impl EngineProvider for FakeJitProvider {
             id: request.domain,
             oracle: InterpreterDomain::new(request.domain),
             metrics: Arc::clone(&self.metrics),
-            generation: EngineGeneration::new(0),
         }))
     }
 }
@@ -97,7 +96,6 @@ struct FakeJitDomain {
     id: EngineDomainId,
     oracle: InterpreterDomain,
     metrics: Arc<FakeJitMetrics>,
-    generation: EngineGeneration,
 }
 
 impl EngineDomain for FakeJitDomain {
@@ -121,16 +119,6 @@ impl EngineDomain for FakeJitDomain {
             metrics: Arc::clone(&self.metrics),
             acknowledged_epoch: 0,
         }))
-    }
-
-    fn quiesce(&mut self) -> Result<DomainQuiescenceToken, EngineFault> {
-        let _ = self.oracle.quiesce()?;
-        let token = DomainQuiescenceToken {
-            domain: self.id,
-            generation: self.generation,
-        };
-        self.generation = EngineGeneration::new(self.generation.get().saturating_add(1));
-        Ok(token)
     }
 }
 
@@ -179,16 +167,7 @@ impl EngineExecutor for FakeJitExecutor {
                     },
                 ));
             }
-            if [
-                CrossVcpuRequest::Preempt,
-                CrossVcpuRequest::ProcessStop,
-                CrossVcpuRequest::DebuggerStop,
-                CrossVcpuRequest::TlbShootdown,
-                CrossVcpuRequest::EngineHandoff,
-            ]
-            .into_iter()
-            .any(|request| snapshot.contains(request))
-            {
+            if snapshot.contains(CrossVcpuRequest::Preempt) {
                 return Ok(empty_report(
                     request.state,
                     nixe_cpu_engine::EngineExit::Safepoint,
@@ -203,7 +182,7 @@ impl EngineExecutor for FakeJitExecutor {
             .fetch32(request.cpu.address_space_id(), source.pc)
             .map_err(|fault| EngineFault {
                 engine: FAKE_JIT_ENGINE_ID,
-                kind: nixe_cpu_engine::EngineFaultKind::StateImport,
+                kind: nixe_cpu_engine::EngineFaultKind::Internal,
                 instructions_executed: 0,
                 message: format!("fake JIT block fetch failed: {fault}").into_boxed_str(),
                 context: Box::new(request.state.register_context()),
@@ -235,7 +214,6 @@ impl EngineExecutor for FakeJitExecutor {
                     entries: Box::new([]),
                     discarded: 0,
                 },
-                state_commit: StateCommitStatus::Canonical,
             });
         }
         if matches!(cached, 0xd503_201f | 0x9100_0400) {
@@ -257,7 +235,6 @@ impl EngineExecutor for FakeJitExecutor {
                     entries: Box::new([]),
                     discarded: 0,
                 },
-                state_commit: StateCommitStatus::Canonical,
             });
         }
         self.oracle.run_slice(request)
@@ -295,17 +272,12 @@ fn descriptor() -> EngineDescriptor {
             a64: true,
             a32: true,
             t32: true,
-            precise_instruction_budget: true,
             instruction_trace: false,
             interpret_one_fallback: true,
-            native_execution: false,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
             acknowledged_invalidation: true,
-            canonical_state_version: 1,
             deterministic_execution: true,
-            precise_exceptions: true,
-            engine_handoff: true,
             canonical_memory_binding: false,
             max_concurrent_executors: None,
         },
@@ -326,6 +298,5 @@ fn empty_report(state: &ThreadCpuState, stop: nixe_cpu_engine::EngineExit) -> Ex
             entries: Box::new([]),
             discarded: 0,
         },
-        state_commit: StateCommitStatus::Canonical,
     }
 }

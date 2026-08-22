@@ -29,7 +29,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         10,
         CONDITION_ONLY,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe320f000),
     pattern(
         "b",
         0x0f00_0000,
@@ -38,7 +40,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         BRANCH,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xea000000),
     pattern(
         "bl",
         0x0f00_0000,

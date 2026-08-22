@@ -6,7 +6,7 @@ pub mod memory;
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{AllocationValidator, DecoderTable, InstructionPattern, OperandField, SemanticId},
+    table::{DecodeSupport, DecoderTable, InstructionPattern, LoweringAvailability, OperandField},
 };
 use crate::{
     coverage::CoverageId,
@@ -25,7 +25,7 @@ pub enum T32Instruction {
 
 #[must_use]
 pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> T32Instruction {
-    let id = opcode.semantic_id().get();
+    let id = opcode.coverage_id().get();
     let bits = encoding.bits();
     match id {
         0x0002_0001 | 0x0002_0002 | 0x0002_0004..=0x0002_000b => {
@@ -95,13 +95,12 @@ const fn pattern(
         mask,
         value,
         operands,
-        reserved_constraints: &[],
         required_features: NO_FEATURES,
-        semantic_id: SemanticId::new(id),
         coverage_id: CoverageId::new(id),
         priority,
-        registration: super::registry::registration(ExecutionState::T32, id),
-        allocation_validator: AllocationValidator::T32,
+        decoder: DecodeSupport::Ready,
+        lowering: LoweringAvailability::Missing,
+        regression_fixture: None,
     }
 }
 

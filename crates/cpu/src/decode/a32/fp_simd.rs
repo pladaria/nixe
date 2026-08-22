@@ -13,7 +13,8 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         SIMD,
-    ),
+    )
+    .recognized_unimplemented(),
     pattern(
         "neon-bitwise",
         0xfe00_0110,

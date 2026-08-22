@@ -76,7 +76,7 @@ impl ScheduledProcess {
             .remove_process(self.process)
             .expect("test process is not in flight")
             .try_teardown()
-            .expect("test engine quiesces")
+            .expect("test engine shuts down")
     }
 
     pub fn into_process(mut self) -> RunnableProcess {
