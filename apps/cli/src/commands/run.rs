@@ -679,10 +679,11 @@ fn execute(
 }
 
 fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
-    let HorizonSvcFault::UnsupportedNvDrv {
-        operation: UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { boundary, .. },
-        ..
-    } = fault
+    let HorizonSvcFault::Ipc { fault, .. } = fault else {
+        return;
+    };
+    let Some(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { boundary, .. }) =
+        fault.unsupported_nvdrv()
     else {
         return;
     };

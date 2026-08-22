@@ -570,20 +570,16 @@ impl HorizonSvcDispatcher {
                 .process_mut()
                 .address_waits_mut()
                 .remove_owner(mutex_address)
-                && self
-                    .pending_runtime_requests
-                    .insert(
-                        context.thread().id(),
-                        PendingRuntimeRequest::RestorePriority {
-                            object_id: owner.get(),
-                            donation_key: mutex_address,
-                        },
-                    )
-                    .is_some()
-            {
-                return ExceptionDispatchOutcome::Fault(runtime_fault(
+                && let Err(fault) = self.queue_runtime_request(
+                    context.thread().id(),
+                    PendingRuntimeRequest::RestorePriority {
+                        object_id: owner.get(),
+                        donation_key: mutex_address,
+                    },
                     "WaitProcessWideKeyAtomic mutex release",
-                ));
+                )
+            {
+                return ExceptionDispatchOutcome::Fault(fault);
             }
             context.process().address_waits().signal_one(mutex_address);
             if timeout == 0 {
@@ -699,19 +695,16 @@ impl HorizonSvcDispatcher {
                         return resume();
                     };
                     let waiter_object_id = context.thread().object().thread_id();
-                    if self
-                        .pending_runtime_requests
-                        .insert(
-                            context.thread().id(),
-                            PendingRuntimeRequest::InheritPriority {
-                                owner_object_id,
-                                waiter_object_id,
-                                donation_key: mutex_address,
-                            },
-                        )
-                        .is_some()
-                    {
-                        return ExceptionDispatchOutcome::Fault(runtime_fault("ArbitrateLock"));
+                    if let Err(fault) = self.queue_runtime_request(
+                        context.thread().id(),
+                        PendingRuntimeRequest::InheritPriority {
+                            owner_object_id,
+                            waiter_object_id,
+                            donation_key: mutex_address,
+                        },
+                        "ArbitrateLock",
+                    ) {
+                        return ExceptionDispatchOutcome::Fault(fault);
                     }
                     let readable = context.process_mut().address_waits_mut().enqueue(
                         mutex_address,
@@ -752,18 +745,16 @@ impl HorizonSvcDispatcher {
             .process_mut()
             .address_waits_mut()
             .remove_owner(mutex_address)
-            && self
-                .pending_runtime_requests
-                .insert(
-                    context.thread().id(),
-                    PendingRuntimeRequest::RestorePriority {
-                        object_id: owner.get(),
-                        donation_key: mutex_address,
-                    },
-                )
-                .is_some()
+            && let Err(fault) = self.queue_runtime_request(
+                context.thread().id(),
+                PendingRuntimeRequest::RestorePriority {
+                    object_id: owner.get(),
+                    donation_key: mutex_address,
+                },
+                "ArbitrateUnlock",
+            )
         {
-            return ExceptionDispatchOutcome::Fault(runtime_fault("ArbitrateUnlock"));
+            return ExceptionDispatchOutcome::Fault(fault);
         }
         context.process().address_waits().signal_one(mutex_address);
         result(context, HorizonKernelResult::SUCCESS);

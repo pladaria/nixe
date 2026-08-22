@@ -61,6 +61,84 @@ pub(crate) enum IpcWireError {
     PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
 }
 
+/// Fatal diagnostic retained when a checked HIPC/CMIF operation cannot finish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HorizonIpcFault(IpcWireError);
+
+impl HorizonIpcFault {
+    #[must_use]
+    pub const fn malformed(reason: &'static str) -> Self {
+        Self(IpcWireError::Malformed(reason))
+    }
+
+    #[must_use]
+    pub fn unsupported_service(operation: UnsupportedServiceOperation) -> Self {
+        Self(IpcWireError::UnsupportedService(operation))
+    }
+
+    /// Returns the retained nvdrv diagnostic when graphics emulation stopped
+    /// at an unsupported operation.
+    #[must_use]
+    pub const fn unsupported_nvdrv(&self) -> Option<&crate::nvdrv::UnsupportedNvDrvOperation> {
+        match &self.0 {
+            IpcWireError::UnsupportedNvDrv(operation) => Some(operation),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn from_wire(error: IpcWireError) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for HorizonIpcFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            IpcWireError::GuestMemory(fault) => write!(formatter, "guest-memory fault: {fault:?}"),
+            IpcWireError::Malformed(reason) => write!(formatter, "malformed IPC: {reason}"),
+            IpcWireError::Internal(reason) => {
+                write!(formatter, "invalid emulator IPC state: {reason}")
+            }
+            IpcWireError::HostResourceExhausted(operation) => {
+                write!(formatter, "exhausted host resources while {operation}")
+            }
+            IpcWireError::ResponseCommit(fault) => {
+                write!(
+                    formatter,
+                    "could not commit a prevalidated response: {fault:?}"
+                )
+            }
+            IpcWireError::CanonicalBacking(fault) => {
+                write!(
+                    formatter,
+                    "cannot access retained canonical backing: {fault}"
+                )
+            }
+            IpcWireError::ErrorApplet(diagnostic) => {
+                write!(
+                    formatter,
+                    "launched the unimplemented Error library applet: {diagnostic}"
+                )
+            }
+            IpcWireError::UnsupportedService(operation) => {
+                write!(
+                    formatter,
+                    "reached unsupported emulator semantics: {operation}"
+                )
+            }
+            IpcWireError::UnsupportedNvDrv(operation) => {
+                write!(
+                    formatter,
+                    "reached unsupported emulator semantics: {operation}"
+                )
+            }
+            IpcWireError::PendingNvDrv(_) => {
+                formatter.write_str("pending nvdrv wait escaped the scheduler boundary")
+            }
+        }
+    }
+}
+
 /// A Horizon service operation for which Nixe lacks faithful semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnsupportedServiceOperation {
@@ -174,6 +252,119 @@ pub(crate) struct HostSystems<'a> {
     pub caller_thread_id: u64,
 }
 
+#[derive(Clone)]
+enum IpcTarget {
+    ServiceManager(ServiceManagerSession),
+    SemanticService(IpcSession),
+    SystemSettings(SystemSettingsSession),
+    UserSettings(UserSettingsSession),
+    PerformanceManager(PerformanceManagerSession),
+    Performance(PerformanceSession),
+    Applet(AppletSession),
+    Account(AccountSession),
+    Hid(HidSession),
+    HidAppletResource(HidAppletResource),
+    Time(TimeServiceSession),
+    SystemClock(SystemClockSession),
+    SteadyClock(SteadyClockSession),
+    TimeZone(TimeZoneServiceSession),
+    Vi(ViSession),
+    NvDrv(NvDrvSession),
+    SemanticObject(HandleObject),
+}
+
+#[derive(Clone, Copy)]
+enum ServiceKind {
+    UserSettings,
+    SystemSettings,
+    Performance,
+    Applet,
+    Hid,
+    Time,
+    Account,
+    Vi(ViServiceKind),
+    NvDrv,
+    Semantic(IpcService),
+}
+
+enum SemanticTarget {
+    Root,
+    Object(HandleObject),
+}
+
+impl ServiceKind {
+    fn from_name(name: &[u8]) -> Option<Self> {
+        match name {
+            b"set" => Some(Self::UserSettings),
+            b"set:sys" => Some(Self::SystemSettings),
+            b"apm" => Some(Self::Performance),
+            b"appletOE" => Some(Self::Applet),
+            b"hid" => Some(Self::Hid),
+            b"time:u" => Some(Self::Time),
+            b"acc:u0" => Some(Self::Account),
+            b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
+            _ => ViServiceKind::from_name(name)
+                .map(Self::Vi)
+                .or_else(|| IpcService::from_name(name).map(Self::Semantic)),
+        }
+    }
+}
+
+impl IpcTarget {
+    fn from_object(object: &HandleObject) -> Option<Self> {
+        if let Some(value) = object.downcast_ref::<ServiceManagerSession>() {
+            Some(Self::ServiceManager(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<IpcSession>() {
+            Some(Self::SemanticService(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<SystemSettingsSession>() {
+            Some(Self::SystemSettings(*value))
+        } else if let Some(value) = object.downcast_ref::<UserSettingsSession>() {
+            Some(Self::UserSettings(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<PerformanceManagerSession>() {
+            Some(Self::PerformanceManager(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<PerformanceSession>() {
+            Some(Self::Performance(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<AppletSession>() {
+            Some(Self::Applet(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<AccountSession>() {
+            Some(Self::Account(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<HidSession>() {
+            Some(Self::Hid(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<HidAppletResource>() {
+            Some(Self::HidAppletResource(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<TimeServiceSession>() {
+            Some(Self::Time(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<SystemClockSession>() {
+            Some(Self::SystemClock(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<SteadyClockSession>() {
+            Some(Self::SteadyClock(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<TimeZoneServiceSession>() {
+            Some(Self::TimeZone(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<ViSession>() {
+            Some(Self::Vi(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<NvDrvSession>() {
+            Some(Self::NvDrv(value.clone()))
+        } else if object.is::<ReadOnlyFileSystem>()
+            || object.is::<HostDirectoryFileSystem>()
+            || object.is::<ReadOnlyFile>()
+            || object.is::<HostFile>()
+            || object.is::<ReadOnlyDirectory>()
+        {
+            Some(Self::SemanticObject(object.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn is_domain(&self) -> bool {
+        match self {
+            Self::Applet(session) => session.is_domain(),
+            Self::SemanticService(session) => session.is_domain(),
+            _ => false,
+        }
+    }
+}
+
 pub(crate) fn send_sync_request(
     process: &mut ExceptionProcessContext<'_>,
     tls: GuestVirtualAddress,
@@ -202,79 +393,13 @@ pub(crate) fn send_sync_request_from_buffer(
     time_environment: &TimeEnvironment,
     host_systems: HostSystems<'_>,
 ) -> Result<SyncRequestResult, IpcWireError> {
-    let manager = process
+    let Some(target) = process
         .handles()
-        .get_as::<ServiceManagerSession>(handle)
-        .cloned();
-    let service = process.handles().get_as::<IpcSession>(handle).cloned();
-    let settings = process
-        .handles()
-        .get_as::<SystemSettingsSession>(handle)
-        .copied();
-    let user_settings = process
-        .handles()
-        .get_as::<UserSettingsSession>(handle)
-        .cloned();
-    let performance_manager = process
-        .handles()
-        .get_as::<PerformanceManagerSession>(handle)
-        .cloned();
-    let performance = process
-        .handles()
-        .get_as::<PerformanceSession>(handle)
-        .cloned();
-    let applet = process.handles().get_as::<AppletSession>(handle).cloned();
-    let account = process.handles().get_as::<AccountSession>(handle).cloned();
-    let hid = process.handles().get_as::<HidSession>(handle).cloned();
-    let hid_applet_resource = process
-        .handles()
-        .get_as::<HidAppletResource>(handle)
-        .cloned();
-    let time = process
-        .handles()
-        .get_as::<TimeServiceSession>(handle)
-        .cloned();
-    let system_clock = process
-        .handles()
-        .get_as::<SystemClockSession>(handle)
-        .cloned();
-    let steady_clock = process
-        .handles()
-        .get_as::<SteadyClockSession>(handle)
-        .cloned();
-    let timezone = process
-        .handles()
-        .get_as::<TimeZoneServiceSession>(handle)
-        .cloned();
-    let vi = process.handles().get_as::<ViSession>(handle).cloned();
-    let nvdrv = process.handles().get_as::<NvDrvSession>(handle).cloned();
-    let semantic_object = process.handles().get(handle).cloned().filter(|object| {
-        object.is::<ReadOnlyFileSystem>()
-            || object.is::<HostDirectoryFileSystem>()
-            || object.is::<ReadOnlyFile>()
-            || object.is::<HostFile>()
-            || object.is::<ReadOnlyDirectory>()
-    });
-    if manager.is_none()
-        && service.is_none()
-        && settings.is_none()
-        && user_settings.is_none()
-        && performance_manager.is_none()
-        && performance.is_none()
-        && applet.is_none()
-        && account.is_none()
-        && hid.is_none()
-        && hid_applet_resource.is_none()
-        && time.is_none()
-        && system_clock.is_none()
-        && steady_clock.is_none()
-        && timezone.is_none()
-        && vi.is_none()
-        && nvdrv.is_none()
-        && semantic_object.is_none()
-    {
+        .get(handle)
+        .and_then(IpcTarget::from_object)
+    else {
         return Ok(SyncRequestResult::InvalidHandle);
-    }
+    };
 
     if size < COMMAND_BUFFER_SIZE {
         return Err(IpcWireError::Malformed(
@@ -289,9 +414,7 @@ pub(crate) fn send_sync_request_from_buffer(
     buffer.resize(size, 0);
     read_bytes(process, address, &mut buffer)?;
     let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
-    let is_domain = applet.as_ref().is_some_and(AppletSession::is_domain)
-        || service.as_ref().is_some_and(IpcSession::is_domain);
-    let request = CmifRequest::decode(&hipc, is_domain).map_err(|error| {
+    let request = CmifRequest::decode(&hipc, target.is_domain()).map_err(|error| {
         if error.0 == "unsupported HIPC command type for CMIF" {
             IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
                 service: "CMIF transport",
@@ -329,7 +452,7 @@ pub(crate) fn send_sync_request_from_buffer(
         CMIF_COMMAND_CONTROL | CMIF_COMMAND_CONTROL_WITH_CONTEXT
     ) {
         if request.command_id == 0
-            && let Some(applet) = &applet
+            && let IpcTarget::Applet(applet) = &target
         {
             // libnx converts appletOE to a domain before opening the
             // application proxy. The control command and returned root object
@@ -347,7 +470,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(SyncRequestResult::Success);
         }
         if request.command_id == 0
-            && let Some(service) = &service
+            && let IpcTarget::SemanticService(service) = &target
         {
             // Generic CMIF domain conversion and its root object response are
             // defined by libnx's pinned service implementation:
@@ -367,7 +490,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(SyncRequestResult::Success);
         }
         if matches!(request.command_id, 2 | 4)
-            && let Some(service) = &service
+            && let IpcTarget::SemanticService(service) = &target
         {
             // CloneCurrentObject (2) returns a moved session handle. The Ex
             // form (4) additionally carries a session-manager tag which the
@@ -401,7 +524,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(SyncRequestResult::Success);
         }
         if matches!(request.command_id, 2 | 4)
-            && let Some(vi) = &vi
+            && let IpcTarget::Vi(vi) = &target
         {
             let cloned_handle = process
                 .handles_mut()
@@ -417,7 +540,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(SyncRequestResult::Success);
         }
         if matches!(request.command_id, 2 | 4)
-            && let Some(nvdrv) = &nvdrv
+            && let IpcTarget::NvDrv(nvdrv) = &target
         {
             // CMIF cloning creates another service connection into the same
             // nvdrv client. The connections share initialization, descriptors,
@@ -455,11 +578,12 @@ pub(crate) fn send_sync_request_from_buffer(
         write_response(process, address, size, &response)?;
         return Ok(SyncRequestResult::Success);
     }
-    let applet_exit_requested = applet
-        .as_ref()
-        .is_some_and(|session| applet_requests_self_exit(session, &request, &hipc));
-    let (response, created_handle) = if let Some(manager) = manager {
-        dispatch_service_manager(
+    let applet_exit_requested = match &target {
+        IpcTarget::Applet(session) => applet_requests_self_exit(session, &request, &hipc),
+        _ => false,
+    };
+    let (response, created_handle) = match target {
+        IpcTarget::ServiceManager(manager) => dispatch_service_manager(
             process,
             &manager,
             request,
@@ -467,35 +591,34 @@ pub(crate) fn send_sync_request_from_buffer(
             initial_operation_mode,
             time_environment,
             host_systems,
-        )?
-    } else if settings.is_some() {
-        dispatch_system_settings(process, request, &hipc.receive_statics)?
-    } else if let Some(settings) = user_settings {
-        dispatch_user_settings(process, &settings, request, &hipc)?
-    } else if let Some(manager) = performance_manager {
-        dispatch_performance_manager(process, &manager, request)?
-    } else if let Some(session) = performance {
-        dispatch_performance_session(&session, request)?
-    } else if let Some(applet) = applet {
-        dispatch_applet(process, &applet, request, &hipc, host_systems.video)?
-    } else if let Some(account) = account {
-        dispatch_account(process, &account, request, &hipc)?
-    } else if let Some(hid) = hid {
-        dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
-    } else if let Some(resource) = hid_applet_resource {
-        dispatch_hid_applet_resource(process, &resource, request)?
-    } else if let Some(time) = time {
-        dispatch_time(process, &time, request)?
-    } else if let Some(clock) = system_clock {
-        dispatch_system_clock(&clock, request)?
-    } else if let Some(clock) = steady_clock {
-        dispatch_steady_clock(&clock, request)?
-    } else if let Some(timezone) = timezone {
-        dispatch_timezone(&timezone, request)?
-    } else if let Some(vi) = vi {
-        dispatch_vi(process, &vi, request, &hipc)?
-    } else if let Some(nvdrv) = nvdrv {
-        match dispatch_nvdrv(
+        )?,
+        IpcTarget::SemanticService(service) => {
+            dispatch_semantic_service(process, &service, request, &hipc)?
+        }
+        IpcTarget::SystemSettings(_) => {
+            dispatch_system_settings(process, request, &hipc.receive_statics)?
+        }
+        IpcTarget::UserSettings(settings) => {
+            dispatch_user_settings(process, &settings, request, &hipc)?
+        }
+        IpcTarget::PerformanceManager(manager) => {
+            dispatch_performance_manager(process, &manager, request)?
+        }
+        IpcTarget::Performance(session) => dispatch_performance_session(&session, request)?,
+        IpcTarget::Applet(applet) => {
+            dispatch_applet(process, &applet, request, &hipc, host_systems.video)?
+        }
+        IpcTarget::Account(account) => dispatch_account(process, &account, request, &hipc)?,
+        IpcTarget::Hid(hid) => dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?,
+        IpcTarget::HidAppletResource(resource) => {
+            dispatch_hid_applet_resource(process, &resource, request)?
+        }
+        IpcTarget::Time(time) => dispatch_time(process, &time, request)?,
+        IpcTarget::SystemClock(clock) => dispatch_system_clock(&clock, request)?,
+        IpcTarget::SteadyClock(clock) => dispatch_steady_clock(&clock, request)?,
+        IpcTarget::TimeZone(timezone) => dispatch_timezone(&timezone, request)?,
+        IpcTarget::Vi(vi) => dispatch_vi(process, &vi, request, &hipc)?,
+        IpcTarget::NvDrv(nvdrv) => match dispatch_nvdrv(
             process,
             &nvdrv,
             request,
@@ -507,13 +630,10 @@ pub(crate) fn send_sync_request_from_buffer(
                 return Ok(SyncRequestResult::PendingNvDrv(wait));
             }
             Err(error) => return Err(error),
+        },
+        IpcTarget::SemanticObject(object) => {
+            dispatch_plain_semantic_object(process, &object, request, &hipc)?
         }
-    } else if let Some(service) = service {
-        dispatch_semantic_service(process, &service, request, &hipc)?
-    } else if let Some(object) = semantic_object {
-        dispatch_plain_semantic_object(process, &object, request, &hipc)?
-    } else {
-        unreachable!("typed session kind was checked")
     };
     if let Err(error) = write_response(process, address, size, &response) {
         if let Some(handle) = created_handle {
@@ -621,149 +741,22 @@ fn dispatch_service_manager(
                 "sm:GetService requested {:?}",
                 String::from_utf8_lossy(name)
             );
-            if matches!(
-                name,
-                b"set" | b"set:sys" | b"apm" | b"appletOE" | b"hid" | b"time:u"
-            ) {
-                return connect_system_service(
-                    process,
-                    request.token,
-                    name,
-                    initial_operation_mode,
-                    time_environment,
-                    host_systems.settings,
-                    host_systems.hid,
-                );
+            if !process.mounts().allows_service(name) {
+                return service_response(request.token, HorizonIpcResult::SM_NOT_ALLOWED, None);
             }
-            // libnx opens acc:u0 for application account sessions. Retain the
-            // real session identity here; commands remain fail-fast until
-            // their account semantics are implemented:
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L25-L30
-            if name == b"acc:u0" {
-                if !process.mounts().allows_service(name) {
-                    return Ok((
-                        encode_response(
-                            request.token,
-                            HorizonIpcResult::SM_NOT_ALLOWED,
-                            &[],
-                            None,
-                        )?,
-                        None,
-                    ));
-                }
-                let handle = process
-                    .handles_mut()
-                    .insert(AccountSession::new())
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted("installing an account service handle")
-                    })?;
-                return Ok((
-                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
-                    Some(handle),
-                ));
-            }
-            if let Some(kind) = ViServiceKind::from_name(name) {
-                if !process.mounts().allows_service(name) {
-                    return Ok((
-                        encode_response(
-                            request.token,
-                            HorizonIpcResult::SM_NOT_ALLOWED,
-                            &[],
-                            None,
-                        )?,
-                        None,
-                    ));
-                }
-                let handle = process
-                    .handles_mut()
-                    .insert(ViSession::new(
-                        ViObjectKind::Root(kind),
-                        host_systems.video.clone(),
-                    ))
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted("installing a VI service handle")
-                    })?;
-                return Ok((
-                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
-                    Some(handle),
-                ));
-            }
-            if matches!(name, b"nvdrv" | b"nvdrv:a" | b"nvdrv:s") {
-                if !process.mounts().allows_service(name) {
-                    return Ok((
-                        encode_response(
-                            request.token,
-                            HorizonIpcResult::SM_NOT_ALLOWED,
-                            &[],
-                            None,
-                        )?,
-                        None,
-                    ));
-                }
-                let handle = process
-                    .handles_mut()
-                    .insert(host_systems.video.nvdrv())
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted("installing an nvdrv service handle")
-                    })?;
-                return Ok((
-                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
-                    Some(handle),
-                ));
-            }
-            let Some(service) = IpcService::from_name(name) else {
-                if !process.mounts().allows_service(name) {
-                    return Ok((
-                        encode_response(
-                            request.token,
-                            HorizonIpcResult::SM_NOT_ALLOWED,
-                            &[],
-                            None,
-                        )?,
-                        None,
-                    ));
-                }
+            let Some(service) = ServiceKind::from_name(name) else {
                 return Err(IpcWireError::UnsupportedService(
                     UnsupportedServiceOperation::Connect { name: name.into() },
                 ));
             };
-            let (mounts, handles) = process.mounts_and_handles_mut();
-            match IpcDispatcher::connect(mounts, handles, service) {
-                Ok(handle) => {
-                    log::debug!("sm:GetService returned session handle {handle:#x}");
-                    Ok((
-                        encode_response(
-                            request.token,
-                            HorizonIpcResult::SUCCESS,
-                            &[],
-                            Some(handle),
-                        )?,
-                        Some(handle),
-                    ))
-                }
-                Err(error) if error == IpcResultCode::ACCESS_DENIED => Ok((
-                    encode_response(request.token, HorizonIpcResult::SM_NOT_ALLOWED, &[], None)?,
-                    None,
-                )),
-                Err(error) if error == IpcResultCode::RESOURCE_LIMIT => Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_OUT_OF_SESSIONS,
-                        &[],
-                        None,
-                    )?,
-                    None,
-                )),
-                Err(_) => Ok((
-                    encode_response(
-                        request.token,
-                        HorizonIpcResult::SM_NOT_REGISTERED,
-                        &[],
-                        None,
-                    )?,
-                    None,
-                )),
-            }
+            connect_service(
+                process,
+                request.token,
+                service,
+                initial_operation_mode,
+                time_environment,
+                host_systems,
+            )
         }
         command_id => unsupported_service_command("sm:", command_id),
     }
@@ -807,56 +800,63 @@ fn dispatch_account(
     }
 }
 
-fn connect_system_service(
+fn connect_service(
     process: &mut ExceptionProcessContext<'_>,
     token: u32,
-    name: &[u8],
+    service: ServiceKind,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
-    settings_environment: &SettingsEnvironment,
-    hid_system: &HidSystem,
+    host_systems: HostSystems<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    if !process.mounts().allows_service(name) {
-        return Ok((
-            encode_response(token, HorizonIpcResult::SM_NOT_ALLOWED, &[], None)?,
-            None,
-        ));
-    }
-    let handle = match name {
-        b"set" => process
+    let host_resource_failure = matches!(
+        service,
+        ServiceKind::Account | ServiceKind::Vi(_) | ServiceKind::NvDrv
+    );
+    let handle = match service {
+        ServiceKind::UserSettings => process
             .handles_mut()
-            .insert(UserSettingsSession::new(settings_environment.clone())),
-        b"set:sys" => process.handles_mut().insert(SystemSettingsSession::new()),
-        b"apm" => process
+            .insert(UserSettingsSession::new(host_systems.settings.clone())),
+        ServiceKind::SystemSettings => process.handles_mut().insert(SystemSettingsSession::new()),
+        ServiceKind::Performance => process
             .handles_mut()
             .insert(PerformanceManagerSession::new()),
-        b"appletOE" => process
+        ServiceKind::Applet => process
             .handles_mut()
             .insert(AppletSession::new(initial_operation_mode)),
-        b"hid" => process
+        ServiceKind::Hid => process
             .handles_mut()
-            .insert(HidSession::new(hid_system.shared_memory())),
-        b"time:u" => time_environment
+            .insert(HidSession::new(host_systems.hid.shared_memory())),
+        ServiceKind::Time => time_environment
             .create_service()
             .and_then(|session| process.handles_mut().insert(session)),
-        _ => unreachable!("system service name was checked"),
+        // libnx opens acc:u0 for application account sessions. Retain the
+        // real session identity while unsupported commands remain fail-fast.
+        ServiceKind::Account => process.handles_mut().insert(AccountSession::new()),
+        ServiceKind::Vi(kind) => process.handles_mut().insert(ViSession::new(
+            ViObjectKind::Root(kind),
+            host_systems.video.clone(),
+        )),
+        ServiceKind::NvDrv => process.handles_mut().insert(host_systems.video.nvdrv()),
+        ServiceKind::Semantic(service) => process.handles_mut().insert(IpcSession::new(service)),
     };
     match handle {
         Ok(handle) => {
-            log::debug!(
-                "sm:GetService returned {:?} session handle {handle:#x}",
-                String::from_utf8_lossy(name)
-            );
-            Ok((
-                encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
-                Some(handle),
-            ))
+            log::debug!("sm:GetService returned session handle {handle:#x}");
+            service_response(token, HorizonIpcResult::SUCCESS, Some(handle))
         }
-        Err(_) => Ok((
-            encode_response(token, HorizonIpcResult::SM_OUT_OF_SESSIONS, &[], None)?,
-            None,
+        Err(_) if host_resource_failure => Err(IpcWireError::HostResourceExhausted(
+            "installing a service handle",
         )),
+        Err(_) => service_response(token, HorizonIpcResult::SM_OUT_OF_SESSIONS, None),
     }
+}
+
+fn service_response(
+    token: u32,
+    result: HorizonIpcResult,
+    handle: Option<u32>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    Ok((encode_response(token, result, &[], handle)?, handle))
 }
 
 fn dispatch_semantic_service(
@@ -865,11 +865,6 @@ fn dispatch_semantic_service(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    enum Target {
-        Root,
-        Object(HandleObject),
-    }
-
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
             let result = if session.close_object(*object_id) {
@@ -893,7 +888,7 @@ fn dispatch_semantic_service(
                 );
             }
             if *object_id == 1 {
-                Target::Root
+                SemanticTarget::Root
             } else {
                 let Some(object) = session.object(*object_id) else {
                     return semantic_error(
@@ -903,7 +898,7 @@ fn dispatch_semantic_service(
                         HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
                     );
                 };
-                Target::Object(object)
+                SemanticTarget::Object(object)
             }
         }
         None if session.is_domain() => {
@@ -911,60 +906,15 @@ fn dispatch_semantic_service(
                 "domain service request omitted its domain header",
             ));
         }
-        None => Target::Root,
+        None => SemanticTarget::Root,
     };
-
-    let semantic_request = match &target {
-        Target::Root => decode_root_request(session.service(), &request, hipc)?,
-        Target::Object(object) => decode_object_request(process, object, &request, hipc)?,
-    };
-    let Some(semantic_request) = semantic_request else {
-        return unsupported_service_command(
-            semantic_service_name(session.service()),
-            request.command_id,
-        );
-    };
-
-    let semantic_result = {
-        let (mounts, handles) = process.mounts_and_handles_mut();
-        match &target {
-            Target::Root => {
-                IpcDispatcher::dispatch_session(mounts, handles, session, semantic_request)
-            }
-            Target::Object(object) => {
-                IpcDispatcher::dispatch_object(mounts, handles, object, semantic_request)
-            }
-        }
-    };
-    let response = match semantic_result {
-        Ok(response) => response,
-        Err(error) if error == IpcResultCode::INVALID_COMMAND => {
-            return unsupported_service_command(
-                semantic_service_name(session.service()),
-                request.command_id,
-            );
-        }
-        Err(error) if error == IpcResultCode::INTERNAL_STATE => {
-            return Err(IpcWireError::Internal(
-                "semantic service entered an invalid internal state",
-            ));
-        }
-        Err(error) => {
-            return semantic_error(
-                request.token,
-                session.service(),
-                Some(session),
-                HorizonIpcResult::from_semantic(session.service(), error),
-            );
-        }
-    };
-    encode_semantic_response(
+    dispatch_semantic_command(
         process,
         session.service(),
         Some(session),
+        target,
         request,
         hipc,
-        response,
     )
 }
 
@@ -974,33 +924,66 @@ fn dispatch_plain_semantic_object(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    let Some(semantic_request) = decode_object_request(process, object, &request, hipc)? else {
-        return unsupported_service_command(semantic_object_name(object), request.command_id);
+    dispatch_semantic_command(
+        process,
+        IpcService::FileSystem,
+        None,
+        SemanticTarget::Object(object.clone()),
+        request,
+        hipc,
+    )
+}
+
+fn dispatch_semantic_command(
+    process: &mut ExceptionProcessContext<'_>,
+    service: IpcService,
+    session: Option<&IpcSession>,
+    target: SemanticTarget,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let (decoded, name) = match &target {
+        SemanticTarget::Root => (
+            decode_root_request(service, &request, hipc)?,
+            semantic_service_name(service),
+        ),
+        SemanticTarget::Object(object) => (
+            decode_object_request(process, object, &request, hipc)?,
+            semantic_object_name(object),
+        ),
+    };
+    let Some(decoded) = decoded else {
+        return unsupported_service_command(name, request.command_id);
     };
     let result = {
         let (mounts, handles) = process.mounts_and_handles_mut();
-        IpcDispatcher::dispatch_object(mounts, handles, object, semantic_request)
+        match &target {
+            SemanticTarget::Root => IpcDispatcher::dispatch_session(
+                mounts,
+                handles,
+                session.expect("a semantic root belongs to a session"),
+                decoded,
+            ),
+            SemanticTarget::Object(object) => {
+                IpcDispatcher::dispatch_object(mounts, handles, object, decoded)
+            }
+        }
     };
     match result {
-        Ok(response) => encode_semantic_response(
-            process,
-            IpcService::FileSystem,
-            None,
-            request,
-            hipc,
-            response,
-        ),
-        Err(error) if error == IpcResultCode::INVALID_COMMAND => {
-            unsupported_service_command(semantic_object_name(object), request.command_id)
+        Ok(response) => {
+            encode_semantic_response(process, service, session, request, hipc, response)
         }
-        Err(error) if error == IpcResultCode::INTERNAL_STATE => Err(IpcWireError::Internal(
-            "semantic object entered an invalid internal state",
+        Err(IpcResultCode::INVALID_COMMAND) => {
+            unsupported_service_command(name, request.command_id)
+        }
+        Err(IpcResultCode::INTERNAL_STATE) => Err(IpcWireError::Internal(
+            "semantic IPC entered an invalid internal state",
         )),
         Err(error) => semantic_error(
             request.token,
-            IpcService::FileSystem,
-            None,
-            HorizonIpcResult::from_semantic(IpcService::FileSystem, error),
+            service,
+            session,
+            HorizonIpcResult::from_semantic(service, error),
         ),
     }
 }

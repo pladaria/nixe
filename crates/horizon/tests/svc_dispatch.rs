@@ -15,9 +15,10 @@ use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
-    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonIpcResult, HorizonKernelResult,
-    HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher,
-    IpcService, OperationMode, UnsupportedServiceOperation, switch_1_scheduler_profile,
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonIpcFault, HorizonIpcResult,
+    HorizonKernelResult, HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport,
+    IpcDispatcher, IpcService, OperationMode, UnsupportedServiceOperation,
+    switch_1_scheduler_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
@@ -822,9 +823,9 @@ fn malformed_wire_messages_are_fatal_with_bounded_diagnostics() {
 
         assert_eq!(
             dispatch_next(&mut process, &mut dispatcher),
-            ExceptionHandlingResult::Fault(HorizonSvcFault::MalformedIpc {
+            ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
                 immediate: 0x21,
-                reason: expected_reason,
+                fault: Box::new(HorizonIpcFault::malformed(expected_reason)),
             })
         );
         assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
@@ -847,12 +848,14 @@ fn unimplemented_command_on_a_known_service_is_fatal() {
 
     assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedService {
+        ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
             immediate: 0x21,
-            operation: UnsupportedServiceOperation::Command {
-                service: "fsp-srv",
-                command_id: 999,
-            },
+            fault: Box::new(HorizonIpcFault::unsupported_service(
+                UnsupportedServiceOperation::Command {
+                    service: "fsp-srv",
+                    command_id: 999,
+                },
+            )),
         })
     );
     assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
@@ -939,55 +942,42 @@ fn normal_session_copies_input_handles_without_consuming_the_source() {
 }
 
 #[test]
-fn normal_session_rejects_client_move_handles_without_consuming_them() {
-    let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = HorizonSvcDispatcher::default();
-    let (_server, client) = SessionObject::create_pair();
-    let client_handle = process.handles_mut().insert(client).unwrap();
-    let source_handle = process.handles_mut().insert(EventObject::new()).unwrap();
-    let tls = process.main_thread().tls_base;
-    let mut request = [0_u8; 0x100];
-    put_u32(&mut request, 0, 4);
-    put_u32(&mut request, 4, 1 << 31);
-    put_u32(&mut request, 8, 1 << 5);
-    put_u32(&mut request, 12, source_handle);
-    write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), client_handle);
+fn normal_session_rejects_invalid_input_handle_descriptors_without_consuming_handles() {
+    let cases = [
+        (1 << 5, true, HorizonKernelResult::INVALID_COMBINATION),
+        (1 << 1, false, HorizonKernelResult::INVALID_HANDLE),
+    ];
 
-    assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    );
-    assert_eq!(
-        state(&mut process).read_w(x(0)),
-        HorizonKernelResult::INVALID_COMBINATION.raw()
-    );
-    assert!(process.handles().get(source_handle).is_some());
-}
+    for (descriptor, use_source_handle, expected) in cases {
+        let (_directory, mut process) = fixture_process(&[svc(0x21)]);
+        let mut dispatcher = HorizonSvcDispatcher::default();
+        let (_server, client) = SessionObject::create_pair();
+        let client_handle = process.handles_mut().insert(client).unwrap();
+        let source_handle = process.handles_mut().insert(EventObject::new()).unwrap();
+        let tls = process.main_thread().tls_base;
+        let mut request = [0_u8; 0x100];
+        put_u32(&mut request, 0, 4);
+        put_u32(&mut request, 4, 1 << 31);
+        put_u32(&mut request, 8, descriptor);
+        put_u32(
+            &mut request,
+            12,
+            if use_source_handle {
+                source_handle
+            } else {
+                u32::MAX
+            },
+        );
+        write_guest_bytes(&process, tls, &request);
+        state(&mut process).write_w(x(0), client_handle);
 
-#[test]
-fn normal_session_rejects_an_invalid_copied_input_handle() {
-    let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = HorizonSvcDispatcher::default();
-    let (_server, client) = SessionObject::create_pair();
-    let client_handle = process.handles_mut().insert(client).unwrap();
-    let tls = process.main_thread().tls_base;
-    let mut request = [0_u8; 0x100];
-    put_u32(&mut request, 0, 4);
-    put_u32(&mut request, 4, 1 << 31);
-    put_u32(&mut request, 8, 1 << 1);
-    put_u32(&mut request, 12, u32::MAX);
-    write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), client_handle);
-
-    assert_eq!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    );
-    assert_eq!(
-        state(&mut process).read_w(x(0)),
-        HorizonKernelResult::INVALID_HANDLE.raw()
-    );
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+        assert!(process.handles().get(source_handle).is_some());
+    }
 }
 
 #[test]
@@ -1685,38 +1675,10 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
 
 #[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
-    let (_directory, mut process) = fixture_process(&[
-        svc(0x1f),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x21),
-        svc(0x13),
-        svc(0x14),
-        svc(0x21),
-    ]);
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 26));
+    instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
+    let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::new(
         OperationMode::Console,
         nixe_horizon::TimeEnvironment::default(),
@@ -2471,11 +2433,13 @@ fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
 
     assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Fault(HorizonSvcFault::UnsupportedService {
+        ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
             immediate: 0x21,
-            operation: UnsupportedServiceOperation::Connect {
-                name: Box::from(&b"missing"[..]),
-            },
+            fault: Box::new(HorizonIpcFault::unsupported_service(
+                UnsupportedServiceOperation::Connect {
+                    name: Box::from(&b"missing"[..]),
+                },
+            )),
         })
     );
 }

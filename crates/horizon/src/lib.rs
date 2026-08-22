@@ -29,7 +29,7 @@ pub use ipc::{
     IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
-pub use ipc_wire::UnsupportedServiceOperation;
+pub use ipc_wire::{HorizonIpcFault, UnsupportedServiceOperation};
 pub use nvdrv::{
     NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
     NvDrvErrorContext, NvDrvFileDescriptor, NvDrvPermissionProfile, NvDrvSession, NvDrvSessionId,

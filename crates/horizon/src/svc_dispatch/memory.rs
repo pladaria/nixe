@@ -229,9 +229,8 @@ pub(super) fn map_shared_memory(
                 );
                 return reject(
                     context,
-                    HorizonSvcFault::MalformedIpc {
-                        immediate: 0x13,
-                        reason: "shared-memory backing cannot satisfy its declared size",
+                    HorizonSvcFault::InternalRuntime {
+                        operation: "reading a shared-memory backing at its declared size",
                     },
                 );
             }

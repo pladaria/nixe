@@ -32,6 +32,7 @@ impl HorizonIpcResult {
     pub(crate) const SM_INVALID_CLIENT: Self = Self::new(MODULE_SM, 2);
     pub(crate) const SM_OUT_OF_SESSIONS: Self = Self::new(MODULE_SM, 3);
     pub(crate) const SM_INVALID_SERVICE_NAME: Self = Self::new(MODULE_SM, 6);
+    #[cfg(test)]
     pub(crate) const SM_NOT_REGISTERED: Self = Self::new(MODULE_SM, 7);
     pub(crate) const SM_NOT_ALLOWED: Self = Self::new(MODULE_SM, 8);
 
