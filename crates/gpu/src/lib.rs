@@ -9,7 +9,6 @@ mod allocation;
 mod backend;
 mod capability;
 mod command;
-mod completion;
 mod diagnostics;
 mod resource;
 mod runtime;
@@ -30,7 +29,7 @@ pub use allocation::{
 pub use backend::{
     AcceptedBackendSubmission, Backend, BackendDriver, BackendDriverError, BackendError,
     BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
-    BackendResourceValidationError, BackendState, ResolvedResourceDependency,
+    BackendResourceValidationError, BackendState,
 };
 pub use capability::{
     BackendCapabilities, BackendCapabilityError, BackendFeatures, BackendLimits,
@@ -44,11 +43,6 @@ pub use command::{
     OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
     TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
     VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
-};
-pub use completion::{
-    BackendCompletionError, BackendCompletionSource, CompletionPropagationError,
-    CompletionRegistrationError, CompletionSubmission, PublishedSubmission,
-    SubmissionCompletionQueue, SubmissionWrite,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,
@@ -79,7 +73,6 @@ pub use shader::{
 };
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,
-    HostCompletion, VisibilityCompletion,
 };
 pub use synchronization::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint, OwnerMismatch,

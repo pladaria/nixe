@@ -878,14 +878,6 @@ fn increment_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use nixe_gpu::{
-        BackendCompletionError, BackendCompletionSource, BackendInstanceId, BackendSubmissionToken,
-        CompletionSubmission, FrontendSubmissionId, SubmissionCompletionQueue,
-    };
-    use nixe_memory::DeviceVisibilityPoint;
-
     use super::*;
     use crate::nvdrv::{
         NV_SUCCESS, NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvPermissionProfile, NvDrvSessionId,
@@ -907,20 +899,6 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
-    }
-
-    #[derive(Default)]
-    struct ManualCompletionDriver {
-        completed: BTreeSet<BackendSubmissionToken>,
-    }
-
-    impl BackendCompletionSource for ManualCompletionDriver {
-        fn has_completed(
-            &mut self,
-            submission: BackendSubmissionToken,
-        ) -> Result<bool, BackendCompletionError> {
-            Ok(self.completed.contains(&submission))
-        }
     }
 
     #[test]
@@ -1193,79 +1171,6 @@ mod tests {
             .unwrap();
         assert!(first.is_signalled());
         assert!(second.is_signalled());
-    }
-
-    #[test]
-    fn horizon_event_is_signalled_only_after_neutral_completion_is_published() {
-        let mut control = NvHostControl::default();
-        control.open(FD);
-        control
-            .ioctl(descriptor(), IOCTL_SYNCPT_ALLOC_EVENT, &words(&[2]))
-            .unwrap();
-        let event = control
-            .query_event(descriptor(), MODERN_EVENT_VALID | 2)
-            .unwrap();
-        let NvHostCtrlIoctlOutcome::DriverResult { driver_result, .. } = control
-            .ioctl(
-                descriptor(),
-                IOCTL_SYNCPT_WAIT_EVENT_EX,
-                &words(&[3, 1, u32::MAX, 2]),
-            )
-            .unwrap()
-        else {
-            panic!("event wait unexpectedly completed")
-        };
-        assert_eq!(driver_result, NV_TIMEOUT);
-
-        let owner = timeline_owner(descriptor());
-        let reservation = control
-            .timeline_mut(descriptor(), GuestSyncpointId::new(3))
-            .unwrap()
-            .reserve(owner, 1)
-            .unwrap();
-        let backend = BackendSubmissionToken::new(BackendInstanceId::new(7), 12, 1);
-        let submission = CompletionSubmission::new(
-            FrontendSubmissionId::new(11),
-            backend,
-            reservation,
-            DeviceVisibilityPoint::new(13),
-            Vec::new(),
-        )
-        .unwrap();
-        let mut queue = SubmissionCompletionQueue::new(owner);
-        queue.enqueue(submission).unwrap();
-        let mut completion = ManualCompletionDriver::default();
-
-        queue.observe_backend(&mut completion).unwrap();
-        assert_eq!(
-            queue
-                .publish_next(
-                    control
-                        .timeline_mut(descriptor(), GuestSyncpointId::new(3))
-                        .unwrap()
-                )
-                .unwrap(),
-            None
-        );
-        assert!(!event.is_signalled());
-
-        completion.completed.insert(backend);
-        queue.observe_backend(&mut completion).unwrap();
-        assert!(!event.is_signalled());
-        let published = queue
-            .publish_next(
-                control
-                    .timeline_mut(descriptor(), GuestSyncpointId::new(3))
-                    .unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        assert!(!event.is_signalled());
-        control.signal_reached(
-            published.guest_point().syncpoint(),
-            published.guest_point().value(),
-        );
-        assert!(event.is_signalled());
     }
 
     #[test]

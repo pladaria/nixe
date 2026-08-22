@@ -4,18 +4,18 @@
 //! lifecycle validation. A concrete [`BackendDriver`] observes a resource or
 //! submission only after the complete request has passed those checks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 
 use crate::{
-    BackendCapabilities, BackendCapabilityError, BackendCompletionError, BackendCompletionSource,
-    BackendInstanceId, BackendSubmissionToken, BufferDescription, BufferId, BufferView,
-    BufferViewError, CapabilityAgreement, CapabilityRequirement, CapabilityRequirements,
-    DescriptorTableBinding, DescriptorTableDescription, DescriptorTableId, FrontendSubmissionId,
-    GpuAllocationDescription, GpuAllocationId, ImageDescription, ImageId, ImageView,
-    ImageViewError, OperationSubmission, PipelineDescription, PipelineId, QueryPoolDescription,
-    QueryPoolId, RenderPassDescription, RenderPassId, ResourceDependency, SamplerDescription,
-    SamplerId, ShaderBackendModule, ShaderDescription, ShaderId, ShaderStage,
+    BackendCapabilities, BackendCapabilityError, BackendInstanceId, BackendSubmissionToken,
+    BufferDescription, BufferId, BufferView, BufferViewError, CapabilityAgreement,
+    CapabilityRequirement, CapabilityRequirements, DescriptorTableBinding,
+    DescriptorTableDescription, DescriptorTableId, FrontendSubmissionId, GpuAllocationDescription,
+    GpuAllocationId, ImageDescription, ImageId, ImageView, ImageViewError, OperationSubmission,
+    PipelineDescription, PipelineId, QueryPoolDescription, QueryPoolId, RenderPassDescription,
+    RenderPassId, ResourceDependency, SamplerDescription, SamplerId, ShaderBackendModule,
+    ShaderDescription, ShaderId, ShaderStage,
 };
 
 /// Semantic kind carried by every backend resource handle.
@@ -179,6 +179,38 @@ impl BackendResourceCreateInfo {
         }
     }
 
+    fn canonical_backings(&self) -> Box<[nixe_memory::CanonicalBackingRange]> {
+        match self {
+            Self::Buffer {
+                view: Some(view), ..
+            } => vec![view.backing().range().clone()].into_boxed_slice(),
+            Self::Image {
+                view: Some(view), ..
+            } => view
+                .bindings()
+                .iter()
+                .map(|binding| binding.backing().range().clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            _ => Box::new([]),
+        }
+    }
+
+    fn references_allocation(&self, allocation: GpuAllocationId) -> bool {
+        match self {
+            Self::Buffer {
+                view: Some(view), ..
+            } => view.backing().allocation() == allocation,
+            Self::Image {
+                view: Some(view), ..
+            } => view
+                .bindings()
+                .iter()
+                .any(|binding| binding.backing().allocation() == allocation),
+            _ => false,
+        }
+    }
+
     /// Capabilities required before this complete resource can be created.
     pub fn capability_requirements(
         &self,
@@ -206,31 +238,12 @@ impl BackendResourceCreateInfo {
     }
 }
 
-/// One fully resolved logical dependency supplied to a concrete backend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolvedResourceDependency {
-    dependency: ResourceDependency,
-    handle: BackendResourceHandle,
-}
-
-impl ResolvedResourceDependency {
-    #[must_use]
-    pub const fn dependency(self) -> ResourceDependency {
-        self.dependency
-    }
-
-    #[must_use]
-    pub const fn handle(self) -> BackendResourceHandle {
-        self.handle
-    }
-}
-
 /// Completely validated submission view passed to a concrete backend.
 pub struct AcceptedBackendSubmission<'a> {
     token: BackendSubmissionToken,
     submission: &'a OperationSubmission,
     agreement: CapabilityAgreement,
-    resources: &'a [ResolvedResourceDependency],
+    resources: &'a BTreeMap<ResourceDependency, BackendResourceHandle>,
 }
 
 impl AcceptedBackendSubmission<'_> {
@@ -250,7 +263,7 @@ impl AcceptedBackendSubmission<'_> {
     }
 
     #[must_use]
-    pub const fn resources(&self) -> &[ResolvedResourceDependency] {
+    pub const fn resources(&self) -> &BTreeMap<ResourceDependency, BackendResourceHandle> {
         self.resources
     }
 }
@@ -332,9 +345,8 @@ struct ResourceSlot {
 }
 
 struct ResourceRecord {
-    dependency: ResourceDependency,
-    backing_allocations: Box<[GpuAllocationId]>,
-    allocation_description: Option<GpuAllocationDescription>,
+    info: BackendResourceCreateInfo,
+    canonical_backings: Box<[nixe_memory::CanonicalBackingRange]>,
 }
 
 struct SubmissionSlot {
@@ -449,12 +461,8 @@ impl<D: BackendDriver> Backend<D> {
             return Err(self.handle_driver_error(error));
         }
         let record = ResourceRecord {
-            dependency,
-            backing_allocations: backing_allocations.into_boxed_slice(),
-            allocation_description: match info {
-                BackendResourceCreateInfo::Allocation { description, .. } => Some(description),
-                _ => None,
-            },
+            canonical_backings: info.canonical_backings(),
+            info,
         };
         commit_resource_slot(&mut self.resources, slot, generation, record);
         self.resources_by_dependency.insert(dependency, handle);
@@ -473,17 +481,17 @@ impl<D: BackendDriver> Backend<D> {
         }) {
             return Err(BackendError::ResourceInUse(handle));
         }
-        if let ResourceDependency::Allocation(allocation) = record.dependency
+        if let ResourceDependency::Allocation(allocation) = record.info.dependency()
             && self.resources.iter().any(|slot| {
                 slot.record.as_ref().is_some_and(|candidate| {
-                    candidate.dependency != record.dependency
-                        && candidate.backing_allocations.contains(&allocation)
+                    candidate.info.dependency() != record.info.dependency()
+                        && candidate.info.references_allocation(allocation)
                 })
             })
         {
             return Err(BackendError::ResourceInUse(handle));
         }
-        let dependency = record.dependency;
+        let dependency = record.info.dependency();
         if let Err(error) = self.driver.destroy_resource(handle) {
             return Err(self.handle_driver_error(error));
         }
@@ -571,19 +579,18 @@ impl<D: BackendDriver> Backend<D> {
             .negotiate_all(&requirements)
             .map_err(BackendError::Capability)?;
 
-        let mut resolved = Vec::new();
+        let mut resolved = BTreeMap::new();
         for operation in submission.operations() {
-            for dependency in operation.dependencies() {
-                if resolved
-                    .iter()
-                    .any(|entry: &ResolvedResourceDependency| entry.dependency == *dependency)
-                {
-                    continue;
+            for access in operation.accesses() {
+                self.validate_access_target(access.target())?;
+            }
+            if let crate::GpuCommand::Barrier(barrier) = operation.command() {
+                for transition in barrier.transitions() {
+                    self.validate_access_target(transition.target())?;
                 }
-                resolved.push(ResolvedResourceDependency {
-                    dependency: *dependency,
-                    handle: self.resolve_dependency(*dependency)?,
-                });
+            }
+            for dependency in operation.dependencies() {
+                resolved.insert(*dependency, self.resolve_dependency(*dependency)?);
             }
         }
         let (slot, generation) = next_submission_slot(&self.submissions)?;
@@ -608,8 +615,8 @@ impl<D: BackendDriver> Backend<D> {
         }
         let record = SubmissionRecord {
             resources: resolved
-                .iter()
-                .map(|dependency| dependency.handle)
+                .values()
+                .copied()
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
@@ -705,6 +712,30 @@ impl<D: BackendDriver> Backend<D> {
             .get(&dependency)
             .copied()
             .ok_or(BackendError::UnknownResource(dependency))
+    }
+
+    pub(crate) fn contains_resource(&self, dependency: ResourceDependency) -> bool {
+        self.resources_by_dependency.contains_key(&dependency)
+    }
+
+    pub(crate) fn resource_backings(
+        &self,
+        dependency: ResourceDependency,
+    ) -> Option<&[nixe_memory::CanonicalBackingRange]> {
+        let handle = self.resources_by_dependency.get(&dependency)?;
+        self.resources
+            .get(handle.slot as usize)?
+            .record
+            .as_ref()
+            .map(|record| record.canonical_backings.as_ref())
+    }
+
+    pub(crate) fn destroy_dependency(
+        &mut self,
+        dependency: ResourceDependency,
+    ) -> Result<(), BackendError> {
+        let handle = self.resolve_dependency(dependency)?;
+        self.destroy_resource(handle)
     }
 
     fn validate_resource_info(&self, info: &BackendResourceCreateInfo) -> Result<(), BackendError> {
@@ -824,13 +855,62 @@ impl<D: BackendDriver> Backend<D> {
         Ok(())
     }
 
+    fn validate_access_target(&self, target: crate::AccessTarget) -> Result<(), BackendError> {
+        let dependency = target.dependency();
+        let handle = self.resolve_dependency(dependency)?;
+        let record = self.validate_resource_handle(handle)?;
+        match (target, &record.info) {
+            (
+                crate::AccessTarget::Buffer { range, .. },
+                BackendResourceCreateInfo::Buffer {
+                    description, view, ..
+                },
+            ) => {
+                if range.end() > description.size() {
+                    return Err(BackendError::AccessOutOfBounds(target));
+                }
+                if let Some(view) = view
+                    && (range.offset() < view.buffer_offset()
+                        || range.end() > view.buffer_offset() + view.size())
+                {
+                    return Err(BackendError::AccessOutsideBacking(target));
+                }
+            }
+            (
+                crate::AccessTarget::Image { subresources, .. },
+                BackendResourceCreateInfo::Image {
+                    description, view, ..
+                },
+            ) => {
+                if !valid_image_range(*description, subresources) {
+                    return Err(BackendError::AccessOutOfBounds(target));
+                }
+                if let Some(view) = view
+                    && !bindings_cover(view, subresources)
+                {
+                    return Err(BackendError::AccessOutsideBacking(target));
+                }
+            }
+            (
+                crate::AccessTarget::Queries { range, .. },
+                BackendResourceCreateInfo::QueryPool { description, .. },
+            ) => {
+                if range.first() + range.count() > description.count() {
+                    return Err(BackendError::AccessOutOfBounds(target));
+                }
+            }
+            _ => return Err(BackendError::ResourceKindMismatch(handle)),
+        }
+        Ok(())
+    }
+
     fn validate_backing_view(&self, view: &crate::BackingView) -> Result<(), BackendError> {
         let dependency = ResourceDependency::Allocation(view.allocation());
         let handle = self.resolve_dependency(dependency)?;
         let record = self.validate_resource_handle(handle)?;
-        let description = record
-            .allocation_description
-            .expect("allocation dependency has an allocation description");
+        let BackendResourceCreateInfo::Allocation { description, .. } = record.info else {
+            unreachable!("allocation dependency has an allocation description")
+        };
         let end = view.allocation_offset().checked_add(view.size()).ok_or(
             BackendError::InvalidResource(BackendResourceValidationError::BackingRangeOverflow),
         )?;
@@ -870,7 +950,7 @@ impl<D: BackendDriver> Backend<D> {
             .record
             .as_ref()
             .ok_or(BackendError::StaleResource(handle))?;
-        if dependency_kind(record.dependency) != handle.kind {
+        if dependency_kind(record.info.dependency()) != handle.kind {
             return Err(BackendError::ResourceKindMismatch(handle));
         }
         Ok(record)
@@ -921,16 +1001,6 @@ impl<D: BackendDriver> Backend<D> {
     }
 }
 
-impl<D: BackendDriver> BackendCompletionSource for Backend<D> {
-    fn has_completed(
-        &mut self,
-        submission: BackendSubmissionToken,
-    ) -> Result<bool, BackendCompletionError> {
-        Backend::has_completed(self, submission)
-            .map_err(|error| BackendCompletionError::new(error.to_string()))
-    }
-}
-
 const fn dependency_kind(dependency: ResourceDependency) -> BackendResourceKind {
     match dependency {
         ResourceDependency::Allocation(_) => BackendResourceKind::Allocation,
@@ -943,6 +1013,49 @@ const fn dependency_kind(dependency: ResourceDependency) -> BackendResourceKind 
         ResourceDependency::RenderPass(_) => BackendResourceKind::RenderPass,
         ResourceDependency::QueryPool(_) => BackendResourceKind::QueryPool,
     }
+}
+
+fn valid_image_range(description: ImageDescription, range: crate::ImageSubresourceRange) -> bool {
+    range.layer_count != 0
+        && range.plane < description.format().plane_count()
+        && range.mip_level < description.mip_levels()
+        && range
+            .base_layer
+            .checked_add(range.layer_count)
+            .is_some_and(|end| end <= description.array_layers())
+}
+
+fn bindings_cover(view: &ImageView, requested: crate::ImageSubresourceRange) -> bool {
+    let requested_end = u32::from(requested.base_layer) + u32::from(requested.layer_count);
+    let mut intervals = view
+        .bindings()
+        .iter()
+        .map(|binding| binding.subresources())
+        .filter(|candidate| {
+            candidate.plane == requested.plane && candidate.mip_level == requested.mip_level
+        })
+        .map(|candidate| {
+            (
+                u32::from(candidate.base_layer),
+                u32::from(candidate.base_layer) + u32::from(candidate.layer_count),
+            )
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut covered_until = u32::from(requested.base_layer);
+    for (start, end) in intervals {
+        if end <= covered_until || start >= requested_end {
+            continue;
+        }
+        if start > covered_until {
+            return false;
+        }
+        covered_until = end.min(requested_end);
+        if covered_until == requested_end {
+            return true;
+        }
+    }
+    false
 }
 
 fn next_resource_slot(slots: &[ResourceSlot]) -> Result<(u64, u32), BackendError> {
@@ -1022,6 +1135,8 @@ pub enum BackendError {
     InvalidResource(BackendResourceValidationError),
     DuplicateResource(ResourceDependency),
     UnknownResource(ResourceDependency),
+    AccessOutOfBounds(crate::AccessTarget),
+    AccessOutsideBacking(crate::AccessTarget),
     ResourceInUse(BackendResourceHandle),
     ResourceKindMismatch(BackendResourceHandle),
     StaleResource(BackendResourceHandle),
@@ -1058,6 +1173,15 @@ impl Display for BackendError {
             Self::InvalidResource(error) => error.fmt(formatter),
             Self::DuplicateResource(resource) => write!(formatter, "duplicate {resource:?}"),
             Self::UnknownResource(resource) => write!(formatter, "unknown {resource:?}"),
+            Self::AccessOutOfBounds(target) => {
+                write!(formatter, "resource access is out of bounds: {target:?}")
+            }
+            Self::AccessOutsideBacking(target) => {
+                write!(
+                    formatter,
+                    "resource access lies outside its backing view: {target:?}"
+                )
+            }
             Self::ResourceInUse(handle) => write!(formatter, "resource is still in use: {handle}"),
             Self::ResourceKindMismatch(handle) => {
                 write!(

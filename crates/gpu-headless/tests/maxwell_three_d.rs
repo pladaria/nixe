@@ -183,7 +183,6 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
     let clear_token = backend.submit(clear_plan.submission()).unwrap();
     clear_plan.commit_cache(&mut cache).unwrap();
 
-    assert_eq!(backend.driver().submission_count(), 1);
     assert!(!backend.has_completed(clear_token).unwrap());
     completion.complete(clear_token).unwrap();
     backend.release_submission(clear_token).unwrap();
@@ -192,6 +191,5 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
         backend.destroy_resource(handle).unwrap();
     }
     assert_eq!(backend.driver().resource_count(), 0);
-    assert_eq!(backend.driver().submission_count(), 0);
     backend.teardown().unwrap();
 }

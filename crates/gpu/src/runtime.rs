@@ -13,9 +13,8 @@ use nixe_memory::{
 };
 
 use crate::{
-    AccessMode, AccessTarget, Backend, BackendCapabilities, BackendDriver,
-    BackendResourceCreateInfo, BackendResourceHandle, BackendSubmissionToken, FrontendSubmissionId,
-    OperationSubmission, ResourceDependency,
+    AccessMode, Backend, BackendCapabilities, BackendDriver, BackendResourceCreateInfo,
+    BackendSubmissionToken, FrontendSubmissionId, OperationSubmission, ResourceDependency,
 };
 
 /// Evidence that host execution and canonical write visibility both finished.
@@ -68,12 +67,6 @@ pub struct SynchronousBackendRuntime<D> {
     device: NonCpuDeviceId,
     visibility: Arc<dyn VisibilityCoordinator>,
     next_visibility: u64,
-    resources: HashMap<ResourceDependency, RuntimeResource>,
-}
-
-struct RuntimeResource {
-    handle: BackendResourceHandle,
-    backings: Box<[CanonicalBackingRange]>,
 }
 
 impl<D: BackendDriver> SynchronousBackendRuntime<D> {
@@ -88,7 +81,6 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
             device,
             visibility,
             next_visibility: 1,
-            resources: HashMap::new(),
         }
     }
 
@@ -99,16 +91,13 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
         let mut created = Vec::new();
         for creation in creations {
             let dependency = creation.dependency();
-            let handle = match self.backend.create_resource(creation.clone()) {
-                Ok(handle) => handle,
+            match self.backend.create_resource(creation.clone()) {
+                Ok(_) => {}
                 Err(error) => {
                     self.rollback_created(&created);
                     return Err(BackendRuntimeError::Backend(error.to_string().into()));
                 }
             };
-            let backings = resource_backings(creation);
-            self.resources
-                .insert(dependency, RuntimeResource { handle, backings });
             created.push(dependency);
         }
         Ok(created)
@@ -116,9 +105,7 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
 
     fn rollback_created(&mut self, created: &[ResourceDependency]) {
         for dependency in created.iter().rev() {
-            if let Some(resource) = self.resources.remove(dependency) {
-                let _ = self.backend.destroy_resource(resource.handle);
-            }
+            let _ = self.backend.destroy_dependency(*dependency);
         }
     }
 
@@ -130,9 +117,7 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
         let mut modes = HashMap::<ResourceDependency, AccessMode>::new();
         for operation in submission.operations() {
             for access in operation.accesses() {
-                let Some(dependency) = access_dependency(access.target()) else {
-                    continue;
-                };
+                let dependency = access.target().dependency();
                 modes
                     .entry(dependency)
                     .and_modify(|mode| *mode = merge_access_modes(*mode, access.scope().mode()))
@@ -142,9 +127,9 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
 
         let mut prepared = Vec::new();
         for (dependency, mode) in modes {
-            let resource = self
-                .resources
-                .get(&dependency)
+            let backings = self
+                .backend
+                .resource_backings(dependency)
                 .ok_or(BackendRuntimeError::UnknownResource(dependency))?;
             let declaration = match mode {
                 AccessMode::Read => DeviceAccessDeclaration::read(self.device, point),
@@ -155,20 +140,20 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
                         .map_err(|_| BackendRuntimeError::InvalidVisibilityDeclaration)?
                 }
             };
-            for backing in &resource.backings {
+            for backing in backings {
                 // Visibility is owned by the retained canonical pages, not by
                 // the content generations captured in a range. Keep the exact
                 // range alive for completion without rebuilding a versioned
                 // snapshot on every submission.
-                let current = backing.clone();
+                let backing = backing.clone();
                 if let Err(error) =
-                    current.prepare_device_access(declaration, Arc::clone(&self.visibility))
+                    backing.prepare_device_access(declaration, Arc::clone(&self.visibility))
                 {
                     invalidate_prepared(&prepared);
                     return Err(BackendRuntimeError::Visibility(error.to_string().into()));
                 }
                 prepared.push(PreparedAccess {
-                    range: current,
+                    range: backing,
                     declaration,
                 });
             }
@@ -181,12 +166,11 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
         invalidations: &[ResourceDependency],
     ) -> Result<(), BackendRuntimeError> {
         for dependency in invalidations {
-            let resource = self
-                .resources
-                .remove(dependency)
-                .ok_or(BackendRuntimeError::UnknownResource(*dependency))?;
+            if !self.backend.contains_resource(*dependency) {
+                return Err(BackendRuntimeError::UnknownResource(*dependency));
+            }
             self.backend
-                .destroy_resource(resource.handle)
+                .destroy_dependency(*dependency)
                 .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
         }
         Ok(())
@@ -210,7 +194,7 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for SynchronousBackendRuntim
         submission: &OperationSubmission,
     ) -> Result<BackendExecutionCompletion, BackendRuntimeError> {
         for dependency in invalidations {
-            if !self.resources.contains_key(dependency)
+            if !self.backend.contains_resource(*dependency)
                 && !creations
                     .iter()
                     .any(|creation| creation.dependency() == *dependency)
@@ -271,35 +255,9 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for SynchronousBackendRuntim
     }
 
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
-        self.resources.clear();
         self.backend
             .teardown()
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
-    }
-}
-
-fn resource_backings(info: &BackendResourceCreateInfo) -> Box<[CanonicalBackingRange]> {
-    match info {
-        BackendResourceCreateInfo::Buffer {
-            view: Some(view), ..
-        } => vec![view.backing().range().clone()].into_boxed_slice(),
-        BackendResourceCreateInfo::Image {
-            view: Some(view), ..
-        } => view
-            .bindings()
-            .iter()
-            .map(|binding| binding.backing().range().clone())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-        _ => Box::new([]),
-    }
-}
-
-const fn access_dependency(target: AccessTarget) -> Option<ResourceDependency> {
-    match target {
-        AccessTarget::Buffer { buffer, .. } => Some(ResourceDependency::Buffer(buffer)),
-        AccessTarget::Image { image, .. } => Some(ResourceDependency::Image(image)),
-        AccessTarget::Queries { pool, .. } => Some(ResourceDependency::QueryPool(pool)),
     }
 }
 

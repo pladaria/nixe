@@ -1395,11 +1395,7 @@ fn query_kind(query: &QueryOperation) -> QueryKind {
 }
 
 fn push_target_dependency(dependencies: &mut Vec<ResourceDependency>, target: AccessTarget) {
-    let dependency = match target {
-        AccessTarget::Buffer { buffer, .. } => ResourceDependency::Buffer(buffer),
-        AccessTarget::Image { image, .. } => ResourceDependency::Image(image),
-        AccessTarget::Queries { pool, .. } => ResourceDependency::QueryPool(pool),
-    };
+    let dependency = target.dependency();
     if !dependencies.contains(&dependency) {
         dependencies.push(dependency);
     }
