@@ -22,10 +22,10 @@ use nixe_horizon::{
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
-    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExecutionStatus,
-    ProcessExitCause, ProcessObject, ProcessRegistration, ReadableEventObject, RunnableProcess,
+    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExitCause,
+    ProcessLifecycle, ProcessObject, ProcessRegistration, ReadableEventObject, RunnableProcess,
     RuntimeCoordinator, SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult,
-    SharedMemoryObject, WritableEventObject,
+    SharedMemoryObject, ThreadLifecycle, WritableEventObject,
 };
 use support::ScheduledProcess;
 
@@ -307,7 +307,7 @@ fn successful_and_rejected_calls_use_each_execution_state_abi() {
             instruction_address(&process),
             entry + 2 * instruction_width(execution_state)
         );
-        assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
+        assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
     }
 }
 
@@ -347,8 +347,8 @@ fn blocking_wait_suspends_and_retries_in_each_execution_state() {
             ExceptionHandlingResult::Suspended
         );
         assert_eq!(
-            process.execution_status(),
-            ProcessExecutionStatus::Suspended
+            process.main_thread_lifecycle(),
+            nixe_scheduler::ThreadLifecycle::Waiting
         );
         assert_eq!(instruction_address(&process), source);
 
@@ -623,8 +623,8 @@ fn unsignalled_wait_times_out_or_suspends_without_becoming_a_no_op() {
         ExceptionHandlingResult::Suspended
     );
     assert_eq!(
-        process.execution_status(),
-        nixe_runtime::ProcessExecutionStatus::Suspended
+        process.main_thread_lifecycle(),
+        nixe_scheduler::ThreadLifecycle::Waiting
     );
 }
 
@@ -827,7 +827,7 @@ fn malformed_wire_messages_are_fatal_with_bounded_diagnostics() {
                 reason: expected_reason,
             })
         );
-        assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+        assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
     }
 }
 
@@ -855,7 +855,7 @@ fn unimplemented_command_on_a_known_service_is_fatal() {
             },
         })
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
 }
 
 #[test]
@@ -1663,7 +1663,7 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
             ..
         })
     ));
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
     assert_eq!(state(&mut process).pc(), source);
     assert_eq!(
         dispatcher.coverage()[0].support,
@@ -1678,7 +1678,7 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Fault(HorizonSvcFault::Unknown(_))
     ));
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Faulted);
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
     assert_eq!(dispatcher.unknown_calls(), 1);
     assert_eq!(dispatcher.coverage().len(), 1);
 }
@@ -2297,7 +2297,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             reason: ExceptionTerminationReason::Requested,
         }
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
 }
 
 #[test]
@@ -2862,7 +2862,7 @@ fn guest_memory_rejection_returns_a_stable_result_and_retains_the_fault() {
         state(&mut process).read_w(x(0)),
         HorizonKernelResult::INVALID_POINTER.raw()
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
+    assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
 }
 
 #[test]
@@ -2926,7 +2926,7 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
                     reason: ExceptionTerminationReason::Requested,
                 }
             );
-            assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+            assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
             assert_eq!(
                 process.exit().unwrap().cause,
                 cause,
@@ -2943,7 +2943,7 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
             assert!(!process.terminate());
 
             let teardown = process.teardown();
-            assert_eq!(teardown.previous_status, ProcessExecutionStatus::Exited);
+            assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
             assert_eq!(teardown.exit.unwrap().cause, cause);
             assert_eq!(teardown.threads_released, 1);
             assert_eq!(teardown.handles_released, handles_before_exit);
@@ -2998,8 +2998,13 @@ fn create_thread_commits_through_a64_abi() {
         .iter()
         .find_map(|(id, thread)| (*id != caller).then_some(thread))
         .unwrap();
+    let created_id = created.id();
     assert_eq!(
-        created.lifecycle(),
+        coordinator
+            .scheduler()
+            .thread(created_id)
+            .unwrap()
+            .lifecycle,
         nixe_scheduler::ThreadLifecycle::Created
     );
     assert_eq!(created.stack_top.get(), stack_top);
@@ -3011,10 +3016,9 @@ fn create_thread_commits_through_a64_abi() {
         ),
     }
     assert_eq!(
-        process.thread(caller).unwrap().lifecycle(),
+        coordinator.scheduler().thread(caller).unwrap().lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
     );
-    let created_id = created.id();
     let created_handle = created.handle;
     write_abi_register(
         coordinator.process_mut(process_id).unwrap(),
@@ -3366,7 +3370,7 @@ fn notification_only_break_reports_success_without_terminating() {
         state(&mut process).read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Ready);
+    assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
     assert!(process.exit().is_none());
     assert_eq!(dispatcher.coverage()[0].support, HorizonSvcSupport::Partial);
     assert_eq!(dispatcher.coverage()[0].resumed, 1);

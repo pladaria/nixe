@@ -23,29 +23,6 @@ pub enum ThreadLifecycle {
     Faulted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum WaitReason {
-    Scheduler,
-    Timer,
-    Device,
-    Ipc,
-    Object,
-    External,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Continuation {
-    Retry,
-    Next,
-    Address(u64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ThreadExitRecord {
-    pub exit_code: u64,
-    pub faulted: bool,
-}
-
 pub fn transition_process(
     state: &mut ProcessLifecycle,
     target: ProcessLifecycle,

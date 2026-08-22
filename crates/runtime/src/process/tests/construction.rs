@@ -352,7 +352,10 @@ fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
             result_code: 0x1234_5678,
         }
     );
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+    assert_eq!(
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Exited
+    );
     assert_eq!(
         process.exit(),
         Some(ProcessExit {
@@ -378,13 +381,6 @@ fn nro_loader_return_preserves_x0_and_exits_without_executing_the_gateway() {
             )),
         })
     );
-    assert!(matches!(
-        process.run(1),
-        Err(ProcessExecutionError::NotRunnable {
-            status: ProcessExecutionStatus::Exited,
-            ..
-        })
-    ));
     let teardown = process.try_teardown().unwrap();
     assert_eq!(teardown.exit.unwrap().exit_code, 0x1234_5678);
 }

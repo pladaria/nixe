@@ -11,7 +11,7 @@ use nixe_horizon::{
 };
 use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
-    ProcessExecutionStatus, ProcessExitCause,
+    ProcessExitCause, ProcessLifecycle,
 };
 
 use support::ScheduledProcess;
@@ -123,7 +123,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
         second.stop,
         ExecutionStop::LoaderReturn { result_code: 0, .. }
     ));
-    assert_eq!(process.execution_status(), ProcessExecutionStatus::Exited);
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
     assert_eq!(
         process.exit().unwrap().cause,
         ProcessExitCause::LoaderReturned
@@ -136,7 +136,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     );
 
     let teardown = process.teardown();
-    assert_eq!(teardown.previous_status, ProcessExecutionStatus::Exited);
+    assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
     assert!(teardown.threads_released > 0);
     assert!(teardown.physical_pages_released > 0);
 }

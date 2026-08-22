@@ -14,8 +14,8 @@ use builder::{a32_register, a64_register, initialize_thread, validate_range};
 pub use execution::{
     ExecutionReport, ExecutionStop, InstructionTrace, InstructionTraceEntry,
     MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-    ProcessExecutionError, ProcessExecutionStatus, ProcessExit, ProcessExitCause,
-    ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
+    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessTeardownFailure,
+    ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
@@ -385,9 +385,6 @@ impl RunnableProcess {
             id,
             object,
             exit: None,
-            lifecycle: nixe_scheduler::ThreadLifecycle::Created,
-            wait_reason: None,
-            continuation: None,
             state: Some(state),
             handle,
             stack_bottom: request.stack_top,
@@ -422,13 +419,6 @@ impl RunnableProcess {
         &mut self,
         id: nixe_scheduler::GuestThreadId,
     ) -> Result<(), ThreadCreateError> {
-        let thread = self.threads.get(id).ok_or(ThreadCreateError::Internal)?;
-        if !matches!(
-            thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Exited | nixe_scheduler::ThreadLifecycle::Faulted
-        ) {
-            return Err(ThreadCreateError::Internal);
-        }
         let thread = self
             .threads
             .remove(id)
@@ -501,38 +491,6 @@ impl RunnableProcess {
         self.threads.get_mut(id)
     }
 
-    pub(crate) fn start_created_thread(
-        &mut self,
-        id: nixe_scheduler::GuestThreadId,
-    ) -> Result<(), nixe_scheduler::LifecycleTransitionError<nixe_scheduler::ThreadLifecycle>> {
-        let thread = self
-            .threads
-            .get_mut(id)
-            .expect("the coordinator validated the target thread");
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Ready,
-        )
-    }
-
-    pub(crate) fn set_thread_activity_from_coordinator(
-        &mut self,
-        id: nixe_scheduler::GuestThreadId,
-        paused: bool,
-    ) {
-        let thread = self
-            .threads
-            .get_mut(id)
-            .expect("the coordinator validated the target thread");
-        let target = if paused {
-            nixe_scheduler::ThreadLifecycle::Suspended
-        } else {
-            nixe_scheduler::ThreadLifecycle::Ready
-        };
-        nixe_scheduler::transition_thread(&mut thread.lifecycle, target)
-            .expect("scheduler and runtime activity transitions remain synchronized");
-    }
-
     pub(crate) fn terminate_thread_from_coordinator(
         &mut self,
         id: nixe_scheduler::GuestThreadId,
@@ -543,18 +501,6 @@ impl RunnableProcess {
             .threads
             .get_mut(id)
             .expect("the coordinator owns every scheduled thread");
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Terminating,
-        )
-        .expect("only a live non-running thread is terminated by the coordinator");
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Exited,
-        )
-        .expect("a terminating thread can exit");
-        thread.wait_reason = None;
-        thread.continuation = None;
         thread.exit = Some(ThreadExit {
             requested_scope,
             exit_code,
@@ -598,9 +544,9 @@ impl RunnableProcess {
 
     /// Consumes the process and deterministically releases all process-owned resources.
     pub fn try_teardown(mut self) -> Result<ProcessTeardownReport, ProcessTeardownFailure> {
-        let previous_status = self.execution_status();
+        let previous_lifecycle = self.lifecycle;
         let report = ProcessTeardownReport {
-            previous_status,
+            previous_lifecycle,
             exit: self.process_exit,
             threads_released: self.threads.len(),
             modules_released: self.modules.len(),

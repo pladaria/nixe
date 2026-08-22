@@ -4,12 +4,13 @@ Status: normative for scheduler architecture phases D and E
 
 ## Ownership boundary
 
-The runtime coordinator is the only owner allowed to mutate scheduler state,
-process registries, guest thread tables, handle tables, address-wait queues, or
-Horizon service policy. These values are intentionally `Send` but are not
-shared with vCPU workers. A worker receives only an exclusive thread-state
-lease, its worker-owned engine executor, a shared CPU-memory view, an immutable
-CPU context, a timer view, and cloneable interrupt/invalidation controls.
+The runtime coordinator alone mutates scheduler lifecycle, leases, waits, the
+process registry, address-wait queues, or Horizon service policy. Each
+registered process owns its threads' CPU state, objects, and exit records. Each
+vCPU worker owns its engine executors. These values are not shared between
+owners: a worker receives only an exclusive thread-state lease, a shared
+CPU-memory view, an immutable CPU context, a timer view, and cloneable
+interrupt/invalidation controls.
 
 Ownership moves through bounded messages. A worker never retains a reference
 to a scheduler entry, process table, handle table, Horizon object table, or GPU

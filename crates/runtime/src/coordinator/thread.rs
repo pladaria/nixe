@@ -63,67 +63,33 @@ impl RuntimeCoordinator {
 
     /// Starts exactly one process-local thread object. Created threads are
     /// published to the ready queue in one coordinator transaction.
-    pub fn start_thread(
-        &mut self,
-        _process_id: ProcessId,
-        object_id: u64,
-    ) -> Result<GuestThreadId, ThreadOperationError> {
+    pub fn start_thread(&mut self, object_id: u64) -> Result<GuestThreadId, ThreadOperationError> {
         let thread = GuestThreadId::new(object_id);
-        let process_id = self
+        if self
             .scheduler
             .thread(thread)
-            .ok_or(ThreadOperationError::InvalidHandle)?
-            .process;
-        let process = self
-            .processes
-            .get(&process_id)
-            .ok_or(ThreadOperationError::Internal)?;
-        if process
-            .thread(thread)
-            .is_none_or(|thread| thread.lifecycle() != nixe_scheduler::ThreadLifecycle::Created)
-            || self
-                .scheduler
-                .thread(thread)
-                .is_none_or(|thread| thread.lifecycle != nixe_scheduler::ThreadLifecycle::Created)
+            .is_none_or(|thread| thread.lifecycle != nixe_scheduler::ThreadLifecycle::Created)
         {
             return Err(ThreadOperationError::InvalidState);
         }
         self.scheduler
             .apply(SchedulerCommand::MakeReady(thread))
             .map_err(|_| ThreadOperationError::Internal)?;
-        self.processes
-            .get_mut(&process_id)
-            .expect("the process was validated")
-            .start_created_thread(thread)
-            .expect("scheduler and runtime lifecycle were prevalidated together");
         Ok(thread)
     }
 
     pub fn thread_scheduling_info(
         &self,
-        _process_id: ProcessId,
         object_id: u64,
-    ) -> Result<ThreadSchedulingInfo, ThreadOperationError> {
+    ) -> Result<nixe_scheduler::ScheduledThreadView, ThreadOperationError> {
         let id = GuestThreadId::new(object_id);
-        let view = self
-            .scheduler
+        self.scheduler
             .thread(id)
-            .ok_or(ThreadOperationError::InvalidHandle)?;
-        Ok(ThreadSchedulingInfo {
-            id,
-            priority: view.base_priority,
-            effective_priority: view.effective_priority,
-            ideal_vcpu: view.ideal_vcpu,
-            affinity: view.affinity,
-            lifecycle: view.lifecycle,
-            last_vcpu: view.last_vcpu,
-            paused: view.paused,
-        })
+            .ok_or(ThreadOperationError::InvalidHandle)
     }
 
     pub fn thread_cpu_state(
         &self,
-        _process_id: ProcessId,
         object_id: u64,
     ) -> Result<nixe_cpu::state::ThreadCpuState, ThreadOperationError> {
         let id = GuestThreadId::new(object_id);
@@ -144,11 +110,10 @@ impl RuntimeCoordinator {
 
     pub fn set_thread_priority(
         &mut self,
-        process_id: ProcessId,
         object_id: u64,
         priority: i32,
     ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(process_id, object_id)?;
+        let info = self.thread_scheduling_info(object_id)?;
         if !self.scheduler.profile().priorities().contains(priority) {
             return Err(ThreadOperationError::InvalidState);
         }
@@ -156,7 +121,7 @@ impl RuntimeCoordinator {
             .get(
                 &self
                     .scheduler
-                    .thread(info.id)
+                    .thread(info.thread)
                     .ok_or(ThreadOperationError::InvalidHandle)?
                     .process,
             )
@@ -165,7 +130,7 @@ impl RuntimeCoordinator {
             .map_err(|_| ThreadOperationError::InvalidState)?;
         self.scheduler
             .apply(SchedulerCommand::SetPriority {
-                thread: info.id,
+                thread: info.thread,
                 priority,
             })
             .map_err(|_| ThreadOperationError::Internal)?;
@@ -175,63 +140,51 @@ impl RuntimeCoordinator {
 
     pub fn set_thread_affinity(
         &mut self,
-        process_id: ProcessId,
         object_id: u64,
         ideal_vcpu: Option<VirtualCpuId>,
         affinity: CoreSet,
     ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(process_id, object_id)?;
+        let info = self.thread_scheduling_info(object_id)?;
         let owner_process = self
             .scheduler
-            .thread(info.id)
+            .thread(info.thread)
             .ok_or(ThreadOperationError::InvalidHandle)?
             .process;
         self.processes
             .get(&owner_process)
             .ok_or(ThreadOperationError::Internal)?
-            .validate_thread_policy(info.priority, &affinity)
+            .validate_thread_policy(info.base_priority, &affinity)
             .map_err(|_| ThreadOperationError::InvalidState)?;
-        self.migrate_thread(info.id, ideal_vcpu, affinity)
+        self.migrate_thread(info.thread, ideal_vcpu, affinity)
             .map_err(|_| ThreadOperationError::InvalidState)
     }
 
     pub fn set_thread_activity(
         &mut self,
-        process_id: ProcessId,
         object_id: u64,
         paused: bool,
     ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(process_id, object_id)?;
-        let owner_process = self
-            .scheduler
-            .thread(info.id)
-            .ok_or(ThreadOperationError::InvalidHandle)?
-            .process;
+        let info = self.thread_scheduling_info(object_id)?;
         self.scheduler
             .apply(SchedulerCommand::SetActivity {
-                thread: info.id,
+                thread: info.thread,
                 paused,
             })
-            .map_err(|_| ThreadOperationError::InvalidState)?;
-        self.processes
-            .get_mut(&owner_process)
-            .ok_or(ThreadOperationError::Internal)?
-            .set_thread_activity_from_coordinator(info.id, paused);
-        Ok(())
+            .map(|_| ())
+            .map_err(|_| ThreadOperationError::InvalidState)
     }
 
     pub fn inherit_thread_priority(
         &mut self,
-        process_id: ProcessId,
         owner_object_id: u64,
         waiter_object_id: u64,
         donation_key: u64,
     ) -> Result<(), ThreadOperationError> {
-        let owner = self.thread_scheduling_info(process_id, owner_object_id)?;
-        let waiter = self.thread_scheduling_info(process_id, waiter_object_id)?;
+        let owner = self.thread_scheduling_info(owner_object_id)?;
+        let waiter = self.thread_scheduling_info(waiter_object_id)?;
         self.priority_donations.insert(PriorityDonation {
-            owner: owner.id,
-            waiter: waiter.id,
+            owner: owner.thread,
+            waiter: waiter.thread,
             key: donation_key,
         });
         self.recompute_effective_priorities()
@@ -240,13 +193,12 @@ impl RuntimeCoordinator {
 
     pub fn restore_thread_priority(
         &mut self,
-        process_id: ProcessId,
         object_id: u64,
         donation_key: u64,
     ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(process_id, object_id)?;
+        let info = self.thread_scheduling_info(object_id)?;
         self.priority_donations
-            .retain(|donation| donation.owner != info.id || donation.key != donation_key);
+            .retain(|donation| donation.owner != info.thread || donation.key != donation_key);
         self.recompute_effective_priorities()
             .map_err(|_| ThreadOperationError::InvalidState)
     }
@@ -328,13 +280,15 @@ impl RuntimeCoordinator {
             .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
             .threads()
             .iter()
-            .filter_map(|(id, thread)| {
+            .filter_map(|(id, _)| {
                 (*id != current
-                    && !matches!(
-                        thread.lifecycle(),
-                        nixe_scheduler::ThreadLifecycle::Exited
-                            | nixe_scheduler::ThreadLifecycle::Faulted
-                    ))
+                    && self.scheduler.thread(*id).is_some_and(|thread| {
+                        !matches!(
+                            thread.lifecycle,
+                            nixe_scheduler::ThreadLifecycle::Exited
+                                | nixe_scheduler::ThreadLifecycle::Faulted
+                        )
+                    }))
                 .then_some(*id)
             })
             .collect();

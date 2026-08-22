@@ -39,15 +39,6 @@ pub use nixe_cpu_engine::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ProcessExecutionStatus {
-    Ready,
-    Running,
-    Suspended,
-    Exited,
-    Faulted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProcessExitCause {
     HostRequested,
     ProcessRequested,
@@ -79,15 +70,11 @@ pub struct ThreadExit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProcessExecutionError {
     UnknownThread(nixe_scheduler::GuestThreadId),
-    NotRunnable {
-        status: ProcessExecutionStatus,
-        context: Box<RegisterContext>,
-    },
     Engine {
         fault: EngineFault,
     },
     ConcurrentProcessStop {
-        status: ProcessExecutionStatus,
+        lifecycle: nixe_scheduler::ProcessLifecycle,
         context: Box<RegisterContext>,
     },
     ExecutorUnavailable {
@@ -109,14 +96,10 @@ impl Display for ProcessExecutionError {
             Self::UnknownThread(thread) => {
                 write!(formatter, "guest thread {thread} does not exist")
             }
-            Self::NotRunnable { status, context } => write!(
-                formatter,
-                "process is not runnable while {status:?}: registers=[{context}]"
-            ),
             Self::Engine { fault } => write!(formatter, "CPU engine failed: {fault}"),
-            Self::ConcurrentProcessStop { status, context } => write!(
+            Self::ConcurrentProcessStop { lifecycle, context } => write!(
                 formatter,
-                "another vCPU stopped the process while this slice was in flight: status={status:?}, registers=[{context}]"
+                "another vCPU stopped the process while this slice was in flight: lifecycle={lifecycle:?}, registers=[{context}]"
             ),
             Self::ExecutorUnavailable { engine } => {
                 write!(
@@ -148,7 +131,7 @@ impl Error for ProcessExecutionError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessTeardownReport {
-    pub previous_status: ProcessExecutionStatus,
+    pub previous_lifecycle: nixe_scheduler::ProcessLifecycle,
     pub exit: Option<ProcessExit>,
     pub threads_released: usize,
     pub modules_released: usize,
@@ -179,7 +162,6 @@ impl Error for ProcessTeardownFailure {}
 
 pub(crate) struct ProcessExecutionControl {
     domain: Box<dyn EngineDomain>,
-    executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
     fallback: Option<FallbackExecutionControl>,
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
     cpu: ProcessCpuContext,
@@ -194,7 +176,11 @@ pub(crate) struct ProcessExecutionControl {
 
 struct FallbackExecutionControl {
     domain: Box<dyn EngineDomain>,
-    executors: BTreeMap<nixe_scheduler::VirtualCpuId, Box<dyn EngineExecutor>>,
+}
+
+pub(crate) struct WorkerExecutors {
+    pub(crate) primary: Box<dyn EngineExecutor>,
+    pub(crate) fallback: Option<Box<dyn EngineExecutor>>,
 }
 
 pub(crate) struct ProcessExecutionConfiguration {
@@ -295,7 +281,6 @@ impl ProcessExecutionControl {
         }
         Ok(Self {
             domain,
-            executors: BTreeMap::new(),
             fallback,
             controls: BTreeMap::new(),
             cpu,
@@ -341,10 +326,6 @@ impl ProcessExecutionControl {
             return result.clone();
         }
         self.request_safepoint();
-        self.executors.clear();
-        if let Some(fallback) = &mut self.fallback {
-            fallback.executors.clear();
-        }
         let primary_result = self.domain.shutdown();
         let fallback_result = self
             .fallback
@@ -389,85 +370,39 @@ impl ProcessExecutionControl {
     fn executor_id(vcpu: nixe_scheduler::VirtualCpuId) -> EngineExecutorId {
         EngineExecutorId::new(u64::from(vcpu.get()) + 1)
     }
-    fn executor_for(
+    pub(crate) fn create_worker_executors(
         &mut self,
         vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Result<&mut Box<dyn EngineExecutor>, EngineFault> {
-        if !self.executors.contains_key(&vcpu) {
-            let executor = self.domain.create_executor(ExecutorRequest {
-                executor: Self::executor_id(vcpu),
-                trace: self.trace_policy,
-            })?;
-            if let Some(control) = executor.control() {
-                self.publish_pending_control(&control);
-                self.controls.insert(vcpu, control);
-            } else if self
-                .domain
-                .descriptor()
-                .capabilities
-                .requires_control_path()
-            {
-                return Err(missing_control_path_fault(
-                    self.cpu,
-                    self.domain.descriptor().id,
-                ));
-            }
-            self.executors.insert(vcpu, executor);
+    ) -> Result<WorkerExecutors, EngineFault> {
+        let primary = self.domain.create_executor(ExecutorRequest {
+            executor: Self::executor_id(vcpu),
+            trace: self.trace_policy,
+        })?;
+        if let Some(control) = primary.control() {
+            self.publish_pending_control(&control);
+            self.controls.insert(vcpu, control);
+        } else if self
+            .domain
+            .descriptor()
+            .capabilities
+            .requires_control_path()
+        {
+            return Err(missing_control_path_fault(
+                self.cpu,
+                self.domain.descriptor().id,
+            ));
         }
-        Ok(self
-            .executors
-            .get_mut(&vcpu)
-            .expect("executor was installed"))
-    }
-
-    pub(crate) fn lease_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        self.executor_for(vcpu)?;
-        Ok(self
-            .executors
-            .remove(&vcpu)
-            .expect("a prepared executor can be leased exactly once"))
-    }
-
-    pub(crate) fn restore_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        executor: Box<dyn EngineExecutor>,
-    ) {
-        debug_assert!(!self.executors.contains_key(&vcpu));
-        self.executors.insert(vcpu, executor);
-    }
-
-    pub(crate) fn lease_fallback_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Result<Option<Box<dyn EngineExecutor>>, EngineFault> {
-        let Some(fallback) = &mut self.fallback else {
-            return Ok(None);
-        };
-        if !fallback.executors.contains_key(&vcpu) {
-            let executor = fallback.domain.create_executor(ExecutorRequest {
-                executor: Self::executor_id(vcpu),
-                trace: self.trace_policy,
-            })?;
-            fallback.executors.insert(vcpu, executor);
-        }
-        Ok(fallback.executors.remove(&vcpu))
-    }
-
-    pub(crate) fn restore_fallback_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        executor: Box<dyn EngineExecutor>,
-    ) {
         let fallback = self
             .fallback
             .as_mut()
-            .expect("a leased fallback executor retains its domain");
-        debug_assert!(!fallback.executors.contains_key(&vcpu));
-        fallback.executors.insert(vcpu, executor);
+            .map(|fallback| {
+                fallback.domain.create_executor(ExecutorRequest {
+                    executor: Self::executor_id(vcpu),
+                    trace: self.trace_policy,
+                })
+            })
+            .transpose()?;
+        Ok(WorkerExecutors { primary, fallback })
     }
 
     fn publish_pending_control(&self, control: &nixe_cpu_engine::EngineControl) {
@@ -522,10 +457,7 @@ fn create_fallback_domain(
         let _ = domain.shutdown();
         return Err(fault);
     }
-    Ok(FallbackExecutionControl {
-        domain,
-        executors: BTreeMap::new(),
-    })
+    Ok(FallbackExecutionControl { domain })
 }
 
 impl Drop for ProcessExecutionControl {

@@ -685,7 +685,7 @@ impl HorizonSvcDispatcher {
                 self.finish_create_thread(coordinator, process_id, thread_id, result)?;
             }
             PendingRuntimeRequest::StartThread { object_id } => {
-                let result = coordinator.start_thread(process_id, object_id);
+                let result = coordinator.start_thread(object_id);
                 let code = match result {
                     Ok(_) => HorizonKernelResult::SUCCESS,
                     Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
@@ -714,9 +714,9 @@ impl HorizonSvcDispatcher {
                 })?;
             }
             PendingRuntimeRequest::GetThreadPriority { object_id } => {
-                let info = coordinator.thread_scheduling_info(process_id, object_id);
+                let info = coordinator.thread_scheduling_info(object_id);
                 let (code, priority) = match info {
-                    Ok(info) => (HorizonKernelResult::SUCCESS, Some(info.priority)),
+                    Ok(info) => (HorizonKernelResult::SUCCESS, Some(info.base_priority)),
                     Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
                         (HorizonKernelResult::INVALID_HANDLE, None)
                     }
@@ -735,7 +735,7 @@ impl HorizonSvcDispatcher {
                 priority,
             } => {
                 let code = map_thread_operation(
-                    coordinator.set_thread_priority(process_id, object_id, priority),
+                    coordinator.set_thread_priority(object_id, priority),
                     "SetThreadPriority",
                 )?;
                 write_register(
@@ -746,7 +746,7 @@ impl HorizonSvcDispatcher {
                 resume_pending_caller(coordinator, thread_id, "SetThreadPriority")?;
             }
             PendingRuntimeRequest::GetThreadCoreMask { object_id } => {
-                let info = coordinator.thread_scheduling_info(process_id, object_id);
+                let info = coordinator.thread_scheduling_info(object_id);
                 let (code, values) = match info {
                     Ok(info) => {
                         let ideal = info.ideal_vcpu.map_or(-1, |vcpu| vcpu.get() as i32);
@@ -815,7 +815,7 @@ impl HorizonSvcDispatcher {
                         return Ok(true);
                     };
                     map_thread_operation(
-                        coordinator.set_thread_affinity(process_id, object_id, ideal, affinity),
+                        coordinator.set_thread_affinity(object_id, ideal, affinity),
                         "SetThreadCoreMask",
                     )?
                 };
@@ -833,18 +833,18 @@ impl HorizonSvcDispatcher {
             }
             PendingRuntimeRequest::SetThreadActivity { object_id, paused } => {
                 let info = coordinator
-                    .thread_scheduling_info(process_id, object_id)
+                    .thread_scheduling_info(object_id)
                     .map_err(|error| match error {
                         nixe_runtime::ThreadOperationError::InvalidHandle => {
                             runtime_fault("SetThreadActivity")
                         }
                         _ => runtime_fault("SetThreadActivity"),
                     })?;
-                let code = if info.id == thread_id {
+                let code = if info.thread == thread_id {
                     HorizonKernelResult::INVALID_STATE
                 } else {
                     map_thread_operation(
-                        coordinator.set_thread_activity(process_id, object_id, paused),
+                        coordinator.set_thread_activity(object_id, paused),
                         "SetThreadActivity",
                     )?
                 };
@@ -857,13 +857,13 @@ impl HorizonSvcDispatcher {
             }
             PendingRuntimeRequest::GetThreadContext { object_id, address } => {
                 let info = coordinator
-                    .thread_scheduling_info(process_id, object_id)
+                    .thread_scheduling_info(object_id)
                     .map_err(|_| runtime_fault("GetThreadContext3"))?;
-                let code = if info.id == thread_id || !info.paused {
+                let code = if info.thread == thread_id || !info.paused {
                     HorizonKernelResult::INVALID_STATE
                 } else {
                     let state = coordinator
-                        .thread_cpu_state(process_id, object_id)
+                        .thread_cpu_state(object_id)
                         .map_err(|_| runtime_fault("GetThreadContext3"))?;
                     let bytes = encode_thread_context(&state);
                     let process = coordinator
@@ -891,12 +891,7 @@ impl HorizonSvcDispatcher {
                 donation_key,
             } => {
                 coordinator
-                    .inherit_thread_priority(
-                        process_id,
-                        owner_object_id,
-                        waiter_object_id,
-                        donation_key,
-                    )
+                    .inherit_thread_priority(owner_object_id, waiter_object_id, donation_key)
                     .map_err(|_| runtime_fault("ArbitrateLock priority inheritance"))?;
                 fully_handled = false;
             }
@@ -905,7 +900,7 @@ impl HorizonSvcDispatcher {
                 donation_key,
             } => {
                 coordinator
-                    .restore_thread_priority(process_id, object_id, donation_key)
+                    .restore_thread_priority(object_id, donation_key)
                     .map_err(|_| runtime_fault("ArbitrateUnlock priority restoration"))?;
                 fully_handled = false;
             }

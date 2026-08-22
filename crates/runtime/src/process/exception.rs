@@ -12,11 +12,16 @@ impl RunnableProcess {
         stop: &ExecutionStop,
         dispatcher: &mut D,
     ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
+        let other_live = self
+            .threads
+            .iter()
+            .any(|(id, thread)| *id != self.main_thread_id && thread.exit.is_none());
         self.route_supervisor_call_for(
             self.main_thread_id,
             nixe_scheduler::VirtualCpuId::new(0),
             stop,
             dispatcher,
+            other_live,
         )
     }
 
@@ -28,6 +33,7 @@ impl RunnableProcess {
         vcpu: nixe_scheduler::VirtualCpuId,
         stop: &ExecutionStop,
         dispatcher: &mut D,
+        other_live: bool,
     ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
         let request = stop
             .exception_dispatch_request()
@@ -37,11 +43,6 @@ impl RunnableProcess {
             .threads
             .get(thread_id)
             .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-        if selected.lifecycle != nixe_scheduler::ThreadLifecycle::Waiting {
-            return Err(ExceptionRouteError::ProcessNotSuspended {
-                status: self.execution_status(),
-            });
-        }
         let current = execution::current_location(self.cpu, selected.state());
         if request.source() != current {
             return Err(ExceptionRouteError::SourceMismatch {
@@ -78,13 +79,14 @@ impl RunnableProcess {
             ExceptionThreadContext::new(thread_id, vcpu, object, handle, thread.state_mut());
         let mut context = ExceptionDispatchContext::new(process, thread);
         let outcome = dispatcher.dispatch(&mut context, request);
-        self.apply_supervisor_call_outcome(thread_id, request.source(), outcome)
+        self.apply_supervisor_call_outcome(thread_id, request.source(), other_live, outcome)
     }
 
     fn apply_supervisor_call_outcome<F>(
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
         source: LocationDescriptor,
+        other_live: bool,
         outcome: ExceptionDispatchOutcome<F>,
     ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
         match outcome {
@@ -98,15 +100,6 @@ impl RunnableProcess {
                         .state_mut(),
                     target,
                 )?;
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Ready,
-                )
-                .expect("a waiting exception thread may resume");
-                thread.wait_reason = None;
                 Ok(ExceptionHandlingResult::Resumed)
             }
             ExceptionDispatchOutcome::Suspend(continuation) => {
@@ -116,13 +109,6 @@ impl RunnableProcess {
                     .thread_mut(thread_id)
                     .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
                 install_continuation(cpu, thread.state_mut(), target)?;
-                thread.continuation = Some(match continuation {
-                    ExceptionResume::Retry => nixe_scheduler::Continuation::Retry,
-                    ExceptionResume::Next => nixe_scheduler::Continuation::Next,
-                    ExceptionResume::At(target) => {
-                        nixe_scheduler::Continuation::Address(target.pc.get())
-                    }
-                });
                 Ok(ExceptionHandlingResult::Suspended)
             }
             ExceptionDispatchOutcome::Reject { diagnostic } => {
@@ -135,15 +121,6 @@ impl RunnableProcess {
                         .state_mut(),
                     target,
                 )?;
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Ready,
-                )
-                .expect("a rejected call resumes its waiting thread");
-                thread.wait_reason = None;
                 Ok(ExceptionHandlingResult::Rejected(diagnostic))
             }
             ExceptionDispatchOutcome::Terminate {
@@ -185,15 +162,7 @@ impl RunnableProcess {
                     source: Some(source),
                     thread_id: thread_id.get(),
                 };
-                let terminate_process = scope == ExceptionTerminationScope::Process
-                    || !self.threads.iter().any(|(id, thread)| {
-                        *id != thread_id
-                            && !matches!(
-                                thread.lifecycle,
-                                nixe_scheduler::ThreadLifecycle::Exited
-                                    | nixe_scheduler::ThreadLifecycle::Faulted
-                            )
-                    });
+                let terminate_process = scope == ExceptionTerminationScope::Process || !other_live;
                 if terminate_process {
                     nixe_scheduler::transition_process(
                         &mut self.lifecycle,
@@ -210,16 +179,6 @@ impl RunnableProcess {
                 let thread = self
                     .thread_mut(thread_id)
                     .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Terminating,
-                )
-                .expect("a waiting exception thread may terminate");
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited,
-                )
-                .expect("a terminating exception thread may exit");
                 thread.exit = Some(ThreadExit {
                     requested_scope: scope,
                     exit_code,
@@ -241,30 +200,17 @@ impl RunnableProcess {
                         .state_mut(),
                     source,
                 )?;
-                let has_other_live = self.threads.iter().any(|(id, thread)| {
-                    *id != thread_id
-                        && !matches!(
-                            thread.lifecycle,
-                            nixe_scheduler::ThreadLifecycle::Exited
-                                | nixe_scheduler::ThreadLifecycle::Faulted
-                        )
-                });
-                if !has_other_live {
+                if !other_live {
                     nixe_scheduler::transition_process(
                         &mut self.lifecycle,
                         nixe_scheduler::ProcessLifecycle::Faulted,
                     )
                     .expect("a live process may fault");
                 }
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Faulted,
-                )
-                .expect("a waiting exception thread may fault");
-                thread.object.signal();
+                self.thread_mut(thread_id)
+                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
+                    .object
+                    .signal();
                 Ok(ExceptionHandlingResult::Fault(fault))
             }
         }

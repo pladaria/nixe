@@ -1,23 +1,6 @@
 use super::*;
 
 impl RunnableProcess {
-    /// Returns the host-side lifecycle state of this process.
-    #[must_use]
-    pub fn execution_status(&self) -> ProcessExecutionStatus {
-        match self.lifecycle {
-            nixe_scheduler::ProcessLifecycle::Exited => ProcessExecutionStatus::Exited,
-            nixe_scheduler::ProcessLifecycle::Faulted => ProcessExecutionStatus::Faulted,
-            _ => match self.main_thread().lifecycle {
-                nixe_scheduler::ThreadLifecycle::Running => ProcessExecutionStatus::Running,
-                nixe_scheduler::ThreadLifecycle::Waiting => ProcessExecutionStatus::Suspended,
-                nixe_scheduler::ThreadLifecycle::Suspended => ProcessExecutionStatus::Suspended,
-                nixe_scheduler::ThreadLifecycle::Exited => ProcessExecutionStatus::Exited,
-                nixe_scheduler::ThreadLifecycle::Faulted => ProcessExecutionStatus::Faulted,
-                _ => ProcessExecutionStatus::Ready,
-            },
-        }
-    }
-
     /// Returns the process exit record retained until teardown.
     #[must_use]
     pub const fn exit(&self) -> Option<ProcessExit> {
@@ -66,35 +49,11 @@ impl RunnableProcess {
         self.execution.fallback_domain_id()
     }
 
-    pub(crate) fn take_worker_executor(
+    pub(crate) fn create_worker_executors(
         &mut self,
         vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Result<Box<dyn nixe_cpu_engine::EngineExecutor>, nixe_cpu_engine::EngineFault> {
-        self.execution.lease_executor(vcpu)
-    }
-
-    pub(crate) fn restore_worker_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        executor: Box<dyn nixe_cpu_engine::EngineExecutor>,
-    ) {
-        self.execution.restore_executor(vcpu, executor);
-    }
-
-    pub(crate) fn take_worker_fallback_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-    ) -> Result<Option<Box<dyn nixe_cpu_engine::EngineExecutor>>, nixe_cpu_engine::EngineFault>
-    {
-        self.execution.lease_fallback_executor(vcpu)
-    }
-
-    pub(crate) fn restore_worker_fallback_executor(
-        &mut self,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        executor: Box<dyn nixe_cpu_engine::EngineExecutor>,
-    ) {
-        self.execution.restore_fallback_executor(vcpu, executor);
+    ) -> Result<execution::WorkerExecutors, nixe_cpu_engine::EngineFault> {
+        self.execution.create_worker_executors(vcpu)
     }
 
     #[cfg(test)]
@@ -105,25 +64,6 @@ impl RunnableProcess {
     #[cfg(test)]
     pub(crate) fn post_event(&self, mask: u32) {
         self.execution.post_event(mask);
-    }
-
-    pub(crate) fn resume_thread(&mut self, id: nixe_scheduler::GuestThreadId) -> bool {
-        if self.lifecycle != nixe_scheduler::ProcessLifecycle::Running {
-            return false;
-        }
-        let Some(thread) = self.threads.get_mut(id) else {
-            return false;
-        };
-        if thread.lifecycle != nixe_scheduler::ThreadLifecycle::Waiting {
-            return false;
-        }
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Ready,
-        )
-        .expect("runtime thread and scheduler lifecycles remain synchronized");
-        thread.wait_reason = None;
-        true
     }
 
     /// Marks the process exited. Resource release occurs in
@@ -151,22 +91,6 @@ impl RunnableProcess {
                 nixe_scheduler::ProcessLifecycle::Exited,
             )
             .expect("a terminating process can exit");
-            let thread_lifecycle = self.main_thread().lifecycle;
-            if !matches!(
-                thread_lifecycle,
-                nixe_scheduler::ThreadLifecycle::Exited | nixe_scheduler::ThreadLifecycle::Faulted
-            ) {
-                nixe_scheduler::transition_thread(
-                    &mut self.main_thread_mut().lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Terminating,
-                )
-                .expect("a live main thread can terminate");
-                nixe_scheduler::transition_thread(
-                    &mut self.main_thread_mut().lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited,
-                )
-                .expect("a terminating main thread can exit");
-            }
             self.process_exit = Some(exit);
             self.main_thread_mut().exit = Some(ThreadExit {
                 requested_scope: ExceptionTerminationScope::Process,
@@ -182,34 +106,26 @@ impl RunnableProcess {
         &mut self,
         instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        self.run_thread(
-            self.main_thread_id,
-            nixe_scheduler::VirtualCpuId::new(0),
-            instruction_budget,
-        )
+        let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+        let mut executor = self
+            .execution
+            .create_worker_executors(vcpu)
+            .map_err(|fault| ProcessExecutionError::Engine { fault })?
+            .primary;
+        self.run_with_executor(executor.as_mut(), instruction_budget)
     }
 
     #[cfg(test)]
-    pub(crate) fn run_thread(
+    pub(crate) fn run_with_executor(
         &mut self,
-        thread_id: nixe_scheduler::GuestThreadId,
-        vcpu: nixe_scheduler::VirtualCpuId,
+        executor: &mut dyn nixe_cpu_engine::EngineExecutor,
         instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let mut executor = self
-            .execution
-            .lease_executor(vcpu)
-            .map_err(|fault| ProcessExecutionError::Engine { fault })?;
-        let mut execution = match self.begin_thread_execution(thread_id, vcpu, instruction_budget) {
-            Ok(execution) => execution,
-            Err(error) => {
-                self.execution.restore_executor(vcpu, executor);
-                return Err(error);
-            }
-        };
-        let result = execution.run(executor.as_mut());
-        self.execution.restore_executor(vcpu, executor);
-        self.finish_thread_execution(thread_id, vcpu, execution, result)
+        let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+        let mut execution =
+            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget)?;
+        let result = execution.run(executor);
+        self.finish_thread_execution(self.main_thread_id, vcpu, execution, result)
     }
 
     pub(crate) fn begin_thread_execution(
@@ -221,12 +137,6 @@ impl RunnableProcess {
         let Some(selected) = self.threads.get(thread_id) else {
             return Err(ProcessExecutionError::UnknownThread(thread_id));
         };
-        if selected.lifecycle != nixe_scheduler::ThreadLifecycle::Ready {
-            return Err(ProcessExecutionError::NotRunnable {
-                status: self.execution_status(),
-                context: Box::new(selected.state().register_context()),
-            });
-        }
         let loader_return = selected.loader_return;
         let (virtual_clock, architectural_timer_frequency, cpu, address_space_end) =
             self.execution.execution_environment();
@@ -234,11 +144,6 @@ impl RunnableProcess {
             .threads
             .get_mut(thread_id)
             .expect("the selected thread was validated");
-        nixe_scheduler::transition_thread(
-            &mut thread.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Running,
-        )
-        .expect("a ready thread can run");
         let state = thread
             .take_state()
             .expect("a ready scheduler thread owns resident CPU state");
@@ -262,34 +167,22 @@ impl RunnableProcess {
         result: Result<ExecutionReport, ProcessExecutionError>,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let execution::VcpuExecutionState { thread: state, .. } = execution;
-        let concurrent_stop = (self.lifecycle != nixe_scheduler::ProcessLifecycle::Running)
-            .then(|| self.execution_status());
+        let concurrent_stop =
+            (self.lifecycle != nixe_scheduler::ProcessLifecycle::Running).then_some(self.lifecycle);
         let thread = self
             .threads
             .get_mut(thread_id)
             .expect("the executed thread remains registered");
         thread.restore_state(state);
-        if let Some(status) = concurrent_stop {
-            if thread.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Faulted,
-                )
-                .expect("an in-flight thread may stop after its process");
-            }
+        if let Some(lifecycle) = concurrent_stop {
             return Err(ProcessExecutionError::ConcurrentProcessStop {
-                status,
+                lifecycle,
                 context: Box::new(thread.state().register_context()),
             });
         }
         let report = match result {
             Ok(report) => report,
             Err(error) => {
-                nixe_scheduler::transition_thread(
-                    &mut thread.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Faulted,
-                )
-                .expect("a running thread may fault");
                 if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
                     nixe_scheduler::transition_process(
                         &mut self.lifecycle,
@@ -300,27 +193,6 @@ impl RunnableProcess {
                 return Err(error);
             }
         };
-        let target = match report.stop {
-            ExecutionStop::BudgetExhausted
-            | ExecutionStop::Safepoint
-            | ExecutionStop::PendingEvent { .. } => nixe_scheduler::ThreadLifecycle::Ready,
-            ExecutionStop::FetchFault { .. } | ExecutionStop::UnsupportedSemantics { .. } => {
-                nixe_scheduler::ThreadLifecycle::Faulted
-            }
-            ExecutionStop::LoaderReturn { .. } => nixe_scheduler::ThreadLifecycle::Exited,
-            _ => nixe_scheduler::ThreadLifecycle::Waiting,
-        };
-        if target == nixe_scheduler::ThreadLifecycle::Exited {
-            nixe_scheduler::transition_thread(
-                &mut thread.lifecycle,
-                nixe_scheduler::ThreadLifecycle::Terminating,
-            )
-            .expect("a running thread may terminate");
-        }
-        nixe_scheduler::transition_thread(&mut thread.lifecycle, target)
-            .expect("engine exits define legal running-thread transitions");
-        thread.wait_reason = (thread.lifecycle == nixe_scheduler::ThreadLifecycle::Waiting)
-            .then_some(nixe_scheduler::WaitReason::Scheduler);
         if let ExecutionStop::LoaderReturn {
             source,
             result_code,
@@ -369,13 +241,6 @@ impl RunnableProcess {
             .get_mut(thread_id)
             .expect("the failed worker's thread remains registered");
         thread.restore_state(state);
-        if thread.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
-            nixe_scheduler::transition_thread(
-                &mut thread.lifecycle,
-                nixe_scheduler::ThreadLifecycle::Faulted,
-            )
-            .expect("a running thread may fault");
-        }
         if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
             nixe_scheduler::transition_process(
                 &mut self.lifecycle,
@@ -385,18 +250,7 @@ impl RunnableProcess {
         }
     }
 
-    pub(crate) fn lose_thread_execution(&mut self, thread_id: nixe_scheduler::GuestThreadId) {
-        let thread = self
-            .threads
-            .get_mut(thread_id)
-            .expect("the lost worker's thread remains registered");
-        if thread.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
-            nixe_scheduler::transition_thread(
-                &mut thread.lifecycle,
-                nixe_scheduler::ThreadLifecycle::Faulted,
-            )
-            .expect("a running thread may fault when its worker is lost");
-        }
+    pub(crate) fn lose_thread_execution(&mut self) {
         if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
             nixe_scheduler::transition_process(
                 &mut self.lifecycle,
