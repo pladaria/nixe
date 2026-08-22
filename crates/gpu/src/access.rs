@@ -228,6 +228,18 @@ pub enum AccessTarget {
     },
 }
 
+impl AccessTarget {
+    /// Returns the logical resource which owns this exact access range.
+    #[must_use]
+    pub const fn dependency(self) -> ResourceDependency {
+        match self {
+            Self::Buffer { buffer, .. } => ResourceDependency::Buffer(buffer),
+            Self::Image { image, .. } => ResourceDependency::Image(image),
+            Self::Queries { pool, .. } => ResourceDependency::QueryPool(pool),
+        }
+    }
+}
+
 /// An explicit read or write emitted by a frontend operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResourceAccess {

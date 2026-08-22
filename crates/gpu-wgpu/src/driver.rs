@@ -1,6 +1,6 @@
 //! `wgpu` resource ownership, command lowering, and conservative completion.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
@@ -191,20 +191,10 @@ impl WgpuBackendDriver {
         Ok(())
     }
 
-    fn dependency_map(
-        accepted: &AcceptedBackendSubmission<'_>,
-    ) -> HashMap<ResourceDependency, BackendResourceHandle> {
-        accepted
-            .resources()
-            .iter()
-            .map(|resolved| (resolved.dependency(), resolved.handle()))
-            .collect()
-    }
-
     fn upload_inputs(
         &self,
         accepted: &AcceptedBackendSubmission<'_>,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     ) -> Result<(), BackendDriverError> {
         let mut uploaded = HashSet::new();
         for operation in accepted.submission().operations() {
@@ -329,7 +319,7 @@ impl WgpuBackendDriver {
     fn encode_submission(
         &mut self,
         accepted: &AcceptedBackendSubmission<'_>,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     ) -> Result<(CommandEncoder, Vec<PendingWriteback>), BackendDriverError> {
         let mut encoder = self
             .device
@@ -378,7 +368,7 @@ impl WgpuBackendDriver {
     fn encode_copy(
         &self,
         encoder: &mut CommandEncoder,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         copy: &CopyOperation,
     ) -> Result<(), BackendDriverError> {
         match copy {
@@ -414,7 +404,7 @@ impl WgpuBackendDriver {
     fn encode_clear(
         &self,
         encoder: &mut CommandEncoder,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         clear: &ClearOperation,
     ) -> Result<(), BackendDriverError> {
         match clear {
@@ -545,7 +535,7 @@ impl WgpuBackendDriver {
     fn encode_render_pass(
         &mut self,
         encoder: &mut CommandEncoder,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         operations: &[nixe_gpu::GpuOperation],
     ) -> Result<(), BackendDriverError> {
         let GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) =
@@ -702,7 +692,7 @@ impl WgpuBackendDriver {
 
     fn create_draw_bind_groups(
         &self,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
     ) -> Result<Vec<BindGroup>, BackendDriverError> {
@@ -813,7 +803,7 @@ impl WgpuBackendDriver {
 
     fn ensure_render_pipeline(
         &mut self,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
     ) -> Result<(), BackendDriverError> {
@@ -992,7 +982,7 @@ impl WgpuBackendDriver {
 
     fn render_pipeline(
         &self,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
     ) -> Result<&RenderPipeline, BackendDriverError> {
@@ -1028,7 +1018,7 @@ impl WgpuBackendDriver {
 
     fn shader_for_stage(
         &self,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         stage: ShaderStage,
     ) -> Result<
         (
@@ -1056,7 +1046,7 @@ impl WgpuBackendDriver {
         &self,
         encoder: &mut CommandEncoder,
         accepted: &AcceptedBackendSubmission<'_>,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     ) -> Result<Vec<PendingWriteback>, BackendDriverError> {
         let mut writebacks = Vec::new();
         let mut seen = HashSet::new();
@@ -1273,7 +1263,7 @@ impl WgpuBackendDriver {
 
     fn attachment_view(
         &self,
-        dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         attachment: RenderAttachment,
     ) -> Result<wgpu::TextureView, BackendDriverError> {
         let handle = dependency_handle(dependencies, ResourceDependency::Image(attachment.image))?;
@@ -1302,11 +1292,6 @@ impl BackendDriver for WgpuBackendDriver {
         info: &BackendResourceCreateInfo,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if self.resources.contains_key(&handle) {
-            return Err(BackendDriverError::failure(
-                "duplicate wgpu resource handle",
-            ));
-        }
         if let BackendResourceCreateInfo::Image {
             view: Some(view), ..
         } = info
@@ -1422,9 +1407,7 @@ impl BackendDriver for WgpuBackendDriver {
         handle: BackendResourceHandle,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if self.resources.remove(&handle).is_none() {
-            return Err(missing(handle));
-        }
+        self.resources.remove(&handle);
         Ok(())
     }
 
@@ -1433,15 +1416,10 @@ impl BackendDriver for WgpuBackendDriver {
         accepted: &AcceptedBackendSubmission<'_>,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if self.completed.contains(&accepted.token()) {
-            return Err(BackendDriverError::failure(
-                "duplicate wgpu submission token",
-            ));
-        }
-        let dependencies = Self::dependency_map(accepted);
-        self.upload_inputs(accepted, &dependencies)?;
+        let dependencies = accepted.resources();
+        self.upload_inputs(accepted, dependencies)?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
-        let (encoder, writebacks) = self.encode_submission(accepted, &dependencies)?;
+        let (encoder, writebacks) = self.encode_submission(accepted, dependencies)?;
         self.queue.submit([encoder.finish()]);
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1466,11 +1444,7 @@ impl BackendDriver for WgpuBackendDriver {
         submission: BackendSubmissionToken,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if !self.completed.remove(&submission) {
-            return Err(BackendDriverError::failure(
-                "wgpu submission is not complete",
-            ));
-        }
+        self.completed.remove(&submission);
         Ok(())
     }
 
@@ -1807,7 +1781,7 @@ fn color_value(value: [f32; 4]) -> Color {
 }
 
 fn dependency_handle(
-    dependencies: &HashMap<ResourceDependency, BackendResourceHandle>,
+    dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     dependency: ResourceDependency,
 ) -> Result<BackendResourceHandle, BackendDriverError> {
     dependencies.get(&dependency).copied().ok_or_else(|| {

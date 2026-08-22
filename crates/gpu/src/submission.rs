@@ -2,8 +2,6 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::DeviceVisibilityPoint;
-
 macro_rules! opaque_submission_id {
     ($(#[$meta:meta])* $name:ident, $label:literal) => {
         $(#[$meta])*
@@ -145,65 +143,6 @@ impl Display for BackendSubmissionToken {
     }
 }
 
-/// Evidence that the host backend completed one accepted submission.
-///
-/// Completion does not imply that device writes have become visible to guest
-/// memory or that a guest timeline point may be signaled.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct HostCompletion {
-    submission: BackendSubmissionToken,
-}
-
-impl HostCompletion {
-    /// Records completion reported by the backend which owns the token.
-    #[must_use]
-    pub const fn new(submission: BackendSubmissionToken) -> Self {
-        Self { submission }
-    }
-
-    /// Returns the backend submission which completed.
-    #[must_use]
-    pub const fn submission(self) -> BackendSubmissionToken {
-        self.submission
-    }
-}
-
-impl Display for HostCompletion {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "host-completion[{}]", self.submission)
-    }
-}
-
-/// Evidence that declared device writes reached a memory visibility point.
-///
-/// This remains distinct from host queue completion and from a guest fence.
-/// A coordinator may establish it with a download and cache operations, or
-/// prove that movement is unnecessary on a coherent shared-memory host.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct VisibilityCompletion {
-    point: DeviceVisibilityPoint,
-}
-
-impl VisibilityCompletion {
-    /// Records a transition completed by the memory visibility coordinator.
-    #[must_use]
-    pub const fn new(point: DeviceVisibilityPoint) -> Self {
-        Self { point }
-    }
-
-    /// Returns the completed device visibility point.
-    #[must_use]
-    pub const fn point(self) -> DeviceVisibilityPoint {
-        self.point
-    }
-}
-
-impl Display for VisibilityCompletion {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "visibility-completion[{}]", self.point)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,15 +152,10 @@ mod tests {
         let frontend = FrontendSubmissionId::new(3);
         let instance = BackendInstanceId::new(5);
         let backend = BackendSubmissionToken::new(instance, 7, 2);
-        let host = HostCompletion::new(backend);
-        let visibility = VisibilityCompletion::new(DeviceVisibilityPoint::new(11));
-
         assert_eq!(frontend.get(), 3);
         assert_eq!(backend.instance(), instance);
         assert_eq!(backend.slot(), 7);
         assert_eq!(backend.generation(), 2);
-        assert_eq!(host.submission(), backend);
-        assert_eq!(visibility.point(), DeviceVisibilityPoint::new(11));
         assert_eq!(
             frontend.to_string(),
             "frontend-submission=0x0000000000000003"
@@ -229,14 +163,6 @@ mod tests {
         assert_eq!(
             backend.to_string(),
             "backend-submission[backend-instance=0x0000000000000005 slot=0x0000000000000007 generation=2]"
-        );
-        assert_eq!(
-            host.to_string(),
-            "host-completion[backend-submission[backend-instance=0x0000000000000005 slot=0x0000000000000007 generation=2]]"
-        );
-        assert_eq!(
-            visibility.to_string(),
-            "visibility-completion[visibility-point=0x000000000000000b]"
         );
     }
 }

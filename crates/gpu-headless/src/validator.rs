@@ -1,6 +1,6 @@
 //! Atomic validation of neutral resources and submissions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -59,7 +59,6 @@ struct ValidationState {
 pub struct HeadlessBackendDriver {
     resources: HashMap<BackendResourceHandle, ResourceRecord>,
     validation: ValidationState,
-    submissions: HashSet<BackendSubmissionToken>,
     timeline: SharedTimeline,
     torn_down: bool,
 }
@@ -73,7 +72,6 @@ impl HeadlessBackendDriver {
             Self {
                 resources: HashMap::new(),
                 validation: ValidationState::default(),
-                submissions: HashSet::new(),
                 timeline: Arc::clone(&timeline),
                 torn_down: false,
             },
@@ -87,22 +85,12 @@ impl HeadlessBackendDriver {
         self.resources.len()
     }
 
-    /// Number of accepted submissions not yet released.
-    #[must_use]
-    pub fn submission_count(&self) -> usize {
-        self.submissions.len()
-    }
-
     fn validate_submission(
         &self,
         accepted: &AcceptedBackendSubmission<'_>,
     ) -> Result<ValidationState, HeadlessValidationError> {
         let submission = accepted.submission();
-        let resources = accepted
-            .resources()
-            .iter()
-            .map(|resolved| (resolved.dependency(), resolved.handle()))
-            .collect::<HashMap<_, _>>();
+        let resources = accepted.resources();
         let mut next = self.validation.clone();
         let mut ancestors = HashSet::new();
         for predecessor in submission.predecessors() {
@@ -117,7 +105,7 @@ impl HeadlessBackendDriver {
             match operation.command() {
                 GpuCommand::Barrier(barrier) => {
                     for transition in barrier.transitions() {
-                        let footprint = self.resolve_footprint(transition.target(), &resources)?;
+                        let footprint = self.resolve_footprint(transition.target(), resources)?;
                         apply_transition(
                             &mut next,
                             footprint,
@@ -131,7 +119,7 @@ impl HeadlessBackendDriver {
                 }
                 _ => {
                     for access in operation.accesses() {
-                        let footprint = self.resolve_footprint(access.target(), &resources)?;
+                        let footprint = self.resolve_footprint(access.target(), resources)?;
                         apply_access(
                             &mut next,
                             footprint,
@@ -151,35 +139,22 @@ impl HeadlessBackendDriver {
     fn resolve_footprint(
         &self,
         target: AccessTarget,
-        resources: &HashMap<ResourceDependency, BackendResourceHandle>,
+        resources: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     ) -> Result<Footprint, HeadlessValidationError> {
         match target {
             AccessTarget::Buffer { buffer, range } => {
                 let (handle, record) =
                     self.resource(ResourceDependency::Buffer(buffer), resources)?;
-                let BackendResourceCreateInfo::Buffer {
-                    description, view, ..
-                } = &record.info
-                else {
+                let BackendResourceCreateInfo::Buffer { view, .. } = &record.info else {
                     return Err(HeadlessValidationError::ResourceKindMismatch);
                 };
-                if range.end() > description.size() {
-                    return Err(HeadlessValidationError::AccessOutOfBounds { target });
-                }
-                let canonical = if let Some(view) = view {
-                    if range.offset() < view.buffer_offset()
-                        || range.end() > view.buffer_offset() + view.size()
-                    {
-                        return Err(HeadlessValidationError::AccessOutsideBacking { target });
-                    }
-                    Some((
+                let canonical = view.as_ref().map(|view| {
+                    (
                         view.backing().clone(),
                         range.offset() - view.buffer_offset(),
                         range.size(),
-                    ))
-                } else {
-                    None
-                };
+                    )
+                });
                 Ok(Footprint::Buffer {
                     handle,
                     id: buffer,
@@ -193,24 +168,15 @@ impl HeadlessBackendDriver {
             } => {
                 let (handle, record) =
                     self.resource(ResourceDependency::Image(image), resources)?;
-                let BackendResourceCreateInfo::Image {
-                    description, view, ..
-                } = &record.info
-                else {
+                let BackendResourceCreateInfo::Image { view, .. } = &record.info else {
                     return Err(HeadlessValidationError::ResourceKindMismatch);
                 };
-                if !valid_image_range(*description, subresources) {
-                    return Err(HeadlessValidationError::AccessOutOfBounds { target });
-                }
                 let mut canonical = Vec::new();
                 if let Some(view) = view {
                     for binding in view.bindings() {
                         if image_ranges_overlap(binding.subresources(), subresources) {
                             canonical.push(binding.backing().clone());
                         }
-                    }
-                    if !bindings_cover(view, subresources) {
-                        return Err(HeadlessValidationError::AccessOutsideBacking { target });
                     }
                 }
                 Ok(Footprint::Image {
@@ -223,12 +189,9 @@ impl HeadlessBackendDriver {
             AccessTarget::Queries { pool, range } => {
                 let (handle, record) =
                     self.resource(ResourceDependency::QueryPool(pool), resources)?;
-                let BackendResourceCreateInfo::QueryPool { description, .. } = &record.info else {
+                let BackendResourceCreateInfo::QueryPool { .. } = &record.info else {
                     return Err(HeadlessValidationError::ResourceKindMismatch);
                 };
-                if range.first().saturating_add(range.count()) > description.count() {
-                    return Err(HeadlessValidationError::AccessOutOfBounds { target });
-                }
                 Ok(Footprint::Queries {
                     handle,
                     pool,
@@ -241,7 +204,7 @@ impl HeadlessBackendDriver {
     fn resource<'a>(
         &'a self,
         dependency: ResourceDependency,
-        resources: &HashMap<ResourceDependency, BackendResourceHandle>,
+        resources: &BTreeMap<ResourceDependency, BackendResourceHandle>,
     ) -> Result<(BackendResourceHandle, &'a ResourceRecord), HeadlessValidationError> {
         let handle = resources
             .get(&dependency)
@@ -266,7 +229,6 @@ impl HeadlessBackendDriver {
         drop(timeline);
         if let Some(reason) = device_loss {
             self.resources.clear();
-            self.submissions.clear();
             self.validation = ValidationState::default();
             let mut timeline = self.timeline()?;
             timeline.accepted.clear();
@@ -287,11 +249,6 @@ impl BackendDriver for HeadlessBackendDriver {
         info: &BackendResourceCreateInfo,
     ) -> Result<(), BackendDriverError> {
         self.check_device()?;
-        if self.resources.contains_key(&handle) {
-            return Err(BackendDriverError::failure(
-                "duplicate headless resource handle",
-            ));
-        }
         self.resources
             .insert(handle, ResourceRecord { info: info.clone() });
         Ok(())
@@ -302,11 +259,7 @@ impl BackendDriver for HeadlessBackendDriver {
         handle: BackendResourceHandle,
     ) -> Result<(), BackendDriverError> {
         self.check_device()?;
-        if self.resources.remove(&handle).is_none() {
-            return Err(BackendDriverError::failure(
-                "unknown headless resource handle",
-            ));
-        }
+        self.resources.remove(&handle);
         self.validation
             .accesses
             .retain(|access| access.footprint.handle() != handle);
@@ -322,13 +275,8 @@ impl BackendDriver for HeadlessBackendDriver {
             .validate_submission(submission)
             .map_err(|error| BackendDriverError::failure(error.to_string()))?;
         let mut timeline = self.timeline()?;
-        if !timeline.accepted.insert(submission.token()) {
-            return Err(BackendDriverError::failure(
-                "duplicate headless submission token",
-            ));
-        }
+        timeline.accepted.insert(submission.token());
         drop(timeline);
-        self.submissions.insert(submission.token());
         self.validation = next;
         Ok(())
     }
@@ -339,11 +287,6 @@ impl BackendDriver for HeadlessBackendDriver {
     ) -> Result<bool, BackendDriverError> {
         self.check_device()?;
         let timeline = self.timeline()?;
-        if !timeline.accepted.contains(&submission) {
-            return Err(BackendDriverError::failure(
-                "unknown headless submission token",
-            ));
-        }
         Ok(timeline.completed.contains(&submission))
     }
 
@@ -353,15 +296,8 @@ impl BackendDriver for HeadlessBackendDriver {
     ) -> Result<(), BackendDriverError> {
         self.check_device()?;
         let mut timeline = self.timeline()?;
-        if !timeline.completed.contains(&submission) || !timeline.accepted.contains(&submission) {
-            return Err(BackendDriverError::failure(
-                "headless submission is not complete",
-            ));
-        }
         timeline.completed.remove(&submission);
         timeline.accepted.remove(&submission);
-        drop(timeline);
-        self.submissions.remove(&submission);
         Ok(())
     }
 
@@ -376,7 +312,6 @@ impl BackendDriver for HeadlessBackendDriver {
         timeline.torn_down = true;
         drop(timeline);
         self.resources.clear();
-        self.submissions.clear();
         self.validation = ValidationState::default();
         self.torn_down = true;
         Ok(())
@@ -719,64 +654,12 @@ fn image_ranges_overlap(left: ImageSubresourceRange, right: ImageSubresourceRang
         )
 }
 
-fn bindings_cover(view: &nixe_gpu::ImageView, requested: ImageSubresourceRange) -> bool {
-    let requested_end = u32::from(requested.base_layer) + u32::from(requested.layer_count);
-    let mut intervals = view
-        .bindings()
-        .iter()
-        .map(|binding| binding.subresources())
-        .filter(|candidate| {
-            candidate.plane == requested.plane && candidate.mip_level == requested.mip_level
-        })
-        .map(|candidate| {
-            (
-                u32::from(candidate.base_layer),
-                u32::from(candidate.base_layer) + u32::from(candidate.layer_count),
-            )
-        })
-        .collect::<Vec<_>>();
-    intervals.sort_unstable();
-    let mut covered_until = u32::from(requested.base_layer);
-    for (start, end) in intervals {
-        if end <= covered_until || start >= requested_end {
-            continue;
-        }
-        if start > covered_until {
-            return false;
-        }
-        covered_until = end.min(requested_end);
-        if covered_until == requested_end {
-            return true;
-        }
-    }
-    false
-}
-
-fn valid_image_range(
-    description: nixe_gpu::ImageDescription,
-    range: ImageSubresourceRange,
-) -> bool {
-    range.layer_count != 0
-        && range.plane < description.format().plane_count()
-        && range.mip_level < description.mip_levels()
-        && range
-            .base_layer
-            .checked_add(range.layer_count)
-            .is_some_and(|end| end <= description.array_layers())
-}
-
 /// Deterministic rejection produced before a headless submission mutates state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeadlessValidationError {
     MissingResolvedResource(ResourceDependency),
     MissingBackendResource(BackendResourceHandle),
     ResourceKindMismatch,
-    AccessOutOfBounds {
-        target: AccessTarget,
-    },
-    AccessOutsideBacking {
-        target: AccessTarget,
-    },
     UnorderedAccess {
         operation_index: usize,
         previous: FrontendSubmissionId,
