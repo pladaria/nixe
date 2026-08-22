@@ -4,6 +4,7 @@ use std::sync::Arc;
 use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 use sha2::{Digest, Sha256};
 
+use crate::binary::{read_u32, read_u64};
 use crate::{Hfs0Archive, Hfs0Entry, Hfs0HashResult, Hfs0Loader};
 
 const PUBLIC_HEADER_SIZE: u64 = 0x200;
@@ -416,22 +417,6 @@ fn hash_prefix(storage: &StorageRef, size: u64) -> Result<[u8; 32], LoadError> {
         offset += read_size as u64;
     }
     Ok(hasher.finalize().into())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("validated range"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated range"),
-    )
 }
 
 #[cfg(test)]

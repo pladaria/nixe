@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::binary::{read_i64, read_u32, read_u64};
 use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, MemoryPermissions, Mod0Metadata,
     NroImage, NsoImage,
@@ -1613,30 +1614,6 @@ fn checked_signed_add(base: u64, addend: i64, name: &str) -> Result<u64, Prepare
         base.checked_sub(addend.unsigned_abs())
     }
     .ok_or_else(|| PrepareError::new(format!("{name} address overflows")))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("validated u32 field"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated u64 field"),
-    )
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated i64 field"),
-    )
 }
 
 #[cfg(test)]

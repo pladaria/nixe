@@ -1,5 +1,6 @@
 //! Loaders for executable images that can be mapped into emulated memory.
 
+mod binary;
 mod npdm;
 mod nro;
 mod nso;

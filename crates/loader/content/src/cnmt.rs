@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
+use crate::binary::{read_u16, read_u32, read_u64};
 use crate::version::{
     ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
 };
@@ -550,30 +551,6 @@ fn record_offset(base: u64, index: u64, size: u64, name: &str) -> Result<u64, Lo
         .checked_mul(size)
         .ok_or_else(|| LoadError::invalid("CNMT", format!("{name} offset overflows")))?;
     checked_end(base, relative, name)
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("validated CNMT u16 range"),
-    )
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("validated CNMT u32 range"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated CNMT u64 range"),
-    )
 }
 
 #[cfg(test)]

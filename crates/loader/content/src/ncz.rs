@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
 
+use crate::binary::{read_u32, read_u64};
 use crate::crypto::apply_ctr_at;
 
 const PREFIX_SIZE: u64 = 0x4000;
@@ -879,22 +880,6 @@ fn read_metadata(
 
 fn invalid_data(reason: impl Into<String>) -> StorageError {
     StorageError::InvalidData(reason.into())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("validated NCZ range"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("validated NCZ range"),
-    )
 }
 
 #[cfg(test)]

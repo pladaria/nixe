@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use nixe_loader_storage::{FormatLoader, LoadError, StorageRef, SubStorage};
 
+use crate::binary::{read_u32, read_u64};
 use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, ExecutableSegmentKind, MemoryPermissions,
 };
@@ -525,22 +526,6 @@ fn checked_align_up(value: u64, alignment: u64) -> Option<u64> {
     value
         .checked_add(alignment - 1)
         .map(|aligned| aligned & !(alignment - 1))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed header field"),
-    )
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("fixed header field"),
-    )
 }
 
 fn invalid(reason: impl Into<String>) -> LoadError {

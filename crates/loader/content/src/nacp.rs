@@ -2,6 +2,8 @@ use std::fmt::{Display, Formatter};
 
 use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
+use crate::binary::{read_i64, read_u16, read_u32, read_u64};
+
 pub const NACP_SIZE: usize = 0x4000;
 const LANGUAGE_COUNT: usize = 16;
 
@@ -391,22 +393,6 @@ fn fixed_string(bytes: &[u8], offset: usize, size: usize, name: &str) -> Result<
     std::str::from_utf8(&field[..used])
         .map(str::to_owned)
         .map_err(|_| LoadError::invalid("NACP", format!("{name} is not valid UTF-8")))
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("fixed range"))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed range"))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed range"))
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed range"))
 }
 
 fn read_u64_array<const N: usize>(bytes: &[u8], offset: usize) -> [u64; N] {
