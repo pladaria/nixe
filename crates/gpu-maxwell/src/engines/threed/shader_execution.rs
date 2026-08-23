@@ -6,7 +6,7 @@
 
 use crate::MaxwellMethodSource;
 
-use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
+use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress, state::PipelineDependencySink};
 
 /// Whether API semantics require depth/stencil testing before pixel shading.
 ///
@@ -402,7 +402,7 @@ impl MaxwellThreeDShaderLocalMemoryState {
         programmed && (self.address().is_none() || self.size().is_none())
     }
 
-    fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+    fn append_pipeline_dependencies(&self, dependencies: &mut impl PipelineDependencySink) {
         dependencies.push(self.address_upper.raw());
         dependencies.push(self.address_lower.raw());
         dependencies.push(self.size_upper.raw());
@@ -721,7 +721,10 @@ impl MaxwellThreeDShaderExecutionState {
         &self.shader_local_memory
     }
 
-    pub(super) fn append_shader_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+    pub(super) fn append_shader_pipeline_dependencies(
+        &self,
+        dependencies: &mut impl PipelineDependencySink,
+    ) {
         if self.api_mandated_early_z.value() == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled) {
             dependencies.push(self.api_mandated_early_z.raw());
         }

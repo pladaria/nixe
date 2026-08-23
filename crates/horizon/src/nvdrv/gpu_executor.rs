@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 
 use nixe_gpu::{
     BackendExecutionCompletion, BackendSubmissionToken, BackendVisibilityRequester,
-    FrontendSubmissionId, NeutralBackendRuntime, ReservedTimelinePoint,
+    FrontendSubmissionId, GpuCacheConfiguration, NeutralBackendRuntime, ReservedTimelinePoint,
 };
 use nixe_gpu_maxwell::{
     MaxwellBackendExecution, MaxwellEnginePacketDispatch, MaxwellGpuAddressSpace,
@@ -298,7 +298,10 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
 }
 
 impl NvDrvGpuExecutor {
-    pub(super) fn new(mut backend: Option<Box<dyn NeutralBackendRuntime>>) -> Self {
+    pub(super) fn new(
+        mut backend: Option<Box<dyn NeutralBackendRuntime>>,
+        cache_configuration: GpuCacheConfiguration,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(MAX_GPU_SUBMISSIONS_IN_FLIGHT);
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
@@ -352,7 +355,7 @@ impl NvDrvGpuExecutor {
             failure,
             worker: Mutex::new(Some(worker)),
             budget,
-            lowering_cache: Mutex::new(MaxwellThreeDLoweringCache::default()),
+            lowering_cache: Mutex::new(MaxwellThreeDLoweringCache::new(cache_configuration)),
         }
     }
 
@@ -909,10 +912,13 @@ mod tests {
                 max_compute_workgroups: [0; 3],
             },
         );
-        let executor = NvDrvGpuExecutor::new(Some(Box::new(VisibilityRuntime {
-            capabilities,
-            requester: Arc::clone(&requester),
-        })));
+        let executor = NvDrvGpuExecutor::new(
+            Some(Box::new(VisibilityRuntime {
+                capabilities,
+                requester: Arc::clone(&requester),
+            })),
+            GpuCacheConfiguration::default(),
+        );
         let requester = requester
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

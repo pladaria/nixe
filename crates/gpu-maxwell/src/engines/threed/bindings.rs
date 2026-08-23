@@ -9,7 +9,7 @@ use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
 use super::state::{
     MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-    MaxwellThreeDRegisterOrigin,
+    MaxwellThreeDRegisterOrigin, PipelineDependencySink,
 };
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
@@ -508,7 +508,10 @@ impl MaxwellThreeDShaderBindingState {
         visible
     }
 
-    pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+    pub(super) fn append_pipeline_dependencies(
+        &self,
+        dependencies: &mut impl PipelineDependencySink,
+    ) {
         if self.has_enabled_pipeline() {
             // Shader translation interprets stage programs relative to this
             // base, so both halves participate only while a stage is active.

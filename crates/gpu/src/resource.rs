@@ -73,7 +73,7 @@ resource_id!(
 );
 
 /// Immutable logical buffer description, without backing storage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDescription {
     size: u64,
 }
@@ -215,7 +215,7 @@ pub enum SampleCount {
 }
 
 /// Immutable logical image description, without layout or backing storage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ImageDescription {
     dimension: ImageDimension,
     extent: ImageExtent,

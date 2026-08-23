@@ -7,6 +7,7 @@ mod access;
 mod address;
 mod allocation;
 mod backend;
+mod cache;
 mod capability;
 mod command;
 mod diagnostics;
@@ -30,6 +31,12 @@ pub use backend::{
     AcceptedBackendSubmission, Backend, BackendDriver, BackendDriverError, BackendError,
     BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
     BackendResourceValidationError, BackendState,
+};
+pub use cache::{
+    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
+    DEFAULT_PIPELINE_CACHE_ENTRIES, DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE,
+    DEFAULT_SHADER_CACHE_ENTRIES, GpuCacheConfiguration, GpuCacheConfigurationError,
+    MIN_SHADER_CACHE_ENTRIES, cache_fingerprint,
 };
 pub use capability::{
     BackendCapabilities, BackendCapabilityError, BackendFeatures, BackendLimits,

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::{GuestTimelinePoint, NeutralBackendRuntime};
+use nixe_gpu::{GpuCacheConfiguration, GuestTimelinePoint, NeutralBackendRuntime};
 
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
@@ -124,12 +124,18 @@ impl Default for NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(None))
+        Self::new_with_executor(NvDrvGpuExecutor::new(
+            None,
+            GpuCacheConfiguration::default(),
+        ))
     }
 
     #[must_use]
-    pub fn with_gpu_backend(backend: Box<dyn NeutralBackendRuntime>) -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend)))
+    pub fn with_gpu_backend(
+        backend: Box<dyn NeutralBackendRuntime>,
+        cache_configuration: GpuCacheConfiguration,
+    ) -> Self {
+        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend), cache_configuration))
     }
 
     fn new_with_executor(gpu_executor: NvDrvGpuExecutor) -> Self {

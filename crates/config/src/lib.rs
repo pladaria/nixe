@@ -7,6 +7,11 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nixe_gpu::{
+    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
+    DEFAULT_PIPELINE_CACHE_ENTRIES, DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE,
+    DEFAULT_SHADER_CACHE_ENTRIES, GpuCacheConfiguration,
+};
 use nixe_input::{ControllerKind, InputSnapshot};
 use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
@@ -34,6 +39,8 @@ pub struct NixeConfig {
     pub diagnostics: DiagnosticsConfig,
     /// CPU execution-engine selection policy.
     pub cpu: CpuConfig,
+    /// GPU shader, pipeline, and backend-derived cache policy.
+    pub gpu: GpuCacheConfiguration,
     /// Host gamepad identification and emulated-controller mappings.
     pub input: InputConfig,
     source_path: PathBuf,
@@ -59,6 +66,7 @@ impl NixeConfig {
         }
         validate_time_config(path, &raw.system.time)?;
         validate_input_config(path, &raw.input)?;
+        let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         let source_path = absolute_path(path).map_err(|source| ConfigError::Io {
             path: path.to_owned(),
@@ -101,6 +109,7 @@ impl NixeConfig {
                 engine: raw.cpu.engine,
                 parallel_vcpus: raw.cpu.parallel_vcpus,
             },
+            gpu,
             input: raw.input,
             source_path,
         })
@@ -303,6 +312,8 @@ pub enum ConfigError {
     InvalidTime { path: PathBuf, reason: String },
     /// Input profiles contain ambiguous device selectors.
     InvalidInput { path: PathBuf, reason: String },
+    /// GPU cache capacities are zero or cannot be represented in bytes.
+    InvalidGpu { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -337,6 +348,11 @@ impl Display for ConfigError {
                 "configuration {} has invalid input settings: {reason}",
                 path.display()
             ),
+            Self::InvalidGpu { path, reason } => write!(
+                formatter,
+                "configuration {} has invalid GPU settings: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -348,7 +364,8 @@ impl Error for ConfigError {
             Self::Parse { source, .. } => Some(source),
             Self::UnsupportedVersion { .. }
             | Self::InvalidTime { .. }
-            | Self::InvalidInput { .. } => None,
+            | Self::InvalidInput { .. }
+            | Self::InvalidGpu { .. } => None,
         }
     }
 }
@@ -366,6 +383,8 @@ struct RawConfig {
     #[serde(default)]
     cpu: RawCpuConfig,
     #[serde(default)]
+    gpu: RawGpuConfig,
+    #[serde(default)]
     input: InputConfig,
 }
 
@@ -376,6 +395,33 @@ struct RawCpuConfig {
     engine: CpuEngineSelection,
     #[serde(default)]
     parallel_vcpus: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGpuConfig {
+    #[serde(default = "default_shader_cache_entries")]
+    shader_cache_entries: usize,
+    #[serde(default = "default_pipeline_cache_entries")]
+    pipeline_cache_entries: usize,
+    #[serde(default = "default_pipeline_variants_per_resource")]
+    pipeline_variants_per_resource: usize,
+    #[serde(default = "default_bind_groups_per_descriptor_table")]
+    bind_groups_per_descriptor_table: usize,
+    #[serde(default = "default_persistent_pipeline_cache_mib")]
+    persistent_pipeline_cache_mib: u64,
+}
+
+impl Default for RawGpuConfig {
+    fn default() -> Self {
+        Self {
+            shader_cache_entries: default_shader_cache_entries(),
+            pipeline_cache_entries: default_pipeline_cache_entries(),
+            pipeline_variants_per_resource: default_pipeline_variants_per_resource(),
+            bind_groups_per_descriptor_table: default_bind_groups_per_descriptor_table(),
+            persistent_pipeline_cache_mib: default_persistent_pipeline_cache_mib(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -453,6 +499,50 @@ fn default_timezone() -> String {
 
 fn default_sd_card_path() -> PathBuf {
     PathBuf::from("./storage/sdmc")
+}
+
+const fn default_shader_cache_entries() -> usize {
+    DEFAULT_SHADER_CACHE_ENTRIES
+}
+
+const fn default_pipeline_cache_entries() -> usize {
+    DEFAULT_PIPELINE_CACHE_ENTRIES
+}
+
+const fn default_pipeline_variants_per_resource() -> usize {
+    DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE
+}
+
+const fn default_bind_groups_per_descriptor_table() -> usize {
+    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE
+}
+
+const fn default_persistent_pipeline_cache_mib() -> u64 {
+    DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES / (1024 * 1024)
+}
+
+fn gpu_cache_configuration(
+    path: &Path,
+    raw: RawGpuConfig,
+) -> Result<GpuCacheConfiguration, ConfigError> {
+    let persistent_bytes = raw
+        .persistent_pipeline_cache_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| ConfigError::InvalidGpu {
+            path: path.to_owned(),
+            reason: "persistent_pipeline_cache_mib does not fit in bytes".to_owned(),
+        })?;
+    GpuCacheConfiguration::new(
+        raw.shader_cache_entries,
+        raw.pipeline_cache_entries,
+        raw.pipeline_variants_per_resource,
+        raw.bind_groups_per_descriptor_table,
+        persistent_bytes,
+    )
+    .map_err(|error| ConfigError::InvalidGpu {
+        path: path.to_owned(),
+        reason: error.to_string(),
+    })
 }
 
 fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
@@ -672,6 +762,7 @@ mod tests {
         );
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert!(!config.diagnostics.instruction_trace);
+        assert_eq!(config.gpu, GpuCacheConfiguration::default());
         assert!(config.input.profiles.is_empty());
     }
 
@@ -796,6 +887,62 @@ mod tests {
             NixeConfig::load(&invalid_file.path),
             Err(ConfigError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn gpu_cache_limits_are_typed_defaulted_and_validated() {
+        let explicit = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [gpu]
+                shader_cache_entries = 512
+                pipeline_cache_entries = 2048
+                pipeline_variants_per_resource = 24
+                bind_groups_per_descriptor_table = 12
+                persistent_pipeline_cache_mib = 96
+            "#,
+        );
+        let config = NixeConfig::load(&explicit.path).unwrap();
+        assert_eq!(config.gpu.shader_entries(), 512);
+        assert_eq!(config.gpu.pipeline_entries(), 2_048);
+        assert_eq!(config.gpu.pipeline_variants_per_resource(), 24);
+        assert_eq!(config.gpu.bind_groups_per_descriptor_table(), 12);
+        assert_eq!(
+            config.gpu.persistent_pipeline_cache_bytes(),
+            96 * 1024 * 1024
+        );
+
+        for setting in [
+            "shader_cache_entries = 0",
+            "pipeline_cache_entries = 0",
+            "pipeline_variants_per_resource = 0",
+            "bind_groups_per_descriptor_table = 0",
+            "persistent_pipeline_cache_mib = 0",
+        ] {
+            let invalid = TemporaryConfig::new(&format!(
+                r#"
+                    version = 2
+                    [library]
+                    paths = []
+                    [system]
+                    preferred_languages = []
+                    keys = "keys"
+                    initial_operation_mode = "handheld"
+                    [gpu]
+                    {setting}
+                "#
+            ));
+            assert!(matches!(
+                NixeConfig::load(&invalid.path),
+                Err(ConfigError::InvalidGpu { .. })
+            ));
+        }
     }
 
     #[test]

@@ -40,6 +40,22 @@ use super::{
 
 pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
 
+pub(super) trait PipelineDependencySink {
+    fn push(&mut self, dependency: Option<u32>);
+
+    fn extend(&mut self, dependencies: impl IntoIterator<Item = Option<u32>>) {
+        for dependency in dependencies {
+            self.push(dependency);
+        }
+    }
+}
+
+impl PipelineDependencySink for Vec<Option<u32>> {
+    fn push(&mut self, dependency: Option<u32>) {
+        Vec::push(self, dependency);
+    }
+}
+
 /// Byte-addressed polygon-mode registers read by the Switch graphics macros.
 pub(super) const MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD: u32 = 0x0dac;
 pub(super) const MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD: u32 = 0x0db0;
@@ -1060,15 +1076,23 @@ impl MaxwellThreeDState {
 
     pub(crate) fn pipeline_dependencies(&self, active_color_targets: &[u8]) -> Box<[Option<u32>]> {
         let mut dependencies = Vec::new();
+        self.append_pipeline_dependencies(active_color_targets, &mut dependencies);
+        dependencies.into_boxed_slice()
+    }
+
+    pub(super) fn append_pipeline_dependencies(
+        &self,
+        active_color_targets: &[u8],
+        dependencies: &mut impl PipelineDependencySink,
+    ) {
         self.fixed_function
-            .append_pipeline_dependencies(&mut dependencies, active_color_targets);
-        self.vertex_input
-            .append_pipeline_dependencies(&mut dependencies);
+            .append_pipeline_dependencies(dependencies, active_color_targets);
+        self.vertex_input.append_pipeline_dependencies(dependencies);
         self.shader_bindings
-            .append_pipeline_dependencies(&mut dependencies);
+            .append_pipeline_dependencies(dependencies);
         if self.shader_bindings.has_enabled_pipeline() {
             self.shader_execution
-                .append_shader_pipeline_dependencies(&mut dependencies);
+                .append_shader_pipeline_dependencies(dependencies);
         }
         if self
             .vertex_input
@@ -1119,7 +1143,7 @@ impl MaxwellThreeDState {
         }
         dependencies.push(self.raster.alpha_fraction.raw());
         self.constant_color_rendering
-            .append_pipeline_dependencies(&mut dependencies);
+            .append_pipeline_dependencies(dependencies);
         dependencies.push(self.raster.fill_via_triangle.raw());
         dependencies.push(self.raster.conservative_raster.raw());
         dependencies.push(self.viewport.z_clip_range.raw());
@@ -1194,8 +1218,7 @@ impl MaxwellThreeDState {
         {
             dependencies.push(self.coverage.ps_output_sample_mask_usage().raw());
         }
-        self.line.append_pipeline_dependencies(&mut dependencies);
-        dependencies.into_boxed_slice()
+        self.line.append_pipeline_dependencies(dependencies);
     }
 
     pub(crate) fn ps_output_sample_mask_effective(&self) -> Option<bool> {

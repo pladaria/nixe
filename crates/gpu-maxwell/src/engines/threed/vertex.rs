@@ -6,7 +6,7 @@
 
 use crate::MaxwellMethodSource;
 
-use super::state::MaxwellThreeDRegister;
+use super::state::{MaxwellThreeDRegister, PipelineDependencySink};
 
 pub const MAXWELL_VERTEX_STREAM_COUNT: usize = 32;
 pub const MAXWELL_VERTEX_ATTRIBUTE_COUNT: usize = 32;
@@ -855,7 +855,10 @@ impl MaxwellThreeDVertexInputState {
         &self.stream_substitute
     }
 
-    pub(super) fn append_pipeline_dependencies(&self, dependencies: &mut Vec<Option<u32>>) {
+    pub(super) fn append_pipeline_dependencies(
+        &self,
+        dependencies: &mut impl PipelineDependencySink,
+    ) {
         for stream in self.streams.iter() {
             dependencies.push(stream.format.raw());
             dependencies.push(stream.frequency.raw());

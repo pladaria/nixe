@@ -5,9 +5,14 @@
 //! module never treats Maxwell code as a neutral or host shader.
 
 use std::{
+    collections::HashMap,
     fmt::{Display, Formatter},
+    hash::{Hash, Hasher},
     ops::Deref,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use nixe_gpu::{
@@ -17,31 +22,36 @@ use nixe_gpu::{
     CapabilityRequirements, ClearOperation, ClearValue, CommandDescriptionError,
     DepthCompareOperation, DepthState, DescriptorKind, DescriptorTableBinding,
     DescriptorTableDescription, DescriptorTableId, DrawArguments, DrawOperation,
-    FrontendSubmissionId, GpuCommand, GpuOperation, ImageId, ImageOrigin, ImageRegion,
-    ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription, PipelineId,
-    PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment, RenderPassDescription,
-    RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency, ResourceTransition,
-    ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage,
-    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
+    FrontendSubmissionId, GpuCacheConfiguration, GpuCommand, GpuOperation, ImageId, ImageOrigin,
+    ImageRegion, ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription,
+    PipelineId, PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment,
+    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency,
+    ResourceTransition, ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind,
+    ShaderStage, TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
     VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::CanonicalCpuWriteDependency;
 
 use crate::MaxwellMethodSource;
 use crate::shader::{
-    MaxwellShaderTranslationError, MaxwellShaderTranslationInputs, MaxwellShaderTranslationKey,
-    MaxwellTranslatedShaderProgram, translate_prepared_maxwell_shader_programs,
+    MaxwellShaderTranslationError, MaxwellShaderTranslationInputs,
+    MaxwellShaderTranslationSourceKey, MaxwellTranslatedShaderProgram,
+    prepare_maxwell_shader_translation_inputs_from_source,
+    translate_prepared_maxwell_shader_programs,
 };
+#[cfg(debug_assertions)]
+use crate::shader::{MaxwellShaderTranslationKey, MaxwellShaderTranslationSource};
 
+use super::state::PipelineDependencySink;
 use super::{
-    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaToCoverageOverride,
-    MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDBegin,
-    MaxwellThreeDBlendEnableCommon, MaxwellThreeDClipIdTestEnable,
-    MaxwellThreeDColorCompressionMode, MaxwellThreeDColorReductionThresholdsEnable,
-    MaxwellThreeDCompareOp, MaxwellThreeDConditionalLoadConstantBuffer,
-    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
-    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
-    MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
+    MAXWELL_COLOR_TARGET_COUNT, MaxwellThreeDAliasedLineWidthEnable,
+    MaxwellThreeDAlphaToCoverageOverride, MaxwellThreeDAntiAliasedLineEnable,
+    MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDBegin, MaxwellThreeDBlendEnableCommon,
+    MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode,
+    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDCompareOp,
+    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
+    MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable, MaxwellThreeDDirectlyAddressableMemory,
+    MaxwellThreeDEdgeFlag, MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDIteratedBlend, MaxwellThreeDLogicOp, MaxwellThreeDPatchSize,
     MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderInterlockControl,
@@ -65,11 +75,14 @@ struct DrawAttachmentSelection {
 
 impl DrawAttachmentSelection {
     fn attachment_indices(&self) -> Vec<usize> {
+        self.attachment_indices_iter().collect()
+    }
+
+    fn attachment_indices_iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.colors
             .iter()
             .map(|(_, index)| *index)
             .chain(self.depth_stencil)
-            .collect()
     }
 
     fn color_targets(&self) -> impl Iterator<Item = u8> + '_ {
@@ -148,10 +161,11 @@ impl MaxwellThreeDOperationTrigger {
 }
 
 /// Stable evidence that T10 translated one enabled Maxwell shader stage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDTranslatedShader {
     stage: ShaderStage,
     shader: ShaderId,
+    cache_fingerprint: u128,
     directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
     maximum_api_visible_calls: u16,
 }
@@ -161,12 +175,14 @@ impl MaxwellThreeDTranslatedShader {
     pub(crate) const fn new(
         stage: ShaderStage,
         shader: ShaderId,
+        cache_fingerprint: u128,
         directly_addressable_memory: Option<MaxwellThreeDDirectlyAddressableMemory>,
         maximum_api_visible_calls: u16,
     ) -> Self {
         Self {
             stage,
             shader,
+            cache_fingerprint,
             directly_addressable_memory,
             maximum_api_visible_calls,
         }
@@ -197,7 +213,7 @@ impl MaxwellThreeDTranslatedShader {
 }
 
 /// Shader-declared use of one already resolved frontend resource.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDShaderResourceUse {
     role: MaxwellThreeDResourceRole,
     binding: u8,
@@ -236,7 +252,7 @@ impl MaxwellThreeDShaderResourceUse {
 
 /// Immutable T10 input to draw lowering. Absence is a typed boundary, not a
 /// fabricated shader or an empty pipeline.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDTranslatedShaders {
     shaders: Box<[MaxwellThreeDTranslatedShader]>,
     resources: Box<[MaxwellThreeDShaderResourceUse]>,
@@ -521,14 +537,105 @@ impl ViewMaterialization {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PipelineAttachmentKey(MaxwellThreeDResourceRole, nixe_gpu::ImageDescription);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PipelineKey {
     method_dependencies: Box<[Option<u32>]>,
     attachments: Box<[PipelineAttachmentKey]>,
     shaders: MaxwellThreeDTranslatedShaders,
+}
+
+struct PipelineLookupKey<'a> {
+    state: &'a MaxwellThreeDState,
+    active_color_targets: &'a [u8],
+    resources: &'a MaxwellThreeDResolvedResources,
+    attachments: &'a DrawAttachmentSelection,
+    shaders: &'a MaxwellThreeDTranslatedShaders,
+}
+
+impl<'a> PipelineLookupKey<'a> {
+    fn new(
+        state: &'a MaxwellThreeDState,
+        active_color_targets: &'a [u8],
+        resources: &'a MaxwellThreeDResolvedResources,
+        attachments: &'a DrawAttachmentSelection,
+        shaders: &'a MaxwellThreeDTranslatedShaders,
+    ) -> Result<Self, MaxwellThreeDLoweringError> {
+        for index in attachments.attachment_indices_iter() {
+            resolved_image(resources, index)?;
+        }
+        Ok(Self {
+            state,
+            active_color_targets,
+            resources,
+            attachments,
+            shaders,
+        })
+    }
+
+    fn attachment_keys(&self) -> impl Iterator<Item = PipelineAttachmentKey> + '_ {
+        self.attachments.attachment_indices_iter().map(|index| {
+            let image = resolved_image(self.resources, index)
+                .expect("pipeline attachment lookup was validated before hashing");
+            PipelineAttachmentKey(image.role(), image.description())
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn matches(&self, key: &PipelineKey) -> bool {
+        self.state
+            .pipeline_dependencies(self.active_color_targets)
+            .as_ref()
+            == key.method_dependencies.as_ref()
+            && self.attachment_keys().eq(key.attachments.iter().cloned())
+            && self.shaders == &key.shaders
+    }
+
+    fn materialize(self) -> PipelineKey {
+        let attachments = self.attachment_keys().collect();
+        PipelineKey {
+            method_dependencies: self.state.pipeline_dependencies(self.active_color_targets),
+            attachments,
+            shaders: self.shaders.clone(),
+        }
+    }
+}
+
+impl Hash for PipelineLookupKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut count = PipelineDependencyCount(0);
+        self.state
+            .append_pipeline_dependencies(self.active_color_targets, &mut count);
+        count.0.hash(state);
+        self.state.append_pipeline_dependencies(
+            self.active_color_targets,
+            &mut PipelineDependencyHasher(state),
+        );
+        (self.attachments.colors.len() + usize::from(self.attachments.depth_stencil.is_some()))
+            .hash(state);
+        for attachment in self.attachment_keys() {
+            attachment.hash(state);
+        }
+        self.shaders.hash(state);
+    }
+}
+
+struct PipelineDependencyCount(usize);
+
+impl PipelineDependencySink for PipelineDependencyCount {
+    fn push(&mut self, _dependency: Option<u32>) {
+        self.0 += 1;
+    }
+}
+
+struct PipelineDependencyHasher<'a, H>(&'a mut H);
+
+impl<H: Hasher> PipelineDependencySink for PipelineDependencyHasher<'_, H> {
+    fn push(&mut self, dependency: Option<u32>) {
+        dependency.hash(self.0);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -559,6 +666,7 @@ struct SamplerRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShaderTranslationRecord {
+    #[cfg(debug_assertions)]
     key: Option<MaxwellShaderTranslationKey>,
     id: ShaderId,
     module: nixe_gpu::ShaderBackendModule,
@@ -567,8 +675,157 @@ struct ShaderTranslationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShaderTranslationSetRecord {
+    #[cfg(debug_assertions)]
     inputs: MaxwellShaderTranslationInputs,
     programs: Arc<[MaxwellTranslatedShaderProgram]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShaderTranslationSourceRecord {
+    #[cfg(debug_assertions)]
+    source: MaxwellShaderTranslationSource,
+    inputs: MaxwellShaderTranslationInputs,
+    programs: Arc<[MaxwellTranslatedShaderProgram]>,
+}
+
+#[derive(Debug)]
+struct FingerprintedRecord<T> {
+    value: T,
+    last_used: AtomicU64,
+}
+
+impl<T: Clone> Clone for FingerprintedRecord<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            last_used: AtomicU64::new(self.last_used.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for FingerprintedRecord<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T: Eq> Eq for FingerprintedRecord<T> {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FingerprintCacheData<T> {
+    records: HashMap<u128, FingerprintedRecord<T>>,
+}
+
+/// Copy-on-write storage with O(1), allocation-free hits and exact LRU stamps.
+/// Recency is policy rather than guest state, so candidates share its monotonic
+/// clock and may record an attempted hit before their transactional commit.
+#[derive(Clone, Debug)]
+struct SharedFingerprintCache<T> {
+    data: Arc<FingerprintCacheData<T>>,
+    next_use: Arc<AtomicU64>,
+}
+
+impl<T: PartialEq> PartialEq for SharedFingerprintCache<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<T: Eq> Eq for SharedFingerprintCache<T> {}
+
+impl<T> Default for SharedFingerprintCache<T> {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(FingerprintCacheData {
+                records: HashMap::new(),
+            }),
+            next_use: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+impl<T> SharedFingerprintCache<T> {
+    fn len(&self) -> usize {
+        self.data.records.len()
+    }
+
+    fn get(&self, fingerprint: u128) -> Option<&T> {
+        let record = self.data.records.get(&fingerprint)?;
+        record.last_used.store(self.take_use(), Ordering::Relaxed);
+        Some(&record.value)
+    }
+
+    fn take_use(&self) -> u64 {
+        self.next_use
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("GPU cache LRU sequence exhausted")
+    }
+}
+
+impl<T: Clone> SharedFingerprintCache<T> {
+    fn push(&mut self, fingerprint: u128, value: T) {
+        let last_used = self.take_use();
+        let data = Arc::make_mut(&mut self.data);
+        assert!(
+            data.records
+                .insert(
+                    fingerprint,
+                    FingerprintedRecord {
+                        value,
+                        last_used: AtomicU64::new(last_used),
+                    }
+                )
+                .is_none(),
+            "duplicate GPU cache fingerprint insertion"
+        );
+    }
+
+    fn get_mut(&mut self, fingerprint: u128) -> Option<&mut T> {
+        let last_used = self.take_use();
+        let data = Arc::make_mut(&mut self.data);
+        let record = data.records.get_mut(&fingerprint)?;
+        record.last_used.store(last_used, Ordering::Relaxed);
+        Some(&mut record.value)
+    }
+
+    fn replace(&mut self, fingerprint: u128, value: T) {
+        let last_used = self.take_use();
+        let data = Arc::make_mut(&mut self.data);
+        if let Some(record) = data.records.get_mut(&fingerprint) {
+            record.value = value;
+            record.last_used.store(last_used, Ordering::Relaxed);
+        } else {
+            data.records.insert(
+                fingerprint,
+                FingerprintedRecord {
+                    value,
+                    last_used: AtomicU64::new(last_used),
+                },
+            );
+        }
+    }
+
+    fn remove_lru(&mut self) -> (u128, T) {
+        let data = Arc::make_mut(&mut self.data);
+        let fingerprint = data
+            .records
+            .iter()
+            .min_by_key(|(_, record)| record.last_used.load(Ordering::Relaxed))
+            .map(|(fingerprint, _)| *fingerprint)
+            .expect("LRU eviction requires a non-empty cache");
+        let removed = data
+            .records
+            .remove(&fingerprint)
+            .expect("selected LRU fingerprint remains present");
+        (fingerprint, removed.value)
+    }
+
+    fn retain(&mut self, mut predicate: impl FnMut(&T) -> bool) {
+        let data = Arc::make_mut(&mut self.data);
+        data.records.retain(|_, record| predicate(&record.value));
+    }
 }
 
 /// Copy-on-write storage for transactional cache collections.
@@ -629,6 +886,7 @@ impl<T: Clone> SharedCacheVec<T> {
 /// changes only through [`MaxwellThreeDLoweringPlan::commit_cache`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDLoweringCache {
+    configuration: GpuCacheConfiguration,
     revision: u64,
     next_identity: u64,
     allocations: SharedCacheVec<(
@@ -637,39 +895,46 @@ pub struct MaxwellThreeDLoweringCache {
     )>,
     views: SharedCacheVec<ViewRecord>,
     color_materializations: SharedCacheVec<ColorRepresentationRecord>,
-    pipelines: SharedCacheVec<PipelineRecord>,
+    pipelines: SharedFingerprintCache<PipelineRecord>,
     render_passes: SharedCacheVec<RenderPassRecord>,
     descriptors: SharedCacheVec<DescriptorRecord>,
     samplers: SharedCacheVec<SamplerRecord>,
-    shader_translation_sets: SharedCacheVec<ShaderTranslationSetRecord>,
-    shader_translations: SharedCacheVec<ShaderTranslationRecord>,
-    retired_shader_resources: SharedCacheVec<ResourceDependency>,
+    shader_translation_sets: SharedFingerprintCache<ShaderTranslationSetRecord>,
+    shader_translation_sources: SharedFingerprintCache<ShaderTranslationSourceRecord>,
+    shader_translations: SharedFingerprintCache<ShaderTranslationRecord>,
+    retired_resources: SharedCacheVec<ResourceDependency>,
     accesses: SharedCacheVec<(AccessTarget, AccessScope)>,
     retained_backings: super::MaxwellThreeDRetainedBackingCache,
 }
 
 impl Default for MaxwellThreeDLoweringCache {
     fn default() -> Self {
+        Self::new(GpuCacheConfiguration::default())
+    }
+}
+
+impl MaxwellThreeDLoweringCache {
+    #[must_use]
+    pub fn new(configuration: GpuCacheConfiguration) -> Self {
         Self {
+            configuration,
             revision: 0,
             next_identity: 1,
             allocations: SharedCacheVec::default(),
             views: SharedCacheVec::default(),
             color_materializations: SharedCacheVec::default(),
-            pipelines: SharedCacheVec::default(),
+            pipelines: SharedFingerprintCache::default(),
             render_passes: SharedCacheVec::default(),
             descriptors: SharedCacheVec::default(),
             samplers: SharedCacheVec::default(),
-            shader_translation_sets: SharedCacheVec::default(),
-            shader_translations: SharedCacheVec::default(),
-            retired_shader_resources: SharedCacheVec::default(),
+            shader_translation_sets: SharedFingerprintCache::default(),
+            shader_translation_sources: SharedFingerprintCache::default(),
+            shader_translations: SharedFingerprintCache::default(),
+            retired_resources: SharedCacheVec::default(),
             accesses: SharedCacheVec::default(),
             retained_backings: super::MaxwellThreeDRetainedBackingCache::default(),
         }
     }
-}
-
-impl MaxwellThreeDLoweringCache {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -711,23 +976,74 @@ impl MaxwellThreeDLoweringCache {
         &mut self,
         inputs: MaxwellShaderTranslationInputs,
     ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
-        if let Some(record) = self
-            .shader_translation_sets
-            .iter()
-            .find(|record| record.inputs == inputs)
-        {
+        let fingerprint = inputs.fingerprint();
+        if let Some(record) = self.shader_translation_sets.get(fingerprint) {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                record.inputs, inputs,
+                "XXH3-128 collision or incomplete shader-set cache key"
+            );
             return Ok(Arc::clone(&record.programs));
         }
 
+        log::debug!("Maxwell shader translation cache miss: fingerprint={fingerprint:032x}");
+
         let programs: Arc<[MaxwellTranslatedShaderProgram]> =
             translate_prepared_maxwell_shader_programs(&inputs)?.into();
-        self.shader_translation_sets
-            .retain(|record| !record.inputs.same_program_bindings(&inputs));
-        self.shader_translation_sets
-            .push(ShaderTranslationSetRecord {
+        self.shader_translation_sets.push(
+            fingerprint,
+            ShaderTranslationSetRecord {
+                #[cfg(debug_assertions)]
                 inputs,
                 programs: Arc::clone(&programs),
-            });
+            },
+        );
+        while self.shader_translation_sets.len() > self.configuration.shader_entries() {
+            let (evicted, _) = self.shader_translation_sets.remove_lru();
+            log::debug!(
+                "Maxwell shader translation cache evicted LRU set: fingerprint={evicted:032x}"
+            );
+        }
+        Ok(programs)
+    }
+
+    pub(crate) fn resolve_shader_translation_source(
+        &mut self,
+        source: MaxwellShaderTranslationSourceKey<'_>,
+        address_space: &crate::MaxwellGpuAddressSpace,
+    ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
+        let source_fingerprint = source.fingerprint();
+        if let Some(record) = self.shader_translation_sources.get(source_fingerprint) {
+            #[cfg(debug_assertions)]
+            assert!(
+                source.matches(&record.source),
+                "XXH3-128 collision or incomplete shader-source cache key"
+            );
+            if record.inputs.source_is_current(address_space) {
+                return Ok(Arc::clone(&record.programs));
+            }
+        }
+
+        log::debug!(
+            "Maxwell shader source cache miss or stale entry: fingerprint={source_fingerprint:032x}"
+        );
+
+        let source = source.materialize();
+        let inputs = prepare_maxwell_shader_translation_inputs_from_source(&source, address_space)?;
+        let programs = self.resolve_shader_translation_inputs(inputs.clone())?;
+        self.shader_translation_sources.replace(
+            source_fingerprint,
+            ShaderTranslationSourceRecord {
+                #[cfg(debug_assertions)]
+                source,
+                inputs,
+                programs: Arc::clone(&programs),
+            },
+        );
+        while self.shader_translation_sources.len() > self.configuration.shader_entries() {
+            let (evicted, _) = self.shader_translation_sources.remove_lru();
+            log::debug!("Maxwell shader source cache evicted LRU set: fingerprint={evicted:032x}");
+        }
         Ok(programs)
     }
 
@@ -739,58 +1055,38 @@ impl MaxwellThreeDLoweringCache {
         let mut shaders = Vec::with_capacity(programs.len());
         let mut resources: Vec<MaxwellThreeDShaderResourceUse> = Vec::new();
         for program in programs {
-            let id = if let Some(record) = self
-                .shader_translations
-                .iter()
-                .find(|record| record.key.as_ref() == Some(program.key()))
-            {
+            let fingerprint = program.fingerprint();
+            let id = if let Some(record) = self.shader_translations.get(fingerprint) {
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    record.key.as_ref(),
+                    Some(program.key()),
+                    "XXH3-128 collision or incomplete shader cache key"
+                );
                 record.id
             } else {
-                let mut retired_ids = Vec::new();
-                self.shader_translations.retain(|record| {
-                    let replaced = record
-                        .key
-                        .as_ref()
-                        .is_some_and(|key| key.same_program_binding(program.key()));
-                    if replaced && record.published {
-                        retired_ids.push(record.id);
-                    }
-                    !replaced
-                });
-                if !retired_ids.is_empty() {
-                    let mut retired_pipelines = Vec::new();
-                    self.pipelines.retain(|record| {
-                        let replaced = record
-                            .key
-                            .shaders
-                            .shaders()
-                            .iter()
-                            .any(|shader| retired_ids.contains(&shader.shader()));
-                        if replaced {
-                            retired_pipelines.push(record.id);
-                        }
-                        !replaced
-                    });
-                    self.retired_shader_resources.extend(
-                        retired_pipelines
-                            .into_iter()
-                            .map(ResourceDependency::Pipeline),
-                    );
-                    self.retired_shader_resources
-                        .extend(retired_ids.into_iter().map(ResourceDependency::Shader));
-                }
+                log::debug!(
+                    "Maxwell translated shader cache miss: stage={:?} fingerprint={fingerprint:032x}",
+                    program.stage()
+                );
                 let id = ShaderId::new(take_identity(self)?);
-                self.shader_translations.push(ShaderTranslationRecord {
-                    key: Some(program.key().clone()),
-                    id,
-                    module: program.module().clone(),
-                    published: false,
-                });
+                self.shader_translations.push(
+                    fingerprint,
+                    ShaderTranslationRecord {
+                        #[cfg(debug_assertions)]
+                        key: Some(program.key().clone()),
+                        id,
+                        module: program.module().clone(),
+                        published: false,
+                    },
+                );
+                self.enforce_shader_translation_limit();
                 id
             };
             shaders.push(MaxwellThreeDTranslatedShader::new(
                 program.stage(),
                 id,
+                fingerprint,
                 program.directly_addressable_memory(),
                 program.maximum_api_visible_calls(),
             ));
@@ -896,17 +1192,47 @@ impl MaxwellThreeDLoweringCache {
         MaxwellThreeDTranslatedShaders::new(shaders, resources)
     }
 
+    fn enforce_shader_translation_limit(&mut self) {
+        while self.shader_translations.len() > self.configuration.shader_entries() {
+            let (fingerprint, retired) = self.shader_translations.remove_lru();
+            log::debug!(
+                "Maxwell translated shader cache evicted LRU shader: id={} fingerprint={fingerprint:032x}",
+                retired.id
+            );
+            if !retired.published {
+                continue;
+            }
+            let mut retired_pipelines = Vec::new();
+            self.pipelines.retain(|record| {
+                let depends_on_shader = record
+                    .key
+                    .shaders
+                    .shaders()
+                    .iter()
+                    .any(|shader| shader.shader() == retired.id);
+                if depends_on_shader {
+                    retired_pipelines.push(record.id);
+                }
+                !depends_on_shader
+            });
+            self.retired_resources.extend(
+                retired_pipelines
+                    .into_iter()
+                    .map(ResourceDependency::Pipeline),
+            );
+            self.retired_resources
+                .push(ResourceDependency::Shader(retired.id));
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn seed_test_shader_translations(
         &mut self,
         shaders: &MaxwellThreeDTranslatedShaders,
     ) {
         for shader in shaders.shaders() {
-            if self
-                .shader_translations
-                .iter()
-                .any(|record| record.id == shader.shader())
-            {
+            if let Some(record) = self.shader_translations.get(shader.cache_fingerprint) {
+                assert_eq!(record.id, shader.shader());
                 continue;
             }
             let ir = nixe_gpu::VerifiedShaderIr::verify(nixe_gpu::ShaderIr::new(
@@ -923,12 +1249,16 @@ impl MaxwellThreeDLoweringCache {
             .expect("synthetic unit-test shader is valid");
             let module =
                 nixe_gpu::lower_shader_ir_to_wgsl(&ir).expect("synthetic unit-test shader lowers");
-            self.shader_translations.push(ShaderTranslationRecord {
-                key: None,
-                id: shader.shader(),
-                module,
-                published: false,
-            });
+            self.shader_translations.push(
+                shader.cache_fingerprint,
+                ShaderTranslationRecord {
+                    #[cfg(debug_assertions)]
+                    key: None,
+                    id: shader.shader(),
+                    module,
+                    published: false,
+                },
+            );
         }
     }
 }
@@ -1701,7 +2031,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         shaders,
     )?;
     let mut creations = Vec::new();
-    let mut invalidations = cache.retired_shader_resources.take();
+    let mut invalidations = cache.retired_resources.take();
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
@@ -1733,6 +2063,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 vertex_count,
                 cache,
                 &mut creations,
+                &mut invalidations,
             )?;
             record_draw_color_materializations(state, resources, attachments, cache)?;
             lowered
@@ -3347,18 +3678,22 @@ fn lower_draw(
     vertex_count: u32,
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
+    invalidations: &mut Vec<ResourceDependency>,
 ) -> Result<(Vec<GpuOperation>, Vec<usize>), MaxwellThreeDLoweringError> {
     if vertex_count == 0 {
         return Err(MaxwellThreeDLoweringError::EmptyDraw);
     }
     validate_shader_stages(state, shaders)?;
     for translated in &shaders.shaders {
-        let record_index = cache
+        let record = cache
             .shader_translations
-            .iter()
-            .position(|record| record.id == translated.shader)
+            .get(translated.cache_fingerprint)
             .ok_or(MaxwellThreeDLoweringError::InvalidTranslatedShaders)?;
-        let record = &cache.shader_translations[record_index];
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            record.id, translated.shader,
+            "XXH3-128 collision or inconsistent translated shader identity"
+        );
         if record.module.stage() != translated.stage {
             return Err(MaxwellThreeDLoweringError::InvalidTranslatedShaders);
         }
@@ -3372,8 +3707,8 @@ fn lower_draw(
             });
             cache
                 .shader_translations
-                .get_mut(record_index)
-                .expect("validated shader translation index exists")
+                .get_mut(translated.cache_fingerprint)
+                .expect("validated shader translation fingerprint exists")
                 .published = true;
         }
     }
@@ -3601,24 +3936,55 @@ fn lower_draw(
         vec![id]
     };
 
-    let pipeline_key = PipelineKey {
-        method_dependencies: state
-            .pipeline_dependencies(&attachment_selection.color_targets().collect::<Vec<_>>()),
-        attachments: attachment_pipeline_key(resources, attachment_selection)?,
-        shaders: shaders.clone(),
-    };
-    let pipeline = if let Some(record) = cache
-        .pipelines
-        .iter()
-        .find(|record| record.key == pipeline_key)
-    {
+    let mut active_color_targets = [0; MAXWELL_COLOR_TARGET_COUNT];
+    let mut active_color_target_count = 0;
+    for target in attachment_selection.color_targets() {
+        active_color_targets[active_color_target_count] = target;
+        active_color_target_count += 1;
+    }
+    let pipeline_lookup = PipelineLookupKey::new(
+        state,
+        &active_color_targets[..active_color_target_count],
+        resources,
+        attachment_selection,
+        shaders,
+    )?;
+    let pipeline_fingerprint = nixe_gpu::cache_fingerprint(&pipeline_lookup);
+    let pipeline = if let Some(record) = cache.pipelines.get(pipeline_fingerprint) {
+        #[cfg(debug_assertions)]
+        assert!(
+            pipeline_lookup.matches(&record.key),
+            "XXH3-128 collision or incomplete Maxwell pipeline cache key"
+        );
         record.id
     } else {
+        let pipeline_key = pipeline_lookup.materialize();
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            pipeline_fingerprint,
+            nixe_gpu::cache_fingerprint(&pipeline_key),
+            "owned and borrowed Maxwell pipeline keys must hash identically"
+        );
         let id = PipelineId::new(take_identity(cache)?);
-        cache.pipelines.push(PipelineRecord {
-            key: pipeline_key,
-            id,
-        });
+        cache.pipelines.push(
+            pipeline_fingerprint,
+            PipelineRecord {
+                key: pipeline_key,
+                id,
+            },
+        );
+        if cache.pipelines.len() > cache.configuration.pipeline_entries() {
+            let (fingerprint, record) = cache.pipelines.remove_lru();
+            let retired = ResourceDependency::Pipeline(record.id);
+            log::debug!(
+                "Maxwell pipeline cache evicted LRU pipeline: id={} fingerprint={fingerprint:032x}",
+                record.id
+            );
+            if !invalidations.contains(&retired) {
+                invalidations.push(retired);
+            }
+        }
+        log::debug!("Maxwell pipeline cache miss: id={id} fingerprint={pipeline_fingerprint:032x}");
         creations.push(BackendResourceCreateInfo::Pipeline {
             id,
             description: PipelineDescription {
@@ -4006,21 +4372,6 @@ fn reject_draw_aliases(
         }
     }
     Ok(())
-}
-
-fn attachment_pipeline_key(
-    resources: &MaxwellThreeDResolvedResources,
-    selection: &DrawAttachmentSelection,
-) -> Result<Box<[PipelineAttachmentKey]>, MaxwellThreeDLoweringError> {
-    selection
-        .attachment_indices()
-        .into_iter()
-        .map(|index| {
-            let image = resolved_image(resources, index)?;
-            Ok(PipelineAttachmentKey(image.role(), image.description()))
-        })
-        .collect::<Result<Vec<_>, MaxwellThreeDLoweringError>>()
-        .map(Vec::into_boxed_slice)
 }
 
 fn view_key(resource: &MaxwellThreeDResolvedResource) -> ViewKey {
@@ -4736,16 +5087,69 @@ mod tests {
     use std::sync::Arc;
 
     use nixe_gpu::{
-        BufferId, DepthCompareOperation, PrimitiveTopology, ResourceDependency,
-        VertexComponentCount, VertexComponentWidth, VertexFormat,
+        BufferId, DepthCompareOperation, GpuCacheConfiguration, PrimitiveTopology,
+        ResourceDependency, ShaderId, ShaderInstruction, ShaderIr, ShaderOperation,
+        ShaderPredicate, ShaderSourceLocation, ShaderStage, VerifiedShaderIr, VertexComponentCount,
+        VertexComponentWidth, VertexFormat,
     };
 
     use crate::{MaxwellThreeDBegin, MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
     use super::{
-        MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, depth_stencil_attachment_required,
-        neutral_depth_compare, neutral_first_instance, neutral_vertex_format, primitive_topology,
+        MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, ShaderTranslationRecord,
+        SharedFingerprintCache, depth_stencil_attachment_required, neutral_depth_compare,
+        neutral_first_instance, neutral_vertex_format, primitive_topology,
     };
+
+    #[test]
+    fn fingerprint_index_tracks_hits_for_lru_eviction() {
+        let mut cache = SharedFingerprintCache::default();
+        cache.push(11, "first");
+        cache.push(22, "second");
+
+        assert_eq!(cache.get(11), Some(&"first"));
+        assert_eq!(cache.remove_lru(), (22, "second"));
+        assert_eq!(cache.get(22), None);
+        assert_eq!(cache.get(11), Some(&"first"));
+    }
+
+    #[test]
+    fn published_shader_translation_storage_is_bounded_and_retires_evictions() {
+        let verified = VerifiedShaderIr::verify(ShaderIr::new(
+            ShaderStage::Vertex,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ShaderInstruction::new(
+                ShaderSourceLocation::new(0),
+                ShaderPredicate::Always,
+                ShaderOperation::Exit,
+            )],
+        ))
+        .unwrap();
+        let module = nixe_gpu::lower_shader_ir_to_wgsl(&verified).unwrap();
+        let configuration = GpuCacheConfiguration::new(6, 1, 1, 1, 1).unwrap();
+        let mut cache = MaxwellThreeDLoweringCache::new(configuration);
+        for raw in 1..=7 {
+            cache.shader_translations.push(
+                raw as u128,
+                ShaderTranslationRecord {
+                    #[cfg(debug_assertions)]
+                    key: None,
+                    id: ShaderId::new(raw as u64),
+                    module: module.clone(),
+                    published: true,
+                },
+            );
+            cache.enforce_shader_translation_limit();
+        }
+
+        assert_eq!(cache.shader_translations.len(), 6);
+        assert_eq!(
+            cache.retired_resources.as_slice(),
+            [ResourceDependency::Shader(ShaderId::new(1))]
+        );
+    }
 
     #[test]
     fn lowering_cache_candidates_copy_only_modified_collections() {
@@ -4754,22 +5158,22 @@ mod tests {
 
         assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
         assert!(Arc::ptr_eq(
-            &cache.shader_translations.0,
-            &candidate.shader_translations.0
+            &cache.shader_translations.data,
+            &candidate.shader_translations.data
         ));
         candidate
-            .retired_shader_resources
+            .retired_resources
             .push(ResourceDependency::Buffer(BufferId::new(7)));
 
-        assert!(cache.retired_shader_resources.is_empty());
+        assert!(cache.retired_resources.is_empty());
         assert!(!Arc::ptr_eq(
-            &cache.retired_shader_resources.0,
-            &candidate.retired_shader_resources.0
+            &cache.retired_resources.0,
+            &candidate.retired_resources.0
         ));
         assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
         assert!(Arc::ptr_eq(
-            &cache.shader_translations.0,
-            &candidate.shader_translations.0
+            &cache.shader_translations.data,
+            &candidate.shader_translations.data
         ));
     }
 

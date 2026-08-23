@@ -1,17 +1,20 @@
 //! Persistent `wgpu` resource ownership, command lowering, and coherence.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
     AcceptedBackendSubmission, AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore,
     BackendDriver, BackendDriverError, BackendResourceCreateInfo, BackendResourceHandle,
     BackendSubmissionToken, BackingView, BlockLinearLayout, ClearOperation, ClearValue,
-    CopyOperation, DepthCompareOperation, DepthState, DrawArguments, DrawOperation, GpuCommand,
-    ImageDescription, ImageDimension, ImageFormat, ImageMemoryLayout, ImageOrigin, ImageRegion,
-    ImageSubresourceRange, IndexType, PipelineDescription, PipelineKind, PrimitiveTopology,
-    RenderAttachment, RenderPassOperation, ResourceDependency, ShaderStage, TriangleRasterization,
-    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
+    CopyOperation, DepthCompareOperation, DepthState, DrawArguments, DrawOperation,
+    GpuCacheConfiguration, GpuCommand, ImageDescription, ImageDimension, ImageFormat,
+    ImageMemoryLayout, ImageOrigin, ImageRegion, ImageSubresourceRange, IndexType,
+    PipelineDescription, PipelineKind, PrimitiveTopology, RenderAttachment, RenderPassOperation,
+    ResourceDependency, ShaderStage, TriangleRasterization, VertexBufferLayout, VertexFormat,
+    VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
     CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageId, ContentGeneration,
@@ -23,7 +26,7 @@ use wgpu::{
     BufferSize, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder,
     CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, ErrorFilter,
     ErrorScopeGuard, Extent3d, FragmentState, FrontFace, IndexFormat, LoadOp, MapMode,
-    MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PolygonMode,
+    MultisampleState, Operations, Origin3d, PipelineCache, PipelineCompilationOptions, PolygonMode,
     PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
     RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModule,
     ShaderModuleDescriptor, ShaderSource, StencilState, StoreOp, TexelCopyBufferInfo,
@@ -33,7 +36,7 @@ use wgpu::{
     VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
 };
 
-use crate::WgpuVisibilityCoordinator;
+use crate::{PIPELINE_CACHE_MAGIC, WgpuVisibilityCoordinator};
 
 enum Resource {
     Allocation,
@@ -55,10 +58,11 @@ enum Resource {
     },
     Pipeline {
         description: PipelineDescription,
-        render: HashMap<RenderPipelineKey, RenderPipeline>,
+        render: RenderPipelineCache,
     },
     DescriptorTable {
         bindings: Box<[nixe_gpu::DescriptorTableBinding]>,
+        bind_groups: HashMap<(u64, u32), CachedBindGroup>,
     },
     RenderPass,
     QueryPool,
@@ -146,6 +150,141 @@ impl ResourceContent {
     }
 }
 
+#[cfg(debug_assertions)]
+impl RenderPipelineKey {
+    fn new(
+        vertex: BackendResourceHandle,
+        fragment: BackendResourceHandle,
+        color_format: ImageFormat,
+        depth_format: Option<ImageFormat>,
+        draw: &DrawOperation,
+    ) -> Self {
+        Self {
+            vertex,
+            fragment,
+            topology: draw.topology,
+            triangle_rasterization: draw.triangle_rasterization,
+            alpha_test: draw.alpha_test,
+            color_format,
+            depth_format,
+            depth_state: draw.depth_state,
+            vertex_buffers: draw
+                .vertex_buffers
+                .iter()
+                .map(VertexPipelineLayoutKey::new)
+                .collect(),
+        }
+    }
+
+    fn matches(
+        &self,
+        vertex: BackendResourceHandle,
+        fragment: BackendResourceHandle,
+        color_format: ImageFormat,
+        depth_format: Option<ImageFormat>,
+        draw: &DrawOperation,
+    ) -> bool {
+        self.vertex == vertex
+            && self.fragment == fragment
+            && self.topology == draw.topology
+            && self.triangle_rasterization == draw.triangle_rasterization
+            && self.alpha_test == draw.alpha_test
+            && self.color_format == color_format
+            && self.depth_format == depth_format
+            && self.depth_state == draw.depth_state
+            && self.vertex_buffers.len() == draw.vertex_buffers.len()
+            && self
+                .vertex_buffers
+                .iter()
+                .zip(draw.vertex_buffers.iter())
+                .all(|(cached, current)| cached.matches(current))
+    }
+}
+
+struct RenderPipelineFingerprintInput<'a> {
+    vertex: BackendResourceHandle,
+    fragment: BackendResourceHandle,
+    topology: PrimitiveTopology,
+    triangle_rasterization: TriangleRasterization,
+    alpha_test: Option<AlphaTest>,
+    color_format: ImageFormat,
+    depth_format: Option<ImageFormat>,
+    depth_state: DepthState,
+    vertex_buffers: &'a [VertexBufferLayout],
+}
+
+impl Hash for RenderPipelineFingerprintInput<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vertex.hash(state);
+        self.fragment.hash(state);
+        self.topology.hash(state);
+        self.triangle_rasterization.hash(state);
+        self.alpha_test.hash(state);
+        self.color_format.hash(state);
+        self.depth_format.hash(state);
+        self.depth_state.hash(state);
+        self.vertex_buffers.len().hash(state);
+        for layout in self.vertex_buffers {
+            let pulled = layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.format.requires_vertex_pulling());
+            pulled.then_some(layout.buffer.range.offset()).hash(state);
+            layout.array_stride.hash(state);
+            layout.step_mode.hash(state);
+            layout.attributes.hash(state);
+        }
+    }
+}
+
+fn render_pipeline_fingerprint(
+    vertex: BackendResourceHandle,
+    fragment: BackendResourceHandle,
+    color_format: ImageFormat,
+    depth_format: Option<ImageFormat>,
+    draw: &DrawOperation,
+) -> u128 {
+    nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
+        vertex,
+        fragment,
+        topology: draw.topology,
+        triangle_rasterization: draw.triangle_rasterization,
+        alpha_test: draw.alpha_test,
+        color_format,
+        depth_format,
+        depth_state: draw.depth_state,
+        vertex_buffers: &draw.vertex_buffers,
+    })
+}
+
+#[cfg(debug_assertions)]
+impl VertexPipelineLayoutKey {
+    fn new(layout: &VertexBufferLayout) -> Self {
+        let pulled = layout
+            .attributes
+            .iter()
+            .any(|attribute| attribute.format.requires_vertex_pulling());
+        Self {
+            pulled_buffer_offset: pulled.then_some(layout.buffer.range.offset()),
+            array_stride: layout.array_stride,
+            step_mode: layout.step_mode,
+            attributes: layout.attributes.clone(),
+        }
+    }
+
+    fn matches(&self, layout: &VertexBufferLayout) -> bool {
+        let pulled = layout
+            .attributes
+            .iter()
+            .any(|attribute| attribute.format.requires_vertex_pulling());
+        self.pulled_buffer_offset == pulled.then_some(layout.buffer.range.offset())
+            && self.array_stride == layout.array_stride
+            && self.step_mode == layout.step_mode
+            && self.attributes == layout.attributes
+    }
+}
+
+#[cfg(debug_assertions)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RenderPipelineKey {
     vertex: BackendResourceHandle,
@@ -156,7 +295,90 @@ struct RenderPipelineKey {
     color_format: ImageFormat,
     depth_format: Option<ImageFormat>,
     depth_state: DepthState,
-    vertex_buffers: Box<[VertexBufferLayout]>,
+    vertex_buffers: Box<[VertexPipelineLayoutKey]>,
+}
+
+struct CachedRenderPipeline {
+    #[cfg(debug_assertions)]
+    key: RenderPipelineKey,
+    pipeline: RenderPipeline,
+    serial: u64,
+    last_used: u64,
+    vertex_pull_bind_groups: HashMap<u128, CachedVertexPullBindGroup>,
+}
+
+#[derive(Default)]
+struct RenderPipelineCache {
+    records: HashMap<u128, CachedRenderPipeline>,
+}
+
+impl RenderPipelineCache {
+    fn get(&self, fingerprint: u128) -> Option<&CachedRenderPipeline> {
+        self.records.get(&fingerprint)
+    }
+
+    fn touch(&mut self, fingerprint: u128, last_used: u64) -> Option<&CachedRenderPipeline> {
+        let pipeline = self.records.get_mut(&fingerprint)?;
+        pipeline.last_used = last_used;
+        Some(pipeline)
+    }
+
+    fn insert(
+        &mut self,
+        fingerprint: u128,
+        pipeline: CachedRenderPipeline,
+        capacity: usize,
+    ) -> Option<(u128, u64)> {
+        assert!(
+            !self.records.contains_key(&fingerprint),
+            "duplicate WGPU pipeline fingerprint insertion"
+        );
+        let evicted = if self.records.len() == capacity {
+            let evicted_fingerprint =
+                least_recent_key(&self.records, |pipeline| pipeline.last_used)
+                    .expect("configured WGPU pipeline cache is non-empty");
+            let pipeline = self
+                .records
+                .remove(&evicted_fingerprint)
+                .expect("selected WGPU pipeline LRU entry remains present");
+            Some((evicted_fingerprint, pipeline.serial))
+        } else {
+            None
+        };
+        self.records.insert(fingerprint, pipeline);
+        evicted
+    }
+}
+
+fn least_recent_key<K, V>(records: &HashMap<K, V>, last_used: impl Fn(&V) -> u64) -> Option<K>
+where
+    K: Copy + Eq + Hash,
+{
+    records
+        .iter()
+        .min_by_key(|(_, value)| last_used(value))
+        .map(|(key, _)| *key)
+}
+
+struct CachedBindGroup {
+    bind_group: BindGroup,
+    last_used: u64,
+}
+
+struct CachedVertexPullBindGroup {
+    #[cfg(debug_assertions)]
+    key: Box<[(u32, BackendResourceHandle)]>,
+    bind_group: BindGroup,
+    last_used: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VertexPipelineLayoutKey {
+    pulled_buffer_offset: Option<u64>,
+    array_stride: u64,
+    step_mode: VertexStepMode,
+    attributes: Box<[nixe_gpu::VertexAttribute]>,
 }
 
 enum PendingWriteback {
@@ -256,6 +478,8 @@ pub(crate) struct WgpuBackendDriver {
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
     next_use: u64,
+    next_cache_use: u64,
+    next_pipeline_serial: u64,
     upload_staging: StagingBelt,
     upload_bytes: u64,
     upload_canonical: Vec<u8>,
@@ -264,6 +488,8 @@ pub(crate) struct WgpuBackendDriver {
     transfer_ranges: Vec<TransferRange>,
     uploaded_generations: Vec<ContentGeneration>,
     dirty_image_bindings: Vec<usize>,
+    vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
+    draw_bind_groups: Vec<Vec<BindGroup>>,
     uploaded_inputs: HashSet<BackendResourceHandle>,
     readback_pool: Vec<Buffer>,
     readback_pool_bytes: u64,
@@ -271,6 +497,9 @@ pub(crate) struct WgpuBackendDriver {
     resident_resource_bytes: u64,
     device_loss: Arc<Mutex<Option<Box<str>>>>,
     backend_error: Arc<Mutex<Option<Box<str>>>>,
+    pipeline_cache: Option<PipelineCache>,
+    pipeline_cache_path: Option<PathBuf>,
+    cache_configuration: GpuCacheConfiguration,
     torn_down: bool,
 }
 
@@ -279,6 +508,9 @@ impl WgpuBackendDriver {
         device: Device,
         queue: Queue,
         visibility: Arc<WgpuVisibilityCoordinator>,
+        pipeline_cache: Option<PipelineCache>,
+        pipeline_cache_path: Option<PathBuf>,
+        cache_configuration: GpuCacheConfiguration,
     ) -> Self {
         let device_loss = Arc::new(Mutex::new(None));
         let callback_state = Arc::clone(&device_loss);
@@ -307,6 +539,8 @@ impl WgpuBackendDriver {
             completion_sender,
             completion_receiver,
             next_use: 1,
+            next_cache_use: 1,
+            next_pipeline_serial: 1,
             upload_staging,
             upload_bytes: 0,
             upload_canonical: Vec::new(),
@@ -315,6 +549,8 @@ impl WgpuBackendDriver {
             transfer_ranges: Vec::new(),
             uploaded_generations: Vec::new(),
             dirty_image_bindings: Vec::new(),
+            vertex_pull_binding_key: Vec::new(),
+            draw_bind_groups: Vec::new(),
             uploaded_inputs: HashSet::new(),
             readback_pool: Vec::new(),
             readback_pool_bytes: 0,
@@ -322,6 +558,9 @@ impl WgpuBackendDriver {
             resident_resource_bytes: 0,
             device_loss,
             backend_error,
+            pipeline_cache,
+            pipeline_cache_path,
+            cache_configuration,
             torn_down: false,
         }
     }
@@ -373,9 +612,82 @@ impl WgpuBackendDriver {
         self.transfer_ranges = Vec::new();
         self.uploaded_generations = Vec::new();
         self.dirty_image_bindings = Vec::new();
+        self.vertex_pull_binding_key = Vec::new();
+        self.draw_bind_groups = Vec::new();
         self.readback_pool_bytes = 0;
         self.resident_resources = 0;
         self.resident_resource_bytes = 0;
+    }
+
+    fn persist_pipeline_cache(&self) -> Result<(), BackendDriverError> {
+        let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) else {
+            return Ok(());
+        };
+        let Some(data) = cache.get_data() else {
+            return Ok(());
+        };
+        if data.len() as u64 > self.cache_configuration.persistent_pipeline_cache_bytes() {
+            return Err(BackendDriverError::failure(format!(
+                "wgpu pipeline cache exceeds its configured {} byte storage bound",
+                self.cache_configuration.persistent_pipeline_cache_bytes()
+            )));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            BackendDriverError::failure("wgpu pipeline cache path has no parent directory")
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            BackendDriverError::failure(format!(
+                "cannot create pipeline cache directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = std::fs::File::create(&temporary).map_err(|error| {
+            BackendDriverError::failure(format!(
+                "cannot create pipeline cache {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        use std::io::Write;
+        file.write_all(PIPELINE_CACHE_MAGIC)
+            .and_then(|()| file.write_all(&data))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                BackendDriverError::failure(format!(
+                    "cannot write pipeline cache {}: {error}",
+                    temporary.display()
+                ))
+            })?;
+        #[cfg(target_os = "windows")]
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(BackendDriverError::failure(format!(
+                "cannot replace pipeline cache {}: {error}",
+                path.display()
+            )));
+        }
+        std::fs::rename(&temporary, path).map_err(|error| {
+            BackendDriverError::failure(format!(
+                "cannot publish pipeline cache {}: {error}",
+                path.display()
+            ))
+        })?;
+        log::info!(
+            "saved WGPU pipeline cache: path={} bytes={}",
+            path.display(),
+            data.len()
+        );
+        Ok(())
+    }
+
+    fn take_cache_use(&mut self) -> Result<u64, BackendDriverError> {
+        let use_serial = self.next_cache_use;
+        self.next_cache_use = self
+            .next_cache_use
+            .checked_add(1)
+            .ok_or_else(|| BackendDriverError::failure("WGPU cache LRU sequence exhausted"))?;
+        Ok(use_serial)
     }
 
     fn capture_error_scope(&self, scope: ErrorScopeGuard) -> Result<(), BackendDriverError> {
@@ -949,15 +1261,25 @@ impl WgpuBackendDriver {
         let depth_attachment = depth_index
             .map(|index| depth_operations(&views[index], &attachments[index]))
             .transpose()?;
-        let draw_bind_groups = operations[1..operations.len() - 1]
-            .iter()
-            .filter_map(|operation| match operation.command() {
-                GpuCommand::Draw(draw) => {
-                    Some(self.create_draw_bind_groups(dependencies, attachments, draw))
-                }
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);
+        let mut draw_count = 0;
+        for operation in &operations[1..operations.len() - 1] {
+            let GpuCommand::Draw(draw) = operation.command() else {
+                continue;
+            };
+            if draw_count == draw_bind_groups.len() {
+                draw_bind_groups.push(Vec::new());
+            }
+            draw_bind_groups[draw_count].clear();
+            self.create_draw_bind_groups(
+                dependencies,
+                attachments,
+                draw,
+                &mut draw_bind_groups[draw_count],
+            )?;
+            draw_count += 1;
+        }
+        draw_bind_groups.truncate(draw_count);
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Nixe neutral render pass"),
             color_attachments: &color_attachments,
@@ -1062,118 +1384,279 @@ impl WgpuBackendDriver {
             }
             draw_index += 1;
         }
+        drop(pass);
+        for groups in &mut draw_bind_groups {
+            groups.clear();
+        }
+        self.draw_bind_groups = draw_bind_groups;
         Ok(())
     }
 
     fn create_draw_bind_groups(
+        &mut self,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        attachments: &[RenderAttachment],
+        draw: &DrawOperation,
+        groups: &mut Vec<BindGroup>,
+    ) -> Result<(), BackendDriverError> {
+        let (pipeline_handle, pipeline_fingerprint) =
+            self.render_pipeline_location(dependencies, attachments, draw)?;
+        let (pipeline, pipeline_serial) = {
+            let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
+                return Err(kind_mismatch(pipeline_handle));
+            };
+            let cached = render
+                .get(pipeline_fingerprint)
+                .ok_or_else(|| unsupported("render pipeline was not compiled"))?;
+            (cached.pipeline.clone(), cached.serial)
+        };
+        groups.reserve(draw.descriptor_tables.len() + 1);
+        for (group, table) in draw.descriptor_tables.iter().enumerate() {
+            let group =
+                u32::try_from(group).map_err(|_| unsupported("descriptor-table group overflow"))?;
+            let table_handle =
+                dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
+            let cache_use = self.take_cache_use()?;
+            let bind_group_capacity = self.cache_configuration.bind_groups_per_descriptor_table();
+            let cached = {
+                let record = self.resource_record_mut(table_handle)?;
+                let Some(Resource::DescriptorTable { bind_groups, .. }) = record.host.as_mut()
+                else {
+                    return Err(kind_mismatch(table_handle));
+                };
+                bind_groups
+                    .get_mut(&(pipeline_serial, group))
+                    .map(|cached| {
+                        cached.last_used = cache_use;
+                        cached.bind_group.clone()
+                    })
+            };
+            if let Some(cached) = cached {
+                groups.push(cached);
+                continue;
+            }
+            log::debug!(
+                "WGPU bind-group cache miss: descriptor={table_handle} pipeline-serial={pipeline_serial} group={group}"
+            );
+            let bindings = {
+                let record = self.resource_record(table_handle)?;
+                let Some(Resource::DescriptorTable { bindings, .. }) = record.host.as_ref() else {
+                    return Err(kind_mismatch(table_handle));
+                };
+                bindings.clone()
+            };
+            let image_views = bindings
+                .iter()
+                .filter_map(|binding| {
+                    let ResourceDependency::Image(image) = binding.resource else {
+                        return None;
+                    };
+                    Some(
+                        dependency_handle(dependencies, ResourceDependency::Image(image)).and_then(
+                            |handle| match self.resource(handle)? {
+                                Resource::Image {
+                                    texture,
+                                    description,
+                                    ..
+                                } => Ok((
+                                    binding.binding,
+                                    texture.create_view(&sampled_texture_view_descriptor(
+                                        *description,
+                                    )),
+                                )),
+                                _ => Err(kind_mismatch(handle)),
+                            },
+                        ),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let entries = bindings
+                .iter()
+                .map(|binding| {
+                    let handle = dependency_handle(dependencies, binding.resource)?;
+                    let resource = match self.resource(handle)? {
+                        Resource::Buffer { buffer, .. } => buffer.as_entire_binding(),
+                        Resource::Image { .. } => BindingResource::TextureView(
+                            &image_views
+                                .iter()
+                                .find(|(candidate, _)| *candidate == binding.binding)
+                                .ok_or_else(|| unsupported("missing sampled-image view"))?
+                                .1,
+                        ),
+                        Resource::Sampler { sampler } => BindingResource::Sampler(sampler),
+                        _ => return Err(kind_mismatch(handle)),
+                    };
+                    Ok(BindGroupEntry {
+                        binding: u32::from(binding.binding),
+                        resource,
+                    })
+                })
+                .collect::<Result<Vec<_>, BackendDriverError>>()?;
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Nixe neutral descriptor table"),
+                layout: &pipeline.get_bind_group_layout(group),
+                entries: &entries,
+            });
+            let record = self.resource_record_mut(table_handle)?;
+            let Some(Resource::DescriptorTable { bind_groups, .. }) = record.host.as_mut() else {
+                return Err(kind_mismatch(table_handle));
+            };
+            if bind_groups.len() == bind_group_capacity {
+                let key = least_recent_key(bind_groups, |cached| cached.last_used)
+                    .expect("configured WGPU bind-group cache is non-empty");
+                bind_groups
+                    .remove(&key)
+                    .expect("selected WGPU bind-group LRU entry remains present");
+                log::debug!(
+                    "WGPU bind-group cache evicted LRU entry: descriptor={table_handle} pipeline-serial={} group={}",
+                    key.0,
+                    key.1
+                );
+            }
+            bind_groups.insert(
+                (pipeline_serial, group),
+                CachedBindGroup {
+                    bind_group: bind_group.clone(),
+                    last_used: cache_use,
+                },
+            );
+            groups.push(bind_group);
+        }
+        if draw.vertex_buffers.iter().any(|layout| {
+            layout
+                .attributes
+                .iter()
+                .any(|attribute| attribute.format.requires_vertex_pulling())
+        }) {
+            let group = u32::try_from(draw.descriptor_tables.len())
+                .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
+            let mut key = std::mem::take(&mut self.vertex_pull_binding_key);
+            key.clear();
+            for (slot, layout) in draw
+                .vertex_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, layout)| {
+                    layout
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.format.requires_vertex_pulling())
+                })
+            {
+                key.push((
+                    u32::try_from(slot).map_err(|_| unsupported("vertex-pull binding overflow"))?,
+                    dependency_handle(
+                        dependencies,
+                        ResourceDependency::Buffer(layout.buffer.buffer),
+                    )?,
+                ));
+            }
+            let fingerprint = nixe_gpu::cache_fingerprint(&key);
+            let cache_use = self.take_cache_use()?;
+            let cached = {
+                let record = self.resource_record_mut(pipeline_handle)?;
+                let Some(Resource::Pipeline { render, .. }) = record.host.as_mut() else {
+                    return Err(kind_mismatch(pipeline_handle));
+                };
+                let cached = render
+                    .records
+                    .get_mut(&pipeline_fingerprint)
+                    .expect("compiled render pipeline remains resident")
+                    .vertex_pull_bind_groups
+                    .get_mut(&fingerprint);
+                if let Some(cached) = cached {
+                    cached.last_used = cache_use;
+                    #[cfg(debug_assertions)]
+                    assert_eq!(
+                        cached.key.as_ref(),
+                        key.as_slice(),
+                        "XXH3-128 collision or incomplete vertex-pull bind-group key"
+                    );
+                    Some(cached.bind_group.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(bind_group) = cached {
+                groups.push(bind_group);
+                self.vertex_pull_binding_key = key;
+                return Ok(());
+            }
+            log::debug!(
+                "WGPU vertex-pull bind-group cache miss: pipeline-serial={pipeline_serial} fingerprint={fingerprint:032x}"
+            );
+            let entries = key
+                .iter()
+                .map(|(binding, handle)| {
+                    Ok(BindGroupEntry {
+                        binding: *binding,
+                        resource: self.buffer(*handle)?.as_entire_binding(),
+                    })
+                })
+                .collect::<Result<Vec<_>, BackendDriverError>>()?;
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Nixe vertex-pull buffers"),
+                layout: &pipeline.get_bind_group_layout(group),
+                entries: &entries,
+            });
+            let capacity = self.cache_configuration.bind_groups_per_descriptor_table();
+            let record = self.resource_record_mut(pipeline_handle)?;
+            let Some(Resource::Pipeline { render, .. }) = record.host.as_mut() else {
+                return Err(kind_mismatch(pipeline_handle));
+            };
+            let cache = &mut render
+                .records
+                .get_mut(&pipeline_fingerprint)
+                .expect("compiled render pipeline remains resident")
+                .vertex_pull_bind_groups;
+            if cache.len() == capacity {
+                let evicted = least_recent_key(cache, |cached| cached.last_used)
+                    .expect("configured vertex-pull bind-group cache is non-empty");
+                cache
+                    .remove(&evicted)
+                    .expect("selected vertex-pull LRU entry remains present");
+                log::debug!(
+                    "WGPU vertex-pull bind-group cache evicted LRU entry: pipeline-serial={pipeline_serial} fingerprint={evicted:032x}"
+                );
+            }
+            cache.insert(
+                fingerprint,
+                CachedVertexPullBindGroup {
+                    #[cfg(debug_assertions)]
+                    key: key.clone().into_boxed_slice(),
+                    bind_group: bind_group.clone(),
+                    last_used: cache_use,
+                },
+            );
+            groups.push(bind_group);
+            self.vertex_pull_binding_key = key;
+        }
+        Ok(())
+    }
+
+    fn render_pipeline_location(
         &self,
         dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
-    ) -> Result<Vec<BindGroup>, BackendDriverError> {
-        let pipeline = self.render_pipeline(dependencies, attachments, draw)?;
-        let mut groups = draw
-            .descriptor_tables
+    ) -> Result<(BackendResourceHandle, u128), BackendDriverError> {
+        let pipeline =
+            dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
+        let vertex = self.shader_handle_for_stage(dependencies, ShaderStage::Vertex)?;
+        let fragment = self.shader_handle_for_stage(dependencies, ShaderStage::Fragment)?;
+        let color_format = attachments
             .iter()
-            .enumerate()
-            .map(|(group, table)| {
-                let table_handle =
-                    dependency_handle(dependencies, ResourceDependency::DescriptorTable(*table))?;
-                let Resource::DescriptorTable { bindings } = self.resource(table_handle)? else {
-                    return Err(kind_mismatch(table_handle));
-                };
-                let image_views = bindings
-                    .iter()
-                    .filter_map(|binding| {
-                        let ResourceDependency::Image(image) = binding.resource else {
-                            return None;
-                        };
-                        Some(
-                            dependency_handle(dependencies, ResourceDependency::Image(image))
-                                .and_then(|handle| match self.resource(handle)? {
-                                    Resource::Image {
-                                        texture,
-                                        description,
-                                        ..
-                                    } => Ok((
-                                        binding.binding,
-                                        texture.create_view(&sampled_texture_view_descriptor(
-                                            *description,
-                                        )),
-                                    )),
-                                    _ => Err(kind_mismatch(handle)),
-                                }),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let entries = bindings
-                    .iter()
-                    .map(|binding| {
-                        let handle = dependency_handle(dependencies, binding.resource)?;
-                        let resource = match self.resource(handle)? {
-                            Resource::Buffer { buffer, .. } => buffer.as_entire_binding(),
-                            Resource::Image { .. } => BindingResource::TextureView(
-                                &image_views
-                                    .iter()
-                                    .find(|(candidate, _)| *candidate == binding.binding)
-                                    .ok_or_else(|| unsupported("missing sampled-image view"))?
-                                    .1,
-                            ),
-                            Resource::Sampler { sampler } => BindingResource::Sampler(sampler),
-                            _ => return Err(kind_mismatch(handle)),
-                        };
-                        Ok(BindGroupEntry {
-                            binding: u32::from(binding.binding),
-                            resource,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, BackendDriverError>>()?;
-                let group = u32::try_from(group)
-                    .map_err(|_| unsupported("descriptor-table group overflow"))?;
-                let layout = pipeline.get_bind_group_layout(group);
-                Ok(self.device.create_bind_group(&BindGroupDescriptor {
-                    label: Some("Nixe neutral descriptor table"),
-                    layout: &layout,
-                    entries: &entries,
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pulled_layouts = draw
-            .vertex_buffers
+            .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
+            .ok_or_else(|| unsupported("graphics draw without color attachment"))?
+            .format;
+        let depth_format = attachments
             .iter()
-            .enumerate()
-            .filter(|(_, layout)| {
-                layout
-                    .attributes
-                    .iter()
-                    .any(|attribute| attribute.format.requires_vertex_pulling())
-            })
-            .collect::<Vec<_>>();
-        if !pulled_layouts.is_empty() {
-            let group = u32::try_from(draw.descriptor_tables.len())
-                .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
-            let entries = pulled_layouts
-                .into_iter()
-                .map(|(slot, layout)| {
-                    let handle = dependency_handle(
-                        dependencies,
-                        ResourceDependency::Buffer(layout.buffer.buffer),
-                    )?;
-                    let buffer = self.buffer(handle)?;
-                    Ok(BindGroupEntry {
-                        binding: u32::try_from(slot)
-                            .map_err(|_| unsupported("vertex-pull binding overflow"))?,
-                        resource: buffer.as_entire_binding(),
-                    })
-                })
-                .collect::<Result<Vec<_>, BackendDriverError>>()?;
-            groups.push(self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("Nixe vertex-pull buffers"),
-                layout: &pipeline.get_bind_group_layout(group),
-                entries: &entries,
-            }));
-        }
-        Ok(groups)
+            .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
+            .map(|attachment| attachment.format);
+        Ok((
+            pipeline,
+            render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw),
+        ))
     }
 
     fn ensure_render_pipeline(
@@ -1184,10 +1667,8 @@ impl WgpuBackendDriver {
     ) -> Result<(), BackendDriverError> {
         let pipeline_handle =
             dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let (vertex_handle, vertex, vertex_ir) =
-            self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
-        let (fragment_handle, fragment, _) =
-            self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
+        let vertex_handle = self.shader_handle_for_stage(dependencies, ShaderStage::Vertex)?;
+        let fragment_handle = self.shader_handle_for_stage(dependencies, ShaderStage::Fragment)?;
         let color_format = attachments
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
@@ -1197,30 +1678,58 @@ impl WgpuBackendDriver {
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
             .map(|attachment| attachment.format);
-        let key = RenderPipelineKey {
-            vertex: vertex_handle,
-            fragment: fragment_handle,
-            topology: draw.topology,
-            triangle_rasterization: draw.triangle_rasterization,
-            alpha_test: draw.alpha_test,
-            color_format,
-            depth_format,
-            depth_state: draw.depth_state,
-            vertex_buffers: draw.vertex_buffers.clone(),
-        };
-        let Resource::Pipeline {
-            description,
-            render,
-        } = self.resource(pipeline_handle)?
-        else {
+        let Resource::Pipeline { description, .. } = self.resource(pipeline_handle)? else {
             return Err(kind_mismatch(pipeline_handle));
         };
         if description.kind != PipelineKind::Graphics {
             return Err(unsupported("compute pipeline used for draw"));
         }
-        if render.contains_key(&key) {
+        let fingerprint = render_pipeline_fingerprint(
+            vertex_handle,
+            fragment_handle,
+            color_format,
+            depth_format,
+            draw,
+        );
+        let cache_use = self.take_cache_use()?;
+        let pipeline_variant_capacity = self.cache_configuration.pipeline_variants_per_resource();
+        let cache_hit = {
+            let record = self.resource_record_mut(pipeline_handle)?;
+            let Some(Resource::Pipeline { render, .. }) = record.host.as_mut() else {
+                return Err(kind_mismatch(pipeline_handle));
+            };
+            let cached = render.touch(fingerprint, cache_use);
+            #[cfg(debug_assertions)]
+            if let Some(cached) = cached {
+                assert!(
+                    cached.key.matches(
+                        vertex_handle,
+                        fragment_handle,
+                        color_format,
+                        depth_format,
+                        draw,
+                    ),
+                    "XXH3-128 collision or incomplete WGPU pipeline cache key"
+                );
+            }
+            cached.is_some()
+        };
+        if cache_hit {
             return Ok(());
         }
+        log::debug!(
+            "WGPU pipeline cache miss; compiling host pipeline: neutral={pipeline_handle} fingerprint={fingerprint:032x}"
+        );
+        let (_, vertex, vertex_ir) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
+        let (_, fragment, _) = self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
+        #[cfg(debug_assertions)]
+        let key = RenderPipelineKey::new(
+            vertex_handle,
+            fragment_handle,
+            color_format,
+            depth_format,
+            draw,
+        );
         let target = ColorTargetState {
             format: texture_format(color_format)
                 .ok_or_else(|| unsupported("color attachment format"))?,
@@ -1344,9 +1853,13 @@ impl WgpuBackendDriver {
                     targets: &targets,
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: self.pipeline_cache.as_ref(),
             });
         self.capture_error_scope(scope)?;
+        let serial = self.next_pipeline_serial;
+        self.next_pipeline_serial = self.next_pipeline_serial.checked_add(1).ok_or_else(|| {
+            BackendDriverError::failure("wgpu compiled-pipeline identity exhausted")
+        })?;
         let Some(ResourceRecord {
             host: Some(Resource::Pipeline { render, .. }),
             ..
@@ -1354,8 +1867,40 @@ impl WgpuBackendDriver {
         else {
             return Err(kind_mismatch(pipeline_handle));
         };
-        render.insert(key, pipeline);
+        let evicted = render.insert(
+            fingerprint,
+            CachedRenderPipeline {
+                #[cfg(debug_assertions)]
+                key,
+                pipeline,
+                serial,
+                last_used: cache_use,
+                vertex_pull_bind_groups: HashMap::new(),
+            },
+            pipeline_variant_capacity,
+        );
+        if let Some((evicted_fingerprint, evicted_serial)) = evicted {
+            log::debug!(
+                "WGPU pipeline cache evicted LRU variant: neutral={pipeline_handle} serial={evicted_serial} fingerprint={evicted_fingerprint:032x}"
+            );
+        }
         Ok(())
+    }
+
+    fn cached_render_pipeline(
+        &self,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        attachments: &[RenderAttachment],
+        draw: &DrawOperation,
+    ) -> Result<&CachedRenderPipeline, BackendDriverError> {
+        let (pipeline_handle, fingerprint) =
+            self.render_pipeline_location(dependencies, attachments, draw)?;
+        let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
+            return Err(kind_mismatch(pipeline_handle));
+        };
+        render
+            .get(fingerprint)
+            .ok_or_else(|| unsupported("render pipeline was not compiled"))
     }
 
     fn render_pipeline(
@@ -1364,34 +1909,30 @@ impl WgpuBackendDriver {
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
     ) -> Result<&RenderPipeline, BackendDriverError> {
-        let pipeline_handle =
-            dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let (vertex, _, _) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
-        let (fragment, _, _) = self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
-        let key = RenderPipelineKey {
-            vertex,
-            fragment,
-            topology: draw.topology,
-            triangle_rasterization: draw.triangle_rasterization,
-            alpha_test: draw.alpha_test,
-            color_format: attachments
-                .iter()
-                .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
-                .ok_or_else(|| unsupported("graphics draw without color attachment"))?
-                .format,
-            depth_format: attachments
-                .iter()
-                .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
-                .map(|attachment| attachment.format),
-            depth_state: draw.depth_state,
-            vertex_buffers: draw.vertex_buffers.clone(),
-        };
-        let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
-            return Err(kind_mismatch(pipeline_handle));
-        };
-        render
-            .get(&key)
-            .ok_or_else(|| unsupported("render pipeline was not compiled"))
+        self.cached_render_pipeline(dependencies, attachments, draw)
+            .map(|cached| &cached.pipeline)
+    }
+
+    fn shader_handle_for_stage(
+        &self,
+        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        stage: ShaderStage,
+    ) -> Result<BackendResourceHandle, BackendDriverError> {
+        let mut found = None;
+        for handle in dependencies.values().copied() {
+            if let Some(ResourceRecord {
+                host: Some(Resource::Shader { neutral, .. }),
+                ..
+            }) = self.resources.get(&handle)
+                && neutral.stage() == stage
+            {
+                if found.is_some() {
+                    return Err(unsupported("multiple shaders for one pipeline stage"));
+                }
+                found = Some(handle);
+            }
+        }
+        found.ok_or_else(|| unsupported("missing shader stage"))
     }
 
     fn shader_for_stage(
@@ -1406,21 +1947,11 @@ impl WgpuBackendDriver {
         ),
         BackendDriverError,
     > {
-        let mut found = None;
-        for handle in dependencies.values().copied() {
-            if let Some(ResourceRecord {
-                host: Some(Resource::Shader { module, neutral }),
-                ..
-            }) = self.resources.get(&handle)
-                && neutral.stage() == stage
-            {
-                if found.is_some() {
-                    return Err(unsupported("multiple shaders for one pipeline stage"));
-                }
-                found = Some((handle, module.clone(), neutral.clone()));
-            }
-        }
-        found.ok_or_else(|| unsupported("missing shader stage"))
+        let handle = self.shader_handle_for_stage(dependencies, stage)?;
+        let Resource::Shader { module, neutral } = self.resource(handle)? else {
+            return Err(kind_mismatch(handle));
+        };
+        Ok((handle, module.clone(), neutral.clone()))
     }
 
     fn encode_buffer_writeback(
@@ -1785,11 +2316,12 @@ impl WgpuBackendDriver {
             },
             BackendResourceCreateInfo::Pipeline { description, .. } => Resource::Pipeline {
                 description: *description,
-                render: HashMap::new(),
+                render: RenderPipelineCache::default(),
             },
             BackendResourceCreateInfo::DescriptorTable { bindings, .. } => {
                 Resource::DescriptorTable {
                     bindings: bindings.clone(),
+                    bind_groups: HashMap::new(),
                 }
             }
             BackendResourceCreateInfo::RenderPass { .. } => Resource::RenderPass,
@@ -2191,9 +2723,10 @@ impl BackendDriver for WgpuBackendDriver {
         if self.torn_down {
             return Ok(());
         }
+        let cache_result = self.persist_pipeline_cache();
         self.clear_owned_state();
         self.torn_down = true;
-        Ok(())
+        cache_result
     }
 }
 
@@ -3332,10 +3865,14 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use nixe_gpu::{
-        BackendInstanceId, BackendResourceHandle, BackendResourceKind, BlockLinearLayout,
-        DepthCompareOperation, ImageDescription, ImageDimension, ImageExtent, ImageFormat,
-        ImageKind, ImageMemoryLayout, SampleCount, TriangleRasterization, ViewportTransform,
+        BackendInstanceId, BackendResourceHandle, BackendResourceKind, BlockLinearLayout, BufferId,
+        BufferRange, BufferRegion, DepthCompareOperation, DepthState, ImageDescription,
+        ImageDimension, ImageExtent, ImageFormat, ImageKind, ImageMemoryLayout, PrimitiveTopology,
+        SampleCount, TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexFormat,
+        VertexStepMode, ViewportTransform,
     };
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
     use wgpu::{CompareFunction, TextureFormat, TextureUsages, TextureViewDimension};
@@ -3343,11 +3880,78 @@ mod tests {
     use super::{
         DemandedBufferWriteback, DemandedWriteback, DeviceWrite, DeviceWriteRegion, ImageCopyShape,
         MAX_DEVICE_WRITE_REGIONS, TransferRange, WebGpuViewport, collect_dirty_buffer_ranges,
-        compare_function, image_texture_plan, linearize_canonical_image,
+        compare_function, image_texture_plan, least_recent_key, linearize_canonical_image,
         prepare_demanded_writebacks, record_buffer_device_write, sampled_texture_view_descriptor,
         subtract_completed_buffer_write, vertex_entry_point, webgpu_viewport,
         write_linear_image_to_canonical,
     };
+
+    #[test]
+    fn bounded_backend_caches_select_the_least_recently_used_entry() {
+        let records = HashMap::from([(11_u32, 40_u64), (22, 10), (33, 30)]);
+
+        assert_eq!(least_recent_key(&records, |last_used| *last_used), Some(22));
+    }
+
+    #[test]
+    fn pipeline_vertex_layout_ignores_buffer_identity_but_keeps_shader_specialization() {
+        let layout = |buffer, offset, format| {
+            VertexBufferLayout::new(
+                BufferRegion {
+                    buffer: BufferId::new(buffer),
+                    range: BufferRange::new(offset, 64).unwrap(),
+                },
+                8,
+                VertexStepMode::Vertex,
+                vec![VertexAttribute {
+                    format,
+                    offset: 0,
+                    shader_location: 0,
+                }],
+            )
+            .unwrap()
+        };
+        let native = super::VertexPipelineLayoutKey::new(&layout(1, 0, VertexFormat::Float32x2));
+        assert!(native.matches(&layout(2, 16, VertexFormat::Float32x2)));
+
+        let pulled = super::VertexPipelineLayoutKey::new(&layout(1, 4, VertexFormat::Uint8x2));
+        assert!(pulled.matches(&layout(2, 4, VertexFormat::Uint8x2)));
+        assert!(!pulled.matches(&layout(2, 8, VertexFormat::Uint8x2)));
+
+        let shader = |slot| {
+            BackendResourceHandle::new(
+                BackendInstanceId::new(1),
+                slot,
+                1,
+                BackendResourceKind::Shader,
+            )
+        };
+        let fingerprint = |layout: &VertexBufferLayout| {
+            nixe_gpu::cache_fingerprint(&super::RenderPipelineFingerprintInput {
+                vertex: shader(1),
+                fragment: shader(2),
+                topology: PrimitiveTopology::Triangles,
+                triangle_rasterization: TriangleRasterization::Fill,
+                alpha_test: None,
+                color_format: ImageFormat::Rgba8Unorm,
+                depth_format: None,
+                depth_state: DepthState::DISABLED,
+                vertex_buffers: std::slice::from_ref(layout),
+            })
+        };
+        assert_eq!(
+            fingerprint(&layout(1, 0, VertexFormat::Float32x2)),
+            fingerprint(&layout(2, 16, VertexFormat::Float32x2))
+        );
+        assert_eq!(
+            fingerprint(&layout(1, 4, VertexFormat::Uint8x2)),
+            fingerprint(&layout(2, 4, VertexFormat::Uint8x2))
+        );
+        assert_ne!(
+            fingerprint(&layout(1, 4, VertexFormat::Uint8x2)),
+            fingerprint(&layout(2, 8, VertexFormat::Uint8x2))
+        );
+    }
 
     #[test]
     fn buffer_upload_tracking_selects_only_modified_aligned_bytes() {
