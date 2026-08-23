@@ -22,7 +22,7 @@ use crate::{
     MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization,
-    shader::{MaxwellStagedShaderWrite, prepare_maxwell_shader_translation_inputs},
+    shader::{MaxwellStagedShaderWrite, prepare_maxwell_shader_translation_source},
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
@@ -454,14 +454,13 @@ pub fn preflight_maxwell_submission_execution(
                     operation.trigger(),
                     crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
                 ) {
-                    let inputs = prepare_maxwell_shader_translation_inputs(
+                    let source = prepare_maxwell_shader_translation_source(
                         operation.state(),
-                        address_space,
                         &staged_shader_writes,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
                     let programs = staged_cache
-                        .resolve_shader_translation_inputs(inputs)
+                        .resolve_shader_translation_source(source, address_space)
                         .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
                     let translated = staged_cache
                         .stage_shader_translations(&programs)
@@ -786,8 +785,10 @@ impl MaxwellBackendExecution {
                     self.creations.extend_from_slice(work.resource_creations());
                     self.invalidations
                         .extend_from_slice(work.resource_invalidations());
-                    self.operations
-                        .extend_from_slice(work.submission().operations());
+                    append_batchable_operations(
+                        &mut self.operations,
+                        work.submission().operations(),
+                    );
                     self.next_step += 1;
                 }
             }
@@ -908,6 +909,62 @@ fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
         MaxwellSubmissionExecutionStep::BackendOperation(_)
             | MaxwellSubmissionExecutionStep::ThreeD(_)
     )
+}
+
+fn append_batchable_operations(target: &mut Vec<GpuOperation>, operations: &[GpuOperation]) {
+    if render_passes_can_merge(target, operations) {
+        target.pop();
+        target.extend_from_slice(&operations[1..]);
+    } else {
+        target.extend_from_slice(operations);
+    }
+}
+
+fn render_passes_can_merge(left: &[GpuOperation], right: &[GpuOperation]) -> bool {
+    let (
+        Some(GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::End {
+            render_pass: left_pass,
+        })),
+        Some(GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::Begin {
+            render_pass: right_pass,
+            attachments: right_attachments,
+        })),
+    ) = (
+        left.last().map(GpuOperation::command),
+        right.first().map(GpuOperation::command),
+    )
+    else {
+        return false;
+    };
+    if left_pass != right_pass {
+        return false;
+    }
+    let Some(left_attachments) = left.iter().rev().find_map(|operation| {
+        let GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::Begin {
+            render_pass,
+            attachments,
+        }) = operation.command()
+        else {
+            return None;
+        };
+        (render_pass == left_pass).then_some(attachments.as_ref())
+    }) else {
+        return false;
+    };
+    left_attachments.len() == right_attachments.len()
+        && left_attachments
+            .iter()
+            .zip(right_attachments.iter())
+            .all(|(left, right)| {
+                left.image == right.image
+                    && left.subresources == right.subresources
+                    && left.kind == right.kind
+                    && left.format == right.format
+                    && left.samples == right.samples
+                    && left.store == nixe_gpu::AttachmentStore::Store
+                    && right.load == nixe_gpu::AttachmentLoad::Load
+                    && right.store == nixe_gpu::AttachmentStore::Store
+            })
 }
 
 fn too_many_backend_segments() -> MaxwellBackendExecutionError {
@@ -1256,8 +1313,12 @@ fn resolve_inline_target(
 #[cfg(test)]
 mod tests {
     use nixe_gpu::{
+        AttachmentLoad, AttachmentStore, CapabilityRequirements, DrawArguments, DrawOperation,
         FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
-        GuestTimeline, MappingGeneration, TimelineInstanceId, TimelineOwnerId,
+        GuestTimeline, ImageFormat, ImageId, ImageKind, ImageSubresourceRange, MappingGeneration,
+        PipelineId, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
+        RenderPassDescription, RenderPassId, RenderPassOperation, SampleCount, TimelineInstanceId,
+        TimelineOwnerId,
     };
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 
@@ -1348,6 +1409,136 @@ mod tests {
             execution.complete_segment();
         }
         execution.completion()
+    }
+
+    fn render_pass_operations(pass: RenderPassId, image: ImageId) -> Vec<GpuOperation> {
+        let description = RenderPassDescription::new(vec![RenderPassAttachmentDescription {
+            kind: ImageKind::Color,
+            format: ImageFormat::Rgba8Unorm,
+            samples: SampleCount::One,
+        }])
+        .unwrap();
+        let attachment = RenderAttachment {
+            image,
+            subresources: ImageSubresourceRange {
+                plane: 0,
+                mip_level: 0,
+                base_layer: 0,
+                layer_count: 1,
+            },
+            kind: ImageKind::Color,
+            format: ImageFormat::Rgba8Unorm,
+            samples: SampleCount::One,
+            load: AttachmentLoad::Load,
+            store: AttachmentStore::Store,
+        };
+        vec![
+            GpuOperation::new(
+                GpuCommand::RenderPass(
+                    RenderPassOperation::begin(pass, description, vec![attachment]).unwrap(),
+                ),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ),
+            GpuOperation::new(
+                GpuCommand::Draw(
+                    DrawOperation::new(
+                        PipelineId::new(1),
+                        pass,
+                        PrimitiveTopology::Triangles,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        DrawArguments::NonIndexed {
+                            first_vertex: 0,
+                            vertex_count: 3,
+                            first_instance: 0,
+                            instance_count: 1,
+                        },
+                    )
+                    .unwrap(),
+                ),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ),
+            GpuOperation::new(
+                GpuCommand::RenderPass(RenderPassOperation::end(pass)),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn compatible_maxwell_render_passes_share_one_explicit_boundary() {
+        let pass = RenderPassId::new(1);
+        let image = ImageId::new(1);
+        let mut operations = render_pass_operations(pass, image);
+
+        append_batchable_operations(&mut operations, &render_pass_operations(pass, image));
+
+        assert_eq!(operations.len(), 4);
+        assert!(matches!(
+            operations[0].command(),
+            GpuCommand::RenderPass(RenderPassOperation::Begin { .. })
+        ));
+        assert!(matches!(
+            operations[3].command(),
+            GpuCommand::RenderPass(RenderPassOperation::End { .. })
+        ));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation.command(), GpuCommand::Draw(_)))
+                .count(),
+            2
+        );
+
+        append_batchable_operations(
+            &mut operations,
+            &render_pass_operations(RenderPassId::new(2), image),
+        );
+        assert_eq!(operations.len(), 7);
+    }
+
+    #[test]
+    fn render_pass_batching_preserves_attachment_load_store_boundaries() {
+        let pass = RenderPassId::new(1);
+        let image = ImageId::new(1);
+        let mut operations = render_pass_operations(pass, image);
+        let mut incompatible = render_pass_operations(pass, image);
+        let GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) =
+            incompatible[0].command()
+        else {
+            unreachable!();
+        };
+        let mut attachment = attachments[0];
+        attachment.load = AttachmentLoad::Clear(nixe_gpu::ClearValue::Color([0.0; 4]));
+        incompatible[0] = GpuOperation::new(
+            GpuCommand::RenderPass(
+                RenderPassOperation::begin(
+                    pass,
+                    RenderPassDescription::new(vec![RenderPassAttachmentDescription {
+                        kind: ImageKind::Color,
+                        format: ImageFormat::Rgba8Unorm,
+                        samples: SampleCount::One,
+                    }])
+                    .unwrap(),
+                    vec![attachment],
+                )
+                .unwrap(),
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        );
+
+        append_batchable_operations(&mut operations, &incompatible);
+
+        assert_eq!(operations.len(), 6);
     }
 
     #[test]

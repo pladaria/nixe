@@ -1722,12 +1722,14 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
+                1,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
+                2,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),
@@ -1754,8 +1756,8 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
     assert_eq!(cache, cache_before);
     let memory_independent_shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Vertex, ShaderId::new(3), None, 0),
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Fragment, ShaderId::new(4), None, 0),
+            MaxwellThreeDTranslatedShader::new(ShaderStage::Vertex, ShaderId::new(3), 3, None, 0),
+            MaxwellThreeDTranslatedShader::new(ShaderStage::Fragment, ShaderId::new(4), 4, None, 0),
         ],
         Vec::new(),
     )
@@ -1778,12 +1780,14 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
+                1,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 128,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
+                2,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 128,
             ),
@@ -1805,12 +1809,14 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
+                1,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 129,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
+                2,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 128,
             ),
@@ -1842,12 +1848,14 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
+                1,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size16KiB),
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
+                2,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size16KiB),
                 0,
             ),
@@ -2056,8 +2064,8 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
 
     let shaders = MaxwellThreeDTranslatedShaders::new(
         vec![
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Vertex, ShaderId::new(1), None, 0),
-            MaxwellThreeDTranslatedShader::new(ShaderStage::Fragment, ShaderId::new(2), None, 0),
+            MaxwellThreeDTranslatedShader::new(ShaderStage::Vertex, ShaderId::new(1), 1, None, 0),
+            MaxwellThreeDTranslatedShader::new(ShaderStage::Fragment, ShaderId::new(2), 2, None, 0),
         ],
         Vec::new(),
     )

@@ -72,6 +72,14 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
+    log::info!(
+        "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
+        config.gpu.shader_entries(),
+        config.gpu.pipeline_entries(),
+        config.gpu.pipeline_variants_per_resource(),
+        config.gpu.bind_groups_per_descriptor_table(),
+        config.gpu.persistent_pipeline_cache_bytes() / (1024 * 1024)
+    );
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
         format!(
@@ -214,7 +222,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let gpu_backend = initialize_backend(
         BackendInstanceId::new(1),
         NonCpuDeviceId::new(1),
-        WgpuBackendConfiguration::default(),
+        WgpuBackendConfiguration {
+            cache: config.gpu,
+            ..WgpuBackendConfiguration::default()
+        },
     )
     .map_err(|error| format!("cannot initialize accelerated GPU backend: {error}"))?;
     log::info!(
@@ -223,7 +234,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         gpu_backend.adapter.name,
         gpu_backend.adapter.driver
     );
-    let video_system = VideoSystem::with_gpu_backend(mailbox, gpu_backend.into_runtime());
+    let video_system =
+        VideoSystem::with_gpu_backend(mailbox, gpu_backend.into_runtime(), config.gpu);
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
 
     let Some(frontend) = frontend else {

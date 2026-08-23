@@ -8,7 +8,7 @@ fn maxwell_frontend_depends_only_on_neutral_gpu_and_memory_contracts() {
         fs::read_to_string(manifest.join("Cargo.toml")).expect("Maxwell manifest must be readable");
     let dependencies = dependency_names(&contents);
 
-    assert_eq!(dependencies, ["nixe-gpu", "nixe-memory"]);
+    assert_eq!(dependencies, ["log", "nixe-gpu", "nixe-memory"]);
     for prohibited in [
         "nixe-horizon",
         "nixe-video",

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 nixe-memory.workspace = true
+twox-hash.workspace = true
 
 [dev-dependencies]
 naga = { version = "30.0.0", features = ["wgsl-in"] }

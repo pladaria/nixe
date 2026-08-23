@@ -362,12 +362,14 @@ fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellThre
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Vertex,
                 ShaderId::new(1),
+                1,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),
             MaxwellThreeDTranslatedShader::new(
                 ShaderStage::Fragment,
                 ShaderId::new(2),
+                2,
                 Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
                 0,
             ),

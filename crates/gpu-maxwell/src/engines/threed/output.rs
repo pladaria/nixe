@@ -5,6 +5,7 @@ use crate::MaxwellMethodSource;
 use super::render_targets::{MaxwellThreeDRawValue, MaxwellThreeDRectangle};
 use super::state::{
     MAXWELL_THREE_D_POLYGON_MODE_RESET, MAXWELL_THREE_D_WINDOW_ORIGIN_RESET, MaxwellThreeDRegister,
+    PipelineDependencySink,
 };
 
 pub const MAXWELL_VIEWPORT_COUNT: usize = 16;
@@ -1140,7 +1141,7 @@ impl MaxwellThreeDFixedFunctionState {
 
     pub(super) fn append_pipeline_dependencies(
         &self,
-        dependencies: &mut Vec<Option<u32>>,
+        dependencies: &mut impl PipelineDependencySink,
         active_color_targets: &[u8],
     ) {
         dependencies.push(self.surface_clip_horizontal.raw());

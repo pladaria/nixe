@@ -52,6 +52,7 @@ sdl3-sys = { version = "=0.6.7", features = ["no-sdl-video"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
 tempfile = "3.27"
+twox-hash = { version = "2.1.3", default-features = false, features = ["std", "xxhash3_128"] }
 nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
 nixe-cpu-engine = { path = "crates/cpu-engine" }

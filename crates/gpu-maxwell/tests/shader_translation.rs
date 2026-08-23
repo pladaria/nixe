@@ -241,16 +241,17 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
     let [MaxwellSubmissionExecutionStep::ThreeD(replacement_work)] = replacement.steps() else {
         panic!("replacement draw did not lower to one neutral 3D work item");
     };
+    assert!(replacement_work.resource_invalidations().is_empty());
     assert!(
-        replacement_work
-            .resource_invalidations()
+        !replacement_work
+            .resource_creations()
             .iter()
-            .any(|dependency| matches!(dependency, nixe_gpu::ResourceDependency::Shader(_)))
+            .any(|creation| matches!(creation, BackendResourceCreateInfo::Shader { .. }))
     );
     assert!(
-        replacement_work
-            .resource_invalidations()
+        !replacement_work
+            .resource_creations()
             .iter()
-            .any(|dependency| matches!(dependency, nixe_gpu::ResourceDependency::Pipeline(_)))
+            .any(|creation| matches!(creation, BackendResourceCreateInfo::Pipeline { .. }))
     );
 }

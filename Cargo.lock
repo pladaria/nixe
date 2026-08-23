@@ -976,6 +976,7 @@ name = "nixe-config"
 version = "0.1.0"
 dependencies = [
  "chrono-tz",
+ "nixe-gpu",
  "nixe-input",
  "nixe-loader-title",
  "serde",
@@ -1022,6 +1023,7 @@ version = "0.1.0"
 dependencies = [
  "naga",
  "nixe-memory",
+ "twox-hash",
 ]
 
 [[package]]
@@ -1037,6 +1039,7 @@ dependencies = [
 name = "nixe-gpu-maxwell"
 version = "0.1.0"
 dependencies = [
+ "log",
  "naga",
  "nixe-gpu",
  "nixe-memory",
@@ -1046,9 +1049,11 @@ dependencies = [
 name = "nixe-gpu-wgpu"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nixe-gpu",
  "nixe-memory",
  "pollster",
+ "tempfile",
  "wgpu",
 ]
 

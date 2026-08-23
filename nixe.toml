@@ -53,6 +53,20 @@ engine = "auto"
 # acknowledged mapping invalidation. False keeps deterministic serialization.
 parallel_vcpus = true
 
+[gpu]
+# Maximum working set retained by each shader cache. Entries are evicted by
+# least-recent use; this is a software budget rather than a hardware limit.
+# Values below six are rejected because one complete pipeline must fit.
+shader_cache_entries = 4096
+# Maximum number of neutral Maxwell pipelines retained in memory.
+pipeline_cache_entries = 8192
+# Maximum host-specialized WGPU variants retained for one neutral pipeline.
+pipeline_variants_per_resource = 64
+# Maximum host bind groups retained for one neutral descriptor table.
+bind_groups_per_descriptor_table = 64
+# Maximum accepted and persisted WGPU driver pipeline-cache size.
+persistent_pipeline_cache_mib = 256
+
 # Use `cargo cli input` to get your controller's SDL gamepad information
 [input.profiles.switch-pro]
 device = "Nintendo Switch Pro Controller"

@@ -7,6 +7,7 @@ mod driver;
 mod visibility;
 
 use std::fmt::{Display, Formatter};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use driver::WgpuBackendDriver;
@@ -14,7 +15,8 @@ use visibility::WgpuVisibilityCoordinator;
 
 use nixe_gpu::{
     Backend, BackendCapabilities, BackendFeatures, BackendInstanceId, BackendLimits,
-    BackendRuntime, ImageFormat, NeutralBackendRuntime, QueryKind, SampleCount, ShaderStage,
+    BackendRuntime, GpuCacheConfiguration, ImageFormat, NeutralBackendRuntime, QueryKind,
+    SampleCount, ShaderStage,
 };
 use nixe_memory::NonCpuDeviceId;
 use wgpu::{
@@ -46,11 +48,13 @@ impl HostBackend {
 }
 
 /// Immutable backend initialization policy selected by the composition root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WgpuBackendConfiguration {
     pub host_backend: HostBackend,
     pub power_preference: WgpuPowerPreference,
     pub force_fallback_adapter: bool,
+    pub pipeline_cache_directory: Option<PathBuf>,
+    pub cache: GpuCacheConfiguration,
 }
 
 impl Default for WgpuBackendConfiguration {
@@ -59,7 +63,35 @@ impl Default for WgpuBackendConfiguration {
             host_backend: default_host_backend(),
             power_preference: WgpuPowerPreference::HighPerformance,
             force_fallback_adapter: false,
+            pipeline_cache_directory: default_pipeline_cache_directory(),
+            cache: GpuCacheConfiguration::default(),
         }
+    }
+}
+
+fn default_pipeline_cache_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("Nixe").join("Cache"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|root| root.join("Library").join("Caches").join("Nixe"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|root| PathBuf::from(root).join(".cache")))
+            .map(|root| root.join("nixe"))
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        None
     }
 }
 
@@ -170,7 +202,47 @@ async fn initialize_backend_async(
         .map_err(|error| WgpuBackendInitializationError::Device(error.to_string().into()))?;
     let capabilities = capabilities(&adapter, &required_limits, required_features);
     let visibility = Arc::new(WgpuVisibilityCoordinator::new(device_id));
-    let driver = WgpuBackendDriver::new(device, queue, Arc::clone(&visibility));
+    let pipeline_cache_path = configuration
+        .pipeline_cache_directory
+        .as_deref()
+        .map(|directory| pipeline_cache_path(directory, configuration.host_backend, &info));
+    let pipeline_cache = if required_features.contains(wgpu::Features::PIPELINE_CACHE) {
+        let data = pipeline_cache_path
+            .as_deref()
+            .map(|path| {
+                load_pipeline_cache(path, configuration.cache.persistent_pipeline_cache_bytes())
+            })
+            .transpose()?
+            .flatten();
+        if let (Some(path), Some(data)) = (&pipeline_cache_path, &data) {
+            log::info!(
+                "loaded WGPU pipeline cache: path={} bytes={}",
+                path.display(),
+                data.len()
+            );
+        }
+        // SAFETY: cache bytes are read only from Nixe's private, versioned cache
+        // file and that file contains only data previously returned by this
+        // `wgpu` API. `fallback` rejects incompatible adapter or driver data.
+        Some(unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("Nixe persistent pipeline cache"),
+                data: data.as_deref(),
+                fallback: true,
+            })
+        })
+    } else {
+        log::debug!("WGPU adapter does not expose persistent pipeline-cache support");
+        None
+    };
+    let driver = WgpuBackendDriver::new(
+        device,
+        queue,
+        Arc::clone(&visibility),
+        pipeline_cache,
+        pipeline_cache_path,
+        configuration.cache,
+    );
     let backend = Backend::new(instance_id, capabilities, driver);
     let visibility: Arc<dyn nixe_memory::VisibilityCoordinator> = visibility;
     Ok(InitializedWgpuBackend {
@@ -184,7 +256,97 @@ async fn initialize_backend_async(
 }
 
 fn requested_device_features(adapter_features: wgpu::Features) -> wgpu::Features {
-    adapter_features & wgpu::Features::FLOAT32_FILTERABLE
+    adapter_features & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::PIPELINE_CACHE)
+}
+
+const PIPELINE_CACHE_MAGIC: &[u8] = b"NIXE-WGPU-CACHE\x01";
+fn pipeline_cache_path(
+    directory: &Path,
+    backend: HostBackend,
+    adapter: &wgpu::AdapterInfo,
+) -> PathBuf {
+    let backend = match backend {
+        HostBackend::Vulkan => "vulkan",
+        HostBackend::Metal => "metal",
+        HostBackend::Direct3D12 => "d3d12",
+        HostBackend::OpenGl => "opengl",
+    };
+    directory.join(format!(
+        "wgpu-30-{backend}-{:08x}-{:08x}.bin",
+        adapter.vendor, adapter.device
+    ))
+}
+
+fn load_pipeline_cache(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Option<Vec<u8>>, WgpuBackendInitializationError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!(
+                "no persistent WGPU pipeline cache found: path={}",
+                path.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(cache_error(path, error)),
+    };
+    let bound = maximum_bytes
+        .checked_add(PIPELINE_CACHE_MAGIC.len() as u64)
+        .ok_or_else(|| {
+            WgpuBackendInitializationError::PipelineCache(
+                "configured pipeline cache bound cannot be represented".into(),
+            )
+        })?;
+    if file
+        .metadata()
+        .map_err(|error| cache_error(path, error))?
+        .len()
+        > bound
+    {
+        return Err(WgpuBackendInitializationError::PipelineCache(
+            format!(
+                "pipeline cache is larger than its configured {} byte bound: {}",
+                maximum_bytes,
+                path.display(),
+            )
+            .into(),
+        ));
+    }
+    let mut data = Vec::new();
+    use std::io::Read;
+    file.take(bound.checked_add(1).ok_or_else(|| {
+        WgpuBackendInitializationError::PipelineCache(
+            "configured pipeline cache read bound cannot be represented".into(),
+        )
+    })?)
+    .read_to_end(&mut data)
+    .map_err(|error| cache_error(path, error))?;
+    if data.len() as u64 > bound {
+        return Err(WgpuBackendInitializationError::PipelineCache(
+            format!(
+                "pipeline cache grew beyond its configured {} byte bound: {}",
+                maximum_bytes,
+                path.display(),
+            )
+            .into(),
+        ));
+    }
+    let Some(data) = data.strip_prefix(PIPELINE_CACHE_MAGIC) else {
+        log::warn!(
+            "ignoring incompatible WGPU pipeline cache: path={}",
+            path.display()
+        );
+        return Ok(None);
+    };
+    Ok(Some(data.to_vec()))
+}
+
+fn cache_error(path: &Path, error: std::io::Error) -> WgpuBackendInitializationError {
+    WgpuBackendInitializationError::PipelineCache(
+        format!("cannot read pipeline cache {}: {error}", path.display()).into(),
+    )
 }
 
 fn required_features_for_image_format(format: ImageFormat) -> wgpu::Features {
@@ -257,6 +419,7 @@ pub enum WgpuBackendInitializationError {
     BackendNotCompiled(HostBackend),
     Adapter(Box<str>),
     Device(Box<str>),
+    PipelineCache(Box<str>),
 }
 
 impl Display for WgpuBackendInitializationError {
@@ -270,6 +433,7 @@ impl Display for WgpuBackendInitializationError {
             }
             Self::Adapter(error) => write!(formatter, "wgpu adapter selection failed: {error}"),
             Self::Device(error) => write!(formatter, "wgpu device creation failed: {error}"),
+            Self::PipelineCache(error) => write!(formatter, "wgpu pipeline cache failed: {error}"),
         }
     }
 }
@@ -281,10 +445,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_enables_float32_filtering_only_when_the_adapter_supports_it() {
+    fn pipeline_cache_loader_accepts_only_versioned_bounded_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pipeline.bin");
+        assert_eq!(load_pipeline_cache(&path, 1024).unwrap(), None);
+
+        std::fs::write(&path, b"unrelated cache data").unwrap();
+        assert_eq!(load_pipeline_cache(&path, 1024).unwrap(), None);
+
+        let payload = b"driver-owned-cache";
+        let mut stored = PIPELINE_CACHE_MAGIC.to_vec();
+        stored.extend_from_slice(payload);
+        std::fs::write(&path, stored).unwrap();
         assert_eq!(
-            requested_device_features(wgpu::Features::FLOAT32_FILTERABLE),
-            wgpu::Features::FLOAT32_FILTERABLE
+            load_pipeline_cache(&path, 1024).unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        std::fs::write(&path, vec![0; 1025 + PIPELINE_CACHE_MAGIC.len()]).unwrap();
+        let error = load_pipeline_cache(&path, 1024).unwrap_err();
+        assert!(error.to_string().contains("larger than its configured"));
+    }
+
+    #[test]
+    fn device_enables_optional_features_only_when_the_adapter_supports_them() {
+        assert_eq!(
+            requested_device_features(
+                wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::PIPELINE_CACHE
+            ),
+            wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::PIPELINE_CACHE
         );
         assert!(requested_device_features(wgpu::Features::empty()).is_empty());
     }
