@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use nixe_gpu::{
     BackendExecutionCompletion, BackendSubmissionToken, BackendVisibilityRequester,
@@ -104,7 +103,6 @@ enum GpuWorkExecution {
 
 struct PendingSegment {
     token: BackendSubmissionToken,
-    final_segment: bool,
 }
 
 #[derive(Default)]
@@ -117,33 +115,19 @@ struct GpuWorkBudget {
 struct GpuWorkBudgetState {
     active: usize,
     preflight_blocked: bool,
+    progress_requested: bool,
     stopped: bool,
 }
 
 impl GpuWorkBudget {
-    fn wait_for_preflight(&self) -> bool {
+    fn reserve(self: &Arc<Self>) -> Option<GpuWorkPermit> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.preflight_blocked && !state.stopped {
-            state = self
-                .available
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        !state.stopped
-    }
-
-    fn reserve(
-        self: &Arc<Self>,
-        release_preflight_after_submission: bool,
-    ) -> Option<GpuWorkPermit> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT && !state.stopped {
+        while (state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT || state.preflight_blocked)
+            && !state.stopped
+        {
             state = self
                 .available
                 .wait(state)
@@ -153,14 +137,10 @@ impl GpuWorkBudget {
             return None;
         }
         state.active += 1;
-        assert!(
-            !state.preflight_blocked,
-            "ordered preflight admitted overlapping frontend work"
-        );
         state.preflight_blocked = true;
         Some(GpuWorkPermit {
             budget: Arc::clone(self),
-            release_preflight_after_submission,
+            release_preflight_after_submission: false,
             preflight_released: false,
         })
     }
@@ -172,6 +152,36 @@ impl GpuWorkBudget {
             .stopped = true;
         self.available.notify_all();
     }
+
+    fn request_progress(&self) -> Option<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            return None;
+        }
+        let wake = !state.progress_requested;
+        state.progress_requested = true;
+        Some(wake)
+    }
+
+    fn take_progress_request(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let requested = state.progress_requested;
+        state.progress_requested = false;
+        requested
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped
+    }
 }
 
 struct GpuWorkPermit {
@@ -181,6 +191,10 @@ struct GpuWorkPermit {
 }
 
 impl GpuWorkPermit {
+    fn set_release_after_submission(&mut self, release: bool) {
+        self.release_preflight_after_submission = release;
+    }
+
     fn release_after_submission(&mut self) {
         if self.release_preflight_after_submission {
             self.release_preflight();
@@ -199,6 +213,10 @@ impl GpuWorkPermit {
         state.preflight_blocked = false;
         self.preflight_released = true;
         self.budget.available.notify_all();
+    }
+
+    fn allows_following(&self) -> bool {
+        self.preflight_released
     }
 }
 
@@ -221,11 +239,18 @@ impl Drop for GpuWorkPermit {
 )]
 enum GpuExecutorMessage {
     Submission(GpuWork),
+    Wake,
     CpuVisibility {
         request: CpuVisibilityRequest,
         reply: mpsc::SyncSender<Result<Box<[u8]>, Box<str>>>,
     },
-    Shutdown,
+}
+
+fn wake_gpu_owner(sender: &mpsc::SyncSender<GpuExecutorMessage>) -> bool {
+    match sender.try_send(GpuExecutorMessage::Wake) {
+        Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
 }
 
 struct GpuVisibilityRequester {
@@ -300,7 +325,7 @@ impl NvDrvGpuExecutor {
                             detail,
                         });
                 } else {
-                    if let Err(failure) = run_gpu_owner(receiver, &mut backend) {
+                    if let Err(failure) = run_gpu_owner(receiver, &mut backend, &worker_budget) {
                         *worker_failure
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
@@ -351,15 +376,15 @@ impl NvDrvGpuExecutor {
             .lowering_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Preflight reads guest memory. It must not overtake the point where
-        // the preceding submission either publishes its GPU ownership or
-        // commits its command-processor writes to canonical memory.
-        if !self.budget.wait_for_preflight() {
-            return Err(self.failure().unwrap_or(GpuExecutorFailure {
+        // Acquire queue capacity and the ordered-memory boundary in one wait.
+        // Preflight must not overtake the point where the preceding submission
+        // publishes GPU ownership or commits command-processor writes.
+        let mut permit = self.budget.reserve().ok_or_else(|| {
+            self.failure().unwrap_or(GpuExecutorFailure {
                 frontend,
                 detail: "GPU executor stopped before ordered frontend preflight".into(),
-            }));
-        }
+            })
+        })?;
         let mut plan = preflight_maxwell_submission_execution(
             &packets,
             &address_space,
@@ -375,19 +400,11 @@ impl NvDrvGpuExecutor {
         let staged_cache = plan.take_staged_cache();
         let release_preflight_after_submission =
             plan.requires_backend() && !plan.has_deferred_canonical_writes();
+        permit.set_release_after_submission(release_preflight_after_submission);
 
         // Retain the cache ownership through queue admission. Besides keeping
         // preflight state transactional, this makes concurrent ioctl callers
         // enter the backend queue in the same order in which they lowered.
-        let permit = self
-            .budget
-            .reserve(release_preflight_after_submission)
-            .ok_or_else(|| {
-                self.failure().unwrap_or(GpuExecutorFailure {
-                    frontend,
-                    detail: "GPU executor stopped while applying queue backpressure".into(),
-                })
-            })?;
         self.require_healthy()?;
         let work = GpuWork {
             descriptor,
@@ -427,6 +444,36 @@ impl NvDrvGpuExecutor {
         }
     }
 
+    pub(super) fn request_progress(&self) -> Result<(), GpuExecutorFailure> {
+        self.require_healthy()?;
+        let Some(wake) = self.budget.request_progress() else {
+            return Err(self.failure().unwrap_or(GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU executor is torn down".into(),
+            }));
+        };
+        if !wake {
+            return Ok(());
+        }
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU executor is torn down".into(),
+            })?;
+        if wake_gpu_owner(&sender) {
+            Ok(())
+        } else {
+            Err(self.failure().unwrap_or(GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU backend owner stopped before progress was requested".into(),
+            }))
+        }
+    }
+
     fn failure(&self) -> Option<GpuExecutorFailure> {
         self.failure
             .lock()
@@ -442,7 +489,9 @@ impl NvDrvGpuExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            let _ = sender.send(GpuExecutorMessage::Shutdown);
+            // Stop is authoritative. The wake merely releases an idle owner;
+            // a full queue already guarantees that it will run again.
+            let _ = wake_gpu_owner(&sender);
         }
         if let Some(worker) = self
             .worker
@@ -475,55 +524,72 @@ impl Drop for NvDrvGpuExecutor {
 fn run_gpu_owner(
     receiver: mpsc::Receiver<GpuExecutorMessage>,
     backend: &mut Option<Box<dyn NeutralBackendRuntime>>,
+    budget: &GpuWorkBudget,
 ) -> Result<(), GpuExecutorFailure> {
     let mut works = VecDeque::new();
-    let mut shutting_down = false;
     loop {
-        drain_backend_completions(&mut works, backend)?;
-        start_ready_work(&mut works, backend)?;
-        if shutting_down && works.is_empty() {
-            return Ok(());
+        let shutting_down = budget.is_stopped();
+        if shutting_down {
+            // Never start queued work after observing teardown. Work already
+            // submitted to the host retains its mappings until real host
+            // completion, but its guest reservation is never published.
+            works.retain(work_has_pending_segment);
+        }
+        drain_backend_completions(&mut works, backend, !shutting_down)?;
+        if shutting_down {
+            if works.is_empty() {
+                return Ok(());
+            }
+            let completion = backend
+                .as_deref_mut()
+                .ok_or_else(|| owner_failure(&works, "GPU backend is unavailable"))?
+                .wait_for_completion()
+                .map_err(|error| owner_failure(&works, error.to_string()))?
+                .ok_or_else(|| owner_failure(&works, "GPU runtime lost its pending submission"))?;
+            complete_backend_segment(&mut works, backend, completion, false)?;
+            continue;
         }
 
-        let host_pending = works.iter().any(work_has_pending_segment);
-        let message = if host_pending {
-            receiver.recv_timeout(Duration::from_millis(1))
-        } else {
-            receiver
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-        };
+        start_ready_work(&mut works, backend)?;
+
+        let progress_requested = budget.take_progress_request();
+        let must_wait = works.len() == MAX_GPU_SUBMISSIONS_IN_FLIGHT
+            || !works.back().is_none_or(work_allows_following)
+            || progress_requested && works.iter().any(work_has_pending_segment);
+        if must_wait {
+            let completion = backend
+                .as_deref_mut()
+                .ok_or_else(|| owner_failure(&works, "GPU backend is unavailable"))?
+                .wait_for_completion()
+                .map_err(|error| owner_failure(&works, error.to_string()))?
+                .ok_or_else(|| owner_failure(&works, "GPU runtime lost its pending submission"))?;
+            complete_backend_segment(&mut works, backend, completion, true)?;
+            continue;
+        }
+
+        let message = receiver.recv();
         match message {
-            Ok(GpuExecutorMessage::Submission(work)) if !shutting_down => works.push_back(work),
-            Ok(GpuExecutorMessage::Submission(_)) => {}
+            Ok(GpuExecutorMessage::Submission(work)) if !budget.is_stopped() => {
+                works.push_back(work);
+            }
+            Ok(GpuExecutorMessage::Submission(_)) | Ok(GpuExecutorMessage::Wake) => {}
             Ok(GpuExecutorMessage::CpuVisibility { request, reply }) => {
-                let result = backend.as_mut().map_or_else(
-                    || Err("GPU backend is unavailable".into()),
-                    |backend| {
-                        backend
-                            .make_cpu_visible(request)
-                            .map_err(|error| error.to_string().into_boxed_str())
-                    },
-                );
+                let result = if budget.is_stopped() {
+                    Err("GPU backend owner is shutting down".into())
+                } else {
+                    backend.as_mut().map_or_else(
+                        || Err("GPU backend is unavailable".into()),
+                        |backend| {
+                            backend
+                                .make_cpu_visible(request)
+                                .map_err(|error| error.to_string().into_boxed_str())
+                        },
+                    )
+                };
                 let _ = reply.send(result);
             }
-            Ok(GpuExecutorMessage::Shutdown) => shutting_down = true,
-            Err(mpsc::RecvTimeoutError::Disconnected) => shutting_down = true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let must_wait = shutting_down
-                    || works.len() == MAX_GPU_SUBMISSIONS_IN_FLIGHT
-                    || !works.back().is_none_or(work_allows_following);
-                if must_wait {
-                    let completion = backend
-                        .as_deref_mut()
-                        .ok_or_else(|| owner_failure(&works, "GPU backend is unavailable"))?
-                        .wait_for_completion()
-                        .map_err(|error| owner_failure(&works, error.to_string()))?
-                        .ok_or_else(|| {
-                            owner_failure(&works, "GPU runtime lost its pending submission")
-                        })?;
-                    complete_backend_segment(&mut works, backend, completion)?;
-                }
+            Err(mpsc::RecvError) => {
+                budget.stop();
             }
         }
     }
@@ -532,6 +598,7 @@ fn run_gpu_owner(
 fn drain_backend_completions(
     works: &mut VecDeque<GpuWork>,
     backend: &mut Option<Box<dyn NeutralBackendRuntime>>,
+    continue_work: bool,
 ) -> Result<(), GpuExecutorFailure> {
     loop {
         let completion = match backend.as_deref_mut() {
@@ -543,7 +610,7 @@ fn drain_backend_completions(
         let Some(completion) = completion else {
             break;
         };
-        complete_backend_segment(works, backend, completion)?;
+        complete_backend_segment(works, backend, completion, continue_work)?;
     }
     Ok(())
 }
@@ -552,6 +619,7 @@ fn complete_backend_segment(
     works: &mut VecDeque<GpuWork>,
     backend: &mut Option<Box<dyn NeutralBackendRuntime>>,
     completion: BackendExecutionCompletion,
+    continue_work: bool,
 ) -> Result<(), GpuExecutorFailure> {
     let index = works
         .iter()
@@ -577,7 +645,7 @@ fn complete_backend_segment(
         });
     }
     execution.complete_segment();
-    if let Some(work) = advance_backend_work(work, backend)? {
+    if continue_work && let Some(work) = advance_backend_work(work, backend)? {
         works.insert(index, work);
     }
     Ok(())
@@ -677,10 +745,7 @@ fn advance_backend_work(
                     frontend,
                     detail: error.to_string().into(),
                 })?;
-            *pending = Some(PendingSegment {
-                token,
-                final_segment,
-            });
+            *pending = Some(PendingSegment { token });
             if final_segment {
                 work.permit.release_after_submission();
             }
@@ -744,16 +809,7 @@ fn work_has_pending_segment(work: &GpuWork) -> bool {
 }
 
 fn work_allows_following(work: &GpuWork) -> bool {
-    matches!(
-        work.execution,
-        Some(GpuWorkExecution::Backend {
-            pending: Some(PendingSegment {
-                final_segment: true,
-                ..
-            }),
-            ..
-        })
-    )
+    work.permit.allows_following()
 }
 
 fn owner_failure(works: &VecDeque<GpuWork>, detail: impl Into<Box<str>>) -> GpuExecutorFailure {
@@ -782,6 +838,7 @@ mod tests {
         ResourceDependency, SampleCount, ShaderStage,
     };
     use nixe_memory::{CanonicalPageId, DeviceVisibilityPoint, NonCpuDeviceId};
+    use std::time::Duration;
 
     struct VisibilityRuntime {
         capabilities: BackendCapabilities,
@@ -877,16 +934,47 @@ mod tests {
     }
 
     #[test]
+    fn progress_wake_is_coalesced_and_nonblocking_when_the_queue_is_full() {
+        let budget = GpuWorkBudget::default();
+        assert_eq!(budget.request_progress(), Some(true));
+        assert_eq!(budget.request_progress(), Some(false));
+
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender.send(GpuExecutorMessage::Wake).unwrap();
+        assert!(wake_gpu_owner(&sender));
+        assert!(budget.take_progress_request());
+        assert!(!budget.take_progress_request());
+    }
+
+    #[test]
+    fn saturated_owner_queue_cannot_block_teardown() {
+        let budget = Arc::new(GpuWorkBudget::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(GpuExecutorMessage::Wake).unwrap();
+
+        budget.stop();
+        assert!(wake_gpu_owner(&sender));
+        let owner_budget = Arc::clone(&budget);
+        let owner = thread::spawn(move || {
+            let mut backend = None;
+            run_gpu_owner(receiver, &mut backend, &owner_budget)
+        });
+        owner.join().unwrap().unwrap();
+        assert_eq!(budget.request_progress(), None);
+    }
+
+    #[test]
     fn frontend_preflight_waits_for_the_prior_memory_boundary() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let permit = budget.reserve(false).unwrap();
+        let permit = budget.reserve().unwrap();
         let waiting_budget = Arc::clone(&budget);
         let (ready_sender, ready) = mpsc::sync_channel(1);
         let (observed_sender, observed) = mpsc::sync_channel(1);
         let waiter = thread::spawn(move || {
             ready_sender.send(()).unwrap();
-            let available = waiting_budget.wait_for_preflight();
-            observed_sender.send(available).unwrap();
+            let permit = waiting_budget.reserve();
+            observed_sender.send(permit.is_some()).unwrap();
+            drop(permit);
         });
         ready.recv().unwrap();
         assert_eq!(
@@ -902,21 +990,33 @@ mod tests {
     #[test]
     fn backend_submission_releases_preflight_without_waiting_for_completion() {
         let budget = Arc::new(GpuWorkBudget::default());
-        let mut permit = budget.reserve(true).unwrap();
+        let mut permit = budget.reserve().unwrap();
+        permit.set_release_after_submission(true);
         let waiting_budget = Arc::clone(&budget);
         let (observed_sender, observed) = mpsc::sync_channel(1);
         let waiter = thread::spawn(move || {
-            observed_sender
-                .send(waiting_budget.wait_for_preflight())
-                .unwrap();
+            let permit = waiting_budget.reserve();
+            observed_sender.send(permit.is_some()).unwrap();
+            drop(permit);
         });
         assert_eq!(
             observed.recv_timeout(Duration::from_millis(10)),
             Err(mpsc::RecvTimeoutError::Timeout)
         );
         permit.release_after_submission();
+        assert!(permit.allows_following());
         assert!(observed.recv().unwrap());
         drop(permit);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn deferred_canonical_writes_keep_completion_demanded() {
+        let budget = Arc::new(GpuWorkBudget::default());
+        let mut permit = budget.reserve().unwrap();
+        permit.set_release_after_submission(false);
+        permit.release_after_submission();
+
+        assert!(!permit.allows_following());
     }
 }

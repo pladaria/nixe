@@ -347,6 +347,36 @@ impl CpuWriteJournal {
             CanonicalCpuWriteOverlap::No
         }
     }
+
+    fn append_ranges_since(
+        &self,
+        generation: ContentGeneration,
+        start: u64,
+        end: u64,
+        output: &mut Vec<CanonicalCpuWriteRange>,
+    ) {
+        if self
+            .lost_through
+            .is_some_and(|lost_through| generation < lost_through)
+        {
+            output.push(CanonicalCpuWriteRange::new(start, end - start));
+            return;
+        }
+        for record in self
+            .records
+            .iter()
+            .filter(|record| record.generation > generation)
+        {
+            let dirty_start = record.start.max(start);
+            let dirty_end = record.end.min(end);
+            if dirty_start < dirty_end {
+                output.push(CanonicalCpuWriteRange::new(
+                    dirty_start,
+                    dirty_end - dirty_start,
+                ));
+            }
+        }
+    }
 }
 
 /// Whether canonical CPU-side writes touched a byte range after a snapshot.
@@ -356,6 +386,31 @@ pub enum CanonicalCpuWriteOverlap {
     Yes,
     /// The bounded provenance journal no longer covers the requested snapshot.
     Unknown,
+}
+
+/// One non-empty CPU-written byte interval within a canonical page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalCpuWriteRange {
+    offset: u64,
+    size: u64,
+}
+
+impl CanonicalCpuWriteRange {
+    pub(crate) const fn new(offset: u64, size: u64) -> Self {
+        Self { offset, size }
+    }
+
+    /// Returns the first dirty byte within the canonical page.
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the number of dirty bytes.
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
 }
 
 struct CanonicalPageInner {
@@ -733,6 +788,30 @@ impl CanonicalBackingPage {
             .lock_state()
             .cpu_writes
             .overlap_since(generation, offset, end))
+    }
+
+    /// Appends CPU-written byte intervals newer than `generation`.
+    ///
+    /// Intervals use page-local offsets. When bounded provenance has expired,
+    /// the complete requested interval is appended so callers cannot miss a
+    /// write.
+    pub fn append_cpu_write_ranges_since(
+        &self,
+        generation: ContentGeneration,
+        offset: u64,
+        size: u64,
+        output: &mut Vec<CanonicalCpuWriteRange>,
+    ) -> Result<(), CanonicalPageError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalPageError::InvalidRange)?;
+        if end > self.size() as u64 {
+            return Err(CanonicalPageError::InvalidRange);
+        }
+        self.lock_state()
+            .cpu_writes
+            .append_ranges_since(generation, offset, end, output);
+        Ok(())
     }
 
     pub(crate) fn prepare_device_access(
@@ -2188,5 +2267,46 @@ mod tests {
             page.cpu_write_overlap_since(generation, 0x800, 0x100),
             Ok(CanonicalCpuWriteOverlap::Unknown)
         );
+    }
+
+    #[test]
+    fn cpu_write_provenance_returns_exact_intervals() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let generation = page.content_generation();
+        allocation.write(0x103, &[1, 2, 3]).unwrap();
+        allocation.write(0x108, &[4, 5]).unwrap();
+
+        let mut dirty = Vec::new();
+        page.append_cpu_write_ranges_since(generation, 0x100, 0x10, &mut dirty)
+            .unwrap();
+        assert_eq!(
+            dirty,
+            [
+                CanonicalCpuWriteRange::new(0x103, 3),
+                CanonicalCpuWriteRange::new(0x108, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_cpu_write_ranges_return_the_complete_requested_interval() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = range.segments()[0].backing().clone();
+        let generation = page.content_generation();
+        for index in 0..=CPU_WRITE_JOURNAL_CAPACITY {
+            allocation.write(index, &[index as u8]).unwrap();
+        }
+
+        let mut dirty = Vec::new();
+        page.append_cpu_write_ranges_since(generation, 0x800, 0x100, &mut dirty)
+            .unwrap();
+        assert_eq!(dirty, [CanonicalCpuWriteRange::new(0x800, 0x100)]);
     }
 }

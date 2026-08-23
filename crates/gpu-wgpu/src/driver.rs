@@ -14,21 +14,23 @@ use nixe_gpu::{
     VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
-    CanonicalCpuWriteOverlap, CanonicalPageId, ContentGeneration, CpuVisibilityRequest,
+    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageId, ContentGeneration,
+    CpuVisibilityRequest,
 };
+use wgpu::util::StagingBelt;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferDescriptor,
-    BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor,
-    CompareFunction, DepthStencilState, Device, ErrorFilter, ErrorScopeGuard, Extent3d,
-    FragmentState, FrontFace, IndexFormat, LoadOp, MapMode, MultisampleState, Operations, Origin3d,
-    PipelineCompilationOptions, PolygonMode, PrimitiveState, Queue, RenderPassColorAttachment,
-    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, StencilState,
-    StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
-    TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
-    TextureViewDescriptor, TextureViewDimension, VertexAttribute as WgpuVertexAttribute,
-    VertexBufferLayout as WgpuVertexBufferLayout, VertexFormat as WgpuVertexFormat, VertexState,
-    VertexStepMode as WgpuVertexStepMode,
+    BufferSize, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder,
+    CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, ErrorFilter,
+    ErrorScopeGuard, Extent3d, FragmentState, FrontFace, IndexFormat, LoadOp, MapMode,
+    MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PolygonMode,
+    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModule,
+    ShaderModuleDescriptor, ShaderSource, StencilState, StoreOp, TexelCopyBufferInfo,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+    VertexAttribute as WgpuVertexAttribute, VertexBufferLayout as WgpuVertexBufferLayout,
+    VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
 };
 
 use crate::WgpuVisibilityCoordinator;
@@ -73,18 +75,40 @@ struct ResourceRecord {
 
 struct ResourceContent {
     uploaded: Vec<ContentGeneration>,
-    device: DeviceContent,
+    initialized: bool,
+    device_writes: Vec<DeviceWrite>,
+}
+
+struct HostSubmission {
+    index: wgpu::SubmissionIndex,
+    completed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeviceContent {
-    Uninitialized,
-    Synchronized,
-    Newer { last_write: u64 },
+struct DeviceWrite {
+    region: DeviceWriteRegion,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceWriteRegion {
+    Buffer(TransferRange),
+    /// Images require layout conversion, so one immutable backing binding is
+    /// the smallest exact transfer domain currently exposed by this backend.
+    ImageBinding(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransferRange {
+    offset: u64,
+    size: u64,
 }
 
 const MAX_REUSABLE_READBACK_BUFFERS: usize = 8;
 const MAX_REUSABLE_READBACK_BYTES: u64 = 64 * 1024 * 1024;
+const UPLOAD_STAGING_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_UPLOAD_BYTES_PER_SUBMISSION: u64 = MAX_RESIDENT_RESOURCE_BYTES;
+const MAX_DEVICE_WRITE_REGIONS: usize = 256;
 const MAX_RESIDENT_RESOURCE_COUNT: usize = 4_096;
 const MAX_RESIDENT_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -112,8 +136,13 @@ impl ResourceContent {
         };
         Some(Self {
             uploaded,
-            device: DeviceContent::Uninitialized,
+            initialized: false,
+            device_writes: Vec::new(),
         })
+    }
+
+    fn has_device_writes(&self) -> bool {
+        !self.device_writes.is_empty()
     }
 }
 
@@ -133,7 +162,10 @@ struct RenderPipelineKey {
 enum PendingWriteback {
     Buffer {
         staging: Buffer,
-        backing: BackingView,
+        page: CanonicalPageId,
+        page_offset: usize,
+        staging_offset: usize,
+        size: usize,
     },
     Image {
         staging: Buffer,
@@ -145,6 +177,47 @@ enum PendingWriteback {
         height: u32,
         depth_or_layers: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DemandedBufferWriteback {
+    handle: BackendResourceHandle,
+    serial: u64,
+    range: TransferRange,
+    page_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DemandedWriteback {
+    Buffer(DemandedBufferWriteback),
+    Image {
+        handle: BackendResourceHandle,
+        binding: usize,
+        serial: u64,
+    },
+}
+
+impl DemandedWriteback {
+    fn serial(self) -> u64 {
+        match self {
+            Self::Buffer(writeback) => writeback.serial,
+            Self::Image { serial, .. } => serial,
+        }
+    }
+
+    fn handle(self) -> BackendResourceHandle {
+        match self {
+            Self::Buffer(writeback) => writeback.handle,
+            Self::Image { handle, .. } => handle,
+        }
+    }
+
+    fn order_offset(self) -> u64 {
+        match self {
+            Self::Buffer(writeback) => writeback.range.offset,
+            Self::Image { binding, .. } => u64::try_from(binding).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 fn alpha_test_entry_point(alpha_test: Option<AlphaTest>) -> &'static str {
@@ -179,13 +252,18 @@ pub(crate) struct WgpuBackendDriver {
     queue: Queue,
     visibility: Arc<WgpuVisibilityCoordinator>,
     resources: HashMap<BackendResourceHandle, ResourceRecord>,
-    completed: HashSet<BackendSubmissionToken>,
-    submission_indices: HashMap<BackendSubmissionToken, wgpu::SubmissionIndex>,
+    submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
     next_use: u64,
+    upload_staging: StagingBelt,
+    upload_bytes: u64,
     upload_canonical: Vec<u8>,
     upload_linear: Vec<u8>,
+    cpu_dirty_ranges: Vec<CanonicalCpuWriteRange>,
+    transfer_ranges: Vec<TransferRange>,
+    uploaded_generations: Vec<ContentGeneration>,
+    dirty_image_bindings: Vec<usize>,
     uploaded_inputs: HashSet<BackendResourceHandle>,
     readback_pool: Vec<Buffer>,
     readback_pool_bytes: u64,
@@ -219,18 +297,24 @@ impl WgpuBackendDriver {
                 Some(error.to_string().into_boxed_str());
         }));
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
+        let upload_staging = StagingBelt::new(device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         Self {
             device,
             queue,
             visibility,
             resources: HashMap::new(),
-            completed: HashSet::new(),
-            submission_indices: HashMap::new(),
+            submissions: HashMap::new(),
             completion_sender,
             completion_receiver,
             next_use: 1,
+            upload_staging,
+            upload_bytes: 0,
             upload_canonical: Vec::new(),
             upload_linear: Vec::new(),
+            cpu_dirty_ranges: Vec::new(),
+            transfer_ranges: Vec::new(),
+            uploaded_generations: Vec::new(),
+            dirty_image_bindings: Vec::new(),
             uploaded_inputs: HashSet::new(),
             readback_pool: Vec::new(),
             readback_pool_bytes: 0,
@@ -249,14 +333,7 @@ impl WgpuBackendDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(reason) = loss {
-            self.resources.clear();
-            self.completed.clear();
-            self.submission_indices.clear();
-            self.readback_pool.clear();
-            self.uploaded_inputs.clear();
-            self.readback_pool_bytes = 0;
-            self.resident_resources = 0;
-            self.resident_resource_bytes = 0;
+            self.clear_owned_state();
             return Err(BackendDriverError::device_lost(reason));
         }
         if let Some(error) = self
@@ -278,8 +355,27 @@ impl WgpuBackendDriver {
 
     fn drain_completions(&mut self) {
         while let Ok(token) = self.completion_receiver.try_recv() {
-            self.completed.insert(token);
+            if let Some(submission) = self.submissions.get_mut(&token) {
+                submission.completed = true;
+            }
         }
+    }
+
+    fn clear_owned_state(&mut self) {
+        self.resources.clear();
+        self.submissions.clear();
+        self.readback_pool.clear();
+        self.uploaded_inputs.clear();
+        self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
+        self.upload_canonical = Vec::new();
+        self.upload_linear = Vec::new();
+        self.cpu_dirty_ranges = Vec::new();
+        self.transfer_ranges = Vec::new();
+        self.uploaded_generations = Vec::new();
+        self.dirty_image_bindings = Vec::new();
+        self.readback_pool_bytes = 0;
+        self.resident_resources = 0;
+        self.resident_resource_bytes = 0;
     }
 
     fn capture_error_scope(&self, scope: ErrorScopeGuard) -> Result<(), BackendDriverError> {
@@ -303,6 +399,7 @@ impl WgpuBackendDriver {
         &mut self,
         accepted: &AcceptedBackendSubmission<'_>,
         dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
         self.uploaded_inputs.clear();
         for operation in accepted.submission().operations() {
@@ -315,14 +412,14 @@ impl WgpuBackendDriver {
                         let handle =
                             dependency_handle(dependencies, ResourceDependency::Buffer(buffer))?;
                         if self.uploaded_inputs.insert(handle) {
-                            self.upload_buffer(handle)?;
+                            self.upload_buffer(handle, encoder)?;
                         }
                     }
                     nixe_gpu::AccessTarget::Image { image, .. } => {
                         let handle =
                             dependency_handle(dependencies, ResourceDependency::Image(image))?;
                         if self.uploaded_inputs.insert(handle) {
-                            self.upload_image(handle)?;
+                            self.upload_image(handle, encoder)?;
                         }
                     }
                     nixe_gpu::AccessTarget::Queries { .. } => {}
@@ -332,8 +429,12 @@ impl WgpuBackendDriver {
         Ok(())
     }
 
-    fn upload_buffer(&mut self, handle: BackendResourceHandle) -> Result<(), BackendDriverError> {
-        let (buffer, view, upload_all, has_dirty) = {
+    fn upload_buffer(
+        &mut self,
+        handle: BackendResourceHandle,
+        encoder: &mut CommandEncoder,
+    ) -> Result<(), BackendDriverError> {
+        let (buffer, view, upload_all) = {
             let record = self.resource_record(handle)?;
             let Resource::Buffer {
                 buffer,
@@ -353,94 +454,74 @@ impl WgpuBackendDriver {
                     "wgpu buffer content record does not match its immutable backing",
                 ));
             }
-            let mut upload_all = content.device == DeviceContent::Uninitialized;
-            let mut has_dirty = false;
-            let mut logical_offset = 0_u64;
-            if !upload_all {
-                for (segment, baseline) in range.segments().iter().zip(&content.uploaded) {
-                    if segment_needs_upload(segment, *baseline)? {
-                        has_dirty = true;
-                        if !(view.buffer_offset() + logical_offset).is_multiple_of(4)
-                            || !segment.size().is_multiple_of(4)
-                        {
-                            upload_all = true;
-                        }
-                    }
-                    logical_offset = logical_offset
-                        .checked_add(segment.size())
-                        .ok_or_else(|| unsupported("buffer upload range overflow"))?;
-                }
-            }
-            (buffer.clone(), view.clone(), upload_all, has_dirty)
+            (buffer.clone(), view.clone(), !content.initialized)
         };
-        if !upload_all && !has_dirty {
+        let mut uploaded_generations = std::mem::take(&mut self.uploaded_generations);
+        uploaded_generations.clear();
+        uploaded_generations.extend_from_slice(
+            &self
+                .resource_record(handle)?
+                .content
+                .as_ref()
+                .expect("a canonically backed buffer has content state")
+                .uploaded,
+        );
+        self.transfer_ranges.clear();
+        if upload_all {
+            self.transfer_ranges.push(TransferRange {
+                offset: 0,
+                size: view.size(),
+            });
+        } else {
+            collect_dirty_buffer_ranges(
+                view.backing().range(),
+                &uploaded_generations,
+                view.buffer_offset(),
+                &mut self.cpu_dirty_ranges,
+                &mut self.transfer_ranges,
+            )?;
+        }
+        self.uploaded_generations = uploaded_generations;
+        if self.transfer_ranges.is_empty() {
             return Ok(());
         }
-        if upload_all {
-            let size = usize_from_u64(view.size(), "buffer upload size")?;
-            self.upload_canonical.resize(size, 0);
+        let ranges = std::mem::take(&mut self.transfer_ranges);
+        let mut upload_canonical = std::mem::take(&mut self.upload_canonical);
+        for range in &ranges {
+            let size = usize_from_u64(range.size, "buffer upload size")?;
+            upload_canonical.resize(size, 0);
             view.backing()
                 .range()
-                .read(0, &mut self.upload_canonical)
+                .read(range.offset, &mut upload_canonical)
                 .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-            self.queue.write_buffer(
+            self.stage_buffer_upload(
+                encoder,
                 &buffer,
-                view.buffer_offset(),
-                self.upload_canonical.as_slice(),
-            );
-        } else {
-            let mut logical_offset = 0_u64;
-            for (index, segment) in view.backing().range().segments().iter().enumerate() {
-                let baseline = self
-                    .resource_record(handle)?
-                    .content
-                    .as_ref()
-                    .expect("a canonically backed buffer has content state")
-                    .uploaded[index];
-                if segment_needs_upload(segment, baseline)? {
-                    let size = usize_from_u64(segment.size(), "buffer dirty upload size")?;
-                    self.upload_canonical.resize(size, 0);
-                    view.backing()
-                        .range()
-                        .read(logical_offset, &mut self.upload_canonical)
-                        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
-                    self.queue.write_buffer(
-                        &buffer,
-                        view.buffer_offset() + logical_offset,
-                        self.upload_canonical.as_slice(),
-                    );
-                }
-                logical_offset = logical_offset
-                    .checked_add(segment.size())
-                    .ok_or_else(|| unsupported("buffer upload range overflow"))?;
-            }
+                view.buffer_offset() + range.offset,
+                upload_canonical.as_slice(),
+            )?;
         }
+        self.upload_canonical = upload_canonical;
         let record = self.resource_record_mut(handle)?;
         let content = record
             .content
             .as_mut()
             .expect("a canonically backed buffer has content state");
-        if upload_all {
-            record_uploaded([view.backing().range()], &mut content.uploaded);
-        } else {
-            for (segment, baseline) in view
-                .backing()
-                .range()
-                .segments()
-                .iter()
-                .zip(&mut content.uploaded)
-            {
-                if segment_needs_upload(segment, *baseline)? {
-                    *baseline = segment.current_content_generation();
-                }
-            }
+        record_uploaded([view.backing().range()], &mut content.uploaded);
+        content.initialized = true;
+        for range in &ranges {
+            subtract_buffer_write_range(&mut content.device_writes, *range, None);
         }
-        content.device = DeviceContent::Synchronized;
+        self.transfer_ranges = ranges;
         Ok(())
     }
 
-    fn upload_image(&mut self, handle: BackendResourceHandle) -> Result<(), BackendDriverError> {
-        let (texture, description, view, needs_upload) = {
+    fn upload_image(
+        &mut self,
+        handle: BackendResourceHandle,
+        encoder: &mut CommandEncoder,
+    ) -> Result<(), BackendDriverError> {
+        let (texture, description, view, initialized) = {
             let record = self.resource_record(handle)?;
             let Resource::Image {
                 texture,
@@ -459,19 +540,34 @@ impl WgpuBackendDriver {
                 texture.clone(),
                 *description,
                 view.clone(),
-                content.device == DeviceContent::Uninitialized
-                    || ranges_need_upload(
-                        view.bindings()
-                            .iter()
-                            .map(|binding| binding.backing().range()),
-                        &content.uploaded,
-                    )?,
+                content.initialized,
             )
         };
-        if !needs_upload {
+        let mut uploaded_generations = std::mem::take(&mut self.uploaded_generations);
+        uploaded_generations.clear();
+        uploaded_generations.extend_from_slice(
+            &self
+                .resource_record(handle)?
+                .content
+                .as_ref()
+                .expect("a canonically backed image has content state")
+                .uploaded,
+        );
+        let mut dirty_bindings = std::mem::take(&mut self.dirty_image_bindings);
+        dirty_bindings.clear();
+        collect_dirty_image_bindings(
+            &view,
+            &uploaded_generations,
+            initialized,
+            &mut dirty_bindings,
+        )?;
+        self.uploaded_generations = uploaded_generations;
+        if dirty_bindings.is_empty() {
+            self.dirty_image_bindings = dirty_bindings;
             return Ok(());
         }
-        for binding in view.bindings() {
+        for binding_index in dirty_bindings.iter().copied() {
+            let binding = &view.bindings()[binding_index];
             let subresources = binding.subresources();
             let extent = description
                 .mip_extent(subresources.mip_level)
@@ -510,7 +606,9 @@ impl WgpuBackendDriver {
                     host_row_pitch,
                 },
             )?;
-            self.queue.write_texture(
+            let upload_linear = std::mem::take(&mut self.upload_linear);
+            self.stage_texture_upload(
+                encoder,
                 TexelCopyTextureInfo {
                     texture: &texture,
                     mip_level: u32::from(subresources.mip_level),
@@ -521,7 +619,7 @@ impl WgpuBackendDriver {
                     },
                     aspect: TextureAspect::All,
                 },
-                &self.upload_linear,
+                upload_linear.as_slice(),
                 TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(host_row_pitch),
@@ -532,20 +630,25 @@ impl WgpuBackendDriver {
                     height: extent.height,
                     depth_or_array_layers: u32::from(subresources.layer_count),
                 },
-            );
+            )?;
+            self.upload_linear = upload_linear;
         }
         let record = self.resource_record_mut(handle)?;
         let content = record
             .content
             .as_mut()
             .expect("a canonically backed image has content state");
-        record_uploaded(
-            view.bindings()
-                .iter()
-                .map(|binding| binding.backing().range()),
-            &mut content.uploaded,
-        );
-        content.device = DeviceContent::Synchronized;
+        for binding in dirty_bindings.iter().copied() {
+            record_image_binding_uploaded(&view, binding, &mut content.uploaded);
+        }
+        content.initialized = true;
+        content.device_writes.retain(|write| {
+            let DeviceWriteRegion::ImageBinding(binding) = write.region else {
+                return true;
+            };
+            !dirty_bindings.contains(&binding)
+        });
+        self.dirty_image_bindings = dirty_bindings;
         Ok(())
     }
 
@@ -553,12 +656,8 @@ impl WgpuBackendDriver {
         &mut self,
         accepted: &AcceptedBackendSubmission<'_>,
         dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        mut encoder: CommandEncoder,
     ) -> Result<CommandEncoder, BackendDriverError> {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Nixe neutral submission"),
-            });
         let operations = accepted.submission().operations();
         let mut index = 0;
         while index < operations.len() {
@@ -595,6 +694,67 @@ impl WgpuBackendDriver {
             index += 1;
         }
         Ok(encoder)
+    }
+
+    fn stage_buffer_upload(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        target: &Buffer,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), BackendDriverError> {
+        let size = u64::try_from(bytes.len()).map_err(|_| unsupported("buffer upload size"))?;
+        self.reserve_upload_bytes(size)?;
+        let size = BufferSize::new(size).ok_or_else(|| unsupported("empty buffer upload"))?;
+        let mut staging = self
+            .upload_staging
+            .write_buffer(encoder, target, offset, size);
+        staging.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn stage_texture_upload(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        target: TexelCopyTextureInfo<'_>,
+        bytes: &[u8],
+        layout: TexelCopyBufferLayout,
+        extent: Extent3d,
+    ) -> Result<(), BackendDriverError> {
+        let size = u64::try_from(bytes.len()).map_err(|_| unsupported("image upload size"))?;
+        self.reserve_upload_bytes(size)?;
+        let size = BufferSize::new(size).ok_or_else(|| unsupported("empty image upload"))?;
+        let staging = self.upload_staging.allocate(
+            size,
+            BufferSize::new(256).expect("WGPU texture-copy alignment is non-zero"),
+        );
+        staging
+            .get_mapped_range_mut()
+            .map_err(|error| BackendDriverError::failure(error.to_string()))?
+            .copy_from_slice(bytes);
+        encoder.copy_buffer_to_texture(
+            TexelCopyBufferInfo {
+                buffer: staging.buffer(),
+                layout: TexelCopyBufferLayout {
+                    offset: staging.offset(),
+                    ..layout
+                },
+            },
+            target,
+            extent,
+        );
+        Ok(())
+    }
+
+    fn reserve_upload_bytes(&mut self, size: u64) -> Result<(), BackendDriverError> {
+        self.upload_bytes = self
+            .upload_bytes
+            .checked_add(size)
+            .filter(|bytes| *bytes <= MAX_UPLOAD_BYTES_PER_SUBMISSION)
+            .ok_or_else(|| {
+                BackendDriverError::failure("one submission exceeds upload storage budget")
+            })?;
+        Ok(())
     }
 
     fn encode_copy(
@@ -634,52 +794,35 @@ impl WgpuBackendDriver {
     }
 
     fn encode_clear(
-        &self,
+        &mut self,
         encoder: &mut CommandEncoder,
         dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
         clear: &ClearOperation,
     ) -> Result<(), BackendDriverError> {
         match clear {
             ClearOperation::Buffer { target, value } => {
-                let buffer = self.buffer(dependency_handle(
-                    dependencies,
-                    ResourceDependency::Buffer(target.buffer),
-                )?)?;
+                let buffer = self
+                    .buffer(dependency_handle(
+                        dependencies,
+                        ResourceDependency::Buffer(target.buffer),
+                    )?)?
+                    .clone();
                 let ClearValue::Buffer(value) = value else {
                     unreachable!();
                 };
                 if *value == 0 {
-                    encoder.clear_buffer(buffer, target.range.offset(), Some(target.range.size()));
+                    encoder.clear_buffer(&buffer, target.range.offset(), Some(target.range.size()));
                 } else {
                     if !target.range.size().is_multiple_of(4) {
                         return Err(unsupported("unaligned non-zero buffer clear"));
                     }
-                    let staging = self.device.create_buffer(&BufferDescriptor {
-                        label: Some("Nixe non-zero clear pattern"),
-                        size: target.range.size(),
-                        usage: BufferUsages::COPY_SRC,
-                        mapped_at_creation: true,
-                    });
-                    {
-                        let mut mapped = staging.get_mapped_range_mut(..).map_err(|error| {
-                            BackendDriverError::failure(format!(
-                                "wgpu clear staging mapping failed: {error}"
-                            ))
-                        })?;
-                        let mut pattern = vec![0; mapped.len()];
-                        for word in pattern.chunks_exact_mut(4) {
-                            word.copy_from_slice(&value.to_le_bytes());
-                        }
-                        mapped.copy_from_slice(&pattern);
+                    let mut pattern = std::mem::take(&mut self.upload_canonical);
+                    pattern.resize(usize_from_u64(target.range.size(), "buffer clear size")?, 0);
+                    for word in pattern.chunks_exact_mut(4) {
+                        word.copy_from_slice(&value.to_le_bytes());
                     }
-                    staging.unmap();
-                    encoder.copy_buffer_to_buffer(
-                        &staging,
-                        0,
-                        buffer,
-                        target.range.offset(),
-                        target.range.size(),
-                    );
+                    self.stage_buffer_upload(encoder, &buffer, target.range.offset(), &pattern)?;
+                    self.upload_canonical = pattern;
                 }
                 Ok(())
             }
@@ -1283,25 +1426,44 @@ impl WgpuBackendDriver {
     fn encode_buffer_writeback(
         &mut self,
         encoder: &mut CommandEncoder,
-        handle: BackendResourceHandle,
+        writeback: DemandedBufferWriteback,
+        page: CanonicalPageId,
         output: &mut Vec<PendingWriteback>,
     ) -> Result<(), BackendDriverError> {
-        let (buffer, view) = match self.resource(handle)? {
+        let (buffer, buffer_size, view) = match self.resource(writeback.handle)? {
             Resource::Buffer {
                 buffer,
                 view: Some(view),
                 ..
-            } => (buffer.clone(), view.clone()),
+            } => (buffer.clone(), buffer.size(), view.clone()),
             _ => return Ok(()),
         };
-        if !view.size().is_multiple_of(4) {
-            return Err(unsupported("unaligned buffer writeback"));
+        let source = view
+            .buffer_offset()
+            .checked_add(writeback.range.offset)
+            .ok_or_else(|| unsupported("buffer writeback offset overflow"))?;
+        let source_end = source
+            .checked_add(writeback.range.size)
+            .ok_or_else(|| unsupported("buffer writeback range overflow"))?;
+        let aligned_source = source / 4 * 4;
+        let aligned_end = align_u64(source_end, 4)?;
+        if aligned_end > buffer_size {
+            return Err(unsupported(
+                "buffer writeback cannot satisfy WGPU copy alignment",
+            ));
         }
-        let staging = self.take_readback_buffer(view.size(), "Nixe buffer readback");
-        encoder.copy_buffer_to_buffer(&buffer, view.buffer_offset(), &staging, 0, view.size());
+        if aligned_source >= aligned_end {
+            return Err(unsupported("empty aligned buffer writeback"));
+        }
+        let copy_size = aligned_end - aligned_source;
+        let staging = self.take_readback_buffer(copy_size, "Nixe buffer readback");
+        encoder.copy_buffer_to_buffer(&buffer, aligned_source, &staging, 0, copy_size);
         output.push(PendingWriteback::Buffer {
             staging,
-            backing: view.backing().clone(),
+            page,
+            page_offset: usize_from_u64(writeback.page_offset, "page writeback offset")?,
+            staging_offset: usize_from_u64(source - aligned_source, "staging writeback offset")?,
+            size: usize_from_u64(writeback.range.size, "buffer writeback size")?,
         });
         Ok(())
     }
@@ -1310,6 +1472,7 @@ impl WgpuBackendDriver {
         &mut self,
         encoder: &mut CommandEncoder,
         handle: BackendResourceHandle,
+        binding_index: usize,
         output: &mut Vec<PendingWriteback>,
     ) -> Result<(), BackendDriverError> {
         let (texture, description, view) = match self.resource(handle)? {
@@ -1321,10 +1484,10 @@ impl WgpuBackendDriver {
             } => (texture.clone(), *description, view.clone()),
             _ => return Ok(()),
         };
-        if view.bindings().len() != 1 {
-            return Err(unsupported("multi-binding image writeback"));
-        }
-        let binding = &view.bindings()[0];
+        let binding = view
+            .bindings()
+            .get(binding_index)
+            .ok_or_else(|| unsupported("missing image writeback binding"))?;
         let subresources = binding.subresources();
         let extent = description
             .mip_extent(subresources.mip_level)
@@ -1422,10 +1585,23 @@ impl WgpuBackendDriver {
                 BackendDriverError::failure(format!("wgpu readback mapping failed: {error}"))
             })?;
             match &writeback {
-                PendingWriteback::Buffer { backing, .. } => self
-                    .visibility
-                    .write_backing(backing, &mapped)
-                    .map_err(|error| BackendDriverError::failure(error.to_string()))?,
+                PendingWriteback::Buffer {
+                    page,
+                    page_offset,
+                    staging_offset,
+                    size,
+                    ..
+                } => {
+                    let end = staging_offset
+                        .checked_add(*size)
+                        .ok_or_else(|| unsupported("mapped buffer writeback range overflow"))?;
+                    let bytes = mapped
+                        .get(*staging_offset..end)
+                        .ok_or_else(|| unsupported("mapped buffer writeback exceeds staging"))?;
+                    self.visibility
+                        .write_page_range(*page, *page_offset, bytes)
+                        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+                }
                 PendingWriteback::Image {
                     backing,
                     host_row_pitch,
@@ -1646,9 +1822,10 @@ impl WgpuBackendDriver {
                         && !protected.is_some_and(|resources| {
                             resources.values().any(|protected| protected == *handle)
                         })
-                        && record.content.as_ref().is_none_or(|content| {
-                            !matches!(content.device, DeviceContent::Newer { .. })
-                        })
+                        && record
+                            .content
+                            .as_ref()
+                            .is_none_or(|content| !content.has_device_writes())
                 })
                 .min_by_key(|(_, record)| record.last_use)
                 .map(|(handle, _)| *handle)
@@ -1663,7 +1840,7 @@ impl WgpuBackendDriver {
                 .expect("residency candidate came from the resource map");
             record.host = None;
             if let Some(content) = record.content.as_mut() {
-                content.device = DeviceContent::Uninitialized;
+                content.initialized = false;
             }
             self.resident_resources -= 1;
             self.resident_resource_bytes -= record.resident_bytes;
@@ -1700,60 +1877,76 @@ impl WgpuBackendDriver {
         &mut self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendDriverError> {
-        let mut dirty = self
-            .resources
-            .iter()
-            .filter_map(|(handle, record)| {
-                record
-                    .content
-                    .as_ref()
-                    .and_then(|content| match content.device {
-                        DeviceContent::Newer { last_write } => Some(last_write),
-                        DeviceContent::Uninitialized | DeviceContent::Synchronized => None,
-                    })
-                    .filter(|_| resource_contains_page(&record.immutable, request.page))
-                    .map(|serial| (serial, *handle))
-            })
-            .collect::<Vec<_>>();
-        dirty.sort_unstable_by_key(|(serial, handle)| (*serial, *handle));
-        if !dirty.is_empty() {
+        let mut demanded = Vec::new();
+        for (handle, record) in &self.resources {
+            collect_demanded_writebacks(*handle, record, request.page, &mut demanded)?;
+        }
+        prepare_demanded_writebacks(&mut demanded);
+        if !demanded.is_empty() {
             let mut encoder = self
                 .device
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("Nixe demanded canonical visibility"),
                 });
-            let mut writebacks = Vec::with_capacity(dirty.len());
-            for (_, handle) in &dirty {
-                match self.resource(*handle)? {
-                    Resource::Buffer { .. } => {
-                        self.encode_buffer_writeback(&mut encoder, *handle, &mut writebacks)?;
+            let mut writebacks = Vec::with_capacity(demanded.len());
+            for demanded_writeback in &demanded {
+                match *demanded_writeback {
+                    DemandedWriteback::Buffer(buffer) => self.encode_buffer_writeback(
+                        &mut encoder,
+                        buffer,
+                        request.page,
+                        &mut writebacks,
+                    )?,
+                    DemandedWriteback::Image {
+                        handle, binding, ..
+                    } => {
+                        self.encode_image_writeback(&mut encoder, handle, binding, &mut writebacks)?
                     }
-                    Resource::Image { .. } => {
-                        self.encode_image_writeback(&mut encoder, *handle, &mut writebacks)?;
-                    }
-                    _ => {}
                 }
             }
             self.queue.submit([encoder.finish()]);
             self.finish_writebacks(writebacks)?;
-            let mut retired = Vec::new();
-            for (_, handle) in dirty {
+            for writeback in &demanded {
                 let record = self
                     .resources
-                    .get(&handle)
-                    .expect("read-back resource remains live");
-                mark_resource_completed(&self.visibility, &record.immutable, request.visible_at)?;
-                if let Some(content) = self
-                    .resources
-                    .get_mut(&handle)
-                    .and_then(|record| record.content.as_mut())
+                    .get_mut(&writeback.handle())
+                    .expect("demanded read-back resource remains live");
+                complete_demanded_writeback(record, *writeback);
+            }
+            for writeback in &demanded {
+                if let DemandedWriteback::Image {
+                    handle, binding, ..
+                } = *writeback
                 {
-                    content.device = DeviceContent::Synchronized;
+                    let BackendResourceCreateInfo::Image {
+                        view: Some(view), ..
+                    } = &self
+                        .resources
+                        .get(&handle)
+                        .expect("demanded image remains live")
+                        .immutable
+                    else {
+                        continue;
+                    };
+                    self.visibility
+                        .mark_backing_completed(
+                            view.bindings()[binding].backing(),
+                            request.visible_at,
+                        )
+                        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
                 }
-                if self
-                    .resources
-                    .get(&handle)
-                    .is_some_and(|record| record.retirement.is_some())
+            }
+            let mut retired = Vec::new();
+            for writeback in demanded {
+                let handle = writeback.handle();
+                if !retired.contains(&handle)
+                    && self.resources.get(&handle).is_some_and(|record| {
+                        record.retirement.is_some()
+                            && record
+                                .content
+                                .as_ref()
+                                .is_none_or(|content| !content.has_device_writes())
+                    })
                 {
                     retired.push(handle);
                 }
@@ -1767,6 +1960,13 @@ impl WgpuBackendDriver {
                 }
             }
         }
+        // The neutral visibility contract is currently page-conservative. If
+        // no exact device-write region overlapped this page, its prepared
+        // mirror is already the newest content once the runtime has waited for
+        // `visible_at`; no host transfer is necessary.
+        self.visibility
+            .mark_page_completed(request.page, request.visible_at)
+            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
         self.visibility
             .take_completed_page(request)
             .map_err(|error| BackendDriverError::failure(error.to_string()))
@@ -1841,7 +2041,7 @@ impl BackendDriver for WgpuBackendDriver {
             if record
                 .content
                 .as_ref()
-                .is_some_and(|content| matches!(content.device, DeviceContent::Newer { .. }))
+                .is_some_and(ResourceContent::has_device_writes)
             {
                 return Ok(());
             }
@@ -1867,16 +2067,28 @@ impl BackendDriver for WgpuBackendDriver {
             .ok_or_else(|| BackendDriverError::failure("wgpu resource-use timeline exhausted"))?;
         let dependencies = accepted.resources();
         self.ensure_resident(dependencies)?;
-        self.upload_inputs(accepted, dependencies)?;
-        let encoder = self.encode_submission(accepted, dependencies)?;
+        self.upload_bytes = 0;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Nixe neutral submission"),
+            });
+        self.upload_inputs(accepted, dependencies, &mut encoder)?;
+        let encoder = self.encode_submission(accepted, dependencies, encoder)?;
+        self.upload_staging.finish_and_recall_on_submit(&encoder);
         let submission_index = self.queue.submit([encoder.finish()]);
-        let completed = self.completion_sender.clone();
         let token = accepted.token();
+        self.submissions.insert(
+            token,
+            HostSubmission {
+                index: submission_index,
+                completed: false,
+            },
+        );
+        let completed = self.completion_sender.clone();
         self.queue.on_submitted_work_done(move || {
             let _ = completed.send(token);
         });
-        self.submission_indices
-            .insert(accepted.token(), submission_index);
         for handle in dependencies.values() {
             if let Some(record) = self.resources.get_mut(handle) {
                 record.last_use = use_serial;
@@ -1888,14 +2100,8 @@ impl BackendDriver for WgpuBackendDriver {
                     continue;
                 }
                 let handle = dependency_handle(dependencies, access.target().dependency())?;
-                if let Some(content) = self
-                    .resources
-                    .get_mut(&handle)
-                    .and_then(|record| record.content.as_mut())
-                {
-                    content.device = DeviceContent::Newer {
-                        last_write: use_serial,
-                    };
+                if let Some(record) = self.resources.get_mut(&handle) {
+                    record_device_write(record, access.target(), use_serial)?;
                 }
             }
         }
@@ -1912,7 +2118,10 @@ impl BackendDriver for WgpuBackendDriver {
             .map_err(|error| BackendDriverError::device_lost(error.to_string()))?;
         self.drain_completions();
         self.require_device()?;
-        Ok(self.completed.contains(&submission))
+        Ok(self
+            .submissions
+            .get(&submission)
+            .is_some_and(|submission| submission.completed))
     }
 
     fn wait_for_completion(
@@ -1921,9 +2130,9 @@ impl BackendDriver for WgpuBackendDriver {
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
         let index = self
-            .submission_indices
+            .submissions
             .get(&submission)
-            .cloned()
+            .map(|submission| submission.index.clone())
             .ok_or_else(|| BackendDriverError::failure("unknown wgpu submission token"))?;
         self.device
             .poll(wgpu::PollType::Wait {
@@ -1933,7 +2142,11 @@ impl BackendDriver for WgpuBackendDriver {
             .map_err(|error| BackendDriverError::device_lost(error.to_string()))?;
         self.drain_completions();
         self.require_device()?;
-        if self.completed.contains(&submission) {
+        if self
+            .submissions
+            .get(&submission)
+            .is_some_and(|submission| submission.completed)
+        {
             Ok(())
         } else {
             Err(BackendDriverError::failure(
@@ -1947,8 +2160,7 @@ impl BackendDriver for WgpuBackendDriver {
         submission: BackendSubmissionToken,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        self.completed.remove(&submission);
-        self.submission_indices.remove(&submission);
+        self.submissions.remove(&submission);
         Ok(())
     }
 
@@ -1979,14 +2191,7 @@ impl BackendDriver for WgpuBackendDriver {
         if self.torn_down {
             return Ok(());
         }
-        self.resources.clear();
-        self.completed.clear();
-        self.submission_indices.clear();
-        self.readback_pool.clear();
-        self.uploaded_inputs.clear();
-        self.readback_pool_bytes = 0;
-        self.resident_resources = 0;
-        self.resident_resource_bytes = 0;
+        self.clear_owned_state();
         self.torn_down = true;
         Ok(())
     }
@@ -2322,6 +2527,136 @@ fn dependency_handle(
     })
 }
 
+fn record_device_write(
+    record: &mut ResourceRecord,
+    target: nixe_gpu::AccessTarget,
+    serial: u64,
+) -> Result<(), BackendDriverError> {
+    let Some(content) = record.content.as_mut() else {
+        return Ok(());
+    };
+    content.initialized = true;
+    match (target, &record.immutable) {
+        (
+            nixe_gpu::AccessTarget::Buffer { range, .. },
+            BackendResourceCreateInfo::Buffer {
+                view: Some(view), ..
+            },
+        ) => {
+            let offset = range
+                .offset()
+                .checked_sub(view.buffer_offset())
+                .ok_or_else(|| unsupported("buffer device-write range precedes its backing"))?;
+            record_buffer_device_write(
+                &mut content.device_writes,
+                TransferRange {
+                    offset,
+                    size: range.size(),
+                },
+                serial,
+            )?;
+        }
+        (
+            nixe_gpu::AccessTarget::Image { subresources, .. },
+            BackendResourceCreateInfo::Image {
+                view: Some(view), ..
+            },
+        ) => {
+            for (index, binding) in view.bindings().iter().enumerate() {
+                if !image_subresources_overlap(binding.subresources(), subresources) {
+                    continue;
+                }
+                content
+                    .device_writes
+                    .retain(|write| write.region != DeviceWriteRegion::ImageBinding(index));
+                if content.device_writes.len() == MAX_DEVICE_WRITE_REGIONS {
+                    return Err(BackendDriverError::failure(
+                        "device-write region budget is exhausted",
+                    ));
+                }
+                content.device_writes.push(DeviceWrite {
+                    region: DeviceWriteRegion::ImageBinding(index),
+                    serial,
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn record_buffer_device_write(
+    writes: &mut Vec<DeviceWrite>,
+    new: TransferRange,
+    serial: u64,
+) -> Result<(), BackendDriverError> {
+    let new_end = new
+        .offset
+        .checked_add(new.size)
+        .ok_or_else(|| unsupported("buffer device-write range overflow"))?;
+    let resulting = writes.iter().try_fold(1_usize, |count, write| {
+        let DeviceWriteRegion::Buffer(old) = write.region else {
+            return Ok(count + 1);
+        };
+        let old_end = old.offset + old.size;
+        if old_end <= new.offset || new_end <= old.offset {
+            return Ok(count + 1);
+        }
+        Ok(count + usize::from(old.offset < new.offset) + usize::from(old_end > new_end))
+    })?;
+    if resulting > MAX_DEVICE_WRITE_REGIONS {
+        return Err(BackendDriverError::failure(
+            "device-write region budget is exhausted",
+        ));
+    }
+    let mut index = 0;
+    while index < writes.len() {
+        let DeviceWriteRegion::Buffer(old) = writes[index].region else {
+            index += 1;
+            continue;
+        };
+        let old_end = old.offset + old.size;
+        if old_end <= new.offset || new_end <= old.offset {
+            index += 1;
+            continue;
+        }
+        let old_serial = writes[index].serial;
+        let left = (old.offset < new.offset).then_some(TransferRange {
+            offset: old.offset,
+            size: new.offset - old.offset,
+        });
+        let right = (old_end > new_end).then_some(TransferRange {
+            offset: new_end,
+            size: old_end - new_end,
+        });
+        writes.swap_remove(index);
+        if let Some(left) = left {
+            writes.push(DeviceWrite {
+                region: DeviceWriteRegion::Buffer(left),
+                serial: old_serial,
+            });
+        }
+        if let Some(right) = right {
+            writes.push(DeviceWrite {
+                region: DeviceWriteRegion::Buffer(right),
+                serial: old_serial,
+            });
+        }
+    }
+    writes.push(DeviceWrite {
+        region: DeviceWriteRegion::Buffer(new),
+        serial,
+    });
+    Ok(())
+}
+
+fn image_subresources_overlap(left: ImageSubresourceRange, right: ImageSubresourceRange) -> bool {
+    left.plane == right.plane
+        && left.mip_level == right.mip_level
+        && u32::from(left.base_layer) < u32::from(right.base_layer) + u32::from(right.layer_count)
+        && u32::from(right.base_layer) < u32::from(left.base_layer) + u32::from(left.layer_count)
+}
+
 fn ranges_need_upload<'a>(
     ranges: impl IntoIterator<Item = &'a nixe_memory::CanonicalBackingRange>,
     uploaded: &[ContentGeneration],
@@ -2356,17 +2691,133 @@ fn ranges_need_upload<'a>(
     Ok(dirty)
 }
 
-fn segment_needs_upload(
-    segment: &nixe_memory::CanonicalBackingSegment,
-    baseline: ContentGeneration,
-) -> Result<bool, BackendDriverError> {
-    if baseline == segment.current_content_generation() {
-        return Ok(false);
+fn collect_dirty_image_bindings(
+    view: &nixe_gpu::ImageView,
+    uploaded: &[ContentGeneration],
+    initialized: bool,
+    output: &mut Vec<usize>,
+) -> Result<(), BackendDriverError> {
+    let mut generation = 0_usize;
+    for (binding, image_binding) in view.bindings().iter().enumerate() {
+        let count = image_binding.backing().range().segments().len();
+        let end = generation
+            .checked_add(count)
+            .ok_or_else(|| unsupported("image content generation range overflow"))?;
+        let baselines = uploaded.get(generation..end).ok_or_else(|| {
+            BackendDriverError::failure(
+                "wgpu resource content record does not match its immutable backing",
+            )
+        })?;
+        if !initialized || ranges_need_upload([image_binding.backing().range()], baselines)? {
+            // A canonical byte interval cannot be copied directly into a host
+            // texture until the pitch/block-linear layout is converted. One
+            // immutable image binding is therefore the exact transfer domain.
+            output.push(binding);
+        }
+        generation = end;
     }
-    segment
-        .cpu_write_overlap_since(baseline)
-        .map(|overlap| overlap != CanonicalCpuWriteOverlap::No)
-        .map_err(|error| BackendDriverError::failure(error.to_string()))
+    if generation != uploaded.len() {
+        return Err(BackendDriverError::failure(
+            "wgpu resource content record does not match its immutable backing",
+        ));
+    }
+    Ok(())
+}
+
+fn record_image_binding_uploaded(
+    view: &nixe_gpu::ImageView,
+    binding: usize,
+    uploaded: &mut [ContentGeneration],
+) {
+    let first = view.bindings()[..binding]
+        .iter()
+        .map(|binding| binding.backing().range().segments().len())
+        .sum::<usize>();
+    let segments = view.bindings()[binding].backing().range().segments();
+    for (baseline, segment) in uploaded[first..first + segments.len()]
+        .iter_mut()
+        .zip(segments)
+    {
+        *baseline = segment.current_content_generation();
+    }
+}
+
+fn collect_dirty_buffer_ranges(
+    range: &nixe_memory::CanonicalBackingRange,
+    uploaded: &[ContentGeneration],
+    buffer_offset: u64,
+    page_dirty: &mut Vec<CanonicalCpuWriteRange>,
+    output: &mut Vec<TransferRange>,
+) -> Result<(), BackendDriverError> {
+    if range.segments().len() != uploaded.len() {
+        return Err(BackendDriverError::failure(
+            "wgpu resource content record does not match its immutable backing",
+        ));
+    }
+    let view_end = buffer_offset
+        .checked_add(range.size())
+        .ok_or_else(|| unsupported("buffer upload range overflow"))?;
+    let mut logical_offset = 0_u64;
+    for (segment, baseline) in range.segments().iter().zip(uploaded) {
+        if *baseline == segment.current_content_generation() {
+            logical_offset += segment.size();
+            continue;
+        }
+        page_dirty.clear();
+        segment
+            .append_cpu_write_ranges_since(*baseline, page_dirty)
+            .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+        for dirty in page_dirty.iter().copied() {
+            let dirty_start = buffer_offset
+                .checked_add(logical_offset)
+                .and_then(|offset| offset.checked_add(dirty.offset()))
+                .ok_or_else(|| unsupported("buffer dirty range overflow"))?;
+            let dirty_end = dirty_start
+                .checked_add(dirty.size())
+                .ok_or_else(|| unsupported("buffer dirty range overflow"))?;
+            let aligned_start = dirty_start / 4 * 4;
+            let aligned_end = align_u64(dirty_end, 4)?;
+            if aligned_start < buffer_offset || aligned_end > view_end {
+                if !buffer_offset.is_multiple_of(4) || !range.size().is_multiple_of(4) {
+                    return Err(unsupported("unaligned canonically backed buffer upload"));
+                }
+                output.clear();
+                output.push(TransferRange {
+                    offset: 0,
+                    size: range.size(),
+                });
+                return Ok(());
+            }
+            output.push(TransferRange {
+                offset: aligned_start - buffer_offset,
+                size: aligned_end - aligned_start,
+            });
+        }
+        logical_offset = logical_offset
+            .checked_add(segment.size())
+            .ok_or_else(|| unsupported("buffer upload range overflow"))?;
+    }
+    normalize_transfer_ranges(output);
+    Ok(())
+}
+
+fn normalize_transfer_ranges(ranges: &mut Vec<TransferRange>) {
+    ranges.sort_unstable_by_key(|range| range.offset);
+    let mut output = 0_usize;
+    for input in 0..ranges.len() {
+        let current = ranges[input];
+        if output != 0 {
+            let previous = &mut ranges[output - 1];
+            let previous_end = previous.offset + previous.size;
+            if current.offset <= previous_end {
+                previous.size = previous_end.max(current.offset + current.size) - previous.offset;
+                continue;
+            }
+        }
+        ranges[output] = current;
+        output += 1;
+    }
+    ranges.truncate(output);
 }
 
 fn record_uploaded<'a>(
@@ -2383,53 +2834,176 @@ fn record_uploaded<'a>(
     debug_assert_eq!(index, uploaded.len());
 }
 
-fn resource_contains_page(info: &BackendResourceCreateInfo, page: CanonicalPageId) -> bool {
-    match info {
-        BackendResourceCreateInfo::Buffer {
-            view: Some(view), ..
-        } => view
-            .backing()
-            .range()
-            .segments()
-            .iter()
-            .any(|segment| segment.page() == page),
-        BackendResourceCreateInfo::Image {
-            view: Some(view), ..
-        } => view.bindings().iter().any(|binding| {
-            binding
-                .backing()
-                .range()
-                .segments()
-                .iter()
-                .any(|segment| segment.page() == page)
-        }),
-        _ => false,
-    }
-}
-
-fn mark_resource_completed(
-    visibility: &WgpuVisibilityCoordinator,
-    info: &BackendResourceCreateInfo,
-    point: nixe_memory::DeviceVisibilityPoint,
+fn collect_demanded_writebacks(
+    handle: BackendResourceHandle,
+    record: &ResourceRecord,
+    page: CanonicalPageId,
+    output: &mut Vec<DemandedWriteback>,
 ) -> Result<(), BackendDriverError> {
-    match info {
+    let Some(content) = record.content.as_ref() else {
+        return Ok(());
+    };
+    match &record.immutable {
         BackendResourceCreateInfo::Buffer {
             view: Some(view), ..
-        } => visibility
-            .mark_backing_completed(view.backing(), point)
-            .map_err(|error| BackendDriverError::failure(error.to_string()))?,
+        } => {
+            for write in &content.device_writes {
+                let DeviceWriteRegion::Buffer(dirty) = write.region else {
+                    continue;
+                };
+                let dirty_end = dirty.offset + dirty.size;
+                let mut logical_offset = 0_u64;
+                for segment in view.backing().range().segments() {
+                    let segment_end = logical_offset + segment.size();
+                    if segment.page() == page {
+                        let start = dirty.offset.max(logical_offset);
+                        let end = dirty_end.min(segment_end);
+                        if start < end {
+                            output.push(DemandedWriteback::Buffer(DemandedBufferWriteback {
+                                handle,
+                                serial: write.serial,
+                                range: TransferRange {
+                                    offset: start,
+                                    size: end - start,
+                                },
+                                page_offset: segment.offset() + start - logical_offset,
+                            }));
+                        }
+                    }
+                    logical_offset = segment_end;
+                }
+            }
+        }
         BackendResourceCreateInfo::Image {
             view: Some(view), ..
         } => {
-            for binding in view.bindings() {
-                visibility
-                    .mark_backing_completed(binding.backing(), point)
-                    .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+            for write in &content.device_writes {
+                let DeviceWriteRegion::ImageBinding(binding) = write.region else {
+                    continue;
+                };
+                if view.bindings()[binding]
+                    .backing()
+                    .range()
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.page() == page)
+                {
+                    output.push(DemandedWriteback::Image {
+                        handle,
+                        binding,
+                        serial: write.serial,
+                    });
+                }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn coalesce_demanded_buffer_writebacks(writebacks: &mut Vec<DemandedWriteback>) {
+    let mut output = 0_usize;
+    for input in 0..writebacks.len() {
+        let current = writebacks[input];
+        if output != 0
+            && let (DemandedWriteback::Buffer(previous), DemandedWriteback::Buffer(current_buffer)) =
+                (&mut writebacks[output - 1], current)
+            && previous.handle == current_buffer.handle
+            && previous.serial == current_buffer.serial
+            && previous.range.offset + previous.range.size == current_buffer.range.offset
+            && previous.page_offset + previous.range.size == current_buffer.page_offset
+        {
+            previous.range.size += current_buffer.range.size;
+            continue;
+        }
+        writebacks[output] = current;
+        output += 1;
+    }
+    writebacks.truncate(output);
+}
+
+fn prepare_demanded_writebacks(writebacks: &mut Vec<DemandedWriteback>) {
+    writebacks.sort_unstable_by_key(|writeback| {
+        (
+            writeback.serial(),
+            writeback.handle(),
+            writeback.order_offset(),
+        )
+    });
+    coalesce_demanded_buffer_writebacks(writebacks);
+}
+
+fn complete_demanded_writeback(record: &mut ResourceRecord, completed: DemandedWriteback) {
+    let Some(content) = record.content.as_mut() else {
+        return;
+    };
+    match completed {
+        DemandedWriteback::Buffer(completed) => {
+            subtract_completed_buffer_write(
+                &mut content.device_writes,
+                completed.range,
+                completed.serial,
+            );
+        }
+        DemandedWriteback::Image {
+            binding, serial, ..
+        } => content.device_writes.retain(|write| {
+            write.serial != serial || write.region != DeviceWriteRegion::ImageBinding(binding)
+        }),
+    }
+}
+
+fn subtract_completed_buffer_write(
+    writes: &mut Vec<DeviceWrite>,
+    completed: TransferRange,
+    serial: u64,
+) {
+    subtract_buffer_write_range(writes, completed, Some(serial));
+}
+
+fn subtract_buffer_write_range(
+    writes: &mut Vec<DeviceWrite>,
+    completed: TransferRange,
+    serial: Option<u64>,
+) {
+    let completed_end = completed.offset + completed.size;
+    let mut index = 0;
+    while index < writes.len() {
+        let DeviceWriteRegion::Buffer(current) = writes[index].region else {
+            index += 1;
+            continue;
+        };
+        let current_end = current.offset + current.size;
+        if serial.is_some_and(|serial| writes[index].serial != serial)
+            || current_end <= completed.offset
+            || completed_end <= current.offset
+        {
+            index += 1;
+            continue;
+        }
+        let left = (current.offset < completed.offset).then_some(TransferRange {
+            offset: current.offset,
+            size: completed.offset - current.offset,
+        });
+        let right = (current_end > completed_end).then_some(TransferRange {
+            offset: completed_end,
+            size: current_end - completed_end,
+        });
+        let current_serial = writes[index].serial;
+        writes.swap_remove(index);
+        if let Some(left) = left {
+            writes.push(DeviceWrite {
+                region: DeviceWriteRegion::Buffer(left),
+                serial: current_serial,
+            });
+        }
+        if let Some(right) = right {
+            writes.push(DeviceWrite {
+                region: DeviceWriteRegion::Buffer(right),
+                serial: current_serial,
+            });
+        }
+    }
 }
 
 fn estimated_resident_bytes(info: &BackendResourceCreateInfo) -> Result<u64, BackendDriverError> {
@@ -2759,21 +3333,24 @@ fn kind_mismatch(handle: BackendResourceHandle) -> BackendDriverError {
 #[cfg(test)]
 mod tests {
     use nixe_gpu::{
-        BlockLinearLayout, DepthCompareOperation, ImageDescription, ImageDimension, ImageExtent,
-        ImageFormat, ImageKind, ImageMemoryLayout, SampleCount, TriangleRasterization,
-        ViewportTransform,
+        BackendInstanceId, BackendResourceHandle, BackendResourceKind, BlockLinearLayout,
+        DepthCompareOperation, ImageDescription, ImageDimension, ImageExtent, ImageFormat,
+        ImageKind, ImageMemoryLayout, SampleCount, TriangleRasterization, ViewportTransform,
     };
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
     use wgpu::{CompareFunction, TextureFormat, TextureUsages, TextureViewDimension};
 
     use super::{
-        ImageCopyShape, WebGpuViewport, compare_function, image_texture_plan,
-        linearize_canonical_image, sampled_texture_view_descriptor, segment_needs_upload,
-        vertex_entry_point, webgpu_viewport, write_linear_image_to_canonical,
+        DemandedBufferWriteback, DemandedWriteback, DeviceWrite, DeviceWriteRegion, ImageCopyShape,
+        MAX_DEVICE_WRITE_REGIONS, TransferRange, WebGpuViewport, collect_dirty_buffer_ranges,
+        compare_function, image_texture_plan, linearize_canonical_image,
+        prepare_demanded_writebacks, record_buffer_device_write, sampled_texture_view_descriptor,
+        subtract_completed_buffer_write, vertex_entry_point, webgpu_viewport,
+        write_linear_image_to_canonical,
     };
 
     #[test]
-    fn buffer_upload_tracking_selects_only_cpu_modified_pages() {
+    fn buffer_upload_tracking_selects_only_modified_aligned_bytes() {
         let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
         let range = allocation
             .backing_range(MemoryPermissions::READ_WRITE)
@@ -2783,22 +3360,161 @@ mod tests {
             .iter()
             .map(|segment| segment.current_content_generation())
             .collect::<Vec<_>>();
-        assert!(
-            range
-                .segments()
-                .iter()
-                .zip(&uploaded)
-                .all(|(segment, baseline)| !segment_needs_upload(segment, *baseline).unwrap())
+        let mut page_dirty = Vec::new();
+        let mut dirty = Vec::new();
+        collect_dirty_buffer_ranges(&range, &uploaded, 0, &mut page_dirty, &mut dirty).unwrap();
+        assert!(dirty.is_empty());
+
+        allocation.write(0x1101, &[1, 2]).unwrap();
+        collect_dirty_buffer_ranges(&range, &uploaded, 0, &mut page_dirty, &mut dirty).unwrap();
+        assert_eq!(
+            dirty,
+            [TransferRange {
+                offset: 0x1100,
+                size: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn newer_device_writes_replace_only_overlapping_bytes() {
+        let mut writes = Vec::new();
+        record_buffer_device_write(
+            &mut writes,
+            TransferRange {
+                offset: 0,
+                size: 100,
+            },
+            1,
+        )
+        .unwrap();
+        record_buffer_device_write(
+            &mut writes,
+            TransferRange {
+                offset: 40,
+                size: 20,
+            },
+            2,
+        )
+        .unwrap();
+        writes.sort_unstable_by_key(|write| match write.region {
+            DeviceWriteRegion::Buffer(range) => range.offset,
+            DeviceWriteRegion::ImageBinding(_) => u64::MAX,
+        });
+
+        assert_eq!(
+            writes,
+            [
+                DeviceWrite {
+                    region: DeviceWriteRegion::Buffer(TransferRange {
+                        offset: 0,
+                        size: 40
+                    }),
+                    serial: 1
+                },
+                DeviceWrite {
+                    region: DeviceWriteRegion::Buffer(TransferRange {
+                        offset: 40,
+                        size: 20
+                    }),
+                    serial: 2
+                },
+                DeviceWrite {
+                    region: DeviceWriteRegion::Buffer(TransferRange {
+                        offset: 60,
+                        size: 40
+                    }),
+                    serial: 1
+                }
+            ]
         );
 
-        allocation.write(0x1100, &[1, 2, 3, 4]).unwrap();
-        let dirty = range
-            .segments()
+        subtract_completed_buffer_write(
+            &mut writes,
+            TransferRange {
+                offset: 44,
+                size: 8,
+            },
+            2,
+        );
+        let device_newer_bytes = writes
             .iter()
-            .zip(&uploaded)
-            .map(|(segment, baseline)| segment_needs_upload(segment, *baseline).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(dirty, [false, true]);
+            .map(|write| match write.region {
+                DeviceWriteRegion::Buffer(range) => range.size,
+                DeviceWriteRegion::ImageBinding(_) => 0,
+            })
+            .sum::<u64>();
+        assert_eq!(device_newer_bytes, 92);
+    }
+
+    #[test]
+    fn device_write_provenance_is_strictly_bounded() {
+        let mut writes = Vec::new();
+        for offset in 0..MAX_DEVICE_WRITE_REGIONS {
+            record_buffer_device_write(
+                &mut writes,
+                TransferRange {
+                    offset: (offset * 2) as u64,
+                    size: 1,
+                },
+                offset as u64 + 1,
+            )
+            .unwrap();
+        }
+        assert_eq!(writes.len(), MAX_DEVICE_WRITE_REGIONS);
+        assert!(
+            record_buffer_device_write(
+                &mut writes,
+                TransferRange {
+                    offset: (MAX_DEVICE_WRITE_REGIONS * 2) as u64,
+                    size: 1,
+                },
+                MAX_DEVICE_WRITE_REGIONS as u64 + 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn demanded_alias_writebacks_keep_last_writer_order_and_coalesce() {
+        let instance = BackendInstanceId::new(1);
+        let older = BackendResourceHandle::new(instance, 0, 1, BackendResourceKind::Buffer);
+        let newer = BackendResourceHandle::new(instance, 1, 1, BackendResourceKind::Buffer);
+        let mut demanded = vec![
+            DemandedWriteback::Buffer(DemandedBufferWriteback {
+                handle: newer,
+                serial: 2,
+                range: TransferRange { offset: 4, size: 4 },
+                page_offset: 4,
+            }),
+            DemandedWriteback::Buffer(DemandedBufferWriteback {
+                handle: older,
+                serial: 1,
+                range: TransferRange { offset: 0, size: 4 },
+                page_offset: 0,
+            }),
+            DemandedWriteback::Buffer(DemandedBufferWriteback {
+                handle: older,
+                serial: 1,
+                range: TransferRange { offset: 4, size: 4 },
+                page_offset: 4,
+            }),
+        ];
+
+        prepare_demanded_writebacks(&mut demanded);
+
+        assert_eq!(demanded.len(), 2);
+        assert_eq!(demanded[0].serial(), 1);
+        assert_eq!(demanded[1].serial(), 2);
+        assert_eq!(
+            demanded[0],
+            DemandedWriteback::Buffer(DemandedBufferWriteback {
+                handle: older,
+                serial: 1,
+                range: TransferRange { offset: 0, size: 8 },
+                page_offset: 0,
+            })
+        );
     }
 
     #[test]

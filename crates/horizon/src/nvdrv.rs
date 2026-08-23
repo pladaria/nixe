@@ -422,6 +422,9 @@ impl NvDrvSession {
                 descriptor, request, error,
             ));
         }
+        let progress_backend = descriptor
+            .filter(|descriptor| descriptor.kind() == NvDrvDeviceKind::HostControl)
+            .and_then(|_| state.gpu_backend.as_ref().cloned());
         let result = match descriptor {
             Some(descriptor)
                 if canonical_memory.is_some_and(|(process_id, _, _)| {
@@ -573,6 +576,15 @@ impl NvDrvSession {
             None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
         };
         drop(state);
+        if result.is_ok()
+            && let Some(backend) = progress_backend
+        {
+            let descriptor =
+                descriptor.expect("GPU progress request has a host-control descriptor");
+            backend
+                .request_progress()
+                .map_err(|error| nvhost_gpu::queued_execution_error(descriptor, request, error))?;
+        }
         match result {
             Ok(LockedIoctlOutcome::DeferredGpuIoctl {
                 gpu,
@@ -723,13 +735,29 @@ impl NvDrvSession {
     /// fences. Unknown syncpoints remain distinct from unreached points.
     #[must_use]
     pub(crate) fn guest_timeline_point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
-        self.state
+        let (control, backend) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                Arc::clone(&state.nvhost_control),
+                state.gpu_backend.as_ref().cloned(),
+            )
+        };
+        let reached = control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .nvhost_control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .point_reached(point)
+            .point_reached(point);
+        if reached == Some(false)
+            && let Some(backend) = backend
+        {
+            // BufferQueue polling is itself a demand for guest timeline
+            // progress. The next compositor sample observes the completion;
+            // no periodic backend wakeup is required.
+            let _ = backend.request_progress();
+        }
+        reached
     }
 
     #[cfg(test)]
