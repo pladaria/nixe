@@ -16,12 +16,12 @@ use visibility::WgpuVisibilityCoordinator;
 use nixe_gpu::{
     Backend, BackendCapabilities, BackendFeatures, BackendInstanceId, BackendLimits,
     BackendRuntime, GpuCacheConfiguration, ImageFormat, NeutralBackendRuntime, QueryKind,
-    SampleCount, ShaderStage,
+    ResidentImage, SampleCount, ShaderStage,
 };
 use nixe_memory::NonCpuDeviceId;
 use wgpu::{
-    Backends, DeviceDescriptor, ExperimentalFeatures, Instance, InstanceDescriptor, MemoryHints,
-    PowerPreference, RequestAdapterOptions, Trace,
+    Adapter, Backends, Device, DeviceDescriptor, ExperimentalFeatures, Instance,
+    InstanceDescriptor, MemoryHints, PowerPreference, Queue, RequestAdapterOptions, Trace,
 };
 
 /// Host API requested for accelerated execution.
@@ -135,6 +135,7 @@ pub struct WgpuAdapterInformation {
 /// Result of accelerated backend initialization.
 pub struct InitializedWgpuBackend {
     runtime: Box<dyn NeutralBackendRuntime>,
+    presentation: WgpuPresentationContext,
     pub adapter: WgpuAdapterInformation,
 }
 
@@ -146,6 +147,73 @@ impl InitializedWgpuBackend {
     pub fn into_runtime(self) -> Box<dyn NeutralBackendRuntime> {
         self.runtime
     }
+
+    /// Returns the host context shared with the window presenter. Cloning these
+    /// WGPU handles retains the same device and queue; it never creates a
+    /// second host graphics device.
+    #[must_use]
+    pub fn presentation_context(&self) -> WgpuPresentationContext {
+        self.presentation.clone()
+    }
+}
+
+/// WGPU objects shared by accelerated execution and host presentation.
+#[derive(Clone, Debug)]
+pub struct WgpuPresentationContext {
+    backend: BackendInstanceId,
+    instance: Instance,
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+}
+
+impl WgpuPresentationContext {
+    #[must_use]
+    pub const fn backend(&self) -> BackendInstanceId {
+        self.backend
+    }
+
+    #[must_use]
+    pub const fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    #[must_use]
+    pub const fn adapter(&self) -> &Adapter {
+        &self.adapter
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> &Device {
+        &self.device
+    }
+
+    #[must_use]
+    pub const fn queue(&self) -> &Queue {
+        &self.queue
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WgpuResidentImage {
+    texture: wgpu::Texture,
+}
+
+impl WgpuResidentImage {
+    pub(crate) fn new(texture: wgpu::Texture) -> Self {
+        Self { texture }
+    }
+}
+
+/// Resolves an opaque resident image for the matching WGPU presenter.
+///
+/// A different backend payload returns `None`; concrete WGPU objects never
+/// cross the neutral GPU or Horizon contracts.
+#[must_use]
+pub fn resident_texture(image: &ResidentImage) -> Option<&wgpu::Texture> {
+    image
+        .payload::<WgpuResidentImage>()
+        .map(|resident| &resident.texture)
 }
 
 /// Creates a validated accelerated backend with immutable host capabilities.
@@ -235,6 +303,13 @@ async fn initialize_backend_async(
         log::debug!("WGPU adapter does not expose persistent pipeline-cache support");
         None
     };
+    let presentation = WgpuPresentationContext {
+        backend: instance_id,
+        instance: instance.clone(),
+        adapter: adapter.clone(),
+        device: device.clone(),
+        queue: queue.clone(),
+    };
     let driver = WgpuBackendDriver::new(
         device,
         queue,
@@ -247,6 +322,7 @@ async fn initialize_backend_async(
     let visibility: Arc<dyn nixe_memory::VisibilityCoordinator> = visibility;
     Ok(InitializedWgpuBackend {
         runtime: Box::new(BackendRuntime::new(backend, device_id, visibility)),
+        presentation,
         adapter: WgpuAdapterInformation {
             name: info.name.into(),
             driver: info.driver.into(),

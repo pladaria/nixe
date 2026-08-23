@@ -316,6 +316,15 @@ impl BackendDriver for HeadlessBackendDriver {
         Ok(())
     }
 
+    fn acquire_presentable_image(
+        &mut self,
+        _request: nixe_gpu::PresentationImageRequest,
+    ) -> Result<nixe_gpu::ResidentImage, BackendDriverError> {
+        Err(BackendDriverError::failure(
+            "the validation backend does not export resident presentation images",
+        ))
+    }
+
     fn teardown(&mut self) -> Result<(), BackendDriverError> {
         if self.torn_down {
             return Ok(());

@@ -7,7 +7,8 @@ use std::thread::{self, JoinHandle};
 
 use nixe_gpu::{
     BackendExecutionCompletion, BackendSubmissionToken, BackendVisibilityRequester,
-    FrontendSubmissionId, GpuCacheConfiguration, NeutralBackendRuntime, ReservedTimelinePoint,
+    FrontendSubmissionId, GpuCacheConfiguration, NeutralBackendRuntime, PresentationImageRequest,
+    ReservedTimelinePoint, ResidentImage,
 };
 use nixe_gpu_maxwell::{
     MaxwellBackendExecution, MaxwellEnginePacketDispatch, MaxwellGpuAddressSpace,
@@ -244,6 +245,10 @@ enum GpuExecutorMessage {
         request: CpuVisibilityRequest,
         reply: mpsc::SyncSender<Result<Box<[u8]>, Box<str>>>,
     },
+    PresentImage {
+        request: PresentationImageRequest,
+        reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
+    },
 }
 
 fn wake_gpu_owner(sender: &mpsc::SyncSender<GpuExecutorMessage>) -> bool {
@@ -477,6 +482,43 @@ impl NvDrvGpuExecutor {
         }
     }
 
+    pub(super) fn acquire_presentable_image(
+        &self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, GpuExecutorFailure> {
+        self.require_healthy()?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU executor is torn down".into(),
+            })?;
+        let (reply, result) = mpsc::sync_channel(1);
+        sender
+            .send(GpuExecutorMessage::PresentImage { request, reply })
+            .map_err(|_| {
+                self.failure().unwrap_or(GpuExecutorFailure {
+                    frontend: FrontendSubmissionId::new(0),
+                    detail: "GPU backend owner stopped before exporting a resident image".into(),
+                })
+            })?;
+        result
+            .recv()
+            .map_err(|_| {
+                self.failure().unwrap_or(GpuExecutorFailure {
+                    frontend: FrontendSubmissionId::new(0),
+                    detail: "GPU resident-image reply was lost".into(),
+                })
+            })?
+            .map_err(|detail| GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail,
+            })
+    }
+
     fn failure(&self) -> Option<GpuExecutorFailure> {
         self.failure
             .lock()
@@ -585,6 +627,21 @@ fn run_gpu_owner(
                         |backend| {
                             backend
                                 .make_cpu_visible(request)
+                                .map_err(|error| error.to_string().into_boxed_str())
+                        },
+                    )
+                };
+                let _ = reply.send(result);
+            }
+            Ok(GpuExecutorMessage::PresentImage { request, reply }) => {
+                let result = if budget.is_stopped() {
+                    Err("GPU backend owner is shutting down".into())
+                } else {
+                    backend.as_mut().map_or_else(
+                        || Err("GPU backend is unavailable".into()),
+                        |backend| {
+                            backend
+                                .acquire_presentable_image(request)
                                 .map_err(|error| error.to_string().into_boxed_str())
                         },
                     )
@@ -890,6 +947,15 @@ mod tests {
             request: CpuVisibilityRequest,
         ) -> Result<Box<[u8]>, BackendRuntimeError> {
             Ok(vec![0x5a; request.size].into_boxed_slice())
+        }
+
+        fn acquire_presentable_image(
+            &mut self,
+            _request: PresentationImageRequest,
+        ) -> Result<ResidentImage, BackendRuntimeError> {
+            Err(BackendRuntimeError::Backend(
+                "visibility fixture does not present images".into(),
+            ))
         }
 
         fn teardown(&mut self) -> Result<(), BackendRuntimeError> {

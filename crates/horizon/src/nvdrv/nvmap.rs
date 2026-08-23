@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{
-    AddressSpaceId, CanonicalBackingRange, CanonicalRangeAccessError, GuestVirtualAddress,
-    MemoryPermissions,
-};
+use nixe_memory::{AddressSpaceId, CanonicalBackingRange, GuestVirtualAddress, MemoryPermissions};
 
 // Switch nvmap ABI values and parameter behavior:
 // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvmap
@@ -224,12 +221,11 @@ impl NvMapObject {
         self.storage.as_ref().map(|storage| &storage.backing)
     }
 
-    /// Constructs an image interpretation without transferring memory
-    /// ownership from this object to the view.
-    pub fn image_view(
+    /// Validates an image interpretation against this object's canonical storage.
+    pub fn validate_image_view(
         &self,
-        metadata: NvMapImageViewMetadata,
-    ) -> Result<NvMapImageView, NvMapViewError> {
+        metadata: &NvMapImageViewMetadata,
+    ) -> Result<(), NvMapViewError> {
         let Some(storage) = &self.storage else {
             return Err(NvMapViewError::UnallocatedObject);
         };
@@ -245,11 +241,7 @@ impl NvMapObject {
                 return Err(NvMapViewError::PlaneOutsideObject);
             }
         }
-        Ok(NvMapImageView {
-            object_id: self.id,
-            backing: storage.backing.clone(),
-            metadata,
-        })
+        Ok(())
     }
 }
 
@@ -346,52 +338,13 @@ impl NvMapImageViewMetadata {
     }
 }
 
-/// One retained image view over canonical `nvmap` bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NvMapImageView {
-    object_id: NvMapObjectId,
-    backing: CanonicalBackingRange,
-    metadata: NvMapImageViewMetadata,
-}
-
-impl NvMapImageView {
-    pub const fn object_id(&self) -> NvMapObjectId {
-        self.object_id
-    }
-
-    pub const fn metadata(&self) -> &NvMapImageViewMetadata {
-        &self.metadata
-    }
-
-    pub fn read_plane(&self, index: usize) -> Result<Vec<u8>, NvMapViewError> {
-        let plane = self
-            .metadata
-            .planes
-            .get(index)
-            .ok_or(NvMapViewError::UnknownPlane)?;
-        let size = usize::try_from(plane.size).map_err(|_| NvMapViewError::RangeOverflow)?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(size)
-            .map_err(|_| NvMapViewError::ResourceExhausted)?;
-        output.resize(size, 0);
-        self.backing
-            .read(plane.offset, &mut output)
-            .map_err(NvMapViewError::Backing)?;
-        Ok(output)
-    }
-}
-
-/// Invalid construction or access of an `nvmap` resource view.
+/// Invalid construction of an `nvmap` image interpretation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NvMapViewError {
     UnallocatedObject,
     MissingPlanes,
-    UnknownPlane,
     PlaneOutsideObject,
     RangeOverflow,
-    ResourceExhausted,
-    Backing(CanonicalRangeAccessError),
 }
 
 impl Display for NvMapViewError {
@@ -399,15 +352,10 @@ impl Display for NvMapViewError {
         match self {
             Self::UnallocatedObject => formatter.write_str("nvmap object has no canonical backing"),
             Self::MissingPlanes => formatter.write_str("nvmap image view has no planes"),
-            Self::UnknownPlane => formatter.write_str("nvmap image view plane does not exist"),
             Self::PlaneOutsideObject => {
                 formatter.write_str("nvmap image view plane exceeds its object")
             }
             Self::RangeOverflow => formatter.write_str("nvmap image view range overflows"),
-            Self::ResourceExhausted => {
-                formatter.write_str("nvmap image view resources are exhausted")
-            }
-            Self::Backing(error) => error.fmt(formatter),
         }
     }
 }

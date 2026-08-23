@@ -32,7 +32,6 @@ use nixe_runtime::{
     VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
-use nixe_video::FrameMailbox;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
 
 use crate::logging::LogLevel;
@@ -59,15 +58,15 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         headless,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let (frontend, frontend_control, mailbox) = if headless {
+    let (frontend, frontend_control, presenter) = if headless {
         log::info!("headless presentation enabled; no host window will be created");
-        (None, None, FrameMailbox::default())
+        (None, None, None)
     } else {
         let frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
             .map_err(|error| error.to_string())?;
         let control = frontend.control();
         let mailbox = frontend.mailbox();
-        (Some(frontend), Some(control), mailbox)
+        (Some(frontend), Some(control), Some(mailbox))
     };
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
@@ -234,8 +233,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         gpu_backend.adapter.name,
         gpu_backend.adapter.driver
     );
+    let presentation_context = gpu_backend.presentation_context();
     let video_system =
-        VideoSystem::with_gpu_backend(mailbox, gpu_backend.into_runtime(), config.gpu);
+        VideoSystem::with_gpu_backend(presenter, gpu_backend.into_runtime(), config.gpu);
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
 
     let Some(frontend) = frontend else {
@@ -248,6 +248,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             gamepad_profiles,
         ));
     };
+    let frontend = frontend.with_gpu_context(presentation_context);
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");

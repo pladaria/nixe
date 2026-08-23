@@ -1,23 +1,21 @@
-//! `winit` window and Vulkan `wgpu` presenter for host-ready Nixe frames.
+//! `winit` window and shared-device `wgpu` presenter for Nixe frames.
 
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use nixe_video::{Frame, FrameMailbox, FrameNotifier};
+use nixe_gpu_wgpu::{WgpuPresentationContext, resident_texture};
+use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
 use wgpu::{
-    Backend, Backends, BindGroup, BindGroupLayout, Color, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, CurrentSurfaceTexture, Device, DeviceDescriptor,
-    ExperimentalFeatures, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor,
-    LoadOp, MemoryHints, MipmapFilterMode, Operations, Origin3d, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, PowerPreference, PresentMode, PrimitiveState, Queue,
+    Backend, BindGroup, BindGroupLayout, Buffer, BufferDescriptor, BufferUsages, Color,
+    ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device,
+    FilterMode, FragmentState, Instance, LoadOp, MipmapFilterMode, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PresentMode, PrimitiveState, Queue,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    RequestAdapterOptions, Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
-    Trace, VertexState,
+    Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StoreOp, Surface, SurfaceConfiguration, TextureSampleType, TextureViewDescriptor,
+    TextureViewDimension, VertexState,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -84,7 +82,7 @@ impl FrameNotifier for EventLoopFrameNotifier {
     }
 }
 
-/// Main-thread owner of the native window and Vulkan presentation state.
+/// Main-thread owner of the native window and WGPU presentation state.
 pub struct WindowFrontend {
     event_loop: EventLoop<FrontendEvent>,
     application: PresenterApplication,
@@ -111,6 +109,7 @@ impl WindowFrontend {
                 stop_requested,
                 worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
+                context: None,
                 presenter: None,
                 failure: None,
             },
@@ -131,7 +130,14 @@ impl WindowFrontend {
         self.control.clone()
     }
 
-    /// Runs native event dispatch and Vulkan presentation on the calling thread.
+    /// Binds the one accelerated WGPU context before entering the event loop.
+    #[must_use]
+    pub fn with_gpu_context(mut self, context: WgpuPresentationContext) -> Self {
+        self.application.context = Some(context);
+        self
+    }
+
+    /// Runs native event dispatch and WGPU presentation on the calling thread.
     pub fn run(self) -> Result<(), WindowError> {
         let Self {
             event_loop,
@@ -156,9 +162,11 @@ struct Presenter {
     bind_group_layout: BindGroupLayout,
     sampler: Sampler,
     pipeline: RenderPipeline,
-    frame_texture: Option<Texture>,
+    sampling_buffer: Buffer,
     frame_bind_group: Option<BindGroup>,
     frame_dimensions: Option<(u32, u32)>,
+    pending_frame: Option<Arc<PresentationFrame>>,
+    backend: nixe_gpu::BackendInstanceId,
     backend_name: &'static str,
     frame_rate: FrameRateTracker,
     displayed_title: String,
@@ -166,54 +174,24 @@ struct Presenter {
 }
 
 impl Presenter {
-    fn new(window: Arc<Window>) -> Result<Self, WindowError> {
-        pollster::block_on(Self::new_async(window))
-    }
-
-    async fn new_async(window: Arc<Window>) -> Result<Self, WindowError> {
-        let mut instance_descriptor = InstanceDescriptor::new_without_display_handle();
-        #[cfg(target_os = "macos")]
-        {
-            instance_descriptor.backends = Backends::METAL;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            instance_descriptor.backends = Backends::VULKAN;
-        }
-        let instance = Instance::new(instance_descriptor);
+    fn new(window: Arc<Window>, context: WgpuPresentationContext) -> Result<Self, WindowError> {
+        let instance = context.instance().clone();
         let surface = instance
             .create_surface(Arc::clone(&window))
             .map_err(WindowError::surface)?;
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(WindowError::adapter)?;
+        let adapter = context.adapter();
         let adapter_info = adapter.get_info();
         let backend_name = backend_name(adapter_info.backend);
         log::info!(
-            "{backend_name} presenter selected {} ({})",
+            "{backend_name} presenter sharing accelerated device {} ({})",
             adapter_info.name,
             adapter_info.driver
         );
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                label: Some("Nixe presentation device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: ExperimentalFeatures::disabled(),
-                memory_hints: MemoryHints::Performance,
-                trace: Trace::Off,
-            })
-            .await
-            .map_err(WindowError::device)?;
+        let device = context.device().clone();
+        let queue = context.queue().clone();
         let size = window.inner_size();
         let mut surface_configuration = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .get_default_config(adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(WindowError::unsupported_surface)?;
         surface_configuration.present_mode = PresentMode::Fifo;
 
@@ -234,6 +212,16 @@ impl Presenter {
                     binding: 1,
                     visibility: ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(32),
+                    },
                     count: None,
                 },
             ],
@@ -279,6 +267,12 @@ impl Presenter {
             multiview_mask: None,
             cache: None,
         });
+        let sampling_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Nixe frame sampling parameters"),
+            size: 32,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let mut presenter = Self {
             window,
             instance,
@@ -289,9 +283,11 @@ impl Presenter {
             bind_group_layout,
             sampler,
             pipeline,
-            frame_texture: None,
+            sampling_buffer,
             frame_bind_group: None,
             frame_dimensions: None,
+            pending_frame: None,
+            backend: context.backend(),
             backend_name,
             frame_rate: FrameRateTracker::new(Instant::now()),
             displayed_title: String::new(),
@@ -333,70 +329,70 @@ impl Presenter {
         Ok(())
     }
 
-    fn upload(&mut self, frame: &Frame) {
-        let dimensions = (frame.width(), frame.height());
-        if self.frame_dimensions != Some(dimensions) {
-            log::info!(
-                "guest framebuffer texture configured at {}x{}",
-                frame.width(),
-                frame.height()
-            );
-            let texture = self.device.create_texture(&TextureDescriptor {
-                label: Some("Nixe guest framebuffer"),
-                size: Extent3d {
-                    width: frame.width(),
-                    height: frame.height(),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Bgra8UnormSrgb,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&TextureViewDescriptor::default());
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Nixe guest framebuffer bind group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            self.frame_texture = Some(texture);
-            self.frame_bind_group = Some(bind_group);
-            self.frame_dimensions = Some(dimensions);
+    fn bind_frame(&mut self, frame: Arc<PresentationFrame>) -> Result<(), WindowError> {
+        let image = frame.image();
+        if image.backend() != self.backend || image.completion().instance() != self.backend {
+            return Err(WindowError::resident(
+                "resident frame belongs to a different GPU backend instance",
+            ));
         }
-        let texture = self
-            .frame_texture
-            .as_ref()
-            .expect("the frame texture was initialized");
-        self.queue.write_texture(
-            TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            bytemuck::cast_slice(frame.pixels()),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(frame.width() * 4),
-                rows_per_image: Some(frame.height()),
-            },
-            Extent3d {
-                width: frame.width(),
-                height: frame.height(),
-                depth_or_array_layers: 1,
-            },
+        let texture = resident_texture(image).ok_or_else(|| {
+            WindowError::resident("resident frame payload is not owned by the WGPU backend")
+        })?;
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        self.frame_bind_group = Some(self.create_frame_bind_group(&view));
+        self.frame_dimensions = Some((frame.width(), frame.height()));
+        let extent = image.description().extent();
+        let crop = frame.crop();
+        self.write_sampling(
+            [
+                crop.left as f32 / extent.width as f32,
+                crop.top as f32 / extent.height as f32,
+                crop.width as f32 / extent.width as f32,
+                crop.height as f32 / extent.height as f32,
+            ],
+            u32::from(frame.transform().flip_horizontal)
+                | (u32::from(frame.transform().flip_vertical) << 1)
+                | (u32::from(frame.transform().rotate_90_clockwise) << 2),
         );
+        self.pending_frame = Some(frame);
+        Ok(())
+    }
+
+    fn create_frame_bind_group(&self, view: &wgpu::TextureView) -> BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nixe presentation image bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.sampling_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn write_sampling(&self, crop: [f32; 4], transform: u32) {
+        let parameters = [
+            crop[0].to_bits(),
+            crop[1].to_bits(),
+            crop[2].to_bits(),
+            crop[3].to_bits(),
+            transform,
+            0,
+            0,
+            0,
+        ];
+        self.queue
+            .write_buffer(&self.sampling_buffer, 0, bytemuck::cast_slice(&parameters));
     }
 
     fn redraw(&mut self) -> Result<(), WindowError> {
@@ -470,6 +466,7 @@ impl Presenter {
             }
         }
         self.queue.submit([encoder.finish()]);
+        self.pending_frame = None;
         self.queue.present(surface_texture);
         let now = Instant::now();
         self.refresh_title(now);
@@ -574,6 +571,7 @@ struct PresenterApplication {
     stop_requested: Arc<AtomicBool>,
     worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
+    context: Option<WgpuPresentationContext>,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
 }
@@ -584,7 +582,7 @@ impl PresenterApplication {
             return Ok(());
         };
         if let Some(frame) = self.mailbox.take_latest() {
-            presenter.upload(&frame);
+            presenter.bind_frame(frame)?;
             presenter.frame_rate.record_frame();
         }
         presenter.redraw()
@@ -610,7 +608,10 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     .create_window(attributes)
                     .map_err(WindowError::window)?,
             );
-            self.presenter = Some(Presenter::new(window)?);
+            let context = self.context.take().ok_or_else(|| {
+                WindowError::device("accelerated presentation context was not configured")
+            })?;
+            self.presenter = Some(Presenter::new(window, context)?);
             if let Some(presenter) = &self.presenter {
                 presenter.window.request_redraw();
             }
@@ -746,21 +747,21 @@ impl WindowError {
         Self::new("window creation", error)
     }
 
-    fn adapter(error: impl Display) -> Self {
-        Self::new("Vulkan adapter selection", error)
+    fn device(error: impl Display) -> Self {
+        Self::new("WGPU device binding", error)
     }
 
-    fn device(error: impl Display) -> Self {
-        Self::new("Vulkan device creation", error)
+    fn resident(error: impl Display) -> Self {
+        Self::new("resident image presentation", error)
     }
 
     fn surface(error: impl Display) -> Self {
-        Self::new("Vulkan surface", error)
+        Self::new("WGPU surface", error)
     }
 
     fn unsupported_surface() -> Self {
         Self::new(
-            "Vulkan surface configuration",
+            "WGPU surface configuration",
             "the selected adapter cannot present to the window",
         )
     }

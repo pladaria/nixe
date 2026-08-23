@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::{GpuCacheConfiguration, GuestTimelinePoint, NeutralBackendRuntime};
+use nixe_gpu::{
+    GpuCacheConfiguration, GuestTimelinePoint, NeutralBackendRuntime, PresentationImageRequest,
+    ResidentImage,
+};
 
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
@@ -36,8 +39,8 @@ use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
 use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources, NvHostGpuSubmitResources};
 pub use nvmap::{
-    NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
-    NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
+    NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageViewMetadata,
+    NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
 };
 use nvmap::{NvMapObjects, NvMapOwner, NvMapStateError};
 pub(crate) use service::{NvDrvService, NvDrvServiceError};
@@ -158,6 +161,27 @@ impl NvDrvSession {
                 gpu_backend: Some(Arc::new(gpu_executor)),
             })),
         }
+    }
+
+    pub(crate) fn acquire_presentable_image(
+        &self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, Box<str>> {
+        let backend = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .gpu_backend
+            .as_ref()
+            .cloned();
+        backend.map_or_else(
+            || Err("GPU backend is unavailable for resident presentation".into()),
+            |backend| {
+                backend
+                    .acquire_presentable_image(request)
+                    .map_err(|error| error.to_string().into_boxed_str())
+            },
+        )
     }
 
     pub(crate) fn initialize(&self) {
@@ -764,6 +788,25 @@ impl NvDrvSession {
             let _ = backend.request_progress();
         }
         reached
+    }
+
+    /// Validates a BufferQueue dependency without demanding host completion.
+    /// Resident presentation carries the backend dependency directly and must
+    /// not turn descriptor validation into a CPU wait.
+    #[must_use]
+    pub(crate) fn knows_guest_timeline_point(&self, point: GuestTimelinePoint) -> bool {
+        let control = Arc::clone(
+            &self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .nvhost_control,
+        );
+        control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .point_reached(point)
+            .is_some()
     }
 
     #[cfg(test)]
@@ -1455,20 +1498,17 @@ mod tests {
             Ok((nvmap_from_id_input(exported_id).to_vec(), NV_BAD_PARAMETER))
         );
 
-        let view = retained_object
-            .image_view(NvMapImageViewMetadata::new(
-                16,
-                8,
-                4,
-                0xfe,
-                3,
-                0,
-                vec![NvMapPlaneMetadata::new(0x100, 0x200, 64)],
-            ))
-            .unwrap();
-        assert_eq!(view.object_id(), retained_object.id());
-        assert_eq!(view.metadata().planes()[0].pitch(), 64);
-        assert_eq!(view.read_plane(0).unwrap(), vec![0_u8; 0x200]);
+        let view = NvMapImageViewMetadata::new(
+            16,
+            8,
+            4,
+            0xfe,
+            3,
+            0,
+            vec![NvMapPlaneMetadata::new(0x100, 0x200, 64)],
+        );
+        retained_object.validate_image_view(&view).unwrap();
+        assert_eq!(view.planes()[0].pitch(), 64);
         let allocation = retained_object.allocation_metadata().unwrap();
         assert_eq!(allocation.heap_mask(), 0x4000_0000);
         assert_eq!(allocation.flags(), 3);

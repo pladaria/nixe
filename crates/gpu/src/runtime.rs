@@ -14,7 +14,8 @@ use nixe_memory::{
 
 use crate::{
     AccessMode, Backend, BackendCapabilities, BackendDriver, BackendResourceCreateInfo,
-    BackendSubmissionToken, FrontendSubmissionId, OperationSubmission, ResourceDependency,
+    BackendSubmissionToken, FrontendSubmissionId, OperationSubmission, PresentationImageRequest,
+    ResidentImage, ResourceDependency,
 };
 
 /// Evidence that host execution and canonical device ownership both finished.
@@ -79,6 +80,12 @@ pub trait NeutralBackendRuntime: Send {
         &mut self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendRuntimeError>;
+
+    /// Retains a backend-resident image and its real completion dependency.
+    fn acquire_presentable_image(
+        &mut self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, BackendRuntimeError>;
 
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
 }
@@ -368,6 +375,15 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
         }
         self.backend
             .make_cpu_visible(request)
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
+    }
+
+    fn acquire_presentable_image(
+        &mut self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
+        self.backend
+            .acquire_presentable_image(request)
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
     }
 

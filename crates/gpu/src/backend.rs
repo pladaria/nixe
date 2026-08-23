@@ -321,6 +321,13 @@ pub trait BackendDriver {
         )))
     }
 
+    /// Retains the newest backend-resident image matching one canonical
+    /// allocation view.
+    fn acquire_presentable_image(
+        &mut self,
+        request: crate::PresentationImageRequest,
+    ) -> Result<crate::ResidentImage, BackendDriverError>;
+
     fn teardown(&mut self) -> Result<(), BackendDriverError>;
 }
 
@@ -441,6 +448,18 @@ impl<D: BackendDriver> Backend<D> {
     #[must_use]
     pub const fn driver(&self) -> &D {
         &self.driver
+    }
+
+    /// Acquires an opaque resident image without making canonical memory CPU
+    /// visible. Concrete host objects remain behind the driver boundary.
+    pub fn acquire_presentable_image(
+        &mut self,
+        request: crate::PresentationImageRequest,
+    ) -> Result<crate::ResidentImage, BackendError> {
+        self.require_active()?;
+        self.driver
+            .acquire_presentable_image(request)
+            .map_err(|error| self.handle_driver_error(error))
     }
 
     /// Creates one resource after validating the complete request.
@@ -1451,6 +1470,15 @@ mod tests {
             _submission: BackendSubmissionToken,
         ) -> Result<(), BackendDriverError> {
             self.result()
+        }
+
+        fn acquire_presentable_image(
+            &mut self,
+            _request: crate::PresentationImageRequest,
+        ) -> Result<crate::ResidentImage, BackendDriverError> {
+            Err(BackendDriverError::failure(
+                "recording backend does not export resident images",
+            ))
         }
 
         fn teardown(&mut self) -> Result<(), BackendDriverError> {

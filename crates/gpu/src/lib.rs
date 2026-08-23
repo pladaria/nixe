@@ -11,6 +11,7 @@ mod cache;
 mod capability;
 mod command;
 mod diagnostics;
+mod presentation;
 mod resource;
 mod runtime;
 mod shader;
@@ -56,6 +57,7 @@ pub use diagnostics::{
     GraphicsAllocationId, GraphicsGapKind,
 };
 pub use nixe_memory::{CanonicalBackingSegment, MappingGeneration};
+pub use presentation::{PresentationImageFormat, PresentationImageRequest, ResidentImage};
 pub use resource::{
     AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableBinding,
     DescriptorTableDescription, DescriptorTableId, FilterMode, ImageDescription, ImageDimension,

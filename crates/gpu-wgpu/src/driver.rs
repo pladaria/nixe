@@ -12,8 +12,9 @@ use nixe_gpu::{
     CopyOperation, DepthCompareOperation, DepthState, DrawArguments, DrawOperation,
     GpuCacheConfiguration, GpuCommand, ImageDescription, ImageDimension, ImageFormat,
     ImageMemoryLayout, ImageOrigin, ImageRegion, ImageSubresourceRange, IndexType,
-    PipelineDescription, PipelineKind, PrimitiveTopology, RenderAttachment, RenderPassOperation,
-    ResourceDependency, ShaderStage, TriangleRasterization, VertexBufferLayout, VertexFormat,
+    PipelineDescription, PipelineKind, PresentationImageFormat, PresentationImageRequest,
+    PrimitiveTopology, RenderAttachment, RenderPassOperation, ResidentImage, ResourceDependency,
+    SampleCount, ShaderStage, TriangleRasterization, VertexBufferLayout, VertexFormat,
     VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
@@ -72,9 +73,36 @@ struct ResourceRecord {
     immutable: BackendResourceCreateInfo,
     host: Option<Resource>,
     content: Option<ResourceContent>,
-    last_use: u64,
-    retirement: Option<u64>,
+    last_use: Option<ResourceUse>,
+    retired: bool,
     resident_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResourceUse {
+    serial: u64,
+    submission: BackendSubmissionToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PresentationImageKey {
+    allocation: nixe_gpu::GpuAllocationId,
+    allocation_offset: u64,
+    width: u32,
+    height: u32,
+    format: PresentationImageFormat,
+}
+
+impl From<PresentationImageRequest> for PresentationImageKey {
+    fn from(request: PresentationImageRequest) -> Self {
+        Self {
+            allocation: request.allocation,
+            allocation_offset: request.allocation_offset,
+            width: request.width,
+            height: request.height,
+            format: request.format,
+        }
+    }
 }
 
 struct ResourceContent {
@@ -456,6 +484,63 @@ fn alpha_test_entry_point(alpha_test: Option<AlphaTest>) -> &'static str {
     }
 }
 
+fn presentation_image_key(info: &BackendResourceCreateInfo) -> Option<PresentationImageKey> {
+    let BackendResourceCreateInfo::Image {
+        description,
+        view: Some(view),
+        ..
+    } = info
+    else {
+        return None;
+    };
+    if description.dimension() != ImageDimension::Two || description.samples() != SampleCount::One {
+        return None;
+    }
+    view.bindings()
+        .iter()
+        .enumerate()
+        .find_map(|(binding, _)| presentation_binding_key(info, binding))
+}
+
+fn presentation_binding_key(
+    info: &BackendResourceCreateInfo,
+    binding: usize,
+) -> Option<PresentationImageKey> {
+    let BackendResourceCreateInfo::Image {
+        description,
+        view: Some(view),
+        ..
+    } = info
+    else {
+        return None;
+    };
+    let binding = view.bindings().get(binding)?;
+    let subresources = binding.subresources();
+    if subresources.plane != 0
+        || subresources.mip_level != 0
+        || subresources.base_layer != 0
+        || subresources.layer_count == 0
+    {
+        return None;
+    }
+    let extent = description.extent();
+    Some(PresentationImageKey {
+        allocation: binding.backing().allocation(),
+        allocation_offset: binding.backing().allocation_offset(),
+        width: extent.width,
+        height: extent.height,
+        format: presentation_format(description.format())?,
+    })
+}
+
+const fn presentation_format(format: ImageFormat) -> Option<PresentationImageFormat> {
+    match format {
+        ImageFormat::Rgba8Unorm | ImageFormat::Rgba8Srgb => Some(PresentationImageFormat::Rgba8),
+        ImageFormat::Bgra8Unorm | ImageFormat::Bgra8Srgb => Some(PresentationImageFormat::Bgra8),
+        _ => None,
+    }
+}
+
 fn vertex_entry_point(
     uses_vertex_pulling: bool,
     triangle_rasterization: TriangleRasterization,
@@ -474,6 +559,7 @@ pub(crate) struct WgpuBackendDriver {
     queue: Queue,
     visibility: Arc<WgpuVisibilityCoordinator>,
     resources: HashMap<BackendResourceHandle, ResourceRecord>,
+    presentation_images: HashMap<PresentationImageKey, Vec<BackendResourceHandle>>,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
@@ -535,6 +621,7 @@ impl WgpuBackendDriver {
             queue,
             visibility,
             resources: HashMap::new(),
+            presentation_images: HashMap::new(),
             submissions: HashMap::new(),
             completion_sender,
             completion_receiver,
@@ -602,6 +689,7 @@ impl WgpuBackendDriver {
 
     fn clear_owned_state(&mut self) {
         self.resources.clear();
+        self.presentation_images.clear();
         self.submissions.clear();
         self.readback_pool.clear();
         self.uploaded_inputs.clear();
@@ -2249,6 +2337,96 @@ impl WgpuBackendDriver {
             .ok_or_else(|| missing(handle))
     }
 
+    fn index_presentable_image(
+        &mut self,
+        handle: BackendResourceHandle,
+        info: &BackendResourceCreateInfo,
+    ) {
+        let Some(key) = presentation_image_key(info) else {
+            return;
+        };
+        self.presentation_images
+            .entry(key)
+            .or_default()
+            .push(handle);
+    }
+
+    fn remove_resource_record(&mut self, handle: BackendResourceHandle) -> Option<ResourceRecord> {
+        let record = self.resources.remove(&handle)?;
+        if let Some(key) = presentation_image_key(&record.immutable)
+            && let Some(handles) = self.presentation_images.get_mut(&key)
+        {
+            handles.retain(|candidate| *candidate != handle);
+            if handles.is_empty() {
+                self.presentation_images.remove(&key);
+            }
+        }
+        if record.host.is_some() {
+            self.resident_resources -= 1;
+            self.resident_resource_bytes -= record.resident_bytes;
+        }
+        Some(record)
+    }
+
+    fn acquire_presentable(
+        &mut self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, BackendDriverError> {
+        self.require_device()?;
+        let key = PresentationImageKey::from(request);
+        let selected = self
+            .presentation_images
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|handle| {
+                let record = self.resources.get(handle)?;
+                let content = record.content.as_ref()?;
+                let newest_write = content
+                    .device_writes
+                    .iter()
+                    .filter_map(|write| match write.region {
+                        DeviceWriteRegion::ImageBinding(binding)
+                            if presentation_binding_key(&record.immutable, binding)
+                                == Some(key) =>
+                        {
+                            Some(write.serial)
+                        }
+                        _ => None,
+                    })
+                    .max()?;
+                let last_use = record.last_use?;
+                let Resource::Image {
+                    texture,
+                    description,
+                    ..
+                } = record.host.as_ref()?
+                else {
+                    return None;
+                };
+                Some((
+                    newest_write,
+                    *handle,
+                    *description,
+                    last_use.submission,
+                    texture.clone(),
+                ))
+            })
+            .max_by_key(|candidate| candidate.0);
+        let Some((_, handle, description, completion, texture)) = selected else {
+            return Err(unsupported(
+                "no device-authored resident image matches the presentation request",
+            ));
+        };
+        Ok(ResidentImage::new(
+            completion.instance(),
+            handle,
+            description,
+            completion,
+            Arc::new(crate::WgpuResidentImage::new(texture)),
+        ))
+    }
+
     fn create_host_resource(
         &self,
         info: &BackendResourceCreateInfo,
@@ -2359,7 +2537,7 @@ impl WgpuBackendDriver {
                             .as_ref()
                             .is_none_or(|content| !content.has_device_writes())
                 })
-                .min_by_key(|(_, record)| record.last_use)
+                .min_by_key(|(_, record)| record.last_use.map_or(0, |last_use| last_use.serial))
                 .map(|(handle, _)| *handle)
                 .ok_or_else(|| {
                     BackendDriverError::failure(
@@ -2473,7 +2651,7 @@ impl WgpuBackendDriver {
                 let handle = writeback.handle();
                 if !retired.contains(&handle)
                     && self.resources.get(&handle).is_some_and(|record| {
-                        record.retirement.is_some()
+                        record.retired
                             && record
                                 .content
                                 .as_ref()
@@ -2484,12 +2662,7 @@ impl WgpuBackendDriver {
                 }
             }
             for handle in retired {
-                if let Some(record) = self.resources.remove(&handle)
-                    && record.host.is_some()
-                {
-                    self.resident_resources -= 1;
-                    self.resident_resource_bytes -= record.resident_bytes;
-                }
+                self.remove_resource_record(handle);
             }
         }
         // The neutral visibility contract is currently page-conservative. If
@@ -2550,11 +2723,12 @@ impl BackendDriver for WgpuBackendDriver {
                 content: ResourceContent::new(info),
                 immutable: info.clone(),
                 host: Some(resource),
-                last_use: 0,
-                retirement: None,
+                last_use: None,
+                retired: false,
                 resident_bytes,
             },
         );
+        self.index_presentable_image(handle, info);
         self.resident_resources += 1;
         self.resident_resource_bytes = self
             .resident_resource_bytes
@@ -2569,7 +2743,7 @@ impl BackendDriver for WgpuBackendDriver {
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
         if let Some(record) = self.resources.get_mut(&handle) {
-            record.retirement = Some(record.last_use);
+            record.retired = true;
             if record
                 .content
                 .as_ref()
@@ -2578,12 +2752,7 @@ impl BackendDriver for WgpuBackendDriver {
                 return Ok(());
             }
         }
-        if let Some(record) = self.resources.remove(&handle)
-            && record.host.is_some()
-        {
-            self.resident_resources -= 1;
-            self.resident_resource_bytes -= record.resident_bytes;
-        }
+        self.remove_resource_record(handle);
         Ok(())
     }
 
@@ -2623,7 +2792,10 @@ impl BackendDriver for WgpuBackendDriver {
         });
         for handle in dependencies.values() {
             if let Some(record) = self.resources.get_mut(handle) {
-                record.last_use = use_serial;
+                record.last_use = Some(ResourceUse {
+                    serial: use_serial,
+                    submission: token,
+                });
             }
         }
         for operation in accepted.submission().operations() {
@@ -2666,25 +2838,25 @@ impl BackendDriver for WgpuBackendDriver {
             .get(&submission)
             .map(|submission| submission.index.clone())
             .ok_or_else(|| BackendDriverError::failure("unknown wgpu submission token"))?;
-        self.device
+        let status = self
+            .device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(index),
                 timeout: None,
             })
             .map_err(|error| BackendDriverError::device_lost(error.to_string()))?;
-        self.drain_completions();
-        self.require_device()?;
-        if self
-            .submissions
-            .get(&submission)
-            .is_some_and(|submission| submission.completed)
-        {
-            Ok(())
-        } else {
-            Err(BackendDriverError::failure(
-                "wgpu completion callback was not delivered",
-            ))
+        if !status.wait_finished() {
+            return Err(BackendDriverError::failure(
+                "wgpu directed submission wait did not finish",
+            ));
         }
+        self.require_device()?;
+        self.submissions
+            .get_mut(&submission)
+            .ok_or_else(|| BackendDriverError::failure("unknown wgpu submission token"))?
+            .completed = true;
+        self.drain_completions();
+        Ok(())
     }
 
     fn release_submission(
@@ -2717,6 +2889,13 @@ impl BackendDriver for WgpuBackendDriver {
             ));
         }
         self.materialize_cpu_page(request)
+    }
+
+    fn acquire_presentable_image(
+        &mut self,
+        request: PresentationImageRequest,
+    ) -> Result<ResidentImage, BackendDriverError> {
+        self.acquire_presentable(request)
     }
 
     fn teardown(&mut self) -> Result<(), BackendDriverError> {

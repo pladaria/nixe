@@ -6,15 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nixe_gpu::{
-    GpuCacheConfiguration, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint,
-    NeutralBackendRuntime,
+    GpuAllocationId, GpuCacheConfiguration, GuestSyncpointId, GuestSyncpointValue,
+    GuestTimelinePoint, NeutralBackendRuntime, PresentationImageFormat, PresentationImageRequest,
+    ResidentImage,
 };
 use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
-use nixe_video::{DisplayClock, Frame, FrameMailbox};
+use nixe_video::{DisplayClock, FrameCrop, FrameMailbox, FrameTransform, PresentationFrame};
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
 use crate::{
-    GraphicsEventSource, NvDrvSession, NvMapExportedId, NvMapImageView, NvMapImageViewMetadata,
+    GraphicsEventSource, NvDrvSession, NvMapExportedId, NvMapImageViewMetadata, NvMapObjectId,
     NvMapPlaneMetadata,
 };
 
@@ -166,7 +167,7 @@ struct VideoState {
     queues: BTreeMap<i32, BufferQueue>,
     vsync_event: ViVsyncEvent,
     display_clock: DisplayClock,
-    mailbox: FrameMailbox,
+    presenter: Option<FrameMailbox>,
     nvdrv: NvDrvSession,
     next_frame_sequence: u64,
     pending_frames: VecDeque<PendingFrame>,
@@ -176,6 +177,28 @@ struct VideoState {
 #[derive(Clone, Debug)]
 pub struct VideoSystem {
     state: Arc<Mutex<VideoState>>,
+    released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReleasedSlot {
+    binder_id: i32,
+    slot: i32,
+}
+
+#[derive(Debug)]
+struct ResidentSlotLease {
+    released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
+    released: ReleasedSlot,
+}
+
+impl Drop for ResidentSlotLease {
+    fn drop(&mut self) {
+        self.released_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.released);
+    }
 }
 
 /// Resources released when one emulated process graphics system is torn down.
@@ -190,29 +213,29 @@ pub struct GraphicsTeardownReport {
 
 impl Default for VideoSystem {
     fn default() -> Self {
-        Self::new(FrameMailbox::default())
+        Self::new()
     }
 }
 
 impl VideoSystem {
     #[must_use]
-    pub fn new(mailbox: FrameMailbox) -> Self {
-        Self::new_with_gpu_backend(mailbox, None, GpuCacheConfiguration::default())
+    pub fn new() -> Self {
+        Self::new_with_gpu_backend(None, None, GpuCacheConfiguration::default())
     }
 
     /// Constructs the process graphics system with a composition-root-selected
     /// neutral GPU backend. Horizon never observes its concrete host API.
     #[must_use]
     pub fn with_gpu_backend(
-        mailbox: FrameMailbox,
+        presenter: Option<FrameMailbox>,
         backend: Box<dyn NeutralBackendRuntime>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
-        Self::new_with_gpu_backend(mailbox, Some(backend), cache_configuration)
+        Self::new_with_gpu_backend(presenter, Some(backend), cache_configuration)
     }
 
     fn new_with_gpu_backend(
-        mailbox: FrameMailbox,
+        presenter: Option<FrameMailbox>,
         backend: Option<Box<dyn NeutralBackendRuntime>>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
@@ -224,23 +247,27 @@ impl VideoSystem {
                 vsync_event: ViVsyncEvent::new(DEFAULT_DISPLAY_ID),
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
-                mailbox,
+                presenter,
                 nvdrv: backend.map_or_else(NvDrvSession::new, |backend| {
                     NvDrvSession::with_gpu_backend(backend, cache_configuration)
                 }),
                 next_frame_sequence: 1,
                 pending_frames: VecDeque::new(),
             })),
+            released_slots: Arc::default(),
         }
     }
 
-    #[must_use]
-    pub fn mailbox(&self) -> FrameMailbox {
-        self.state
+    fn drain_released_slots(&self, state: &mut VideoState) {
+        let mut released = self
+            .released_slots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mailbox
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for released in released.drain(..) {
+            if let Some(queue) = state.queues.get_mut(&released.binder_id) {
+                let _ = queue.release(released.slot);
+            }
+        }
     }
 
     /// Returns the number of live VI layers for diagnostics and acceptance
@@ -452,6 +479,7 @@ impl VideoSystem {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_released_slots(&mut state);
         let queue = state
             .queues
             .get_mut(&binder_id)
@@ -473,10 +501,10 @@ impl VideoSystem {
             let primary = request.buffer.primary_plane();
             let crop = effective_crop(request.input.crop, primary.width, primary.height);
             validate_present_descriptor(&request.buffer, Some(crop))?;
-            transformed_dimensions(crop, request.input.transform)?;
+            let transform = frame_transform(request.input.transform)?;
             let nvdrv = self.nvdrv();
             for fence in &request.input.acquire_fences {
-                if nvdrv.guest_timeline_point_reached(fence.point).is_none() {
+                if !nvdrv.knows_guest_timeline_point(fence.point) {
                     return Err(FramebufferError::Malformed(
                         "QueueBuffer acquire fence references an unknown GPU syncpoint",
                     ));
@@ -492,9 +520,31 @@ impl VideoSystem {
                     "queued graphic buffer exceeds its nvmap allocation",
                 ));
             }
-            let view = object
-                .image_view(request.buffer.nvmap_view_metadata())
+            object
+                .validate_image_view(&request.buffer.nvmap_view_metadata())
                 .map_err(FramebufferError::NvMap)?;
+
+            let presenting = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .presenter
+                .is_some();
+            let presentation = if presenting {
+                let image = nvdrv
+                    .acquire_presentable_image(presentable_image_request(
+                        &request.buffer,
+                        object.id(),
+                    )?)
+                    .map_err(FramebufferError::Backend)?;
+                Some(PendingPresentation {
+                    image,
+                    crop: frame_crop(crop)?,
+                    transform,
+                })
+            } else {
+                None
+            };
 
             let mut state = self
                 .state
@@ -514,11 +564,8 @@ impl VideoSystem {
             state.pending_frames.push_back(PendingFrame {
                 binder_id,
                 slot: request.slot,
-                source: PendingFrameSource::GuestImage {
-                    buffer: request.buffer,
-                    input: request.input,
-                    view,
-                },
+                acquire_fences: request.input.acquire_fences,
+                presentation,
             });
             Ok(())
         })();
@@ -541,6 +588,7 @@ impl VideoSystem {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_released_slots(&mut state);
         let ticks = state.display_clock.advance(elapsed);
         if ticks.crossed != 0 {
             state.vsync_event.signal();
@@ -549,47 +597,52 @@ impl VideoSystem {
             let Some(pending) = state.pending_frames.front().cloned() else {
                 break;
             };
-            let frame = match &pending.source {
-                PendingFrameSource::GuestImage {
-                    buffer,
-                    input,
-                    view,
-                } => {
-                    if !input.acquire_fences.iter().all(|fence| {
-                        state
-                            .nvdrv
-                            .guest_timeline_point_reached(fence.point)
-                            .unwrap_or(false)
-                    }) {
-                        break;
-                    }
-                    let bytes = view.read_plane(0).map_err(FramebufferError::NvMap)?;
-                    let primary = buffer.primary_plane();
-                    let crop = effective_crop(input.crop, primary.width, primary.height);
-                    let pixels =
-                        decode_present_image(buffer, &bytes, Some((crop, input.transform)))?;
-                    let dimensions = transformed_dimensions(crop, input.transform)?;
-                    let sequence = state.next_frame_sequence;
-                    state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
-                    Arc::new(
-                        Frame::new_xrgb8888(dimensions.0, dimensions.1, sequence, pixels).map_err(
-                            |_| {
-                                FramebufferError::Malformed("composed frame dimensions are invalid")
-                            },
-                        )?,
-                    )
-                }
-            };
+            if pending.presentation.is_none()
+                && !pending.acquire_fences.iter().all(|fence| {
+                    state
+                        .nvdrv
+                        .guest_timeline_point_reached(fence.point)
+                        .unwrap_or(false)
+                })
+            {
+                break;
+            }
             state.pending_frames.pop_front();
-            state.mailbox.publish(frame);
-            log::debug!(
-                "latched frame from Binder producer {} slot {} at VSync {}",
-                pending.binder_id,
-                pending.slot,
-                ticks.latest_sequence
-            );
-            if let Some(queue) = state.queues.get_mut(&pending.binder_id) {
+            if let Some(presentation) = pending.presentation {
+                let sequence = state.next_frame_sequence;
+                state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
+                let frame = Arc::new(PresentationFrame::new(
+                    presentation.image,
+                    presentation.crop,
+                    presentation.transform,
+                    sequence,
+                    Arc::new(ResidentSlotLease {
+                        released_slots: Arc::clone(&self.released_slots),
+                        released: ReleasedSlot {
+                            binder_id: pending.binder_id,
+                            slot: pending.slot,
+                        },
+                    }),
+                ));
+                state
+                    .presenter
+                    .as_ref()
+                    .expect("a pending presentation retains its presenter")
+                    .publish(frame);
+                log::debug!(
+                    "latched resident frame from Binder producer {} slot {} at VSync {}",
+                    pending.binder_id,
+                    pending.slot,
+                    ticks.latest_sequence
+                );
+            } else if let Some(queue) = state.queues.get_mut(&pending.binder_id) {
                 let _ = queue.release(pending.slot);
+                log::debug!(
+                    "discarded headless frame from Binder producer {} slot {} at VSync {}",
+                    pending.binder_id,
+                    pending.slot,
+                    ticks.latest_sequence
+                );
             }
         }
         Ok(ticks.crossed)
@@ -717,22 +770,22 @@ pub(crate) struct BinderTransaction {
 struct PendingFrame {
     binder_id: i32,
     slot: i32,
-    source: PendingFrameSource,
+    acquire_fences: Box<[NvFence]>,
+    presentation: Option<PendingPresentation>,
 }
 
 #[derive(Clone, Debug)]
-enum PendingFrameSource {
-    GuestImage {
-        buffer: GraphicBuffer,
-        input: QueueBufferInput,
-        view: NvMapImageView,
-    },
+struct PendingPresentation {
+    image: ResidentImage,
+    crop: FrameCrop,
+    transform: FrameTransform,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FramebufferError {
     Malformed(&'static str),
     Unsupported(&'static str),
+    Backend(Box<str>),
     NvMap(crate::NvMapViewError),
 }
 
@@ -743,6 +796,7 @@ impl Display for FramebufferError {
             Self::Unsupported(reason) => {
                 write!(formatter, "unsupported presentation semantic: {reason}")
             }
+            Self::Backend(reason) => write!(formatter, "GPU presentation export failed: {reason}"),
             Self::NvMap(error) => write!(formatter, "queued nvmap image access failed: {error}"),
         }
     }
@@ -1228,6 +1282,55 @@ fn present_format(
     }
 }
 
+fn presentable_image_request(
+    buffer: &GraphicBuffer,
+    object: NvMapObjectId,
+) -> Result<PresentationImageRequest, FramebufferError> {
+    let plane = buffer.primary_plane();
+    let format = match present_format(buffer, plane)? {
+        PresentFormat::Rgba8 | PresentFormat::Rgbx8 => PresentationImageFormat::Rgba8,
+        PresentFormat::Bgra8 => PresentationImageFormat::Bgra8,
+        PresentFormat::Rgb565 | PresentFormat::Rgba4444 => {
+            return Err(FramebufferError::Unsupported(
+                "queued image format cannot be exported as a resident presentation image",
+            ));
+        }
+    };
+    Ok(PresentationImageRequest {
+        allocation: GpuAllocationId::new(object.raw()),
+        allocation_offset: u64::from(plane.offset),
+        width: plane.width,
+        height: plane.height,
+        format,
+    })
+}
+
+fn frame_crop(crop: CropRect) -> Result<FrameCrop, FramebufferError> {
+    Ok(FrameCrop {
+        left: u32::try_from(crop.left)
+            .map_err(|_| FramebufferError::Malformed("QueueBuffer crop left overflows"))?,
+        top: u32::try_from(crop.top)
+            .map_err(|_| FramebufferError::Malformed("QueueBuffer crop top overflows"))?,
+        width: u32::try_from(crop.right - crop.left)
+            .map_err(|_| FramebufferError::Malformed("QueueBuffer crop width overflows"))?,
+        height: u32::try_from(crop.bottom - crop.top)
+            .map_err(|_| FramebufferError::Malformed("QueueBuffer crop height overflows"))?,
+    })
+}
+
+fn frame_transform(transform: u32) -> Result<FrameTransform, FramebufferError> {
+    if transform & !0x7 != 0 {
+        return Err(FramebufferError::Unsupported(
+            "QueueBuffer transform contains unsupported bits",
+        ));
+    }
+    Ok(FrameTransform {
+        flip_horizontal: transform & 0x1 != 0,
+        flip_vertical: transform & 0x2 != 0,
+        rotate_90_clockwise: transform & 0x4 != 0,
+    })
+}
+
 fn validate_crop(crop: CropRect, width: u32, height: u32) -> Result<(), FramebufferError> {
     if crop.left < 0
         || crop.top < 0
@@ -1264,147 +1367,6 @@ fn effective_crop(crop: CropRect, width: u32, height: u32) -> CropRect {
     }
 }
 
-fn transformed_dimensions(crop: CropRect, transform: u32) -> Result<(u32, u32), FramebufferError> {
-    // HAL applies horizontal/vertical flips first and ROT_90 clockwise after
-    // them. These exact bits and ordering are recorded by pinned libnx:
-    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/display/types.h
-    if transform & !0x7 != 0 {
-        return Err(FramebufferError::Unsupported(
-            "QueueBuffer transform contains unsupported bits",
-        ));
-    }
-    let width = u32::try_from(crop.right - crop.left)
-        .map_err(|_| FramebufferError::Malformed("QueueBuffer crop width overflows"))?;
-    let height = u32::try_from(crop.bottom - crop.top)
-        .map_err(|_| FramebufferError::Malformed("QueueBuffer crop height overflows"))?;
-    Ok(if transform & 0x4 != 0 {
-        (height, width)
-    } else {
-        (width, height)
-    })
-}
-
-fn decode_present_image(
-    buffer: &GraphicBuffer,
-    bytes: &[u8],
-    presentation: Option<(CropRect, u32)>,
-) -> Result<Vec<u32>, FramebufferError> {
-    validate_present_descriptor(buffer, presentation.map(|value| value.0))?;
-    let plane = buffer.primary_plane();
-    let format = present_format(buffer, plane)?;
-    let crop = presentation.map_or(
-        CropRect {
-            left: 0,
-            top: 0,
-            right: i32::try_from(plane.width).unwrap_or(i32::MAX),
-            bottom: i32::try_from(plane.height).unwrap_or(i32::MAX),
-        },
-        |value| value.0,
-    );
-    let transform = presentation.map_or(0, |value| value.1);
-    let dimensions = transformed_dimensions(crop, transform)?;
-    let crop_width = u32::try_from(crop.right - crop.left).unwrap();
-    let crop_height = u32::try_from(crop.bottom - crop.top).unwrap();
-    let pixel_count = usize::try_from(dimensions.0)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(dimensions.1)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .ok_or(FramebufferError::Malformed(
-            "queued image dimensions overflow",
-        ))?;
-    let mut pixels = vec![0_u32; pixel_count];
-    let width_in_gobs = u64::from(plane.pitch / 64);
-    let block_height_gobs = 1_u64 << plane.block_height_log2;
-    for source_y in 0..crop_height {
-        for source_x in 0..crop_width {
-            let x = u64::from(u32::try_from(crop.left).unwrap() + source_x);
-            let y = u64::from(u32::try_from(crop.top).unwrap() + source_y);
-            let byte_x = x * u64::from(format.bytes_per_pixel());
-            let address = if plane.layout == 1 {
-                y * u64::from(plane.pitch) + byte_x
-            } else {
-                (y / (8 * block_height_gobs)) * 512 * block_height_gobs * width_in_gobs
-                    + (byte_x / 64) * 512 * block_height_gobs
-                    + ((y % (8 * block_height_gobs)) / 8) * 512
-                    + ((byte_x % 64) / 32) * 256
-                    + ((y % 8) / 2) * 64
-                    + ((byte_x % 32) / 16) * 32
-                    + (y % 2) * 16
-                    + byte_x % 16
-            };
-            let address = usize::try_from(address)
-                .map_err(|_| FramebufferError::Malformed("image address overflows"))?;
-            let needed = usize::try_from(format.bytes_per_pixel()).unwrap();
-            let texel = bytes
-                .get(address..address + needed)
-                .ok_or(FramebufferError::Malformed(
-                    "queued image backing is truncated",
-                ))?;
-            let (red, green, blue) = match format {
-                PresentFormat::Rgba8 | PresentFormat::Rgbx8 => (
-                    u32::from(texel[0]),
-                    u32::from(texel[1]),
-                    u32::from(texel[2]),
-                ),
-                PresentFormat::Bgra8 => (
-                    u32::from(texel[2]),
-                    u32::from(texel[1]),
-                    u32::from(texel[0]),
-                ),
-                PresentFormat::Rgb565 => {
-                    let packed = u16::from_le_bytes(texel.try_into().unwrap());
-                    (
-                        u32::from((packed >> 11) & 0x1f) * 255 / 31,
-                        u32::from((packed >> 5) & 0x3f) * 255 / 63,
-                        u32::from(packed & 0x1f) * 255 / 31,
-                    )
-                }
-                PresentFormat::Rgba4444 => {
-                    let packed = u16::from_le_bytes(texel.try_into().unwrap());
-                    (
-                        u32::from(packed & 0xf) * 17,
-                        u32::from((packed >> 4) & 0xf) * 17,
-                        u32::from((packed >> 8) & 0xf) * 17,
-                    )
-                }
-            };
-            let transformed_x = if transform & 0x1 != 0 {
-                crop_width - 1 - source_x
-            } else {
-                source_x
-            };
-            let transformed_y = if transform & 0x2 != 0 {
-                crop_height - 1 - source_y
-            } else {
-                source_y
-            };
-            let (output_x, output_y) = if transform & 0x4 != 0 {
-                (crop_height - 1 - transformed_y, transformed_x)
-            } else {
-                (transformed_x, transformed_y)
-            };
-            let output_index = usize::try_from(output_y)
-                .ok()
-                .and_then(|y| {
-                    usize::try_from(dimensions.0)
-                        .ok()
-                        .and_then(|w| y.checked_mul(w))
-                })
-                .and_then(|row| {
-                    usize::try_from(output_x)
-                        .ok()
-                        .and_then(|x| row.checked_add(x))
-                })
-                .ok_or(FramebufferError::Malformed("RGB565 output index overflows"))?;
-            pixels[output_index] = (red << 16) | (green << 8) | blue;
-        }
-    }
-    Ok(pixels)
-}
-
 pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x1c] {
     let mut parcel = [0_u8; 0x1c];
     parcel[0..4].copy_from_slice(&12_u32.to_le_bytes());
@@ -1417,11 +1379,16 @@ pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x1c] {
 
 #[cfg(test)]
 mod tests {
-    use nixe_cpu::memory::{
-        CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryMappingPurpose,
-        MemoryValue, ProcessMemory,
+    use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
+    use nixe_gpu::{
+        BackendCapabilities, BackendExecutionCompletion, BackendFeatures, BackendInstanceId,
+        BackendLimits, BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
+        BackendRuntimeError, BackendSubmissionToken, ImageDescription, ImageDimension, ImageExtent,
+        ImageFormat, ImageKind, OperationSubmission, QueryKind, ResourceDependency, SampleCount,
+        ShaderStage,
     };
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
+    use nixe_video::FrameNotifier;
 
     use super::*;
 
@@ -1452,7 +1419,10 @@ mod tests {
     }
 
     fn video_with_rgba_nvmap() -> (VideoSystem, i32, GraphicBuffer) {
-        let video = VideoSystem::default();
+        configure_rgba_nvmap(VideoSystem::default())
+    }
+
+    fn configure_rgba_nvmap(video: VideoSystem) -> (VideoSystem, i32, GraphicBuffer) {
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
         let memory = ExecutionMemory::new();
@@ -1468,19 +1438,6 @@ mod tests {
                 MemoryMappingPurpose::Normal,
             )
             .unwrap();
-        for index in 0..16_usize {
-            let x = index % 4;
-            let y = index / 4;
-            let pixel = if x <= y { 0xff00_00ff_u32 } else { 0xffff_0000 };
-            memory
-                .write(
-                    address_space,
-                    GuestVirtualAddress::new(address.get() + u64::try_from(index * 4).unwrap()),
-                    MemoryAccess::normal(MemoryAccessSize::Word),
-                    MemoryValue::U32(pixel),
-                )
-                .unwrap();
-        }
         nvdrv.initialize();
         let fd = nvdrv.open(b"/dev/nvmap", 44).unwrap();
         let mut create = [0_u8; 8];
@@ -1508,6 +1465,113 @@ mod tests {
         assert_eq!(error, super::super::nvdrv::NV_SUCCESS);
         let exported_id = u32::from_le_bytes(get_id[..4].try_into().unwrap());
         (video, layer.binder_id, rgba_pitch_buffer(exported_id))
+    }
+
+    #[derive(Debug)]
+    struct ResidentTestRuntime {
+        capabilities: BackendCapabilities,
+    }
+
+    impl ResidentTestRuntime {
+        fn new() -> Self {
+            Self {
+                capabilities: BackendCapabilities::new(
+                    BackendFeatures::empty(),
+                    [ImageFormat::Rgba8Unorm],
+                    [SampleCount::One],
+                    std::iter::empty::<ShaderStage>(),
+                    std::iter::empty::<QueryKind>(),
+                    BackendLimits {
+                        max_color_attachments: 1,
+                        max_descriptor_bindings: 0,
+                        max_compute_workgroups: [0; 3],
+                    },
+                ),
+            }
+        }
+    }
+
+    impl NeutralBackendRuntime for ResidentTestRuntime {
+        fn capabilities(&self) -> &BackendCapabilities {
+            &self.capabilities
+        }
+
+        fn submit(
+            &mut self,
+            _creations: &[BackendResourceCreateInfo],
+            _invalidations: &[ResourceDependency],
+            _submission: &OperationSubmission,
+        ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+            unreachable!("resident presentation fixture submits no GPU work")
+        }
+
+        fn poll_completion(
+            &mut self,
+        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+            Ok(None)
+        }
+
+        fn wait_for_completion(
+            &mut self,
+        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+            Ok(None)
+        }
+
+        fn bind_visibility_requester(
+            &mut self,
+            _requester: Arc<dyn nixe_gpu::BackendVisibilityRequester>,
+        ) -> Result<(), BackendRuntimeError> {
+            Ok(())
+        }
+
+        fn make_cpu_visible(
+            &mut self,
+            _request: nixe_memory::CpuVisibilityRequest,
+        ) -> Result<Box<[u8]>, BackendRuntimeError> {
+            unreachable!("resident presentation must not request CPU visibility")
+        }
+
+        fn acquire_presentable_image(
+            &mut self,
+            request: PresentationImageRequest,
+        ) -> Result<ResidentImage, BackendRuntimeError> {
+            let instance = BackendInstanceId::new(7);
+            let description = ImageDescription::new(
+                ImageDimension::Two,
+                ImageExtent {
+                    width: request.width,
+                    height: request.height,
+                    depth: 1,
+                },
+                match request.format {
+                    PresentationImageFormat::Rgba8 => ImageFormat::Rgba8Unorm,
+                    PresentationImageFormat::Bgra8 => ImageFormat::Bgra8Unorm,
+                },
+                ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap();
+            Ok(ResidentImage::new(
+                instance,
+                BackendResourceHandle::new(instance, 3, 1, BackendResourceKind::Image),
+                description,
+                BackendSubmissionToken::new(instance, 4, 1),
+                Arc::new(()),
+            ))
+        }
+
+        fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ResidentTestNotifier;
+
+    impl FrameNotifier for ResidentTestNotifier {
+        fn frame_available(&self) {}
     }
 
     #[test]
@@ -1583,147 +1647,6 @@ mod tests {
         assert_eq!(video.active_layer_count(), 0);
         assert!(video.binder_event(layer.binder_id).is_none());
         assert_eq!(video.teardown(), GraphicsTeardownReport::default());
-    }
-
-    #[test]
-    fn libnx_gob_layout_decodes_to_xrgb8888() {
-        let width = 32_u32;
-        let height = 8_u32;
-        let pitch = 64_u32;
-        let mut linear = vec![0_u8; usize::try_from(pitch * height).unwrap()];
-        let colors = [0xf800_u16, 0x07e0, 0x001f, 0xffff];
-        for y in 0..height {
-            for x in 0..width {
-                let packed = colors[usize::try_from((x + y) % 4).unwrap()];
-                let offset = usize::try_from(y * pitch + x * 2).unwrap();
-                linear[offset..offset + 2].copy_from_slice(&packed.to_le_bytes());
-            }
-        }
-        // This is the 16-byte group permutation used by pinned libnx's
-        // _convertGobTo16Bx2, independent from the address equation under test.
-        let mut swizzled = vec![0_u8; 512];
-        for index in 0..32_u32 {
-            let y = ((index >> 1) & 0x06) | (index & 0x01);
-            let x = ((index << 3) & 0x10) | ((index << 1) & 0x20);
-            let source = usize::try_from(y * pitch + x).unwrap();
-            let destination = usize::try_from(index * 16).unwrap();
-            swizzled[destination..destination + 16].copy_from_slice(&linear[source..source + 16]);
-        }
-        let buffer = GraphicBuffer {
-            nvmap_id: 1,
-            stride_pixels: width,
-            format: 4,
-            external_format: 4,
-            usage: 0,
-            total_size: 512,
-            planes: vec![GraphicBufferPlane {
-                width,
-                height,
-                color_format: 0x010a_881210,
-                layout: 3,
-                pitch,
-                offset: 0,
-                kind: 0xfe,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 512,
-            }]
-            .into_boxed_slice(),
-        };
-        let decoded = decode_present_image(&buffer, &swizzled, None).unwrap();
-        assert_eq!(&decoded[..4], &[0xff0000, 0x00ff00, 0x0000ff, 0xffffff]);
-        assert_eq!(
-            &decoded[usize::try_from(width).unwrap()..][..4],
-            &[0x00ff00, 0x0000ff, 0xffffff, 0xff0000]
-        );
-    }
-
-    #[test]
-    fn unsupported_framebuffer_formats_are_not_guest_malformed_data() {
-        let buffer = GraphicBuffer {
-            nvmap_id: 1,
-            stride_pixels: 1,
-            format: 1,
-            external_format: 1,
-            usage: 0,
-            total_size: 4,
-            planes: vec![GraphicBufferPlane {
-                width: 1,
-                height: 1,
-                color_format: 0,
-                layout: 1,
-                pitch: 4,
-                offset: 0,
-                kind: 0,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 4,
-            }]
-            .into_boxed_slice(),
-        };
-        assert!(matches!(
-            decode_present_image(&buffer, &[0; 4], None),
-            Err(FramebufferError::Unsupported(_))
-        ));
-    }
-
-    #[test]
-    fn rgba_crop_and_rotation_produce_the_expected_host_image() {
-        let buffer = GraphicBuffer {
-            nvmap_id: 3,
-            stride_pixels: 3,
-            format: 1,
-            external_format: 1,
-            usage: 0x100,
-            total_size: 24,
-            planes: vec![GraphicBufferPlane {
-                width: 3,
-                height: 2,
-                color_format: 0x0100_532120,
-                layout: 1,
-                pitch: 12,
-                offset: 0,
-                kind: 0,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 24,
-            }]
-            .into_boxed_slice(),
-        };
-        let bytes = [
-            1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255,
-        ];
-        let crop = CropRect {
-            left: 0,
-            top: 0,
-            right: 3,
-            bottom: 2,
-        };
-
-        assert_eq!(
-            decode_present_image(&buffer, &bytes, Some((crop, 4))).unwrap(),
-            vec![0x040000, 0x010000, 0x050000, 0x020000, 0x060000, 0x030000]
-        );
-        assert_eq!(transformed_dimensions(crop, 4).unwrap(), (2, 3));
-        assert_eq!(
-            effective_crop(
-                CropRect {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                },
-                3,
-                2,
-            ),
-            crop
-        );
     }
 
     #[test]
@@ -1864,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_gpu_fence_blocks_composition_but_not_vsync_or_slot_ownership() {
+    fn headless_discard_waits_for_the_acquire_fence_without_materializing_a_frame() {
         let (video, binder_id, buffer) = video_with_rgba_nvmap();
         let syncpoint = GuestSyncpointId::new(9);
         video.nvdrv().install_test_timeline(syncpoint);
@@ -1908,7 +1831,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
-        assert_eq!(video.mailbox().statistics().published, 0);
         assert_eq!(
             video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
             SlotOwnership::Queued
@@ -1916,15 +1838,72 @@ mod tests {
 
         video.nvdrv().advance_test_timeline(syncpoint);
         assert_eq!(video.advance(Duration::from_millis(34)).unwrap(), 1);
-        let frame = video.mailbox().take_latest().unwrap();
         assert_eq!(
-            frame.pixels(),
-            &[
-                0xff0000, 0x0000ff, 0x0000ff, 0x0000ff, 0xff0000, 0xff0000, 0x0000ff, 0x0000ff,
-                0xff0000, 0xff0000, 0xff0000, 0x0000ff, 0xff0000, 0xff0000, 0xff0000, 0xff0000,
-            ]
+            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
+            SlotOwnership::Free
         );
-        assert_eq!(frame.content_hash64(), 0x2e24_7804_7487_ddaf);
+    }
+
+    #[test]
+    fn resident_frame_skips_cpu_materialization_and_retains_its_buffer_slot() {
+        let mailbox = FrameMailbox::with_notifier(Arc::new(ResidentTestNotifier));
+        let video = VideoSystem::with_gpu_backend(
+            Some(mailbox.clone()),
+            Box::new(ResidentTestRuntime::new()),
+            GpuCacheConfiguration::default(),
+        );
+        let (video, binder_id, buffer) = configure_rgba_nvmap(video);
+        let syncpoint = GuestSyncpointId::new(11);
+        video.nvdrv().install_test_timeline(syncpoint);
+        {
+            let mut state = video.state.lock().unwrap();
+            state.queues.get_mut(&binder_id).unwrap().slots.insert(
+                0,
+                BufferSlot {
+                    ownership: SlotOwnership::Queueing,
+                    buffer: buffer.clone(),
+                    release_fences: Box::default(),
+                },
+            );
+        }
+        video
+            .queue_graphic_buffer(
+                binder_id,
+                QueuedBufferRequest {
+                    slot: 0,
+                    buffer,
+                    input: QueueBufferInput {
+                        timestamp: 0,
+                        auto_timestamp: true,
+                        crop: CropRect {
+                            left: 0,
+                            top: 0,
+                            right: 4,
+                            bottom: 4,
+                        },
+                        scaling_mode: 0,
+                        transform: 0,
+                        sticky_transform: 0,
+                        swap_interval: 1,
+                        acquire_fences: vec![NvFence {
+                            point: GuestTimelinePoint::new(syncpoint, GuestSyncpointValue::new(1)),
+                        }]
+                        .into_boxed_slice(),
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
+        let frame = mailbox.take_latest().unwrap();
+        assert_eq!((frame.width(), frame.height()), (4, 4));
+        assert_eq!(
+            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
+            SlotOwnership::Queued
+        );
+
+        drop(frame);
+        video.advance(Duration::ZERO).unwrap();
         assert_eq!(
             video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
             SlotOwnership::Free
@@ -1984,7 +1963,6 @@ mod tests {
 
             elapsed += Duration::from_millis(17);
             assert_eq!(video.advance(elapsed).unwrap(), 1);
-            assert_eq!(video.mailbox().statistics().published, frame as u64);
             assert_eq!(
                 video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
                 SlotOwnership::Queued
@@ -1993,18 +1971,12 @@ mod tests {
             video.nvdrv().advance_test_timeline(syncpoint);
             elapsed += Duration::from_millis(17);
             assert_eq!(video.advance(elapsed).unwrap(), 1);
-            let published = video.mailbox().take_latest().unwrap();
-            assert_eq!((published.width(), published.height()), (4, 4));
-            assert_eq!(published.content_hash64(), 0x2e24_7804_7487_ddaf);
             assert_eq!(
                 video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
                 SlotOwnership::Free
             );
         }
 
-        let statistics = video.mailbox().statistics();
-        assert_eq!(statistics.published, 2);
-        assert_eq!(statistics.consumed, 2);
         let report = video.teardown();
         assert_eq!(report.layers_released, 1);
         assert_eq!(report.queues_released, 1);
@@ -2052,6 +2024,5 @@ mod tests {
         let report = video.teardown();
         assert_eq!(report.pending_frames_released, 1);
         assert_eq!(video.advance(Duration::from_secs(1)).unwrap(), 60);
-        assert_eq!(video.mailbox().statistics().published, 0);
     }
 }

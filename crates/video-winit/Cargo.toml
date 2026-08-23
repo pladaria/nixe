@@ -7,7 +7,8 @@ license.workspace = true
 [dependencies]
 bytemuck.workspace = true
 log.workspace = true
+nixe-gpu.workspace = true
+nixe-gpu-wgpu.workspace = true
 nixe-video.workspace = true
-pollster.workspace = true
 wgpu.workspace = true
 winit.workspace = true
