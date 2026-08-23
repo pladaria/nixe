@@ -1,139 +1,102 @@
-//! Host-independent video frames, presentation mailboxes, and display timing.
-//!
-//! Console-specific services publish already decoded frames through this
-//! boundary. Window-system and host-GPU crates consume them without becoming
-//! dependencies of Horizon or the emulated runtime.
+//! Host-independent resident presentation frames, mailboxes, and display timing.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Pixel representation accepted by the initial host presentation backends.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum FrameFormat {
-    /// One native-endian `u32` per pixel with bits `00RRGGBB`.
-    Xrgb8888,
+use nixe_gpu::ResidentImage;
+
+/// Pixel rectangle selected from a resident source image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCrop {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
-/// A complete, immutable image ready for host presentation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Frame {
-    width: u32,
-    height: u32,
-    format: FrameFormat,
+/// Android display transform applied after cropping the source image.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameTransform {
+    pub flip_horizontal: bool,
+    pub flip_vertical: bool,
+    pub rotate_90_clockwise: bool,
+}
+
+/// Semantic ownership retained until the presenter has consumed a frame.
+pub trait FrameLease: Debug + Send + Sync {}
+
+impl<T: Debug + Send + Sync> FrameLease for T {}
+
+/// Frame ready to be sampled directly from its backend-resident image.
+#[derive(Clone, Debug)]
+pub struct PresentationFrame {
+    image: ResidentImage,
+    crop: FrameCrop,
+    transform: FrameTransform,
+    dimensions: (u32, u32),
     sequence: u64,
-    pixels: Arc<[u32]>,
+    _lease: Arc<dyn FrameLease>,
 }
 
-impl Frame {
-    /// Builds a checked frame without accepting partial image storage.
-    pub fn new_xrgb8888(
-        width: u32,
-        height: u32,
+impl PresentationFrame {
+    #[must_use]
+    pub fn new(
+        image: ResidentImage,
+        crop: FrameCrop,
+        transform: FrameTransform,
         sequence: u64,
-        pixels: impl Into<Arc<[u32]>>,
-    ) -> Result<Self, FrameError> {
-        if width == 0 || height == 0 {
-            return Err(FrameError::EmptyDimensions);
-        }
-        let expected = usize::try_from(width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .ok_or(FrameError::DimensionsOverflow)?;
-        let pixels = pixels.into();
-        if pixels.len() != expected {
-            return Err(FrameError::PixelCount {
-                expected,
-                actual: pixels.len(),
-            });
-        }
-        Ok(Self {
-            width,
-            height,
-            format: FrameFormat::Xrgb8888,
+        lease: Arc<dyn FrameLease>,
+    ) -> Self {
+        let dimensions = if transform.rotate_90_clockwise {
+            (crop.height, crop.width)
+        } else {
+            (crop.width, crop.height)
+        };
+        Self {
+            image,
+            crop,
+            transform,
+            dimensions,
             sequence,
-            pixels,
-        })
+            _lease: lease,
+        }
+    }
+
+    #[must_use]
+    pub const fn image(&self) -> &ResidentImage {
+        &self.image
+    }
+
+    #[must_use]
+    pub const fn crop(&self) -> FrameCrop {
+        self.crop
+    }
+
+    #[must_use]
+    pub const fn transform(&self) -> FrameTransform {
+        self.transform
     }
 
     #[must_use]
     pub const fn width(&self) -> u32 {
-        self.width
+        self.dimensions.0
     }
 
     #[must_use]
     pub const fn height(&self) -> u32 {
-        self.height
-    }
-
-    #[must_use]
-    pub const fn format(&self) -> FrameFormat {
-        self.format
+        self.dimensions.1
     }
 
     #[must_use]
     pub const fn sequence(&self) -> u64 {
         self.sequence
     }
-
-    #[must_use]
-    pub fn pixels(&self) -> &[u32] {
-        &self.pixels
-    }
-
-    /// Returns a stable, host-independent content fingerprint for headless
-    /// presentation assertions. Sequence is intentionally excluded so equal
-    /// images produced on different VSyncs compare equal.
-    #[must_use]
-    pub fn content_hash64(&self) -> u64 {
-        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut hash = OFFSET_BASIS;
-        for byte in self
-            .width
-            .to_le_bytes()
-            .into_iter()
-            .chain(self.height.to_le_bytes())
-            .chain([0])
-            .chain(self.pixels.iter().flat_map(|pixel| pixel.to_le_bytes()))
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-        hash
-    }
 }
-
-/// Invalid host-ready frame description.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FrameError {
-    EmptyDimensions,
-    DimensionsOverflow,
-    PixelCount { expected: usize, actual: usize },
-}
-
-impl Display for FrameError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyDimensions => write!(formatter, "frame dimensions must be non-zero"),
-            Self::DimensionsOverflow => write!(formatter, "frame dimensions overflow usize"),
-            Self::PixelCount { expected, actual } => write!(
-                formatter,
-                "frame contains {actual} pixels but its dimensions require {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
 
 #[derive(Debug, Default)]
 struct MailboxState {
-    latest: Option<Arc<Frame>>,
+    latest: Option<Arc<PresentationFrame>>,
     published: u64,
     consumed: u64,
 }
@@ -158,12 +121,6 @@ impl Debug for FrameMailbox {
     }
 }
 
-impl Default for FrameMailbox {
-    fn default() -> Self {
-        Self::with_notifier(Arc::new(NoopFrameNotifier))
-    }
-}
-
 impl FrameMailbox {
     #[must_use]
     pub fn with_notifier(notifier: Arc<dyn FrameNotifier>) -> Self {
@@ -173,7 +130,7 @@ impl FrameMailbox {
         }
     }
 
-    pub fn publish(&self, frame: Arc<Frame>) {
+    pub fn publish(&self, frame: Arc<PresentationFrame>) {
         {
             let mut state = self
                 .state
@@ -186,7 +143,7 @@ impl FrameMailbox {
     }
 
     /// Takes the newest frame, if one has not already been consumed.
-    pub fn take_latest(&self) -> Option<Arc<Frame>> {
+    pub fn take_latest(&self) -> Option<Arc<PresentationFrame>> {
         let mut state = self
             .state
             .lock()
@@ -217,13 +174,6 @@ impl FrameMailbox {
 /// Implementations must return promptly and must not consume the mailbox.
 pub trait FrameNotifier: Send + Sync {
     fn frame_available(&self);
-}
-
-#[derive(Debug)]
-struct NoopFrameNotifier;
-
-impl FrameNotifier for NoopFrameNotifier {
-    fn frame_available(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -314,6 +264,11 @@ impl std::error::Error for DisplayClockError {}
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nixe_gpu::{
+        BackendInstanceId, BackendResourceHandle, BackendResourceKind, BackendSubmissionToken,
+        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
+    };
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -325,32 +280,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn frame_rejects_incomplete_storage() {
-        assert_eq!(
-            Frame::new_xrgb8888(2, 2, 1, vec![0; 3]),
-            Err(FrameError::PixelCount {
-                expected: 4,
-                actual: 3
-            })
-        );
-    }
-
-    #[test]
-    fn content_hash_is_stable_across_frame_sequences() {
-        let first = Frame::new_xrgb8888(2, 1, 1, vec![0x112233, 0x445566]).unwrap();
-        let second = Frame::new_xrgb8888(2, 1, 99, vec![0x112233, 0x445566]).unwrap();
-        let changed = Frame::new_xrgb8888(2, 1, 1, vec![0x112233, 0x445567]).unwrap();
-
-        assert_eq!(first.content_hash64(), second.content_hash64());
-        assert_ne!(first.content_hash64(), changed.content_hash64());
+    fn frame(sequence: u64) -> PresentationFrame {
+        let instance = BackendInstanceId::new(1);
+        PresentationFrame::new(
+            ResidentImage::new(
+                instance,
+                BackendResourceHandle::new(instance, sequence, 1, BackendResourceKind::Image),
+                ImageDescription::new(
+                    ImageDimension::Two,
+                    ImageExtent {
+                        width: 4,
+                        height: 2,
+                        depth: 1,
+                    },
+                    ImageFormat::Rgba8Unorm,
+                    ImageKind::Color,
+                    1,
+                    1,
+                    SampleCount::One,
+                )
+                .unwrap(),
+                BackendSubmissionToken::new(instance, sequence, 1),
+                Arc::new(()),
+            ),
+            FrameCrop {
+                left: 0,
+                top: 0,
+                width: 4,
+                height: 2,
+            },
+            FrameTransform::default(),
+            sequence,
+            Arc::new(()),
+        )
     }
 
     #[test]
     fn mailbox_drops_stale_unconsumed_frames() {
-        let mailbox = FrameMailbox::default();
-        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 1, vec![1]).unwrap()));
-        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 2, vec![2]).unwrap()));
+        let mailbox = FrameMailbox::with_notifier(Arc::new(CountingNotifier::default()));
+        mailbox.publish(Arc::new(frame(1)));
+        mailbox.publish(Arc::new(frame(2)));
 
         let frame = mailbox.take_latest().unwrap();
         assert_eq!(frame.sequence(), 2);
@@ -369,8 +338,8 @@ mod tests {
         let notifier = Arc::new(CountingNotifier::default());
         let mailbox = FrameMailbox::with_notifier(notifier.clone());
 
-        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 1, vec![1]).unwrap()));
-        mailbox.publish(Arc::new(Frame::new_xrgb8888(1, 1, 2, vec![2]).unwrap()));
+        mailbox.publish(Arc::new(frame(1)));
+        mailbox.publish(Arc::new(frame(2)));
 
         assert_eq!(notifier.0.load(Ordering::Relaxed), 2);
         assert_eq!(mailbox.take_latest().unwrap().sequence(), 2);

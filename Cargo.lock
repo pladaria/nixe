@@ -1159,6 +1159,9 @@ version = "0.1.0"
 [[package]]
 name = "nixe-video"
 version = "0.1.0"
+dependencies = [
+ "nixe-gpu",
+]
 
 [[package]]
 name = "nixe-video-winit"
@@ -1166,8 +1169,9 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "log",
+ "nixe-gpu",
+ "nixe-gpu-wgpu",
  "nixe-video",
- "pollster",
  "wgpu",
  "winit",
 ]

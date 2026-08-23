@@ -7,15 +7,15 @@ use nixe_gpu::{
     DrawArguments, DrawOperation, FrontendSubmissionId, GpuAllocationDescription, GpuAllocationId,
     GpuCommand, GpuOperation, ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId,
     ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView, NeutralBackendRuntime,
-    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PrimitiveTopology,
-    RenderAttachment, RenderPassAttachmentDescription, RenderPassDescription, RenderPassId,
-    RenderPassOperation, ResourceDependency, SampleCount, ShaderDescription, ShaderId,
-    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
-    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
-    ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
+    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PresentationImageFormat,
+    PresentationImageRequest, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
+    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceDependency, SampleCount,
+    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
+    ShaderIoLocation, ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
+    ShaderSourceLocation, ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
 };
-use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
+use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend, resident_texture};
 use nixe_memory::{
     CanonicalAllocation, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, ContentGeneration, CpuVisibilityRequest, DeviceVisibilityPoint,
@@ -627,10 +627,22 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         ],
     )
     .unwrap();
-    runtime
+    let token = runtime
         .runtime()
         .submit(&creations, &[], &submission)
         .unwrap();
+    let resident = runtime
+        .runtime()
+        .acquire_presentable_image(PresentationImageRequest {
+            allocation,
+            allocation_offset: 0,
+            width: WIDTH,
+            height: HEIGHT,
+            format: PresentationImageFormat::Rgba8,
+        })
+        .unwrap();
+    assert_eq!(resident.completion(), token);
+    assert!(resident_texture(&resident).is_some());
     let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     image_backing.range().read(0, &mut pixels).unwrap();
     let pixel = |x: u32, y: u32| {

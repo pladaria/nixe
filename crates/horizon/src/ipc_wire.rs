@@ -10,7 +10,6 @@ use nixe_cpu::memory::{
     DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAccessSize,
     MemoryPermissions, MemoryRegionKind, MemoryValue,
 };
-use nixe_memory::CanonicalRangeAccessError;
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
 
@@ -53,7 +52,7 @@ pub(crate) enum IpcWireError {
     Internal(&'static str),
     HostResourceExhausted(&'static str),
     ResponseCommit(DataAccessFault),
-    CanonicalBacking(CanonicalRangeAccessError),
+    GraphicsBackend(Box<str>),
     ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
@@ -108,11 +107,8 @@ impl std::fmt::Display for HorizonIpcFault {
                     "could not commit a prevalidated response: {fault:?}"
                 )
             }
-            IpcWireError::CanonicalBacking(fault) => {
-                write!(
-                    formatter,
-                    "cannot access retained canonical backing: {fault}"
-                )
+            IpcWireError::GraphicsBackend(reason) => {
+                write!(formatter, "GPU presentation export failed: {reason}")
             }
             IpcWireError::ErrorApplet(diagnostic) => {
                 write!(
@@ -2360,14 +2356,9 @@ fn dispatch_binder_relay(
                                 },
                             )
                         }
-                        crate::graphics::FramebufferError::NvMap(
-                            crate::NvMapViewError::ResourceExhausted,
-                        ) => IpcWireError::HostResourceExhausted(
-                            "resolving a Binder framebuffer nvmap view",
-                        ),
-                        crate::graphics::FramebufferError::NvMap(
-                            crate::NvMapViewError::Backing(error),
-                        ) => IpcWireError::CanonicalBacking(error),
+                        crate::graphics::FramebufferError::Backend(reason) => {
+                            IpcWireError::GraphicsBackend(reason)
+                        }
                         crate::graphics::FramebufferError::NvMap(_) => {
                             IpcWireError::Malformed("queued graphic-buffer image view is invalid")
                         }
