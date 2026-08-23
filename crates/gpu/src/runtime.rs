@@ -3,13 +3,13 @@
 //! The composition root selects a concrete backend driver. Console frontends
 //! only receive this interface and therefore cannot observe host API objects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use nixe_memory::{
-    CanonicalBackingRange, DeviceAccessDeclaration, DeviceVisibilityPoint, NonCpuDeviceId,
-    VisibilityCoordinator,
+    CanonicalBackingRange, CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
+    NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
 };
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
     BackendSubmissionToken, FrontendSubmissionId, OperationSubmission, ResourceDependency,
 };
 
-/// Evidence that host execution and canonical write visibility both finished.
+/// Evidence that host execution and canonical device ownership both finished.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendExecutionCompletion {
     frontend: FrontendSubmissionId,
@@ -46,30 +46,62 @@ impl BackendExecutionCompletion {
 pub trait NeutralBackendRuntime: Send {
     fn capabilities(&self) -> &BackendCapabilities;
 
-    /// Executes one serialized neutral transaction.
+    /// Accepts one neutral transaction without waiting for host completion.
     ///
-    /// A successful return means resource creation, host execution, readback,
-    /// canonical visibility, completion release, and resource retirement have
-    /// all completed in that order.
-    fn execute(
+    /// A successful return means resource creation and host submission
+    /// succeeded and canonical memory records the resulting device dependency.
+    /// Completion, retirement, and guest progress remain pending.
+    fn submit(
         &mut self,
         creations: &[BackendResourceCreateInfo],
         invalidations: &[ResourceDependency],
         submission: &OperationSubmission,
-    ) -> Result<BackendExecutionCompletion, BackendRuntimeError>;
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError>;
+
+    /// Polls the oldest accepted submission on the completion timeline.
+    fn poll_completion(
+        &mut self,
+    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
+
+    /// Waits for the oldest accepted submission on the same timeline.
+    fn wait_for_completion(
+        &mut self,
+    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
+
+    /// Connects canonical CPU visibility requests to the backend owner.
+    fn bind_visibility_requester(
+        &mut self,
+        requester: Arc<dyn BackendVisibilityRequester>,
+    ) -> Result<(), BackendRuntimeError>;
+
+    /// Materializes one page whose newest contents are owned by this backend.
+    fn make_cpu_visible(
+        &mut self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, BackendRuntimeError>;
 
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
 }
 
-/// Serialized adapter around a validated neutral backend.
-pub struct SynchronousBackendRuntime<D> {
+/// Blocking request path from canonical memory to the sole backend owner.
+pub trait BackendVisibilityRequester: Send + Sync {
+    fn make_cpu_visible(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError>;
+}
+
+/// Ordered asynchronous adapter around a validated neutral backend.
+pub struct BackendRuntime<D> {
     backend: Backend<D>,
     device: NonCpuDeviceId,
     visibility: Arc<dyn VisibilityCoordinator>,
     next_visibility: u64,
+    pending: VecDeque<PendingSubmission>,
+    unreported: VecDeque<BackendExecutionCompletion>,
 }
 
-impl<D: BackendDriver> SynchronousBackendRuntime<D> {
+impl<D: BackendDriver> BackendRuntime<D> {
     #[must_use]
     pub fn new(
         backend: Backend<D>,
@@ -81,6 +113,8 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
             device,
             visibility,
             next_visibility: 1,
+            pending: VecDeque::new(),
+            unreported: VecDeque::new(),
         }
     }
 
@@ -146,8 +180,8 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
                 // range alive for completion without rebuilding a versioned
                 // snapshot on every submission.
                 let backing = backing.clone();
-                if let Err(error) =
-                    backing.prepare_device_access(declaration, Arc::clone(&self.visibility))
+                if let Err(error) = backing
+                    .prepare_resident_device_access(declaration, Arc::clone(&self.visibility))
                 {
                     invalidate_prepared(&prepared);
                     return Err(BackendRuntimeError::Visibility(error.to_string().into()));
@@ -175,6 +209,40 @@ impl<D: BackendDriver> SynchronousBackendRuntime<D> {
         }
         Ok(())
     }
+
+    fn complete_front(
+        &mut self,
+        wait: bool,
+    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+        let Some(pending) = self.pending.front() else {
+            return Ok(None);
+        };
+        let token = pending.token;
+        if wait {
+            self.backend
+                .wait_for_completion(token)
+                .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
+        } else if !self
+            .backend
+            .has_completed(token)
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?
+        {
+            return Ok(None);
+        }
+        let pending = self
+            .pending
+            .pop_front()
+            .expect("checked pending submission remains at the front");
+        self.backend
+            .release_submission(pending.token)
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
+        self.retire_resources(&pending.invalidations)?;
+        Ok(Some(BackendExecutionCompletion {
+            frontend: pending.frontend,
+            submission: pending.token,
+            visibility: pending.visibility,
+        }))
+    }
 }
 
 struct PreparedAccess {
@@ -182,17 +250,25 @@ struct PreparedAccess {
     declaration: DeviceAccessDeclaration,
 }
 
-impl<D: BackendDriver + Send> NeutralBackendRuntime for SynchronousBackendRuntime<D> {
+struct PendingSubmission {
+    frontend: FrontendSubmissionId,
+    token: BackendSubmissionToken,
+    visibility: DeviceVisibilityPoint,
+    invalidations: Box<[ResourceDependency]>,
+    retained_accesses: Box<[PreparedAccess]>,
+}
+
+impl<D: BackendDriver + Send> NeutralBackendRuntime for BackendRuntime<D> {
     fn capabilities(&self) -> &BackendCapabilities {
         self.backend.capabilities()
     }
 
-    fn execute(
+    fn submit(
         &mut self,
         creations: &[BackendResourceCreateInfo],
         invalidations: &[ResourceDependency],
         submission: &OperationSubmission,
-    ) -> Result<BackendExecutionCompletion, BackendRuntimeError> {
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
         for dependency in invalidations {
             if !self.backend.contains_resource(*dependency)
                 && !creations
@@ -224,37 +300,82 @@ impl<D: BackendDriver + Send> NeutralBackendRuntime for SynchronousBackendRuntim
                 return Err(BackendRuntimeError::Backend(error.to_string().into()));
             }
         };
-        let complete = self
-            .backend
-            .has_completed(token)
-            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
-        if !complete {
-            return Err(BackendRuntimeError::AsynchronousCompletionUnsupported(
-                token,
-            ));
-        }
-        for access in &prepared {
+        let pending = PendingSubmission {
+            frontend: submission.id(),
+            token,
+            visibility: point,
+            invalidations: invalidations.into(),
+            retained_accesses: prepared.into_boxed_slice(),
+        };
+        for access in &pending.retained_accesses {
             if access.declaration.kind().writes()
                 && let Err(error) = access
                     .range
-                    .complete_device_write(access.declaration, Arc::clone(&self.visibility))
+                    .publish_device_write(access.declaration, Arc::clone(&self.visibility))
             {
-                invalidate_prepared(&prepared);
+                invalidate_prepared(&pending.retained_accesses);
+                // The host accepted this submission, so retain it even though
+                // canonical publication failed. Terminal teardown must still
+                // wait for and release the real backend token.
+                self.pending.push_back(pending);
                 return Err(BackendRuntimeError::Visibility(error.to_string().into()));
             }
         }
+        self.pending.push_back(pending);
+        Ok(token)
+    }
+
+    fn poll_completion(
+        &mut self,
+    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+        match self.unreported.pop_front() {
+            Some(completion) => Ok(Some(completion)),
+            None => self.complete_front(false),
+        }
+    }
+
+    fn wait_for_completion(
+        &mut self,
+    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+        match self.unreported.pop_front() {
+            Some(completion) => Ok(Some(completion)),
+            None => self.complete_front(true),
+        }
+    }
+
+    fn bind_visibility_requester(
+        &mut self,
+        requester: Arc<dyn BackendVisibilityRequester>,
+    ) -> Result<(), BackendRuntimeError> {
         self.backend
-            .release_submission(token)
-            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
-        self.retire_resources(invalidations)?;
-        Ok(BackendExecutionCompletion {
-            frontend: submission.id(),
-            submission: token,
-            visibility: point,
-        })
+            .bind_visibility_requester(requester)
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
+    }
+
+    fn make_cpu_visible(
+        &mut self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, BackendRuntimeError> {
+        while self
+            .pending
+            .front()
+            .is_some_and(|pending| pending.visibility <= request.visible_at)
+        {
+            let completion = self
+                .complete_front(true)?
+                .expect("pending visibility point has a submission");
+            self.unreported.push_back(completion);
+        }
+        self.backend
+            .make_cpu_visible(request)
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
     }
 
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
+        self.unreported.clear();
+        while !self.pending.is_empty() {
+            self.complete_front(true)?;
+        }
         self.backend
             .teardown()
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
@@ -281,7 +402,6 @@ pub enum BackendRuntimeError {
     UnknownResource(ResourceDependency),
     InvalidVisibilityDeclaration,
     VisibilityPointExhausted,
-    AsynchronousCompletionUnsupported(BackendSubmissionToken),
     Visibility(Box<str>),
     Backend(Box<str>),
 }
@@ -298,10 +418,6 @@ impl Display for BackendRuntimeError {
             Self::VisibilityPointExhausted => {
                 formatter.write_str("neutral runtime visibility points are exhausted")
             }
-            Self::AsynchronousCompletionUnsupported(token) => write!(
-                formatter,
-                "serialized neutral runtime cannot yet retain incomplete host submission {token}"
-            ),
             Self::Visibility(error) => write!(formatter, "canonical visibility failed: {error}"),
             Self::Backend(error) => write!(formatter, "neutral backend failed: {error}"),
         }

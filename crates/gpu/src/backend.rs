@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use crate::{
     BackendCapabilities, BackendCapabilityError, BackendInstanceId, BackendSubmissionToken,
@@ -293,10 +294,32 @@ pub trait BackendDriver {
         submission: BackendSubmissionToken,
     ) -> Result<bool, BackendDriverError>;
 
+    fn wait_for_completion(
+        &mut self,
+        submission: BackendSubmissionToken,
+    ) -> Result<(), BackendDriverError>;
+
     fn release_submission(
         &mut self,
         submission: BackendSubmissionToken,
     ) -> Result<(), BackendDriverError>;
+
+    fn bind_visibility_requester(
+        &mut self,
+        _requester: Arc<dyn crate::BackendVisibilityRequester>,
+    ) -> Result<(), BackendDriverError> {
+        Ok(())
+    }
+
+    fn make_cpu_visible(
+        &mut self,
+        request: nixe_memory::CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, BackendDriverError> {
+        Err(BackendDriverError::failure(format!(
+            "backend cannot materialize canonical {} at {}",
+            request.page, request.visible_at
+        )))
+    }
 
     fn teardown(&mut self) -> Result<(), BackendDriverError>;
 }
@@ -640,6 +663,19 @@ impl<D: BackendDriver> Backend<D> {
             .map_err(|error| self.handle_driver_error(error))
     }
 
+    /// Waits for host completion without releasing the submission or changing
+    /// canonical-memory or guest-timeline state.
+    pub fn wait_for_completion(
+        &mut self,
+        token: BackendSubmissionToken,
+    ) -> Result<(), BackendError> {
+        self.require_active()?;
+        self.validate_submission_token(token)?;
+        self.driver
+            .wait_for_completion(token)
+            .map_err(|error| self.handle_driver_error(error))
+    }
+
     /// Releases one host-complete token, making its slot reusable with a new
     /// generation. Frontend ordering history remains retained for successors.
     pub fn release_submission(
@@ -660,6 +696,28 @@ impl<D: BackendDriver> Backend<D> {
         }
         self.submissions[token.slot() as usize].record = None;
         Ok(())
+    }
+
+    /// Connects canonical visibility faults to this backend's sole owner.
+    pub fn bind_visibility_requester(
+        &mut self,
+        requester: Arc<dyn crate::BackendVisibilityRequester>,
+    ) -> Result<(), BackendError> {
+        self.require_active()?;
+        self.driver
+            .bind_visibility_requester(requester)
+            .map_err(|error| self.handle_driver_error(error))
+    }
+
+    /// Makes one device-authoritative canonical page CPU-visible on demand.
+    pub fn make_cpu_visible(
+        &mut self,
+        request: nixe_memory::CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, BackendError> {
+        self.require_active()?;
+        self.driver
+            .make_cpu_visible(request)
+            .map_err(|error| self.handle_driver_error(error))
     }
 
     /// Explicitly tears down the instance without fabricating completion.
@@ -1377,6 +1435,15 @@ mod tests {
         ) -> Result<bool, BackendDriverError> {
             self.result()?;
             Ok(self.completed.contains(&submission))
+        }
+
+        fn wait_for_completion(
+            &mut self,
+            submission: BackendSubmissionToken,
+        ) -> Result<(), BackendDriverError> {
+            self.result()?;
+            self.completed.insert(submission);
+            Ok(())
         }
 
         fn release_submission(

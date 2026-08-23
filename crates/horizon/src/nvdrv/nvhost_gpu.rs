@@ -1,19 +1,18 @@
 //! `/dev/nvhost-gpu` channel ioctl and event ABI adapter.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
     FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
-    GuestTimelinePoint, NeutralBackendRuntime,
+    GuestTimelinePoint, ReservedTimelinePoint,
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
     MaxwellFrontendDispatchBoundary, MaxwellFrontendFailure, MaxwellGpfifoDecodeError,
     MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
     MaxwellInvalidGpfifoSubmission, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
-    MaxwellThreeDLoweringCache, MaxwellZCullMode, capture_maxwell_frontend_dispatch,
-    decode_gpfifo_submission, execute_maxwell_backend_submission,
-    execute_maxwell_software_initialization, preflight_maxwell_submission_execution,
+    MaxwellZCullMode, capture_maxwell_frontend_dispatch, decode_gpfifo_submission,
     resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
@@ -21,6 +20,7 @@ use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 use crate::GraphicsEventSource;
 
 use super::diagnostics::NvDrvCallError;
+use super::gpu_executor::{GpuExecutorFailure, GpuSubmission};
 use super::nvhost_ctrl::NvHostControl;
 use super::{
     NV_BAD_PARAMETER, NV_BAD_VALUE, NV_INVALID_STATE, NvDrvDeviceDescriptor, NvDrvErrorContext,
@@ -82,14 +82,16 @@ pub(super) struct NvHostGpu {
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
     scheduler: MaxwellScheduler,
-    lowering_cache: MaxwellThreeDLoweringCache,
 }
 
 pub(super) struct NvHostGpuIoctlResources<'a> {
-    pub control: &'a mut NvHostControl,
+    pub control: &'a Arc<Mutex<NvHostControl>>,
     pub devices: &'a BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
-    pub address_spaces: &'a BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>,
-    pub backend: Option<&'a mut dyn NeutralBackendRuntime>,
+}
+
+pub(super) struct NvHostGpuSubmitResources<'a> {
+    pub control: &'a Arc<Mutex<NvHostControl>>,
+    pub address_space: Option<&'a MaxwellGpuAddressSpace>,
 }
 
 struct NvHostGpuSubmit<'a> {
@@ -101,7 +103,6 @@ struct NvHostGpuSubmit<'a> {
 struct NvHostGpuSubmissionState<'a> {
     scheduler: &'a mut MaxwellScheduler,
     next_frontend_submission: &'a mut u64,
-    lowering_cache: &'a mut MaxwellThreeDLoweringCache,
 }
 
 impl Default for NvHostGpu {
@@ -111,7 +112,6 @@ impl Default for NvHostGpu {
             error_events: BTreeMap::new(),
             next_frontend_submission: 1,
             scheduler: MaxwellScheduler::default(),
-            lowering_cache: MaxwellThreeDLoweringCache::default(),
         }
     }
 }
@@ -157,6 +157,15 @@ impl NvHostGpu {
             .map(|channel| channel.bind_address_space(address_space))
     }
 
+    pub(super) fn bound_address_space(
+        &self,
+        channel_fd: NvDrvFileDescriptor,
+    ) -> Option<nixe_gpu_maxwell::MaxwellAddressSpaceId> {
+        self.channels
+            .get(&channel_fd)
+            .and_then(MaxwellGpuChannel::address_space)
+    }
+
     pub(super) fn unbind_address_space(
         &mut self,
         address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
@@ -172,7 +181,6 @@ impl NvHostGpu {
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
         input: &[u8],
-        additional_input: &[u8],
     ) -> Result<Vec<u8>, NvDrvCallError> {
         let channel = self
             .channels
@@ -230,12 +238,16 @@ impl NvHostGpu {
                 }
                 let point = resources
                     .control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .allocate_channel_syncpoint(descriptor, request)?;
                 if let Err(error) =
                     channel.allocate_gpfifo(entries, flags & 1 != 0, point.syncpoint())
                 {
                     resources
                         .control
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .release_channel_syncpoint(point.syncpoint());
                     return Err(channel_driver_result(descriptor, request, error));
                 }
@@ -243,47 +255,6 @@ impl NvHostGpu {
                 write_u32(&mut output, 12, point.syncpoint().get())?;
                 write_u32(&mut output, 16, point.value().get())?;
                 Ok(output)
-            }
-            IOCTL_CHANNEL_SUBMIT_GPFIFO2 => {
-                require_input_size(input, CHANNEL_SUBMIT_GPFIFO_HEADER_SIZE)?;
-                submit_gpfifo(
-                    channel,
-                    NvHostGpuSubmissionState {
-                        scheduler: &mut self.scheduler,
-                        next_frontend_submission: &mut self.next_frontend_submission,
-                        lowering_cache: &mut self.lowering_cache,
-                    },
-                    resources,
-                    descriptor,
-                    request,
-                    NvHostGpuSubmit {
-                        header: decode_submit_header(input)?,
-                        entries: additional_input,
-                        response: input,
-                    },
-                )
-            }
-            request if is_legacy_submit_gpfifo(request) => {
-                if !additional_input.is_empty() {
-                    return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
-                }
-                let (header, entries) = decode_legacy_submit_gpfifo(request, input)?;
-                submit_gpfifo(
-                    channel,
-                    NvHostGpuSubmissionState {
-                        scheduler: &mut self.scheduler,
-                        next_frontend_submission: &mut self.next_frontend_submission,
-                        lowering_cache: &mut self.lowering_cache,
-                    },
-                    resources,
-                    descriptor,
-                    request,
-                    NvHostGpuSubmit {
-                        header,
-                        entries,
-                        response: input,
-                    },
-                )
             }
             IOCTL_CHANNEL_ALLOC_OBJ_CTX => {
                 require_input_size(input, 16)?;
@@ -356,6 +327,51 @@ impl NvHostGpu {
         }
     }
 
+    pub(super) fn submit_ioctl(
+        &mut self,
+        resources: NvHostGpuSubmitResources<'_>,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+        input: &[u8],
+        additional_input: &[u8],
+    ) -> Result<(Vec<u8>, GpuSubmission), NvDrvCallError> {
+        let channel = self
+            .channels
+            .get_mut(&descriptor.fd())
+            .ok_or_else(|| unsupported_state(descriptor, request))?;
+        let submit = if request == IOCTL_CHANNEL_SUBMIT_GPFIFO2 {
+            require_input_size(input, CHANNEL_SUBMIT_GPFIFO_HEADER_SIZE)?;
+            NvHostGpuSubmit {
+                header: decode_submit_header(input)?,
+                entries: additional_input,
+                response: input,
+            }
+        } else if is_legacy_submit_gpfifo(request) {
+            if !additional_input.is_empty() {
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+            }
+            let (header, entries) = decode_legacy_submit_gpfifo(request, input)?;
+            NvHostGpuSubmit {
+                header,
+                entries,
+                response: input,
+            }
+        } else {
+            return Err(unsupported_state(descriptor, request));
+        };
+        submit_gpfifo(
+            channel,
+            NvHostGpuSubmissionState {
+                scheduler: &mut self.scheduler,
+                next_frontend_submission: &mut self.next_frontend_submission,
+            },
+            resources,
+            descriptor,
+            request,
+            submit,
+        )
+    }
+
     pub(super) fn query_event(
         &self,
         descriptor: NvDrvDeviceDescriptor,
@@ -388,6 +404,10 @@ impl NvHostGpu {
 
 fn is_legacy_submit_gpfifo(request: u32) -> bool {
     request & IOCTL_DIRECTION_TYPE_NUMBER_MASK == IOCTL_CHANNEL_SUBMIT_GPFIFO_FAMILY
+}
+
+pub(super) fn is_submit_gpfifo(request: u32) -> bool {
+    request == IOCTL_CHANNEL_SUBMIT_GPFIFO2 || is_legacy_submit_gpfifo(request)
 }
 
 fn decode_submit_header(input: &[u8]) -> Result<MaxwellGpfifoSubmitRequest, NvDrvCallError> {
@@ -433,15 +453,14 @@ fn decode_legacy_submit_gpfifo(
 fn submit_gpfifo(
     channel: &mut MaxwellGpuChannel,
     state: NvHostGpuSubmissionState<'_>,
-    mut resources: NvHostGpuIoctlResources<'_>,
+    resources: NvHostGpuSubmitResources<'_>,
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     submit: NvHostGpuSubmit<'_>,
-) -> Result<Vec<u8>, NvDrvCallError> {
+) -> Result<(Vec<u8>, GpuSubmission), NvDrvCallError> {
     let NvHostGpuSubmissionState {
         scheduler,
         next_frontend_submission,
-        lowering_cache,
     } = state;
     let allocated_entries = channel
         .frontend()
@@ -476,9 +495,8 @@ fn submit_gpfifo(
         .address_space()
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let address_space = resources
-        .address_spaces
-        .values()
-        .find(|address_space| address_space.id() == address_space_id)
+        .address_space
+        .filter(|address_space| address_space.id() == address_space_id)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let frontend = FrontendSubmissionId::new(*next_frontend_submission);
     let following_frontend_submission = next_frontend_submission
@@ -500,6 +518,8 @@ fn submit_gpfifo(
     let dependency_reached = match dependency {
         Some(point) => resources
             .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .submission_dependency_reached(descriptor, point)?,
         None => true,
     };
@@ -518,12 +538,18 @@ fn submit_gpfifo(
         // after them. The increment is reserved here but cannot be published
         // until backend work and memory visibility have completed:
         // https://android.googlesource.com/kernel/tegra.git/+/76359c267702c0815c82c970f38f5b27031d5ba6/drivers/gpu/nvgpu/gk20a/channel_gk20a.c#1496
-        Some(resources.control.reserve_channel_submission(
-            descriptor,
-            request,
-            syncpoint,
-            completion_increments,
-        )?)
+        Some(
+            resources
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reserve_channel_submission(
+                    descriptor,
+                    request,
+                    syncpoint,
+                    completion_increments,
+                )?,
+        )
     } else {
         None
     };
@@ -536,9 +562,8 @@ fn submit_gpfifo(
         .next_address_space()
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let dispatch_address_space = resources
-        .address_spaces
-        .values()
-        .find(|address_space| address_space.id() == next_address_space)
+        .address_space
+        .filter(|address_space| address_space.id() == next_address_space)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let dispatch = scheduler
         .dispatch_next(dependency_reached, dispatch_address_space)
@@ -558,131 +583,47 @@ fn submit_gpfifo(
         };
         return Err(unsupported_frontend_boundary(descriptor, request, boundary));
     }
-    let plan = match preflight_maxwell_submission_execution(
-        replay.packets(),
-        dispatch_address_space,
-        dispatch.scheduled().frontend(),
-        Vec::new(),
-        dispatch.scheduled().completion(),
-        lowering_cache,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-                dispatch: Box::new(dispatch),
-                capture: Box::new(capture),
-                replay: Box::new(replay),
-                execution_failure: Some(Box::new(error)),
-            };
-            return Err(unsupported_frontend_boundary(descriptor, request, boundary));
-        }
-    };
-
+    let frontend = dispatch.scheduled().frontend();
+    let expected_completion = dispatch
+        .scheduled()
+        .completion()
+        .map(ReservedTimelinePoint::point);
     let reservation = dispatch.scheduled().completion().cloned();
-    let mut executed_cache = None;
-    let mut executed_completion = None;
-    if plan.requires_backend()
-        && let Some(backend) = resources.backend.as_deref_mut()
-    {
-        let backend_error = match reservation.as_ref() {
-            Some(reservation) => resources
-                .control
-                .complete_immediate_channel_submission(descriptor, request, reservation, || {
-                    let executed =
-                        execute_maxwell_backend_submission(plan, dispatch_address_space, backend)?;
-                    let (cache, completion, _) = executed.into_parts();
-                    executed_cache = Some(cache);
-                    executed_completion = completion;
-                    Ok(())
-                })?
-                .err(),
-            None => match execute_maxwell_backend_submission(plan, dispatch_address_space, backend)
-            {
-                Ok(executed) => {
-                    let (cache, completion, _) = executed.into_parts();
-                    executed_cache = Some(cache);
-                    executed_completion = completion;
-                    None
-                }
-                Err(error) => Some(error),
-            },
-        };
-        if let Some(error) = backend_error {
-            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-                dispatch: Box::new(dispatch),
-                capture: Box::new(capture),
-                replay: Box::new(replay),
-                execution_failure: None,
-            };
-            return Err(NvDrvCallError::Unsupported(
-                UnsupportedNvDrvOperation::ScheduledGpfifoBackendExecution {
-                    context: NvDrvErrorContext::new(
-                        descriptor.kind(),
-                        request,
-                        descriptor.fd(),
-                        None,
-                        NvDrvValidationReason::NeutralBackendExecutionFailed,
-                    ),
-                    boundary: Box::new(boundary),
-                    error: Box::new(error),
-                },
-            ));
-        }
-    } else {
-        let software_error = match reservation.as_ref() {
-            Some(reservation) => resources
-                .control
-                .complete_immediate_channel_submission(descriptor, request, reservation, || {
-                    let executed =
-                        execute_maxwell_software_initialization(plan, dispatch_address_space)
-                            .map_err(Box::new)?;
-                    let (cache, completion) = executed.into_parts();
-                    executed_cache = Some(cache);
-                    executed_completion = completion;
-                    Ok(())
-                })?
-                .err(),
-            None => match execute_maxwell_software_initialization(plan, dispatch_address_space) {
-                Ok(executed) => {
-                    let (cache, completion) = executed.into_parts();
-                    executed_cache = Some(cache);
-                    executed_completion = completion;
-                    None
-                }
-                Err(error) => Some(Box::new(error)),
-            },
-        };
-        if let Some(error) = software_error {
-            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-                dispatch: Box::new(dispatch),
-                capture: Box::new(capture),
-                replay: Box::new(replay),
-                execution_failure: None,
-            };
-            return Err(NvDrvCallError::Unsupported(
-                UnsupportedNvDrvOperation::ScheduledGpfifoExecution {
-                    context: NvDrvErrorContext::new(
-                        descriptor.kind(),
-                        request,
-                        descriptor.fd(),
-                        None,
-                        NvDrvValidationReason::MaxwellPacketSemanticsUnavailable,
-                    ),
-                    boundary: Box::new(boundary),
-                    error,
-                },
-            ));
-        }
-    }
+    let submission = GpuSubmission::new(
+        descriptor,
+        request,
+        frontend,
+        replay.packets().to_vec().into_boxed_slice(),
+        dispatch_address_space.clone(),
+        reservation.clone(),
+        Arc::clone(resources.control),
+    );
 
-    *lowering_cache = executed_cache.expect("successful execution records its cache");
     let mut output = submit.response.to_vec();
     if let Some(reservation) = reservation {
-        debug_assert_eq!(executed_completion, Some(reservation.point()));
+        debug_assert_eq!(expected_completion, Some(reservation.point()));
         write_u32(&mut output, 16, reservation.point().syncpoint().get())?;
         write_u32(&mut output, 20, reservation.point().value().get())?;
     }
-    Ok(output)
+    Ok((output, submission))
+}
+
+pub(super) fn queued_execution_error(
+    descriptor: NvDrvDeviceDescriptor,
+    request: u32,
+    error: GpuExecutorFailure,
+) -> UnsupportedNvDrvOperation {
+    UnsupportedNvDrvOperation::GpuExecution {
+        context: NvDrvErrorContext::new(
+            descriptor.kind(),
+            request,
+            descriptor.fd(),
+            None,
+            error.reason(),
+        ),
+        frontend: error.frontend(),
+        detail: error.to_string().into(),
+    }
 }
 
 fn unsupported_frontend_boundary(
@@ -778,7 +719,7 @@ fn channel_driver_result(
     })
 }
 
-fn unsupported_state(descriptor: NvDrvDeviceDescriptor, request: u32) -> NvDrvCallError {
+pub(super) fn unsupported_state(descriptor: NvDrvDeviceDescriptor, request: u32) -> NvDrvCallError {
     NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
         context: NvDrvErrorContext::new(
             descriptor.kind(),

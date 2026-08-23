@@ -465,8 +465,8 @@ impl GuestTimeline {
     /// Advances through the oldest complete reservation.
     ///
     /// This method only enforces neutral timeline ordering and ownership. The
-    /// completion coordinator added by later blocks is responsible for calling
-    /// it only after host completion and required visibility transitions.
+    /// GPU completion owner calls it only after host completion and required
+    /// visibility transitions.
     pub fn advance(
         &mut self,
         owner: TimelineOwnerId,

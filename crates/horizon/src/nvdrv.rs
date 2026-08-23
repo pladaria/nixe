@@ -13,6 +13,7 @@ use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress}
 
 mod device;
 mod diagnostics;
+mod gpu_executor;
 mod ioctl;
 mod nvhost_as_gpu;
 mod nvhost_ctrl;
@@ -28,11 +29,12 @@ pub use device::{
 };
 use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
+use gpu_executor::NvDrvGpuExecutor;
 use ioctl::NvDrvIoctlResponse;
 pub(crate) use ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
-use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources};
+use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources, NvHostGpuSubmitResources};
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageView,
     NvMapImageViewMetadata, NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
@@ -70,24 +72,23 @@ struct NvDrvClientState {
     next_fd: u32,
     devices: BTreeMap<NvDrvFileDescriptor, NvDrvDeviceDescriptor>,
     next_gpu_address_space_id: u64,
-    gpu_address_spaces: BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>,
+    gpu_address_spaces: Arc<Mutex<BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>>>,
     next_gpu_channel_id: u64,
-    nvhost_gpu: NvHostGpu,
-    nvhost_control: NvHostControl,
+    nvhost_gpu: Arc<Mutex<NvHostGpu>>,
+    nvhost_control: Arc<Mutex<NvHostControl>>,
     nvmap: NvMapObjects,
     gpu_profile: MaxwellGpuProfile,
-    gpu_backend: Option<NvDrvGpuBackend>,
+    gpu_backend: Option<Arc<NvDrvGpuExecutor>>,
 }
 
-struct NvDrvGpuBackend(Box<dyn NeutralBackendRuntime>);
-
-impl std::fmt::Debug for NvDrvGpuBackend {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NvDrvGpuBackend")
-            .field("capabilities", self.0.capabilities())
-            .finish_non_exhaustive()
-    }
+enum LockedIoctlOutcome {
+    Standard(NvHostCtrlIoctlOutcome),
+    DeferredGpuIoctl {
+        gpu: Arc<Mutex<NvHostGpu>>,
+        control: Arc<Mutex<NvHostControl>>,
+        address_spaces: Arc<Mutex<BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>>>,
+        backend: Arc<NvDrvGpuExecutor>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -123,15 +124,15 @@ impl Default for NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_backend(None)
+        Self::new_with_executor(NvDrvGpuExecutor::new(None))
     }
 
     #[must_use]
     pub fn with_gpu_backend(backend: Box<dyn NeutralBackendRuntime>) -> Self {
-        Self::new_with_backend(Some(NvDrvGpuBackend(backend)))
+        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend)))
     }
 
-    fn new_with_backend(gpu_backend: Option<NvDrvGpuBackend>) -> Self {
+    fn new_with_executor(gpu_executor: NvDrvGpuExecutor) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
@@ -142,13 +143,13 @@ impl NvDrvSession {
                 next_fd: 1,
                 devices: BTreeMap::new(),
                 next_gpu_address_space_id: 1,
-                gpu_address_spaces: BTreeMap::new(),
+                gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
-                nvhost_gpu: NvHostGpu::default(),
-                nvhost_control: NvHostControl::default(),
+                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::default())),
+                nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
-                gpu_backend,
+                gpu_backend: Some(Arc::new(gpu_executor)),
             })),
         }
     }
@@ -238,13 +239,21 @@ impl NvDrvSession {
         state.next_fd = next_fd;
         state.devices.insert(fd, descriptor);
         if kind == NvDrvDeviceKind::HostControl {
-            state.nvhost_control.open(fd);
+            state
+                .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .open(fd);
         }
         if let Some(next_gpu_address_space_id) = next_gpu_address_space_id {
             let address_space_id = MaxwellAddressSpaceId::new(state.next_gpu_address_space_id);
             state.next_gpu_address_space_id = next_gpu_address_space_id;
             let address_space = MaxwellGpuAddressSpace::new(address_space_id, state.gpu_profile);
-            state.gpu_address_spaces.insert(fd, address_space);
+            state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(fd, address_space);
         }
         if let Some(next_gpu_channel_id) = next_gpu_channel_id {
             let channel = MaxwellGpuChannel::new(
@@ -253,7 +262,11 @@ impl NvDrvSession {
                 state.gpu_profile,
             );
             state.next_gpu_channel_id = next_gpu_channel_id;
-            state.nvhost_gpu.open(fd, channel);
+            state
+                .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .open(fd, channel);
         }
         Ok(fd)
     }
@@ -264,13 +277,35 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.devices.remove(&fd).is_some() {
-            if let Some(address_space) = state.gpu_address_spaces.remove(&fd) {
-                state.nvhost_gpu.unbind_address_space(address_space.id());
+            let removed_address_space = state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&fd);
+            if let Some(address_space) = removed_address_space {
+                state
+                    .nvhost_gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unbind_address_space(address_space.id());
             }
-            if let Some(syncpoint) = state.nvhost_gpu.close(fd) {
-                state.nvhost_control.release_channel_syncpoint(syncpoint);
+            if let Some(syncpoint) = state
+                .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close(fd)
+            {
+                state
+                    .nvhost_control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .release_channel_syncpoint(syncpoint);
             }
-            state.nvhost_control.close(fd);
+            state
+                .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .close(fd);
             NV_SUCCESS
         } else {
             NV_BAD_PARAMETER
@@ -377,7 +412,17 @@ impl NvDrvSession {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = match state.devices.get(&fd).copied() {
+        let descriptor = state.devices.get(&fd).copied();
+        let backend_failure = state
+            .gpu_backend
+            .as_ref()
+            .and_then(|backend| backend.require_healthy().err());
+        if let (Some(descriptor), Some(error)) = (descriptor, backend_failure) {
+            return Err(nvhost_gpu::queued_execution_error(
+                descriptor, request, error,
+            ));
+        }
+        let result = match descriptor {
             Some(descriptor)
                 if canonical_memory.is_some_and(|(process_id, _, _)| {
                     descriptor.owner().process_id() != process_id
@@ -392,9 +437,13 @@ impl NvDrvSession {
                 input,
                 canonical_memory.map(|(_, address_space, translator)| (address_space, translator)),
             )
-            .map(NvHostCtrlIoctlOutcome::Complete),
-            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControl => {
-                state.nvhost_control.ioctl_for_waiter(
+            .map(NvHostCtrlIoctlOutcome::Complete)
+            .map(LockedIoctlOutcome::Standard),
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControl => state
+                .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ioctl_for_waiter(
                     descriptor,
                     request,
                     input,
@@ -403,37 +452,39 @@ impl NvDrvSession {
                         thread_id,
                     ),
                 )
-            }
+                .map(LockedIoctlOutcome::Standard),
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
                 ioctl_nvhost_ctrl_gpu(state.gpu_profile, descriptor, request, input)
                     .map(NvHostCtrlIoctlOutcome::Complete)
+                    .map(LockedIoctlOutcome::Standard)
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
-                let NvDrvClientState {
-                    nvhost_gpu,
-                    nvhost_control,
-                    devices,
-                    gpu_address_spaces,
-                    gpu_backend,
-                    ..
-                } = &mut *state;
-                nvhost_gpu
-                    .ioctl(
-                        NvHostGpuIoctlResources {
-                            control: nvhost_control,
-                            devices,
-                            address_spaces: gpu_address_spaces,
-                            backend: match gpu_backend.as_mut() {
-                                Some(backend) => Some(backend.0.as_mut()),
-                                None => None,
+                match state.gpu_backend.as_ref().cloned() {
+                    Some(gpu_backend) if nvhost_gpu::is_submit_gpfifo(request) => {
+                        Ok(LockedIoctlOutcome::DeferredGpuIoctl {
+                            gpu: Arc::clone(&state.nvhost_gpu),
+                            control: Arc::clone(&state.nvhost_control),
+                            address_spaces: Arc::clone(&state.gpu_address_spaces),
+                            backend: gpu_backend,
+                        })
+                    }
+                    Some(_) => state
+                        .nvhost_gpu
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .ioctl(
+                            NvHostGpuIoctlResources {
+                                control: &state.nvhost_control,
+                                devices: &state.devices,
                             },
-                        },
-                        descriptor,
-                        request,
-                        input,
-                        additional_input,
-                    )
-                    .map(NvHostCtrlIoctlOutcome::Complete)
+                            descriptor,
+                            request,
+                            input,
+                        )
+                        .map(NvHostCtrlIoctlOutcome::Complete)
+                        .map(LockedIoctlOutcome::Standard),
+                    None => Err(nvhost_gpu::unsupported_state(descriptor, request)),
+                }
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostAddressSpaceGpu => {
                 if request == nvhost_as_gpu::IOCTL_AS_GPU_BIND_CHANNEL {
@@ -448,6 +499,8 @@ impl NvDrvSession {
                         }
                         let address_space = state
                             .gpu_address_spaces
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .get(&fd)
                             .map(MaxwellGpuAddressSpace::id)
                             .ok_or_else(|| {
@@ -463,6 +516,8 @@ impl NvDrvSession {
                             })?;
                         let Some(binding) = state
                             .nvhost_gpu
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .bind_address_space(channel_fd, address_space)
                         else {
                             return Err(NvDrvCallError::Unsupported(
@@ -480,14 +535,15 @@ impl NvDrvSession {
                         binding.map_err(|_| NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
                         Ok(Vec::from(input))
                     })();
-                    bind_result.map(NvHostCtrlIoctlOutcome::Complete)
+                    bind_result
+                        .map(NvHostCtrlIoctlOutcome::Complete)
+                        .map(LockedIoctlOutcome::Standard)
                 } else {
-                    let NvDrvClientState {
-                        gpu_address_spaces,
-                        nvmap,
-                        ..
-                    } = &mut *state;
-                    let Some(address_space) = gpu_address_spaces.get_mut(&fd) else {
+                    let address_spaces = Arc::clone(&state.gpu_address_spaces);
+                    let mut address_spaces = address_spaces
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let Some(address_space) = address_spaces.get_mut(&fd) else {
                         return Err(UnsupportedNvDrvOperation::Ioctl {
                             context: NvDrvErrorContext::new(
                                 descriptor.kind(),
@@ -498,8 +554,9 @@ impl NvDrvSession {
                             ),
                         });
                     };
-                    ioctl_nvhost_as_gpu(address_space, nvmap, descriptor, request, input)
+                    ioctl_nvhost_as_gpu(address_space, &state.nvmap, descriptor, request, input)
                         .map(NvHostCtrlIoctlOutcome::Complete)
+                        .map(LockedIoctlOutcome::Standard)
                 }
             }
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
@@ -515,21 +572,73 @@ impl NvDrvSession {
             )),
             None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
         };
+        drop(state);
         match result {
-            Ok(NvHostCtrlIoctlOutcome::Complete(output)) => {
+            Ok(LockedIoctlOutcome::DeferredGpuIoctl {
+                gpu,
+                control,
+                address_spaces,
+                backend,
+            }) => {
+                let descriptor = descriptor.expect("deferred GPU ioctl has a descriptor");
+                let address_space_id = gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .bound_address_space(descriptor.fd());
+                let address_space = address_space_id.and_then(|id| {
+                    address_spaces
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .values()
+                        .find(|address_space| address_space.id() == id)
+                        .cloned()
+                });
+                let result = gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .submit_ioctl(
+                        NvHostGpuSubmitResources {
+                            control: &control,
+                            address_space: address_space.as_ref(),
+                        },
+                        descriptor,
+                        request,
+                        input,
+                        additional_input,
+                    );
+                let result = match result {
+                    Ok(result) => result,
+                    Err(NvDrvCallError::GuestResult(error)) => {
+                        return Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                            output: input.to_vec(),
+                            driver_result: error,
+                        }));
+                    }
+                    Err(NvDrvCallError::Unsupported(operation)) => return Err(operation),
+                };
+                let (output, submission) = result;
+                backend.enqueue(submission).map_err(|error| {
+                    nvhost_gpu::queued_execution_error(descriptor, request, error)
+                })?;
                 Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
                     output,
                     driver_result: NV_SUCCESS,
                 }))
             }
-            Ok(NvHostCtrlIoctlOutcome::DriverResult {
+            Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::Complete(output))) => {
+                Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+                    output,
+                    driver_result: NV_SUCCESS,
+                }))
+            }
+            Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::DriverResult {
                 output,
                 driver_result,
-            }) => Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
+            })) => Ok(NvDrvIoctlOutcome::Complete(NvDrvIoctlResponse {
                 output,
                 driver_result,
             })),
-            Ok(NvHostCtrlIoctlOutcome::Pending(wait)) => {
+            Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::Pending(wait))) => {
                 Ok(NvDrvIoctlOutcome::PendingSyncpointWait(wait))
             }
             Err(NvDrvCallError::GuestResult(error)) => {
@@ -552,17 +661,30 @@ impl NvDrvSession {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = match state.devices.get(&fd).copied() {
+        let descriptor = state.devices.get(&fd).copied();
+        let backend_failure = state
+            .gpu_backend
+            .as_ref()
+            .and_then(|backend| backend.require_healthy().err());
+        if let (Some(descriptor), Some(error)) = (descriptor, backend_failure) {
+            return Err(nvhost_gpu::queued_execution_error(descriptor, 0, error));
+        }
+        let result = match descriptor {
             Some(descriptor) if descriptor.owner().process_id() != process_id => {
                 Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
             }
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControl => state
                 .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .query_event(descriptor, event_id)
                 .map(Some),
-            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
-                state.nvhost_gpu.query_event(descriptor, event_id).map(Some)
-            }
+            Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => state
+                .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_event(descriptor, event_id)
+                .map(Some),
             Some(descriptor) => Err(NvDrvCallError::Unsupported(
                 UnsupportedNvDrvOperation::QueryEvent {
                     device: descriptor.kind(),
@@ -605,6 +727,8 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvhost_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .point_reached(point)
     }
 
@@ -614,6 +738,8 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvhost_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .install_test_timeline(id);
     }
 
@@ -623,32 +749,55 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvhost_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .advance_test_timeline(id);
     }
 
     pub(crate) fn teardown(&self) -> NvDrvTeardownReport {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let report = NvDrvTeardownReport {
-            device_fds_released: state.devices.len(),
-            allocations_released: state.nvmap.clear(),
+        let (report, channel_syncpoints, backend) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let report = NvDrvTeardownReport {
+                device_fds_released: state.devices.len(),
+                allocations_released: state.nvmap.clear(),
+            };
+            state.devices.clear();
+            state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let channel_syncpoints = state
+                .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            state.initialized = false;
+            state.client_identity = None;
+            (report, channel_syncpoints, state.gpu_backend.take())
         };
-        state.devices.clear();
-        state.gpu_address_spaces.clear();
-        let channel_syncpoints = state.nvhost_gpu.clear();
-        for syncpoint in channel_syncpoints {
-            state.nvhost_control.release_channel_syncpoint(syncpoint);
-        }
-        state.nvhost_control.clear();
-        if let Some(mut backend) = state.gpu_backend.take()
-            && let Err(error) = backend.0.teardown()
+
+        if let Some(backend) = backend
+            && let Err(error) = backend.teardown()
         {
             log::warn!("neutral GPU backend teardown failed: {error}");
         }
-        state.initialized = false;
-        state.client_identity = None;
+
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut control = state
+            .nvhost_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for syncpoint in channel_syncpoints {
+            control.release_channel_syncpoint(syncpoint);
+        }
+        control.clear();
         report
     }
 }
@@ -2114,11 +2263,15 @@ mod tests {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(0, &[0x78, 0x56, 0x34, 0x12]).unwrap();
         let mapping = {
-            let mut state = session
+            let state = session
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let address_space = state.gpu_address_spaces.get_mut(&as_fd).unwrap();
+            let mut address_spaces = state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let address_space = address_spaces.get_mut(&as_fd).unwrap();
             address_space
                 .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
                 .unwrap();
@@ -2245,6 +2398,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvhost_gpu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending_submission_count();
         assert_eq!(
             session
@@ -2285,6 +2440,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending_submission_count(),
             pending_before_malformed
         );
@@ -2325,12 +2482,14 @@ mod tests {
 
         drop(allocation);
         {
-            let mut state = session
+            let state = session
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get_mut(&as_fd)
                 .unwrap()
                 .unmap(mapping.offset())
@@ -2448,11 +2607,15 @@ mod tests {
         let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
         allocation.write(0, &[0x12, 0x34, 0x56, 0x78]).unwrap();
         let mapping = {
-            let mut state = session
+            let state = session
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let address_space = state.gpu_address_spaces.get_mut(&as_fd).unwrap();
+            let mut address_spaces = state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let address_space = address_spaces.get_mut(&as_fd).unwrap();
             address_space
                 .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
                 .unwrap();
@@ -2500,8 +2663,21 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(state.nvhost_gpu.pending_submission_count(), 1);
-            assert!(state.nvhost_control.has_timeline(syncpoint));
+            assert_eq!(
+                state
+                    .nvhost_gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_submission_count(),
+                1
+            );
+            assert!(
+                state
+                    .nvhost_control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .has_timeline(syncpoint)
+            );
         }
         let mut read = [0_u8; 8];
         read[..4].copy_from_slice(&syncpoint.get().to_le_bytes());
@@ -2515,8 +2691,21 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(state.nvhost_gpu.pending_submission_count(), 0);
-            assert!(state.nvhost_control.has_timeline(syncpoint));
+            assert_eq!(
+                state
+                    .nvhost_gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_submission_count(),
+                0
+            );
+            assert!(
+                state
+                    .nvhost_control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .has_timeline(syncpoint)
+            );
         }
 
         // Recreate pending work and exercise process-wide teardown separately
@@ -2545,6 +2734,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending_submission_count(),
             1
         );
@@ -2560,9 +2751,28 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(state.nvhost_gpu.pending_submission_count(), 0);
-        assert!(!state.nvhost_control.has_timeline(syncpoint));
-        assert!(state.gpu_address_spaces.is_empty());
+        assert_eq!(
+            state
+                .nvhost_gpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_submission_count(),
+            0
+        );
+        assert!(
+            !state
+                .nvhost_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .has_timeline(syncpoint)
+        );
+        assert!(
+            state
+                .gpu_address_spaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]

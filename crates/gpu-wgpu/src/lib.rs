@@ -9,12 +9,12 @@ mod visibility;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-pub use driver::WgpuBackendDriver;
-pub use visibility::WgpuVisibilityCoordinator;
+use driver::WgpuBackendDriver;
+use visibility::WgpuVisibilityCoordinator;
 
 use nixe_gpu::{
-    Backend, BackendCapabilities, BackendFeatures, BackendInstanceId, BackendLimits, ImageFormat,
-    NeutralBackendRuntime, QueryKind, SampleCount, ShaderStage, SynchronousBackendRuntime,
+    Backend, BackendCapabilities, BackendFeatures, BackendInstanceId, BackendLimits,
+    BackendRuntime, ImageFormat, NeutralBackendRuntime, QueryKind, SampleCount, ShaderStage,
 };
 use nixe_memory::NonCpuDeviceId;
 use wgpu::{
@@ -102,8 +102,7 @@ pub struct WgpuAdapterInformation {
 
 /// Result of accelerated backend initialization.
 pub struct InitializedWgpuBackend {
-    pub backend: Backend<WgpuBackendDriver>,
-    pub visibility: Arc<WgpuVisibilityCoordinator>,
+    runtime: Box<dyn NeutralBackendRuntime>,
     pub adapter: WgpuAdapterInformation,
 }
 
@@ -113,13 +112,7 @@ impl InitializedWgpuBackend {
     /// contracts.
     #[must_use]
     pub fn into_runtime(self) -> Box<dyn NeutralBackendRuntime> {
-        let device = self.visibility.device();
-        let visibility: Arc<dyn nixe_memory::VisibilityCoordinator> = self.visibility;
-        Box::new(SynchronousBackendRuntime::new(
-            self.backend,
-            device,
-            visibility,
-        ))
+        self.runtime
     }
 }
 
@@ -178,9 +171,10 @@ async fn initialize_backend_async(
     let capabilities = capabilities(&adapter, &required_limits, required_features);
     let visibility = Arc::new(WgpuVisibilityCoordinator::new(device_id));
     let driver = WgpuBackendDriver::new(device, queue, Arc::clone(&visibility));
+    let backend = Backend::new(instance_id, capabilities, driver);
+    let visibility: Arc<dyn nixe_memory::VisibilityCoordinator> = visibility;
     Ok(InitializedWgpuBackend {
-        backend: Backend::new(instance_id, capabilities, driver),
-        visibility,
+        runtime: Box::new(BackendRuntime::new(backend, device_id, visibility)),
         adapter: WgpuAdapterInformation {
             name: info.name.into(),
             driver: info.driver.into(),

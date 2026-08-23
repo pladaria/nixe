@@ -174,10 +174,9 @@ pub use engines::{
     resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use execution::{
-    MaxwellBackendExecutionCompletion, MaxwellBackendExecutionError,
-    MaxwellSoftwareInitializationCompletion, MaxwellSoftwareInitializationError,
-    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
-    MaxwellSubmissionExecutionStep, execute_maxwell_backend_submission,
+    MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellBackendSegment,
+    MaxwellSoftwareInitializationError, MaxwellSubmissionExecutionError,
+    MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionStep,
     execute_maxwell_software_initialization, preflight_maxwell_submission_execution,
 };
 pub use gpfifo::{

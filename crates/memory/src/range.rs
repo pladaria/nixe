@@ -136,6 +136,14 @@ impl CanonicalBackingSegment {
         self.content_generation
     }
 
+    /// Returns the currently published content generation of the retained
+    /// canonical page. Resource owners use this to advance their upload
+    /// watermark without rebuilding a versioned mapping snapshot.
+    #[must_use]
+    pub fn current_content_generation(&self) -> ContentGeneration {
+        self.backing.content_generation()
+    }
+
     /// Returns the store CPU-write epoch captured before generation validation.
     #[must_use]
     pub const fn captured_cpu_write_epoch(&self) -> CpuWriteEpoch {
@@ -563,12 +571,52 @@ impl CanonicalBackingRange {
         Ok(())
     }
 
-    /// Publishes newer device contents after the declaration's write point.
+    /// Establishes device visibility only where canonical CPU bytes are newer.
     ///
-    /// Callers must invoke this only after the host operations which make that
-    /// point true. It records logical ownership; it does not signal a guest
-    /// fence or claim host queue completion.
-    pub fn complete_device_write(
+    /// A resident resource already owns a device representation for clean
+    /// pages. Avoiding another whole-page handoff for those pages keeps the
+    /// steady-state path proportional to actual CPU writes. Newly created
+    /// resources remain responsible for their initial upload.
+    pub fn prepare_resident_device_access(
+        &self,
+        declaration: DeviceAccessDeclaration,
+        coordinator: Arc<dyn VisibilityCoordinator>,
+    ) -> Result<(), VisibilityError> {
+        let mut visited = BTreeSet::new();
+        for segment in self.segments.iter() {
+            if !visited.insert(segment.page()) {
+                continue;
+            }
+            match segment.backing.visibility_state() {
+                VisibilityState::Clean if !declaration.kind().writes() => {}
+                VisibilityState::Clean => segment
+                    .backing
+                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
+                VisibilityState::CpuNewer if !declaration.kind().writes() => {
+                    segment.backing.prepare_resident_device_read(declaration)?
+                }
+                VisibilityState::CpuNewer => segment
+                    .backing
+                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
+                VisibilityState::GpuNewer { device, visible_at }
+                    if device == declaration.device()
+                        && visible_at <= declaration.device_visible_at() => {}
+                VisibilityState::GpuNewer { .. }
+                | VisibilityState::Conflicting
+                | VisibilityState::Invalid => segment
+                    .backing
+                    .prepare_device_access(declaration, Arc::clone(&coordinator))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes device ownership with its required completion point.
+    ///
+    /// The point may still be in flight. CPU consumers route through the
+    /// visibility coordinator, which waits for that point before materializing
+    /// bytes. This does not signal a guest fence or claim host completion.
+    pub fn publish_device_write(
         &self,
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
@@ -581,7 +629,7 @@ impl CanonicalBackingRange {
             if visited.insert(segment.page()) {
                 segment
                     .backing
-                    .complete_device_write(declaration, Arc::clone(&coordinator))?;
+                    .publish_device_write(declaration, Arc::clone(&coordinator))?;
             }
         }
         Ok(())

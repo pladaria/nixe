@@ -513,7 +513,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         .prepare_device_access(declaration, Arc::clone(&coordinator))
         .unwrap();
     backing
-        .complete_device_write(declaration, Arc::clone(&coordinator))
+        .publish_device_write(declaration, Arc::clone(&coordinator))
         .unwrap();
     // Presentation may materialize only the pages it reads. The remaining
     // pages retain GPU authority and the original content generation.

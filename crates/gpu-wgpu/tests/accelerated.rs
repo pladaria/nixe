@@ -1,26 +1,67 @@
-use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use nixe_gpu::{
-    AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo, BackingView,
-    BufferDescription, BufferId, BufferRange, BufferRegion, BufferView, CapabilityRequirements,
-    ClearOperation, ClearValue, CopyOperation, DrawArguments, DrawOperation, FrontendSubmissionId,
-    GpuAllocationDescription, GpuAllocationId, GpuCommand, GpuOperation, ImageDescription,
-    ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind, ImageMemoryLayout,
-    ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription, PipelineId,
-    PipelineKind, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
-    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceDependency, SampleCount,
-    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
-    ShaderIoLocation, ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
-    ShaderSourceLocation, ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
+    AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,
+    BackendVisibilityRequester, BackingView, BufferDescription, BufferId, BufferRange,
+    BufferRegion, BufferView, CapabilityRequirements, ClearOperation, ClearValue, CopyOperation,
+    DrawArguments, DrawOperation, FrontendSubmissionId, GpuAllocationDescription, GpuAllocationId,
+    GpuCommand, GpuOperation, ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId,
+    ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView, NeutralBackendRuntime,
+    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PrimitiveTopology,
+    RenderAttachment, RenderPassAttachmentDescription, RenderPassDescription, RenderPassId,
+    RenderPassOperation, ResourceDependency, SampleCount, ShaderDescription, ShaderId,
+    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
+    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
+    ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
 };
-use nixe_gpu_wgpu::{WgpuBackendConfiguration, WgpuVisibilityCoordinator, initialize_backend};
+use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_memory::{
     CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
-    ContentGeneration, DeviceAccessDeclaration, DeviceVisibilityPoint, GuestPhysicalPageId,
-    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator,
+    ContentGeneration, CpuVisibilityRequest, DeviceVisibilityPoint, GuestPhysicalPageId,
+    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinatorError,
 };
+
+struct RuntimeOwner {
+    runtime: Mutex<Box<dyn NeutralBackendRuntime>>,
+}
+
+struct RuntimeRequester(Weak<RuntimeOwner>);
+
+impl BackendVisibilityRequester for RuntimeRequester {
+    fn make_cpu_visible(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        self.0
+            .upgrade()
+            .ok_or_else(|| VisibilityCoordinatorError::new("test runtime owner stopped"))?
+            .runtime()
+            .make_cpu_visible(request)
+            .map_err(|error| VisibilityCoordinatorError::new(error.to_string()))
+    }
+}
+
+impl RuntimeOwner {
+    fn new(runtime: Box<dyn NeutralBackendRuntime>) -> Arc<Self> {
+        let owner = Arc::new(Self {
+            runtime: Mutex::new(runtime),
+        });
+        let requester: Arc<dyn BackendVisibilityRequester> =
+            Arc::new(RuntimeRequester(Arc::downgrade(&owner)));
+        owner
+            .runtime()
+            .bind_visibility_requester(requester)
+            .unwrap();
+        owner
+    }
+
+    fn runtime(&self) -> MutexGuard<'_, Box<dyn NeutralBackendRuntime>> {
+        self.runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 fn initialized_page(bytes: &[u8]) -> CanonicalBackingPage {
     let store = CanonicalBackingStore::allocate().unwrap();
@@ -64,41 +105,11 @@ fn backing(
     .unwrap()
 }
 
-fn prepare_write(
-    backing: &BackingView,
-    visibility: &Arc<WgpuVisibilityCoordinator>,
-    point: u64,
-) -> DeviceAccessDeclaration {
-    let declaration = DeviceAccessDeclaration::write(
-        visibility.device(),
-        DeviceVisibilityPoint::new(point),
-        DeviceVisibilityPoint::new(point),
-    )
-    .unwrap();
-    let coordinator: Arc<dyn VisibilityCoordinator> = visibility.clone();
-    backing
-        .range()
-        .prepare_device_access(declaration, coordinator)
-        .unwrap();
-    declaration
-}
-
-fn prepare_read(backing: &BackingView, visibility: &Arc<WgpuVisibilityCoordinator>, point: u64) {
-    let coordinator: Arc<dyn VisibilityCoordinator> = visibility.clone();
-    backing
-        .range()
-        .prepare_device_access(
-            DeviceAccessDeclaration::read(visibility.device(), DeviceVisibilityPoint::new(point)),
-            coordinator,
-        )
-        .unwrap();
-}
-
 #[test]
-fn accelerated_buffer_clear_completes_before_canonical_visibility_is_published() {
+fn accelerated_submissions_remain_in_flight_until_cpu_demand() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x11);
-    let Ok(mut initialized) = initialize_backend(
+    let Ok(initialized) = initialize_backend(
         BackendInstanceId::new(0x11),
         device_id,
         WgpuBackendConfiguration::default(),
@@ -106,21 +117,18 @@ fn accelerated_buffer_clear_completes_before_canonical_visibility_is_published()
         eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
     let page = initialized_page(&[0x5a; 64]);
     let allocation = GpuAllocationId::new(1);
     let allocation_description = GpuAllocationDescription::new(64, 4).unwrap();
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Allocation {
-            id: allocation,
-            description: allocation_description,
-        })
-        .unwrap();
     let backing = backing(allocation, allocation_description, &page);
     let buffer = BufferId::new(1);
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Buffer {
+    let creations = vec![
+        BackendResourceCreateInfo::Allocation {
+            id: allocation,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Buffer {
             id: buffer,
             description: BufferDescription::new(64).unwrap(),
             view: Some(
@@ -132,9 +140,8 @@ fn accelerated_buffer_clear_completes_before_canonical_visibility_is_published()
                 )
                 .unwrap(),
             ),
-        })
-        .unwrap();
-    let declaration = prepare_write(&backing, &initialized.visibility, 1);
+        },
+    ];
     let clear = ClearOperation::buffer(
         BufferRegion {
             buffer,
@@ -154,31 +161,55 @@ fn accelerated_buffer_clear_completes_before_canonical_visibility_is_published()
         )],
     )
     .unwrap();
-    let token = initialized.backend.submit(&submission).unwrap();
-    assert_eq!(initialized.backend.has_completed(token), Ok(true));
-    assert_ne!(
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+    assert_eq!(
         page.visibility_state(),
         nixe_memory::VisibilityState::GpuNewer {
             device: device_id,
             visible_at: DeviceVisibilityPoint::new(1),
         }
     );
-    let coordinator: Arc<dyn VisibilityCoordinator> = initialized.visibility.clone();
-    backing
-        .range()
-        .complete_device_write(declaration, coordinator)
-        .unwrap();
+    let second_clear = ClearOperation::buffer(
+        BufferRegion {
+            buffer,
+            range: BufferRange::new(0, 64).unwrap(),
+        },
+        0xaabb_ccdd,
+    )
+    .unwrap();
+    let second = OperationSubmission::new(
+        FrontendSubmissionId::new(2),
+        vec![submission.id()],
+        vec![GpuOperation::new(
+            GpuCommand::Clear(second_clear),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    runtime.runtime().submit(&[], &[], &second).unwrap();
+    assert_eq!(
+        page.visibility_state(),
+        nixe_memory::VisibilityState::GpuNewer {
+            device: device_id,
+            visible_at: DeviceVisibilityPoint::new(2),
+        }
+    );
     let mut bytes = [0xff; 64];
     backing.range().read(0, &mut bytes).unwrap();
     assert!(
         bytes
             .chunks_exact(4)
-            .all(|word| word == 0x1122_3344_u32.to_le_bytes())
+            .all(|word| word == 0xaabb_ccdd_u32.to_le_bytes())
     );
 }
 
 #[test]
-fn neutral_runtime_executes_and_publishes_a_complete_transaction() {
+fn neutral_runtime_reports_completion_separately_from_submission() {
     let _guard = accelerated_test_guard();
     let Ok(initialized) = initialize_backend(
         BackendInstanceId::new(0x12),
@@ -224,9 +255,15 @@ fn neutral_runtime_executes_and_publishes_a_complete_transaction() {
         )],
     )
     .unwrap();
-    let mut runtime = initialized.into_runtime();
-    let completed = runtime.execute(&creations, &[], &submission).unwrap();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let mut owner = runtime.runtime();
+    owner.submit(&creations, &[], &submission).unwrap();
+    let completed = owner
+        .wait_for_completion()
+        .unwrap()
+        .expect("submitted WGPU work has one completion");
     assert_eq!(completed.frontend(), submission.id());
+    drop(owner);
 
     let mut bytes = [0; 64];
     backing.range().read(0, &mut bytes).unwrap();
@@ -241,7 +278,7 @@ fn neutral_runtime_executes_and_publishes_a_complete_transaction() {
 fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x13);
-    let Ok(mut initialized) = initialize_backend(
+    let Ok(initialized) = initialize_backend(
         BackendInstanceId::new(0x13),
         device_id,
         WgpuBackendConfiguration::default(),
@@ -249,41 +286,34 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
         eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
     let source_page = initialized_page(&[0x3c; 64]);
     let destination_page = initialized_page(&[0; 64]);
     let description = GpuAllocationDescription::new(64, 4).unwrap();
     let source_allocation = GpuAllocationId::new(3);
     let destination_allocation = GpuAllocationId::new(4);
-    for allocation in [source_allocation, destination_allocation] {
-        initialized
-            .backend
-            .create_resource(BackendResourceCreateInfo::Allocation {
-                id: allocation,
-                description,
-            })
-            .unwrap();
-    }
     let source_backing = backing(source_allocation, description, &source_page);
     let destination_backing = backing(destination_allocation, description, &destination_page);
     let source = BufferId::new(3);
     let destination = BufferId::new(4);
-    for (id, backing) in [
-        (source, source_backing.clone()),
-        (destination, destination_backing.clone()),
-    ] {
-        initialized
-            .backend
-            .create_resource(BackendResourceCreateInfo::Buffer {
+    let creations = [source_allocation, destination_allocation]
+        .into_iter()
+        .map(|id| BackendResourceCreateInfo::Allocation { id, description })
+        .chain(
+            [
+                (source, source_backing.clone()),
+                (destination, destination_backing.clone()),
+            ]
+            .into_iter()
+            .map(|(id, backing)| BackendResourceCreateInfo::Buffer {
                 id,
                 description: BufferDescription::new(64).unwrap(),
                 view: Some(
                     BufferView::new(id, BufferDescription::new(64).unwrap(), 0, backing).unwrap(),
                 ),
-            })
-            .unwrap();
-    }
-    prepare_read(&source_backing, &initialized.visibility, 3);
-    let destination_declaration = prepare_write(&destination_backing, &initialized.visibility, 3);
+            }),
+        )
+        .collect::<Vec<_>>();
     let copy = CopyOperation::buffer_to_buffer(
         BufferRegion {
             buffer: source,
@@ -306,11 +336,9 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
         )],
     )
     .unwrap();
-    initialized.backend.submit(&submission).unwrap();
-    let coordinator: Arc<dyn VisibilityCoordinator> = initialized.visibility.clone();
-    destination_backing
-        .range()
-        .complete_device_write(destination_declaration, coordinator)
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
         .unwrap();
     let mut bytes = [0; 64];
     destination_backing.range().read(0, &mut bytes).unwrap();
@@ -321,7 +349,7 @@ fn accelerated_copy_uploads_cpu_newer_input_before_backend_consumption() {
 fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract() {
     let _guard = accelerated_test_guard();
     let device_id = NonCpuDeviceId::new(0x12);
-    let Ok(mut initialized) = initialize_backend(
+    let Ok(initialized) = initialize_backend(
         BackendInstanceId::new(0x12),
         device_id,
         WgpuBackendConfiguration::default(),
@@ -329,19 +357,17 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
         return;
     };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
     const WIDTH: u32 = 32;
     const HEIGHT: u32 = 32;
     let page = initialized_page(&vec![0; (WIDTH * HEIGHT * 4) as usize]);
     let allocation = GpuAllocationId::new(2);
     let allocation_description =
         GpuAllocationDescription::new(u64::from(WIDTH * HEIGHT * 4), 4).unwrap();
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Allocation {
-            id: allocation,
-            description: allocation_description,
-        })
-        .unwrap();
+    let mut creations = vec![BackendResourceCreateInfo::Allocation {
+        id: allocation,
+        description: allocation_description,
+    }];
     let image_backing = backing(allocation, allocation_description, &page);
     let image = ImageId::new(2);
     let image_description = ImageDescription::new(
@@ -360,29 +386,26 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         base_layer: 0,
         layer_count: 1,
     };
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Image {
-            id: image,
-            description: image_description,
-            view: Some(
-                ImageView::new(
-                    image,
-                    image_description,
-                    Swizzle::IDENTITY,
-                    vec![(
-                        subresources,
-                        ImageMemoryLayout::PitchLinear {
-                            row_pitch: u64::from(WIDTH * 4),
-                            layer_stride: u64::from(WIDTH * HEIGHT * 4),
-                        },
-                        image_backing.clone(),
-                    )],
-                )
-                .unwrap(),
-            ),
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::Image {
+        id: image,
+        description: image_description,
+        view: Some(
+            ImageView::new(
+                image,
+                image_description,
+                Swizzle::IDENTITY,
+                vec![(
+                    subresources,
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch: u64::from(WIDTH * 4),
+                        layer_stride: u64::from(WIDTH * HEIGHT * 4),
+                    },
+                    image_backing.clone(),
+                )],
+            )
+            .unwrap(),
+        ),
+    });
 
     let mut vertex_bytes = Vec::new();
     for component in [
@@ -394,68 +417,53 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     let vertex_page = initialized_page(&vertex_bytes);
     let vertex_allocation = GpuAllocationId::new(3);
     let vertex_allocation_description = GpuAllocationDescription::new(72, 4).unwrap();
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Allocation {
-            id: vertex_allocation,
-            description: vertex_allocation_description,
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::Allocation {
+        id: vertex_allocation,
+        description: vertex_allocation_description,
+    });
     let vertex_backing = backing(
         vertex_allocation,
         vertex_allocation_description,
         &vertex_page,
     );
     let vertex_buffer = BufferId::new(3);
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Buffer {
-            id: vertex_buffer,
-            description: BufferDescription::new(72).unwrap(),
-            view: Some(
-                BufferView::new(
-                    vertex_buffer,
-                    BufferDescription::new(72).unwrap(),
-                    0,
-                    vertex_backing.clone(),
-                )
-                .unwrap(),
-            ),
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::Buffer {
+        id: vertex_buffer,
+        description: BufferDescription::new(72).unwrap(),
+        view: Some(
+            BufferView::new(
+                vertex_buffer,
+                BufferDescription::new(72).unwrap(),
+                0,
+                vertex_backing.clone(),
+            )
+            .unwrap(),
+        ),
+    });
 
     let vertex = ShaderId::new(1);
     let fragment = ShaderId::new(2);
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Shader {
-            id: vertex,
-            description: ShaderDescription {
-                stage: ShaderStage::Vertex,
-            },
-            module: triangle_vertex_module(),
-        })
-        .unwrap();
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Shader {
-            id: fragment,
-            description: ShaderDescription {
-                stage: ShaderStage::Fragment,
-            },
-            module: triangle_fragment_module(),
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::Shader {
+        id: vertex,
+        description: ShaderDescription {
+            stage: ShaderStage::Vertex,
+        },
+        module: triangle_vertex_module(),
+    });
+    creations.push(BackendResourceCreateInfo::Shader {
+        id: fragment,
+        description: ShaderDescription {
+            stage: ShaderStage::Fragment,
+        },
+        module: triangle_fragment_module(),
+    });
     let pipeline = PipelineId::new(1);
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::Pipeline {
-            id: pipeline,
-            description: PipelineDescription {
-                kind: PipelineKind::Graphics,
-            },
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::Pipeline {
+        id: pipeline,
+        description: PipelineDescription {
+            kind: PipelineKind::Graphics,
+        },
+    });
     let render_pass = RenderPassId::new(1);
     let render_pass_description =
         RenderPassDescription::new(vec![RenderPassAttachmentDescription {
@@ -464,13 +472,10 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
             samples: SampleCount::One,
         }])
         .unwrap();
-    initialized
-        .backend
-        .create_resource(BackendResourceCreateInfo::RenderPass {
-            id: render_pass,
-            description: render_pass_description.clone(),
-        })
-        .unwrap();
+    creations.push(BackendResourceCreateInfo::RenderPass {
+        id: render_pass,
+        description: render_pass_description.clone(),
+    });
     let attachment = RenderAttachment {
         image,
         subresources,
@@ -551,13 +556,9 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         ],
     )
     .unwrap();
-    prepare_read(&vertex_backing, &initialized.visibility, 2);
-    let declaration = prepare_write(&image_backing, &initialized.visibility, 2);
-    initialized.backend.submit(&submission).unwrap();
-    let coordinator: Arc<dyn VisibilityCoordinator> = initialized.visibility.clone();
-    image_backing
-        .range()
-        .complete_device_write(declaration, coordinator)
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
         .unwrap();
     let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     image_backing.range().read(0, &mut pixels).unwrap();
