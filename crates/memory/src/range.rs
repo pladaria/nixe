@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::{
-    AddressSpaceId, CanonicalBackingPage, CanonicalCpuWriteOverlap, CanonicalPageError,
-    CanonicalPageId, ContentGeneration, CpuWriteEpoch, DeviceAccessDeclaration,
+    AddressSpaceId, CanonicalBackingPage, CanonicalCpuWriteOverlap, CanonicalCpuWriteRange,
+    CanonicalPageError, CanonicalPageId, ContentGeneration, CpuWriteEpoch, DeviceAccessDeclaration,
     GuestVirtualAddress, MappingGeneration, MemoryPermissions, VisibilityCoordinator,
     VisibilityError, VisibilityState,
 };
@@ -175,6 +175,22 @@ impl CanonicalBackingSegment {
     ) -> Result<CanonicalCpuWriteOverlap, CanonicalPageError> {
         self.backing
             .cpu_write_overlap_since(generation, self.offset, self.size)
+    }
+
+    /// Appends dirty intervals relative to this segment's first byte.
+    pub fn append_cpu_write_ranges_since(
+        &self,
+        generation: ContentGeneration,
+        output: &mut Vec<CanonicalCpuWriteRange>,
+    ) -> Result<(), CanonicalPageError> {
+        let first = output.len();
+        self.backing
+            .append_cpu_write_ranges_since(generation, self.offset, self.size, output)?;
+        for interval in &mut output[first..] {
+            *interval =
+                CanonicalCpuWriteRange::new(interval.offset() - self.offset, interval.size());
+        }
+        Ok(())
     }
 }
 

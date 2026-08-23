@@ -77,6 +77,31 @@ impl WgpuVisibilityCoordinator {
         Ok(())
     }
 
+    pub(crate) fn write_page_range(
+        &self,
+        page: CanonicalPageId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VisibilityCoordinatorError> {
+        let mut pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        let mirror = pages.get_mut(&page).ok_or_else(|| {
+            VisibilityCoordinatorError::new(
+                "GPU writeback reached a page which was not prepared for device access",
+            )
+        })?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| VisibilityCoordinatorError::new("page range overflows"))?;
+        let destination = mirror.bytes.get_mut(offset..end).ok_or_else(|| {
+            VisibilityCoordinatorError::new("GPU writeback exceeds its prepared canonical page")
+        })?;
+        destination.copy_from_slice(bytes);
+        Ok(())
+    }
+
     pub(crate) fn bind_requester(
         &self,
         requester: Arc<dyn BackendVisibilityRequester>,
@@ -168,6 +193,24 @@ impl WgpuVisibilityCoordinator {
             })?;
             page.completed = Some(page.completed.map_or(point, |current| current.max(point)));
         }
+        Ok(())
+    }
+
+    pub(crate) fn mark_page_completed(
+        &self,
+        page: CanonicalPageId,
+        point: DeviceVisibilityPoint,
+    ) -> Result<(), VisibilityCoordinatorError> {
+        let mut pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        let mirror = pages.get_mut(&page).ok_or_else(|| {
+            VisibilityCoordinatorError::new(
+                "completed GPU write has no prepared canonical page mirror",
+            )
+        })?;
+        mirror.completed = Some(mirror.completed.map_or(point, |current| current.max(point)));
         Ok(())
     }
 }

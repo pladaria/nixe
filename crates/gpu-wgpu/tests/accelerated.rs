@@ -17,9 +17,10 @@ use nixe_gpu::{
 };
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_memory::{
-    CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment, CanonicalBackingStore,
-    ContentGeneration, CpuVisibilityRequest, DeviceVisibilityPoint, GuestPhysicalPageId,
-    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinatorError,
+    CanonicalAllocation, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
+    CanonicalBackingStore, ContentGeneration, CpuVisibilityRequest, DeviceVisibilityPoint,
+    GuestPhysicalPageId, MappingGeneration, MemoryPermissions, NonCpuDeviceId,
+    VisibilityCoordinatorError,
 };
 
 struct RuntimeOwner {
@@ -206,6 +207,76 @@ fn accelerated_submissions_remain_in_flight_until_cpu_demand() {
             .chunks_exact(4)
             .all(|word| word == 0xaabb_ccdd_u32.to_le_bytes())
     );
+}
+
+#[test]
+fn demanded_buffer_visibility_downloads_only_the_written_page_interval() {
+    let _guard = accelerated_test_guard();
+    let device_id = NonCpuDeviceId::new(0x14);
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(0x14),
+        device_id,
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let canonical = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+    let allocation = GpuAllocationId::new(14);
+    let allocation_description = GpuAllocationDescription::new(0x2000, 4).unwrap();
+    let backing = BackingView::new(
+        allocation,
+        allocation_description,
+        0,
+        canonical
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap(),
+    )
+    .unwrap();
+    let buffer = BufferId::new(14);
+    let description = BufferDescription::new(0x2000).unwrap();
+    let creations = [
+        BackendResourceCreateInfo::Allocation {
+            id: allocation,
+            description: allocation_description,
+        },
+        BackendResourceCreateInfo::Buffer {
+            id: buffer,
+            description,
+            view: Some(BufferView::new(buffer, description, 0, backing.clone()).unwrap()),
+        },
+    ];
+    let clear = ClearOperation::buffer(
+        BufferRegion {
+            buffer,
+            range: BufferRange::new(0x1100, 4).unwrap(),
+        },
+        0x1122_3344,
+    )
+    .unwrap();
+    let submission = OperationSubmission::new(
+        FrontendSubmissionId::new(14),
+        vec![],
+        vec![GpuOperation::new(
+            GpuCommand::Clear(clear),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        )],
+    )
+    .unwrap();
+    runtime
+        .runtime()
+        .submit(&creations, &[], &submission)
+        .unwrap();
+
+    let mut untouched = [0xff; 4];
+    backing.range().read(0x100, &mut untouched).unwrap();
+    assert_eq!(untouched, [0; 4]);
+    let mut written = [0; 4];
+    backing.range().read(0x1100, &mut written).unwrap();
+    assert_eq!(written, 0x1122_3344_u32.to_le_bytes());
 }
 
 #[test]

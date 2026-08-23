@@ -18,7 +18,8 @@ pub use access::{
 };
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
-    CanonicalCpuWriteOverlap, CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
+    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageError, CanonicalWriteBatch,
+    CanonicalWriteBatchError,
 };
 pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalCpuWriteDependency,
