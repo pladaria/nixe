@@ -1,18 +1,24 @@
-//! Canonical-page mirrors used by the conservative staging policy.
+//! Canonical-page mirrors and demanded readback routing.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use nixe_gpu::BackingView;
+use nixe_gpu::{BackendVisibilityRequester, BackingView};
 use nixe_memory::{
-    CanonicalPageId, CpuVisibilityRequest, DeviceVisibilityRequest, NonCpuDeviceId,
-    VisibilityCoordinator, VisibilityCoordinatorError,
+    CanonicalPageId, CpuVisibilityRequest, DeviceVisibilityPoint, DeviceVisibilityRequest,
+    NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
 };
 
-/// Thread-safe canonical-page mirror shared by submission and completion code.
-pub struct WgpuVisibilityCoordinator {
+struct PageMirror {
+    bytes: Box<[u8]>,
+    completed: Option<DeviceVisibilityPoint>,
+}
+
+/// Thread-safe canonical-page mirrors shared by submission and completion code.
+pub(crate) struct WgpuVisibilityCoordinator {
     device: NonCpuDeviceId,
-    pages: Mutex<HashMap<CanonicalPageId, Box<[u8]>>>,
+    pages: Mutex<HashMap<CanonicalPageId, PageMirror>>,
+    requester: OnceLock<Arc<dyn BackendVisibilityRequester>>,
 }
 
 impl WgpuVisibilityCoordinator {
@@ -20,6 +26,7 @@ impl WgpuVisibilityCoordinator {
         Self {
             device,
             pages: Mutex::new(HashMap::new()),
+            requester: OnceLock::new(),
         }
     }
 
@@ -59,13 +66,107 @@ impl WgpuVisibilityCoordinator {
             let source_end = source
                 .checked_add(size)
                 .ok_or_else(|| VisibilityCoordinatorError::new("source range overflows"))?;
-            if end > page.len() || source_end > bytes.len() {
+            if end > page.bytes.len() || source_end > bytes.len() {
                 return Err(VisibilityCoordinatorError::new(
                     "GPU writeback exceeds its prepared canonical page",
                 ));
             }
-            page[offset..end].copy_from_slice(&bytes[source..source_end]);
+            page.bytes[offset..end].copy_from_slice(&bytes[source..source_end]);
             source = source_end;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_requester(
+        &self,
+        requester: Arc<dyn BackendVisibilityRequester>,
+    ) -> Result<(), VisibilityCoordinatorError> {
+        self.requester.set(requester).map_err(|_| {
+            VisibilityCoordinatorError::new("wgpu visibility requester is already bound")
+        })
+    }
+
+    pub(crate) fn read_backing(
+        &self,
+        backing: &BackingView,
+        output: &mut [u8],
+    ) -> Result<(), VisibilityCoordinatorError> {
+        if output.len() != backing.size() as usize {
+            return Err(VisibilityCoordinatorError::new(
+                "backend mirror read size does not match the canonical backing view",
+            ));
+        }
+        let pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        let mut destination = 0_usize;
+        for segment in backing.range().segments() {
+            let size = usize::try_from(segment.size())
+                .map_err(|_| VisibilityCoordinatorError::new("segment size overflows usize"))?;
+            let offset = usize::try_from(segment.offset())
+                .map_err(|_| VisibilityCoordinatorError::new("segment offset overflows usize"))?;
+            let page = pages.get(&segment.page()).ok_or_else(|| {
+                VisibilityCoordinatorError::new("canonical page has no device mirror")
+            })?;
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| VisibilityCoordinatorError::new("page range overflows"))?;
+            let destination_end = destination
+                .checked_add(size)
+                .ok_or_else(|| VisibilityCoordinatorError::new("destination range overflows"))?;
+            output[destination..destination_end].copy_from_slice(&page.bytes[offset..end]);
+            destination = destination_end;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_completed_page(
+        &self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
+        let mut pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        let page = pages
+            .get(&request.page)
+            .ok_or_else(|| VisibilityCoordinatorError::new("wgpu page has no device mirror"))?;
+        if !page
+            .completed
+            .is_some_and(|completed| completed >= request.visible_at)
+        {
+            return Err(VisibilityCoordinatorError::new(
+                "wgpu page mirror has not reached the requested visibility point",
+            ));
+        }
+        if page.bytes.len() != request.size {
+            return Err(VisibilityCoordinatorError::new(
+                "wgpu page mirror has an unexpected size",
+            ));
+        }
+        Ok(pages
+            .remove(&request.page)
+            .expect("validated page remains present while locked")
+            .bytes)
+    }
+
+    pub(crate) fn mark_backing_completed(
+        &self,
+        backing: &BackingView,
+        point: DeviceVisibilityPoint,
+    ) -> Result<(), VisibilityCoordinatorError> {
+        let mut pages = self
+            .pages
+            .lock()
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
+        for segment in backing.range().segments() {
+            let page = pages.get_mut(&segment.page()).ok_or_else(|| {
+                VisibilityCoordinatorError::new(
+                    "completed GPU write has no prepared canonical page mirror",
+                )
+            })?;
+            page.completed = Some(page.completed.map_or(point, |current| current.max(point)));
         }
         Ok(())
     }
@@ -90,7 +191,13 @@ impl VisibilityCoordinator for WgpuVisibilityCoordinator {
         self.pages
             .lock()
             .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?
-            .insert(request.page, canonical_bytes.into());
+            .insert(
+                request.page,
+                PageMirror {
+                    bytes: canonical_bytes.into(),
+                    completed: None,
+                },
+            );
         Ok(())
     }
 
@@ -103,18 +210,19 @@ impl VisibilityCoordinator for WgpuVisibilityCoordinator {
                 "visibility request targets another device",
             ));
         }
-        let pages = self
+        let completed = self
             .pages
             .lock()
-            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?;
-        let bytes = pages.get(&request.page).ok_or_else(|| {
-            VisibilityCoordinatorError::new("wgpu page has no completed device mirror")
-        })?;
-        if bytes.len() != request.size {
-            return Err(VisibilityCoordinatorError::new(
-                "wgpu page mirror has an unexpected size",
-            ));
+            .map_err(|_| VisibilityCoordinatorError::new("wgpu page mirror is poisoned"))?
+            .get(&request.page)
+            .and_then(|page| page.completed)
+            .is_some_and(|completed| completed >= request.visible_at);
+        if completed {
+            return self.take_completed_page(request);
         }
-        Ok(bytes.clone())
+        let requester = self.requester.get().ok_or_else(|| {
+            VisibilityCoordinatorError::new("wgpu visibility requester is not bound")
+        })?;
+        requester.make_cpu_visible(request)
     }
 }

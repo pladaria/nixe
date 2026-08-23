@@ -1,9 +1,9 @@
 use std::fmt::{Display, Formatter, Write};
 
-use nixe_gpu::GraphicsGapKind;
+use nixe_gpu::{FrontendSubmissionId, GraphicsGapKind};
 use nixe_gpu_maxwell::{
-    MaxwellBackendExecutionError, MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError,
-    MaxwellScheduleError, MaxwellSoftwareInitializationError, MaxwellUnsupportedGpfifoSubmission,
+    MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError, MaxwellScheduleError,
+    MaxwellUnsupportedGpfifoSubmission,
 };
 use nixe_memory::CanonicalRangeTranslationError;
 
@@ -129,15 +129,10 @@ pub enum UnsupportedNvDrvOperation {
         context: NvDrvErrorContext,
         boundary: Box<MaxwellFrontendDispatchBoundary>,
     },
-    ScheduledGpfifoExecution {
+    GpuExecution {
         context: NvDrvErrorContext,
-        boundary: Box<MaxwellFrontendDispatchBoundary>,
-        error: Box<MaxwellSoftwareInitializationError>,
-    },
-    ScheduledGpfifoBackendExecution {
-        context: NvDrvErrorContext,
-        boundary: Box<MaxwellFrontendDispatchBoundary>,
-        error: Box<MaxwellBackendExecutionError>,
+        frontend: FrontendSubmissionId,
+        detail: Box<str>,
     },
     CanonicalMemory {
         context: NvDrvErrorContext,
@@ -159,9 +154,9 @@ impl UnsupportedNvDrvOperation {
             | Self::GpfifoMemory { .. }
             | Self::GpfifoScheduling { .. }
             | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
-            Self::ScheduledGpfifoSubmission { .. }
-            | Self::ScheduledGpfifoExecution { .. }
-            | Self::ScheduledGpfifoBackendExecution { .. } => GraphicsGapKind::GpuPacket,
+            Self::ScheduledGpfifoSubmission { .. } | Self::GpuExecution { .. } => {
+                GraphicsGapKind::GpuPacket
+            }
         }
     }
 }
@@ -233,33 +228,19 @@ impl Display for UnsupportedNvDrvOperation {
                 context.reason(),
                 boundary
             ),
-            Self::ScheduledGpfifoExecution {
+            Self::GpuExecution {
                 context,
-                boundary,
-                error,
+                frontend,
+                detail,
             } => write!(
                 formatter,
-                "validated GPFIFO work cannot execute through the immediate Maxwell initialization path: device={} request={:#010x} fd={} reason={} detail=[{}] dispatch=[{}]",
+                "GPU execution failed: device={} request={:#010x} fd={} reason={} {} detail=[{}]",
                 context.device().path(),
                 context.request(),
                 context.fd(),
                 context.reason(),
-                error,
-                boundary
-            ),
-            Self::ScheduledGpfifoBackendExecution {
-                context,
-                boundary,
-                error,
-            } => write!(
-                formatter,
-                "validated GPFIFO work reached the neutral backend but execution failed: device={} request={:#010x} fd={} reason={} detail=[{}] dispatch=[{}]",
-                context.device().path(),
-                context.request(),
-                context.fd(),
-                context.reason(),
-                error,
-                boundary
+                frontend,
+                detail
             ),
             Self::CanonicalMemory { context, fault } => {
                 write!(

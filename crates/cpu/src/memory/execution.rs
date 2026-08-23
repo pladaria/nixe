@@ -2016,7 +2016,7 @@ mod tests {
             .prepare_device_access(declaration, Arc::clone(&coordinator))
             .unwrap();
         retained
-            .complete_device_write(declaration, Arc::clone(&coordinator))
+            .publish_device_write(declaration, Arc::clone(&coordinator))
             .unwrap();
         assert_eq!(
             memory.content_mutation_epoch(),
@@ -2055,7 +2055,7 @@ mod tests {
             .prepare_device_access(second_write, Arc::clone(&coordinator))
             .unwrap();
         retained
-            .complete_device_write(second_write, coordinator)
+            .publish_device_write(second_write, coordinator)
             .unwrap();
         assert_eq!(
             memory.content_mutation_epoch(),
@@ -2125,7 +2125,7 @@ mod tests {
             .prepare_device_access(declaration, Arc::clone(&coordinator))
             .unwrap();
         retained
-            .complete_device_write(declaration, coordinator)
+            .publish_device_write(declaration, coordinator)
             .unwrap();
 
         let (_, stored) = memory

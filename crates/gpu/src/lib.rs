@@ -58,8 +58,8 @@ pub use resource::{
     SamplerId, ShaderDescription, ShaderId, ShaderStage,
 };
 pub use runtime::{
-    BackendExecutionCompletion, BackendRuntimeError, NeutralBackendRuntime,
-    SynchronousBackendRuntime,
+    BackendExecutionCompletion, BackendRuntime, BackendRuntimeError, BackendVisibilityRequester,
+    NeutralBackendRuntime,
 };
 pub use shader::{
     ShaderBackendLoweringError, ShaderBackendModule, ShaderEvaluationError, ShaderEvaluationInputs,

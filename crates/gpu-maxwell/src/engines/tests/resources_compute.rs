@@ -1610,11 +1610,8 @@ fn clear_trigger_lowers_atomically_and_cache_publication_is_generation_checked()
         &cache,
     )
     .unwrap();
-    assert_eq!(refreshed_plan.resource_creations().len(), 1);
-    assert!(matches!(
-        refreshed_plan.resource_invalidations(),
-        [nixe_gpu::ResourceDependency::Image(_)]
-    ));
+    assert!(refreshed_plan.resource_creations().is_empty());
+    assert!(refreshed_plan.resource_invalidations().is_empty());
     refreshed_plan.commit_cache(&mut cache).unwrap();
     assert_eq!(cache.view_count(), 1);
 
@@ -1968,10 +1965,7 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         &cache,
     )
     .unwrap();
-    assert!(matches!(
-        vertex_plan.resource_invalidations(),
-        [nixe_gpu::ResourceDependency::Buffer(_)]
-    ));
+    assert!(vertex_plan.resource_invalidations().is_empty());
     assert!(
         !vertex_plan
             .resource_creations()
@@ -1997,27 +1991,8 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         &cache,
     )
     .unwrap();
-    assert!(
-        target_plan
-            .resource_invalidations()
-            .iter()
-            .any(|dependency| matches!(dependency, nixe_gpu::ResourceDependency::Pipeline(_)))
-    );
-    assert!(
-        target_plan
-            .resource_invalidations()
-            .iter()
-            .any(|dependency| matches!(dependency, nixe_gpu::ResourceDependency::Image(_)))
-    );
-    assert!(
-        target_plan
-            .resource_creations()
-            .iter()
-            .any(|creation| matches!(
-                creation,
-                nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
-            ))
-    );
+    assert!(target_plan.resource_invalidations().is_empty());
+    assert!(target_plan.resource_creations().is_empty());
 }
 
 #[test]

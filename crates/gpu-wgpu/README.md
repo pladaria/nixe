@@ -8,10 +8,12 @@ The initial correct policy is intentionally conservative:
 
 - Vulkan is the only compiled host API, while backend selection remains an
   explicit configuration value.
-- Canonical guest bytes remain authoritative host memory. Buffers and images
-  are device mirrors uploaded before reads and copied back after writes.
-- Submissions are executed serially and report host completion separately from
-  canonical-memory visibility and guest timeline publication.
+- Canonical memory keeps stable guest identity while content authority may
+  reside on the CPU or device. Resident resources upload only CPU-dirty input
+  and GPU writes return to canonical memory only at a verified CPU boundary.
+- A bounded queue accepts ordered submissions asynchronously. One backend
+  owner reports them on one completion timeline; canonical-memory visibility
+  and guest timeline publication advance only at their required boundaries.
 - `wgpu` usage tracking implements host barriers from neutral access
   declarations; guest cache-maintenance commands remain explicit ordering
   points.

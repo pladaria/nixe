@@ -318,7 +318,7 @@ impl ViewKey {
             ) => {
                 *description == current.description()
                     && *buffer_offset == current.view().buffer_offset()
-                    && backing == current.view().backing()
+                    && same_canonical_backing(backing, current.view().backing())
                     && mappings.as_ref() == current.mappings()
             }
             (
@@ -345,7 +345,7 @@ impl ViewKey {
                         |((subresources, layout, backing), current)| {
                             *subresources == current.subresources()
                                 && *layout == current.layout()
-                                && backing == current.backing()
+                                && same_canonical_backing(backing, current.backing())
                         },
                     )
             }
@@ -522,17 +522,12 @@ impl ViewMaterialization {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PipelineAttachmentKey(
-    MaxwellThreeDResourceRole,
-    nixe_gpu::ImageDescription,
-    ImageId,
-);
+struct PipelineAttachmentKey(MaxwellThreeDResourceRole, nixe_gpu::ImageDescription);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PipelineKey {
     method_dependencies: Box<[Option<u32>]>,
     attachments: Box<[PipelineAttachmentKey]>,
-    resource_dependencies: Box<[(MaxwellThreeDResourceRole, ResourceDependency)]>,
     shaders: MaxwellThreeDTranslatedShaders,
 }
 
@@ -2874,23 +2869,6 @@ fn prepare_resources(
                 .iter()
                 .any(|dependency| dependency_matches_target(*dependency, *target))
         });
-        let invalidated_pipelines = cache
-            .pipelines
-            .iter()
-            .filter(|record| {
-                record.key.attachments.iter().any(|attachment| {
-                    invalidated.contains(&ResourceDependency::Image(attachment.2))
-                }) || record
-                    .key
-                    .resource_dependencies
-                    .iter()
-                    .any(|(_, dependency)| invalidated.contains(dependency))
-            })
-            .map(|record| ResourceDependency::Pipeline(record.id))
-            .collect::<Vec<_>>();
-        cache.pipelines.retain(|record| {
-            !invalidated_pipelines.contains(&ResourceDependency::Pipeline(record.id))
-        });
         let invalidated_descriptors = cache
             .descriptors
             .iter()
@@ -2905,11 +2883,6 @@ fn prepare_resources(
         cache.descriptors.retain(|record| {
             !invalidated_descriptors.contains(&ResourceDependency::DescriptorTable(record.id))
         });
-        for dependency in invalidated_pipelines {
-            if !invalidations.contains(&dependency) {
-                invalidations.push(dependency);
-            }
-        }
         for dependency in invalidated_descriptors {
             if !invalidations.contains(&dependency) {
                 invalidations.push(dependency);
@@ -3631,14 +3604,7 @@ fn lower_draw(
     let pipeline_key = PipelineKey {
         method_dependencies: state
             .pipeline_dependencies(&attachment_selection.color_targets().collect::<Vec<_>>()),
-        attachments: attachment_pipeline_key(resources, bindings, attachment_selection)?,
-        resource_dependencies: shaders
-            .resources
-            .iter()
-            .zip(descriptor_dependencies.iter().copied())
-            .map(|(resource, dependency)| (resource.role, dependency))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        attachments: attachment_pipeline_key(resources, attachment_selection)?,
         shaders: shaders.clone(),
     };
     let pipeline = if let Some(record) = cache
@@ -4044,7 +4010,6 @@ fn reject_draw_aliases(
 
 fn attachment_pipeline_key(
     resources: &MaxwellThreeDResolvedResources,
-    bindings: &[Option<ResourceDependency>],
     selection: &DrawAttachmentSelection,
 ) -> Result<Box<[PipelineAttachmentKey]>, MaxwellThreeDLoweringError> {
     selection
@@ -4052,11 +4017,7 @@ fn attachment_pipeline_key(
         .into_iter()
         .map(|index| {
             let image = resolved_image(resources, index)?;
-            Ok(PipelineAttachmentKey(
-                image.role(),
-                image.description(),
-                image_dependency(binding_at(resources, bindings, index)?)?,
-            ))
+            Ok(PipelineAttachmentKey(image.role(), image.description()))
         })
         .collect::<Result<Vec<_>, MaxwellThreeDLoweringError>>()
         .map(Vec::into_boxed_slice)

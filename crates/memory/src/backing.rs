@@ -784,7 +784,30 @@ impl CanonicalBackingPage {
         Self::publish_visibility(&mut state, PageVisibility::Clean)
     }
 
-    pub(crate) fn complete_device_write(
+    pub(crate) fn prepare_resident_device_read(
+        &self,
+        declaration: DeviceAccessDeclaration,
+    ) -> Result<(), VisibilityError> {
+        let mut state = self.lock_state();
+        match state.visibility {
+            PageVisibility::Clean => Ok(()),
+            PageVisibility::CpuNewer => Self::publish_visibility(&mut state, PageVisibility::Clean),
+            PageVisibility::GpuNewer {
+                device, visible_at, ..
+            } if device == declaration.device()
+                && visible_at <= declaration.device_visible_at() =>
+            {
+                Ok(())
+            }
+            PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
+                Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+                Err(VisibilityError::ConflictingAccess)
+            }
+            PageVisibility::Invalid => Err(VisibilityError::InvalidState),
+        }
+    }
+
+    pub(crate) fn publish_device_write(
         &self,
         declaration: DeviceAccessDeclaration,
         coordinator: Arc<dyn VisibilityCoordinator>,
@@ -1821,7 +1844,7 @@ mod tests {
         );
 
         range
-            .complete_device_write(declaration, Arc::clone(&erased))
+            .publish_device_write(declaration, Arc::clone(&erased))
             .unwrap();
         let device_write_epoch = allocation.inner.store.content_epoch();
         assert_eq!(
@@ -1879,7 +1902,7 @@ mod tests {
             .prepare_device_access(first, Arc::clone(&coordinator))
             .unwrap();
         range
-            .complete_device_write(first, Arc::clone(&coordinator))
+            .publish_device_write(first, Arc::clone(&coordinator))
             .unwrap();
 
         let second =
@@ -1961,7 +1984,7 @@ mod tests {
             .prepare_device_access(declaration, Arc::clone(&erased))
             .unwrap();
         range
-            .complete_device_write(declaration, Arc::clone(&erased))
+            .publish_device_write(declaration, Arc::clone(&erased))
             .unwrap();
 
         let mut observed = [0; 1];

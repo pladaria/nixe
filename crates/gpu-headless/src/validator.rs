@@ -290,6 +290,21 @@ impl BackendDriver for HeadlessBackendDriver {
         Ok(timeline.completed.contains(&submission))
     }
 
+    fn wait_for_completion(
+        &mut self,
+        submission: BackendSubmissionToken,
+    ) -> Result<(), BackendDriverError> {
+        self.check_device()?;
+        let mut timeline = self.timeline()?;
+        if !timeline.accepted.contains(&submission) {
+            return Err(BackendDriverError::failure(format!(
+                "headless submission {submission} was not accepted"
+            )));
+        }
+        timeline.completed.insert(submission);
+        Ok(())
+    }
+
     fn release_submission(
         &mut self,
         submission: BackendSubmissionToken,

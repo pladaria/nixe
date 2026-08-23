@@ -8,8 +8,23 @@ The current directory and crate structure is an initial proposal. It is temporar
 project evolves, new technical information becomes available, and implementation needs become clearer.
 
 Contributors should avoid treating the existing module boundaries as permanent. Architectural changes are
-welcome when they improve correctness, maintainability, testing, or meaningful code reuse between the
-supported platforms.
+expected when they move the project toward the architecture required to emulate commercial software accurately
+and efficiently. Do not preserve temporary boundaries, layers, or data flows merely because they already work.
+
+Correctness is required, but correctness within the current design is not the final objective. Among correct
+solutions, prefer the one aligned with the intended architecture and its long-term performance requirements,
+even when it requires broader restructuring. Avoid short-term fixes that make that architecture harder to reach.
+
+## Completion Standard
+
+An architectural change, migration, refactor, or replacement is not complete until the superseded implementation
+has been removed in full. This includes old and alternate execution paths, compatibility branches, transitional
+adapters, obsolete abstractions, dead code, and tests that encode the previous design. Multiple paths are acceptable
+only when they represent distinct behavior required by the target architecture, not as a way to preserve legacy code.
+
+Update tests to exercise the new contract directly. Remove tests that are no longer relevant instead of retaining
+production compatibility paths solely to keep them passing. The finished change must leave one coherent current
+implementation, without a hidden fallback to the design it replaced.
 
 ## Language
 
@@ -38,7 +53,8 @@ Nixe prioritizes correctness over resilience.
 
 ## Contribution Principles
 
-- Prefer correctness and clear behavior over premature optimization.
+- Preserve guest-visible correctness and clear behavior. Do not classify removal of architectural bottlenecks on
+  emulator-critical paths as premature optimization.
 - Add tests for new behavior whenever practical.
 - When an implementation relies on external references, record those references in nearby code comments and link
   to the relevant resources. Prefer stable, versioned, or commit-pinned links when available.
