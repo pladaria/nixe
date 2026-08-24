@@ -83,12 +83,20 @@ all represented pages before every cache lookup; reconstruction occurs only
 when an entry is created or its retained provenance is invalidated.
 
 The mutation intent closes admission before waiting for active leases, so a
-stream of new slices cannot starve a pending mapping change. Runtime mapping
-entry points first publish a TLB safepoint request and, after a successful
-commit, publish the new mapping epoch as an invalidation request. Executors
-acknowledge that request only after stale translations or code can no longer be
-re-entered. The Phase E coordinator must not dispatch the next slice until all
-controls acknowledge the committed epoch.
+stream of new slices cannot starve a pending mapping change. Canonical memory
+publishes each committed mapping or executable-content change through one
+monotonic engine-neutral invalidation source. A record describes the semantic
+address-space, mapping, permission, canonical-range, visibility, or generation
+change; it never names a JIT cache object or virtualization framework handle.
+
+Runtime mapping entry points first publish a mapping-change safepoint request
+and, after a successful commit, make the new record visible. Each engine domain
+consumes the source through its own cursor. Executors acknowledge a record only
+after stale derived mappings, translations, links, and code cannot be
+re-entered. The coordinator must not dispatch the next slice until every
+required control acknowledges the committed cursor. A JIT may evict cache and
+software-TLB state while an NCE provider reconciles VM mappings or traps; those
+mechanisms never enter the shared record.
 
 The first parallel implementation deliberately serializes semantic memory
 transactions. This is stronger than guest hardware ordering but cannot expose

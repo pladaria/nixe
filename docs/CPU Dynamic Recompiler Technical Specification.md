@@ -1,8 +1,12 @@
 # CPU Dynamic Recompiler Technical Specification
 
-Status: proposed architecture  
-Audience: CPU, memory, kernel, scheduler, and GPU implementers  
-Primary target: Arm A64, A32, and T32 guest code on AMD64 hosts
+Status: normative architecture; implementation is tracked by
+[`notes/jit.md`](../notes/jit.md)
+
+Audience: CPU, memory, kernel, scheduler, and GPU implementers
+
+Primary target: Arm A64, A32, and T32 guest code on x86-64 and AArch64 hosts
+
 Applies to: Nintendo Switch and Nintendo Switch 2 research profiles
 
 ## 1. Purpose
@@ -12,25 +16,28 @@ engines and their scheduler boundary. It is a decision framework for
 implementation rather than a claim that all hardware details of either console
 are already known.
 
-The recommended high-performance portable engine is a specialized dynamic
-binary translator (DBT):
+The planned production JIT is a portable dynamic binary translator (DBT):
 
 ```text
 A64 frontend ----+
-A32 frontend ----+-> shared typed IR -> AMD64 backend -> executable code cache
-T32 frontend ----+
+A32 frontend ----+-> verified Nixe typed IR regions -> Cranelift -> native code
+T32 frontend ----+                                      |
+                                                          v
+                                            bounded cache and dispatcher
 ```
 
 Each frontend fetches, decodes, and lifts its execution state's encodings into
-the same host-independent IR. The shared IR and backend do not erase
+the same host-independent IR. The shared IR and Cranelift lowering do not erase
 architectural differences: frontend-specific state access, PC behavior, flags,
 conditions, and interworking semantics are made explicit before lowering.
 
 An interpreter using the same architectural definitions is required alongside
-the recompiler. It is the correctness oracle, debugging engine, and fallback for
-instructions which have not yet been lowered by the JIT.
+the recompiler. It is the independent correctness oracle, debugging engine, and
+the explicit `InterpretOne` provider for newly recognized instructions which
+have not yet been lowered by the JIT. A production-complete JIT has no such
+fallback for instructions already supported by the interpreter.
 
-The interpreter, DBT, and any future native-code-execution (NCE) backend are
+The interpreter, DBT, and any future native-code-execution (NCE) provider are
 implementations of one engine-neutral bounded run-slice protocol. NCE is an
 optional family of platform engines backed by a suitable virtualization
 facility, not direct execution of untrusted guest code in Nixe's host process.
@@ -42,7 +49,7 @@ The design prioritizes, in this order:
 1. Architectural correctness and precise observable behavior.
 2. Explicit, testable boundaries between CPU, memory, kernel, and GPU.
 3. Low translation latency and predictable runtime behavior.
-4. High steady-state performance on common desktop AMD64 processors.
+4. High steady-state performance on supported x86-64 and AArch64 hosts.
 5. Maintainability by a small Rust-focused project.
 6. Reuse between consoles only where the behavior is genuinely shared.
 
@@ -75,30 +82,24 @@ pretend that host instruction count is guest time.
 
 ## 3. Design basis and state of the art
 
-The design combines techniques demonstrated by several maintained systems:
+The design draws on techniques demonstrated by several maintained systems:
 
-- Dynarmic demonstrates that a focused ARM DBT with a compact IR and dedicated
-  x86-64 backend can expose a clean embedding API while supporting unusual
-  memory layouts.
+- Dynarmic demonstrates that a focused Arm DBT with a compact IR can expose a
+  clean embedding API while supporting unusual memory layouts.
 - QEMU TCG demonstrates mature translation-block lookup, direct block chaining,
   software TLBs, page-based invalidation, multicore invalidation, and recovery
   of precise guest state from host faults.
-- Cranelift demonstrates that fast compilation and verified instruction
-  lowering are achievable in a reusable Rust backend. Its general-purpose
-  function model is useful as a reference and possible validation backend, but
-  it does not by itself solve emulator-specific block patching, fault recovery,
-  memory fast paths, or architectural-state synchronization.
+- Cranelift provides portable x86-64 and AArch64 code generation, bounded
+  compilation suitable for a baseline JIT, verifier support, and maintained
+  host-ABI handling in Rust.
 
-The preferred implementation is therefore an emulator-specific IR and AMD64
-backend. A general compiler backend is not the primary execution tier. LLVM is
-explicitly rejected for the baseline tier because its compilation latency,
-optimization scope, and integration complexity are poorly matched to short
-translation blocks.
-
-This choice is not an endorsement of unnecessary custom machinery. The custom
-backend should implement only the operations required by the supported Arm
-frontends and should use small, independently testable components for encoding,
-register allocation, patching, and executable-memory management.
+Nixe therefore retains a specialized typed IR for Arm semantics and emulator
+effects, then lowers that IR exclusively through Cranelift. Cranelift does not
+own emulator dispatch, cache lifetime, link tables, invalidation, memory
+authority, or architectural-state commitment; those facilities remain
+JIT-private Nixe integration code around the compiler. Nixe does not implement
+a parallel direct host-ISA emitter, register allocator, or instruction encoder.
+LLVM and a second optimizing tier are outside the production plan.
 
 ## 4. Verified facts, profiles, and assumptions
 
@@ -134,15 +135,15 @@ This is a conservative software-profile policy, not a claim that every detail
 of the Switch 2 CPU or compatibility mechanism is publicly known. A32/T32
 availability, the exact architecture revision, optional instruction features,
 and compatibility-mode execution behavior remain unresolved Switch 2 profile
-questions. They must not be inferred from the AMD64 host, Switch 1 behavior, or
+questions. They must not be inferred from the host ISA, Switch 1 behavior, or
 unverified SoC descriptions.
 
 Switch 1 and Switch 2 select separate profiles. A profile determines which
 execution states, encodings, and features are legal for a process, after its
 initial state has been obtained from validated process metadata. It does not
 replace any execution state's decoder, state model, or semantics. Frontends may
-reuse their declarative decoding framework, semantic primitives, IR, and
-backend while enabling different feature bits and platform callbacks.
+reuse their declarative decoding framework, semantic primitives, IR, and JIT
+lowering while enabling different feature bits and platform callbacks.
 Unsupported encodings produce the architecturally appropriate exception; they
 must never silently execute according to the host's capabilities.
 
@@ -157,7 +158,7 @@ feature. This is not inferred from games or host capabilities: Arm documents
 Advanced SIMD/NEON as mandatory for Armv8-A, and NVIDIA's public Tegra X1
 documentation identifies NEON on the Cortex-A57 CPU cores. This decision enables
 classification of the relevant A64 encodings; it does not claim that the current
-interpreter or backend implements every FP/SIMD operation. The provisional
+interpreter or JIT implements every FP/SIMD operation. The provisional
 Switch 2 native profile keeps this feature `Unknown` until separately verified
 evidence establishes its guest-visible contract.
 
@@ -212,6 +213,9 @@ nixe-cpu-engine-interpreter complete reference-interpreter engine, including
                             semantic dispatch and executor-local state
 nixe-cpu-engine-testkit     dev-only fake JIT/NCE providers and reusable
                             engine-boundary acceptance fixtures
+nixe-cpu-engine-jit         established provider and private native ABI owning
+                            Cranelift; generated code, dispatch, links, cache
+                            lifetime, and acceleration state remain here
 nixe-scheduler              console-neutral thread/vCPU state machine,
                             topology, ready queues, waits, and decisions
 nixe-memory                 mappings, canonical physical identity, aliases,
@@ -219,26 +223,29 @@ nixe-memory                 mappings, canonical physical identity, aliases,
 nixe-runtime                process/thread ownership, coordinator, workers,
                             exception routing, and teardown
 nixe-horizon                versioned Horizon ABI and policy adapters
-future engine crates        JIT and platform NCE implementations
+future NCE crates           platform virtualization implementations
 ```
 
-The first four neutral CPU boundaries above are separate workspace crates as of
-Phase A; dependency-boundary tests keep them acyclic. Circular dependencies are forbidden. In
-particular, CPU, engine-protocol, and scheduler code must not depend on Horizon,
-the runtime, a graphics API, or a platform NCE implementation. A concrete engine
+The neutral CPU boundaries are separate workspace crates and dependency-boundary
+tests keep them acyclic. Circular dependencies are forbidden. In particular,
+CPU, engine-protocol, and scheduler code must not depend on Horizon, the runtime,
+Cranelift, a graphics API, or a platform NCE implementation. A concrete engine
 must not call Horizon directly. Product composition owns concrete providers;
 `nixe-runtime` accepts the neutral provider protocol and does not depend on the
-reference interpreter in production.
+reference interpreter or concrete JIT in production.
 
-Phase F completed the implementation handoff at this boundary. The runtime has
-no product-name engine selection and owns no JIT- or NCE-specific execution
-branch. A backend supplies a provider, process domain, worker executor, memory
-synchronization, and normalized exit/trap behavior; canonical thread state,
-scheduling, exceptions, and Horizon policy stay unchanged. Every new backend
-must first pass the reusable conformance suite. The dev-only fake block engine
-also proves exact one-instruction fallback and stale-block invalidation, while
-the dev-only fake NCE proves shadow registers, mirrored bindings, dirty-memory
-reconciliation, migration, and teardown without a host virtualization API.
+The runtime has no product-name or engine-family execution branch. A provider
+supplies a process domain, worker executor, memory synchronization, and
+normalized exit/trap behavior; canonical thread state, scheduling, exceptions,
+and Horizon policy stay unchanged. Every provider must pass the reusable
+conformance suite before production registration. The pre-code JIT provider is
+covered by native-ABI, lifecycle, capability, and explicit-fallback tests until
+JIT-016 enables its full provider conformance run. The dev-only fake JIT
+exercises exact
+one-instruction fallback and stale-derived-state invalidation without exposing
+a native-code ABI. The dev-only fake NCE exercises shadow registers, mirrored
+bindings, dirty-memory reconciliation, migration, and teardown without a host
+virtualization API.
 
 Implementation proceeds as four independent projects: the portable baseline
 JIT, Apple HVF, Linux KVM, and an Android feasibility decision. Platform NCE
@@ -257,21 +264,20 @@ separate:
   thread. It has distinct A64 and AArch32 representations; CPSR.T selects A32 or
   T32 within the AArch32 representation. Architectural state never belongs to
   an engine.
-- `VcpuExecutionState` owns resources associated with a currently executing
-  virtual CPU, such as its software TLB, dispatch budget, pending-event state,
-  safepoint data, and local exclusive monitor. These resources are not part of
-  a guest thread's register file or a persistent process state. The scheduler
-  defines how local-monitor state is handled when a thread migrates.
+- An engine executor owns resources associated with a currently executing
+  virtual CPU, such as its dispatch budget, pending-control observation, and
+  local exclusive monitor. These resources are not part of a guest thread's
+  register file or persistent process state. The scheduler defines how local
+  monitor state is handled when a thread migrates.
 
-`VcpuExecutionState` is a scheduler/worker ownership concept, not a concrete
-type in `nixe-cpu`. Until the scheduler introduces the common container, each
-engine owns its executor-local representation; `nixe-cpu` exposes only portable
-exclusive-reservation values required by the memory contract.
+`VcpuExecutionState` is a runtime worker-owned lease container, not a type in
+`nixe-cpu` or a place for engine-specific acceleration. Each engine owns its
+executor-local representation; `nixe-cpu` exposes only portable exclusive-
+reservation values required by the memory contract.
 
 Conceptually:
 
 ```rust,ignore
-#[repr(C)]
 pub struct ProcessCpuContext {
     pub profile_id: CpuProfileId,
     pub address_space_id: AddressSpaceId,
@@ -282,7 +288,6 @@ pub enum ThreadCpuState {
     A32(A32State),
 }
 
-#[repr(C)]
 pub struct A64State {
     pub x: [u64; 31],
     pub sp: u64,
@@ -294,32 +299,28 @@ pub struct A64State {
     pub thread_pointer: u64,
 }
 
-#[repr(C)]
 pub struct A32State {
-    pub r: [u32; 16],
+    pub r: [u32; 15],
+    pub pc: u32,
     pub cpsr: u32,
     // VFP/NEON storage, FPSCR, and required user-visible system state.
 }
 
-pub struct VcpuExecutionState {
-    pub software_tlb: SoftwareTlb,
-    pub exclusive: ExclusiveMonitorState,
-    pub pending_events: AtomicU32,
-    pub dispatch_budget: u64,
-}
 ```
 
-These examples are illustrative; final layouts are decided by generated offset
-tests and ABI requirements. Important rules are:
+These examples illustrate semantic fields, not Rust layout or an ABI. Important
+rules are:
 
 - A64 state must not be used as the storage model for A32/T32 state.
 - A32 PC reads, CPSR flags, T state, register banking assumptions, and VFP/NEON
   aliases are represented according to AArch32 semantics.
 - A32/T32 interworking updates architectural state; it is not a profile change.
-- These layouts are internal and versioned. They are not a save-state format.
-- Generated code addresses fields through checked, generated constants.
+- Canonical Rust layout is not a save-state, native-engine interchange, or
+  generated-code ABI.
+- A native engine imports and exports fields explicitly; generated code
+  addresses only its provider-private checked layout.
 - State visible to helpers is committed before a helper that can observe it.
-- State not observable by an exit may remain in host registers within a block.
+- State not observable by an exit may remain in host registers within a region.
 - Every faulting IR operation has enough metadata to reconstruct precise guest
   state.
 - Host floating-point state is treated as scratch owned by the executor and is
@@ -327,10 +328,11 @@ tests and ABI requirements. Important rules are:
 - An engine may cache architectural state while executing, but it commits every
   guest-visible component to `ThreadCpuState` before returning an exit.
 
-One AMD64 nonvolatile register should normally hold the active
-`ThreadCpuState` representation while guest code is running. Another fixed
-pointer or a containing execution context may expose `VcpuExecutionState` if
-benchmarks show a net benefit across supported host ABIs.
+The JIT imports canonical state into a private native execution frame once at
+slice entry and commits it at every observable exit. Cranelift may keep values
+in host registers within and across internal region edges; neither register
+assignment nor the native frame layout is part of `ThreadCpuState` or the
+engine-neutral ABI.
 
 ### 7.1 Engine run-slice boundary
 
@@ -383,9 +385,9 @@ The scalar Switch 1 MVP includes predicated A32 integer execution, common T32
 16-bit forms, selected T32 32-bit forms, ordinary, multiple, and initial NEON
 memory transfers, exceptions, calls, and A32/T32 interworking. Exact A32 VFP
 semantics remain explicit fallback until the architectural FP provider exists.
-A32 acquire/release and exclusive execution remains a Phase 4 item until
-`CpuMemory` exposes reservation identity and generation; recognizing an encoding
-must not be mistaken for implementing its memory-model semantics.
+A32 acquire/release and exclusive execution remains tracked by `JIT-004` and
+`JIT-012`; recognizing an encoding must not be mistaken for implementing its
+memory-model semantics.
 
 Generated conformance tests should enumerate boundary encodings and verify that
 decoder patterns neither overlap unexpectedly nor leave declared instructions
@@ -396,9 +398,12 @@ unreachable.
 ### 9.1 Form
 
 The IR is typed, SSA-like within one translation unit, and explicitly models
-side effects. A translation unit begins as a basic block and may later become a
-small extended block or trace. It is not a whole guest function: guest code may
-jump into any aligned instruction and code pages may change.
+side effects. The production translation unit is a bounded multi-block region,
+not a whole guest function: guest code may jump into any aligned instruction
+and code pages may change. Region formation internalizes profitable direct and
+conditional edges while preserving arbitrary entry points, exact code
+dependencies, precise fault locations, execution-state changes, and bounded
+safepoints.
 
 Required scalar and vector types include:
 
@@ -433,7 +438,7 @@ An operation that may trap carries a `LocationDescriptor` containing at least
 the guest PC and execution context required by the exception model.
 
 Each memory operation represents one complete architectural access. The
-frontend does not split an access at a page boundary: the backend may select a
+frontend does not split an access at a page boundary: JIT lowering may select a
 fast path for a proven single-page access or a precise slow path that validates
 the whole range before committing visible effects. Pre- and post-indexed base
 writeback is emitted after the potentially faulting access so optimization and
@@ -443,7 +448,7 @@ lowering preserve exception ordering.
 
 NZCV must not be represented as an implicit host flags dependency across the
 entire IR. Arithmetic produces a lazy flag value, and condition consumers read
-only the bits they require. The backend may keep a short-lived value in host
+only the bits they require. Cranelift may keep a short-lived value in host
 flags where profitable, but it must materialize architectural NZCV at exits or
 when another operation clobbers the required host flags.
 
@@ -456,7 +461,7 @@ Baseline compilation performs bounded, linear or near-linear passes only:
 - Constant folding and algebraic simplification.
 - Copy propagation.
 - Dead temporary and dead flag elimination.
-- Redundant guest-state load/store elimination within the unit.
+- Redundant guest-state load/store elimination within the region.
 - Address folding.
 - Known-bit and zero/sign-extension simplification.
 - Local load/store pairing when fault and ordering semantics remain identical.
@@ -465,12 +470,13 @@ Baseline compilation performs bounded, linear or near-linear passes only:
 No baseline pass may have unbounded iteration. Translation latency, generated
 code size, and execution speed must be measured separately.
 
-Cross-block optimization is deferred to an optional hot tier. The baseline JIT
-must be capable of running complete titles efficiently without it.
+Only bounded local and region-wide transformations needed by the production JIT
+are planned. Speculative trace compilation, deoptimization, and a second hot
+tier are outside this architecture.
 
 ### 9.5 Verification
 
-Every IR block is verified in debug and test builds for:
+Every IR block and formed region is verified in debug and test builds for:
 
 - Type correctness.
 - Dominance and use-before-definition.
@@ -481,9 +487,9 @@ Every IR block is verified in debug and test builds for:
 
 The textual IR printer is a required debugging interface, not optional tooling.
 
-## 10. Translation unit formation
+## 10. Translation-region formation
 
-A baseline block ends at the earliest of:
+Initial block discovery ends at the earliest of:
 
 - An unconditional or indirect control-flow transfer.
 - A conditional branch, unless represented as a bounded extended block.
@@ -492,161 +498,178 @@ A baseline block ends at the earliest of:
 - A configured instruction or byte limit.
 - A guest page boundary in modes where cross-page validation is expensive.
 
-The block key is conceptually:
+The region key is conceptually:
 
 ```rust,ignore
-pub struct BlockKey {
+pub struct RegionKey {
     pub guest_pc: u64,
     pub address_space_id: u64,
-    pub code_page_id: u64,
-    pub code_generation: u64,
     pub profile_id: u32,
     pub execution_state: ExecutionState,
     pub translation_context: TranslationContext,
+    pub code_dependencies: CodeDependencies,
 }
 ```
 
 Only context that can change translation semantics belongs in the key. Runtime
 data such as general registers must not fragment the cache. Resolving a virtual
 PC to a physical code-page identity before the main lookup prevents unrelated
-mapping changes from invalidating the entire code cache. A unit spanning more
+mapping changes from invalidating the entire code cache. A region spanning more
 than one page records every physical page and generation as dependencies in its
 metadata rather than expanding the hot lookup key without bound.
 
 `translation_context` contains only additional state that changes decoding or
 lifting at block entry, such as T32 IT state when applicable. It is not a bag of
 arbitrary vCPU state. Direct branch exits retain the destination guest address
-and destination execution state; the dispatcher resolves those to host blocks.
+and destination execution state; the dispatcher resolves those to native
+regions.
 
-Small extended blocks can include a conditional branch and its fall-through
-path. Trace formation and speculative guards are optional future work and must
-not complicate precise exceptions in the baseline design.
+The region builder may internalize bounded direct successors and both sides of
+a conditional branch. Indirect edges, required observable exits, and edges that
+would exceed instruction, byte, IR, page-dependency, or safepoint limits remain
+external. `nixe-cpu` owns region formation for the JIT; the interpreter and
+future NCE providers do not depend on the region representation.
 
-## 11. AMD64 backend
+## 11. Cranelift lowering and the native ABI
 
-### 11.1 Host feature tiers
+### 11.1 One code generator
 
-The executable selects a backend feature tier once per process:
+`nixe-cpu-engine-jit` pins one compatible Cranelift release and is the only
+crate which depends on it. Verified Nixe IR is lowered to Cranelift IR without
+re-decoding guest instructions. Both IRs are verified in debug and test builds
+before native code is published.
 
-- A conservative AMD64 tier for broad compatibility.
-- An enhanced SIMD tier using host features such as SSSE3/SSE4.1 when present.
-- An AVX2/FMA tier for profitable vector sequences.
-- Future tiers only when supported by measurements and tests.
+Guest and host capabilities are independent. `GuestCpuProfile` decides whether
+an instruction is legal; the JIT's capability probe and guarded lowering decide
+whether Cranelift may use a native operation with identical semantics. Otherwise
+lowering invokes an exact typed helper. Cranelift owns host instruction
+selection, register allocation, calling-convention details, and emission for
+supported x86-64 and AArch64 hosts. Nixe has no host-feature tier, direct
+instruction encoder, or second code-generation path.
 
-Guest capabilities and host capabilities are independent. A guest instruction
-is legal according to `GuestCpuProfile`; its lowering is selected according to
-the host tier. Unsupported host operations call a semantically exact helper.
+Particularly sensitive operations include saturation and narrowing, FP NaNs and
+status, vector shifts and table lookups, exclusives and atomics, cache
+maintenance, and cross-page accesses. A native operation is selected only when
+its behavior matches the selected guest profile; otherwise the helper is the
+production lowering for that operation, not a semantic approximation.
 
-Using AVX requires consistent handling of upper vector state and host ABI
-transitions. Mixed SSE/AVX penalties and `vzeroupper` placement must be handled
-by backend policy, not individual instruction translators.
+### 11.2 Private native execution frame
 
-### 11.2 Register allocation
+Generated regions receive one private `repr(C)` execution frame owned by the
+JIT. It contains imported architectural state, JIT memory-acceleration data,
+control flags, the helper table, and normalized exit storage. Field offsets are
+generated and checked. Canonical `ThreadCpuState` is imported once at slice
+entry and committed once at every exit that can expose state; generated code
+does not cross the Rust ABI at ordinary region boundaries.
 
-A linear-scan allocator is the default. Translation units are short, compile
-time matters, and predictable spills are preferable to a complex global
-allocator.
+The established frame is versioned and sized explicitly, contains independent
+complete A64 and A32/T32 payloads rather than exposing a Rust enum or union,
+and uses checked two-limb vector values at its C boundary. The initial executor
+retains this frame and reusable Cranelift contexts while returning the explicit
+`InterpretOne` exit until Cranelift lowering is implemented;
+it does not contain a second semantic executor.
 
-Allocator requirements:
+The frame, Cranelift IR, software TLB, native entry convention, spill storage,
+and exit-record layout never appear in `nixe-cpu-engine`, `nixe-runtime`,
+`nixe-memory`, or an NCE crate. Rust panics and unwinding must not cross
+generated code. Entry/exit trampolines catch host-side failures at a safe Rust
+boundary and convert them to a typed engine fault with precise committed state.
 
-- Integer, vector, and flags constraints.
-- Fixed-register constraints for shifts, multiply/divide, atomics, and calls.
-- Caller/callee-saved knowledge for every supported host ABI.
-- Rematerialization of constants and cheap address expressions.
-- Spill slots in a dedicated JIT frame, not arbitrary modifications to
-  `ThreadCpuState`.
-- Parallel move resolution for block exits and helper calls.
+### 11.3 Versioned helper ABI
 
-The initial implementation should not pin an execution state's entire guest
-register file across blocks. Within-block state caching delivers most of the
-maintainable benefit. Linked block entry conventions can later carry a small,
-measured set of live values.
+The helper table is a small, versioned JIT-private ABI generated from typed
+declarations. Its established memory-read, memory-write, atomic, and system
+slots have non-unwinding C signatures and remain null until their implementations
+can be validated with published code. Each helper declares the architectural state and memory effects
+it observes, whether it may fault or schedule, and whether execution may resume
+inside the region. Generated code calls no Horizon, scheduler, runtime, GPU, or
+host graphics API.
 
-### 11.3 Instruction selection
+Helpers provide the precise path for MMIO, cross-page accesses, uncommon
+ordering, exclusives or atomics without an exact native lowering, cache and
+system operations, device-authoritative memory, and normalized exits. A helper
+which can expose guest state receives committed state at the declared boundary.
+Hot recoverable memory helpers may resume at a side entry in the originating
+region after updating the execution frame; architectural exits return through
+the single native exit trampoline.
 
-Lowering is pattern-based and local. Complex semantics may use helpers until a
-native sequence is proven correct. Particularly sensitive areas are:
-
-- Saturating and narrowing SIMD operations.
-- Floating-point NaNs, rounding, flush-to-zero, and exception flags.
-- Variable vector shifts and table lookups.
-- Exclusive monitors and large-system-extension atomics.
-- Unaligned accesses crossing a page boundary.
-
-A fast incorrect lowering is worse than a helper. Profiling identifies which
-helpers justify native implementations.
-
-### 11.4 Host ABI and generated-code ABI
-
-Generated blocks use a private ABI. Entry and exit trampolines are the only
-places that translate between the platform ABI and JIT ABI. Helpers use typed
-stubs generated from declarations so that register preservation and stack
-alignment cannot diverge between call sites.
-
-Every exit returns an explicit reason:
-
-```rust,ignore
-pub enum ExitReason {
-    Dispatch { next_pc: u64 },
-    Syscall,
-    Exception,
-    Interrupt,
-    TimesliceExpired,
-    MemorySlowPath,
-    CodeInvalidated,
-    DebugTrap,
-    Stop,
-}
-```
-
-Hot memory slow paths should resume inside the originating block when safe
-rather than always returning to the outer runtime.
+Helper table indices, signatures, frame offsets, and resume targets are
+validated before publication. Adding a helper does not expand the neutral engine
+contract and does not create a second semantic memory service.
 
 ## 12. Code cache and dispatch
 
 ### 12.1 Lookup
 
-The dispatcher uses a small per-thread level-zero cache followed by a shared or
-per-process block table. An indirect branch may use a polymorphic inline cache
-containing a few recent guest-target to host-target pairs.
+The dispatcher uses a small per-vCPU lookup cache followed by the bounded domain
+code cache. An indirect branch may use a small polymorphic cache containing
+recent guest-target to native-entry pairs.
 
-Direct branches are patched to the destination block after it is compiled.
-Links are atomically replaceable so invalidation never exposes a partially
-patched instruction stream.
+Direct and conditional exits load atomically replaceable link cells from
+writable metadata. Published executable pages are immutable: ordinary linking
+does not patch native instructions or temporarily make them writable. A miss
+returns to one resolver. Links may name only published live entries and become
+unreachable before invalidated storage can be reclaimed.
 
 ### 12.2 Ownership
 
-The recommended ownership model is:
+The ownership model is:
 
-- Immutable compiled block metadata after publication, except atomic links and
+- Immutable compiled region metadata after publication, except atomic links and
   counters.
-- Per-process translation identity and invalidation indices.
+- One domain cache owning translation identity, reverse-dependency indices,
+  link tables, and retirement state.
 - Read-mostly access by vCPU threads.
-- Compilation either by the requesting vCPU or a controlled compiler service.
-- Reclamation through epochs or stop-the-world cache rotation, never immediate
-  free while another vCPU may execute the block.
+- The domain coordinates single-flight compilation and owns all published
+  results; compilation scheduling does not change cache ownership.
+- The JIT provider supplies one reclaimable process-wide executable-memory
+  owner retained by live providers, domains, and executors. A domain cache owns
+  the identity, metadata, links, and lifetime of its published results; the
+  process owner owns only the bounded OS mapping and page-publication mechanism.
+- Reclamation through epochs, never immediate free while another vCPU may
+  execute the region.
 
 A single global lock around dispatch is not acceptable. A coarse lock during
-rare cache allocation or rotation can be acceptable if measurements support it.
+rare cache-segment allocation or retirement can be acceptable if measurements
+support it.
 
 ### 12.3 Executable memory
 
-The cache must enforce write xor execute. Preferred implementations use two
-views of the same backing allocation, one writable and one executable. Where a
-platform cannot provide dual mappings, permission changes are isolated to
-sealed batches and synchronized before publication.
+The JIT executable-memory owner enforces write xor execute in a 64 MiB arena
+with at most 4096 page-isolated publications. Checked accounting rejects an
+invalid alignment, arithmetic overflow, byte exhaustion, or segment exhaustion
+before publication. A failed platform transition poisons the owner so a
+partially transitioned page can never be reused.
 
-The emitter writes only through the writable view. Executing threads see only
-fully finalized blocks. Instruction-cache maintenance is performed according to
-the host platform even though coherent AMD64 hosts commonly require no explicit
-flush.
+Capability probing reserves and seals one internal page containing an
+unreachable sentinel. That publication counts against both bounds and exposes
+no native entry; every later publication accepts only finalized Cranelift
+output.
+
+On non-Apple Unix, pages transition once from read-write to read-execute with
+`mprotect`. Windows reserves an inaccessible arena, commits each segment
+read-write, seals it read-execute with `VirtualProtect`, and calls
+`FlushInstructionCache`. macOS creates one `MAP_JIT` arena and uses
+`pthread_jit_write_protect_np` for thread-local write/execute exclusion plus
+`sys_icache_invalidate`; capability probing rejects a missing JIT policy and the
+incompatible JIT write-allowlist entitlement. x86-64 relies on its coherent
+instruction cache after the compiler publication fence, while AArch64 performs
+the required data-cache clean, barriers, and instruction-cache invalidation.
+
+The publisher copies that finalized output during the bounded writable
+publication interval. Executing threads see only immutable published regions.
+Instruction-cache maintenance is performed according to the host platform on
+both x86-64 and AArch64. Executable code and writable link/metadata storage are
+separate, and neither an arena pointer nor a native entry address is guest-
+visible or part of an engine-neutral API.
 
 ### 12.4 Cache pressure
 
-Code cache growth is bounded. The first policy should be simple arena rotation:
-stop publication, detach links, wait for executing epochs to drain, discard an
-arena, and recompile on demand. Fine-grained eviction is deferred until evidence
-shows it is required.
+Code cache growth is bounded by configured byte and compilation-work budgets.
+Segment retirement first detaches links and lookup entries, then waits until
+every executor has passed the retirement epoch before reclaiming native
+storage. Queued and in-progress compilation is cancellable during pressure or
+domain teardown.
 
 Persistent on-disk native code is not an initial feature. It creates validation,
 relocation, host-feature, executable-version, and security problems. Persisting
@@ -679,14 +702,21 @@ pub struct FastTlbEntry {
     pub guest_page_tag: u64,
     pub host_page_base: usize,
     pub flags: u32,
-    pub mapping_epoch: u32,
+    pub mapping_epoch: u64,
 }
 ```
 
-For normal RAM, translated code performs tag, permission, and epoch checks and
-then accesses `host_page_base + page_offset`. Flags force the slow path for
-MMIO, watchpoints, GPU-owned pages, code-write tracking, unusual alignment, or
-other special behavior.
+The real entry also retains a safe canonical-backing lease, access class,
+visibility state, and exact permissions. The host base is valid only for the
+lifetime and epoch certified by that lease. `nixe-memory` may expose a neutral
+direct-access lease describing canonical identity, lifetime, permissions, and
+visibility; it never exposes or stores a JIT software-TLB entry.
+
+For normal RAM, translated code performs tag, permission, access-class,
+visibility, width, page-boundary, and epoch checks and then accesses
+`host_page_base + page_offset`. Flags force the slow path for MMIO, watchpoints,
+GPU-owned pages, executable or observed writes, unusual alignment or ordering,
+and all other special behavior.
 
 Writable pages that can be consumed by a device use a first-write barrier. The
 first CPU store in a clean ownership epoch takes a slow path, marks the affected
@@ -698,27 +728,7 @@ ordinary store.
 This design is portable, debuggable, compatible with multiple guest address
 spaces, and similar to the proven QEMU SoftMMU strategy.
 
-### 13.3 Optional fault-based fastmem
-
-A later AMD64-specific mode may reserve a large host virtual range and encode
-guest addresses directly into host accesses. Host access faults are decoded
-using generated-code metadata and redirected to MMIO, permission faults, page
-population, or guest exceptions.
-
-Fault fastmem is optional because it introduces substantial costs:
-
-- Signal or structured-exception integration.
-- Async-signal-safe lookup constraints.
-- Host virtual-address-space requirements.
-- Difficult debugger and sanitizer interaction.
-- Alias and multiple-address-space complexity.
-- Platform-specific recovery code.
-
-The IR and memory API must support both modes without changing AArch64
-semantics. Software-TLB fastmem is implemented first and retained as the
-portable/reference JIT path.
-
-### 13.4 Cross-page and unaligned access
+### 13.3 Cross-page and unaligned access
 
 An access whose bytes can cross a guest page boundary must validate both pages
 before committing an architecturally indivisible effect. The fast path may
@@ -730,15 +740,24 @@ effect afterward.
 
 ## 14. Code invalidation and cache maintenance
 
-Compiled blocks are indexed by every guest physical code page they cover. Each
-page tracks a code generation and a list or compact index of dependent blocks.
+Canonical memory publishes mapping and executable-content changes through one
+monotonic engine-neutral invalidation source. Records describe the semantic
+change using address-space, virtual mapping, canonical page/range, permissions,
+visibility, and generations. They never contain a JIT region/link identity or
+an NCE framework object.
 
-When code becomes invalid:
+Each engine domain consumes the source through an acknowledged cursor. The JIT
+uses reverse dependencies from virtual mappings and physical code pages to
+regions and TLB entries. A future NCE uses the same events to reconcile VM
+mappings or inject traps. Neither mechanism changes the shared record format.
 
-1. The page generation changes.
-2. Incoming direct links are atomically redirected to the dispatcher.
-3. Blocks are marked unavailable for new entries.
-4. Existing executions reach a safe exit before reclamation.
+When compiled code becomes invalid:
+
+1. Canonical memory publishes the new mapping or content generation.
+2. The JIT makes incoming link cells and lookup entries miss.
+3. Dependent regions and TLB entries become unavailable for new entries.
+4. Every executor acknowledges the event after stale state is unreachable.
+5. Native storage is reclaimed only after the retirement epoch has drained.
 
 ARM software normally uses explicit data-cache clean and instruction-cache
 invalidate sequences when publishing code. The memory subsystem should model
@@ -746,8 +765,11 @@ those operations and invalidate at the architecturally visible point. A
 conservative write-watch mode must also exist for debugging, incomplete cache
 modeling, and mappings where code/data aliases make explicit tracking unsafe.
 
-Writes through any virtual alias must invalidate blocks associated with the same
-guest physical page. Indexing solely by guest virtual address is incorrect.
+Writes through any virtual alias must invalidate regions associated with the
+same canonical physical page. Mapping changes also invalidate dependencies on
+the affected virtual view. The dispatcher does not revalidate every dependency
+on every entry; publication, reverse indices, cursors, and retirement make stale
+native code unreachable.
 
 ## 15. Precise exceptions and host faults
 
@@ -789,19 +811,17 @@ default floating-point behavior. The implementation accounts for:
 - Min/max variants with different NaN semantics.
 - Conversion saturation and invalid-result behavior.
 
-Host MXCSR may be specialized for a block when profitable, but all transitions
-are explicit and host state is restored before returning to Rust or calling a
-normal helper. Rare modes may use software helpers.
-
-NEON is lowered to the best available combination of scalar AMD64, SSE, AVX,
-and helpers. The IR retains 64-bit and 128-bit vector semantics rather than
-prematurely exposing host register widths. Wider host instructions may combine
-independent guest operations only when exceptions and FP status remain correct.
+Cranelift native FP/vector operations may be used behind explicit host-feature,
+guest-profile, and FPCR guards. All host floating-point transitions are
+explicit and host state is restored before returning to Rust or calling a
+normal helper. Rare or mismatched modes use the exact architectural FP
+provider shared with interpreter helpers. The IR retains 64-bit and 128-bit
+vector semantics rather than exposing x86-64 or AArch64 register widths.
 
 ## 17. Atomics and the memory model
 
-AMD64 has a stronger default memory ordering than AArch64, but that does not
-remove the need to model AArch64 ordering explicitly. The IR distinguishes:
+Host memory ordering differs between x86-64 and AArch64 and never defines guest
+semantics. The IR distinguishes:
 
 - Plain memory accesses.
 - Acquire and release.
@@ -811,7 +831,7 @@ remove the need to model AArch64 ordering explicitly. The IR distinguishes:
 - Exclusive load/store pairs and explicit exclusive clear.
 - Profile-enabled atomic read-modify-write instructions.
 
-The backend may legally implement a guest operation with stronger host ordering
+Cranelift lowering may implement a guest operation with stronger host ordering
 when observable behavior remains correct, but systematic over-serialization is
 a performance bug and may conceal missing guest synchronization in tests.
 
@@ -836,7 +856,7 @@ affinity, migration, suspension, and event delivery under the guest scheduler's
 control. Every engine cooperates through the same safepoint and run-slice
 protocol.
 
-A block receives an instruction budget or deadline token. Generated code checks
+A region receives an instruction budget or deadline token. Generated code checks
 for exits at bounded intervals and at backward branches. The check covers:
 
 - Timeslice exhaustion.
@@ -845,8 +865,8 @@ for exits at bounded intervals and at backward branches. The check covers:
 - Global TLB or code invalidation requests.
 - Process termination.
 
-Checking only at block boundaries is acceptable while blocks are strictly
-bounded; trace tiers must insert additional polls.
+Regions poll at bounded safepoints and backward edges. No region-formation or
+linking decision may exceed the provider's declared maximum poll interval.
 
 Deterministic execution is a permanent policy, not temporary bring-up code. It
 models every configured vCPU while allowing only one host worker to execute one
@@ -970,7 +990,7 @@ are treated separately:
 1. The emulated fence establishes when GPU work completed.
 2. Guest synchronization establishes when the CPU may observe it.
 3. The coherency manager performs any host API barrier, invalidate, or download.
-4. The CPU fastmem entry becomes readable with the current backing/version.
+4. The CPU software-TLB entry becomes readable with the current backing/version.
 
 Until then, a TLB flag routes CPU accesses to the slow path. The slow path may
 wait, synchronize, or report the architecturally correct state; generated code
@@ -984,8 +1004,8 @@ The following should be shared unless testing disproves the abstraction:
 - Canonical semantic primitives where the Arm execution states genuinely agree.
 - Typed IR and verifier.
 - Interpreter framework.
-- AMD64 backend, register allocator, and host feature tiers.
-- Code cache, W^X allocator, dispatcher, and link machinery.
+- Cranelift lowering in the one portable JIT provider.
+- JIT-private code cache, W^X allocator, dispatcher, and link machinery.
 - Software TLB structure and memory slow-path ABI.
 - Exception metadata and host-fault recovery framework.
 - Scheduler safepoint protocol.
@@ -1018,17 +1038,18 @@ count, topology, priority ranges, and timeslice policy enter through a separate
 immutable machine scheduler profile; memory, kernel, and device differences use
 their respective platform adapters. Unverified Switch 2 CPU or scheduler facts
 remain explicit unknown profile values rather than inheriting Switch 1 values
-or a fixed four-core assumption. These differences do not require separate
-AMD64 instruction emitters unless guest semantics genuinely differ.
+or a fixed four-core assumption. These differences do not require separate code
+generators. Guest semantic differences remain in profiles, normalization, Nixe
+IR, and exact helpers.
 
-## 22. Engine and tiering policy
+## 22. Engine-family policy
 
-The engine implementations and tiers are:
+The engine families are:
 
 1. Reference interpreter: always available, simple, instrumentable, and exact.
-2. Baseline JIT: planned primary portable performance engine.
-3. Optional optimized hot tier: considered only after profiling real workloads.
-4. Optional platform NCE engines: selected only when host virtualization and
+2. Cranelift JIT: established provider/native ABI and planned primary portable
+   performance engine on supported x86-64 and AArch64 hosts.
+3. Optional platform NCE engines: selected only when host virtualization and
    the full guest profile, state, memory, trap, and execution-policy contracts
    are supported.
 
@@ -1036,10 +1057,8 @@ The interpreter is mandatory. JIT and NCE implementations use the same
 run-slice and state-commit boundary and may be unavailable without changing
 scheduler or Horizon semantics. Engine selection is capability-based; an
 explicitly requested incompatible engine fails before guest execution rather
-than silently selecting another engine. A hot tier is not assumed. If added, it
-should compile only frequently executed units and use guards with explicit side
-exits. Deoptimization metadata must reconstruct the active canonical
-`ThreadCpuState` at every side exit.
+than silently selecting another engine. A speculative optimizing tier and its
+deoptimization machinery are outside the current architecture.
 
 Platform NCE feasibility, privilege requirements, lifecycle seams, and current
 availability are versioned in [Native Code Execution Platform
@@ -1047,9 +1066,9 @@ Feasibility](NCE%20Platform%20Feasibility.md). In particular, Android
 virtualization is not currently considered a usable arbitrary-payload NCE
 facility.
 
-Tier counters should be sampled or incremented cheaply; an atomic counter on
-every block execution is not acceptable. Optimization must be disabled in
-deterministic validation modes.
+JIT counters are sampled cheaply; an atomic counter on every region execution
+is not acceptable. Deterministic validation uses the same lowering and semantic
+boundaries while disabling nondeterministic compilation policy.
 
 One interpreter step receives an immutable execution context containing
 `ProcessCpuContext` and a narrow `CpuMemory` view. Architectural register state
@@ -1060,16 +1079,21 @@ cache-maintenance callbacks will be added to this context only when those runtim
 contracts exist. Until then, instructions requiring them remain explicit
 fallbacks rather than approximate no-ops.
 
-The Phase 1 scalar MVP covers A64 control flow, integer/address generation,
-supported user-visible system registers and barriers, and ordinary scalar memory
-including acquire/release accesses. FP/SIMD, exclusives, atomics, and the
-multicore memory model remain Phase 4 work and do not hold the scalar MVP open.
+The completed scalar frontend foundation covers A64 control flow,
+integer/address generation, supported user-visible system registers and
+barriers, and ordinary scalar memory including acquire/release accesses.
+FP/SIMD, exclusives, atomics, and the multicore memory model remain tracked
+JIT/interpreter-parity work and do not weaken the completed frontend claim.
 
 ## 23. Fallback policy
 
-Fallback is per instruction or block, not per title. When the lifter encounters
-an instruction without JIT support it terminates the block and invokes the
-interpreter for that instruction. Afterward execution returns to dispatch.
+Fallback is per instruction or region, not per title. When the lifter encounters
+an instruction without JIT support it terminates formation before that
+instruction and invokes the interpreter for it. Afterward execution returns to
+dispatch.
+This mechanism remains part of the architecture for newly recognized
+instructions, but the production JIT is not complete until every instruction
+already supported by the interpreter runs without `InterpretOne`.
 
 Fallback helpers declare:
 
@@ -1077,7 +1101,7 @@ Fallback helpers declare:
 - Whether they access memory.
 - Whether they can raise an exception, schedule, or invalidate code.
 - Memory ordering effects.
-- Whether execution can resume inside a block.
+- Whether execution can resume inside a region.
 
 Unknown instructions do not become no-ops. Profile-disabled or unallocated
 encodings take the correct exception path.
@@ -1150,19 +1174,19 @@ No mutable global diagnostics configuration is permitted.
 Required developer features are:
 
 - Single-step interpreter mode.
-- Block-level JIT stepping.
-- A64, A32, and T32 disassembly plus pre/post-optimization IR and AMD64
-  disassembly dumps.
+- Region-level JIT stepping.
+- A64, A32, and T32 disassembly plus pre/post-optimization Nixe IR,
+  verified Cranelift IR, and host-native disassembly dumps.
 - Translation reason and timing traces.
 - Register and memory watchpoints.
 - Per-op fallback counters.
-- Block execution sampling.
+- Region execution sampling.
 - Code cache size, link hit rate, TLB hit rate, and invalidation metrics.
 - CPU/GPU upload, download, stall, and dirty-range metrics.
 - Deterministic event log sufficient to reproduce scheduler/device ordering.
 
-Instrumentation is inserted through IR or block hooks selected before
-translation. Production blocks contain no unconditional callback on every
+Instrumentation is inserted through IR or region hooks selected before
+translation. Production regions contain no unconditional callback on every
 instruction.
 
 The frontend exposes a separate opt-in block-report path. Normal translation
@@ -1187,9 +1211,10 @@ decoder, lifter, builder, or verifier.
 
 ### 25.1 Unit tests
 
-Each semantic primitive, decoder family, IR operation, optimization, register
-constraint, and encoder receives focused tests. Backend tests compare emitted
-bytes and execute code where the test host permits it.
+Each semantic primitive, decoder family, Nixe IR operation, optimization, and
+Cranelift lowering receives focused tests. JIT tests verify generated Cranelift
+IR, publication metadata, and execution where the test host permits it; they do
+not assert bytes from a second Nixe-owned encoder.
 
 ### 25.2 Differential execution
 
@@ -1217,16 +1242,16 @@ Fuzz targets include:
 - JIT versus interpreter scalar and SIMD semantics.
 - Cross-page, permission, and alias behavior.
 - Fault metadata lookup.
-- Concurrent invalidation and direct-link patching.
+- Concurrent invalidation and link-cell retirement.
 - Exclusive monitors and atomic litmus tests.
 - CPU/GPU dirty ownership transitions.
 
 ### 25.4 Memory-model tests
 
 Litmus tests cover acquire/release, barriers, exclusives, self-modifying code,
-and multicore visibility. Tests must run repeatedly with forced yields and on
-different host architectures when an AArch64 backend exists; AMD64's stronger
-ordering can otherwise hide missing barriers.
+and multicore visibility. Tests must run repeatedly with forced yields on both
+supported x86-64 and AArch64 hosts; stronger host ordering can otherwise hide
+missing barriers.
 
 ### 25.5 End-to-end milestones
 
@@ -1253,7 +1278,7 @@ Guest code is untrusted input even when obtained lawfully. The JIT must:
 - Keep host fault handlers allocation-free and narrowly scoped.
 - Bound block length, IR growth, code size, and cache memory.
 - Avoid invoking Rust unwinding across generated code or signal frames.
-- Validate helper indices and patch targets.
+- Validate helper indices, link targets, and resume targets.
 - Keep debugging or writable code-cache views inaccessible to guest mappings.
 
 A malformed executable should produce a controlled loader, memory, or guest
@@ -1264,20 +1289,20 @@ exception error, not host undefined behavior.
 Performance work is evidence-driven. Benchmarks separately report:
 
 - Decode/lift time per guest instruction.
-- Optimization and backend time.
+- Nixe IR optimization and Cranelift compilation time.
 - Generated bytes per guest instruction.
 - Cold-start and steady-state execution.
 - Dispatcher and indirect-branch miss rates.
 - Software-TLB hit/miss cost.
 - Helper and interpreter fallback frequency.
-- Code invalidation and cache rotation cost.
+- Code invalidation and segment-retirement cost.
 - Scheduler safepoint overhead.
 - CPU/GPU synchronization bytes and wait time.
 
-The baseline target is low enough translation overhead that code is profitable
-after few executions, while producing code fast enough for games without a hot
-tier. Numeric thresholds should be established from Nixe microbenchmarks on a
-documented host matrix rather than copied from unrelated runtimes.
+The target is low enough translation overhead that code is profitable after few
+executions while the single Cranelift JIT remains fast enough for games. Numeric
+thresholds should be established from Nixe microbenchmarks on a documented host
+matrix rather than copied from unrelated runtimes.
 
 Optimization order should normally be:
 
@@ -1285,8 +1310,9 @@ Optimization order should normally be:
 2. Improve memory and dispatch fast paths.
 3. Eliminate redundant architectural-state traffic.
 4. Improve common integer and SIMD lowering.
-5. Improve block formation and linking.
-6. Consider a hot tier only after the above are measured.
+5. Improve region formation and linking.
+6. Improve bounded Cranelift lowering only after the preceding costs are
+   measured.
 
 ## 28. Major technical decisions
 
@@ -1294,56 +1320,49 @@ Optimization order should normally be:
 
 Decision: accepted.
 
-Justification: it provides a stable boundary between guest semantics and host
-backends, supports an interpreter and future AArch64 host backend, and makes
-exceptions, ordering, and instrumentation explicit. Direct instruction-to-
-instruction translation is initially smaller but becomes difficult to maintain
-for flags, SIMD, optimization, and multiple hosts.
+Justification: it provides a stable boundary between guest semantics and the
+one JIT code generator, keeps the interpreter independent, leaves future NCE
+engines free of compiler IR, and makes exceptions, ordering, and
+instrumentation explicit.
 
-### D2: Use a direct AMD64 baseline backend
-
-Decision: accepted.
-
-Justification: short blocks require low compile latency and emulator-specific
-control over patching, state, fault sites, and memory fast paths. The backend's
-scope is constrained by the IR.
-
-### D3: Keep Cranelift optional
+### D2: Use Cranelift as the only JIT code generator
 
 Decision: accepted.
 
-Justification: Cranelift is a credible Rust backend and valuable comparison
-point, but adopting it as the primary tier would still require custom machinery
-for dispatch, code invalidation, fastmem faults, precise state maps, and block
-links. It may later serve as a prototype, validation backend, or hot tier if a
-measured experiment justifies it.
+Justification: Cranelift supplies maintained x86-64 and AArch64 instruction
+selection, register allocation, ABI handling, verification, and native emission
+with compilation latency suitable for the baseline JIT. Nixe retains the
+emulator-specific dispatcher, state frame, helpers, cache, linking, memory fast
+path, and invalidation that a general compiler cannot own. A direct host-ISA
+emitter or alternative compiler tier would duplicate semantics and lifetime
+paths and is not part of the architecture.
 
-### D4: Do not integrate Dynarmic as the architectural core
-
-Decision: provisionally accepted.
-
-Justification: Dynarmic is the closest proven design and an important reference,
-but direct integration would place the core CPU engine and substantial C++
-infrastructure outside Nixe's Rust architecture. Reconsider this if early
-execution is prioritized over owning and researching the CPU implementation.
-License compatibility and maintenance status must be re-evaluated at that time.
-
-### D5: Implement software-TLB fastmem first
+### D3: Keep native-code machinery inside the JIT provider
 
 Decision: accepted.
 
-Justification: it is portable, supports multiple address spaces and aliases,
-and keeps faults debuggable. Fault-based fastmem remains an optional measured
-optimization rather than an architectural dependency.
+Justification: Cranelift IR, the execution frame, helper table, software TLB,
+link cells, executable memory, cache entries, and retirement epochs are derived
+JIT state. Keeping them out of `nixe-cpu-engine`, memory, scheduler, and runtime
+preserves the common interpreter/JIT/NCE boundary.
 
-### D6: Keep graphics APIs out of generated CPU code
+### D4: Implement the software-TLB fast path
+
+Decision: accepted.
+
+Justification: it is portable across the supported host ISAs, supports multiple
+address spaces and aliases, keeps faults explicit, and derives safe entries from
+canonical memory without making host pointers authoritative. Fault-based
+fastmem is not part of the current JIT plan.
+
+### D5: Keep graphics APIs out of generated CPU code
 
 Decision: accepted.
 
 Justification: the semantic boundary is guest memory and device events. This
-preserves backend portability and centralizes CPU/GPU coherence.
+preserves engine and graphics portability and centralizes CPU/GPU coherence.
 
-### D7: Model one guest memory identity with adaptable host backing
+### D6: Model one guest memory identity with adaptable host backing
 
 Decision: accepted.
 
@@ -1351,12 +1370,23 @@ Justification: guest shared/unified memory semantics must work on both integrate
 and discrete host GPUs. Canonical page identity plus ownership/version tracking
 allows zero-copy, mirroring, or staging without changing the CPU engine.
 
-### D8: Require an interpreter as a first-class engine
+### D7: Require an interpreter as a first-class engine
 
 Decision: accepted.
 
 Justification: differential testing and incremental instruction coverage are
-essential for a maintainable JIT. The interpreter is not temporary scaffolding.
+essential for a maintainable JIT. The interpreter is not temporary scaffolding,
+and `InterpretOne` remains available for newly recognized semantics even though
+interpreter-parity coverage is a JIT completion gate.
+
+### D8: Preserve NCE as a separate engine family
+
+Decision: accepted.
+
+Future HVF, KVM, or other verified NCE providers consume canonical state,
+memory bindings, invalidation, control, and normalized exits. They never depend
+on Cranelift or JIT-private state, and NCE never means executing untrusted guest
+code directly inside Nixe's host process.
 
 ### D9: Bind host workers to active vCPUs, not guest threads
 
@@ -1373,73 +1403,21 @@ scheduler and topology. Unknown Switch 2 core counts and scheduling details are
 supplied by a validated machine scheduler profile and are never encoded as a
 four-vCPU invariant.
 
-## 29. Implementation phases and exit criteria
+## 29. Implementation order and completion
 
-### Phase 0: contracts and test harness
+The sole ordered implementation and release plan is
+[`notes/jit.md`](../notes/jit.md). Its
+Cranelift provider, private native ABI, and secure executable-memory owner are
+established; the remaining order continues with frontend parity and ends with
+complete differential, release, and performance gates. This specification defines the
+architecture those tasks must preserve; it does not maintain a parallel set of
+phases or accept completion through a transitional execution path.
 
-- Define `ProcessCpuContext`, `ThreadCpuState`, `VcpuExecutionState`, profiles,
-  execution-state selection, memory access results, and exit reasons.
-- Implement executable-memory abstraction and a minimal AMD64 call trampoline.
-- Establish interpreter/JIT differential harness.
-
-Exit: a generated block can enter and leave Rust safely on supported host ABIs.
-
-### Phase 1: scalar interpreter
-
-- Establish separate A64, A32, and T32 decoder skeletons behind one interface.
-- Decode the core A64 integer, branch, load/store, and exception subset first,
-  then add A32/T32 subsets according to redistributable tests and observed
-  workloads.
-- Map executable segments into the new memory service.
-- Run small test programs through runtime syscall callbacks.
-
-Exit: deterministic interpreter tests cover control flow and precise memory
-faults.
-
-### Phase 2: scalar baseline JIT
-
-- Lift implemented scalar instructions from each enabled execution state to
-  verified shared IR.
-- Add linear-scan allocation and conservative AMD64 lowering.
-- Add block lookup, bounded cache, and interpreter fallback.
-
-Exit: randomized differential tests pass and JIT execution is faster than the
-interpreter on representative scalar loops.
-
-### Phase 3: memory and dispatch performance
-
-- Inline software TLB.
-- Add direct links and indirect inline caches.
-- Add page-based invalidation and side-table exception recovery.
-
-Exit: memory, alias, self-modifying code, and concurrent invalidation suites pass.
-
-### Phase 4: FP, NEON, and atomics
-
-- Expand A32/T32 scalar and interworking coverage required by Switch 1 titles.
-- Complete execution-state-specific architectural FP control/status behavior.
-- Add vector IR and tiered AMD64 SIMD lowering.
-- Implement exclusive monitors, atomics, barriers, and multicore tests.
-
-Exit: differential FP/SIMD suites and memory-model litmus suites pass.
-
-### Phase 5: GPU coherency integration
-
-- Connect guest page identity to CPU and GPU virtual memory managers.
-- Implement dirty ownership, uploads/downloads, and fence visibility.
-- Measure unified and discrete host strategies.
-
-Exit: CPU-to-GPU and GPU-to-CPU end-to-end tests pass without unconditional
-whole-memory copies.
-
-### Phase 6: platform profiles
-
-- Validate and enable Switch 1 profile behavior.
-- Add separately sourced Switch 2 profile facts.
-- Keep unknown behavior explicit and tested behind profile capabilities.
-
-Exit: no product-name conditional exists inside generic decode, IR, or AMD64
-lowering code.
+A completed slice removes every superseded implementation, adapter, cache,
+invalidation mechanism, and test that existed only for the old path. The final
+production JIT has one Cranelift lowering path, one bounded domain cache, one
+link system, one software TLB with a precise helper slow path, and one
+engine-neutral invalidation source.
 
 ## 30. Open questions
 
@@ -1457,16 +1435,14 @@ decisions:
   capability is derived from the public compatibility description alone.
 - Guest page-table and address-space details exposed to the emulator runtime.
 - Required fidelity of cache-maintenance operations for titles and system code.
-- Whether software-TLB fastmem meets performance targets on Windows, Linux, and
-  macOS before fault fastmem is justified.
-- Best code cache ownership model under many simultaneously active guest threads.
-- Host baseline SIMD requirement and whether a non-SSE4.1 tier is worthwhile.
+- Software-TLB shape and replacement policy on supported x86-64 and AArch64
+  hosts.
+- Code-cache segment sizing and retirement policy under many simultaneously
+  active guest threads.
 - Granularity of CPU/GPU dirty tracking for buffers, textures, and aliased views.
 - Required semantics for CPU/GPU concurrent atomics and accesses to shared
   device-visible memory for each platform profile.
 - Feasibility and benefit of imported host memory on each graphics backend.
-- Whether an optimized hot tier materially improves games after GPU and memory
-  bottlenecks are addressed.
 - Requirements for save states, replay, and debugger integration that affect
   architectural-state versioning.
 
@@ -1491,8 +1467,8 @@ alternatives, benchmark/test method, and compatibility impact.
 - [QEMU TCG intermediate representation](https://www.qemu.org/docs/master/devel/tcg-ops.html)
   — typed translation-block IR and CPU-state representation.
 - [QEMU multi-threaded TCG](https://www.qemu.org/docs/master/devel/multi-thread-tcg.html)
-  — atomic block patching, software-TLB hot paths, cross-vCPU invalidation, and
-  memory consistency.
+  — translated-code publication, software-TLB hot paths, cross-vCPU
+  invalidation, and memory consistency.
 - [Cranelift](https://cranelift.dev/) — fast, maintainable, general-purpose code
   generation and its stated compilation/runtime trade-offs.
 - [Armv8-A memory model guide](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Armv8-A%20memory%20model%20guide.pdf?revision=58b1dd0a-3800-4218-b21a-f95a0332034c)

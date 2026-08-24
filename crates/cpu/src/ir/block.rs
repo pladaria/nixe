@@ -68,9 +68,9 @@ pub struct BlockExit {
     pub target: Option<GuestVirtualAddress>,
 }
 
-/// Backend-visible dispatch budget and safepoint annotation.
+/// JIT-visible dispatch budget and safepoint annotation.
 ///
-/// A backend polls at the block boundary and charges the completed guest
+/// JIT lowering polls at the block boundary and charges the completed guest
 /// instruction count. The frontend records policy only; it does not access a
 /// scheduler or vCPU budget directly.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -19,15 +19,15 @@ pub const FAKE_JIT_ENGINE_ID: EngineId = EngineId::new(0xf100);
 
 #[derive(Default)]
 pub struct FakeJitMetrics {
-    compiled_blocks: AtomicU64,
+    compiled_regions: AtomicU64,
     cache_hits: AtomicU64,
     invalidations: AtomicU64,
 }
 
 impl FakeJitMetrics {
     #[must_use]
-    pub fn compiled_blocks(&self) -> u64 {
-        self.compiled_blocks.load(Ordering::Acquire)
+    pub fn compiled_regions(&self) -> u64 {
+        self.compiled_regions.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -122,7 +122,7 @@ impl EngineDomain for FakeJitDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct BlockKey {
+struct RegionKey {
     address_space: AddressSpaceId,
     profile: CpuProfileId,
     pc: GuestVirtualAddress,
@@ -132,7 +132,7 @@ struct BlockKey {
 struct FakeJitExecutor {
     id: EngineExecutorId,
     oracle: Box<dyn EngineExecutor>,
-    cache: HashMap<BlockKey, u32>,
+    cache: HashMap<RegionKey, u32>,
     metrics: Arc<FakeJitMetrics>,
     acknowledged_epoch: u64,
 }
@@ -183,10 +183,10 @@ impl EngineExecutor for FakeJitExecutor {
                 engine: FAKE_JIT_ENGINE_ID,
                 kind: nixe_cpu_engine::EngineFaultKind::Internal,
                 instructions_executed: 0,
-                message: format!("fake JIT block fetch failed: {fault}").into_boxed_str(),
+                message: format!("fake JIT region fetch failed: {fault}").into_boxed_str(),
                 context: Box::new(request.state.register_context()),
             })?;
-        let key = BlockKey {
+        let key = RegionKey {
             address_space: request.cpu.address_space_id(),
             profile: request.cpu.profile().id(),
             pc: source.pc,
@@ -195,7 +195,7 @@ impl EngineExecutor for FakeJitExecutor {
         let cached = match self.cache.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(fetched.bits);
-                self.metrics.compiled_blocks.fetch_add(1, Ordering::AcqRel);
+                self.metrics.compiled_regions.fetch_add(1, Ordering::AcqRel);
                 fetched.bits
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -212,7 +212,7 @@ impl EngineExecutor for FakeJitExecutor {
         }
         if matches!(cached, 0xd503_201f | 0x9100_0400) {
             let ThreadCpuState::A64(state) = request.state else {
-                unreachable!("the synthetic block path is A64-only");
+                unreachable!("the synthetic region path is A64-only");
             };
             if cached == 0x9100_0400 {
                 let x0 =
@@ -255,8 +255,8 @@ impl EngineExecutor for FakeJitExecutor {
 fn descriptor() -> EngineDescriptor {
     EngineDescriptor {
         id: FAKE_JIT_ENGINE_ID,
-        name: "synthetic-block-jit".into(),
-        kind: EngineKind::BlockJit,
+        name: "synthetic-region-jit".into(),
+        kind: EngineKind::Jit,
         capabilities: EngineCapabilities {
             a64: true,
             a32: true,

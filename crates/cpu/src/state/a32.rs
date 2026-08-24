@@ -1,6 +1,6 @@
 //! AArch32 architectural state shared by A32 and T32 execution.
 
-use core::{fmt, mem::offset_of};
+use core::fmt;
 
 use crate::{location::ExecutionState, location::InstructionSize};
 
@@ -192,9 +192,10 @@ impl std::error::Error for InvalidBranchTarget {}
 /// operand reads apply the A32/T32 pipeline offset through [`Self::read_pc`].
 /// This is the user-mode process view; privileged banked registers and
 /// exception entry state belong to the runtime's exception model.
-/// The C layout is an internal backend ABI and is not a save-state format.
+/// Engines exchange this value through the canonical field-level contract. A
+/// native engine must not treat its Rust layout as a generated-code ABI or a
+/// save-state format.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[repr(C, align(8))]
 pub struct A32State {
     r: [u32; GENERAL_REGISTER_COUNT],
     pc: u32,
@@ -464,23 +465,8 @@ impl A32State {
     }
 }
 
-/// Stable offsets for the current internal machine-code backend ABI.
-pub mod offsets {
-    use super::*;
-
-    pub const R: usize = offset_of!(A32State, r);
-    pub const PC: usize = offset_of!(A32State, pc);
-    pub const CPSR: usize = offset_of!(A32State, cpsr);
-    pub const D: usize = offset_of!(A32State, d);
-    pub const FPSCR: usize = offset_of!(A32State, fpscr);
-    pub const TPIDRURW: usize = offset_of!(A32State, tpidrurw);
-    pub const TPIDRURO: usize = offset_of!(A32State, tpidruro);
-}
-
 #[cfg(test)]
 mod tests {
-    use core::mem::{align_of, size_of};
-
     use super::*;
     use crate::ir::op::Condition;
 
@@ -617,18 +603,5 @@ mod tests {
         assert_eq!(state.instruction_address(), 0x1000);
         assert_eq!(state.read_r(r(14)), 0xaaaa_aaaa);
         assert_eq!(state.execution_state(), ExecutionState::A32);
-    }
-
-    #[test]
-    fn backend_layout_offsets_are_intentional() {
-        assert_eq!(align_of::<A32State>(), 8);
-        assert_eq!(size_of::<A32State>(), 344);
-        assert_eq!(offsets::R, 0);
-        assert_eq!(offsets::PC, 60);
-        assert_eq!(offsets::CPSR, 64);
-        assert_eq!(offsets::D, 72);
-        assert_eq!(offsets::FPSCR, 328);
-        assert_eq!(offsets::TPIDRURW, 332);
-        assert_eq!(offsets::TPIDRURO, 336);
     }
 }

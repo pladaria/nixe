@@ -4,7 +4,7 @@ use core::fmt::Write;
 
 use super::{block::IrBlock, types::IrType, value::Value};
 
-/// Position of an IR dump in the frontend/backend optimization pipeline.
+/// Position of an IR dump in the Nixe IR optimization pipeline.
 ///
 /// The frontend currently emits only pre-optimization IR. Keeping the stage in
 /// the public diagnostic contract lets future optimization passes publish a

@@ -379,7 +379,7 @@ impl MemoryDescriptor {
 pub enum MemoryOperation {
     /// Read one complete architectural access from a guest address.
     ///
-    /// A backend may use multiple host operations internally, but it must keep
+    /// JIT lowering may use multiple host operations internally, but it must keep
     /// this as one precise guest access when a page or protection boundary is
     /// crossed.
     Load {
@@ -785,7 +785,7 @@ pub struct IrOperation {
     pub results: OperationResults,
     /// Semantic operation payload.
     pub kind: OperationKind,
-    /// Explicit optimizer/backend contract.
+    /// Explicit optimizer/lowering contract.
     pub effects: OperationEffects,
 }
 

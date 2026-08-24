@@ -1,9 +1,10 @@
 //! Guest architectural thread state.
 //!
-//! The `repr(C)` layouts in this module are an internal code-generation ABI.
-//! They are deliberately not a save-state or interchange format. Persistent
-//! state must use an explicitly versioned, field-by-field representation so a
-//! backend layout change cannot silently change serialized data.
+//! These types are the canonical semantic state exchanged through the neutral
+//! engine contract. They are not a generated-code ABI, save-state format, or
+//! native-engine interchange layout. A JIT imports fields into its private
+//! execution frame, and persistent or native-provider interchange uses an
+//! explicitly versioned field-by-field representation.
 
 pub mod a32;
 pub mod a64;
@@ -132,7 +133,7 @@ impl ThreadCpuState {
     }
 
     /// Captures bounded diagnostic state without retaining a reference to the
-    /// live thread or exposing its backend-oriented in-memory layout.
+    /// live thread or exposing its concrete in-memory layout.
     #[must_use]
     pub fn register_context(&self) -> RegisterContext {
         match self {

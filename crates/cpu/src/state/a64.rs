@@ -1,7 +1,5 @@
 //! AArch64 architectural state.
 
-use core::mem::offset_of;
-
 /// Number of architecturally stored A64 general-purpose registers.
 pub const GENERAL_REGISTER_COUNT: usize = 31;
 /// Number of A64 SIMD/floating-point registers.
@@ -81,11 +79,10 @@ impl Nzcv {
 
 /// Canonical A64 register state for one guest thread.
 ///
-/// This C layout is an internal backend ABI only; it is not a save-state
-/// format. Backend loads and stores must use the checked constants in
-/// [`offsets`].
+/// Engines exchange this value through the canonical field-level contract. A
+/// native engine must not treat its Rust layout as a generated-code ABI or a
+/// save-state format.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[repr(C, align(16))]
 pub struct A64State {
     x: [u64; GENERAL_REGISTER_COUNT],
     sp: u64,
@@ -230,28 +227,8 @@ impl A64State {
     }
 }
 
-/// Stable offsets for the current internal machine-code backend ABI.
-///
-/// Changing one of these values is an intentional backend ABI change, not a
-/// save-state migration.
-pub mod offsets {
-    use super::*;
-
-    pub const X: usize = offset_of!(A64State, x);
-    pub const SP: usize = offset_of!(A64State, sp);
-    pub const PC: usize = offset_of!(A64State, pc);
-    pub const NZCV: usize = offset_of!(A64State, nzcv);
-    pub const VECTOR: usize = offset_of!(A64State, vector);
-    pub const FPCR: usize = offset_of!(A64State, fpcr);
-    pub const FPSR: usize = offset_of!(A64State, fpsr);
-    pub const TPIDR_EL0: usize = offset_of!(A64State, tpidr_el0);
-    pub const TPIDRRO_EL0: usize = offset_of!(A64State, tpidrro_el0);
-}
-
 #[cfg(test)]
 mod tests {
-    use core::mem::{align_of, size_of};
-
     use super::*;
 
     fn x(index: u8) -> A64Register {
@@ -295,20 +272,5 @@ mod tests {
         assert_eq!(state.vector(31), Some(value));
         assert!(!state.set_vector(32, value));
         assert_eq!(state.vector(32), None);
-    }
-
-    #[test]
-    fn backend_layout_offsets_are_intentional() {
-        assert_eq!(align_of::<A64State>(), 16);
-        assert_eq!(size_of::<A64State>(), 816);
-        assert_eq!(offsets::X, 0);
-        assert_eq!(offsets::SP, 248);
-        assert_eq!(offsets::PC, 256);
-        assert_eq!(offsets::NZCV, 264);
-        assert_eq!(offsets::VECTOR, 272);
-        assert_eq!(offsets::FPCR, 784);
-        assert_eq!(offsets::FPSR, 788);
-        assert_eq!(offsets::TPIDR_EL0, 792);
-        assert_eq!(offsets::TPIDRRO_EL0, 800);
     }
 }

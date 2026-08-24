@@ -2,8 +2,8 @@
 //!
 //! Execution engines report an [`ExceptionDispatchRequest`]. Runtime policy
 //! handles it and returns an [`ExceptionDispatchOutcome`] which an outer
-//! execution loop applies. Neither side assumes that the source was the
-//! reference interpreter, frontend IR, or a native block.
+//! execution loop applies. Neither side assumes a particular interpreter, JIT,
+//! or future NCE implementation.
 
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::{

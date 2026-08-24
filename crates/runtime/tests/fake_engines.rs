@@ -92,7 +92,7 @@ fn fake_jit_interpret_one_fallback_preserves_canonical_state() {
             .unwrap()
             .engine_descriptor()
             .kind,
-        EngineKind::BlockJit
+        EngineKind::Jit
     );
     let compiled = coordinator.run_next(1).unwrap().unwrap();
     assert_eq!(compiled.report.stop, ExecutionStop::BudgetExhausted);
@@ -159,7 +159,7 @@ fn fake_jit_interpret_one_fallback_preserves_canonical_state() {
         execution.report.stop,
         ExecutionStop::ArchitecturalException { .. }
     ));
-    assert!(metrics.compiled_blocks() >= 2);
+    assert!(metrics.compiled_regions() >= 2);
     assert!(metrics.invalidations() > 0);
 }
 

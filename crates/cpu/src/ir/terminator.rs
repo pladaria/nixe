@@ -24,7 +24,7 @@ pub enum ControlTarget {
         execution_state: ExecutionState,
     },
     /// A32 `BX`/`BLX`-style target whose bit zero selects T32 versus A32 at
-    /// runtime. The backend masks the address according to the selected state.
+    /// runtime. The execution engine masks the address for the selected state.
     A32Interworking { address: Operand },
 }
 
