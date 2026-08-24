@@ -573,12 +573,9 @@ pub struct MaxwellThreeDSynchronizationOperation {
 impl MaxwellThreeDSynchronizationOperation {
     pub(crate) fn new(
         trigger: MaxwellThreeDSynchronizationTrigger,
-        state: MaxwellThreeDState,
+        state: Arc<MaxwellThreeDState>,
     ) -> Self {
-        Self {
-            trigger,
-            state: Arc::new(state),
-        }
+        Self { trigger, state }
     }
 
     #[must_use]

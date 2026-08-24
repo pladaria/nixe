@@ -967,7 +967,7 @@ fn draw_omits_compressed_depth_when_depth_and_stencil_tests_are_disabled() {
 }
 
 #[test]
-fn three_d_surface_clip_pair_preserves_origin_extent_sources_and_dependencies() {
+fn three_d_surface_clip_pair_preserves_sources_and_controls_draw_validation() {
     let allocation = CanonicalAllocation::zeroed(0x40_0000, 0x1000).unwrap();
     let backing = allocation
         .backing_range(MemoryPermissions::READ_WRITE)
@@ -976,7 +976,6 @@ fn three_d_surface_clip_pair_preserves_origin_extent_sources_and_dependencies() 
     let mapping = map_resource(&mut address_space, backing, 12, 0xfe);
     let address = mapping.offset().get();
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let dispatch =
         dispatch_incrementing(&mut channel, 0x0ff4 / 4, &[0x0500_0000, 0x02d0_0000]).unwrap();
 
@@ -1007,10 +1006,6 @@ fn three_d_surface_clip_pair_preserves_origin_extent_sources_and_dependencies() 
         Some(dispatch.methods()[1].method().source())
     );
     let clip_source = horizontal.source().unwrap();
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
     assert!(dispatch.ordered_operations().is_empty());
 
     for (method, argument) in [
@@ -1167,7 +1162,6 @@ fn standalone_inline_to_memory_rejects_invalid_sequences_atomically() {
 fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
     let mut channel = three_d_channel();
     dispatch_incrementing(&mut channel, 0x2380 / 4, &[0x10, 0, 0x82c_3000]).unwrap();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     let dispatch =
         dispatch_incrementing(&mut channel, 0x238c / 4, &[0, 0x1122_3344, 0x5566_7788]).unwrap();
@@ -1193,10 +1187,6 @@ fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
         let method = dispatch.methods()[index + 1];
         assert_eq!(method.metadata().method_name(), "LOAD_CONSTANT_BUFFER");
     }
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
@@ -2097,7 +2087,7 @@ fn procedural_draw_lowers_without_fabricating_a_vertex_stream() {
 }
 
 #[test]
-fn draw_routing_is_ordered_exact_and_separates_render_pass_and_pipeline_caches() {
+fn draw_routing_is_exact_and_reuses_one_graphics_pipeline_family() {
     let vertex_allocation = CanonicalAllocation::zeroed(0x4000, 0x1000).unwrap();
     let target_zero_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let target_one_allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
@@ -2169,6 +2159,10 @@ fn draw_routing_is_ordered_exact_and_separates_render_pass_and_pipeline_caches()
         &cache,
     )
     .unwrap();
+    assert!(plan.resource_creations().iter().any(|creation| matches!(
+        creation,
+        nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
+    )));
     assert_eq!(plan.dirty_images(), &[target_one_index]);
     assert_eq!(
         plan.resource_creations()
@@ -2260,7 +2254,6 @@ fn draw_routing_is_ordered_exact_and_separates_render_pass_and_pipeline_caches()
         [ImageFormat::Bgra8Unorm, ImageFormat::Rgba8Unorm]
     );
     plan.commit_cache(&mut cache).unwrap();
-    let pipeline_count = cache.pipeline_count();
 
     program_three_d(
         &mut channel,
@@ -2290,12 +2283,11 @@ fn draw_routing_is_ordered_exact_and_separates_render_pass_and_pipeline_caches()
                 ImageFormat::Bgra8Unorm,
             ])
     )));
-    assert!(plan.resource_creations().iter().any(|creation| matches!(
+    assert!(!plan.resource_creations().iter().any(|creation| matches!(
         creation,
         nixe_gpu::BackendResourceCreateInfo::Pipeline { .. }
     )));
     plan.commit_cache(&mut cache).unwrap();
-    assert_eq!(cache.pipeline_count(), pipeline_count + 1);
 }
 
 #[test]
@@ -2514,17 +2506,7 @@ fn ct_mrt_enable_only_affects_multi_target_draws_and_not_clears() {
     );
 
     program_three_d(&mut channel, 0x0fac, 0);
-    let single_target_disabled = channel.three_d().pipeline_dependencies(&[0]);
-    let multi_target_disabled = channel.three_d().pipeline_dependencies(&[0, 1]);
     program_three_d(&mut channel, 0x0fac, 1);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[0]),
-        single_target_disabled
-    );
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[0, 1]),
-        multi_target_disabled
-    );
 
     let (shaders, cache) = translated_graphics_shaders();
     let capabilities =

@@ -17,7 +17,7 @@ use nixe_gpu::{
     ImageSubresourceRange, ImageView, SampleCount, SamplerDescription, Swizzle,
 };
 use nixe_memory::{
-    CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalRangeAccessError,
+    CanonicalBackingRange, CanonicalCpuWriteDependency, CanonicalPageId, CanonicalRangeAccessError,
     CanonicalRangeError, CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions,
 };
 
@@ -722,6 +722,14 @@ struct ResourceBuilder<'a> {
     sample_mode: Option<MaxwellThreeDSampleMode>,
     resources: Vec<MaxwellThreeDResolvedResource>,
     samplers: Vec<MaxwellThreeDResolvedSampler>,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalResourceInterval {
+    page: CanonicalPageId,
+    start: u64,
+    end: u64,
+    resource: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1551,27 +1559,60 @@ impl<'a> ResourceBuilder<'a> {
     }
 
     fn finish(self) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
-        let mut aliases = Vec::new();
-        for right in 0..self.resources.len() {
-            for left in 0..right {
-                if self.resources[left]
-                    .backing_view()
-                    .overlaps(self.resources[right].backing_view())
-                {
-                    if contradictory_image_alias(&self.resources[left], &self.resources[right]) {
-                        return Err(MaxwellThreeDResourceError::ContradictoryAlias {
-                            first: self.resources[left].role(),
-                            second: self.resources[right].role(),
-                        });
-                    }
-                    aliases.push(MaxwellThreeDResourceAlias {
-                        first: u16::try_from(left)
-                            .map_err(|_| MaxwellThreeDResourceError::ResourceExhausted)?,
-                        second: u16::try_from(right)
-                            .map_err(|_| MaxwellThreeDResourceError::ResourceExhausted)?,
-                    });
+        let mut intervals = Vec::new();
+        for (resource, resolved) in self.resources.iter().enumerate() {
+            let resource = u16::try_from(resource)
+                .map_err(|_| MaxwellThreeDResourceError::ResourceExhausted)?;
+            intervals.extend(resolved.backing_view().canonical_intervals().map(
+                |(page, start, end)| CanonicalResourceInterval {
+                    page,
+                    start,
+                    end,
+                    resource,
+                },
+            ));
+        }
+        intervals.sort_unstable_by_key(|interval| {
+            (
+                interval.page,
+                interval.start,
+                interval.end,
+                interval.resource,
+            )
+        });
+
+        let mut active = Vec::<CanonicalResourceInterval>::new();
+        let mut alias_pairs = BTreeSet::new();
+        for interval in intervals {
+            active.retain(|candidate| {
+                candidate.page == interval.page && candidate.end > interval.start
+            });
+            for candidate in &active {
+                if candidate.resource != interval.resource {
+                    alias_pairs.insert((
+                        candidate.resource.min(interval.resource),
+                        candidate.resource.max(interval.resource),
+                    ));
                 }
             }
+            active.push(interval);
+        }
+
+        let mut aliases = Vec::with_capacity(alias_pairs.len());
+        for (left, right) in alias_pairs {
+            let left_index = usize::from(left);
+            let right_index = usize::from(right);
+            if contradictory_image_alias(&self.resources[left_index], &self.resources[right_index])
+            {
+                return Err(MaxwellThreeDResourceError::ContradictoryAlias {
+                    first: self.resources[left_index].role(),
+                    second: self.resources[right_index].role(),
+                });
+            }
+            aliases.push(MaxwellThreeDResourceAlias {
+                first: left,
+                second: right,
+            });
         }
         let result = MaxwellThreeDResolvedResources {
             address_space_generation: self.address_space.mapping_generation(),

@@ -6,7 +6,7 @@
 
 use crate::MaxwellMethodSource;
 
-use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress, state::PipelineDependencySink};
+use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 /// Whether API semantics require depth/stencil testing before pixel shading.
 ///
@@ -401,15 +401,6 @@ impl MaxwellThreeDShaderLocalMemoryState {
             || self.size_lower.raw().is_some();
         programmed && (self.address().is_none() || self.size().is_none())
     }
-
-    fn append_pipeline_dependencies(&self, dependencies: &mut impl PipelineDependencySink) {
-        dependencies.push(self.address_upper.raw());
-        dependencies.push(self.address_lower.raw());
-        dependencies.push(self.size_upper.raw());
-        dependencies.push(self.size_lower.raw());
-        dependencies.push(self.default_size_per_warp.raw());
-        dependencies.push(self.window_base_address.raw());
-    }
 }
 
 /// Directly addressable memory partition selected by `SET_L1_CONFIGURATION`.
@@ -719,24 +710,6 @@ impl MaxwellThreeDShaderExecutionState {
     #[must_use]
     pub const fn shader_local_memory(&self) -> &MaxwellThreeDShaderLocalMemoryState {
         &self.shader_local_memory
-    }
-
-    pub(super) fn append_shader_pipeline_dependencies(
-        &self,
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        if self.api_mandated_early_z.value() == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled) {
-            dependencies.push(self.api_mandated_early_z.raw());
-        }
-        if self
-            .pixel_shader_interlock_control
-            .value()
-            .is_some_and(|value| value.conflict_detection_enabled())
-        {
-            dependencies.push(self.pixel_shader_interlock_control.raw());
-        }
-        self.shader_local_memory
-            .append_pipeline_dependencies(dependencies);
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {

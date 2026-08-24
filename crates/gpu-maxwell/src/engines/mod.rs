@@ -9,6 +9,7 @@ mod dma_copy;
 mod inline_to_memory;
 mod spa;
 mod threed;
+pub(crate) use threed::MaxwellThreeDFrontendState;
 pub(crate) use threed::lower_maxwell_three_d_operation_into_cache;
 mod twod;
 

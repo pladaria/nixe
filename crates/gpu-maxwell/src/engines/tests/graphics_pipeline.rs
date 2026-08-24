@@ -133,13 +133,7 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
         let depth_before = channel.three_d().render_targets().depth_stencil().clone();
         let two_d_before = channel.two_d().clone();
 
-        for (index, state) in channel
-            .three_d()
-            .render_targets()
-            .color()
-            .iter()
-            .enumerate()
-        {
+        for state in channel.three_d().render_targets().color().iter() {
             let compression = state.compression();
             assert_eq!(
                 compression.origin(),
@@ -151,9 +145,10 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
                 Some(MaxwellThreeDColorCompressionMode::Disabled)
             );
             assert_eq!(compression.source(), None);
-
+        }
+        for index in 0..MAXWELL_COLOR_TARGET_COUNT {
             let raw = channel
-                .three_d()
+                .three_d_mut()
                 .raw_register(GpuMethodId(0x19e0 + index as u32 * 4))
                 .expect("color compression reset must be visible to MME");
             assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
@@ -242,7 +237,6 @@ fn invalid_color_compression_values_are_rejected_atomically() {
 fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for (argument, expected, samples) in [
         (0, MaxwellThreeDCompressionThreshold::Samples0, 0),
@@ -273,10 +267,6 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
         assert_eq!(register.source(), Some(source));
         assert_eq!(expected.raw(), argument);
         assert_eq!(expected.sample_count(), samples);
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
@@ -633,7 +623,6 @@ fn color_target_selection_retains_all_fields_for_counts_zero_through_eight() {
 #[test]
 fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
     let mut channel = three_d_channel();
-    let neutral_dependencies = channel.three_d().pipeline_dependencies(&[0]);
 
     for (argument, layer, control, fixed_layering, geometry_layering) in [
         (
@@ -685,20 +674,11 @@ fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
         assert_eq!(register.source(), Some(source));
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[0]) == neutral_dependencies,
-            !fixed_layering
-        );
     }
 
     program_three_d(&mut channel, 0x15cc, 0);
     program_three_d(&mut channel, 0x20c0, 0x41);
-    let geometry_without_layer_routing = channel.three_d().pipeline_dependencies(&[0]);
     program_three_d(&mut channel, 0x15cc, 0x0001_0000);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[0]),
-        geometry_without_layer_routing
-    );
 }
 
 #[test]
@@ -1060,7 +1040,6 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
             | ((combination & 2) << 3)
             | ((combination & 4) << 6)
             | ((combination & 8) << 9);
-        let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
         let dispatch = dispatch_method(&mut channel, 0x10f8 / 4, argument).unwrap();
         let method = dispatch.methods()[0];
         let source = method.method().source();
@@ -1078,10 +1057,6 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
         assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.source(), Some(source));
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -1281,7 +1256,6 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
             MaxwellThreeDWindowClipType::Inclusive
         ))
     );
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let arguments = std::array::from_fn::<_, 16, _>(|word| {
         let region = word / 2;
         let minimum = (region * 10 + word % 2) as u32;
@@ -1323,10 +1297,6 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
             assert_eq!(register.source(), Some(source));
         }
     }
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
@@ -1355,27 +1325,16 @@ fn malformed_window_clip_rectangle_keeps_valid_prefix_before_failure() {
 }
 
 #[test]
-fn window_clip_dependencies_and_draw_error_follow_enable_while_clear_is_independent() {
+fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1950, 0);
     program_three_d(&mut channel, 0x194c, 0);
-    let dependencies_disabled = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x0d00, (100 << 16) | 10);
     program_three_d(&mut channel, 0x1950, 1);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_disabled
-    );
 
     program_three_d(&mut channel, 0x194c, 1);
-    let dependencies_enabled = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(dependencies_enabled, dependencies_disabled);
     program_three_d(&mut channel, 0x0d04, (200 << 16) | 20);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_enabled
-    );
 
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
@@ -1504,7 +1463,6 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x197c, 0);
-    let dependencies_disabled = channel.three_d().pipeline_dependencies(&[]);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
@@ -1534,10 +1492,6 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
     ));
 
     program_three_d(&mut channel, 0x197c, 1);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_disabled
-    );
     let enabled_source = channel
         .three_d()
         .fixed_function()
@@ -1641,18 +1595,13 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
 }
 
 #[test]
-fn viewport_scale_offset_dependencies_and_draw_validation_follow_enable_only() {
+fn viewport_scale_offset_draw_validation_follows_enable_only() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x192c, 0);
-    let dependencies_disabled = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x0a00, 1.0_f32.to_bits());
     program_three_d(&mut channel, 0x0a0c, 2.0_f32.to_bits());
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_disabled
-    );
 
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
@@ -1682,8 +1631,6 @@ fn viewport_scale_offset_dependencies_and_draw_validation_follow_enable_only() {
     ));
 
     program_three_d(&mut channel, 0x192c, 1);
-    let dependencies_enabled = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(dependencies_enabled, dependencies_disabled);
     for (method, value) in [
         (0x0a00, 3.0_f32),
         (0x0a04, -4.0_f32),
@@ -1696,10 +1643,6 @@ fn viewport_scale_offset_dependencies_and_draw_validation_follow_enable_only() {
     ] {
         program_three_d(&mut channel, method, value.to_bits());
     }
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_enabled
-    );
 
     let enabled_source = channel
         .three_d()
@@ -1746,7 +1689,6 @@ fn viewport_scale_offset_dependencies_and_draw_validation_follow_enable_only() {
 #[test]
 fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     let start_dispatch = dispatch_incrementing(&mut channel, 0x011c / 4, &[5, 7]).unwrap();
     let start_source = start_dispatch.methods()[1].method().source();
@@ -1771,7 +1713,7 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
         ],
     )
     .unwrap();
-    let mme = channel.three_d().mme();
+    let mme = channel.three_d_mut().mme();
 
     assert!(start_dispatch.operations().is_empty());
     assert!(instruction_dispatch.operations().is_empty());
@@ -1808,21 +1750,17 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     assert_eq!(start.raw(), Some(7));
     assert_eq!(start.value(), Some(&MaxwellThreeDMmeRamAddress::new(7)));
     assert_eq!(start.source(), Some(start_source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
-fn mme_ram_load_failures_discard_the_whole_packet() {
+fn mme_ram_load_failures_preserve_only_valid_prefixes() {
     let mut channel = three_d_channel();
 
     for (method, ram) in [
         (0x0118, MaxwellThreeDMmeRam::Instruction),
         (0x0120, MaxwellThreeDMmeRam::StartAddress),
     ] {
-        let before = channel.three_d().clone();
+        let before = channel.three_d_mut().clone();
         let decoded = packet(method / 4, 0);
         assert!(matches!(
             dispatch_first(&mut channel, &decoded),
@@ -1832,14 +1770,14 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
                 ..
             }) if actual == ram
         ));
-        assert_eq!(channel.three_d(), &before);
+        assert_eq!(channel.three_d_mut(), &before);
     }
 
     for (method, ram) in [
         (0x0114, MaxwellThreeDMmeRam::Instruction),
         (0x011c, MaxwellThreeDMmeRam::StartAddress),
     ] {
-        let before = channel.three_d().clone();
+        let before = channel.three_d_mut().clone();
         let decoded = incrementing_packet(method / 4, &[u32::MAX, 0]);
         assert!(matches!(
             dispatch_first(&mut channel, &decoded),
@@ -1849,10 +1787,10 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
                 ..
             }) if actual == ram
         ));
-        assert_ne!(channel.three_d(), &before);
+        assert_ne!(channel.three_d_mut(), &before);
     }
 
-    let before = channel.three_d().clone();
+    let before = channel.three_d_mut().clone();
     let mut arguments = Vec::with_capacity(MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS + 2);
     arguments.push(0);
     arguments.resize(
@@ -1870,7 +1808,7 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
             ..
         })
     ));
-    assert_ne!(channel.three_d(), &before);
+    assert_ne!(channel.three_d_mut(), &before);
 
     let mut arguments = Vec::with_capacity(MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES + 2);
     arguments.push(0);
@@ -1886,7 +1824,7 @@ fn mme_ram_load_failures_discard_the_whole_packet() {
             ..
         })
     ));
-    assert_ne!(channel.three_d(), &before);
+    assert_ne!(channel.three_d_mut(), &before);
 }
 
 #[test]
@@ -1926,7 +1864,7 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
     assert_eq!(source.argument(), argument);
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x1518))
             .and_then(MaxwellThreeDRegister::raw),
         Some(argument)
@@ -1980,7 +1918,10 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
         (0x0dac, MaxwellThreeDFixedFunctionRegister::FrontPolygonMode),
         (0x0db0, MaxwellThreeDFixedFunctionRegister::BackPolygonMode),
     ] {
-        let raw = channel.three_d().raw_register(GpuMethodId(method)).unwrap();
+        let raw = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(method))
+            .unwrap();
         assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
         assert_eq!(raw.raw(), Some(0));
         assert_eq!(raw.value(), Some(&0));
@@ -2007,7 +1948,10 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
     assert_eq!(channel.three_d(), &before_call);
 
     program_three_d(&mut channel, 0x0dac, 0x1b02);
-    let raw = channel.three_d().raw_register(GpuMethodId(0x0dac)).unwrap();
+    let raw = channel
+        .three_d_mut()
+        .raw_register(GpuMethodId(0x0dac))
+        .unwrap();
     assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(raw.raw(), Some(0x1b02));
     assert!(raw.source().is_some());
@@ -2024,7 +1968,7 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
     );
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x0db0))
             .unwrap()
             .origin(),
@@ -2038,7 +1982,10 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
 
     for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
         let method = 0x2000 + pipeline as u32 * 0x40;
-        let raw = channel.three_d().raw_register(GpuMethodId(method)).unwrap();
+        let raw = channel
+            .three_d_mut()
+            .raw_register(GpuMethodId(method))
+            .unwrap();
         assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
         assert_eq!(raw.raw(), Some(0));
         assert_eq!(raw.value(), Some(&0));
@@ -2071,7 +2018,7 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         assert_eq!(binding.group().source(), None);
 
         let raw_binding = channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(method + 0x10))
             .unwrap();
         assert_eq!(
@@ -2109,7 +2056,10 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     assert_eq!(channel.three_d(), &before_invalid);
 
     program_three_d(&mut channel, 0x20c0, 0x41);
-    let raw = channel.three_d().raw_register(GpuMethodId(0x20c0)).unwrap();
+    let raw = channel
+        .three_d_mut()
+        .raw_register(GpuMethodId(0x20c0))
+        .unwrap();
     assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(raw.raw(), Some(0x41));
     assert!(raw.source().is_some());
@@ -2142,7 +2092,7 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     assert_eq!(binding.effective_group(), Some(6));
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x2100))
             .unwrap()
             .origin(),
@@ -2154,22 +2104,22 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
 fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     let mut channel = three_d_channel();
     assert_eq!(
-        channel.three_d().mme().shadow_ram_control().origin(),
+        channel.three_d_mut().mme().shadow_ram_control().origin(),
         MaxwellThreeDRegisterOrigin::VerifiedReset
     );
     assert_eq!(
-        channel.three_d().mme().shadow_ram_control().value(),
+        channel.three_d_mut().mme().shadow_ram_control().value(),
         Some(&MaxwellThreeDMmeShadowRamControl::MethodTrack)
     );
 
     program_three_d(&mut channel, 0x0124, 0);
     assert_eq!(
-        channel.three_d().mme().shadow_ram_control().value(),
+        channel.three_d_mut().mme().shadow_ram_control().value(),
         Some(&MaxwellThreeDMmeShadowRamControl::MethodTrack)
     );
     program_three_d(&mut channel, 0x0dac, 0x1b02);
     let tracked = channel
-        .three_d()
+        .three_d_mut()
         .mme()
         .shadow_register(GpuMethodId(0x0dac))
         .unwrap();
@@ -2180,7 +2130,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     program_three_d(&mut channel, 0x0dac, 0x1b01);
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_register(GpuMethodId(0x0dac))
             .unwrap()
@@ -2189,7 +2139,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     );
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x0dac))
             .unwrap()
             .raw(),
@@ -2202,7 +2152,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     assert_eq!(replayed_source.argument(), 0x1b02);
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x0dac))
             .unwrap()
             .raw(),
@@ -2213,13 +2163,13 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     // the stream to leave replay mode.
     program_three_d(&mut channel, 0x0124, 1);
     assert_eq!(
-        channel.three_d().mme().shadow_ram_control().value(),
+        channel.three_d_mut().mme().shadow_ram_control().value(),
         Some(&MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter)
     );
     program_three_d(&mut channel, 0x0dac, 0x1b00);
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_register(GpuMethodId(0x0dac))
             .unwrap()
@@ -2264,7 +2214,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
     assert_eq!(layer.value(), Some(&0));
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x0820))
             .and_then(MaxwellThreeDRegister::raw),
         Some(0)
@@ -2290,7 +2240,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
     for (method, argument) in initial {
         assert_eq!(
             channel
-                .three_d()
+                .three_d_mut()
                 .raw_register(GpuMethodId(method))
                 .and_then(MaxwellThreeDRegister::raw),
             Some(argument)
@@ -2322,7 +2272,7 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
 
     assert!(
         channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_register(GpuMethodId(0x13ac))
             .is_none()
@@ -2363,7 +2313,7 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
     // guest write.
     assert!(
         channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_register(GpuMethodId(0x13ac))
             .is_none()
@@ -2384,7 +2334,7 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
         );
 
         let scratch = channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
             .unwrap();
@@ -2394,14 +2344,14 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
         assert_eq!(scratch.source(), Some(source));
         assert_eq!(
             channel
-                .three_d()
+                .three_d_mut()
                 .raw_register(GpuMethodId(method))
                 .unwrap()
                 .raw(),
             Some(value)
         );
     }
-    assert_eq!(channel.three_d().mme().shadow_scratch_count(), 3);
+    assert_eq!(channel.three_d_mut().mme().shadow_scratch_count(), 3);
     assert_eq!(MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT, 256);
 
     let macro_index = 5;
@@ -2449,7 +2399,7 @@ fn falcon_call_four_applies_masked_pgraph_writes_and_signals_completion() {
     assert_eq!(register.value(), 0x00f0_0500);
     assert_eq!(register.source(), source);
     let completion = channel
-        .three_d()
+        .three_d_mut()
         .mme()
         .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(0))
         .unwrap();
@@ -2457,7 +2407,7 @@ fn falcon_call_four_applies_masked_pgraph_writes_and_signals_completion() {
     assert_eq!(completion.source(), Some(source));
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .raw_register(GpuMethodId(0x3400))
             .unwrap()
             .raw(),
@@ -2510,7 +2460,7 @@ fn captured_deko_write_hardware_register_macro_reaches_falcon_call_four() {
     assert_eq!(write.mask(), 0x0180_0000);
     assert_eq!(
         channel
-            .three_d()
+            .three_d_mut()
             .mme()
             .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(0))
             .and_then(MaxwellThreeDRegister::raw),
@@ -2815,20 +2765,32 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
 }
 
 #[test]
-fn vertex_assembly_controls_are_draw_dependencies() {
+fn vertex_assembly_controls_update_typed_state() {
     let mut channel = three_d_channel();
-    let unset = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x1610, 0x0e);
-    let defaults = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(defaults, unset);
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .assembly()
+            .attribute_defaults()
+            .raw(),
+        Some(0x0e)
+    );
 
     program_three_d(&mut channel, 0x164c, 0x1000);
-    let vertex_id = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(vertex_id, defaults);
+    assert_eq!(
+        channel
+            .three_d()
+            .vertex_input()
+            .assembly()
+            .vertex_id_uses_array_start()
+            .raw(),
+        Some(0x1000)
+    );
 
     program_three_d(&mut channel, 0x1610, 0x3f);
-    assert_ne!(channel.three_d().pipeline_dependencies(&[]), vertex_id);
 }
 
 #[test]
@@ -2919,15 +2881,12 @@ fn vertex_stream_attributes_and_begin_state_remain_unresolved_and_typed() {
 #[test]
 fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x1618, 4);
     let primitive = channel.three_d().vertex_input().primitive();
     assert!(primitive.is_open());
     assert_eq!(primitive.active_begin().unwrap().topology(), 4);
     let begin_source = primitive.begin().source().unwrap();
-    let open_dependencies = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(open_dependencies, dependencies_before);
 
     let dispatch = dispatch_method(&mut channel, 0x1614 / 4, 0).unwrap();
     let source = dispatch.methods()[0].method().source();
@@ -2947,10 +2906,6 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     assert_eq!(primitive.end().raw(), Some(0));
     assert_eq!(primitive.end().value(), Some(&false));
     assert_eq!(primitive.end().source(), Some(source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
@@ -2991,7 +2946,6 @@ fn begin_instance_modes_reset_advance_and_preserve_the_instance_sequence() {
             .instance_index(),
         0
     );
-    let first_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x1618, 4 | (1 << 26));
     assert_eq!(
@@ -3001,10 +2955,6 @@ fn begin_instance_modes_reset_advance_and_preserve_the_instance_sequence() {
             .primitive()
             .instance_index(),
         1
-    );
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        first_dependencies
     );
     program_three_d(&mut channel, 0x1618, 4 | (1 << 26));
     assert_eq!(
@@ -3133,7 +3083,6 @@ fn shader_bindings_snapshot_selectors_and_preserve_stage_visibility() {
 fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     let lower_dispatch = dispatch_method(&mut channel, 0x160c / 4, 0).unwrap();
     let lower_source = lower_dispatch.methods()[0].method().source();
@@ -3146,10 +3095,6 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     assert!(region.address().is_none());
     assert_eq!(region.address_lower().raw(), Some(0));
     assert_eq!(region.address_lower().source(), Some(lower_source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
 
     let upper_dispatch = dispatch_method(&mut channel, 0x1608 / 4, 4).unwrap();
     let upper_source = upper_dispatch.methods()[0].method().source();
@@ -3161,26 +3106,16 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     assert_eq!(region.address_upper().raw(), Some(4));
     assert_eq!(region.address_upper().source(), Some(upper_source));
     assert_eq!(region.address().unwrap().get(), 0x0000_0004_0000_0000);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 
     program_three_d(&mut channel, 0x2000, 0x11);
-    let active_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x160c, 0x1000);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        active_dependencies
-    );
 }
 
 #[test]
 fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     let dispatch = dispatch_method(&mut channel, 0x0310 / 4, 0x0503).unwrap();
     let method = dispatch.methods()[0];
@@ -3202,19 +3137,10 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
     assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(register.raw(), Some(0x0503));
     assert_eq!(register.source(), Some(source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 
     program_three_d(&mut channel, 0x2000, 0x11);
-    let active_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x0310, 0x0400);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        active_dependencies
-    );
 }
 
 #[test]
@@ -3300,7 +3226,6 @@ fn invalid_program_region_upper_and_failed_packet_keeps_valid_prefix() {
 fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     let lower_dispatch = dispatch_method(&mut channel, 0x0f88 / 4, 0x082c_3000).unwrap();
     let lower_method = lower_dispatch.methods()[0];
@@ -3327,10 +3252,6 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
     assert_eq!(substitute.address_upper().raw(), Some(0x7f));
     assert_eq!(substitute.address_upper().source(), Some(upper_source));
     assert_eq!(substitute.address().unwrap().get(), 0x7f_082c_3000);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
@@ -3496,45 +3417,24 @@ fn pipeline_program_offsets_and_register_counts_are_indexed_and_atomic() {
 }
 
 #[test]
-fn program_offset_and_register_count_dependencies_require_an_enabled_slot() {
+fn program_offset_and_register_count_updates_preserve_slot_state() {
     let mut channel = three_d_channel();
-    let reset_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x2044, 0x7f730);
     program_three_d(&mut channel, 0x204c, 4);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        reset_dependencies
-    );
 
     program_three_d(&mut channel, 0x2040, 0x11);
-    let enabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(enabled_dependencies, reset_dependencies);
 
     program_three_d(&mut channel, 0x2044, 0x7f830);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        enabled_dependencies
-    );
-    let offset_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x204c, 5);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        offset_dependencies
-    );
 
     program_three_d(&mut channel, 0x2040, 0x10);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x2044, 0x7f930);
     program_three_d(&mut channel, 0x204c, 6);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 }
 
 #[test]
-fn tessellation_lod_family_is_source_preserving_and_stage_conditional() {
+fn tessellation_lod_family_is_source_preserving() {
     let mut channel = three_d_channel();
     let levels = [
         MaxwellThreeDTessellationLod::OuterU0OrDensity,
@@ -3544,7 +3444,6 @@ fn tessellation_lod_family_is_source_preserving_and_stage_conditional() {
         MaxwellThreeDTessellationLod::InnerU,
         MaxwellThreeDTessellationLod::InnerV,
     ];
-    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     for (index, level) in levels.into_iter().enumerate() {
         let method = 0x0324 + index as u32 * 4;
@@ -3565,34 +3464,18 @@ fn tessellation_lod_family_is_source_preserving_and_stage_conditional() {
         assert_eq!(register.value(), Some(&argument));
         assert_eq!(register.source(), Some(source));
     }
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
 
     program_three_d(&mut channel, 0x2080, 0x21);
-    let tessellation_dependencies = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(tessellation_dependencies, inactive_dependencies);
     program_three_d(&mut channel, 0x0324, 0x4000_0000);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        tessellation_dependencies
-    );
 
     program_three_d(&mut channel, 0x2080, 0x20);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x0324, 0x4040_0000);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 }
 
 #[test]
 fn render_target_index_offset_is_typed_source_preserving_and_conditionally_dependent() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let neutral_dependencies = channel.three_d().pipeline_dependencies(&[0]);
 
     for (argument, expected, enabled) in [
         (0, MaxwellThreeDRenderTargetIndexOffset::Disabled, false),
@@ -3622,10 +3505,6 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
         assert_eq!(register.source(), Some(source));
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[0]) == neutral_dependencies,
-            !enabled
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 

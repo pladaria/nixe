@@ -12,7 +12,7 @@ use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 use crate::{
     GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellDmaCopyState,
     MaxwellGpuProfile, MaxwellInlineToMemoryState, MaxwellPushbufferSubchannel, MaxwellThreeDState,
-    MaxwellTwoDState,
+    MaxwellTwoDState, engines::MaxwellThreeDFrontendState,
 };
 
 /// Stable identity of one Maxwell channel lifetime.
@@ -283,7 +283,7 @@ pub struct MaxwellGpuChannel {
     dma_copy: MaxwellDmaCopyState,
     inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
-    three_d: MaxwellThreeDState,
+    three_d: MaxwellThreeDFrontendState,
     priority: MaxwellChannelPriority,
     timeslice: MaxwellChannelTimeslice,
     timeout: MaxwellChannelTimeout,
@@ -317,7 +317,7 @@ impl MaxwellGpuChannel {
             dma_copy: MaxwellDmaCopyState::new(),
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
-            three_d: MaxwellThreeDState::new(),
+            three_d: MaxwellThreeDFrontendState::new(),
             priority: MaxwellChannelPriority::Medium,
             timeslice: MaxwellChannelTimeslice::DriverDefault,
             timeout: MaxwellChannelTimeout::DriverDefault,
@@ -409,13 +409,13 @@ impl MaxwellGpuChannel {
         &mut self.two_d
     }
 
-    /// Returns an immutable snapshot of channel-owned `MAXWELL_B` state.
+    /// Returns the typed `MAXWELL_B` state consumed by a triggered operation.
     #[must_use]
-    pub const fn three_d(&self) -> &MaxwellThreeDState {
-        &self.three_d
+    pub fn three_d(&self) -> &MaxwellThreeDState {
+        self.three_d.operation_state()
     }
 
-    pub(crate) const fn three_d_mut(&mut self) -> &mut MaxwellThreeDState {
+    pub(crate) const fn three_d_mut(&mut self) -> &mut MaxwellThreeDFrontendState {
         &mut self.three_d
     }
 

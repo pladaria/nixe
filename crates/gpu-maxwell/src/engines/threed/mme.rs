@@ -1,6 +1,6 @@
 //! Source-preserving Macro Method Expander program storage for `MAXWELL_B`.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use nixe_gpu::GpuMethodId;
 
@@ -242,7 +242,7 @@ pub(super) enum MaxwellThreeDMmeRunError<E> {
 }
 
 struct MaxwellThreeDMmeInterpreter<'a, H> {
-    program: &'a MaxwellThreeDMmeState,
+    program: &'a MaxwellThreeDMmeProgram,
     host: &'a mut H,
     parameters: &'a [u32],
     registers: [u32; MME_REGISTER_COUNT],
@@ -256,7 +256,13 @@ struct MaxwellThreeDMmeInterpreter<'a, H> {
     emitted_methods: u32,
 }
 
-impl MaxwellThreeDMmeState {
+#[derive(Clone)]
+pub(super) struct MaxwellThreeDMmeProgram {
+    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
+    start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
+}
+
+impl MaxwellThreeDMmeProgram {
     /// Executes one Maxwell MME program against a transactional host state.
     ///
     /// The ISA layout and behavior are pinned to yuzu's low-level Maxwell MME
@@ -271,7 +277,8 @@ impl MaxwellThreeDMmeState {
         host: &mut H,
     ) -> Result<(), MaxwellThreeDMmeRunError<H::Error>> {
         let start = self
-            .start_address(MaxwellThreeDMmeRamAddress::new(u32::from(macro_index)))
+            .start_addresses
+            .get(&u32::from(macro_index))
             .and_then(MaxwellThreeDRegister::value)
             .copied()
             .ok_or(MaxwellThreeDMmeRunError::Execution(
@@ -326,7 +333,8 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
         let address = MaxwellThreeDMmeRamAddress::new(self.pc);
         let raw = self
             .program
-            .instruction(address)
+            .instructions
+            .get(&address.raw())
             .and_then(MaxwellThreeDRegister::value)
             .map(|instruction| instruction.raw())
             .ok_or_else(|| {
@@ -572,10 +580,10 @@ const fn bitfield_mask(raw: u32) -> u32 {
 pub struct MaxwellThreeDMmeState {
     instruction_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_instruction_address: Option<MaxwellThreeDMmeRamAddress>,
-    instructions: BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>,
+    instructions: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>>,
     start_address_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
-    start_addresses: BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>,
+    start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
     shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
     shadow_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
@@ -597,10 +605,10 @@ impl Default for MaxwellThreeDMmeState {
         Self {
             instruction_pointer: MaxwellThreeDRegister::default(),
             next_instruction_address: None,
-            instructions: BTreeMap::new(),
+            instructions: Arc::new(BTreeMap::new()),
             start_address_pointer: MaxwellThreeDRegister::default(),
             next_start_address_index: None,
-            start_addresses: BTreeMap::new(),
+            start_addresses: Arc::new(BTreeMap::new()),
             shadow_ram_control: MaxwellThreeDRegister::verified_reset(
                 MaxwellThreeDMmeShadowRamControl::MethodTrack.raw(),
                 Some(MaxwellThreeDMmeShadowRamControl::MethodTrack),
@@ -613,6 +621,13 @@ impl Default for MaxwellThreeDMmeState {
 }
 
 impl MaxwellThreeDMmeState {
+    pub(super) fn program(&self) -> MaxwellThreeDMmeProgram {
+        MaxwellThreeDMmeProgram {
+            instructions: Arc::clone(&self.instructions),
+            start_addresses: Arc::clone(&self.start_addresses),
+        }
+    }
+
     #[must_use]
     pub const fn instruction_pointer(&self) -> &MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress> {
         &self.instruction_pointer
@@ -745,7 +760,7 @@ impl MaxwellThreeDMmeState {
                 value,
                 source,
             } => {
-                self.instructions.insert(
+                Arc::make_mut(&mut self.instructions).insert(
                     address.raw(),
                     MaxwellThreeDRegister::programmed(value.raw(), value, source),
                 );
@@ -766,7 +781,7 @@ impl MaxwellThreeDMmeState {
                 address,
                 source,
             } => {
-                self.start_addresses.insert(
+                Arc::make_mut(&mut self.start_addresses).insert(
                     index.raw(),
                     MaxwellThreeDRegister::programmed(address.raw(), address, source),
                 );

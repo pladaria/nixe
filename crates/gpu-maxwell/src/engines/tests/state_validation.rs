@@ -38,7 +38,6 @@ fn pipe_nop_accepts_its_full_payload_without_state_or_execution_effects() {
 #[test]
 fn instrumentation_header_and_data_are_source_preserving_pipeline_neutral_annotations() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let dispatch =
         dispatch_incrementing(&mut channel, 0x0150 / 4, &[0x4900_0000, 0x4900_0001]).unwrap();
 
@@ -74,10 +73,6 @@ fn instrumentation_header_and_data_are_source_preserving_pipeline_neutral_annota
     assert_eq!(data_register.raw(), Some(0x4900_0001));
     assert_eq!(data_register.value().copied(), Some(data));
     assert_eq!(data_register.source(), Some(data_source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
@@ -108,7 +103,6 @@ fn instrumentation_accepts_all_word_bits_and_invalid_failed_packet_keeps_valid_p
 #[test]
 fn tiled_cache_initialization_family_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for (method, argument) in [
         (0x0f60, 1),
@@ -139,10 +133,6 @@ fn tiled_cache_initialization_family_is_typed_source_preserving_and_pipeline_neu
         assert!(register.source().is_some());
     }
     assert!(state.unknown_config(4).is_none());
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
@@ -170,11 +160,14 @@ fn tiled_cache_enable_rejects_reserved_bits_and_failed_packet_keeps_valid_prefix
 }
 
 #[test]
-fn mutable_method_control_is_typed_source_preserving_and_pipeline_neutral() {
+fn mutable_method_control_is_typed_and_source_preserving() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
-        channel.three_d().mme().mutable_method_control().origin(),
+        channel
+            .three_d_mut()
+            .mme()
+            .mutable_method_control()
+            .origin(),
         MaxwellThreeDRegisterOrigin::Unset
     );
 
@@ -189,16 +182,11 @@ fn mutable_method_control_is_typed_source_preserving_and_pipeline_neutral() {
             "SET_MUTABLE_METHOD_CONTROL"
         );
 
-        let register = channel.three_d().mme().mutable_method_control();
+        let register = channel.three_d_mut().mme().mutable_method_control();
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.source(), Some(source));
     }
-
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
@@ -220,7 +208,6 @@ fn mutable_method_control_rejects_reserved_bits_atomically() {
 fn constant_color_rendering_family_is_typed_and_conditionally_pipeline_relevant() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x0f40, 0);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     for (method, component, bits) in [
         (
@@ -254,17 +241,8 @@ fn constant_color_rendering_family_is_typed_and_conditionally_pipeline_relevant(
         assert_eq!(register.value().map(|value| value.bits()), Some(bits));
         assert_eq!(register.source(), Some(source));
     }
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 
     program_three_d(&mut channel, 0x0f40, 1);
-    let enabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(enabled_dependencies, disabled_dependencies);
-    for raw in [1, 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000] {
-        assert!(enabled_dependencies.contains(&Some(raw)));
-    }
 }
 
 #[test]
@@ -297,7 +275,6 @@ fn api_mandated_early_z_is_typed_and_source_preserving() {
     program_three_d(&mut channel, 0x2000, 0x11);
 
     program_three_d(&mut channel, 0x0210, 0);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
     let disabled = channel.three_d().shader_execution().api_mandated_early_z();
     assert_eq!(
         disabled.value(),
@@ -314,10 +291,6 @@ fn api_mandated_early_z_is_typed_and_source_preserving() {
     );
     assert_eq!(enabled.raw(), Some(1));
     assert!(enabled.source().is_some());
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 }
 
 #[test]
@@ -340,7 +313,6 @@ fn post_z_pixel_shader_imask_is_typed_and_only_active_state_is_pipeline_relevant
     let mut channel = three_d_channel();
 
     program_three_d(&mut channel, 0x0f1c, 0);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
     let disabled = channel.three_d().coverage().post_z_pixel_shader_imask();
     assert_eq!(
         disabled.value(),
@@ -357,10 +329,6 @@ fn post_z_pixel_shader_imask_is_typed_and_only_active_state_is_pipeline_relevant
     );
     assert_eq!(enabled.raw(), Some(1));
     assert!(enabled.source().is_some());
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 }
 
 #[test]
@@ -416,12 +384,7 @@ fn pixel_shader_interlock_control_decodes_all_allocated_field_combinations() {
     }
 
     program_three_d(&mut channel, 0x1224, 0);
-    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x1224, 1);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
 }
 
 #[test]
@@ -444,7 +407,6 @@ fn pixel_shader_interlock_control_rejects_reserved_encodings_atomically() {
 #[test]
 fn global_draw_indices_preserve_full_width_values_without_changing_pipeline_identity() {
     let mut channel = three_d_channel();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for raw in [0, 1, i32::MAX as u32, u32::MAX] {
         let dispatch = dispatch_method(&mut channel, 0x1434 / 4, raw).unwrap();
@@ -483,18 +445,12 @@ fn global_draw_indices_preserve_full_width_values_without_changing_pipeline_iden
             Some(dispatch.methods()[0].method().source())
         );
     }
-
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
 }
 
 #[test]
 fn shader_exceptions_enable_is_typed_source_preserving_diagnostic_state() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
         channel
             .three_d()
@@ -525,10 +481,6 @@ fn shader_exceptions_enable_is_typed_source_preserving_diagnostic_state() {
         assert_eq!(register.source(), Some(source));
         assert_eq!(expected.raw(), argument);
         assert_eq!(expected.enabled(), argument != 0);
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -582,7 +534,6 @@ fn alpha_fraction_is_typed_source_preserving_raster_state() {
     let viewport_before = channel.three_d().viewport().clone();
     let point_size_before = *channel.three_d().raster().point_size();
     let two_d_before = channel.two_d().clone();
-    let mut previous_dependencies = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
         channel.three_d().raster().alpha_fraction().origin(),
         MaxwellThreeDRegisterOrigin::Unset
@@ -610,10 +561,6 @@ fn alpha_fraction_is_typed_source_preserving_raster_state() {
         assert_eq!(channel.three_d().render_targets(), &render_targets_before);
         assert_eq!(channel.three_d().viewport(), &viewport_before);
         assert_eq!(channel.two_d(), &two_d_before);
-
-        let dependencies = channel.three_d().pipeline_dependencies(&[]);
-        assert_ne!(dependencies, previous_dependencies);
-        previous_dependencies = dependencies;
     }
 }
 
@@ -785,7 +732,6 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
 #[test]
 fn raster_bounding_box_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
-    let dependencies = channel.three_d().pipeline_dependencies(&[]);
     let two_d_before = channel.two_d().clone();
     assert_eq!(
         channel.three_d().raster().bounding_box().origin(),
@@ -820,7 +766,6 @@ fn raster_bounding_box_is_typed_source_preserving_and_pipeline_neutral() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
         assert_eq!(register.source(), Some(source));
-        assert_eq!(channel.three_d().pipeline_dependencies(&[]), dependencies);
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
@@ -848,7 +793,6 @@ fn raster_bounding_box_is_typed_source_preserving_and_pipeline_neutral() {
         source.location(),
         dispatch.methods()[0].method().source().location()
     );
-    assert_eq!(channel.three_d().pipeline_dependencies(&[]), dependencies);
 }
 
 #[test]
@@ -1098,7 +1042,6 @@ fn rop_l2_cache_controls_are_typed_source_preserving_independent_state() {
     ];
     let requests = methods.map(|(_, _, request)| request);
     let two_d_before = channel.two_d().clone();
-    let pipeline_dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for request in requests {
         assert_eq!(
@@ -1137,10 +1080,6 @@ fn rop_l2_cache_controls_are_typed_source_preserving_independent_state() {
                 }
             }
             assert_eq!(channel.two_d(), &two_d_before);
-            assert_eq!(
-                channel.three_d().pipeline_dependencies(&[]),
-                pipeline_dependencies_before
-            );
         }
     }
 }
@@ -1149,7 +1088,6 @@ fn rop_l2_cache_controls_are_typed_source_preserving_independent_state() {
 fn vaf_l2_cache_control_preserves_volatility_policy_source_and_isolation() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let rop_before = [
         MaxwellThreeDRopL2CacheRequest::PrefetchRead,
         MaxwellThreeDRopL2CacheRequest::NoninterlockedRead,
@@ -1230,10 +1168,6 @@ fn vaf_l2_cache_control_preserves_volatility_policy_source_and_isolation() {
             ]
             .map(|request| *channel.three_d().l2_cache().rop_policy(request)),
             rop_before
-        );
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
         );
         assert_eq!(channel.two_d(), &two_d_before);
     }
@@ -2133,7 +2067,6 @@ fn render_enable_control_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
     let mode_before = *channel.three_d().render_enable().mode();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for (argument, value) in [
         (0, MaxwellThreeDConditionalLoadConstantBuffer::Disabled),
@@ -2157,10 +2090,6 @@ fn render_enable_control_is_typed_source_preserving_and_pipeline_neutral() {
         assert_eq!(register.source(), Some(source));
         assert_eq!(value.raw(), argument);
         assert_eq!(channel.three_d().render_enable().mode(), &mode_before);
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -2339,7 +2268,6 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
         .shader_execution()
         .visible_call_limit()
         .to_owned();
-    let pipeline_dependencies = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
         channel
             .three_d()
@@ -2382,11 +2310,6 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
             &visible_call_before
         );
         assert_eq!(channel.two_d(), &two_d_before);
-
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            pipeline_dependencies
-        );
     }
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
@@ -2458,7 +2381,6 @@ fn invalid_l1_configurations_and_failed_packet_keeps_valid_prefix() {
 fn shader_local_memory_block_is_typed_source_preserving_and_shader_scoped() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let inactive_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     let region_dispatch = dispatch_incrementing(
         &mut channel,
@@ -2510,19 +2432,10 @@ fn shader_local_memory_block_is_typed_source_preserving_and_shader_scoped() {
         local.window_base_address().source(),
         Some(window_dispatch.methods()[0].method().source())
     );
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        inactive_dependencies
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 
     program_three_d(&mut channel, 0x2000, 0x11);
-    let active_dependencies = channel.three_d().pipeline_dependencies(&[]);
     program_three_d(&mut channel, 0x077c, 0xfe00_0000);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        active_dependencies
-    );
 }
 
 #[test]
@@ -2903,7 +2816,6 @@ fn active_zcull_region_is_typed_source_preserving_and_pipeline_neutral() {
     );
 
     for argument in [0, 1, 0x3f] {
-        let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
         let dispatch = dispatch_method(&mut channel, 0x1590 / 4, argument).unwrap();
         let method = dispatch.methods()[0];
         let source = method.method().source();
@@ -2919,10 +2831,6 @@ fn active_zcull_region_is_typed_source_preserving_and_pipeline_neutral() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.source(), Some(source));
         assert_eq!(channel.three_d().zcull().stats_enable(), &stats_before);
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
     }
@@ -3042,23 +2950,12 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x121c, 0);
     program_three_d(&mut channel, 0x1380, 0);
-    let disabled_dependencies = channel.three_d().pipeline_dependencies(&[]);
 
     program_three_d(&mut channel, 0x1594, 1);
     program_three_d(&mut channel, 0x1598, 0x1e00);
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        disabled_dependencies
-    );
 
     program_three_d(&mut channel, 0x1380, 1);
-    let two_sided_dependencies = channel.three_d().pipeline_dependencies(&[]);
-    assert_ne!(two_sided_dependencies, disabled_dependencies);
     program_three_d(&mut channel, 0x1598, 0x1e01);
-    assert_ne!(
-        channel.three_d().pipeline_dependencies(&[]),
-        two_sided_dependencies
-    );
 
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
@@ -3221,7 +3118,6 @@ fn zpass_pixel_count_enable_is_typed_source_preserving_pipeline_neutral_state() 
     let mut channel = three_d_channel();
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     assert_eq!(
         channel
             .three_d()
@@ -3250,10 +3146,6 @@ fn zpass_pixel_count_enable_is_typed_source_preserving_pipeline_neutral_state() 
         assert_eq!(expected.raw(), argument);
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
     }
 }
 
@@ -3413,7 +3305,6 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
 fn balanced_primitive_workload_is_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for argument in [0, 1, 0x10, 0x11] {
         let dispatch = dispatch_method(&mut channel, 0x0374 / 4, argument).unwrap();
@@ -3445,10 +3336,6 @@ fn balanced_primitive_workload_is_typed_source_preserving_nonsemantic_policy() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.source(), Some(source));
         assert!(dispatch.operations().is_empty());
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -3486,7 +3373,6 @@ fn balanced_primitive_workload_reserved_bits_and_failed_packet_keeps_valid_prefi
 fn subtiling_perf_knobs_are_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let dispatch = dispatch_incrementing(&mut channel, 0x0360 / 4, &[0x2016_4010, 0x20]).unwrap();
 
     assert_eq!(
@@ -3524,10 +3410,6 @@ fn subtiling_perf_knobs_are_typed_source_preserving_nonsemantic_policy() {
     assert_eq!(b_register.value().copied(), Some(b));
     assert_eq!(b_register.source(), Some(b_source));
 
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
@@ -3577,7 +3459,6 @@ fn subtiling_perf_knob_b_reserved_bits_and_failed_packet_keeps_valid_prefix() {
 fn shader_watermark_family_is_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
 
     for (method, method_name, target, argument) in [
         (
@@ -3622,10 +3503,6 @@ fn shader_watermark_family_is_typed_source_preserving_nonsemantic_policy() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
         assert_eq!(register.source(), Some(source));
-        assert_eq!(
-            channel.three_d().pipeline_dependencies(&[]),
-            dependencies_before
-        );
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -3650,7 +3527,6 @@ fn shader_watermark_failed_packet_keeps_valid_prefix() {
 fn zcull_enable_and_bounds_are_typed_source_preserving_pipeline_neutral_state() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let dispatch = dispatch_incrementing(&mut channel, 0x1968 / 4, &[0x11, 0]).unwrap();
 
     assert_eq!(
@@ -3697,10 +3573,6 @@ fn zcull_enable_and_bounds_are_typed_source_preserving_pipeline_neutral_state() 
         assert_eq!(MaxwellThreeDZCullEnable::parse(raw).unwrap().raw(), raw);
         assert_eq!(MaxwellThreeDZCullBounds::parse(raw).unwrap().raw(), raw);
     }
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
@@ -3708,7 +3580,6 @@ fn zcull_enable_and_bounds_are_typed_source_preserving_pipeline_neutral_state() 
 fn zcull_criterion_is_typed_source_preserving_pipeline_neutral_state() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    let dependencies_before = channel.three_d().pipeline_dependencies(&[]);
     let dispatch = dispatch_method(&mut channel, 0x0dd8 / 4, 0xff00_0005).unwrap();
 
     assert_eq!(dispatch.methods().len(), 1);
@@ -3735,10 +3606,6 @@ fn zcull_criterion_is_typed_source_preserving_pipeline_neutral_state() {
     assert_eq!(register.raw(), Some(0xff00_0005));
     assert_eq!(register.value().copied(), Some(criterion));
     assert_eq!(register.source(), Some(source));
-    assert_eq!(
-        channel.three_d().pipeline_dependencies(&[]),
-        dependencies_before
-    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
