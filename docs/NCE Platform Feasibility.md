@@ -3,10 +3,10 @@
 Status: design record
 Revision: 2026-08-11
 
-This note records integration seams, not backend commitments. Nixe must probe
+This note records integration seams, not provider commitments. Nixe must probe
 each facility at runtime and expose an unavailable engine with a typed reason.
 No frontend may infer availability from the operating-system name or CPU ISA.
-Every backend remains behind `EngineProvider`, `EngineDomain`, and
+Every NCE implementation remains behind `EngineProvider`, `EngineDomain`, and
 `EngineExecutor`; raw framework objects, file descriptors, and host pointers
 must not cross into runtime or scheduler code. `DomainMemoryBinding` supplies
 the common mapping and retained-canonical-backing seam, so runtime never
@@ -18,11 +18,11 @@ An NCE implementation needs an AArch64 host, permission to create a VM and
 vCPUs, lossless import/export of all `ThreadCpuState`, explicit guest-memory
 map/unmap/protect notification, interrupt injection, and precise normalization
 of SVC, instruction/data abort, timer, interrupt, and shutdown exits. It also
-needs a small backend-private supervisor because Nixe executes guest user code
+needs a small provider-private supervisor because Nixe executes guest user code
 while the virtualization facility exposes a virtual machine, not a direct
 user-mode process executor.
 
-Canonical `ExecutionMemory` remains semantic authority. A backend may mirror or
+Canonical `ExecutionMemory` remains semantic authority. An NCE domain may mirror or
 map its pages only while it tracks invalidation and dirty generations. Every
 bounded `run_slice` must return canonical thread state; mapping changes reach
 each executor through `synchronize_address_space`, and executors acknowledge an
@@ -30,6 +30,13 @@ invalidation only after stale translations cannot be re-entered. Domain shutdown
 runs after its executors are released. Protected VM memory that the host cannot
 read cannot satisfy this contract without an explicit shared-memory and
 reconciliation design.
+
+NCE providers consume semantic mapping and content invalidation through their
+own acknowledged domain cursor. The records contain no JIT region, link-cell,
+software-TLB, Cranelift, VM, or vCPU-framework identity. An NCE provider may
+derive VM mappings and dirty tracking from canonical memory, but it never
+depends on the JIT execution frame or helper ABI and never makes its mirrored
+view authoritative.
 
 ## Apple silicon Hypervisor.framework
 
@@ -46,18 +53,18 @@ and the
   `PrivilegeUnavailable`, not a guest error.
 - Lifecycle: create one framework VM per Nixe NCE domain and one
   `hv_vcpu_t` per active virtual CPU. Apple documents vCPU creation for the
-  current thread, so the backend worker owns creation, run, register access, and
+  current thread, so the provider's worker owns creation, run, register access, and
   destruction for that vCPU.
 - Memory: `hv_vm_map`/unmap/protect operations consume domain mapping
   notifications. Executable mappings must never grant host write and guest
   execute simultaneously unless the canonical memory policy explicitly permits
   it; code mutation is reconciled through canonical generations.
 - Exits and interrupts: `hv_vcpu_run` updates the vCPU exit structure. The
-  backend translates exit reason and syndrome directly into `EngineExit` and
+  provider translates exit reason and syndrome directly into `EngineExit` and
   consumes interrupts through the common executor control path.
 - Supervisor: a minimal EL1 image must establish the EL0 address space, trap
   SVC and faults, virtualize timer state, and return a bounded exit record. Its
-  ABI is backend-private and versioned with the backend.
+  ABI is provider-private and versioned with the provider.
 - Feasibility: plausible on entitled Apple-silicon macOS applications, but
   unavailable until register round-trip, alias coherency, timer, and exception
   conformance tests pass. The common contract requires no Apple-specific change.
@@ -75,7 +82,7 @@ minimum tested kernel version and UAPI headers in its crate.
   rejection.
 - Lifecycle: `KVM_CREATE_VM` creates the domain FD, `KVM_CREATE_VCPU` creates
   one vCPU FD per executor, `KVM_RUN` enters it, and closing the owned FDs tears
-  the domain down. FDs never leave the backend crate.
+  the domain down. FDs never leave the provider crate.
 - Memory: canonical host mappings become KVM memslots through
   `KVM_SET_USER_MEMORY_REGION`. Map/unmap/protect changes must quiesce affected
   vCPUs and update memslots before acknowledging the generation. Dirty logging
@@ -85,7 +92,7 @@ minimum tested kernel version and UAPI headers in its crate.
   `ThreadCpuState`, `EngineExit`, and the executor control path. Unsupported or
   lossy register sets reject the profile before execution.
 - Executable memory and supervisor: KVM models guest-physical memory rather than
-  the runtime's process permissions, so the backend-private EL1 supervisor must
+  the runtime's process permissions, so the provider-private EL1 supervisor must
   enforce guest stage-1 permissions and trap EL0 SVC/faults. Host W^X and
   security-module policy remain probe-time constraints.
 - Feasibility: plausible on AArch64 Linux with accessible KVM and suitable Arm
@@ -123,7 +130,7 @@ Versioned basis: Android Open Source Project
 - Feasibility: **unsupported profile** for now. Android `auto` must select the
   interpreter unless a future supported API satisfies the common conformance
   suite. Direct KVM access on a particular rooted or vendor device is not a
-  portable Android backend capability.
+  portable Android NCE capability.
 
 ## Contract mapping and decision
 
@@ -138,7 +145,7 @@ Versioned basis: Android Open Source Project
 | Virtual interrupt delivery          | `EngineControl`                                  |
 | Stable stop boundary                | canonical state on every `run_slice` return      |
 
-HVF and Linux KVM map to the common contracts without exposing backend handles.
+HVF and Linux KVM map to the common contracts without exposing framework handles.
 Android currently maps only at the conceptual VM lifecycle level and therefore
 remains unavailable. Scheduler work may depend on these common seams, but not on
-the existence or behavior of any proposed platform backend.
+the existence or behavior of any proposed platform NCE provider.

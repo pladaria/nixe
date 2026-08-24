@@ -134,8 +134,8 @@ fn execute_msr(state: &mut A64State, fields: Operands) -> bool {
 fn execute_barrier(fields: Operands) -> bool {
     match fields.barrier_opcode {
         4 | 5 if valid_barrier_option(fields.barrier_option) => {
-            // This supplies the local reference engine's host ordering. The
-            // guest multicore scheduler/memory-model contract remains Phase 4.
+            // This supplies the local reference engine's host ordering. Exact
+            // guest multicore behavior remains tracked by JIT-012.
             fence(Ordering::SeqCst);
             true
         }

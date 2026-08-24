@@ -2,7 +2,8 @@
 //!
 //! This crate owns the boundary between runtime orchestration and CPU execution
 //! implementations. It deliberately has no dependency on runtime, Horizon,
-//! scheduler, graphics, application configuration, or host backend APIs.
+//! scheduler, graphics, application configuration, compiler, or host
+//! virtualization APIs.
 
 use core::fmt::{self, Display, Formatter};
 use std::sync::Arc;

@@ -11,7 +11,7 @@ use crate::EngineId;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EngineKind {
     Interpreter,
-    BlockJit,
+    Jit,
     NativeCodeExecution,
     Test,
 }

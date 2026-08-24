@@ -524,7 +524,8 @@ pub const fn indirect_target(address: Operand, execution_state: ExecutionState) 
 }
 
 /// Forms a computed A32/T32 interworking target. Its guest address bit zero is
-/// deliberately interpreted by the backend, never converted to a host pointer.
+/// deliberately interpreted by the execution engine, never converted to a host
+/// pointer.
 #[must_use]
 pub const fn indirect_interworking_target(address: Operand) -> ControlTarget {
     ControlTarget::A32Interworking { address }

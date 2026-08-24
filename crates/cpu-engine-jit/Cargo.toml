@@ -1,0 +1,25 @@
+[package]
+name = "nixe-cpu-engine-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranelift-codegen = { version = "=0.134.3", default-features = false, features = ["host-arch", "std"] }
+cranelift-frontend = "=0.134.3"
+cranelift-native = "=0.134.3"
+nixe-cpu.workspace = true
+nixe-cpu-engine.workspace = true
+nixe-memory.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
