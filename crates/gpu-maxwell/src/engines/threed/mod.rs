@@ -97,12 +97,11 @@ pub use operations::{
     MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreRelease,
     MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
     MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDShaderCacheInvalidation,
-    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
-    MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
-    MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
-    MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
-    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode,
-    lower_maxwell_three_d_synchronization,
+    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
+    MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
+    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTextureCacheInvalidation,
+    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureCacheTarget,
+    MaxwellThreeDTiledCacheFlushMode, lower_maxwell_three_d_synchronization,
 };
 
 pub use l2_cache::{
@@ -211,8 +210,8 @@ use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 
 use super::{
     AppliedMethod, MaxwellEngineCapability, MaxwellEngineDispatchError,
-    MaxwellEngineMethodDispatch, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
-    MaxwellInlineToMemoryUpload, MaxwellShaderCacheInvalidation, MaxwellThreeDTriggeredOperation,
+    MaxwellEngineMethodDispatch, MaxwellEngineMethodMetadata, MaxwellInlineToMemoryUpload,
+    MaxwellShaderCacheInvalidation, PendingEngineOperation,
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
@@ -1013,121 +1012,142 @@ pub(super) const fn is_mme_aperture(method: GpuMethodId) -> bool {
     method.0 >= 0x3800 && method.0 <= 0x3ffc && method.0 & 3 == 0
 }
 
-pub(super) struct MaxwellThreeDMmePreflight {
-    pub methods: Box<[MaxwellEngineMethodDispatch]>,
-    pub ordered_operations: Box<[MaxwellEngineOperation]>,
+pub(super) enum MaxwellThreeDMmePreflightError<E> {
+    Dispatch(Box<MaxwellEngineDispatchError>),
+    Consumer(E),
 }
 
-pub(super) fn preflight_mme_call(
+impl<E> MaxwellThreeDMmePreflightError<E> {
+    fn dispatch(error: MaxwellEngineDispatchError) -> Self {
+        Self::Dispatch(Box::new(error))
+    }
+}
+
+pub(super) fn preflight_mme_call<E>(
     profile: MaxwellGpuProfile,
     methods: &[MaxwellMethodDispatch],
+    parameters: &mut Vec<u32>,
     candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<MaxwellThreeDMmePreflight, MaxwellEngineDispatchError> {
+    observed_methods: Option<&mut Vec<MaxwellEngineMethodDispatch>>,
+    consume: &mut impl FnMut(PendingEngineOperation, &MaxwellThreeDState) -> Result<(), E>,
+) -> Result<(), MaxwellThreeDMmePreflightError<E>> {
     let first = methods[0];
     let source = first.source();
     let offset = source.method().0 - 0x3800;
     if offset & 7 != 0 {
-        return Err(MaxwellEngineDispatchError::MmeExecution {
-            source,
-            error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
-        });
+        return Err(MaxwellThreeDMmePreflightError::dispatch(
+            MaxwellEngineDispatchError::MmeExecution {
+                source,
+                error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
+            },
+        ));
     }
     let data_method = source.method().0 + 4;
     if methods.iter().skip(1).any(|method| {
         let current = method.source().method().0;
         current != source.method().0 && current != data_method
     }) {
-        return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "CALL_MME_MACRO",
-            reason: "macro parameters target a different indexed aperture",
-        });
+        return Err(MaxwellThreeDMmePreflightError::dispatch(
+            MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "CALL_MME_MACRO",
+                reason: "macro parameters target a different indexed aperture",
+            },
+        ));
     }
     let macro_index = (offset / 8) as u8;
-    let parameters = methods
-        .iter()
-        .map(|method| method.source().argument())
-        .collect::<Vec<_>>();
+    parameters.clear();
+    parameters.try_reserve(methods.len()).map_err(|_| {
+        MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::ResourceExhausted)
+    })?;
+    parameters.extend(methods.iter().map(|method| method.source().argument()));
     let program = candidate.mme().program();
-    let ordered_operations = {
+    {
         let mut host = MmeDispatchHost {
             profile,
             source,
             candidate,
-            ordered_operations: Vec::new(),
+            consume,
+            _error: std::marker::PhantomData,
         };
-        match program.execute(macro_index, &parameters, &mut host) {
+        match program.execute(macro_index, parameters, &mut host) {
             Ok(()) => {}
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
-                return Err(MaxwellEngineDispatchError::MmeExecution { source, error });
+                return Err(MaxwellThreeDMmePreflightError::dispatch(
+                    MaxwellEngineDispatchError::MmeExecution { source, error },
+                ));
             }
             Err(MaxwellThreeDMmeRunError::Host(error)) => return Err(error),
         };
-        host.ordered_operations
-    };
-    let mut dispatches = Vec::new();
-    dispatches
-        .try_reserve_exact(methods.len())
-        .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-    for (index, method) in methods.iter().copied().enumerate() {
-        let source = method.source();
-        let metadata = MaxwellEngineMethodMetadata::new(
-            CLASS,
-            CLASS_NAME,
-            source.method(),
-            if index == 0 {
-                "CALL_MME_MACRO"
-            } else {
-                "CALL_MME_DATA"
-            },
-        );
-        dispatches.push(MaxwellEngineMethodDispatch::new(method, metadata));
     }
-    Ok(MaxwellThreeDMmePreflight {
-        methods: dispatches.into_boxed_slice(),
-        ordered_operations: ordered_operations.into_boxed_slice(),
-    })
+    if let Some(observed_methods) = observed_methods {
+        observed_methods.try_reserve(methods.len()).map_err(|_| {
+            MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::ResourceExhausted)
+        })?;
+        for (index, method) in methods.iter().copied().enumerate() {
+            let source = method.source();
+            let metadata = MaxwellEngineMethodMetadata::new(
+                CLASS,
+                CLASS_NAME,
+                source.method(),
+                if index == 0 {
+                    "CALL_MME_MACRO"
+                } else {
+                    "CALL_MME_DATA"
+                },
+            );
+            observed_methods.push(MaxwellEngineMethodDispatch::new(method, metadata));
+        }
+    }
+    Ok(())
 }
 
-struct MmeDispatchHost<'a> {
+struct MmeDispatchHost<'a, E, F> {
     profile: MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &'a mut MaxwellThreeDFrontendState,
-    ordered_operations: Vec<MaxwellEngineOperation>,
+    consume: &'a mut F,
+    _error: std::marker::PhantomData<E>,
 }
 
-impl MaxwellThreeDMmeHost for MmeDispatchHost<'_> {
-    type Error = MaxwellEngineDispatchError;
+impl<E, F> MaxwellThreeDMmeHost for MmeDispatchHost<'_, E, F>
+where
+    F: FnMut(PendingEngineOperation, &MaxwellThreeDState) -> Result<(), E>,
+{
+    type Error = MaxwellThreeDMmePreflightError<E>;
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         self.candidate
             .raw_register(method)
             .and_then(MaxwellThreeDRegister::raw)
-            .ok_or(MaxwellEngineDispatchError::MmeExecution {
-                source: self.source,
-                error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
+            .ok_or_else(|| {
+                MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
+                    source: self.source,
+                    error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
+                })
             })
     }
 
     fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         if is_mme_aperture(method) {
-            return Err(MaxwellEngineDispatchError::MmeExecution {
-                source: self.source,
-                error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall { method_dword },
-            });
+            return Err(MaxwellThreeDMmePreflightError::dispatch(
+                MaxwellEngineDispatchError::MmeExecution {
+                    source: self.source,
+                    error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall { method_dword },
+                },
+            ));
         }
         let source = self.source.emitted_by_mme(method, argument);
         let dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
         // MME-emitted methods target the live register file directly and do
         // not pass through pushbuffer shadow-RAM tracking/replay.
-        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate, false)?;
+        let prepared = preflight_with_shadow(self.profile, dispatch, self.candidate, false)
+            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
-            self.ordered_operations
-                .try_reserve(1)
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            self.ordered_operations.push(operation);
+            (self.consume)(operation, self.candidate.operation_state())
+                .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
         }
         Ok(())
     }
@@ -1149,23 +1169,16 @@ pub(super) fn preflight(
 
 fn lower_pending_operation(
     operation: Option<PendingOperation>,
-    state: &MaxwellThreeDFrontendState,
-) -> Option<MaxwellEngineOperation> {
+    _state: &MaxwellThreeDFrontendState,
+) -> Option<PendingEngineOperation> {
     operation.map(|operation| match operation {
-        PendingOperation::ThreeD(trigger) => {
-            MaxwellEngineOperation::ThreeD(Box::new(MaxwellThreeDTriggeredOperation {
-                trigger,
-                state: state.operation_snapshot(),
-            }))
-        }
+        PendingOperation::ThreeD(trigger) => PendingEngineOperation::ThreeD(trigger),
         PendingOperation::Synchronization(trigger) => {
-            MaxwellEngineOperation::ThreeDSynchronization(Box::new(
-                MaxwellThreeDSynchronizationOperation::new(trigger, state.operation_snapshot()),
-            ))
+            PendingEngineOperation::ThreeDSynchronization(trigger)
         }
-        PendingOperation::InlineToMemory(upload) => MaxwellEngineOperation::InlineToMemory(upload),
+        PendingOperation::InlineToMemory(upload) => PendingEngineOperation::InlineToMemory(upload),
         PendingOperation::InlineConstantBuffer(upload) => {
-            MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)
+            PendingEngineOperation::ThreeDInlineConstantBuffer(upload)
         }
     })
 }

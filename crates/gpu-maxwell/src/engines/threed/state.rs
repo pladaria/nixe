@@ -943,7 +943,7 @@ impl MaxwellThreeDResourceSemanticWrites {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellThreeDFrontendState {
     raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
-    operation: Arc<MaxwellThreeDState>,
+    operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
     resource_semantic_writes: MaxwellThreeDResourceSemanticWrites,
     shader_semantic_write: bool,
@@ -998,7 +998,7 @@ impl Default for MaxwellThreeDFrontendState {
         }
         Self {
             raw_registers,
-            operation: Arc::new(MaxwellThreeDState::default()),
+            operation: MaxwellThreeDState::default(),
             mme: Default::default(),
             resource_semantic_writes: MaxwellThreeDResourceSemanticWrites::default(),
             shader_semantic_write: false,
@@ -1017,12 +1017,8 @@ impl MaxwellThreeDFrontendState {
         &self.operation
     }
 
-    pub(super) fn operation_snapshot(&self) -> Arc<MaxwellThreeDState> {
-        Arc::clone(&self.operation)
-    }
-
     fn operation_state_mut(&mut self) -> &mut MaxwellThreeDState {
-        Arc::make_mut(&mut self.operation)
+        &mut self.operation
     }
 
     #[must_use]

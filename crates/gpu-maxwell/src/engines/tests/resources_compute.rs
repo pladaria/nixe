@@ -1950,6 +1950,26 @@ fn draw_lowering_requires_t10_evidence_and_emits_complete_neutral_pass() {
         &draw.prepared,
         &reused_draw.prepared
     ));
+    let original_draw = &plan.submission().operations()[1];
+    let reused_draw = &reused_plan.submission().operations()[1];
+    assert_eq!(
+        original_draw.accesses().as_ptr(),
+        reused_draw.accesses().as_ptr()
+    );
+    assert_eq!(
+        original_draw.dependencies().as_ptr(),
+        reused_draw.dependencies().as_ptr()
+    );
+    assert_eq!(
+        original_draw
+            .capability_requirements()
+            .requirements()
+            .as_ptr(),
+        reused_draw
+            .capability_requirements()
+            .requirements()
+            .as_ptr()
+    );
     assert!(reused_plan.resource_creations().is_empty());
 
     vertex_allocation.write(0, &[1, 2, 3, 4]).unwrap();
@@ -2366,12 +2386,7 @@ fn draw_alias_validation_ignores_unselected_targets_and_rejects_selected_aliases
 }
 
 #[test]
-fn packet_dispatch_does_not_retain_complete_engine_snapshots() {
-    assert!(
-        size_of::<MaxwellEnginePacketDispatch>() < size_of::<MaxwellThreeDState>(),
-        "packet results must retain validated effects, not complete engine snapshots"
-    );
-
+fn three_d_register_writes_do_not_mutate_compute_state() {
     let mut channel = three_d_channel();
     let compute_before = channel.compute().clone();
     dispatch_method(&mut channel, 0x1518 / 4, 0x3f80_0000).unwrap();

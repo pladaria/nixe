@@ -1,8 +1,8 @@
 use nixe_gpu::{
     BackendCapabilities, BackendFeatures, BackendLimits, GpuCommand, GpuVirtualAddress,
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, ImageFormat, MappingGeneration,
-    QueryKind, RenderPassOperation, SampleCount, ShaderId, ShaderStage, TimelineInstanceId,
-    TimelineOwnerId,
+    QueryKind, RenderPassOperation, ReservedTimelinePoint, SampleCount, ShaderId, ShaderStage,
+    TimelineInstanceId, TimelineOwnerId,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
@@ -10,9 +10,9 @@ use super::*;
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellChannelId, MaxwellChannelOwner,
-    MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellMapRequest,
-    MaxwellMappingId, MaxwellPushbufferWord, MaxwellShaderProgramHeaderVersion,
-    SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
+    MaxwellDecodedPushbuffer, MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace,
+    MaxwellGpuMapping, MaxwellMapRequest, MaxwellMappingId, MaxwellPushbufferWord,
+    MaxwellShaderProgramHeaderVersion, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
 };
 
 fn channel() -> MaxwellGpuChannel {
@@ -27,6 +27,19 @@ fn three_d_channel() -> MaxwellGpuChannel {
     let mut channel = channel();
     bind_three_d(&mut channel);
     channel
+}
+
+fn lower_maxwell_three_d_synchronization(
+    operation: &MaxwellThreeDSynchronizationOperation,
+    completion: Option<&ReservedTimelinePoint>,
+    prior_work_pending: bool,
+) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
+    super::threed::lower_maxwell_three_d_synchronization(
+        operation.trigger(),
+        operation.state(),
+        completion,
+        prior_work_pending,
+    )
 }
 
 fn dispatch_first(

@@ -561,13 +561,8 @@ struct PreparedDrawRecord {
     state: super::state::MaxwellThreeDDrawStateIdentity,
     resources: Arc<()>,
     shaders: Arc<()>,
-    draw: Arc<PreparedDraw>,
-    render_pass_description: RenderPassDescription,
-    attachments: Box<[RenderAttachment]>,
-    shader_accesses: Box<[ResourceAccess]>,
-    shader_dependencies: Box<[ResourceDependency]>,
-    requirements: CapabilityRequirements,
-    dirty_images: Box<[usize]>,
+    operations: [GpuOperation; 3],
+    dirty_images: Arc<[usize]>,
 }
 
 impl PreparedDrawRecord {
@@ -585,35 +580,13 @@ impl PreparedDrawRecord {
     fn operations(
         &self,
         arguments: DrawArguments,
-    ) -> Result<Vec<GpuOperation>, MaxwellThreeDLoweringError> {
-        let draw = DrawOperation::new(Arc::clone(&self.draw), arguments)
-            .map_err(MaxwellThreeDLoweringError::Command)?;
-        Ok(vec![
-            GpuOperation::new(
-                GpuCommand::RenderPass(
-                    RenderPassOperation::begin(
-                        self.draw.render_pass,
-                        self.render_pass_description.clone(),
-                        self.attachments.to_vec(),
-                    )
-                    .map_err(MaxwellThreeDLoweringError::Command)?,
-                ),
-                [],
-                [],
-                CapabilityRequirements::none(),
-            ),
-            GpuOperation::new(
-                GpuCommand::Draw(draw),
-                self.shader_accesses.iter().copied(),
-                self.shader_dependencies.iter().copied(),
-                self.requirements.clone(),
-            ),
-            GpuOperation::new(
-                GpuCommand::RenderPass(RenderPassOperation::end(self.draw.render_pass)),
-                [],
-                [],
-                CapabilityRequirements::none(),
-            ),
+    ) -> Result<[GpuOperation; 3], MaxwellThreeDLoweringError> {
+        Ok([
+            self.operations[0].clone(),
+            self.operations[1]
+                .with_draw_arguments(arguments)
+                .map_err(MaxwellThreeDLoweringError::Command)?,
+            self.operations[2].clone(),
         ])
     }
 }
@@ -779,6 +752,8 @@ pub struct MaxwellThreeDLoweringCache {
     accesses: Vec<(AccessTarget, AccessScope)>,
     resolved_resources: super::MaxwellThreeDResolvedResourceCache,
     resource_roles: Vec<MaxwellThreeDResourceRole>,
+    mme_methods: Vec<crate::MaxwellMethodDispatch>,
+    mme_parameters: Vec<u32>,
 }
 
 impl Default for MaxwellThreeDLoweringCache {
@@ -810,6 +785,8 @@ impl MaxwellThreeDLoweringCache {
             accesses: Vec::new(),
             resolved_resources: super::MaxwellThreeDResolvedResourceCache::default(),
             resource_roles: Vec::new(),
+            mme_methods: Vec::new(),
+            mme_parameters: Vec::new(),
         }
     }
     #[must_use]
@@ -838,6 +815,23 @@ impl MaxwellThreeDLoweringCache {
 
     pub(crate) fn recycle_resource_roles(&mut self, roles: Vec<MaxwellThreeDResourceRole>) {
         self.resource_roles = roles;
+    }
+
+    pub(crate) fn take_mme_scratch(&mut self) -> (Vec<crate::MaxwellMethodDispatch>, Vec<u32>) {
+        let mut methods = std::mem::take(&mut self.mme_methods);
+        let mut parameters = std::mem::take(&mut self.mme_parameters);
+        methods.clear();
+        parameters.clear();
+        (methods, parameters)
+    }
+
+    pub(crate) fn recycle_mme_scratch(
+        &mut self,
+        methods: Vec<crate::MaxwellMethodDispatch>,
+        parameters: Vec<u32>,
+    ) {
+        self.mme_methods = methods;
+        self.mme_parameters = parameters;
     }
 
     #[cfg(test)]
@@ -1150,8 +1144,8 @@ impl MaxwellThreeDLoweringCache {
                 continue;
             }
             if self.prepared_draw.as_ref().is_some_and(|prepared| {
-                prepared
-                    .shader_dependencies
+                prepared.operations[1]
+                    .dependencies()
                     .contains(&ResourceDependency::Shader(retired.id))
             }) {
                 self.prepared_draw = None;
@@ -1204,7 +1198,7 @@ pub struct MaxwellThreeDLoweredWork {
     creations: Box<[BackendResourceCreateInfo]>,
     invalidations: Box<[ResourceDependency]>,
     submission: OperationSubmission,
-    dirty_images: Box<[usize]>,
+    dirty_images: Arc<[usize]>,
 }
 
 impl MaxwellThreeDLoweredWork {
@@ -1287,7 +1281,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             .map(|prepared| {
                 Ok::<_, MaxwellThreeDLoweringError>((
                     prepared.operations(arguments)?,
-                    prepared.dirty_images.to_vec(),
+                    Arc::clone(&prepared.dirty_images),
                 ))
             })
             .transpose()?;
@@ -1894,8 +1888,8 @@ fn finish_lowered_work(
     predecessors: Vec<FrontendSubmissionId>,
     creations: Vec<BackendResourceCreateInfo>,
     invalidations: Vec<ResourceDependency>,
-    commands: Vec<GpuOperation>,
-    dirty_images: Vec<usize>,
+    commands: impl IntoIterator<Item = GpuOperation>,
+    dirty_images: Arc<[usize]>,
 ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
     let operations = sequence_with_transitions(commands, cache)?;
     let submission = OperationSubmission::new(submission, predecessors, operations)
@@ -1908,7 +1902,7 @@ fn finish_lowered_work(
         creations: creations.into_boxed_slice(),
         invalidations: invalidations.into_boxed_slice(),
         submission,
-        dirty_images: dirty_images.into_boxed_slice(),
+        dirty_images,
     })
 }
 
@@ -3387,7 +3381,7 @@ fn lower_clear(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     bindings: &[Option<ResourceDependency>],
-) -> Result<(Vec<GpuOperation>, Vec<usize>), MaxwellThreeDLoweringError> {
+) -> Result<(Vec<GpuOperation>, Arc<[usize]>), MaxwellThreeDLoweringError> {
     let clear = state.render_targets().clear();
     let surface = clear
         .last_surface()
@@ -3505,7 +3499,7 @@ fn lower_clear(
         ));
         dirty.push(index);
     }
-    Ok((operations, dirty))
+    Ok((operations, dirty.into()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3519,7 +3513,7 @@ fn lower_draw(
     vertex_count: u32,
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
-) -> Result<(Vec<GpuOperation>, Vec<usize>), MaxwellThreeDLoweringError> {
+) -> Result<(Vec<GpuOperation>, Arc<[usize]>), MaxwellThreeDLoweringError> {
     let arguments = draw_arguments(state, vertex_count)?;
     let DrawArguments::NonIndexed { first_vertex, .. } = arguments else {
         unreachable!("Maxwell vertex-array draw arguments are non-indexed")
@@ -3834,34 +3828,57 @@ fn lower_draw(
     if attachment_selection.depth_stencil.is_some() {
         draw = draw.with_depth_state(draw_depth_state(state)?);
     }
+    let draw = Arc::new(draw);
+    let operations = [
+        GpuOperation::new(
+            GpuCommand::RenderPass(
+                RenderPassOperation::begin(draw.render_pass, render_pass_description, attachments)
+                    .map_err(MaxwellThreeDLoweringError::Command)?,
+            ),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        ),
+        GpuOperation::new(
+            GpuCommand::Draw(
+                DrawOperation::new(Arc::clone(&draw), arguments)
+                    .map_err(MaxwellThreeDLoweringError::Command)?,
+            ),
+            shader_accesses,
+            shader_dependencies,
+            CapabilityRequirements::new(
+                shaders
+                    .shaders
+                    .iter()
+                    .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
+            ),
+        ),
+        GpuOperation::new(
+            GpuCommand::RenderPass(RenderPassOperation::end(draw.render_pass)),
+            [],
+            [],
+            CapabilityRequirements::none(),
+        ),
+    ];
     let record = PreparedDrawRecord {
         state: state.draw_state_identity(),
         resources: resources.identity(),
         shaders: shaders.identity(),
-        draw: Arc::new(draw),
-        render_pass_description,
-        attachments: attachments.into_boxed_slice(),
-        shader_accesses: shader_accesses.into_boxed_slice(),
-        shader_dependencies: shader_dependencies.into_boxed_slice(),
-        requirements: CapabilityRequirements::new(
-            shaders
-                .shaders
-                .iter()
-                .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
-        ),
-        dirty_images: attachment_selection.attachment_indices().into_boxed_slice(),
+        operations,
+        dirty_images: attachment_selection.attachment_indices().into(),
     };
     let operations = record.operations(arguments)?;
-    let dirty = record.dirty_images.to_vec();
+    let dirty = Arc::clone(&record.dirty_images);
     cache.prepared_draw = Some(record);
-    Ok((operations, dirty))
+    Ok((operations.into(), dirty))
 }
 
 fn sequence_with_transitions(
-    commands: Vec<GpuOperation>,
+    commands: impl IntoIterator<Item = GpuOperation>,
     cache: &mut MaxwellThreeDLoweringCache,
 ) -> Result<Vec<GpuOperation>, MaxwellThreeDLoweringError> {
-    let mut result = Vec::new();
+    let commands = commands.into_iter();
+    let mut result = Vec::with_capacity(commands.size_hint().0);
     for command in commands {
         let mut transitions = Vec::new();
         for access in command.accesses() {

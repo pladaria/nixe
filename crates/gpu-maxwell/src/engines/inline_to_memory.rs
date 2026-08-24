@@ -3,7 +3,7 @@
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
 use super::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -443,7 +443,7 @@ pub(super) fn preflight(
         return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            Some(MaxwellEngineOperation::InlineToMemory(upload)),
+            Some(PendingEngineOperation::InlineToMemory(upload)),
         ));
     }
 

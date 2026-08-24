@@ -8,10 +8,9 @@ use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
     MaxwellChannelId, MaxwellChannelOwner, MaxwellDecodedPushbuffer, MaxwellGpfifoSourceLocation,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellMapRequest,
-    MaxwellMappingId, MaxwellPushbufferWord, MaxwellThreeDLoweringCache,
-    MaxwellThreeDTriggeredOperation, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
-    dispatch_maxwell_engine_pushbuffer, lower_maxwell_three_d_operation,
-    resolve_maxwell_three_d_resources,
+    MaxwellMappingId, MaxwellPushbufferWord, MaxwellSubmissionExecutionPlan,
+    MaxwellSubmissionExecutionStep, MaxwellThreeDLoweringCache, SWITCH_1_GM20B_PROFILE,
+    decode_maxwell_pushbuffer, lower_maxwell_pushbuffer,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
@@ -103,19 +102,19 @@ fn method_stream(methods: &[(u32, u32)]) -> MaxwellDecodedPushbuffer {
 
 fn dispatch_stream(
     channel: &mut MaxwellGpuChannel,
+    address_space: &MaxwellGpuAddressSpace,
     methods: &[(u32, u32)],
-) -> Vec<MaxwellThreeDTriggeredOperation> {
-    dispatch_maxwell_engine_pushbuffer(channel, FRONTEND_STATE, &method_stream(methods))
-        .unwrap()
-        .iter()
-        .flat_map(|packet| packet.ordered_operations())
-        .filter_map(|operation| match operation {
-            nixe_gpu_maxwell::MaxwellEngineOperation::ThreeD(operation) => {
-                Some(operation.as_ref().clone())
-            }
-            _ => None,
-        })
-        .collect()
+) -> MaxwellSubmissionExecutionPlan {
+    lower_maxwell_pushbuffer(
+        &method_stream(methods),
+        channel,
+        address_space,
+        FRONTEND_STATE,
+        Vec::new(),
+        None,
+        &mut MaxwellThreeDLoweringCache::default(),
+    )
+    .unwrap()
 }
 
 fn clear_stream(target: u64) -> Vec<(u32, u32)> {
@@ -155,32 +154,24 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
     );
 
     let mut channel = channel();
-    let clear = dispatch_stream(&mut channel, &clear_stream(target_mapping.offset().get()));
-    assert_eq!(clear.len(), 1);
+    let plan = dispatch_stream(
+        &mut channel,
+        &address_space,
+        &clear_stream(target_mapping.offset().get()),
+    );
+    let [MaxwellSubmissionExecutionStep::ThreeD(clear)] = plan.steps() else {
+        panic!("clear stream did not lower to one 3D work item");
+    };
     let capabilities = capabilities();
     let (mut backend, completion) =
         headless_backend(BackendInstanceId::new(41), capabilities.clone());
     let mut handles = Vec::<(ResourceDependency, BackendResourceHandle)>::new();
-    let mut cache = MaxwellThreeDLoweringCache::default();
-    let clear_resources =
-        resolve_maxwell_three_d_resources(clear[0].state(), &address_space).unwrap();
-    let clear_plan = lower_maxwell_three_d_operation(
-        clear[0].state(),
-        &clear_resources,
-        clear[0].trigger(),
-        None,
-        FrontendSubmissionId::new(10),
-        Vec::new(),
-        &capabilities,
-        &mut cache,
-    )
-    .unwrap();
-    for creation in clear_plan.resource_creations() {
+    for creation in clear.resource_creations() {
         let dependency = creation.dependency();
         let handle = backend.create_resource(creation.clone()).unwrap();
         handles.push((dependency, handle));
     }
-    let clear_token = backend.submit(clear_plan.submission()).unwrap();
+    let clear_token = backend.submit(clear.submission()).unwrap();
 
     assert!(!backend.has_completed(clear_token).unwrap());
     completion.complete(clear_token).unwrap();

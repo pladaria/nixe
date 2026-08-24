@@ -128,30 +128,29 @@ pub use threed::{
     MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
     MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
     MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDSurfaceClipAxis,
-    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationOperation,
-    MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
-    MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
-    MaxwellThreeDSystemMemoryVolatile, MaxwellThreeDTessellationLod,
-    MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
-    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode,
-    MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheTileSize,
-    MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
-    MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
-    MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders, MaxwellThreeDUnorm8,
-    MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
-    MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
-    MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
-    MaxwellThreeDVertexIdUsesArrayStart, MaxwellThreeDVertexInputState,
-    MaxwellThreeDVertexNumericalType, MaxwellThreeDVertexStreamFormat,
-    MaxwellThreeDVertexStreamState, MaxwellThreeDVertexStreamSubstituteState,
-    MaxwellThreeDViewportClipControl, MaxwellThreeDViewportCoordinateSwizzle,
-    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportScaleOffsetEnable,
-    MaxwellThreeDViewportState, MaxwellThreeDViewportSwizzleComponent,
-    MaxwellThreeDViewportTransformState, MaxwellThreeDViewportZClipRange,
-    MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
-    MaxwellThreeDZCompressionMode, MaxwellThreeDZCullBounds, MaxwellThreeDZCullCriterion,
-    MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullState,
-    MaxwellThreeDZCullStatsEnable, MaxwellThreeDZCullStencilFunction,
+    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
+    MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
+    MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
+    MaxwellThreeDTessellationLod, MaxwellThreeDTextureCacheInvalidation,
+    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureCacheTarget,
+    MaxwellThreeDTiledCacheFlushMode, MaxwellThreeDTiledCacheState,
+    MaxwellThreeDTiledCacheTileSize, MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl,
+    MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
+    MaxwellThreeDTirModulationFunction, MaxwellThreeDTranslatedShader,
+    MaxwellThreeDTranslatedShaders, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
+    MaxwellThreeDVafL2CacheControl, MaxwellThreeDVertexArrayPrimitiveRestartEnable,
+    MaxwellThreeDVertexAssemblyState, MaxwellThreeDVertexAttributeFormat,
+    MaxwellThreeDVertexComponentWidths, MaxwellThreeDVertexIdUsesArrayStart,
+    MaxwellThreeDVertexInputState, MaxwellThreeDVertexNumericalType,
+    MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
+    MaxwellThreeDVertexStreamSubstituteState, MaxwellThreeDViewportClipControl,
+    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportPixelCenter,
+    MaxwellThreeDViewportScaleOffsetEnable, MaxwellThreeDViewportState,
+    MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
+    MaxwellThreeDViewportZClipRange, MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState,
+    MaxwellThreeDWindowClipType, MaxwellThreeDZCompressionMode, MaxwellThreeDZCullBounds,
+    MaxwellThreeDZCullCriterion, MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionId,
+    MaxwellThreeDZCullState, MaxwellThreeDZCullStatsEnable, MaxwellThreeDZCullStencilFunction,
     MaxwellThreeDZPassPixelCountEnable, lower_maxwell_three_d_operation,
     lower_maxwell_three_d_synchronization, resolve_maxwell_three_d_resources,
     resolve_maxwell_three_d_resources_for_roles,
@@ -166,18 +165,18 @@ pub use twod::{
     MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
 };
 
-use std::{
-    fmt::{Display, Formatter},
-    sync::Arc,
-};
+use std::fmt::{Display, Formatter};
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
+use crate::pushbuffer::dispatch::{MaxwellMethodStreamError, stream_maxwell_packet_methods};
 use crate::{
-    MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellDecodedPushbuffer, MaxwellGpuChannel,
-    MaxwellHostMemoryOperation, MaxwellHostMethod, MaxwellMethodDispatch,
-    MaxwellMethodDispatchError, MaxwellMethodDispatchKind, MaxwellMethodSource,
-    MaxwellPacketDispatch, MaxwellShaderProgramHeaderVersionRange, dispatch_maxwell_packet,
+    MaxwellAamVersionRange, MaxwellDecodedPacket, MaxwellGpuChannel, MaxwellHostMemoryOperation,
+    MaxwellHostMethod, MaxwellMethodDispatch, MaxwellMethodDispatchError,
+    MaxwellMethodDispatchKind, MaxwellMethodSource, MaxwellShaderProgramHeaderVersionRange,
 };
 
 /// Execution layer required by a known method whose semantics are unavailable.
@@ -224,11 +223,13 @@ impl MaxwellEngineMethodMetadata {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn class(self) -> GpuClassId {
         self.class
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn class_name(self) -> &'static str {
         self.class_name
     }
@@ -244,32 +245,32 @@ impl MaxwellEngineMethodMetadata {
     }
 }
 
-/// One execution-relevant effect in exact pushbuffer order.
+/// One execution-relevant effect produced while applying a method.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MaxwellEngineOperation {
+pub(crate) enum PendingEngineOperation {
     HostSynchronization(MaxwellHostSynchronizationOperation),
     ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
     InlineToMemory(MaxwellInlineToMemoryUpload),
     DmaCopy(MaxwellDmaCopyOperation),
     ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
-    ThreeD(Box<MaxwellThreeDTriggeredOperation>),
-    ThreeDSynchronization(Box<MaxwellThreeDSynchronizationOperation>),
+    ThreeD(MaxwellThreeDOperationTrigger),
+    ThreeDSynchronization(MaxwellThreeDSynchronizationTrigger),
+}
+
+/// One execution effect paired with live state for immediate consumption.
+pub(crate) struct MaxwellEngineEvent<'a> {
+    pub(crate) operation: PendingEngineOperation,
+    pub(crate) three_d: &'a MaxwellThreeDState,
 }
 
 /// One validated host cache operation at its exact pushbuffer source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellHostSynchronizationOperation {
-    source: MaxwellMethodSource,
+pub(crate) struct MaxwellHostSynchronizationOperation {
     operation: MaxwellHostMemoryOperation,
 }
 
 impl MaxwellHostSynchronizationOperation {
-    #[must_use]
-    pub const fn source(self) -> MaxwellMethodSource {
-        self.source
-    }
-
     #[must_use]
     pub const fn operation(self) -> MaxwellHostMemoryOperation {
         self.operation
@@ -278,7 +279,7 @@ impl MaxwellHostSynchronizationOperation {
 
 /// One named class method applied during direct packet dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellEngineMethodDispatch {
+pub(crate) struct MaxwellEngineMethodDispatch {
     method: MaxwellMethodDispatch,
     metadata: MaxwellEngineMethodMetadata,
 }
@@ -292,11 +293,13 @@ impl MaxwellEngineMethodDispatch {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn method(self) -> MaxwellMethodDispatch {
         self.method
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn metadata(self) -> MaxwellEngineMethodMetadata {
         self.metadata
     }
@@ -304,14 +307,14 @@ impl MaxwellEngineMethodDispatch {
 
 struct AppliedMethod {
     dispatch: MaxwellEngineMethodDispatch,
-    operation: Option<MaxwellEngineOperation>,
+    operation: Option<PendingEngineOperation>,
 }
 
 impl AppliedMethod {
     const fn new(
         method: MaxwellMethodDispatch,
         metadata: MaxwellEngineMethodMetadata,
-        operation: Option<MaxwellEngineOperation>,
+        operation: Option<PendingEngineOperation>,
     ) -> Self {
         Self {
             dispatch: MaxwellEngineMethodDispatch::new(method, metadata),
@@ -320,21 +323,36 @@ impl AppliedMethod {
     }
 }
 
-/// Validated packet methods and ordered operations after immediate state commit.
+/// Test observation of validated methods and owned operation snapshots.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellEnginePacketDispatch {
-    binding: MaxwellPacketDispatch,
     methods: Box<[MaxwellEngineMethodDispatch]>,
     ordered_operations: Box<[MaxwellEngineOperation]>,
 }
 
-/// One execution trigger paired with the exact channel-state snapshot at that method.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaxwellEngineOperation {
+    HostSynchronization(MaxwellHostSynchronizationOperation),
+    ComputeInlineToMemory(MaxwellComputeInlineToMemoryUpload),
+    InlineToMemory(MaxwellInlineToMemoryUpload),
+    DmaCopy(MaxwellDmaCopyOperation),
+    ComputeSynchronization(Box<MaxwellComputeTriggeredOperation>),
+    ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
+    ThreeD(Box<MaxwellThreeDTriggeredOperation>),
+    ThreeDSynchronization(Box<MaxwellThreeDSynchronizationOperation>),
+}
+
+/// Test snapshot of one 3D trigger.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDTriggeredOperation {
     trigger: MaxwellThreeDOperationTrigger,
     state: Arc<MaxwellThreeDState>,
 }
 
+#[cfg(test)]
 impl MaxwellThreeDTriggeredOperation {
     #[must_use]
     pub const fn trigger(&self) -> MaxwellThreeDOperationTrigger {
@@ -347,12 +365,8 @@ impl MaxwellThreeDTriggeredOperation {
     }
 }
 
+#[cfg(test)]
 impl MaxwellEnginePacketDispatch {
-    #[must_use]
-    pub const fn binding(&self) -> &MaxwellPacketDispatch {
-        &self.binding
-    }
-
     #[must_use]
     pub fn methods(&self) -> &[MaxwellEngineMethodDispatch] {
         &self.methods
@@ -582,36 +596,70 @@ impl Display for MaxwellEngineDispatchError {
 
 impl std::error::Error for MaxwellEngineDispatchError {}
 
-/// Dispatches one packet directly against channel-owned engine state.
+/// Failure while streaming one packet into its immediate consumer.
+pub(crate) enum MaxwellEngineStreamError<E> {
+    Dispatch(Box<MaxwellEngineDispatchError>),
+    Consumer(E),
+}
+
+impl<E> MaxwellEngineStreamError<E> {
+    fn dispatch(error: MaxwellEngineDispatchError) -> Self {
+        Self::Dispatch(Box::new(error))
+    }
+}
+
+fn emit_pending_operation<E>(
+    operation: PendingEngineOperation,
+    three_d: &MaxwellThreeDState,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    consume(MaxwellEngineEvent { operation, three_d })
+}
+
+/// Applies one packet and streams sparse execution effects in exact method order.
 ///
 /// Unsupported semantics terminate the guest process, so successfully applied
-/// method prefixes are intentionally not rolled back.
-pub fn dispatch_maxwell_engine_packet(
+/// method prefixes are intentionally not rolled back. A 3D effect borrows the
+/// live state only for the callback and therefore cannot survive a following
+/// register mutation.
+pub(crate) fn stream_maxwell_engine_packet<E>(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedPacket,
-) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
-    let binding = dispatch_maxwell_packet(channel, submission, packet)?;
-    let mut methods = Vec::new();
-    let mut ordered_operations = Vec::new();
-    methods
-        .try_reserve_exact(binding.methods().len())
-        .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-
-    let mut method_index = 0;
-    while method_index < binding.methods().len() {
-        let method = binding.methods()[method_index];
+    methods: Option<&mut Vec<MaxwellEngineMethodDispatch>>,
+    mme_methods: &mut Vec<MaxwellMethodDispatch>,
+    mme_parameters: &mut Vec<u32>,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), MaxwellEngineStreamError<E>> {
+    let mut methods = methods;
+    stream_maxwell_packet_methods(channel, submission, packet, &mut |channel, method| {
+        if !mme_methods.is_empty() {
+            let first_method = mme_methods[0].source().method().0;
+            let next_method = method.source().method().0;
+            let continues = method.kind() == MaxwellMethodDispatchKind::ClassMethod
+                && method.class() == threed::CLASS
+                && (next_method == first_method || next_method == first_method + 4);
+            if continues {
+                mme_methods.try_reserve(1).map_err(|_| {
+                    MaxwellEngineStreamError::dispatch(
+                        MaxwellEngineDispatchError::ResourceExhausted,
+                    )
+                })?;
+                mme_methods.push(method);
+                return Ok(());
+            }
+            flush_mme_methods(channel, mme_methods, mme_parameters, &mut methods, consume)?;
+        }
         if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
             let applied = preflight_host_method(method, host);
             if let Some(operation) = applied.operation {
-                ordered_operations
-                    .try_reserve(1)
-                    .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-                ordered_operations.push(operation);
+                emit_pending_operation(operation, channel.three_d(), consume)
+                    .map_err(MaxwellEngineStreamError::Consumer)?;
             }
-            methods.push(applied.dispatch);
-            method_index += 1;
-            continue;
+            if let Some(methods) = methods.as_deref_mut() {
+                methods.push(applied.dispatch);
+            }
+            return Ok(());
         }
         if method.kind() == MaxwellMethodDispatchKind::ClassMethod
             && method.class() == threed::CLASS
@@ -619,63 +667,76 @@ pub fn dispatch_maxwell_engine_packet(
         {
             let first_method = method.source().method().0;
             if (first_method - 0x3800) & 7 != 0 {
-                return Err(MaxwellEngineDispatchError::MmeExecution {
-                    source: method.source(),
-                    error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
-                });
+                return Err(MaxwellEngineStreamError::dispatch(
+                    MaxwellEngineDispatchError::MmeExecution {
+                        source: method.source(),
+                        error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
+                    },
+                ));
             }
-            let data_method = first_method + 4;
-            let mut end = method_index + 1;
-            while end < binding.methods().len() {
-                let next = binding.methods()[end];
-                let next_method = next.source().method().0;
-                if next.kind() != MaxwellMethodDispatchKind::ClassMethod
-                    || next.class() != threed::CLASS
-                    || (next_method != first_method && next_method != data_method)
-                {
-                    break;
-                }
-                end += 1;
-            }
-            let macro_preflight = threed::preflight_mme_call(
-                channel.profile(),
-                &binding.methods()[method_index..end],
-                channel.three_d_mut(),
-            )?;
-            methods
-                .try_reserve(macro_preflight.methods.len())
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            ordered_operations
-                .try_reserve(macro_preflight.ordered_operations.len())
-                .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-            methods.extend(macro_preflight.methods);
-            ordered_operations.extend(macro_preflight.ordered_operations);
-            method_index = end;
-            continue;
+            mme_methods.try_reserve(1).map_err(|_| {
+                MaxwellEngineStreamError::dispatch(MaxwellEngineDispatchError::ResourceExhausted)
+            })?;
+            mme_methods.push(method);
+            return Ok(());
         }
         if method.kind() == MaxwellMethodDispatchKind::ClassMethod {
-            let applied = dispatch_class_method(channel, method)?;
-            methods.push(applied.dispatch);
+            let applied = dispatch_class_method(channel, method)
+                .map_err(MaxwellEngineStreamError::dispatch)?;
             if let Some(operation) = applied.operation {
-                ordered_operations
-                    .try_reserve(1)
-                    .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-                ordered_operations.push(operation);
+                emit_pending_operation(operation, channel.three_d(), consume)
+                    .map_err(MaxwellEngineStreamError::Consumer)?;
+            }
+            if let Some(methods) = methods.as_deref_mut() {
+                methods.push(applied.dispatch);
             }
         }
-        method_index += 1;
-    }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        MaxwellMethodStreamError::Dispatch(error) => {
+            MaxwellEngineStreamError::dispatch(error.into())
+        }
+        MaxwellMethodStreamError::Consumer(error) => error,
+    })?;
+    flush_mme_methods(channel, mme_methods, mme_parameters, &mut methods, consume)?;
     // Maxwell register programming is not transactional across pushbuffer
     // packets. Related address, limit, format, and selector fields may form an
     // inconsistent intermediate snapshot while the guest moves from one valid
     // configuration to the next. Keep method-local encoding checks here, but
     // defer relational validation until a draw or clear consumes its immutable
     // state snapshot in the neutral lowering preflight.
-    Ok(MaxwellEnginePacketDispatch {
-        binding,
-        methods: methods.into_boxed_slice(),
-        ordered_operations: ordered_operations.into_boxed_slice(),
-    })
+    Ok(())
+}
+
+fn flush_mme_methods<E>(
+    channel: &mut MaxwellGpuChannel,
+    pending: &mut Vec<MaxwellMethodDispatch>,
+    parameters: &mut Vec<u32>,
+    methods: &mut Option<&mut Vec<MaxwellEngineMethodDispatch>>,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), MaxwellEngineStreamError<E>> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    threed::preflight_mme_call(
+        channel.profile(),
+        pending,
+        parameters,
+        channel.three_d_mut(),
+        methods.as_deref_mut(),
+        &mut |operation, state| emit_pending_operation(operation, state, consume),
+    )
+    .map_err(|error| match error {
+        threed::MaxwellThreeDMmePreflightError::Dispatch(error) => {
+            MaxwellEngineStreamError::Dispatch(error)
+        }
+        threed::MaxwellThreeDMmePreflightError::Consumer(error) => {
+            MaxwellEngineStreamError::Consumer(error)
+        }
+    })?;
+    pending.clear();
+    Ok(())
 }
 
 fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod) -> AppliedMethod {
@@ -698,30 +759,96 @@ fn preflight_host_method(method: MaxwellMethodDispatch, host: MaxwellHostMethod)
                 method.source().method(),
                 "MEM_OP_B",
             ),
-            Some(MaxwellEngineOperation::HostSynchronization(
-                MaxwellHostSynchronizationOperation {
-                    source: method.source(),
-                    operation,
-                },
+            Some(PendingEngineOperation::HostSynchronization(
+                MaxwellHostSynchronizationOperation { operation },
             )),
         ),
     }
 }
 
-/// Dispatches packets and methods in stream order.
-pub fn dispatch_maxwell_engine_pushbuffer(
+/// Test collector for method semantics and owned trigger observations.
+#[cfg(test)]
+pub fn dispatch_maxwell_engine_packet(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
-    pushbuffer: &MaxwellDecodedPushbuffer,
-) -> Result<Box<[MaxwellEnginePacketDispatch]>, MaxwellEngineDispatchError> {
-    let mut packets = Vec::new();
-    packets
-        .try_reserve_exact(pushbuffer.packets().len())
-        .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-    for packet in pushbuffer.packets() {
-        packets.push(dispatch_maxwell_engine_packet(channel, submission, packet)?);
+    packet: &MaxwellDecodedPacket,
+) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
+    let mut methods = Vec::new();
+    let mut ordered_operations = Vec::new();
+    let mut mme_methods = Vec::new();
+    let mut mme_parameters = Vec::new();
+    stream_maxwell_engine_packet(
+        channel,
+        submission,
+        packet,
+        Some(&mut methods),
+        &mut mme_methods,
+        &mut mme_parameters,
+        &mut |event| {
+            let operation = match event.operation {
+                PendingEngineOperation::HostSynchronization(operation) => {
+                    MaxwellEngineOperation::HostSynchronization(operation)
+                }
+                PendingEngineOperation::ComputeInlineToMemory(upload) => {
+                    MaxwellEngineOperation::ComputeInlineToMemory(upload)
+                }
+                PendingEngineOperation::InlineToMemory(upload) => {
+                    MaxwellEngineOperation::InlineToMemory(upload)
+                }
+                PendingEngineOperation::DmaCopy(operation) => {
+                    MaxwellEngineOperation::DmaCopy(operation)
+                }
+                PendingEngineOperation::ComputeSynchronization(operation) => {
+                    MaxwellEngineOperation::ComputeSynchronization(operation)
+                }
+                PendingEngineOperation::ThreeDInlineConstantBuffer(upload) => {
+                    MaxwellEngineOperation::ThreeDInlineConstantBuffer(upload)
+                }
+                PendingEngineOperation::ThreeD(trigger) => {
+                    MaxwellEngineOperation::ThreeD(Box::new(MaxwellThreeDTriggeredOperation {
+                        trigger,
+                        state: Arc::new(event.three_d.clone()),
+                    }))
+                }
+                PendingEngineOperation::ThreeDSynchronization(trigger) => {
+                    MaxwellEngineOperation::ThreeDSynchronization(Box::new(
+                        MaxwellThreeDSynchronizationOperation {
+                            trigger,
+                            state: Arc::new(event.three_d.clone()),
+                        },
+                    ))
+                }
+            };
+            ordered_operations.push(operation);
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .map_err(|error| match error {
+        MaxwellEngineStreamError::Dispatch(error) => *error,
+        MaxwellEngineStreamError::Consumer(never) => match never {},
+    })?;
+    Ok(MaxwellEnginePacketDispatch {
+        methods: methods.into_boxed_slice(),
+        ordered_operations: ordered_operations.into_boxed_slice(),
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDSynchronizationOperation {
+    trigger: MaxwellThreeDSynchronizationTrigger,
+    state: Arc<MaxwellThreeDState>,
+}
+
+#[cfg(test)]
+impl MaxwellThreeDSynchronizationOperation {
+    pub const fn trigger(&self) -> MaxwellThreeDSynchronizationTrigger {
+        self.trigger
     }
-    Ok(packets.into_boxed_slice())
+
+    pub fn state(&self) -> &MaxwellThreeDState {
+        &self.state
+    }
 }
 
 fn dispatch_class_method(

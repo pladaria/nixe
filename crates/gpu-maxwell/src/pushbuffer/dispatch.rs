@@ -10,10 +10,12 @@ use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
 use crate::{
     MaxwellChannelFrontendState, MaxwellChannelId, MaxwellDecodedMethod,
-    MaxwellDecodedMethodPacket, MaxwellDecodedPacket, MaxwellDecodedPushbuffer,
-    MaxwellGpfifoSourceLocation, MaxwellGpuChannel, MaxwellGpuProfile, MaxwellPushbufferControl,
-    MaxwellPushbufferSubchannel,
+    MaxwellDecodedMethodPacket, MaxwellDecodedPacket, MaxwellGpfifoSourceLocation,
+    MaxwellGpuChannel, MaxwellGpuProfile, MaxwellPushbufferControl, MaxwellPushbufferSubchannel,
 };
+
+#[cfg(test)]
+use crate::MaxwellDecodedPushbuffer;
 
 /// Byte address of the PBDMA SetObject host method.
 pub const MAXWELL_SET_OBJECT_METHOD: GpuMethodId = GpuMethodId(0);
@@ -183,12 +185,14 @@ impl Display for MaxwellMethodDispatch {
     }
 }
 
-/// Methods decoded and applied while dispatching one packet.
+/// Test observation of methods decoded and applied while dispatching a packet.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellPacketDispatch {
     methods: Box<[MaxwellMethodDispatch]>,
 }
 
+#[cfg(test)]
 impl MaxwellPacketDispatch {
     #[must_use]
     pub fn methods(&self) -> &[MaxwellMethodDispatch] {
@@ -315,41 +319,64 @@ impl Display for MaxwellMethodDispatchError {
 
 impl std::error::Error for MaxwellMethodDispatchError {}
 
-/// Dispatches one packet in method order, mutating frontend state directly.
-///
-/// Unsupported semantics are fatal to the guest process, so successfully
-/// dispatched method prefixes are not rolled back when a later method fails.
-pub fn dispatch_maxwell_packet(
+pub(crate) enum MaxwellMethodStreamError<E> {
+    Dispatch(MaxwellMethodDispatchError),
+    Consumer(E),
+}
+
+/// Applies class binding and streams methods without retaining a second packet.
+pub(crate) fn stream_maxwell_packet_methods<E>(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedPacket,
-) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
+    consume: &mut impl FnMut(&mut MaxwellGpuChannel, MaxwellMethodDispatch) -> Result<(), E>,
+) -> Result<(), MaxwellMethodStreamError<E>> {
     match packet {
         MaxwellDecodedPacket::Methods(packet) => {
-            dispatch_method_packet(channel, submission, packet)
+            stream_method_packet(channel, submission, packet, consume)
         }
         MaxwellDecodedPacket::Control { operation, source } => {
-            validate_source_identity(channel.id(), submission, *source)?;
+            validate_source_identity(channel.id(), submission, *source)
+                .map_err(MaxwellMethodStreamError::Dispatch)?;
             match operation {
-                MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment => {
-                    Ok(MaxwellPacketDispatch {
-                        methods: Box::new([]),
-                    })
-                }
+                MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment => Ok(()),
                 MaxwellPushbufferControl::SetSubdeviceMask(_)
                 | MaxwellPushbufferControl::StoreSubdeviceMask(_)
                 | MaxwellPushbufferControl::UseSubdeviceMask => {
-                    Err(MaxwellMethodDispatchError::UnsupportedControl {
-                        source: *source,
-                        operation: *operation,
-                    })
+                    Err(MaxwellMethodStreamError::Dispatch(
+                        MaxwellMethodDispatchError::UnsupportedControl {
+                            source: *source,
+                            operation: *operation,
+                        },
+                    ))
                 }
             }
         }
     }
 }
 
-/// Dispatches decoded packets and methods in stream order.
+#[cfg(test)]
+pub fn dispatch_maxwell_packet(
+    channel: &mut MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    packet: &MaxwellDecodedPacket,
+) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
+    let mut methods = Vec::new();
+    stream_maxwell_packet_methods(channel, submission, packet, &mut |_, method| {
+        methods.push(method);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .map_err(|error| match error {
+        MaxwellMethodStreamError::Dispatch(error) => error,
+        MaxwellMethodStreamError::Consumer(never) => match never {},
+    })?;
+    Ok(MaxwellPacketDispatch {
+        methods: methods.into_boxed_slice(),
+    })
+}
+
+/// Dispatches decoded packets and methods in stream order for tests.
+#[cfg(test)]
 pub fn dispatch_maxwell_pushbuffer(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
@@ -365,44 +392,38 @@ pub fn dispatch_maxwell_pushbuffer(
     Ok(packets.into_boxed_slice())
 }
 
-fn dispatch_method_packet(
+fn stream_method_packet<E>(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: &MaxwellDecodedMethodPacket,
-) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
-    validate_source_identity(channel.id(), submission, packet.header())?;
+    consume: &mut impl FnMut(&mut MaxwellGpuChannel, MaxwellMethodDispatch) -> Result<(), E>,
+) -> Result<(), MaxwellMethodStreamError<E>> {
+    validate_source_identity(channel.id(), submission, packet.header())
+        .map_err(MaxwellMethodStreamError::Dispatch)?;
     if packet.methods().is_empty() {
-        return Ok(MaxwellPacketDispatch {
-            methods: Box::new([]),
-        });
+        return Ok(());
     }
-    let subchannel =
-        packet
-            .subchannel()
-            .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel {
-                source: packet.header(),
-            })?;
+    let subchannel = packet
+        .subchannel()
+        .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel {
+            source: packet.header(),
+        })
+        .map_err(MaxwellMethodStreamError::Dispatch)?;
     let channel_id = channel.id();
     let profile = channel.profile();
-    let mut methods = Vec::new();
-    methods
-        .try_reserve_exact(packet.methods().len())
-        .map_err(|_| MaxwellMethodDispatchError::ResourceExhausted)?;
-
     for method in packet.methods() {
-        methods.push(dispatch_method(
+        let method = dispatch_method(
             channel_id,
             profile,
             submission,
             subchannel,
             *method,
             channel.frontend_mut(),
-        )?);
+        )
+        .map_err(MaxwellMethodStreamError::Dispatch)?;
+        consume(channel, method).map_err(MaxwellMethodStreamError::Consumer)?;
     }
-
-    Ok(MaxwellPacketDispatch {
-        methods: methods.into_boxed_slice(),
-    })
+    Ok(())
 }
 
 fn dispatch_method(

@@ -131,12 +131,17 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
         MaxwellChannelOwner::new(1),
         SWITCH_1_GM20B_PROFILE,
     );
+    let mut lowering_cache = MaxwellThreeDLoweringCache::default();
     let mut dispatch = |method: u32, argument: u32| {
         let decoded = packet(0, method / 4, &[argument]);
-        dispatch_maxwell_engine_packet(
+        lower_maxwell_pushbuffer(
+            &decoded,
             &mut channel,
+            &address_space,
             FrontendSubmissionId::new(2),
-            &decoded.packets()[0],
+            Vec::new(),
+            None,
+            &mut lowering_cache,
         )
         .unwrap()
     };
@@ -179,18 +184,7 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
         let _ = dispatch(method, argument);
     }
     let draw = dispatch(0x0d78, 3);
-    let draws = [draw];
-    let mut first_cache = MaxwellThreeDLoweringCache::default();
-    let plan = preflight_maxwell_submission_execution(
-        &draws,
-        &address_space,
-        FrontendSubmissionId::new(2),
-        Vec::new(),
-        None,
-        &mut first_cache,
-    )
-    .unwrap();
-    let [MaxwellSubmissionExecutionStep::ThreeD(work)] = plan.steps() else {
+    let [MaxwellSubmissionExecutionStep::ThreeD(work)] = draw.steps() else {
         panic!("captured draw did not lower to one neutral 3D work item");
     };
     let shader_modules = work
@@ -229,15 +223,7 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
     shader_allocation
         .write(0, &vertex_header[0].to_le_bytes())
         .unwrap();
-    let replacement = preflight_maxwell_submission_execution(
-        &draws,
-        &address_space,
-        FrontendSubmissionId::new(3),
-        Vec::new(),
-        None,
-        &mut first_cache,
-    )
-    .unwrap();
+    let replacement = dispatch(0x0d78, 3);
     let [MaxwellSubmissionExecutionStep::ThreeD(replacement_work)] = replacement.steps() else {
         panic!("replacement draw did not lower to one neutral 3D work item");
     };
