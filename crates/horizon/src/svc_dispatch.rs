@@ -13,6 +13,7 @@ use nixe_cpu::memory::{
     DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAttributes,
     MemoryMappingError, MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions,
     MemoryProtectionError, MemoryProtectionErrorReason, MemoryRegionKind, MemoryValue,
+    ProcessMemory,
 };
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a32::A32GeneralRegister;
@@ -828,11 +829,11 @@ impl HorizonSvcDispatcher {
                     let process = coordinator
                         .process(process_id)
                         .ok_or_else(|| runtime_fault("GetThreadContext3"))?;
-                    if !process.memory().write_mapped_ram(
-                        process.cpu_context().address_space_id(),
-                        address,
-                        &bytes,
-                    ) {
+                    if process
+                        .memory()
+                        .write_bytes(process.cpu_context().address_space_id(), address, &bytes)
+                        .is_err()
+                    {
                         return Err(runtime_fault("GetThreadContext3 atomic context write"));
                     }
                     HorizonKernelResult::SUCCESS

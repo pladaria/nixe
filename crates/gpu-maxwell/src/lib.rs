@@ -4,10 +4,10 @@
 //! on host-independent GPU contracts and never on Horizon or a host backend.
 
 mod address_space;
-mod capture;
 mod channel;
 mod engines;
 mod execution;
+mod frontend;
 mod gpfifo;
 mod profile;
 mod pushbuffer;
@@ -20,11 +20,6 @@ pub use address_space::{
     MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellMapRequest, MaxwellMappingDiagnostic,
     MaxwellMappingDump, MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange,
     MaxwellSparseMapping, MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
-};
-pub use capture::{
-    MAXWELL_FRONTEND_CAPTURE_WORDS, MaxwellFrontendCapture, MaxwellFrontendCaptureError,
-    MaxwellFrontendFailure, MaxwellFrontendReplay, capture_maxwell_frontend_dispatch,
-    replay_maxwell_frontend_capture,
 };
 pub use channel::{
     MaxwellChannelError, MaxwellChannelFrontendState, MaxwellChannelId, MaxwellChannelOwner,
@@ -178,6 +173,10 @@ pub use execution::{
     MaxwellSoftwareInitializationError, MaxwellSubmissionExecutionError,
     MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionStep,
     execute_maxwell_software_initialization, preflight_maxwell_submission_execution,
+};
+pub use frontend::{
+    MAXWELL_FRONTEND_DIAGNOSTIC_WORDS, MaxwellFrontendDiagnostic, MaxwellFrontendDispatchError,
+    diagnose_maxwell_frontend, dispatch_maxwell_frontend,
 };
 pub use gpfifo::{
     MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,

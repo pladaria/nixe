@@ -11,7 +11,7 @@ use nixe_cpu_engine::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, DomainMemoryBinding,
     DomainRequest, EngineCapabilities, EngineControl, EngineDescriptor, EngineDomain,
     EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind, EngineId,
-    EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace, RunRequest,
+    EngineKind, EngineProvider, ExecutionReport, RunRequest,
 };
 use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
@@ -242,14 +242,14 @@ impl EngineDomain for FakeNceDomain {
 
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
         if self.torn_down || self.address_space.is_none() {
             return Err(self.fault("fake NCE domain is not bound"));
         }
-        let oracle = self.oracle.create_executor(request)?;
+        let oracle = self.oracle.create_executor(executor)?;
         Ok(Box::new(FakeNceExecutor {
-            id: request.executor,
+            id: executor,
             oracle,
             shadow: Arc::clone(&self.shadow),
             metrics: Arc::clone(&self.metrics),
@@ -327,11 +327,6 @@ impl EngineExecutor for FakeNceExecutor {
                         immediate: (bits >> 5) & 0xffff,
                     },
                     context: shadow.register_context(),
-                    trace: InstructionTrace {
-                        enabled: false,
-                        entries: Box::new([]),
-                        discarded: 0,
-                    },
                 })
             }
             Some(bits) if bits & 0xffe0_001f == 0xd420_0000 => {
@@ -344,11 +339,6 @@ impl EngineExecutor for FakeNceExecutor {
                         syndrome: Some(u64::from((bits >> 5) & 0xffff)),
                     },
                     context: shadow.register_context(),
-                    trace: InstructionTrace {
-                        enabled: false,
-                        entries: Box::new([]),
-                        discarded: 0,
-                    },
                 })
             }
             _ => self.oracle.run_slice(RunRequest {
@@ -423,7 +413,6 @@ fn descriptor() -> EngineDescriptor {
             a64: true,
             a32: false,
             t32: false,
-            instruction_trace: false,
             interpret_one_fallback: false,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),

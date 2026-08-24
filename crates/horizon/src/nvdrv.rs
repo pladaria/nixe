@@ -2386,22 +2386,10 @@ mod tests {
         let location = boundary.first_packet().unwrap();
         assert_eq!(location.entry_index, 0);
         assert_eq!(location.word_offset, 0);
-        let frontend_capture = boundary.frontend_capture().unwrap();
-        let frontend_result = boundary.frontend_replay().unwrap();
-        assert_eq!(frontend_capture.words().len(), 1);
         assert!(matches!(
-            frontend_result.failure(),
-            nixe_gpu_maxwell::MaxwellFrontendFailure::PacketDecode(_)
+            boundary.frontend_failure(),
+            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_))
         ));
-        let mut replay_channel = channel_before_submission.clone();
-        assert_eq!(
-            nixe_gpu_maxwell::replay_maxwell_frontend_capture(
-                frontend_capture,
-                &mut replay_channel
-            )
-            .unwrap(),
-            *frontend_result
-        );
         let submission = boundary.dispatch().scheduled().submission();
         let completion = boundary.dispatch().scheduled().completion().unwrap();
         assert_eq!(completion.point().syncpoint().get(), syncpoint);
@@ -2530,8 +2518,8 @@ mod tests {
             panic!("empty legacy submission must retain the explicit frontend boundary");
         };
         assert!(matches!(
-            empty_legacy_boundary.frontend_replay().unwrap().failure(),
-            nixe_gpu_maxwell::MaxwellFrontendFailure::EmptySubmission
+            empty_legacy_boundary.frontend_failure(),
+            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
         ));
         assert_eq!(
             empty_legacy_boundary
@@ -2673,8 +2661,8 @@ mod tests {
             panic!("empty work must stop at its explicit frontend boundary");
         };
         assert!(matches!(
-            empty_boundary.frontend_replay().unwrap().failure(),
-            nixe_gpu_maxwell::MaxwellFrontendFailure::EmptySubmission
+            empty_boundary.frontend_failure(),
+            Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
         ));
         assert!(empty_boundary.dispatch().scheduled().completion().is_none());
 

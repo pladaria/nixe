@@ -10,8 +10,7 @@ use nixe_cpu_engine::{
     CONFORMANCE_FALLBACK_ENCODING, CapabilityRejection, CapabilityRejectionReason,
     CapabilityReport, CrossVcpuRequest, DomainRequest, EngineCapabilities, EngineControl,
     EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault,
-    EngineId, EngineKind, EngineProvider, ExecutionReport, ExecutorRequest, InstructionTrace,
-    RunRequest,
+    EngineId, EngineKind, EngineProvider, ExecutionReport, RunRequest,
 };
 use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
@@ -109,11 +108,11 @@ impl EngineDomain for FakeJitDomain {
 
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        let oracle = self.oracle.create_executor(request)?;
+        let oracle = self.oracle.create_executor(executor)?;
         Ok(Box::new(FakeJitExecutor {
-            id: request.executor,
+            id: executor,
             oracle,
             cache: HashMap::new(),
             metrics: Arc::clone(&self.metrics),
@@ -209,11 +208,6 @@ impl EngineExecutor for FakeJitExecutor {
                 instructions_executed: 0,
                 stop: nixe_cpu_engine::EngineExit::InterpretOne { source },
                 context: request.state.register_context(),
-                trace: InstructionTrace {
-                    enabled: false,
-                    entries: Box::new([]),
-                    discarded: 0,
-                },
             });
         }
         if matches!(cached, 0xd503_201f | 0x9100_0400) {
@@ -230,11 +224,6 @@ impl EngineExecutor for FakeJitExecutor {
                 instructions_executed: 1,
                 stop: nixe_cpu_engine::EngineExit::BudgetExhausted,
                 context: request.state.register_context(),
-                trace: InstructionTrace {
-                    enabled: false,
-                    entries: Box::new([]),
-                    discarded: 0,
-                },
             });
         }
         self.oracle.run_slice(request)
@@ -272,7 +261,6 @@ fn descriptor() -> EngineDescriptor {
             a64: true,
             a32: true,
             t32: true,
-            instruction_trace: false,
             interpret_one_fallback: true,
             concurrent_executors: true,
             max_safepoint_instructions: std::num::NonZeroU64::new(1),
@@ -293,10 +281,5 @@ fn empty_report(state: &ThreadCpuState, stop: nixe_cpu_engine::EngineExit) -> Ex
         instructions_executed: 0,
         stop,
         context: state.register_context(),
-        trace: InstructionTrace {
-            enabled: false,
-            entries: Box::new([]),
-            discarded: 0,
-        },
     }
 }

@@ -10,8 +10,6 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     assert_eq!(report.instructions_executed, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
-    assert!(!report.trace.enabled());
-    assert!(report.trace.entries().is_empty());
     let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
         panic!("homebrew fixture must report A64 context");
     };
@@ -26,13 +24,7 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
 #[test]
 fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     let (_directory, plan) = plan();
-    let mut process = reference_process_builder()
-        .with_diagnostics(crate::DiagnosticsPolicy {
-            instruction_trace: true,
-            ..crate::DiagnosticsPolicy::default()
-        })
-        .build(&plan)
-        .unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     replace_entry_instructions(
         &mut process,
         &[
@@ -80,14 +72,6 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
             immediate: 0x42,
         } if source.pc.get() == entry + 8
     ));
-    let sources = svc
-        .trace
-        .entries()
-        .iter()
-        .map(|entry| entry.source.pc.get())
-        .collect::<Vec<_>>();
-    assert_eq!(sources, [entry, entry + 4, entry + 8]);
-
     let mut dispatcher = FixedSupervisorCallDispatcher {
         outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
             crate::ExceptionResume::Next,

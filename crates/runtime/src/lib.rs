@@ -4,7 +4,6 @@ pub use nixe_loader_executable::RelocationState;
 
 mod address_wait;
 mod coordinator;
-mod diagnostics;
 mod exception_dispatch;
 mod execution_record;
 mod external_event;
@@ -22,7 +21,6 @@ pub use coordinator::{
     CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
     VcpuExecutionMode, WorkerFailure,
 };
-pub use diagnostics::{DiagnosticsPolicy, ReportDetail};
 pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume,
@@ -56,13 +54,11 @@ pub use module_memory::{
 };
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use process::{
-    ExecutionReport, ExecutionStop, GuestThread, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-    ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
-    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryLayout,
-    ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
-    ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
-    ThreadExit, ThreadTable, ThreadTableError,
+    ExecutionReport, ExecutionStop, GuestThread, ProcessAddressSpace, ProcessBuildConfig,
+    ProcessBuildError, ProcessBuildStage, ProcessBuilder, ProcessExecutionError, ProcessExit,
+    ProcessExitCause, ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure,
+    ProcessTeardownReport, ProcessVirtualRegion, RunnableProcess, ThreadCreateError,
+    ThreadCreateRequest, ThreadCreation, ThreadExit, ThreadTable, ThreadTableError,
 };
 pub use process_mount::ProcessMountNamespace;
 pub use virtual_time::{VirtualClock, VirtualClockMode};

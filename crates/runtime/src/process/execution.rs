@@ -12,13 +12,11 @@ use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu_engine::{
     DomainRequest, EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault,
-    EngineProvider, EngineTimer, ExecutorRequest, RunRequest, TimerSnapshot, TracePolicy,
+    EngineProvider, EngineTimer, RunRequest, TimerSnapshot,
 };
 use nixe_memory::GuestVirtualAddress;
 
-use crate::{
-    DiagnosticsPolicy, ExceptionTerminationScope, GuestBreakPayload, ReportDetail, VirtualClock,
-};
+use crate::{ExceptionTerminationScope, GuestBreakPayload, VirtualClock};
 
 static NEXT_ENGINE_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -33,10 +31,7 @@ pub(super) fn allocate_engine_domain_id() -> Option<EngineDomainId> {
         .map(EngineDomainId::new)
 }
 
-pub use nixe_cpu_engine::{
-    EngineExit as ExecutionStop, ExecutionReport, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-};
+pub use nixe_cpu_engine::{EngineExit as ExecutionStop, ExecutionReport};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProcessExitCause {
@@ -165,7 +160,6 @@ pub(crate) struct ProcessExecutionControl {
     fallback: Option<FallbackExecutionControl>,
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
     cpu: ProcessCpuContext,
-    trace_policy: TracePolicy,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
     address_space_end: nixe_memory::GuestVirtualAddress,
@@ -184,7 +178,6 @@ pub(crate) struct WorkerExecutors {
 }
 
 pub(crate) struct ProcessExecutionConfiguration {
-    pub(crate) diagnostics: DiagnosticsPolicy,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) timer_frequency: u64,
     pub(crate) cpu: ProcessCpuContext,
@@ -200,16 +193,11 @@ impl ProcessExecutionControl {
         fallback: Option<(EngineDomainId, &dyn EngineProvider)>,
     ) -> Result<Self, EngineFault> {
         let ProcessExecutionConfiguration {
-            diagnostics,
             virtual_clock,
             timer_frequency,
             cpu,
             address_space_end,
         } = configuration;
-        let trace = TracePolicy {
-            enabled: diagnostics.instruction_trace,
-            detailed: diagnostics.report_detail == ReportDetail::Detailed,
-        };
         let mut domain = provider.create_domain(DomainRequest {
             domain: domain_id,
             cpu,
@@ -224,10 +212,7 @@ impl ProcessExecutionControl {
             let _ = domain.shutdown();
             return Err(fault);
         }
-        let executor = match domain.create_executor(ExecutorRequest {
-            executor: EngineExecutorId::new(1),
-            trace,
-        }) {
+        let executor = match domain.create_executor(EngineExecutorId::new(1)) {
             Ok(executor) => executor,
             Err(fault) => {
                 let _ = domain.shutdown();
@@ -284,7 +269,6 @@ impl ProcessExecutionControl {
             fallback,
             controls: BTreeMap::new(),
             cpu,
-            trace_policy: trace,
             virtual_clock,
             architectural_timer_frequency: timer_frequency,
             address_space_end,
@@ -296,10 +280,6 @@ impl ProcessExecutionControl {
 
     pub(crate) fn engine_descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
         self.domain.descriptor()
-    }
-
-    pub(crate) const fn instruction_trace_enabled(&self) -> bool {
-        self.trace_policy.enabled
     }
 
     pub(crate) fn domain_id(&self) -> EngineDomainId {
@@ -374,10 +354,7 @@ impl ProcessExecutionControl {
         &mut self,
         vcpu: nixe_scheduler::VirtualCpuId,
     ) -> Result<WorkerExecutors, EngineFault> {
-        let primary = self.domain.create_executor(ExecutorRequest {
-            executor: Self::executor_id(vcpu),
-            trace: self.trace_policy,
-        })?;
+        let primary = self.domain.create_executor(Self::executor_id(vcpu))?;
         if let Some(control) = primary.control() {
             self.publish_pending_control(&control);
             self.controls.insert(vcpu, control);
@@ -395,12 +372,7 @@ impl ProcessExecutionControl {
         let fallback = self
             .fallback
             .as_mut()
-            .map(|fallback| {
-                fallback.domain.create_executor(ExecutorRequest {
-                    executor: Self::executor_id(vcpu),
-                    trace: self.trace_policy,
-                })
-            })
+            .map(|fallback| fallback.domain.create_executor(Self::executor_id(vcpu)))
             .transpose()?;
         Ok(WorkerExecutors { primary, fallback })
     }
@@ -442,17 +414,9 @@ fn create_fallback_domain(
         domain: domain_id,
         cpu,
     })?;
-    let result = domain.bind_memory(binding).and_then(|()| {
-        domain
-            .create_executor(ExecutorRequest {
-                executor: EngineExecutorId::new(1),
-                trace: TracePolicy {
-                    enabled: false,
-                    detailed: false,
-                },
-            })
-            .map(drop)
-    });
+    let result = domain
+        .bind_memory(binding)
+        .and_then(|()| domain.create_executor(EngineExecutorId::new(1)).map(drop));
     if let Err(fault) = result {
         let _ = domain.shutdown();
         return Err(fault);
@@ -663,9 +627,9 @@ mod tests {
 
         fn create_executor(
             &mut self,
-            request: ExecutorRequest,
+            executor: EngineExecutorId,
         ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-            Ok(Box::new(InertExecutor(request.executor)))
+            Ok(Box::new(InertExecutor(executor)))
         }
 
         fn shutdown(&mut self) -> Result<(), EngineFault> {
@@ -709,7 +673,6 @@ mod tests {
             let memory = nixe_cpu::memory::ExecutionMemory::new();
             let mut execution = ProcessExecutionControl::with_provider(
                 ProcessExecutionConfiguration {
-                    diagnostics: DiagnosticsPolicy::default(),
                     virtual_clock: VirtualClock::default(),
                     timer_frequency: 19_200_000,
                     cpu,

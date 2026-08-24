@@ -61,7 +61,6 @@ fn descriptor(id: EngineId) -> EngineDescriptor {
             a64: true,
             a32: true,
             t32: true,
-            instruction_trace: false,
             interpret_one_fallback: false,
             concurrent_executors: false,
             max_safepoint_instructions: None,
@@ -170,10 +169,10 @@ impl EngineDomain for FakeDomain {
 
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
         Ok(Box::new(FakeExecutor {
-            id: request.executor,
+            id: executor,
             budget: Arc::clone(&self.executor_budget),
         }))
     }
@@ -200,11 +199,6 @@ impl EngineExecutor for FakeExecutor {
             instructions_executed: request.instruction_budget,
             stop: EngineExit::BudgetExhausted,
             context: request.state.register_context(),
-            trace: InstructionTrace {
-                enabled: false,
-                entries: Box::new([]),
-                discarded: 0,
-            },
         })
     }
 
@@ -269,15 +263,7 @@ fn fake_engine_is_object_safe_and_reports_normalized_lifecycle_exits() {
         })
         .unwrap();
     assert_eq!(domain.descriptor().kind, EngineKind::Test);
-    let executor = domain
-        .create_executor(ExecutorRequest {
-            executor: EngineExecutorId::new(1),
-            trace: TracePolicy {
-                enabled: false,
-                detailed: false,
-            },
-        })
-        .unwrap();
+    let executor = domain.create_executor(EngineExecutorId::new(1)).unwrap();
     assert_eq!(executor.executor_id(), EngineExecutorId::new(1));
 }
 
@@ -362,9 +348,9 @@ impl EngineDomain for RecordingDomain {
     }
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        self.base.create_executor(request)
+        self.base.create_executor(executor)
     }
 
     fn bind_memory(&mut self, binding: DomainMemoryBinding<'_>) -> Result<(), EngineFault> {

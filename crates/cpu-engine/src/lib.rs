@@ -29,10 +29,6 @@ pub use conformance::{
 };
 pub use control::{ControlSnapshot, CrossVcpuRequest, EngineControl, EngineExecutionGuard};
 
-pub const MAX_INSTRUCTION_TRACE_ENTRIES: usize = 64;
-pub const MAX_TRACE_DISASSEMBLY_BYTES: usize = 96;
-pub const MAX_INSTRUCTION_TRACE_EXPORT_BYTES: usize = 16 * 1024;
-
 macro_rules! identity {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -64,81 +60,6 @@ pub struct TimerSnapshot {
 
 pub trait EngineTimer {
     fn snapshot(&self) -> TimerSnapshot;
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TracePolicy {
-    pub enabled: bool,
-    pub detailed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstructionTraceEntry {
-    pub sequence: u64,
-    pub source: LocationDescriptor,
-    pub encoding: InstructionEncoding,
-    pub disassembly: Option<Box<str>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstructionTrace {
-    pub enabled: bool,
-    pub entries: Box<[InstructionTraceEntry]>,
-    pub discarded: u64,
-}
-
-impl InstructionTrace {
-    #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.enabled
-    }
-    #[must_use]
-    pub const fn entries(&self) -> &[InstructionTraceEntry] {
-        &self.entries
-    }
-    #[must_use]
-    pub const fn discarded(&self) -> u64 {
-        self.discarded
-    }
-}
-
-impl Display for InstructionTraceEntry {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "#{} source=[{}] encoding={}",
-            self.sequence, self.source, self.encoding
-        )?;
-        if let Some(disassembly) = &self.disassembly {
-            write!(formatter, " disassembly={disassembly}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Display for InstructionTrace {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        if !self.enabled {
-            return formatter.write_str("disabled");
-        }
-        let mut output = format!(
-            "retained={} discarded={}",
-            self.entries.len(),
-            self.discarded
-        );
-        for entry in &self.entries {
-            let line = format!("\n{entry}");
-            if output.len().saturating_add(line.len()) > MAX_INSTRUCTION_TRACE_EXPORT_BYTES {
-                const MARKER: &str = "\n<trace-export-truncated>";
-                if output.len().saturating_add(MARKER.len()) <= MAX_INSTRUCTION_TRACE_EXPORT_BYTES {
-                    output.push_str(MARKER);
-                }
-                break;
-            }
-            output.push_str(&line);
-        }
-        formatter.write_str(&output)
-    }
 }
 
 /// One bounded request. Borrowed resources cannot escape the call.
@@ -319,15 +240,14 @@ pub struct ExecutionReport {
     pub instructions_executed: u64,
     pub stop: EngineExit,
     pub context: RegisterContext,
-    pub trace: InstructionTrace,
 }
 
 impl Display for ExecutionReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "instructions={} stop=[{}] registers=[{}] trace=[{}]",
-            self.instructions_executed, self.stop, self.context, self.trace
+            "instructions={} stop=[{}] registers=[{}]",
+            self.instructions_executed, self.stop, self.context
         )
     }
 }
@@ -383,13 +303,6 @@ pub struct DomainMemoryBinding<'a> {
     pub end_exclusive: GuestVirtualAddress,
     pub memory: &'a dyn DomainMemory,
     pub invalidation_generation: u64,
-}
-
-/// Construction parameters for one worker-owned vCPU executor.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ExecutorRequest {
-    pub executor: EngineExecutorId,
-    pub trace: TracePolicy,
 }
 
 pub trait EngineProvider: Send + Sync {
@@ -487,7 +400,7 @@ pub trait EngineDomain: Send {
     /// Creates executor-local state for an already-bound domain.
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault>;
     /// Binds the complete canonical address-space view before executors are
     /// created. Implementations must copy or retain safe backing objects; they

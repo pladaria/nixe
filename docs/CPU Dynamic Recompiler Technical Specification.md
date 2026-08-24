@@ -1130,39 +1130,19 @@ execution state, and at most 32 bytes of local instruction context, and counts
 total frequency independently from unique occurrences. Runtime integration
 feeds `UnsupportedInstruction` terminators into this tracker.
 
-The tracker supports both detailed and sanitized exports. Detailed reports are
-the default and include the bounded byte window required for local debugging.
-Sanitized reports contain only one raw instruction, guest addresses, opaque
-numeric identities, and counters; selecting this policy also prevents the
-tracker from retaining surrounding bytes. Neither mode accepts module paths,
-title names, or arbitrary caller-provided strings. A report can be reduced to
+The tracker has one deterministic, bounded export containing the local byte
+window required for debugging. It accepts no module paths, title names, host
+pointers, or arbitrary caller-provided strings. A report can be reduced to
 `MissingInstructionFixture`, which carries only coverage ID, encoding, and
 execution state for a regression test.
 
-### 23.2 Diagnostics configuration ownership
+### 23.2 Diagnostics ownership
 
-Diagnostic detail is a runtime policy, not an intrinsic CPU-profile property
-and not a debug-versus-release compile-time choice. Application configuration
-loads a user-facing `diagnostics.report_detail` value. The runtime normalizes it
-into one immutable `DiagnosticsPolicy` for the emulation session, and
-`ProcessBuilder` retains that policy while constructing process resources.
-`Detailed` is the default in every build profile; applications may explicitly
-select `Sanitized`.
-
-The complete runtime policy may later cover CPU missing-instruction reports, IR
-dumps, AMD64 code dumps, GPU command diagnostics, and runtime event logs. It is
-never passed wholesale into a subsystem. Instead, the runtime derives narrow
-immutable views such as `CpuDiagnosticsConfig`; future backend and GPU crates
-must receive equivalent subsystem-specific views. This preserves the dependency
-direction: CPU code does not depend on the application configuration crate,
-runtime types, graphics APIs, file paths, CLI behavior, or report destinations.
-
-The CPU view currently selects whether missing-instruction collection is
-enabled and whether its detail is `Detailed` or `Sanitized`. It also exposes
-whether the runtime should fetch surrounding bytes, avoiding unnecessary guest
-memory reads in sanitized mode. The tracker owns no output path and performs no
-I/O. A later diagnostics sink may route structured reports to console, files, or
-developer tools without changing decoder, lifter, interpreter, or backend APIs.
+Missing-instruction diagnostics are an explicit CPU development tool rather
+than an emulation-session policy. Creating a tracker enables collection; code
+that does not need a report does not create one. The tracker owns no output path
+and performs no I/O, preserving the dependency direction from the CPU frontend
+away from runtime, application configuration, graphics APIs, and CLI behavior.
 No mutable global diagnostics configuration is permitted.
 
 ## 24. Debugging and instrumentation

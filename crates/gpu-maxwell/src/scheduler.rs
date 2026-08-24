@@ -12,9 +12,9 @@ use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
 
 use crate::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
-    MaxwellFrontendCapture, MaxwellFrontendReplay, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
+    MaxwellFrontendDispatchError, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
     MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellGpuChannel,
-    MaxwellSubmissionExecutionError, MaxwellValidatedGpfifoSubmission,
+    MaxwellValidatedGpfifoSubmission,
 };
 
 /// Global acceptance order assigned by one deterministic scheduler.
@@ -181,9 +181,7 @@ pub enum MaxwellFrontendDispatchBoundary {
     /// so its completion reservation cannot be published accidentally.
     Frontend {
         dispatch: Box<MaxwellFrontendDispatch>,
-        capture: Box<MaxwellFrontendCapture>,
-        replay: Box<MaxwellFrontendReplay>,
-        execution_failure: Option<Box<MaxwellSubmissionExecutionError>>,
+        failure: MaxwellFrontendDispatchError,
     },
 }
 
@@ -202,42 +200,36 @@ impl MaxwellFrontendDispatchBoundary {
         match self {
             Self::FirstPacket { location, .. } => Some(*location),
             Self::EmptySubmission { .. } => None,
-            Self::Frontend { capture, .. } => capture.words().first().map(|word| word.location()),
+            Self::Frontend { dispatch, .. } => dispatch
+                .scheduled()
+                .submission()
+                .first_packet_location()
+                .ok()
+                .flatten(),
         }
     }
 
     #[must_use]
-    pub const fn frontend_capture(&self) -> Option<&MaxwellFrontendCapture> {
+    pub const fn frontend_failure(&self) -> Option<&MaxwellFrontendDispatchError> {
         match self {
-            Self::Frontend { capture, .. } => Some(capture),
+            Self::Frontend { failure, .. } => Some(failure),
             Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
         }
     }
 
-    #[must_use]
-    pub const fn frontend_replay(&self) -> Option<&MaxwellFrontendReplay> {
+    /// Reconstructs a bounded raw command prefix only after frontend failure.
+    pub fn frontend_diagnostic(
+        &self,
+    ) -> Result<Option<crate::MaxwellFrontendDiagnostic>, Box<str>> {
         match self {
-            Self::Frontend { replay, .. } => Some(replay),
-            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
-        }
-    }
-
-    /// Returns the first submission-execution preflight failure, if decoding
-    /// and method dispatch completed far enough to reach that layer.
-    #[must_use]
-    pub fn execution_failure(&self) -> Option<&MaxwellSubmissionExecutionError> {
-        match self {
-            Self::Frontend {
-                execution_failure, ..
-            } => execution_failure.as_deref(),
-            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
+            Self::Frontend { dispatch, .. } => crate::diagnose_maxwell_frontend(dispatch).map(Some),
+            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => Ok(None),
         }
     }
 }
 
 impl Display for MaxwellFrontendDispatchBoundary {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        let includes_capture = matches!(self, Self::Frontend { .. });
         let scheduled = self.dispatch().scheduled();
         write!(
             formatter,
@@ -260,25 +252,7 @@ impl Display for MaxwellFrontendDispatchBoundary {
             Self::EmptySubmission { .. } => {
                 formatter.write_str("empty-submission completion semantics are unavailable")
             }
-            Self::Frontend {
-                capture,
-                replay,
-                execution_failure,
-                ..
-            } => write!(
-                formatter,
-                "frontend-packets={} first-fatal=[{}] frontend-capture=[{}]",
-                replay.packets().len(),
-                execution_failure
-                    .as_deref()
-                    .map_or_else(|| replay.failure() as &dyn Display, |error| error),
-                capture
-            ),
-        }?;
-        if includes_capture {
-            Ok(())
-        } else {
-            write!(formatter, " capture=[{}]", self.dispatch().capture())
+            Self::Frontend { failure, .. } => write!(formatter, "frontend-failure=[{failure}]"),
         }
     }
 }
