@@ -127,10 +127,8 @@ impl Default for NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(
-            None,
-            GpuCacheConfiguration::default(),
-        ))
+        let cache_configuration = GpuCacheConfiguration::default();
+        Self::new_with_executor(NvDrvGpuExecutor::new(None), cache_configuration)
     }
 
     #[must_use]
@@ -138,10 +136,13 @@ impl NvDrvSession {
         backend: Box<dyn NeutralBackendRuntime>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend), cache_configuration))
+        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend)), cache_configuration)
     }
 
-    fn new_with_executor(gpu_executor: NvDrvGpuExecutor) -> Self {
+    fn new_with_executor(
+        gpu_executor: NvDrvGpuExecutor,
+        cache_configuration: GpuCacheConfiguration,
+    ) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
@@ -154,7 +155,7 @@ impl NvDrvSession {
                 next_gpu_address_space_id: 1,
                 gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
-                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::default())),
+                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new(cache_configuration))),
                 nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvmap: NvMapObjects::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
@@ -635,10 +636,14 @@ impl NvDrvSession {
                         .find(|address_space| address_space.id() == id)
                         .cloned()
                 });
+                let permit = backend.reserve_submission().map_err(|error| {
+                    nvhost_gpu::queued_execution_error(descriptor, request, error)
+                })?;
                 let result = gpu
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .submit_ioctl(
+                        permit,
                         NvHostGpuSubmitResources {
                             control: &control,
                             address_space: address_space.as_ref(),

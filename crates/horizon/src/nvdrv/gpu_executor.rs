@@ -7,13 +7,12 @@ use std::thread::{self, JoinHandle};
 
 use nixe_gpu::{
     BackendExecutionCompletion, BackendSubmissionToken, BackendVisibilityRequester,
-    FrontendSubmissionId, GpuCacheConfiguration, NeutralBackendRuntime, PresentationImageRequest,
-    ReservedTimelinePoint, ResidentImage,
+    FrontendSubmissionId, NeutralBackendRuntime, PresentationImageRequest, ReservedTimelinePoint,
+    ResidentImage,
 };
 use nixe_gpu_maxwell::{
-    MaxwellBackendExecution, MaxwellEnginePacketDispatch, MaxwellGpuAddressSpace,
-    MaxwellSubmissionExecutionPlan, MaxwellThreeDLoweringCache,
-    execute_maxwell_software_initialization, preflight_maxwell_submission_execution,
+    MaxwellBackendExecution, MaxwellSubmissionExecutionPlan,
+    execute_maxwell_software_initialization,
 };
 use nixe_memory::{CpuVisibilityRequest, VisibilityCoordinatorError};
 
@@ -59,37 +58,34 @@ struct GpuWork {
     execution: Option<GpuWorkExecution>,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
-    permit: GpuWorkPermit,
+    permit: GpuFrontendPermit,
 }
 
 pub(super) struct GpuSubmission {
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
-    frontend: FrontendSubmissionId,
-    packets: Box<[MaxwellEnginePacketDispatch]>,
-    address_space: MaxwellGpuAddressSpace,
+    execution: MaxwellSubmissionExecutionPlan,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
+    permit: GpuFrontendPermit,
 }
 
 impl GpuSubmission {
     pub(super) fn new(
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
-        frontend: FrontendSubmissionId,
-        packets: Box<[MaxwellEnginePacketDispatch]>,
-        address_space: MaxwellGpuAddressSpace,
+        execution: MaxwellSubmissionExecutionPlan,
         reservation: Option<ReservedTimelinePoint>,
         control: Arc<Mutex<NvHostControl>>,
+        permit: GpuFrontendPermit,
     ) -> Self {
         Self {
             descriptor,
             request,
-            frontend,
-            packets,
-            address_space,
+            execution,
             reservation,
             control,
+            permit,
         }
     }
 }
@@ -121,7 +117,7 @@ struct GpuWorkBudgetState {
 }
 
 impl GpuWorkBudget {
-    fn reserve(self: &Arc<Self>) -> Option<GpuWorkPermit> {
+    fn reserve(self: &Arc<Self>) -> Option<GpuFrontendPermit> {
         let mut state = self
             .state
             .lock()
@@ -139,7 +135,7 @@ impl GpuWorkBudget {
         }
         state.active += 1;
         state.preflight_blocked = true;
-        Some(GpuWorkPermit {
+        Some(GpuFrontendPermit {
             budget: Arc::clone(self),
             release_preflight_after_submission: false,
             preflight_released: false,
@@ -185,13 +181,13 @@ impl GpuWorkBudget {
     }
 }
 
-struct GpuWorkPermit {
+pub(super) struct GpuFrontendPermit {
     budget: Arc<GpuWorkBudget>,
     release_preflight_after_submission: bool,
     preflight_released: bool,
 }
 
-impl GpuWorkPermit {
+impl GpuFrontendPermit {
     fn set_release_after_submission(&mut self, release: bool) {
         self.release_preflight_after_submission = release;
     }
@@ -221,7 +217,7 @@ impl GpuWorkPermit {
     }
 }
 
-impl Drop for GpuWorkPermit {
+impl Drop for GpuFrontendPermit {
     fn drop(&mut self) {
         self.release_preflight();
         let mut state = self
@@ -284,7 +280,6 @@ pub(super) struct NvDrvGpuExecutor {
     failure: Arc<Mutex<Option<GpuExecutorFailure>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     budget: Arc<GpuWorkBudget>,
-    lowering_cache: Mutex<MaxwellThreeDLoweringCache>,
 }
 
 impl std::fmt::Debug for NvDrvGpuExecutor {
@@ -303,10 +298,7 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
 }
 
 impl NvDrvGpuExecutor {
-    pub(super) fn new(
-        mut backend: Option<Box<dyn NeutralBackendRuntime>>,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
+    pub(super) fn new(mut backend: Option<Box<dyn NeutralBackendRuntime>>) -> Self {
         let (sender, receiver) = mpsc::sync_channel(MAX_GPU_SUBMISSIONS_IN_FLIGHT);
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
@@ -360,7 +352,6 @@ impl NvDrvGpuExecutor {
             failure,
             worker: Mutex::new(Some(worker)),
             budget,
-            lowering_cache: Mutex::new(MaxwellThreeDLoweringCache::new(cache_configuration)),
         }
     }
 
@@ -368,55 +359,24 @@ impl NvDrvGpuExecutor {
         let GpuSubmission {
             descriptor,
             request,
-            frontend,
-            packets,
-            address_space,
+            execution,
             reservation,
             control,
+            mut permit,
         } = submission;
+        let frontend = execution.frontend();
         self.require_healthy()?;
-        // Frontend lowering can demand CPU visibility for canonical memory.
-        // Keep it outside both the global nvdrv lock and the backend-owner
-        // thread: the latter must remain free to satisfy that visibility
-        // request. The cache has one ordered owner at a time, while only the
-        // resulting neutral plan crosses the bounded backend queue.
-        let mut lowering_cache = self
-            .lowering_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Acquire queue capacity and the ordered-memory boundary in one wait.
-        // Preflight must not overtake the point where the preceding submission
-        // publishes GPU ownership or commits command-processor writes.
-        let mut permit = self.budget.reserve().ok_or_else(|| {
-            self.failure().unwrap_or(GpuExecutorFailure {
-                frontend,
-                detail: "GPU executor stopped before ordered frontend preflight".into(),
-            })
-        })?;
-        let plan = preflight_maxwell_submission_execution(
-            &packets,
-            &address_space,
-            frontend,
-            Vec::new(),
-            reservation.as_ref(),
-            &mut lowering_cache,
-        )
-        .map_err(|error| GpuExecutorFailure {
-            frontend,
-            detail: error.to_string().into(),
-        })?;
         let release_preflight_after_submission =
-            plan.requires_backend() && !plan.has_deferred_canonical_writes();
+            execution.requires_backend() && !execution.has_deferred_canonical_writes();
         permit.set_release_after_submission(release_preflight_after_submission);
 
-        // Retain the cache ownership through queue admission. Besides keeping
-        // preflight state transactional, this makes concurrent ioctl callers
-        // enter the backend queue in the same order in which they lowered.
+        // The permit retains the ordered frontend boundary through queue
+        // admission, so another ioctl cannot lower past this submission.
         self.require_healthy()?;
         let work = GpuWork {
             descriptor,
             request,
-            execution: Some(GpuWorkExecution::Prepared(plan)),
+            execution: Some(GpuWorkExecution::Prepared(execution)),
             reservation,
             control,
             permit,
@@ -441,6 +401,18 @@ impl NvDrvGpuExecutor {
                 })
             })?;
         Ok(())
+    }
+
+    /// Reserves bounded queue capacity and the ordered frontend boundary
+    /// before channel state is dispatched and lowered.
+    pub(super) fn reserve_submission(&self) -> Result<GpuFrontendPermit, GpuExecutorFailure> {
+        self.require_healthy()?;
+        self.budget.reserve().ok_or_else(|| {
+            self.failure().unwrap_or(GpuExecutorFailure {
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU executor stopped before ordered frontend lowering".into(),
+            })
+        })
     }
 
     pub(super) fn require_healthy(&self) -> Result<(), GpuExecutorFailure> {
@@ -976,13 +948,10 @@ mod tests {
                 max_compute_workgroups: [0; 3],
             },
         );
-        let executor = NvDrvGpuExecutor::new(
-            Some(Box::new(VisibilityRuntime {
-                capabilities,
-                requester: Arc::clone(&requester),
-            })),
-            GpuCacheConfiguration::default(),
-        );
+        let executor = NvDrvGpuExecutor::new(Some(Box::new(VisibilityRuntime {
+            capabilities,
+            requester: Arc::clone(&requester),
+        })));
         let requester = requester
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

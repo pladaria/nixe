@@ -885,7 +885,7 @@ impl RenderAttachment {
 pub enum RenderPassOperation {
     Begin {
         render_pass: RenderPassId,
-        attachments: Box<[RenderAttachment]>,
+        attachments: Arc<[RenderAttachment]>,
     },
     End {
         render_pass: RenderPassId,
@@ -923,7 +923,7 @@ impl RenderPassOperation {
         }
         Ok(Self::Begin {
             render_pass,
-            attachments: attachments.into_boxed_slice(),
+            attachments: attachments.into(),
         })
     }
 
@@ -951,8 +951,8 @@ pub enum GpuCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuOperation {
     command: GpuCommand,
-    accesses: Box<[ResourceAccess]>,
-    dependencies: Box<[ResourceDependency]>,
+    accesses: Arc<[ResourceAccess]>,
+    dependencies: Arc<[ResourceDependency]>,
     requirements: CapabilityRequirements,
 }
 
@@ -976,10 +976,27 @@ impl GpuOperation {
             .merged(&additional_requirements);
         Self {
             command,
-            accesses: accesses.into_boxed_slice(),
-            dependencies: dependencies.into_boxed_slice(),
+            accesses: accesses.into(),
+            dependencies: dependencies.into(),
             requirements,
         }
+    }
+
+    /// Reuses immutable validation metadata for a prepared draw which differs
+    /// only in its direct arguments.
+    pub fn with_draw_arguments(
+        &self,
+        arguments: DrawArguments,
+    ) -> Result<Self, CommandDescriptionError> {
+        let GpuCommand::Draw(draw) = &self.command else {
+            panic!("draw argument reuse requires a prepared draw operation");
+        };
+        Ok(Self {
+            command: GpuCommand::Draw(DrawOperation::new(Arc::clone(&draw.prepared), arguments)?),
+            accesses: Arc::clone(&self.accesses),
+            dependencies: Arc::clone(&self.dependencies),
+            requirements: self.requirements.clone(),
+        })
     }
 
     #[must_use]
@@ -1098,7 +1115,7 @@ impl GpuCommand {
                         .filter(|attachment| attachment.kind == ImageKind::Color)
                         .count() as u8,
                 ));
-                for attachment in attachments {
+                for attachment in attachments.iter() {
                     requirements.push(CapabilityRequirement::ImageFormat(attachment.format));
                     requirements.push(CapabilityRequirement::SampleCount(attachment.samples));
                 }

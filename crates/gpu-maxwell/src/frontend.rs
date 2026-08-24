@@ -2,12 +2,16 @@
 
 use std::fmt::{Display, Formatter};
 
+use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_packet};
+use crate::execution::MaxwellSubmissionPlanner;
 use crate::pushbuffer::packet::SubmissionWords;
 use crate::{
-    MaxwellEngineDispatchError, MaxwellEnginePacketDispatch, MaxwellFrontendDispatch,
+    MaxwellDecodedPushbuffer, MaxwellEngineDispatchError, MaxwellFrontendDispatch,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellPushbufferDecodeError,
-    decode_maxwell_pushbuffer, dispatch_maxwell_engine_packet,
+    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan, MaxwellThreeDLoweringCache,
+    decode_maxwell_pushbuffer,
 };
+use nixe_gpu::{FrontendSubmissionId, ReservedTimelinePoint};
 
 /// Hard bound for a failure-only command dump.
 pub const MAXWELL_FRONTEND_DIAGNOSTIC_WORDS: usize = 4_096;
@@ -41,7 +45,7 @@ pub enum MaxwellFrontendDispatchError {
     EmptySubmission,
     PacketDecode(MaxwellPushbufferDecodeError),
     EngineDispatch(Box<MaxwellEngineDispatchError>),
-    ResourceExhausted,
+    Execution(Box<MaxwellSubmissionExecutionError>),
 }
 
 impl Display for MaxwellFrontendDispatchError {
@@ -50,43 +54,84 @@ impl Display for MaxwellFrontendDispatchError {
             Self::EmptySubmission => formatter.write_str("empty Maxwell submission"),
             Self::PacketDecode(error) => write!(formatter, "packet decode failed: {error}"),
             Self::EngineDispatch(error) => write!(formatter, "engine dispatch failed: {error}"),
-            Self::ResourceExhausted => {
-                formatter.write_str("Maxwell frontend dispatch exhausted host resources")
-            }
+            Self::Execution(error) => write!(formatter, "frontend lowering failed: {error}"),
         }
     }
 }
 
 impl std::error::Error for MaxwellFrontendDispatchError {}
 
-/// Decodes and dispatches a retained submission exactly once.
+/// Decodes, dispatches, and lowers a retained submission exactly once.
 ///
-/// Successful work retains only execution-relevant packets. Source mappings
-/// remain owned by `dispatch`, and typed failures already carry their precise
-/// command location, so normal execution does not clone engine state or record
-/// a parallel replay stream.
-pub fn dispatch_maxwell_frontend(
+/// Each packet is lowered before the next packet mutates channel state. Only
+/// the completed neutral plan survives this function; packet objects and their
+/// temporary trigger snapshots do not cross the frontend boundary.
+pub fn lower_maxwell_frontend(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
     address_space: &MaxwellGpuAddressSpace,
-) -> Result<Box<[MaxwellEnginePacketDispatch]>, MaxwellFrontendDispatchError> {
+    frontend: FrontendSubmissionId,
+    predecessors: Vec<FrontendSubmissionId>,
+    completion: Option<&ReservedTimelinePoint>,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
     let decoded = decode_maxwell_pushbuffer(SubmissionWords::new(submission, address_space))
         .map_err(MaxwellFrontendDispatchError::PacketDecode)?;
     if decoded.packets().is_empty() {
         return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
-    let mut packets = Vec::new();
-    packets
-        .try_reserve_exact(decoded.packets().len())
-        .map_err(|_| MaxwellFrontendDispatchError::ResourceExhausted)?;
-    for packet in decoded.packets() {
-        packets.push(
-            dispatch_maxwell_engine_packet(channel, submission.frontend(), packet)
-                .map_err(|error| MaxwellFrontendDispatchError::EngineDispatch(Box::new(error)))?,
-        );
+    lower_maxwell_pushbuffer(
+        &decoded,
+        channel,
+        address_space,
+        frontend,
+        predecessors,
+        completion,
+        cache,
+    )
+}
+
+/// Applies and lowers an already decoded pushbuffer through the current
+/// streaming frontend path.
+pub fn lower_maxwell_pushbuffer(
+    decoded: &MaxwellDecodedPushbuffer,
+    channel: &mut MaxwellGpuChannel,
+    address_space: &MaxwellGpuAddressSpace,
+    frontend: FrontendSubmissionId,
+    predecessors: Vec<FrontendSubmissionId>,
+    completion: Option<&ReservedTimelinePoint>,
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<MaxwellSubmissionExecutionPlan, MaxwellFrontendDispatchError> {
+    if decoded.packets().is_empty() {
+        return Err(MaxwellFrontendDispatchError::EmptySubmission);
     }
-    Ok(packets.into_boxed_slice())
+    let mut planner =
+        MaxwellSubmissionPlanner::new(address_space, frontend, predecessors, completion, cache);
+    let (mut mme_methods, mut mme_parameters) = planner.take_mme_scratch();
+    for packet in decoded.packets() {
+        stream_maxwell_engine_packet(
+            channel,
+            frontend,
+            packet,
+            None,
+            &mut mme_methods,
+            &mut mme_parameters,
+            &mut |event| planner.push_event(event),
+        )
+        .map_err(|error| match error {
+            MaxwellEngineStreamError::Dispatch(error) => {
+                MaxwellFrontendDispatchError::EngineDispatch(error)
+            }
+            MaxwellEngineStreamError::Consumer(error) => {
+                MaxwellFrontendDispatchError::Execution(Box::new(error))
+            }
+        })?;
+    }
+    planner.recycle_mme_scratch(mme_methods, mme_parameters);
+    planner
+        .finish()
+        .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))
 }
 
 /// Reconstructs a bounded raw command prefix from sources already retained by

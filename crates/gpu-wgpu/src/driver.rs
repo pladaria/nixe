@@ -1638,7 +1638,7 @@ impl WgpuBackendDriver {
 
         let mut views = std::mem::take(&mut self.render_attachment_views);
         views.clear();
-        for attachment in attachments {
+        for attachment in attachments.iter() {
             views.push(self.attachment_view(dependencies, *attachment)?);
         }
         let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);

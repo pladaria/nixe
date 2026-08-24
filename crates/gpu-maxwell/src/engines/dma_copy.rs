@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
 use super::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -368,7 +368,7 @@ pub(super) fn preflight(
     Ok(AppliedMethod::new(
         method,
         *declaration.metadata,
-        operation.map(MaxwellEngineOperation::DmaCopy),
+        operation.map(PendingEngineOperation::DmaCopy),
     ))
 }
 

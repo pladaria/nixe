@@ -1,6 +1,9 @@
 //! Backend capability reporting and side-effect-free negotiation.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use crate::{ImageFormat, QueryKind, SampleCount, ShaderStage};
 
@@ -69,14 +72,14 @@ pub enum CapabilityRequirement {
 /// Canonical, immutable requirements for one operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityRequirements {
-    requirements: Box<[CapabilityRequirement]>,
+    requirements: Arc<[CapabilityRequirement]>,
 }
 
 impl CapabilityRequirements {
     #[must_use]
     pub fn none() -> Self {
         Self {
-            requirements: Box::new([]),
+            requirements: Arc::from([]),
         }
     }
 
@@ -90,7 +93,7 @@ impl CapabilityRequirements {
             }
         }
         Self {
-            requirements: unique.into_boxed_slice(),
+            requirements: unique.into(),
         }
     }
 

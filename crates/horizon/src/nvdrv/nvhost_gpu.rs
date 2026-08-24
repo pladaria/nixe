@@ -4,22 +4,22 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
-    FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
-    GuestTimelinePoint, ReservedTimelinePoint,
+    FrontendSubmissionId, GpuCacheConfiguration, GpuVirtualAddress, GuestSyncpointId,
+    GuestSyncpointValue, GuestTimelinePoint, ReservedTimelinePoint,
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
     MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
-    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
-    decode_gpfifo_submission, dispatch_maxwell_frontend, resolve_gpfifo_submission,
+    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellThreeDLoweringCache,
+    MaxwellZCullMode, decode_gpfifo_submission, lower_maxwell_frontend, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
 use crate::GraphicsEventSource;
 
 use super::diagnostics::NvDrvCallError;
-use super::gpu_executor::{GpuExecutorFailure, GpuSubmission};
+use super::gpu_executor::{GpuExecutorFailure, GpuFrontendPermit, GpuSubmission};
 use super::nvhost_ctrl::NvHostControl;
 use super::{
     NV_BAD_PARAMETER, NV_BAD_VALUE, NV_INVALID_STATE, NvDrvDeviceDescriptor, NvDrvErrorContext,
@@ -75,12 +75,13 @@ impl NvHostGpuErrorEvent {
 ///
 /// Durable GPU semantics remain in `MaxwellGpuChannel`; this table only maps
 /// Horizon descriptor lifetimes onto those frontend objects.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct NvHostGpu {
     channels: BTreeMap<NvDrvFileDescriptor, MaxwellGpuChannel>,
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
     scheduler: MaxwellScheduler,
+    lowering_cache: MaxwellThreeDLoweringCache,
 }
 
 pub(super) struct NvHostGpuIoctlResources<'a> {
@@ -102,20 +103,19 @@ struct NvHostGpuSubmit<'a> {
 struct NvHostGpuSubmissionState<'a> {
     scheduler: &'a mut MaxwellScheduler,
     next_frontend_submission: &'a mut u64,
+    lowering_cache: &'a mut MaxwellThreeDLoweringCache,
 }
 
-impl Default for NvHostGpu {
-    fn default() -> Self {
+impl NvHostGpu {
+    pub(super) fn new(cache_configuration: GpuCacheConfiguration) -> Self {
         Self {
             channels: BTreeMap::new(),
             error_events: BTreeMap::new(),
             next_frontend_submission: 1,
             scheduler: MaxwellScheduler::default(),
+            lowering_cache: MaxwellThreeDLoweringCache::new(cache_configuration),
         }
     }
-}
-
-impl NvHostGpu {
     pub(super) fn open(&mut self, fd: NvDrvFileDescriptor, channel: MaxwellGpuChannel) {
         let channel_id = channel.id().get();
         let previous_channel = self.channels.insert(fd, channel);
@@ -328,6 +328,7 @@ impl NvHostGpu {
 
     pub(super) fn submit_ioctl(
         &mut self,
+        permit: GpuFrontendPermit,
         resources: NvHostGpuSubmitResources<'_>,
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
@@ -363,11 +364,13 @@ impl NvHostGpu {
             NvHostGpuSubmissionState {
                 scheduler: &mut self.scheduler,
                 next_frontend_submission: &mut self.next_frontend_submission,
+                lowering_cache: &mut self.lowering_cache,
             },
             resources,
             descriptor,
             request,
             submit,
+            permit,
         )
     }
 
@@ -456,10 +459,12 @@ fn submit_gpfifo(
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     submit: NvHostGpuSubmit<'_>,
+    permit: GpuFrontendPermit,
 ) -> Result<(Vec<u8>, GpuSubmission), NvDrvCallError> {
     let NvHostGpuSubmissionState {
         scheduler,
         next_frontend_submission,
+        lowering_cache,
     } = state;
     let allocated_entries = channel
         .frontend()
@@ -568,8 +573,17 @@ fn submit_gpfifo(
         .dispatch_next(dependency_reached, dispatch_address_space)
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let packets = match dispatch_maxwell_frontend(&dispatch, channel, dispatch_address_space) {
-        Ok(packets) => packets,
+    let frontend = dispatch.scheduled().frontend();
+    let execution = match lower_maxwell_frontend(
+        &dispatch,
+        channel,
+        dispatch_address_space,
+        frontend,
+        Vec::new(),
+        dispatch.scheduled().completion(),
+        lowering_cache,
+    ) {
+        Ok(execution) => execution,
         Err(failure) => {
             let boundary = MaxwellFrontendDispatchBoundary::Frontend {
                 dispatch: Box::new(dispatch),
@@ -578,7 +592,6 @@ fn submit_gpfifo(
             return Err(unsupported_frontend_boundary(descriptor, request, boundary));
         }
     };
-    let frontend = dispatch.scheduled().frontend();
     let expected_completion = dispatch
         .scheduled()
         .completion()
@@ -587,11 +600,10 @@ fn submit_gpfifo(
     let submission = GpuSubmission::new(
         descriptor,
         request,
-        frontend,
-        packets,
-        dispatch_address_space.clone(),
+        execution,
         reservation.clone(),
         Arc::clone(resources.control),
+        permit,
     );
 
     let mut output = submit.response.to_vec();

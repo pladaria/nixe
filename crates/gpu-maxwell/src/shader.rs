@@ -4655,12 +4655,12 @@ mod tests {
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 
     use super::*;
+    use crate::engines::dispatch_maxwell_engine_packet;
     use crate::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
         MaxwellChannelId, MaxwellChannelOwner, MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace,
         MaxwellGpuChannel, MaxwellMapRequest, MaxwellMappingId, MaxwellPushbufferWord,
         MaxwellThreeDLoweringCache, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
-        dispatch_maxwell_engine_packet,
     };
 
     fn translate_maxwell_shader_programs(

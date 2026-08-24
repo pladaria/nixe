@@ -11,7 +11,7 @@ use super::{
     MaxwellComputeTriggeredOperation,
 };
 use crate::engines::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, MaxwellEngineOperation,
+    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -157,7 +157,7 @@ pub(super) fn preflight(
         return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            Some(MaxwellEngineOperation::ComputeSynchronization(Box::new(
+            Some(PendingEngineOperation::ComputeSynchronization(Box::new(
                 MaxwellComputeTriggeredOperation::new(trigger, candidate.clone()),
             ))),
         ));
@@ -199,7 +199,7 @@ pub(super) fn preflight(
         return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            Some(MaxwellEngineOperation::ComputeInlineToMemory(upload)),
+            Some(PendingEngineOperation::ComputeInlineToMemory(upload)),
         ));
     }
     let write = match declaration.action {

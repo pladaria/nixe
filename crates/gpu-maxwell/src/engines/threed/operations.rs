@@ -1,9 +1,6 @@
 //! Host-independent `MAXWELL_B` ordering and completion operations.
 
-use std::{
-    fmt::{Display, Formatter},
-    sync::Arc,
-};
+use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{
     CacheMaintenanceOperation, GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint,
@@ -563,32 +560,6 @@ impl MaxwellThreeDSynchronizationTrigger {
     }
 }
 
-/// One synchronization trigger paired with the exact 3D state at that method.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDSynchronizationOperation {
-    trigger: MaxwellThreeDSynchronizationTrigger,
-    state: Arc<MaxwellThreeDState>,
-}
-
-impl MaxwellThreeDSynchronizationOperation {
-    pub(crate) fn new(
-        trigger: MaxwellThreeDSynchronizationTrigger,
-        state: Arc<MaxwellThreeDState>,
-    ) -> Self {
-        Self { trigger, state }
-    }
-
-    #[must_use]
-    pub const fn trigger(&self) -> MaxwellThreeDSynchronizationTrigger {
-        self.trigger
-    }
-
-    #[must_use]
-    pub fn state(&self) -> &MaxwellThreeDState {
-        &self.state
-    }
-}
-
 /// Validated host-independent lowering of one 3D synchronization operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationPlan {
@@ -734,23 +705,23 @@ impl Display for MaxwellThreeDSynchronizationError {
 /// NVIDIA exposes `WAIT_FOR_IDLE` as a full-width channel-ordering method:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L51-L52>
 pub fn lower_maxwell_three_d_synchronization(
-    operation: &MaxwellThreeDSynchronizationOperation,
+    trigger: MaxwellThreeDSynchronizationTrigger,
+    state: &MaxwellThreeDState,
     completion: Option<&ReservedTimelinePoint>,
     prior_work_pending: bool,
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
-    match operation.trigger() {
+    match trigger {
         MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source } => {
-            let compression = operation.state().render_targets().color()
-                [usize::from(request.color_target())]
-            .compression()
-            .value()
-            .copied()
-            .ok_or(
-                MaxwellThreeDSynchronizationError::IncompleteDecompressSurfaceState {
-                    source,
-                    target: request.color_target(),
-                },
-            )?;
+            let compression = state.render_targets().color()[usize::from(request.color_target())]
+                .compression()
+                .value()
+                .copied()
+                .ok_or(
+                    MaxwellThreeDSynchronizationError::IncompleteDecompressSurfaceState {
+                        source,
+                        target: request.color_target(),
+                    },
+                )?;
             if compression == MaxwellThreeDColorCompressionMode::Enabled {
                 return Err(
                     MaxwellThreeDSynchronizationError::CompressedSurfaceDecompressionUnavailable {
@@ -842,7 +813,7 @@ pub fn lower_maxwell_three_d_synchronization(
                     },
                 );
             }
-            let state = operation.state().report_semaphore();
+            let state = state.report_semaphore();
             let (Some(address), Some(payload)) =
                 (state.address(), state.payload().value().copied())
             else {
