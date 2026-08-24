@@ -12,7 +12,7 @@
 
 use crate::MaxwellMethodSource;
 
-use super::{MaxwellThreeDRawValue, MaxwellThreeDRegister, state::PipelineDependencySink};
+use super::{MaxwellThreeDRawValue, MaxwellThreeDRegister};
 
 /// Treatment of edges generated when polygon clipping precedes line-mode
 /// rasterization.
@@ -202,20 +202,6 @@ impl MaxwellThreeDLineState {
         &self,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDLineStippleParameters> {
         &self.stipple_parameters
-    }
-
-    pub(super) fn append_pipeline_dependencies(
-        &self,
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        dependencies.push(self.polygon_clip_generated_edge.raw());
-        dependencies.push(self.aliased_line_width_enable.raw());
-        dependencies.push(self.anti_aliased_line_enable.raw());
-        dependencies.push(self.aliased_line_width.raw());
-        dependencies.push(self.stipple_enable.raw());
-        if self.stipple_enable.value() != Some(&false) {
-            dependencies.push(self.stipple_parameters.raw());
-        }
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDLineStateWrite) {

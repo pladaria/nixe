@@ -172,6 +172,7 @@ pub use shader_execution::{
     MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDSubtilingPerfKnobA,
     MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDVisibleCallLimit,
 };
+pub(crate) use state::MaxwellThreeDFrontendState;
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAttributePointSize, MaxwellThreeDConservativeRasterEnable, MaxwellThreeDEdgeFlag,
@@ -1022,7 +1023,7 @@ pub(super) struct MaxwellThreeDMmePreflight {
 pub(super) fn preflight_mme_call(
     profile: MaxwellGpuProfile,
     methods: &[MaxwellMethodDispatch],
-    candidate: &mut MaxwellThreeDState,
+    candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<MaxwellThreeDMmePreflight, MaxwellEngineDispatchError> {
     let first = methods[0];
     let source = first.source();
@@ -1049,7 +1050,7 @@ pub(super) fn preflight_mme_call(
         .iter()
         .map(|method| method.source().argument())
         .collect::<Vec<_>>();
-    let program = candidate.mme().clone();
+    let program = candidate.mme().program();
     let ordered_operations = {
         let mut host = MmeDispatchHost {
             profile,
@@ -1093,7 +1094,7 @@ pub(super) fn preflight_mme_call(
 struct MmeDispatchHost<'a> {
     profile: MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
-    candidate: &'a mut MaxwellThreeDState,
+    candidate: &'a mut MaxwellThreeDFrontendState,
     ordered_operations: Vec<MaxwellEngineOperation>,
 }
 
@@ -1137,7 +1138,7 @@ impl MaxwellThreeDMmeHost for MmeDispatchHost<'_> {
 pub(super) fn preflight(
     profile: MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellThreeDState,
+    candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
     let prepared = preflight_with_shadow(profile, method, candidate, true)?;
     let operation = lower_pending_operation(prepared.operation, candidate);
@@ -1150,18 +1151,18 @@ pub(super) fn preflight(
 
 fn lower_pending_operation(
     operation: Option<PendingOperation>,
-    state: &MaxwellThreeDState,
+    state: &MaxwellThreeDFrontendState,
 ) -> Option<MaxwellEngineOperation> {
     operation.map(|operation| match operation {
         PendingOperation::ThreeD(trigger) => {
             MaxwellEngineOperation::ThreeD(Box::new(MaxwellThreeDTriggeredOperation {
                 trigger,
-                state: std::sync::Arc::new(state.clone()),
+                state: state.operation_snapshot(),
             }))
         }
         PendingOperation::Synchronization(trigger) => {
             MaxwellEngineOperation::ThreeDSynchronization(Box::new(
-                MaxwellThreeDSynchronizationOperation::new(trigger, state.clone()),
+                MaxwellThreeDSynchronizationOperation::new(trigger, state.operation_snapshot()),
             ))
         }
         PendingOperation::InlineToMemory(upload) => MaxwellEngineOperation::InlineToMemory(upload),
@@ -1174,7 +1175,7 @@ fn lower_pending_operation(
 fn preflight_with_shadow(
     profile: MaxwellGpuProfile,
     mut method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellThreeDState,
+    candidate: &mut MaxwellThreeDFrontendState,
     apply_shadow_ram: bool,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
@@ -1207,11 +1208,11 @@ fn preflight_with_shadow(
 fn preflight_register(
     profile: MaxwellGpuProfile,
     method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellThreeDState,
+    candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     let source = method.source();
     if let Some((write, method_name, upload)) =
-        inline_to_memory::preflight(source, candidate.inline_to_memory())?
+        inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
     {
         candidate.apply(write);
         let metadata =
@@ -2330,7 +2331,7 @@ fn preflight_register(
 
 fn preflight_mme_state(
     source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDState,
+    candidate: &MaxwellThreeDFrontendState,
 ) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
     let mme = candidate.mme();
     if (0x3400..0x3800).contains(&source.method().0) {
@@ -2442,7 +2443,7 @@ type PreflightConstantBufferLoad = (
 
 fn preflight_constant_buffer_load(
     source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDState,
+    candidate: &MaxwellThreeDFrontendState,
 ) -> Result<Option<PreflightConstantBufferLoad>, MaxwellEngineDispatchError> {
     use MaxwellThreeDShaderBindingWrite as B;
 
@@ -2463,6 +2464,7 @@ fn preflight_constant_buffer_load(
         )),
         method if (0x2390..0x2400).contains(&method) && method.is_multiple_of(4) => {
             if candidate
+                .operation_state()
                 .render_enable()
                 .conditional_load_constant_buffer()
                 .value()
@@ -2472,7 +2474,7 @@ fn preflight_constant_buffer_load(
                     MaxwellEngineDispatchError::UnsupportedConditionalConstantBufferLoad { source },
                 );
             }
-            let bindings = candidate.shader_bindings();
+            let bindings = candidate.operation_state().shader_bindings();
             let selector = bindings.selector();
             let address = selector.address().ok_or_else(|| {
                 invalid_encoding(
@@ -2540,7 +2542,7 @@ fn preflight_constant_buffer_load(
 
 fn preflight_vertex_and_binding_state(
     source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDState,
+    candidate: &MaxwellThreeDFrontendState,
 ) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
     use MaxwellThreeDShaderBindingWrite as B;
     use MaxwellThreeDVertexInputWrite as V;
@@ -2963,7 +2965,7 @@ fn preflight_vertex_and_binding_state(
         }
         let enabled = raw & 1 != 0;
         let slot = ((raw >> 4) & 0x1f) as u8;
-        let selector = candidate.shader_bindings().selector();
+        let selector = candidate.operation_state().shader_bindings().selector();
         let (address, size) = if enabled {
             let address = selector.address().ok_or_else(|| {
                 invalid_encoding(

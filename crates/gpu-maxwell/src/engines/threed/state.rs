@@ -27,8 +27,8 @@ use super::{
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
     MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDShaderStage, MaxwellThreeDTiledCacheState,
-    MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDTirMode, MaxwellThreeDVertexInputState,
+    MaxwellThreeDShaderExecutionStateWrite, MaxwellThreeDTiledCacheState,
+    MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDVertexInputState,
     MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
@@ -39,22 +39,6 @@ use super::{
 };
 
 pub const MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT: usize = 32;
-
-pub(super) trait PipelineDependencySink {
-    fn push(&mut self, dependency: Option<u32>);
-
-    fn extend(&mut self, dependencies: impl IntoIterator<Item = Option<u32>>) {
-        for dependency in dependencies {
-            self.push(dependency);
-        }
-    }
-}
-
-impl PipelineDependencySink for Vec<Option<u32>> {
-    fn push(&mut self, dependency: Option<u32>) {
-        Vec::push(self, dependency);
-    }
-}
 
 /// Byte-addressed polygon-mode registers read by the Switch graphics macros.
 pub(super) const MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD: u32 = 0x0dac;
@@ -845,34 +829,43 @@ impl MaxwellThreeDViewportState {
     }
 }
 
-/// Complete currently modeled state of one channel's `MAXWELL_B` engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Typed 3D state retained by an operation after its triggering method.
+///
+/// Frontend-only register and MME state deliberately live outside this value,
+/// so queued operations do not retain or copy command-decoding state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
-    raw_registers: Arc<BTreeMap<u32, MaxwellThreeDRegister<u32>>>,
     render_targets: Arc<MaxwellThreeDRenderTargetState>,
     fixed_function: Arc<MaxwellThreeDFixedFunctionState>,
     vertex_input: Arc<MaxwellThreeDVertexInputState>,
     shader_bindings: Arc<MaxwellThreeDShaderBindingState>,
-    raster: MaxwellThreeDRasterState,
-    viewport: MaxwellThreeDViewportState,
-    render_enable: MaxwellThreeDRenderEnableState,
-    shader_execution: MaxwellThreeDShaderExecutionState,
-    color_reduction: MaxwellThreeDColorReductionState,
-    constant_color_rendering: MaxwellThreeDConstantColorRenderingState,
-    coverage: MaxwellThreeDCoverageState,
-    line: MaxwellThreeDLineState,
-    zcull: MaxwellThreeDZCullState,
-    l2_cache: MaxwellThreeDL2CacheState,
-    report_semaphore: MaxwellThreeDReportSemaphoreState,
-    counters: MaxwellThreeDCounterState,
-    falcon: MaxwellThreeDFalconState,
-    instrumentation: MaxwellThreeDInstrumentationState,
-    inline_to_memory: MaxwellThreeDInlineToMemoryState,
-    tiled_cache: MaxwellThreeDTiledCacheState,
+    raster: Arc<MaxwellThreeDRasterState>,
+    viewport: Arc<MaxwellThreeDViewportState>,
+    render_enable: Arc<MaxwellThreeDRenderEnableState>,
+    shader_execution: Arc<MaxwellThreeDShaderExecutionState>,
+    color_reduction: Arc<MaxwellThreeDColorReductionState>,
+    constant_color_rendering: Arc<MaxwellThreeDConstantColorRenderingState>,
+    coverage: Arc<MaxwellThreeDCoverageState>,
+    line: Arc<MaxwellThreeDLineState>,
+    zcull: Arc<MaxwellThreeDZCullState>,
+    l2_cache: Arc<MaxwellThreeDL2CacheState>,
+    report_semaphore: Arc<MaxwellThreeDReportSemaphoreState>,
+    counters: Arc<MaxwellThreeDCounterState>,
+    falcon: Arc<MaxwellThreeDFalconState>,
+    instrumentation: Arc<MaxwellThreeDInstrumentationState>,
+    inline_to_memory: Arc<MaxwellThreeDInlineToMemoryState>,
+    tiled_cache: Arc<MaxwellThreeDTiledCacheState>,
+}
+
+/// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MaxwellThreeDFrontendState {
+    raw_registers: BTreeMap<u32, MaxwellThreeDRegister<u32>>,
+    operation: Arc<MaxwellThreeDState>,
     mme: MaxwellThreeDMmeState,
 }
 
-impl Default for MaxwellThreeDState {
+impl Default for MaxwellThreeDFrontendState {
     fn default() -> Self {
         let mut raw_registers = BTreeMap::new();
         for method in [
@@ -920,38 +913,56 @@ impl Default for MaxwellThreeDState {
             );
         }
         Self {
-            raw_registers: Arc::new(raw_registers),
-            render_targets: Default::default(),
-            fixed_function: Default::default(),
-            vertex_input: Default::default(),
-            shader_bindings: Default::default(),
-            raster: Default::default(),
-            viewport: Default::default(),
-            render_enable: Default::default(),
-            shader_execution: Default::default(),
-            color_reduction: Default::default(),
-            constant_color_rendering: Default::default(),
-            coverage: Default::default(),
-            line: Default::default(),
-            zcull: Default::default(),
-            l2_cache: Default::default(),
-            report_semaphore: Default::default(),
-            counters: Default::default(),
-            falcon: Default::default(),
-            instrumentation: Default::default(),
-            inline_to_memory: Default::default(),
-            tiled_cache: Default::default(),
+            raw_registers,
+            operation: Arc::new(MaxwellThreeDState::default()),
             mme: Default::default(),
         }
     }
 }
 
-impl MaxwellThreeDState {
+impl MaxwellThreeDFrontendState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
+    pub fn operation_state(&self) -> &MaxwellThreeDState {
+        &self.operation
+    }
+
+    pub(super) fn operation_snapshot(&self) -> Arc<MaxwellThreeDState> {
+        Arc::clone(&self.operation)
+    }
+
+    fn operation_state_mut(&mut self) -> &mut MaxwellThreeDState {
+        Arc::make_mut(&mut self.operation)
+    }
+
+    #[must_use]
+    pub const fn mme(&self) -> &MaxwellThreeDMmeState {
+        &self.mme
+    }
+
+    pub(super) const fn mme_mut(&mut self) -> &mut MaxwellThreeDMmeState {
+        &mut self.mme
+    }
+
+    /// Returns the last validated raw value for one byte-addressed class method.
+    #[must_use]
+    pub fn raw_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
+        self.raw_registers.get(&method.0)
+    }
+
+    pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
+        self.raw_registers.insert(
+            source.method().0,
+            MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
+        );
+    }
+}
+
+impl MaxwellThreeDState {
     #[must_use]
     pub fn render_targets(&self) -> &MaxwellThreeDRenderTargetState {
         &self.render_targets
@@ -973,252 +984,83 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
-    pub const fn raster(&self) -> &MaxwellThreeDRasterState {
-        &self.raster
+    pub fn raster(&self) -> &MaxwellThreeDRasterState {
+        self.raster.as_ref()
     }
 
     #[must_use]
-    pub const fn viewport(&self) -> &MaxwellThreeDViewportState {
-        &self.viewport
+    pub fn viewport(&self) -> &MaxwellThreeDViewportState {
+        self.viewport.as_ref()
     }
 
     #[must_use]
-    pub const fn render_enable(&self) -> &MaxwellThreeDRenderEnableState {
-        &self.render_enable
+    pub fn render_enable(&self) -> &MaxwellThreeDRenderEnableState {
+        self.render_enable.as_ref()
     }
 
     #[must_use]
-    pub const fn shader_execution(&self) -> &MaxwellThreeDShaderExecutionState {
-        &self.shader_execution
+    pub fn shader_execution(&self) -> &MaxwellThreeDShaderExecutionState {
+        self.shader_execution.as_ref()
     }
 
     #[must_use]
-    pub const fn color_reduction(&self) -> &MaxwellThreeDColorReductionState {
-        &self.color_reduction
+    pub fn color_reduction(&self) -> &MaxwellThreeDColorReductionState {
+        self.color_reduction.as_ref()
     }
 
     #[must_use]
-    pub const fn constant_color_rendering(&self) -> &MaxwellThreeDConstantColorRenderingState {
-        &self.constant_color_rendering
+    pub fn constant_color_rendering(&self) -> &MaxwellThreeDConstantColorRenderingState {
+        self.constant_color_rendering.as_ref()
     }
 
     #[must_use]
-    pub const fn coverage(&self) -> &MaxwellThreeDCoverageState {
-        &self.coverage
+    pub fn coverage(&self) -> &MaxwellThreeDCoverageState {
+        self.coverage.as_ref()
     }
 
     #[must_use]
-    pub const fn line(&self) -> &MaxwellThreeDLineState {
-        &self.line
+    pub fn line(&self) -> &MaxwellThreeDLineState {
+        self.line.as_ref()
     }
 
     #[must_use]
-    pub const fn zcull(&self) -> &MaxwellThreeDZCullState {
-        &self.zcull
+    pub fn zcull(&self) -> &MaxwellThreeDZCullState {
+        self.zcull.as_ref()
     }
 
     #[must_use]
-    pub const fn l2_cache(&self) -> &MaxwellThreeDL2CacheState {
-        &self.l2_cache
+    pub fn l2_cache(&self) -> &MaxwellThreeDL2CacheState {
+        self.l2_cache.as_ref()
     }
 
     #[must_use]
-    pub const fn report_semaphore(&self) -> &MaxwellThreeDReportSemaphoreState {
-        &self.report_semaphore
+    pub fn report_semaphore(&self) -> &MaxwellThreeDReportSemaphoreState {
+        self.report_semaphore.as_ref()
     }
 
     #[must_use]
-    pub const fn counters(&self) -> &MaxwellThreeDCounterState {
-        &self.counters
+    pub fn counters(&self) -> &MaxwellThreeDCounterState {
+        self.counters.as_ref()
     }
 
     #[must_use]
-    pub const fn falcon(&self) -> &MaxwellThreeDFalconState {
-        &self.falcon
+    pub fn falcon(&self) -> &MaxwellThreeDFalconState {
+        self.falcon.as_ref()
     }
 
     #[must_use]
-    pub const fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
-        &self.instrumentation
+    pub fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
+        self.instrumentation.as_ref()
     }
 
     #[must_use]
-    pub const fn inline_to_memory(&self) -> &MaxwellThreeDInlineToMemoryState {
-        &self.inline_to_memory
+    pub fn inline_to_memory(&self) -> &MaxwellThreeDInlineToMemoryState {
+        self.inline_to_memory.as_ref()
     }
 
     #[must_use]
-    pub const fn tiled_cache(&self) -> &MaxwellThreeDTiledCacheState {
-        &self.tiled_cache
-    }
-
-    #[must_use]
-    pub const fn mme(&self) -> &MaxwellThreeDMmeState {
-        &self.mme
-    }
-
-    pub(super) const fn mme_mut(&mut self) -> &mut MaxwellThreeDMmeState {
-        &mut self.mme
-    }
-
-    /// Returns the last validated raw value for one byte-addressed class method.
-    #[must_use]
-    pub fn raw_register(&self, method: GpuMethodId) -> Option<&MaxwellThreeDRegister<u32>> {
-        self.raw_registers.get(&method.0)
-    }
-
-    pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
-        Arc::make_mut(&mut self.raw_registers).insert(
-            source.method().0,
-            MaxwellThreeDRegister::programmed(source.argument(), source.argument(), source),
-        );
-    }
-
-    pub(crate) fn pipeline_dependencies(&self, active_color_targets: &[u8]) -> Box<[Option<u32>]> {
-        let mut dependencies = Vec::new();
-        self.append_pipeline_dependencies(active_color_targets, &mut dependencies);
-        dependencies.into_boxed_slice()
-    }
-
-    pub(super) fn append_pipeline_dependencies(
-        &self,
-        active_color_targets: &[u8],
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        self.fixed_function
-            .append_pipeline_dependencies(dependencies, active_color_targets);
-        self.vertex_input.append_pipeline_dependencies(dependencies);
-        self.shader_bindings
-            .append_pipeline_dependencies(dependencies);
-        if self.shader_bindings.has_enabled_pipeline() {
-            self.shader_execution
-                .append_shader_pipeline_dependencies(dependencies);
-        }
-        if self
-            .vertex_input
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| begin.topology() == 0)
-        {
-            dependencies.push(self.raster.attribute_point_size.raw());
-            if !self
-                .raster
-                .attribute_point_size
-                .value()
-                .is_some_and(|value| value.enabled())
-            {
-                dependencies.push(self.raster.point_size.raw());
-            }
-            dependencies.push(self.raster.point_sprite_enable.raw());
-            dependencies.push(self.raster.anti_aliased_point_enable.raw());
-            if self
-                .raster
-                .point_sprite_select
-                .value()
-                .is_some_and(|value| value.affects_point_coordinates())
-            {
-                dependencies.push(self.raster.point_sprite_select.raw());
-            }
-            dependencies.push(self.raster.point_center_mode.raw());
-        }
-        if self.edge_flag_affects_draw() {
-            dependencies.push(self.raster.edge_flag.raw());
-        }
-        if self
-            .vertex_input
-            .primitive()
-            .active_begin()
-            .is_some_and(|begin| matches!(begin.topology(), 4..=6))
-        {
-            dependencies.push(self.raster.polygon_smooth_enable.raw());
-            dependencies.push(self.raster.polygon_stipple_enable.raw());
-            if self.raster.polygon_stipple_enable.value() == Some(&true) {
-                dependencies.extend(
-                    self.raster
-                        .polygon_stipple_pattern
-                        .iter()
-                        .map(MaxwellThreeDRegister::raw),
-                );
-            }
-        }
-        dependencies.push(self.raster.alpha_fraction.raw());
-        self.constant_color_rendering
-            .append_pipeline_dependencies(dependencies);
-        dependencies.push(self.raster.fill_via_triangle.raw());
-        dependencies.push(self.raster.conservative_raster.raw());
-        dependencies.push(self.viewport.z_clip_range.raw());
-        dependencies.push(self.viewport.pixel_center.raw());
-        dependencies.push(self.render_targets.color_target_selection().raw());
-        dependencies.push(self.render_targets.depth_target_count().raw());
-        if self
-            .render_targets
-            .render_target_layer()
-            .value()
-            .is_some_and(|value| {
-                value.affects_draw_layering(
-                    self.shader_bindings
-                        .has_enabled_stage(MaxwellThreeDShaderStage::Geometry),
-                )
-            })
-        {
-            dependencies.push(self.render_targets.render_target_layer().raw());
-        }
-        if self
-            .render_targets
-            .render_target_index_offset()
-            .value()
-            .is_some_and(|value| value.enabled())
-        {
-            dependencies.push(self.render_targets.render_target_index_offset().raw());
-        }
-        if active_color_targets.len() > 1 {
-            dependencies.push(self.render_targets.separate_fragment_data().raw());
-        }
-        dependencies.push(self.coverage.csaa_enable().raw());
-        if self.coverage.post_z_pixel_shader_imask().value()
-            == Some(&super::MaxwellThreeDPostZPixelShaderImask::Enabled)
-        {
-            dependencies.push(self.coverage.post_z_pixel_shader_imask().raw());
-        }
-        dependencies.push(self.coverage.tir_mode().raw());
-        if self.coverage.tir_mode().value() == Some(&MaxwellThreeDTirMode::RasterNTargetM) {
-            dependencies.push(self.coverage.tir_control().raw());
-            dependencies.push(self.coverage.tir_modulation().raw());
-            dependencies.push(self.coverage.tir_modulation_function().raw());
-        }
-        if self
-            .coverage
-            .coverage_to_color()
-            .value()
-            .is_some_and(|value| value.enabled())
-        {
-            dependencies.push(self.coverage.coverage_to_color().raw());
-        }
-        if self
-            .coverage
-            .alpha_to_coverage_override()
-            .value()
-            .is_some_and(|value| value.raw() != 0)
-        {
-            dependencies.push(self.coverage.alpha_to_coverage_override().raw());
-        }
-        dependencies.push(self.coverage.hybrid_anti_alias_control().raw());
-        dependencies.extend(
-            self.coverage
-                .sample_locations()
-                .iter()
-                .map(MaxwellThreeDRegister::raw),
-        );
-        if self
-            .coverage
-            .ps_output_sample_mask_usage()
-            .value()
-            .is_some()
-            && self.ps_output_sample_mask_effective() != Some(false)
-        {
-            dependencies.push(self.coverage.ps_output_sample_mask_usage().raw());
-        }
-        self.line.append_pipeline_dependencies(dependencies);
+    pub fn tiled_cache(&self) -> &MaxwellThreeDTiledCacheState {
+        self.tiled_cache.as_ref()
     }
 
     pub(crate) fn ps_output_sample_mask_effective(&self) -> Option<bool> {
@@ -1257,62 +1099,64 @@ impl MaxwellThreeDState {
             && non_fill_polygon_mode
             && self.raster.edge_flag.value() == Some(&MaxwellThreeDEdgeFlag::Disabled)
     }
+}
 
+impl MaxwellThreeDFrontendState {
     pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite) {
         match write {
             MaxwellThreeDStateWrite::PointSize { value, source } => {
-                self.raster.point_size =
+                Arc::make_mut(&mut self.operation_state_mut().raster).point_size =
                     MaxwellThreeDRegister::programmed(value.bits(), value, source);
             }
             MaxwellThreeDStateWrite::InlineToMemory(write) => {
-                self.inline_to_memory.apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().inline_to_memory).apply(write);
             }
             MaxwellThreeDStateWrite::AttributePointSize { value, source } => {
-                self.raster.attribute_point_size =
+                Arc::make_mut(&mut self.operation_state_mut().raster).attribute_point_size =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PointSpriteEnable { value, source } => {
-                self.raster.point_sprite_enable =
+                Arc::make_mut(&mut self.operation_state_mut().raster).point_sprite_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source } => {
-                self.raster.anti_aliased_point_enable =
+                Arc::make_mut(&mut self.operation_state_mut().raster).anti_aliased_point_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PointSpriteSelect { value, source } => {
-                self.raster.point_sprite_select =
+                Arc::make_mut(&mut self.operation_state_mut().raster).point_sprite_select =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PointCenterMode { value, source } => {
-                self.raster.point_center_mode =
+                Arc::make_mut(&mut self.operation_state_mut().raster).point_center_mode =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::EdgeFlag { value, source } => {
-                self.raster.edge_flag =
+                Arc::make_mut(&mut self.operation_state_mut().raster).edge_flag =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::AlphaFraction { value, source } => {
-                self.raster.alpha_fraction =
+                Arc::make_mut(&mut self.operation_state_mut().raster).alpha_fraction =
                     MaxwellThreeDRegister::programmed(u32::from(value.raw()), value, source);
             }
             MaxwellThreeDStateWrite::RasterBoundingBox { value, source } => {
-                self.raster.bounding_box =
+                Arc::make_mut(&mut self.operation_state_mut().raster).bounding_box =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::FillViaTriangle { value, source } => {
-                self.raster.fill_via_triangle =
+                Arc::make_mut(&mut self.operation_state_mut().raster).fill_via_triangle =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::ConservativeRaster { value, source } => {
-                self.raster.conservative_raster =
+                Arc::make_mut(&mut self.operation_state_mut().raster).conservative_raster =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source } => {
-                self.raster.polygon_smooth_enable =
+                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_smooth_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PolygonStippleEnable { value, source } => {
-                self.raster.polygon_stipple_enable =
+                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_stipple_enable =
                     MaxwellThreeDRegister::programmed(u32::from(value), value, source);
             }
             MaxwellThreeDStateWrite::PolygonStipplePattern {
@@ -1320,52 +1164,75 @@ impl MaxwellThreeDState {
                 value,
                 source,
             } => {
-                self.raster.polygon_stipple_pattern[word as usize] =
-                    MaxwellThreeDRegister::programmed(value, value, source);
+                Arc::make_mut(&mut self.operation_state_mut().raster).polygon_stipple_pattern
+                    [word as usize] = MaxwellThreeDRegister::programmed(value, value, source);
             }
             MaxwellThreeDStateWrite::ViewportZClip { value, source } => {
-                self.viewport.z_clip_range =
+                Arc::make_mut(&mut self.operation_state_mut().viewport).z_clip_range =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::ViewportPixelCenter { value, source } => {
-                self.viewport.pixel_center =
+                Arc::make_mut(&mut self.operation_state_mut().viewport).pixel_center =
                     MaxwellThreeDRegister::programmed(value.raw(), value, source);
             }
             MaxwellThreeDStateWrite::RenderTarget(write) => {
-                Arc::make_mut(&mut self.render_targets).apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().render_targets).apply(write);
             }
             MaxwellThreeDStateWrite::FixedFunction(write) => {
-                Arc::make_mut(&mut self.fixed_function).apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().fixed_function).apply(write);
             }
             MaxwellThreeDStateWrite::VertexInput(write) => {
-                Arc::make_mut(&mut self.vertex_input).apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().vertex_input).apply(write);
             }
             MaxwellThreeDStateWrite::ShaderBinding(write) => {
-                Arc::make_mut(&mut self.shader_bindings).apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().shader_bindings).apply(write);
             }
-            MaxwellThreeDStateWrite::RenderEnable(write) => self.render_enable.apply(write),
-            MaxwellThreeDStateWrite::ShaderExecution(write) => self.shader_execution.apply(write),
-            MaxwellThreeDStateWrite::ColorReduction(write) => self.color_reduction.apply(write),
+            MaxwellThreeDStateWrite::RenderEnable(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().render_enable).apply(write)
+            }
+            MaxwellThreeDStateWrite::ShaderExecution(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().shader_execution).apply(write)
+            }
+            MaxwellThreeDStateWrite::ColorReduction(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().color_reduction).apply(write)
+            }
             MaxwellThreeDStateWrite::ConstantColorRendering(write) => {
-                self.constant_color_rendering.apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().constant_color_rendering)
+                    .apply(write);
             }
-            MaxwellThreeDStateWrite::Coverage(write) => self.coverage.apply(write),
-            MaxwellThreeDStateWrite::Line(write) => self.line.apply(write),
-            MaxwellThreeDStateWrite::ZCull(write) => self.zcull.apply(write),
-            MaxwellThreeDStateWrite::L2Cache(write) => self.l2_cache.apply(write),
-            MaxwellThreeDStateWrite::ReportSemaphore(write) => self.report_semaphore.apply(write),
-            MaxwellThreeDStateWrite::Counter(write) => self.counters.apply(write),
-            MaxwellThreeDStateWrite::Instrumentation(write) => self.instrumentation.apply(write),
-            MaxwellThreeDStateWrite::TiledCache(write) => self.tiled_cache.apply(write),
+            MaxwellThreeDStateWrite::Coverage(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().coverage).apply(write)
+            }
+            MaxwellThreeDStateWrite::Line(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().line).apply(write)
+            }
+            MaxwellThreeDStateWrite::ZCull(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().zcull).apply(write)
+            }
+            MaxwellThreeDStateWrite::L2Cache(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().l2_cache).apply(write)
+            }
+            MaxwellThreeDStateWrite::ReportSemaphore(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().report_semaphore).apply(write)
+            }
+            MaxwellThreeDStateWrite::Counter(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().counters).apply(write)
+            }
+            MaxwellThreeDStateWrite::Instrumentation(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().instrumentation).apply(write)
+            }
+            MaxwellThreeDStateWrite::TiledCache(write) => {
+                Arc::make_mut(&mut self.operation_state_mut().tiled_cache).apply(write)
+            }
             MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
-                self.falcon.apply(write);
+                Arc::make_mut(&mut self.operation_state_mut().falcon).apply(write);
                 let completion = MaxwellThreeDMmeStateWrite::ShadowScratch {
                     index: MaxwellThreeDMmeShadowScratchIndex::new(0),
                     value: 1,
                     source: write.source(),
                 };
                 self.mme.apply(completion);
-                Arc::make_mut(&mut self.raw_registers).insert(
+                self.raw_registers.insert(
                     0x3400,
                     MaxwellThreeDRegister::programmed(1, 1, write.source()),
                 );
@@ -1373,7 +1240,9 @@ impl MaxwellThreeDState {
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
     }
+}
 
+impl MaxwellThreeDState {
     #[cfg(test)]
     pub(in crate::engines) fn validate_cross_registers(
         &self,

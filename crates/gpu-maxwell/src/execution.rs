@@ -671,6 +671,7 @@ pub struct MaxwellBackendExecution {
     creations: Vec<BackendResourceCreateInfo>,
     invalidations: Vec<ResourceDependency>,
     operations: Vec<GpuOperation>,
+    batchable_render_pass_begin: Option<usize>,
     segments: BackendSegmentCursor,
     completion: Option<GuestTimelinePoint>,
     awaiting_completion: bool,
@@ -698,6 +699,7 @@ impl MaxwellBackendExecution {
             creations: Vec::new(),
             invalidations: Vec::new(),
             operations: Vec::new(),
+            batchable_render_pass_begin: None,
             segments,
             completion: plan.completion,
             awaiting_completion: false,
@@ -744,6 +746,7 @@ impl MaxwellBackendExecution {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
+                    self.batchable_render_pass_begin = None;
                     self.operations.push(operation.clone());
                     self.next_step += 1;
                 }
@@ -787,6 +790,7 @@ impl MaxwellBackendExecution {
                         .extend_from_slice(work.resource_invalidations());
                     append_batchable_operations(
                         &mut self.operations,
+                        &mut self.batchable_render_pass_begin,
                         work.submission().operations(),
                     );
                     self.next_step += 1;
@@ -827,6 +831,7 @@ impl MaxwellBackendExecution {
             std::mem::take(&mut self.operations),
         )
         .map_err(MaxwellBackendExecutionError::InvalidSubmission)?;
+        self.batchable_render_pass_begin = None;
         self.awaiting_completion = true;
         self.submitted_any = true;
         Ok(Some(MaxwellBackendSegment {
@@ -911,50 +916,61 @@ fn backend_step_emits_operation(step: &MaxwellSubmissionExecutionStep) -> bool {
     )
 }
 
-fn append_batchable_operations(target: &mut Vec<GpuOperation>, operations: &[GpuOperation]) {
-    if render_passes_can_merge(target, operations) {
+fn append_batchable_operations(
+    target: &mut Vec<GpuOperation>,
+    current_begin: &mut Option<usize>,
+    operations: &[GpuOperation],
+) {
+    let next = batchable_render_pass(operations);
+    let can_merge = current_begin
+        .and_then(|begin| target.get(begin))
+        .zip(next)
+        .is_some_and(|(left, right)| render_passes_can_merge(left, right));
+    if can_merge {
         target.pop();
         target.extend_from_slice(&operations[1..]);
     } else {
+        let begin = target.len();
         target.extend_from_slice(operations);
+        *current_begin = next.map(|_| begin);
     }
 }
 
-fn render_passes_can_merge(left: &[GpuOperation], right: &[GpuOperation]) -> bool {
+fn batchable_render_pass(
+    operations: &[GpuOperation],
+) -> Option<(nixe_gpu::RenderPassId, &[nixe_gpu::RenderAttachment])> {
     let (
-        Some(GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::End {
-            render_pass: left_pass,
-        })),
         Some(GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::Begin {
-            render_pass: right_pass,
-            attachments: right_attachments,
+            render_pass,
+            attachments,
         })),
+        Some(GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::End { render_pass: end })),
     ) = (
-        left.last().map(GpuOperation::command),
-        right.first().map(GpuOperation::command),
+        operations.first().map(GpuOperation::command),
+        operations.last().map(GpuOperation::command),
     )
+    else {
+        return None;
+    };
+    (*render_pass == *end).then_some((*render_pass, attachments))
+}
+
+fn render_passes_can_merge(
+    left: &GpuOperation,
+    right: (nixe_gpu::RenderPassId, &[nixe_gpu::RenderAttachment]),
+) -> bool {
+    let GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::Begin {
+        render_pass: left_pass,
+        attachments: left_attachments,
+    }) = left.command()
     else {
         return false;
     };
-    if left_pass != right_pass {
-        return false;
-    }
-    let Some(left_attachments) = left.iter().rev().find_map(|operation| {
-        let GpuCommand::RenderPass(nixe_gpu::RenderPassOperation::Begin {
-            render_pass,
-            attachments,
-        }) = operation.command()
-        else {
-            return None;
-        };
-        (render_pass == left_pass).then_some(attachments.as_ref())
-    }) else {
-        return false;
-    };
-    left_attachments.len() == right_attachments.len()
+    *left_pass == right.0
+        && left_attachments.len() == right.1.len()
         && left_attachments
             .iter()
-            .zip(right_attachments.iter())
+            .zip(right.1.iter())
             .all(|(left, right)| {
                 left.image == right.image
                     && left.subresources == right.subresources
@@ -1477,8 +1493,13 @@ mod tests {
         let pass = RenderPassId::new(1);
         let image = ImageId::new(1);
         let mut operations = render_pass_operations(pass, image);
+        let mut current = Some(0);
 
-        append_batchable_operations(&mut operations, &render_pass_operations(pass, image));
+        append_batchable_operations(
+            &mut operations,
+            &mut current,
+            &render_pass_operations(pass, image),
+        );
 
         assert_eq!(operations.len(), 4);
         assert!(matches!(
@@ -1499,6 +1520,7 @@ mod tests {
 
         append_batchable_operations(
             &mut operations,
+            &mut current,
             &render_pass_operations(RenderPassId::new(2), image),
         );
         assert_eq!(operations.len(), 7);
@@ -1509,6 +1531,7 @@ mod tests {
         let pass = RenderPassId::new(1);
         let image = ImageId::new(1);
         let mut operations = render_pass_operations(pass, image);
+        let mut current = Some(0);
         let mut incompatible = render_pass_operations(pass, image);
         let GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) =
             incompatible[0].command()
@@ -1536,7 +1559,7 @@ mod tests {
             CapabilityRequirements::none(),
         );
 
-        append_batchable_operations(&mut operations, &incompatible);
+        append_batchable_operations(&mut operations, &mut current, &incompatible);
 
         assert_eq!(operations.len(), 6);
     }

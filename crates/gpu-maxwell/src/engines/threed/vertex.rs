@@ -4,9 +4,11 @@
 //! commit `9fdf5c4062007929d9f4e6cbad9c9771fe61b880`:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 
+use std::sync::Arc;
+
 use crate::MaxwellMethodSource;
 
-use super::state::{MaxwellThreeDRegister, PipelineDependencySink};
+use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_VERTEX_STREAM_COUNT: usize = 32;
 pub const MAXWELL_VERTEX_ATTRIBUTE_COUNT: usize = 32;
@@ -800,8 +802,8 @@ impl MaxwellThreeDBegin {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDVertexInputState {
-    streams: Box<[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT]>,
-    attributes: Box<
+    streams: Arc<[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT]>,
+    attributes: Arc<
         [MaxwellThreeDRegister<MaxwellThreeDVertexAttributeFormat>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
     >,
     index: MaxwellThreeDIndexBufferState,
@@ -813,10 +815,10 @@ pub struct MaxwellThreeDVertexInputState {
 impl Default for MaxwellThreeDVertexInputState {
     fn default() -> Self {
         Self {
-            streams: Box::new(std::array::from_fn(|_| {
+            streams: Arc::new(std::array::from_fn(|_| {
                 MaxwellThreeDVertexStreamState::default()
             })),
-            attributes: Box::new(std::array::from_fn(|_| MaxwellThreeDRegister::default())),
+            attributes: Arc::new(std::array::from_fn(|_| MaxwellThreeDRegister::default())),
             index: MaxwellThreeDIndexBufferState::default(),
             primitive: MaxwellThreeDPrimitiveState::default(),
             assembly: MaxwellThreeDVertexAssemblyState::default(),
@@ -855,47 +857,6 @@ impl MaxwellThreeDVertexInputState {
         &self.stream_substitute
     }
 
-    pub(super) fn append_pipeline_dependencies(
-        &self,
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        for stream in self.streams.iter() {
-            dependencies.push(stream.format.raw());
-            dependencies.push(stream.frequency.raw());
-            dependencies.push(stream.instanced.raw());
-        }
-        dependencies.extend(self.attributes.iter().map(MaxwellThreeDRegister::raw));
-        dependencies.push(self.index.element_size.raw());
-        // Circular-buffer throttling changes internal scheduling, not the
-        // logical vertex-input or pipeline configuration.
-        dependencies.push(self.primitive.topology_override.raw());
-        dependencies.push(self.primitive.topology.raw());
-        dependencies.push(self.primitive.restart_enabled.raw());
-        dependencies.push(self.primitive.restart_index.raw());
-        if self.primitive.is_open() {
-            // BEGIN instance sequencing, primitive-ID continuation, and split
-            // boundaries are draw-command state. Only topology contributes to
-            // immutable host pipeline identity.
-            dependencies.push(
-                self.primitive
-                    .active_begin()
-                    .map(|begin| u32::from(begin.topology())),
-            );
-        }
-        if self
-            .primitive
-            .active_begin()
-            .is_some_and(|begin| begin.topology() == 14)
-        {
-            dependencies.push(self.primitive.patch_size.raw());
-        }
-        dependencies.push(self.assembly.attribute_defaults.raw());
-        dependencies.push(self.assembly.vertex_id_uses_array_start.raw());
-        // The public ABI identifies the substitute address but not the state
-        // that makes it active. An unconsumed address does not alter a host
-        // pipeline key.
-    }
-
     pub(super) fn apply(&mut self, write: MaxwellThreeDVertexInputWrite) {
         let raw = write.raw();
         let source = write.source();
@@ -912,37 +873,37 @@ impl MaxwellThreeDVertexInputState {
                 self.primitive.patch_size = MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamFormat { stream, value, .. } => {
-                self.streams[stream as usize].format =
+                Arc::make_mut(&mut self.streams)[stream as usize].format =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamAddressUpper { stream, value, .. } => {
-                self.streams[stream as usize].address_upper =
+                Arc::make_mut(&mut self.streams)[stream as usize].address_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamAddressLower { stream, value, .. } => {
-                self.streams[stream as usize].address_lower =
+                Arc::make_mut(&mut self.streams)[stream as usize].address_lower =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamLimitUpper { stream, value, .. } => {
-                self.streams[stream as usize].limit_upper =
+                Arc::make_mut(&mut self.streams)[stream as usize].limit_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamLimitLower { stream, value, .. } => {
-                self.streams[stream as usize].limit_lower =
+                Arc::make_mut(&mut self.streams)[stream as usize].limit_lower =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamFrequency { stream, value, .. } => {
-                self.streams[stream as usize].frequency =
+                Arc::make_mut(&mut self.streams)[stream as usize].frequency =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::StreamInstanced { stream, value, .. } => {
-                self.streams[stream as usize].instanced =
+                Arc::make_mut(&mut self.streams)[stream as usize].instanced =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::Attribute {
                 attribute, value, ..
             } => {
-                self.attributes[attribute as usize] =
+                Arc::make_mut(&mut self.attributes)[attribute as usize] =
                     MaxwellThreeDRegister::programmed(raw, value, source)
             }
             MaxwellThreeDVertexInputWrite::IndexAddressUpper { value, .. } => {

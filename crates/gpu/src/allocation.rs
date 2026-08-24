@@ -173,6 +173,17 @@ impl BackingView {
         self.range.size()
     }
 
+    /// Iterates the page-ordered canonical byte intervals retained by this view.
+    ///
+    /// Canonical identity is exposed without revealing host pointers so
+    /// callers can index aliases once instead of comparing every pair of
+    /// complete views.
+    pub fn canonical_intervals(&self) -> impl Iterator<Item = (CanonicalPageId, u64, u64)> + '_ {
+        self.canonical_intervals
+            .iter()
+            .map(|interval| (interval.page, interval.start, interval.end))
+    }
+
     /// Returns whether both views retain any of the same canonical bytes.
     ///
     /// Each constructor creates a page-ordered interval index once, so this

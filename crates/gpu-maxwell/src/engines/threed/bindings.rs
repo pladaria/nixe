@@ -9,7 +9,7 @@ use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
 use super::state::{
     MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET,
-    MaxwellThreeDRegisterOrigin, PipelineDependencySink,
+    MaxwellThreeDRegisterOrigin,
 };
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
@@ -506,43 +506,6 @@ impl MaxwellThreeDShaderBindingState {
             }
         }
         visible
-    }
-
-    pub(super) fn append_pipeline_dependencies(
-        &self,
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        if self.has_enabled_pipeline() {
-            // Shader translation interprets stage programs relative to this
-            // base, so both halves participate only while a stage is active.
-            dependencies.push(self.program_region.address_upper.raw());
-            dependencies.push(self.program_region.address_lower.raw());
-            dependencies.push(self.program_region.spa_version.raw());
-        }
-        for pipeline in &self.pipeline {
-            dependencies.push(pipeline.enabled.raw());
-            dependencies.push(pipeline.stage.raw());
-            if pipeline.enabled.value() == Some(&true) {
-                dependencies.push(pipeline.program_offset.raw());
-                dependencies.push(pipeline.register_count.raw());
-            }
-            dependencies.push(pipeline.group.raw());
-        }
-        if self.pipeline.iter().any(|pipeline| {
-            pipeline.enabled.value() == Some(&true)
-                && matches!(
-                    pipeline.stage.value(),
-                    Some(
-                        MaxwellThreeDShaderStage::TessellationInit
-                            | MaxwellThreeDShaderStage::Tessellation
-                    )
-                )
-        }) {
-            dependencies.extend(self.tessellation_lod.iter().map(MaxwellThreeDRegister::raw));
-        }
-        dependencies.push(self.sampler_binding.raw());
-        dependencies.push(self.maxwell_texture_headers.raw());
-        dependencies.push(self.bindless_texture_constant_buffer_slot.raw());
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderBindingWrite) {

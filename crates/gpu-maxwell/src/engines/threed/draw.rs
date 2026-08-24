@@ -7,7 +7,6 @@
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
-    hash::{Hash, Hasher},
     ops::Deref,
     sync::{
         Arc,
@@ -42,16 +41,15 @@ use crate::shader::{
 #[cfg(debug_assertions)]
 use crate::shader::{MaxwellShaderTranslationKey, MaxwellShaderTranslationSource};
 
-use super::state::PipelineDependencySink;
 use super::{
-    MAXWELL_COLOR_TARGET_COUNT, MaxwellThreeDAliasedLineWidthEnable,
-    MaxwellThreeDAlphaToCoverageOverride, MaxwellThreeDAntiAliasedLineEnable,
-    MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDBegin, MaxwellThreeDBlendEnableCommon,
-    MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode,
-    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDCompareOp,
-    MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
-    MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDEdgeFlag, MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
+    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaToCoverageOverride,
+    MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ, MaxwellThreeDBegin,
+    MaxwellThreeDBlendEnableCommon, MaxwellThreeDClipIdTestEnable,
+    MaxwellThreeDColorCompressionMode, MaxwellThreeDColorReductionThresholdsEnable,
+    MaxwellThreeDCompareOp, MaxwellThreeDConditionalLoadConstantBuffer,
+    MaxwellThreeDConservativeRasterEnable, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
+    MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionValue, MaxwellThreeDHybridAntiAliasControl,
     MaxwellThreeDIteratedBlend, MaxwellThreeDLogicOp, MaxwellThreeDPatchSize,
     MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderInterlockControl,
@@ -537,113 +535,6 @@ impl ViewMaterialization {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PipelineAttachmentKey(MaxwellThreeDResourceRole, nixe_gpu::ImageDescription);
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PipelineKey {
-    method_dependencies: Box<[Option<u32>]>,
-    attachments: Box<[PipelineAttachmentKey]>,
-    shaders: MaxwellThreeDTranslatedShaders,
-}
-
-struct PipelineLookupKey<'a> {
-    state: &'a MaxwellThreeDState,
-    active_color_targets: &'a [u8],
-    resources: &'a MaxwellThreeDResolvedResources,
-    attachments: &'a DrawAttachmentSelection,
-    shaders: &'a MaxwellThreeDTranslatedShaders,
-}
-
-impl<'a> PipelineLookupKey<'a> {
-    fn new(
-        state: &'a MaxwellThreeDState,
-        active_color_targets: &'a [u8],
-        resources: &'a MaxwellThreeDResolvedResources,
-        attachments: &'a DrawAttachmentSelection,
-        shaders: &'a MaxwellThreeDTranslatedShaders,
-    ) -> Result<Self, MaxwellThreeDLoweringError> {
-        for index in attachments.attachment_indices_iter() {
-            resolved_image(resources, index)?;
-        }
-        Ok(Self {
-            state,
-            active_color_targets,
-            resources,
-            attachments,
-            shaders,
-        })
-    }
-
-    fn attachment_keys(&self) -> impl Iterator<Item = PipelineAttachmentKey> + '_ {
-        self.attachments.attachment_indices_iter().map(|index| {
-            let image = resolved_image(self.resources, index)
-                .expect("pipeline attachment lookup was validated before hashing");
-            PipelineAttachmentKey(image.role(), image.description())
-        })
-    }
-
-    #[cfg(debug_assertions)]
-    fn matches(&self, key: &PipelineKey) -> bool {
-        self.state
-            .pipeline_dependencies(self.active_color_targets)
-            .as_ref()
-            == key.method_dependencies.as_ref()
-            && self.attachment_keys().eq(key.attachments.iter().cloned())
-            && self.shaders == &key.shaders
-    }
-
-    fn materialize(self) -> PipelineKey {
-        let attachments = self.attachment_keys().collect();
-        PipelineKey {
-            method_dependencies: self.state.pipeline_dependencies(self.active_color_targets),
-            attachments,
-            shaders: self.shaders.clone(),
-        }
-    }
-}
-
-impl Hash for PipelineLookupKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut count = PipelineDependencyCount(0);
-        self.state
-            .append_pipeline_dependencies(self.active_color_targets, &mut count);
-        count.0.hash(state);
-        self.state.append_pipeline_dependencies(
-            self.active_color_targets,
-            &mut PipelineDependencyHasher(state),
-        );
-        (self.attachments.colors.len() + usize::from(self.attachments.depth_stencil.is_some()))
-            .hash(state);
-        for attachment in self.attachment_keys() {
-            attachment.hash(state);
-        }
-        self.shaders.hash(state);
-    }
-}
-
-struct PipelineDependencyCount(usize);
-
-impl PipelineDependencySink for PipelineDependencyCount {
-    fn push(&mut self, _dependency: Option<u32>) {
-        self.0 += 1;
-    }
-}
-
-struct PipelineDependencyHasher<'a, H>(&'a mut H);
-
-impl<H: Hasher> PipelineDependencySink for PipelineDependencyHasher<'_, H> {
-    fn push(&mut self, dependency: Option<u32>) {
-        dependency.hash(self.0);
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PipelineRecord {
-    key: PipelineKey,
-    id: PipelineId,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RenderPassRecord {
     description: RenderPassDescription,
@@ -821,11 +712,6 @@ impl<T: Clone> SharedFingerprintCache<T> {
             .expect("selected LRU fingerprint remains present");
         (fingerprint, removed.value)
     }
-
-    fn retain(&mut self, mut predicate: impl FnMut(&T) -> bool) {
-        let data = Arc::make_mut(&mut self.data);
-        data.records.retain(|_, record| predicate(&record.value));
-    }
 }
 
 /// Copy-on-write storage for transactional cache collections.
@@ -864,10 +750,6 @@ impl<T: Clone> SharedCacheVec<T> {
         Arc::make_mut(&mut self.0).retain(predicate);
     }
 
-    fn extend(&mut self, values: impl IntoIterator<Item = T>) {
-        Arc::make_mut(&mut self.0).extend(values);
-    }
-
     fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
         Arc::make_mut(&mut self.0).iter_mut()
     }
@@ -895,7 +777,7 @@ pub struct MaxwellThreeDLoweringCache {
     )>,
     views: SharedCacheVec<ViewRecord>,
     color_materializations: SharedCacheVec<ColorRepresentationRecord>,
-    pipelines: SharedFingerprintCache<PipelineRecord>,
+    graphics_pipeline: Option<PipelineId>,
     render_passes: SharedCacheVec<RenderPassRecord>,
     descriptors: SharedCacheVec<DescriptorRecord>,
     samplers: SharedCacheVec<SamplerRecord>,
@@ -923,7 +805,7 @@ impl MaxwellThreeDLoweringCache {
             allocations: SharedCacheVec::default(),
             views: SharedCacheVec::default(),
             color_materializations: SharedCacheVec::default(),
-            pipelines: SharedFingerprintCache::default(),
+            graphics_pipeline: None,
             render_passes: SharedCacheVec::default(),
             descriptors: SharedCacheVec::default(),
             samplers: SharedCacheVec::default(),
@@ -943,11 +825,6 @@ impl MaxwellThreeDLoweringCache {
     pub fn view_count(&self) -> usize {
         self.views.len()
     }
-    #[must_use]
-    pub fn pipeline_count(&self) -> usize {
-        self.pipelines.len()
-    }
-
     pub(crate) fn retained_backings_mut(
         &mut self,
     ) -> &mut super::MaxwellThreeDRetainedBackingCache {
@@ -1202,24 +1079,6 @@ impl MaxwellThreeDLoweringCache {
             if !retired.published {
                 continue;
             }
-            let mut retired_pipelines = Vec::new();
-            self.pipelines.retain(|record| {
-                let depends_on_shader = record
-                    .key
-                    .shaders
-                    .shaders()
-                    .iter()
-                    .any(|shader| shader.shader() == retired.id);
-                if depends_on_shader {
-                    retired_pipelines.push(record.id);
-                }
-                !depends_on_shader
-            });
-            self.retired_resources.extend(
-                retired_pipelines
-                    .into_iter()
-                    .map(ResourceDependency::Pipeline),
-            );
             self.retired_resources
                 .push(ResourceDependency::Shader(retired.id));
         }
@@ -2063,7 +1922,6 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
                 vertex_count,
                 cache,
                 &mut creations,
-                &mut invalidations,
             )?;
             record_draw_color_materializations(state, resources, attachments, cache)?;
             lowered
@@ -3678,7 +3536,6 @@ fn lower_draw(
     vertex_count: u32,
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
-    invalidations: &mut Vec<ResourceDependency>,
 ) -> Result<(Vec<GpuOperation>, Vec<usize>), MaxwellThreeDLoweringError> {
     if vertex_count == 0 {
         return Err(MaxwellThreeDLoweringError::EmptyDraw);
@@ -3936,55 +3793,14 @@ fn lower_draw(
         vec![id]
     };
 
-    let mut active_color_targets = [0; MAXWELL_COLOR_TARGET_COUNT];
-    let mut active_color_target_count = 0;
-    for target in attachment_selection.color_targets() {
-        active_color_targets[active_color_target_count] = target;
-        active_color_target_count += 1;
+    for index in attachment_selection.attachment_indices_iter() {
+        resolved_image(resources, index)?;
     }
-    let pipeline_lookup = PipelineLookupKey::new(
-        state,
-        &active_color_targets[..active_color_target_count],
-        resources,
-        attachment_selection,
-        shaders,
-    )?;
-    let pipeline_fingerprint = nixe_gpu::cache_fingerprint(&pipeline_lookup);
-    let pipeline = if let Some(record) = cache.pipelines.get(pipeline_fingerprint) {
-        #[cfg(debug_assertions)]
-        assert!(
-            pipeline_lookup.matches(&record.key),
-            "XXH3-128 collision or incomplete Maxwell pipeline cache key"
-        );
-        record.id
+    let pipeline = if let Some(pipeline) = cache.graphics_pipeline {
+        pipeline
     } else {
-        let pipeline_key = pipeline_lookup.materialize();
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            pipeline_fingerprint,
-            nixe_gpu::cache_fingerprint(&pipeline_key),
-            "owned and borrowed Maxwell pipeline keys must hash identically"
-        );
         let id = PipelineId::new(take_identity(cache)?);
-        cache.pipelines.push(
-            pipeline_fingerprint,
-            PipelineRecord {
-                key: pipeline_key,
-                id,
-            },
-        );
-        if cache.pipelines.len() > cache.configuration.pipeline_entries() {
-            let (fingerprint, record) = cache.pipelines.remove_lru();
-            let retired = ResourceDependency::Pipeline(record.id);
-            log::debug!(
-                "Maxwell pipeline cache evicted LRU pipeline: id={} fingerprint={fingerprint:032x}",
-                record.id
-            );
-            if !invalidations.contains(&retired) {
-                invalidations.push(retired);
-            }
-        }
-        log::debug!("Maxwell pipeline cache miss: id={id} fingerprint={pipeline_fingerprint:032x}");
+        cache.graphics_pipeline = Some(id);
         creations.push(BackendResourceCreateInfo::Pipeline {
             id,
             description: PipelineDescription {

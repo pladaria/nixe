@@ -1,6 +1,6 @@
 //! Source-preserving constant-color rendering state for `MAXWELL_B`.
 
-use super::{MaxwellThreeDRegister, state::PipelineDependencySink};
+use super::MaxwellThreeDRegister;
 use crate::MaxwellMethodSource;
 
 /// One component of the color that replaces shader color output when enabled.
@@ -59,20 +59,6 @@ impl MaxwellThreeDConstantColorRenderingState {
         component: MaxwellThreeDConstantColorComponent,
     ) -> &MaxwellThreeDRegister<MaxwellThreeDConstantColorValue> {
         &self.components[component.index()]
-    }
-
-    pub(super) fn append_pipeline_dependencies(
-        &self,
-        dependencies: &mut impl PipelineDependencySink,
-    ) {
-        match self.enabled.value() {
-            Some(false) => {}
-            Some(true) => {
-                dependencies.push(self.enabled.raw());
-                dependencies.extend(self.components.iter().map(MaxwellThreeDRegister::raw));
-            }
-            None => dependencies.push(self.enabled.raw()),
-        }
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDConstantColorRenderingStateWrite) {
