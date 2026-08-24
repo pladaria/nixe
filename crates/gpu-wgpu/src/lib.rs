@@ -311,6 +311,7 @@ async fn initialize_backend_async(
         queue: queue.clone(),
     };
     let driver = WgpuBackendDriver::new(
+        instance_id,
         device,
         queue,
         Arc::clone(&visibility),

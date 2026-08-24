@@ -97,7 +97,7 @@ impl GpuSubmission {
 enum GpuWorkExecution {
     Prepared(MaxwellSubmissionExecutionPlan),
     Backend {
-        execution: MaxwellBackendExecution,
+        execution: Box<MaxwellBackendExecution>,
         pending: Option<PendingSegment>,
     },
 }
@@ -393,19 +393,18 @@ impl NvDrvGpuExecutor {
                 detail: "GPU executor stopped before ordered frontend preflight".into(),
             })
         })?;
-        let mut plan = preflight_maxwell_submission_execution(
+        let plan = preflight_maxwell_submission_execution(
             &packets,
             &address_space,
             frontend,
             Vec::new(),
             reservation.as_ref(),
-            &lowering_cache,
+            &mut lowering_cache,
         )
         .map_err(|error| GpuExecutorFailure {
             frontend,
             detail: error.to_string().into(),
         })?;
-        let staged_cache = plan.take_staged_cache();
         let release_preflight_after_submission =
             plan.requires_backend() && !plan.has_deferred_canonical_writes();
         permit.set_release_after_submission(release_preflight_after_submission);
@@ -441,7 +440,6 @@ impl NvDrvGpuExecutor {
                     detail: "GPU backend owner stopped before accepting work".into(),
                 })
             })?;
-        *lowering_cache = staged_cache;
         Ok(())
     }
 
@@ -743,7 +741,7 @@ fn start_ready_work(
                     detail: error.to_string().into(),
                 })?;
             work.execution = Some(GpuWorkExecution::Backend {
-                execution,
+                execution: Box::new(execution),
                 pending: None,
             });
             let work = advance_backend_work(work, backend)?.ok_or_else(|| GpuExecutorFailure {

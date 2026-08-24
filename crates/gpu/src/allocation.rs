@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use nixe_memory::{CanonicalBackingRange, CanonicalPageId};
+use nixe_memory::{CanonicalBackingRange, CanonicalBackingSegment, CanonicalPageId};
 
 /// Backend-independent identity of one logical GPU backing allocation.
 ///
@@ -106,14 +106,91 @@ pub struct BackingView {
     allocation: GpuAllocationId,
     allocation_offset: u64,
     range: CanonicalBackingRange,
-    canonical_intervals: Arc<[CanonicalByteInterval]>,
+    canonical_spans: Arc<[CanonicalBackingSpan]>,
 }
 
+/// One maximal run of canonical bytes retained by a backing view.
+///
+/// Consecutive fully covered pages share one span. Boundary offsets preserve
+/// exact byte identity for partial first and last pages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CanonicalByteInterval {
-    page: CanonicalPageId,
-    start: u64,
-    end: u64,
+pub struct CanonicalBackingSpan {
+    first_page: CanonicalPageId,
+    last_page: CanonicalPageId,
+    first_offset: u64,
+    last_end: u64,
+    ends_at_page_boundary: bool,
+}
+
+impl CanonicalBackingSpan {
+    /// Returns the first page covered by this span.
+    #[must_use]
+    pub const fn first_page(self) -> CanonicalPageId {
+        self.first_page
+    }
+
+    /// Returns the last page covered by this span.
+    #[must_use]
+    pub const fn last_page(self) -> CanonicalPageId {
+        self.last_page
+    }
+
+    /// Returns the first covered byte within [`Self::first_page`].
+    #[must_use]
+    pub const fn first_offset(self) -> u64 {
+        self.first_offset
+    }
+
+    /// Returns the exclusive final covered byte within [`Self::last_page`].
+    #[must_use]
+    pub const fn last_end(self) -> u64 {
+        self.last_end
+    }
+
+    /// Returns whether this span can no longer overlap a later sorted span.
+    #[must_use]
+    pub fn ends_before(self, page: CanonicalPageId, offset: u64) -> bool {
+        self.last_page < page || (self.last_page == page && self.last_end <= offset)
+    }
+
+    /// Returns whether both spans contain any of the same canonical bytes.
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        if self.first_page.store() != other.first_page.store()
+            || self.last_page < other.first_page
+            || other.last_page < self.first_page
+        {
+            return false;
+        }
+
+        let page = self.first_page.max(other.first_page);
+        let last_page = self.last_page.min(other.last_page);
+        if page < last_page {
+            return true;
+        }
+
+        let self_start = if page == self.first_page {
+            self.first_offset
+        } else {
+            0
+        };
+        let self_end = if page == self.last_page {
+            self.last_end
+        } else {
+            u64::MAX
+        };
+        let other_start = if page == other.first_page {
+            other.first_offset
+        } else {
+            0
+        };
+        let other_end = if page == other.last_page {
+            other.last_end
+        } else {
+            u64::MAX
+        };
+        self_start < other_end && other_start < self_end
+    }
 }
 
 impl BackingView {
@@ -134,18 +211,12 @@ impl BackingView {
                 allocation_size: description.size,
             });
         }
-        let canonical_intervals = canonical_intervals(&range);
-        if canonical_intervals
-            .windows(2)
-            .any(|pair| pair[0].page == pair[1].page && pair[1].start < pair[0].end)
-        {
-            return Err(BackingViewError::OverlappingCanonicalBytes);
-        }
+        let canonical_spans = canonical_spans(&range)?;
         Ok(Self {
             allocation,
             allocation_offset,
             range,
-            canonical_intervals: canonical_intervals.into(),
+            canonical_spans: canonical_spans.into(),
         })
     }
 
@@ -173,24 +244,22 @@ impl BackingView {
         self.range.size()
     }
 
-    /// Iterates the page-ordered canonical byte intervals retained by this view.
+    /// Returns the page-ordered, maximally compressed canonical coverage.
     ///
     /// Canonical identity is exposed without revealing host pointers so
-    /// callers can index aliases once instead of comparing every pair of
-    /// complete views.
-    pub fn canonical_intervals(&self) -> impl Iterator<Item = (CanonicalPageId, u64, u64)> + '_ {
-        self.canonical_intervals
-            .iter()
-            .map(|interval| (interval.page, interval.start, interval.end))
+    /// callers can index aliases without enumerating every retained page.
+    #[must_use]
+    pub fn canonical_spans(&self) -> &[CanonicalBackingSpan] {
+        &self.canonical_spans
     }
 
     /// Returns whether both views retain any of the same canonical bytes.
     ///
-    /// Each constructor creates a page-ordered interval index once, so this
-    /// comparison is linear in the number of segments rather than quadratic.
+    /// Each constructor creates a compressed page-ordered index once, so this
+    /// comparison depends on discontiguous runs rather than retained pages.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        sorted_intervals_overlap(&self.canonical_intervals, &other.canonical_intervals)
+        sorted_spans_overlap(&self.canonical_spans, &other.canonical_spans)
     }
 }
 
@@ -230,33 +299,82 @@ impl Display for BackingViewError {
 
 impl std::error::Error for BackingViewError {}
 
-fn canonical_intervals(range: &CanonicalBackingRange) -> Vec<CanonicalByteInterval> {
-    let mut intervals = range
-        .segments()
-        .iter()
-        .map(|segment| CanonicalByteInterval {
-            page: segment.page(),
-            start: segment.offset(),
-            end: segment.offset() + segment.size(),
-        })
-        .collect::<Vec<_>>();
-    intervals.sort_unstable_by_key(|interval| (interval.page, interval.start, interval.end));
-    intervals
+fn canonical_spans(
+    range: &CanonicalBackingRange,
+) -> Result<Vec<CanonicalBackingSpan>, BackingViewError> {
+    let segments = range.segments();
+    let ordered = segments
+        .windows(2)
+        .all(|pair| canonical_segment_key(&pair[0]) <= canonical_segment_key(&pair[1]));
+    let mut spans = Vec::new();
+    if ordered {
+        for segment in segments {
+            append_canonical_span(&mut spans, segment)?;
+        }
+    } else {
+        let mut sorted = segments.iter().collect::<Vec<_>>();
+        sorted.sort_unstable_by_key(|segment| canonical_segment_key(segment));
+        for segment in sorted {
+            append_canonical_span(&mut spans, segment)?;
+        }
+    }
+    Ok(spans)
 }
 
-fn sorted_intervals_overlap(
-    left: &[CanonicalByteInterval],
-    right: &[CanonicalByteInterval],
-) -> bool {
+fn canonical_segment_key(segment: &CanonicalBackingSegment) -> (CanonicalPageId, u64, u64) {
+    (
+        segment.page(),
+        segment.offset(),
+        segment.offset() + segment.size(),
+    )
+}
+
+fn append_canonical_span(
+    spans: &mut Vec<CanonicalBackingSpan>,
+    segment: &CanonicalBackingSegment,
+) -> Result<(), BackingViewError> {
+    let span = CanonicalBackingSpan {
+        first_page: segment.page(),
+        last_page: segment.page(),
+        first_offset: segment.offset(),
+        last_end: segment.offset() + segment.size(),
+        ends_at_page_boundary: segment.ends_at_page_boundary(),
+    };
+    if let Some(previous) = spans.last_mut() {
+        if previous.last_page == span.first_page {
+            if span.first_offset < previous.last_end {
+                return Err(BackingViewError::OverlappingCanonicalBytes);
+            }
+            if span.first_offset == previous.last_end {
+                previous.last_end = span.last_end;
+                previous.ends_at_page_boundary = span.ends_at_page_boundary;
+                return Ok(());
+            }
+        } else if previous.last_page.store() == span.first_page.store()
+            && previous.last_page.page().get().checked_add(1) == Some(span.first_page.page().get())
+            && previous.ends_at_page_boundary
+            && span.first_offset == 0
+        {
+            previous.last_page = span.last_page;
+            previous.last_end = span.last_end;
+            previous.ends_at_page_boundary = span.ends_at_page_boundary;
+            return Ok(());
+        }
+    }
+    spans.push(span);
+    Ok(())
+}
+
+fn sorted_spans_overlap(left: &[CanonicalBackingSpan], right: &[CanonicalBackingSpan]) -> bool {
     let mut left_index = 0;
     let mut right_index = 0;
     while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
-        if left.page < right.page || (left.page == right.page && left.end <= right.start) {
+        if left.ends_before(right.first_page, right.first_offset) {
             left_index += 1;
-        } else if right.page < left.page || right.end <= left.start {
+        } else if right.ends_before(left.first_page, left.first_offset) {
             right_index += 1;
         } else {
-            return true;
+            return left.overlaps(*right);
         }
     }
     false
@@ -377,5 +495,63 @@ mod tests {
         assert!(overlapping.overlaps(&first));
         assert!(!first.overlaps(&adjacent));
         assert!(!adjacent.overlaps(&first));
+    }
+
+    #[test]
+    fn backing_view_compresses_consecutive_pages_without_losing_boundaries() {
+        let store = CanonicalBackingStore::allocate().unwrap();
+        let pages = [10, 11, 12, 14]
+            .into_iter()
+            .map(|id| {
+                CanonicalBackingPage::zeroed(
+                    &store,
+                    GuestPhysicalPageId::new(id),
+                    0x1000,
+                    ContentGeneration::INITIAL,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let description = GpuAllocationDescription::new(0x5000, 1).unwrap();
+        let view = BackingView::new(
+            GpuAllocationId::new(1),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![
+                segment(&pages[0], 0x800, 0x800),
+                segment(&pages[1], 0, 0x1000),
+                segment(&pages[2], 0, 0x400),
+                segment(&pages[3], 0, 0x1000),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let [span, separate] = view.canonical_spans() else {
+            panic!("only consecutive canonical pages may share a span");
+        };
+        assert_eq!(span.first_page(), pages[0].identity());
+        assert_eq!(span.last_page(), pages[2].identity());
+        assert_eq!(span.first_offset(), 0x800);
+        assert_eq!(span.last_end(), 0x400);
+        assert_eq!(separate.first_page(), pages[3].identity());
+        assert_eq!(separate.last_page(), pages[3].identity());
+
+        let middle = BackingView::new(
+            GpuAllocationId::new(2),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![segment(&pages[1], 0x400, 0x100)]).unwrap(),
+        )
+        .unwrap();
+        let adjacent = BackingView::new(
+            GpuAllocationId::new(3),
+            description,
+            0,
+            CanonicalBackingRange::new(vec![segment(&pages[2], 0x400, 0x100)]).unwrap(),
+        )
+        .unwrap();
+        assert!(view.overlaps(&middle));
+        assert!(!view.overlaps(&adjacent));
     }
 }

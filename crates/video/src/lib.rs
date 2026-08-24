@@ -265,8 +265,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use nixe_gpu::{
-        BackendInstanceId, BackendResourceHandle, BackendResourceKind, BackendSubmissionToken,
-        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
+        BackendInstanceId, ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind,
+        SampleCount,
     };
 
     use super::*;
@@ -285,7 +285,6 @@ mod tests {
         PresentationFrame::new(
             ResidentImage::new(
                 instance,
-                BackendResourceHandle::new(instance, sequence, 1, BackendResourceKind::Image),
                 ImageDescription::new(
                     ImageDimension::Two,
                     ImageExtent {
@@ -300,7 +299,6 @@ mod tests {
                     SampleCount::One,
                 )
                 .unwrap(),
-                BackendSubmissionToken::new(instance, sequence, 1),
                 Arc::new(()),
             ),
             FrameCrop {

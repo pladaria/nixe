@@ -81,7 +81,8 @@ pub trait NeutralBackendRuntime: Send {
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendRuntimeError>;
 
-    /// Retains a backend-resident image and its real completion dependency.
+    /// Retains a backend-resident image whose opaque payload carries the host
+    /// ownership and synchronization required by the matching presenter.
     fn acquire_presentable_image(
         &mut self,
         request: PresentationImageRequest,

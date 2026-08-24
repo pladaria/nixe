@@ -109,6 +109,7 @@ pub(crate) struct MaxwellShaderBinary {
     header: MaxwellShaderProgramHeader,
     bundles: Box<[MaxwellShaderInstructionBundle]>,
     source_pages: Box<[CanonicalBackingSegment]>,
+    source_mappings: Box<[crate::MaxwellGpuMapping]>,
 }
 
 // Mapping identity and content generations prove that the snapshot was read
@@ -137,7 +138,6 @@ impl Hash for MaxwellShaderBinary {
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationInputs {
     fingerprint: u128,
-    mapping_generation: nixe_memory::MappingGeneration,
     programs: Box<[Arc<MaxwellShaderProgramTranslationInput>]>,
 }
 
@@ -163,14 +163,30 @@ impl Hash for MaxwellShaderTranslationInputs {
 
 impl MaxwellShaderTranslationInputs {
     pub(crate) fn source_is_current(&self, address_space: &MaxwellGpuAddressSpace) -> bool {
-        self.mapping_generation == address_space.mapping_generation()
-            && self.programs.iter().all(|program| {
-                program
+        self.programs.iter().all(|program| {
+            program
+                .binary
+                .source_mappings
+                .iter()
+                .all(|mapping| address_space.retained_mapping_is_current(mapping))
+                && program
                     .binary
                     .source_pages
                     .iter()
                     .all(CanonicalBackingSegment::content_is_current)
+        })
+    }
+
+    pub(crate) fn staged_writes_are_irrelevant(&self, writes: &[MaxwellStagedShaderWrite]) -> bool {
+        writes.iter().all(|write| {
+            self.programs.iter().all(|program| {
+                let binary = &program.binary;
+                let size = MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64
+                    + binary.bundles.len() as u64 * MAXWELL_SCHEDULE_BUNDLE_SIZE as u64;
+                let end = binary.address.saturating_add(size);
+                write.address.saturating_add(4) <= binary.address || write.address >= end
             })
+        })
     }
 }
 
@@ -749,6 +765,7 @@ struct MaxwellShaderMemoryView<'a> {
 struct MaxwellShaderRead {
     bytes: Vec<u8>,
     snapshots: Vec<CanonicalBackingRange>,
+    mappings: Vec<crate::MaxwellGpuMapping>,
 }
 
 impl<'a> MaxwellShaderMemoryView<'a> {
@@ -815,6 +832,7 @@ impl<'a> MaxwellShaderMemoryView<'a> {
             })?;
         let mut bytes = vec![0_u8; size];
         let mut snapshots = Vec::new();
+        let mut mappings = Vec::new();
         for segment in resolved.segments() {
             let snapshot = segment
                 .mapping()
@@ -825,6 +843,12 @@ impl<'a> MaxwellShaderMemoryView<'a> {
                     address,
                 })?;
             snapshots.push(snapshot);
+            if !mappings
+                .iter()
+                .any(|mapping: &crate::MaxwellGpuMapping| mapping.id() == segment.mapping().id())
+            {
+                mappings.push(segment.mapping().clone());
+            }
         }
         self.address_space
             .read_resolved(&resolved, &mut bytes)
@@ -889,7 +913,11 @@ impl<'a> MaxwellShaderMemoryView<'a> {
             bytes[target_start..target_start + length]
                 .copy_from_slice(&write.value.to_le_bytes()[source_start..source_start + length]);
         }
-        Ok(MaxwellShaderRead { bytes, snapshots })
+        Ok(MaxwellShaderRead {
+            bytes,
+            snapshots,
+            mappings,
+        })
     }
 }
 
@@ -4093,7 +4121,6 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     let programs: Box<[_]> = programs.into_iter().map(Arc::new).collect();
     Ok(MaxwellShaderTranslationInputs {
         fingerprint: nixe_gpu::cache_fingerprint(&programs),
-        mapping_generation,
         programs,
     })
 }
@@ -4448,7 +4475,8 @@ fn read_shader_binary(
     )?;
     let header = decode_program_header(&header_read.bytes)?;
     let mut source_pages = BTreeMap::new();
-    retain_shader_read_evidence(&header_read, &mut source_pages);
+    let mut source_mappings = BTreeMap::new();
+    retain_shader_read_evidence(&header_read, &mut source_pages, &mut source_mappings);
     let mut bundles = Vec::new();
     let code_address = address
         .checked_add(MAXWELL_SHADER_PROGRAM_HEADER_SIZE as u64)
@@ -4473,7 +4501,7 @@ fn read_shader_binary(
             bundle_address,
             MAXWELL_SCHEDULE_BUNDLE_SIZE,
         )?;
-        retain_shader_read_evidence(&read, &mut source_pages);
+        retain_shader_read_evidence(&read, &mut source_pages, &mut source_mappings);
         let words = read
             .bytes
             .chunks_exact(MAXWELL_INSTRUCTION_SIZE)
@@ -4504,6 +4532,7 @@ fn read_shader_binary(
                 header,
                 bundles: bundles.into_boxed_slice(),
                 source_pages: source_pages.into_values().collect(),
+                source_mappings: source_mappings.into_values().collect(),
             });
         }
     }
@@ -4516,11 +4545,17 @@ fn read_shader_binary(
 fn retain_shader_read_evidence(
     read: &MaxwellShaderRead,
     pages: &mut BTreeMap<nixe_memory::CanonicalPageId, CanonicalBackingSegment>,
+    mappings: &mut BTreeMap<crate::MaxwellMappingId, crate::MaxwellGpuMapping>,
 ) {
     for segment in read.snapshots.iter().flat_map(|range| range.segments()) {
         pages
             .entry(segment.page())
             .or_insert_with(|| segment.clone());
+    }
+    for mapping in &read.mappings {
+        mappings
+            .entry(mapping.id())
+            .or_insert_with(|| mapping.clone());
     }
 }
 
@@ -6984,7 +7019,18 @@ mod tests {
             .unwrap();
         assert!(std::sync::Arc::ptr_eq(&repeated, &first));
         assert_eq!(cache.shader_translation_set_count(), 1);
-        let first_id = cache.stage_shader_translations(&first).unwrap().shaders()[0].shader();
+        let state_programs = cache
+            .resolve_shader_translation_for_state(channel.three_d(), &[], &address_space)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&state_programs, &first));
+        let translated =
+            std::sync::Arc::new(cache.stage_shader_translations(&state_programs).unwrap());
+        let first_id = translated.shaders()[0].shader();
+        cache.retain_translated_shader_state(&state_programs, std::sync::Arc::clone(&translated));
+        let repeated_translated = cache
+            .reuse_translated_shaders_for_state(channel.three_d(), &[], &address_space)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&repeated_translated, &translated));
         let repeated_id = cache
             .stage_shader_translations(&repeated)
             .unwrap()

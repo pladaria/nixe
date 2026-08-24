@@ -4,10 +4,9 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use crate::{
-    BackendInstanceId, BackendResourceHandle, BackendSubmissionToken, GpuAllocationId,
-    ImageDescription,
-};
+use nixe_memory::CanonicalCpuWriteDependency;
+
+use crate::{BackendInstanceId, BackingView, ImageDescription, ImageMemoryLayout};
 
 /// Channel order declared by a host presentation buffer.
 ///
@@ -16,34 +15,39 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PresentationImageFormat {
     Rgba8,
+    Rgbx8,
     Bgra8,
+    Rgb565,
+    Rgba4444,
 }
 
-/// Stable lookup key for the base level of a canonically backed image.
+/// Complete retained source for one GPU presentation operation.
 ///
-/// The allocation owner assigns the identity independently from guest handles
-/// and mappings. A backend can therefore index presentation candidates without
-/// walking canonical pages or host resources for every frame.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// The backing preserves canonical byte identity after the guest mapping or
+/// nvmap handle disappears. Backends may export a compatible device-authored
+/// image directly or import this source into a reusable resident image; they
+/// must not materialize a software-rendered host frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentationImageRequest {
-    pub allocation: GpuAllocationId,
-    pub allocation_offset: u64,
+    pub backing: BackingView,
     pub width: u32,
     pub height: u32,
     pub format: PresentationImageFormat,
+    pub layout: ImageMemoryLayout,
+    pub row_pitch: u32,
+    pub cpu_writes: CanonicalCpuWriteDependency,
 }
 
 /// An immutable presentation lease over a backend-resident image.
 ///
-/// `completion` names the sole backend timeline dependency which produced the
-/// retained image. Concrete presenters may encode that dependency directly;
-/// they must not infer readiness from guest fences or force CPU visibility.
+/// Concrete payloads retain any host completion primitive required by their
+/// presentation API. For WGPU, export and presentation use the same device and
+/// queue, so queue ordering is the completion dependency and no neutral token
+/// needs to duplicate backend synchronization state.
 #[derive(Clone)]
 pub struct ResidentImage {
     backend: BackendInstanceId,
-    resource: BackendResourceHandle,
     description: ImageDescription,
-    completion: BackendSubmissionToken,
     payload: Arc<dyn Any + Send + Sync>,
 }
 
@@ -51,16 +55,12 @@ impl ResidentImage {
     #[must_use]
     pub fn new(
         backend: BackendInstanceId,
-        resource: BackendResourceHandle,
         description: ImageDescription,
-        completion: BackendSubmissionToken,
         payload: Arc<dyn Any + Send + Sync>,
     ) -> Self {
         Self {
             backend,
-            resource,
             description,
-            completion,
             payload,
         }
     }
@@ -71,18 +71,8 @@ impl ResidentImage {
     }
 
     #[must_use]
-    pub const fn resource(&self) -> BackendResourceHandle {
-        self.resource
-    }
-
-    #[must_use]
     pub const fn description(&self) -> ImageDescription {
         self.description
-    }
-
-    #[must_use]
-    pub const fn completion(&self) -> BackendSubmissionToken {
-        self.completion
     }
 
     #[must_use]
@@ -96,9 +86,7 @@ impl Debug for ResidentImage {
         formatter
             .debug_struct("ResidentImage")
             .field("backend", &self.backend)
-            .field("resource", &self.resource)
             .field("description", &self.description)
-            .field("completion", &self.completion)
             .finish_non_exhaustive()
     }
 }

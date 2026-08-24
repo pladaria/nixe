@@ -1,6 +1,6 @@
 //! Persistent `wgpu` resource ownership, command lowering, and coherence.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,31 +13,35 @@ use nixe_gpu::{
     GpuCacheConfiguration, GpuCommand, ImageDescription, ImageDimension, ImageFormat,
     ImageMemoryLayout, ImageOrigin, ImageRegion, ImageSubresourceRange, IndexType,
     PipelineDescription, PipelineKind, PresentationImageFormat, PresentationImageRequest,
-    PrimitiveTopology, RenderAttachment, RenderPassOperation, ResidentImage, ResourceDependency,
-    SampleCount, ShaderStage, TriangleRasterization, VertexBufferLayout, VertexFormat,
-    VertexStepMode, ViewportTransform,
+    PrimitiveTopology, RenderAttachment, RenderPassOperation, ResidentImage,
+    ResolvedBackendResources, ResourceDependency, SampleCount, ShaderStage, TriangleRasterization,
+    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform,
 };
 use nixe_memory::{
     CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageId, ContentGeneration,
-    CpuVisibilityRequest,
+    CpuVisibilityRequest, VisibilityState,
 };
 use wgpu::util::StagingBelt;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferDescriptor,
     BufferSize, BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder,
-    CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, ErrorFilter,
-    ErrorScopeGuard, Extent3d, FragmentState, FrontFace, IndexFormat, LoadOp, MapMode,
-    MultisampleState, Operations, Origin3d, PipelineCache, PipelineCompilationOptions, PolygonMode,
-    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModule,
-    ShaderModuleDescriptor, ShaderSource, StencilState, StoreOp, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, TextureViewDimension,
-    VertexAttribute as WgpuVertexAttribute, VertexBufferLayout as WgpuVertexBufferLayout,
-    VertexFormat as WgpuVertexFormat, VertexState, VertexStepMode as WgpuVertexStepMode,
+    CommandEncoderDescriptor, CompareFunction, ComputePassDescriptor, ComputePipeline,
+    ComputePipelineDescriptor, DepthStencilState, Device, ErrorFilter, ErrorScopeGuard, Extent3d,
+    FragmentState, FrontFace, IndexFormat, LoadOp, MapMode, MultisampleState, Operations, Origin3d,
+    PipelineCache, PipelineCompilationOptions, PolygonMode, PrimitiveState, Queue,
+    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
+    RenderPipeline, RenderPipelineDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource,
+    StencilState, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
+    Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureViewDescriptor, TextureViewDimension, VertexAttribute as WgpuVertexAttribute,
+    VertexBufferLayout as WgpuVertexBufferLayout, VertexFormat as WgpuVertexFormat, VertexState,
+    VertexStepMode as WgpuVertexStepMode,
 };
 
 use crate::{PIPELINE_CACHE_MAGIC, WgpuVisibilityCoordinator};
+
+// WebGPU and Maxwell expose at most eight simultaneous color attachments.
+const MAX_COLOR_ATTACHMENTS: usize = 8;
 
 enum Resource {
     Allocation,
@@ -49,6 +53,7 @@ enum Resource {
         texture: Texture,
         description: ImageDescription,
         view: Option<nixe_gpu::ImageView>,
+        attachment_views: HashMap<ImageSubresourceRange, wgpu::TextureView>,
     },
     Sampler {
         sampler: wgpu::Sampler,
@@ -78,10 +83,21 @@ struct ResourceRecord {
     resident_bytes: u64,
 }
 
+struct WgpuResourceSlot {
+    handle: BackendResourceHandle,
+    record: ResourceRecord,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResourceUse {
     serial: u64,
     submission: BackendSubmissionToken,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UploadMark {
+    epoch: u64,
+    handle: Option<BackendResourceHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -93,16 +109,46 @@ struct PresentationImageKey {
     format: PresentationImageFormat,
 }
 
-impl From<PresentationImageRequest> for PresentationImageKey {
-    fn from(request: PresentationImageRequest) -> Self {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PresentationImportKey {
+    image: PresentationImageKey,
+    layout: ImageMemoryLayout,
+    row_pitch: u32,
+    source_size: u64,
+}
+
+impl From<&PresentationImageRequest> for PresentationImageKey {
+    fn from(request: &PresentationImageRequest) -> Self {
         Self {
-            allocation: request.allocation,
-            allocation_offset: request.allocation_offset,
+            allocation: request.backing.allocation(),
+            allocation_offset: request.backing.allocation_offset(),
             width: request.width,
             height: request.height,
             format: request.format,
         }
     }
+}
+
+impl From<&PresentationImageRequest> for PresentationImportKey {
+    fn from(request: &PresentationImageRequest) -> Self {
+        Self {
+            image: PresentationImageKey::from(request),
+            layout: request.layout,
+            row_pitch: request.row_pitch,
+            source_size: request.backing.size(),
+        }
+    }
+}
+
+struct PresentationImport {
+    source: Buffer,
+    texture: Texture,
+    bind_group: BindGroup,
+    uploaded: Vec<ContentGeneration>,
+    cpu_writes: Option<nixe_memory::CanonicalCpuWriteDependency>,
+    initialized: bool,
+    last_used: u64,
+    resident_bytes: u64,
 }
 
 struct ResourceContent {
@@ -128,6 +174,12 @@ enum DeviceWriteRegion {
     /// Images require layout conversion, so one immutable backing binding is
     /// the smallest exact transfer domain currently exposed by this backend.
     ImageBinding(usize),
+}
+
+#[derive(Clone, Copy)]
+enum ResidencyCandidate {
+    Resource(BackendResourceHandle),
+    Presentation(PresentationImportKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,13 +242,14 @@ impl RenderPipelineKey {
         Self {
             vertex,
             fragment,
-            topology: draw.topology,
-            triangle_rasterization: draw.triangle_rasterization,
-            alpha_test: draw.alpha_test,
+            topology: draw.prepared.topology,
+            triangle_rasterization: draw.prepared.triangle_rasterization,
+            alpha_test: draw.prepared.alpha_test,
             color_format,
             depth_format,
-            depth_state: draw.depth_state,
+            depth_state: draw.prepared.depth_state,
             vertex_buffers: draw
+                .prepared
                 .vertex_buffers
                 .iter()
                 .map(VertexPipelineLayoutKey::new)
@@ -214,17 +267,17 @@ impl RenderPipelineKey {
     ) -> bool {
         self.vertex == vertex
             && self.fragment == fragment
-            && self.topology == draw.topology
-            && self.triangle_rasterization == draw.triangle_rasterization
-            && self.alpha_test == draw.alpha_test
+            && self.topology == draw.prepared.topology
+            && self.triangle_rasterization == draw.prepared.triangle_rasterization
+            && self.alpha_test == draw.prepared.alpha_test
             && self.color_format == color_format
             && self.depth_format == depth_format
-            && self.depth_state == draw.depth_state
-            && self.vertex_buffers.len() == draw.vertex_buffers.len()
+            && self.depth_state == draw.prepared.depth_state
+            && self.vertex_buffers.len() == draw.prepared.vertex_buffers.len()
             && self
                 .vertex_buffers
                 .iter()
-                .zip(draw.vertex_buffers.iter())
+                .zip(draw.prepared.vertex_buffers.iter())
                 .all(|(cached, current)| cached.matches(current))
     }
 }
@@ -275,13 +328,13 @@ fn render_pipeline_fingerprint(
     nixe_gpu::cache_fingerprint(&RenderPipelineFingerprintInput {
         vertex,
         fragment,
-        topology: draw.topology,
-        triangle_rasterization: draw.triangle_rasterization,
-        alpha_test: draw.alpha_test,
+        topology: draw.prepared.topology,
+        triangle_rasterization: draw.prepared.triangle_rasterization,
+        alpha_test: draw.prepared.alpha_test,
         color_format,
         depth_format,
-        depth_state: draw.depth_state,
-        vertex_buffers: &draw.vertex_buffers,
+        depth_state: draw.prepared.depth_state,
+        vertex_buffers: &draw.prepared.vertex_buffers,
     })
 }
 
@@ -327,6 +380,7 @@ struct RenderPipelineKey {
 }
 
 struct CachedRenderPipeline {
+    identity: PreparedPipelineIdentity,
     #[cfg(debug_assertions)]
     key: RenderPipelineKey,
     pipeline: RenderPipeline,
@@ -335,20 +389,111 @@ struct CachedRenderPipeline {
     vertex_pull_bind_groups: HashMap<u128, CachedVertexPullBindGroup>,
 }
 
+struct PreparedPipelineIdentity {
+    draw: Arc<nixe_gpu::PreparedDraw>,
+    vertex: BackendResourceHandle,
+    fragment: BackendResourceHandle,
+    color_format: ImageFormat,
+    depth_format: Option<ImageFormat>,
+}
+
+impl PreparedPipelineIdentity {
+    fn matches(
+        &self,
+        vertex: BackendResourceHandle,
+        fragment: BackendResourceHandle,
+        color_format: ImageFormat,
+        depth_format: Option<ImageFormat>,
+        draw: &DrawOperation,
+    ) -> bool {
+        Arc::ptr_eq(&self.draw, &draw.prepared)
+            && self.vertex == vertex
+            && self.fragment == fragment
+            && self.color_format == color_format
+            && self.depth_format == depth_format
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RenderPipelineLocation {
+    pipeline: BackendResourceHandle,
+    vertex: BackendResourceHandle,
+    fragment: BackendResourceHandle,
+    color_format: ImageFormat,
+    depth_format: Option<ImageFormat>,
+    fingerprint: u128,
+}
+
+#[derive(Clone)]
+struct PreparedRenderPipeline {
+    location: RenderPipelineLocation,
+    pipeline: RenderPipeline,
+    serial: u64,
+}
+
+struct CurrentRenderPipeline {
+    fingerprint: u128,
+    record: CachedRenderPipeline,
+}
+
 #[derive(Default)]
 struct RenderPipelineCache {
     records: HashMap<u128, CachedRenderPipeline>,
+    current: Option<CurrentRenderPipeline>,
 }
 
 impl RenderPipelineCache {
-    fn get(&self, fingerprint: u128) -> Option<&CachedRenderPipeline> {
-        self.records.get(&fingerprint)
+    fn current_fingerprint(
+        &self,
+        vertex: BackendResourceHandle,
+        fragment: BackendResourceHandle,
+        color_format: ImageFormat,
+        depth_format: Option<ImageFormat>,
+        draw: &DrawOperation,
+    ) -> Option<u128> {
+        let current = self.current.as_ref()?;
+        current
+            .record
+            .identity
+            .matches(vertex, fragment, color_format, depth_format, draw)
+            .then_some(current.fingerprint)
     }
 
-    fn touch(&mut self, fingerprint: u128, last_used: u64) -> Option<&CachedRenderPipeline> {
-        let pipeline = self.records.get_mut(&fingerprint)?;
-        pipeline.last_used = last_used;
-        Some(pipeline)
+    fn touch(&mut self, fingerprint: u128, last_used: u64) -> Option<(RenderPipeline, u64)> {
+        if let Some(current) = self.current.as_mut()
+            && current.fingerprint == fingerprint
+        {
+            current.record.last_used = last_used;
+            return Some((current.record.pipeline.clone(), current.record.serial));
+        }
+        if let Some(current) = self.current.take() {
+            self.records.insert(current.fingerprint, current.record);
+        }
+        let mut record = self.records.remove(&fingerprint)?;
+        record.last_used = last_used;
+        let result = (record.pipeline.clone(), record.serial);
+        let current = CurrentRenderPipeline {
+            fingerprint,
+            record,
+        };
+        self.current = Some(current);
+        Some(result)
+    }
+
+    #[cfg(debug_assertions)]
+    fn current_record(&self) -> Option<&CachedRenderPipeline> {
+        self.current.as_ref().map(|current| &current.record)
+    }
+
+    fn record_mut(&mut self, fingerprint: u128) -> Option<&mut CachedRenderPipeline> {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.fingerprint == fingerprint)
+        {
+            return self.current.as_mut().map(|current| &mut current.record);
+        }
+        self.records.get_mut(&fingerprint)
     }
 
     fn insert(
@@ -358,13 +503,16 @@ impl RenderPipelineCache {
         capacity: usize,
     ) -> Option<(u128, u64)> {
         assert!(
-            !self.records.contains_key(&fingerprint),
+            self.current.is_none() && !self.records.contains_key(&fingerprint),
             "duplicate WGPU pipeline fingerprint insertion"
         );
         let evicted = if self.records.len() == capacity {
-            let evicted_fingerprint =
-                least_recent_key(&self.records, |pipeline| pipeline.last_used)
-                    .expect("configured WGPU pipeline cache is non-empty");
+            let evicted_fingerprint = self
+                .records
+                .iter()
+                .min_by_key(|(_, pipeline)| pipeline.last_used)
+                .map(|(fingerprint, _)| *fingerprint)
+                .expect("configured WGPU pipeline cache is non-empty");
             let pipeline = self
                 .records
                 .remove(&evicted_fingerprint)
@@ -373,7 +521,11 @@ impl RenderPipelineCache {
         } else {
             None
         };
-        self.records.insert(fingerprint, pipeline);
+        let current = CurrentRenderPipeline {
+            fingerprint,
+            record: pipeline,
+        };
+        self.current = Some(current);
         evicted
     }
 }
@@ -533,6 +685,96 @@ fn presentation_binding_key(
     })
 }
 
+fn direct_presentation_key(request: &PresentationImageRequest) -> Option<PresentationImageKey> {
+    let mut key = PresentationImageKey::from(request);
+    key.format = match request.format {
+        PresentationImageFormat::Rgba8 | PresentationImageFormat::Rgbx8 => {
+            PresentationImageFormat::Rgba8
+        }
+        PresentationImageFormat::Bgra8 => PresentationImageFormat::Bgra8,
+        PresentationImageFormat::Rgb565 | PresentationImageFormat::Rgba4444 => return None,
+    };
+    Some(key)
+}
+
+const fn presentation_bytes_per_texel(format: PresentationImageFormat) -> u32 {
+    match format {
+        PresentationImageFormat::Rgba8
+        | PresentationImageFormat::Rgbx8
+        | PresentationImageFormat::Bgra8 => 4,
+        PresentationImageFormat::Rgb565 | PresentationImageFormat::Rgba4444 => 2,
+    }
+}
+
+const fn presentation_format_code(format: PresentationImageFormat) -> u32 {
+    match format {
+        PresentationImageFormat::Rgba8 => 0,
+        PresentationImageFormat::Rgbx8 => 1,
+        PresentationImageFormat::Bgra8 => 2,
+        PresentationImageFormat::Rgb565 => 3,
+        PresentationImageFormat::Rgba4444 => 4,
+    }
+}
+
+fn validate_presentation_request(
+    request: &PresentationImageRequest,
+) -> Result<(), BackendDriverError> {
+    if request.width == 0 || request.height == 0 {
+        return Err(unsupported("empty presentation image"));
+    }
+    let row_bytes = u64::from(request.width)
+        .checked_mul(u64::from(presentation_bytes_per_texel(request.format)))
+        .ok_or_else(|| unsupported("presentation row size overflow"))?;
+    if u64::from(request.row_pitch) < row_bytes {
+        return Err(unsupported(
+            "presentation row pitch is smaller than one row",
+        ));
+    }
+    let required = match request.layout {
+        ImageMemoryLayout::PitchLinear {
+            row_pitch,
+            layer_stride,
+        } => {
+            if row_pitch != u64::from(request.row_pitch) {
+                return Err(unsupported("presentation pitch-linear layouts disagree"));
+            }
+            let required = u64::from(request.height - 1)
+                .checked_mul(row_pitch)
+                .and_then(|offset| offset.checked_add(row_bytes))
+                .ok_or_else(|| unsupported("presentation pitch-linear size overflow"))?;
+            if layer_stride < required {
+                return Err(unsupported("presentation pitch-linear layer is truncated"));
+            }
+            required
+        }
+        ImageMemoryLayout::BlockLinear(blocks) => {
+            if blocks.block_width_log2 != 0
+                || blocks.block_depth_log2 != 0
+                || blocks.block_height_log2 > 5
+                || !request.row_pitch.is_multiple_of(64)
+            {
+                return Err(unsupported("presentation block-linear layout"));
+            }
+            let block_height_gobs = 1_u64 << blocks.block_height_log2;
+            let block_rows = 8 * block_height_gobs;
+            let required = u64::from(request.height)
+                .div_ceil(block_rows)
+                .checked_mul(u64::from(request.row_pitch) / 64)
+                .and_then(|blocks| blocks.checked_mul(512))
+                .and_then(|bytes| bytes.checked_mul(block_height_gobs))
+                .ok_or_else(|| unsupported("presentation block-linear size overflow"))?;
+            if blocks.layer_stride < required {
+                return Err(unsupported("presentation block-linear layer is truncated"));
+            }
+            required
+        }
+    };
+    if required > request.backing.size() {
+        return Err(unsupported("presentation backing is truncated"));
+    }
+    Ok(())
+}
+
 const fn presentation_format(format: ImageFormat) -> Option<PresentationImageFormat> {
     match format {
         ImageFormat::Rgba8Unorm | ImageFormat::Rgba8Srgb => Some(PresentationImageFormat::Rgba8),
@@ -555,11 +797,14 @@ fn vertex_entry_point(
 
 /// Accelerated implementation retained behind [`nixe_gpu::Backend`].
 pub(crate) struct WgpuBackendDriver {
+    backend: nixe_gpu::BackendInstanceId,
     device: Device,
     queue: Queue,
     visibility: Arc<WgpuVisibilityCoordinator>,
-    resources: HashMap<BackendResourceHandle, ResourceRecord>,
+    resources: Vec<Option<WgpuResourceSlot>>,
     presentation_images: HashMap<PresentationImageKey, Vec<BackendResourceHandle>>,
+    presentation_imports: HashMap<PresentationImportKey, PresentationImport>,
+    presentation_import_pipeline: Option<ComputePipeline>,
     submissions: HashMap<BackendSubmissionToken, HostSubmission>,
     completion_sender: std::sync::mpsc::Sender<BackendSubmissionToken>,
     completion_receiver: std::sync::mpsc::Receiver<BackendSubmissionToken>,
@@ -576,7 +821,10 @@ pub(crate) struct WgpuBackendDriver {
     dirty_image_bindings: Vec<usize>,
     vertex_pull_binding_key: Vec<(u32, BackendResourceHandle)>,
     draw_bind_groups: Vec<Vec<BindGroup>>,
-    uploaded_inputs: HashSet<BackendResourceHandle>,
+    draw_pipelines: Vec<PreparedRenderPipeline>,
+    render_attachment_views: Vec<wgpu::TextureView>,
+    uploaded_inputs: Vec<UploadMark>,
+    upload_epoch: u64,
     readback_pool: Vec<Buffer>,
     readback_pool_bytes: u64,
     resident_resources: usize,
@@ -591,6 +839,7 @@ pub(crate) struct WgpuBackendDriver {
 
 impl WgpuBackendDriver {
     pub(crate) fn new(
+        backend: nixe_gpu::BackendInstanceId,
         device: Device,
         queue: Queue,
         visibility: Arc<WgpuVisibilityCoordinator>,
@@ -617,11 +866,14 @@ impl WgpuBackendDriver {
         let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
         let upload_staging = StagingBelt::new(device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         Self {
+            backend,
             device,
             queue,
             visibility,
-            resources: HashMap::new(),
+            resources: Vec::new(),
             presentation_images: HashMap::new(),
+            presentation_imports: HashMap::new(),
+            presentation_import_pipeline: None,
             submissions: HashMap::new(),
             completion_sender,
             completion_receiver,
@@ -638,7 +890,10 @@ impl WgpuBackendDriver {
             dirty_image_bindings: Vec::new(),
             vertex_pull_binding_key: Vec::new(),
             draw_bind_groups: Vec::new(),
-            uploaded_inputs: HashSet::new(),
+            draw_pipelines: Vec::new(),
+            render_attachment_views: Vec::new(),
+            uploaded_inputs: Vec::new(),
+            upload_epoch: 0,
             readback_pool: Vec::new(),
             readback_pool_bytes: 0,
             resident_resources: 0,
@@ -690,9 +945,12 @@ impl WgpuBackendDriver {
     fn clear_owned_state(&mut self) {
         self.resources.clear();
         self.presentation_images.clear();
+        self.presentation_imports.clear();
+        self.presentation_import_pipeline = None;
         self.submissions.clear();
         self.readback_pool.clear();
         self.uploaded_inputs.clear();
+        self.upload_epoch = 0;
         self.upload_staging = StagingBelt::new(self.device.clone(), UPLOAD_STAGING_CHUNK_BYTES);
         self.upload_canonical = Vec::new();
         self.upload_linear = Vec::new();
@@ -702,6 +960,8 @@ impl WgpuBackendDriver {
         self.dirty_image_bindings = Vec::new();
         self.vertex_pull_binding_key = Vec::new();
         self.draw_bind_groups = Vec::new();
+        self.draw_pipelines = Vec::new();
+        self.render_attachment_views = Vec::new();
         self.readback_pool_bytes = 0;
         self.resident_resources = 0;
         self.resident_resource_bytes = 0;
@@ -778,6 +1038,15 @@ impl WgpuBackendDriver {
         Ok(use_serial)
     }
 
+    fn take_resource_use(&mut self) -> Result<u64, BackendDriverError> {
+        let use_serial = self.next_use;
+        self.next_use = self
+            .next_use
+            .checked_add(1)
+            .ok_or_else(|| BackendDriverError::failure("wgpu resource-use timeline exhausted"))?;
+        Ok(use_serial)
+    }
+
     fn capture_error_scope(&self, scope: ErrorScopeGuard) -> Result<(), BackendDriverError> {
         if let Some(error) = pollster::block_on(scope.pop()) {
             if let Some(reason) = self
@@ -798,10 +1067,16 @@ impl WgpuBackendDriver {
     fn upload_inputs(
         &mut self,
         accepted: &AcceptedBackendSubmission<'_>,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
         encoder: &mut CommandEncoder,
     ) -> Result<(), BackendDriverError> {
-        self.uploaded_inputs.clear();
+        self.upload_epoch = match self.upload_epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => {
+                self.uploaded_inputs.fill(UploadMark::default());
+                1
+            }
+        };
         for operation in accepted.submission().operations() {
             for access in operation.accesses() {
                 if !access.scope().mode().reads() {
@@ -811,14 +1086,14 @@ impl WgpuBackendDriver {
                     nixe_gpu::AccessTarget::Buffer { buffer, .. } => {
                         let handle =
                             dependency_handle(dependencies, ResourceDependency::Buffer(buffer))?;
-                        if self.uploaded_inputs.insert(handle) {
+                        if self.mark_input_for_upload(handle)? {
                             self.upload_buffer(handle, encoder)?;
                         }
                     }
                     nixe_gpu::AccessTarget::Image { image, .. } => {
                         let handle =
                             dependency_handle(dependencies, ResourceDependency::Image(image))?;
-                        if self.uploaded_inputs.insert(handle) {
+                        if self.mark_input_for_upload(handle)? {
                             self.upload_image(handle, encoder)?;
                         }
                     }
@@ -827,6 +1102,25 @@ impl WgpuBackendDriver {
             }
         }
         Ok(())
+    }
+
+    fn mark_input_for_upload(
+        &mut self,
+        handle: BackendResourceHandle,
+    ) -> Result<bool, BackendDriverError> {
+        let slot = usize::try_from(handle.slot()).map_err(|_| missing(handle))?;
+        if self.uploaded_inputs.len() <= slot {
+            self.uploaded_inputs.resize(slot + 1, UploadMark::default());
+        }
+        let mark = &mut self.uploaded_inputs[slot];
+        if mark.epoch == self.upload_epoch && mark.handle == Some(handle) {
+            return Ok(false);
+        }
+        *mark = UploadMark {
+            epoch: self.upload_epoch,
+            handle: Some(handle),
+        };
+        Ok(true)
     }
 
     fn upload_buffer(
@@ -1055,7 +1349,7 @@ impl WgpuBackendDriver {
     fn encode_submission(
         &mut self,
         accepted: &AcceptedBackendSubmission<'_>,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
         mut encoder: CommandEncoder,
     ) -> Result<CommandEncoder, BackendDriverError> {
         let operations = accepted.submission().operations();
@@ -1075,7 +1369,7 @@ impl WgpuBackendDriver {
                         })
                         .map(|offset| index + 1 + offset)
                         .ok_or_else(|| unsupported("unterminated render pass"))?;
-                    self.encode_render_pass(&mut encoder, dependencies, &operations[index..=end])?;
+                    self.encode_render_pass(&mut encoder, dependencies, operations, index, end)?;
                     index = end;
                 }
                 GpuCommand::RenderPass(RenderPassOperation::End { .. }) => {
@@ -1160,7 +1454,7 @@ impl WgpuBackendDriver {
     fn encode_copy(
         &self,
         encoder: &mut CommandEncoder,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
         copy: &CopyOperation,
     ) -> Result<(), BackendDriverError> {
         match copy {
@@ -1196,7 +1490,7 @@ impl WgpuBackendDriver {
     fn encode_clear(
         &mut self,
         encoder: &mut CommandEncoder,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
         clear: &ClearOperation,
     ) -> Result<(), BackendDriverError> {
         match clear {
@@ -1310,196 +1604,216 @@ impl WgpuBackendDriver {
     fn encode_render_pass(
         &mut self,
         encoder: &mut CommandEncoder,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
         operations: &[nixe_gpu::GpuOperation],
+        begin: usize,
+        end: usize,
     ) -> Result<(), BackendDriverError> {
         let GpuCommand::RenderPass(RenderPassOperation::Begin { attachments, .. }) =
-            operations[0].command()
+            operations[begin].command()
         else {
             unreachable!();
         };
-        for operation in &operations[1..operations.len() - 1] {
+        let mut draw_pipelines = std::mem::take(&mut self.draw_pipelines);
+        draw_pipelines.clear();
+        for (operation_index, operation) in operations[begin + 1..end].iter().enumerate() {
+            let operation_index = begin + 1 + operation_index;
             if let GpuCommand::Draw(draw) = operation.command() {
-                self.ensure_render_pipeline(dependencies, attachments, draw)?;
+                let location = self.render_pipeline_location(
+                    dependencies,
+                    operation_index,
+                    attachments,
+                    draw,
+                )?;
+                draw_pipelines.push(self.ensure_render_pipeline(
+                    dependencies,
+                    operation_index,
+                    draw,
+                    location,
+                )?);
             } else if !matches!(operation.command(), GpuCommand::Barrier(_)) {
                 return Err(unsupported("non-draw command inside render pass"));
             }
         }
 
-        let views = attachments
-            .iter()
-            .map(|attachment| self.attachment_view(dependencies, *attachment))
-            .collect::<Result<Vec<_>, _>>()?;
-        let color_attachments = attachments
-            .iter()
-            .zip(&views)
-            .filter(|(attachment, _)| attachment.kind == nixe_gpu::ImageKind::Color)
-            .map(|(attachment, view)| {
-                Ok(Some(RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: color_operations(attachment)?,
-                    depth_slice: None,
-                }))
-            })
-            .collect::<Result<Vec<_>, BackendDriverError>>()?;
-        let depth_index = attachments
-            .iter()
-            .position(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil);
-        let depth_attachment = depth_index
-            .map(|index| depth_operations(&views[index], &attachments[index]))
-            .transpose()?;
-        let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);
-        let mut draw_count = 0;
-        for operation in &operations[1..operations.len() - 1] {
-            let GpuCommand::Draw(draw) = operation.command() else {
-                continue;
-            };
-            if draw_count == draw_bind_groups.len() {
-                draw_bind_groups.push(Vec::new());
-            }
-            draw_bind_groups[draw_count].clear();
-            self.create_draw_bind_groups(
-                dependencies,
-                attachments,
-                draw,
-                &mut draw_bind_groups[draw_count],
-            )?;
-            draw_count += 1;
+        let mut views = std::mem::take(&mut self.render_attachment_views);
+        views.clear();
+        for attachment in attachments {
+            views.push(self.attachment_view(dependencies, *attachment)?);
         }
-        draw_bind_groups.truncate(draw_count);
-        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("Nixe neutral render pass"),
-            color_attachments: &color_attachments,
-            depth_stencil_attachment: depth_attachment,
-            ..Default::default()
-        });
-        let mut draw_index = 0;
-        for operation in &operations[1..operations.len() - 1] {
-            let GpuCommand::Draw(draw) = operation.command() else {
-                continue;
-            };
-            let pipeline = self.render_pipeline(dependencies, attachments, draw)?;
-            pass.set_pipeline(pipeline);
-            for (slot, layout) in draw.vertex_buffers.iter().enumerate() {
-                if !layout
-                    .attributes
-                    .iter()
-                    .any(|attribute| !attribute.format.requires_vertex_pulling())
-                {
+        let mut draw_bind_groups = std::mem::take(&mut self.draw_bind_groups);
+        {
+            let mut color_attachments: [Option<RenderPassColorAttachment<'_>>;
+                MAX_COLOR_ATTACHMENTS] = std::array::from_fn(|_| None);
+            let mut color_attachment_count = 0;
+            for (attachment, view) in attachments.iter().zip(&views) {
+                if attachment.kind == nixe_gpu::ImageKind::Color {
+                    let slot = color_attachments
+                        .get_mut(color_attachment_count)
+                        .ok_or_else(|| unsupported("too many color attachments"))?;
+                    *slot = Some(RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: color_operations(attachment)?,
+                        depth_slice: None,
+                    });
+                    color_attachment_count += 1;
+                }
+            }
+            let depth_index = attachments
+                .iter()
+                .position(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil);
+            let depth_attachment = depth_index
+                .map(|index| depth_operations(&views[index], &attachments[index]))
+                .transpose()?;
+            let mut draw_count = 0;
+            for operation in &operations[begin + 1..end] {
+                let GpuCommand::Draw(draw) = operation.command() else {
                     continue;
+                };
+                if draw_count == draw_bind_groups.len() {
+                    draw_bind_groups.push(Vec::new());
                 }
-                let buffer = self.buffer(dependency_handle(
+                draw_bind_groups[draw_count].clear();
+                self.create_draw_bind_groups(
                     dependencies,
-                    ResourceDependency::Buffer(layout.buffer.buffer),
-                )?)?;
-                pass.set_vertex_buffer(
-                    u32::try_from(slot).map_err(|_| unsupported("vertex buffer slot overflow"))?,
-                    buffer.slice(layout.buffer.range.offset()..layout.buffer.range.end()),
-                );
+                    draw,
+                    &draw_pipelines[draw_count],
+                    &mut draw_bind_groups[draw_count],
+                )?;
+                draw_count += 1;
             }
-            for (group, bind_group) in draw_bind_groups[draw_index].iter().enumerate() {
-                pass.set_bind_group(
-                    u32::try_from(group)
-                        .map_err(|_| unsupported("descriptor-table group overflow"))?,
-                    bind_group,
-                    &[],
-                );
-            }
-            if let Some(viewport) = draw.viewport_transform {
-                let viewport = webgpu_viewport(viewport)?;
-                pass.set_viewport(
-                    viewport.x,
-                    viewport.y,
-                    viewport.width,
-                    viewport.height,
-                    viewport.min_depth,
-                    viewport.max_depth,
-                );
-            }
-            match draw.arguments {
-                DrawArguments::NonIndexed {
-                    first_vertex,
-                    vertex_count,
-                    first_instance,
-                    instance_count,
-                } => {
-                    let (first_vertex, vertex_count) = match draw.triangle_rasterization {
-                        TriangleRasterization::Fill => (first_vertex, vertex_count),
-                        TriangleRasterization::FillRectangle => (
-                            first_vertex.checked_mul(2).ok_or_else(|| {
-                                unsupported("fill-rectangle first vertex overflow")
-                            })?,
-                            vertex_count.checked_mul(2).ok_or_else(|| {
-                                unsupported("fill-rectangle vertex count overflow")
-                            })?,
-                        ),
-                    };
-                    pass.draw(
-                        first_vertex..first_vertex + vertex_count,
-                        first_instance..first_instance + instance_count,
-                    );
-                }
-                DrawArguments::Indexed {
-                    first_index,
-                    index_count,
-                    vertex_offset,
-                    first_instance,
-                    instance_count,
-                } => {
-                    let (region, index_type) = draw
-                        .index_buffer
-                        .ok_or_else(|| unsupported("missing index buffer"))?;
+            draw_bind_groups.truncate(draw_count);
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Nixe neutral render pass"),
+                color_attachments: &color_attachments[..color_attachment_count],
+                depth_stencil_attachment: depth_attachment,
+                ..Default::default()
+            });
+            let mut draw_index = 0;
+            for operation in &operations[begin + 1..end] {
+                let GpuCommand::Draw(draw) = operation.command() else {
+                    continue;
+                };
+                pass.set_pipeline(&draw_pipelines[draw_index].pipeline);
+                for (slot, layout) in draw.prepared.vertex_buffers.iter().enumerate() {
+                    if !layout
+                        .attributes
+                        .iter()
+                        .any(|attribute| !attribute.format.requires_vertex_pulling())
+                    {
+                        continue;
+                    }
                     let buffer = self.buffer(dependency_handle(
                         dependencies,
-                        ResourceDependency::Buffer(region.buffer),
+                        ResourceDependency::Buffer(layout.buffer.buffer),
                     )?)?;
-                    let format = match index_type {
-                        IndexType::Uint16 => IndexFormat::Uint16,
-                        IndexType::Uint32 => IndexFormat::Uint32,
-                        IndexType::Uint8 => return Err(unsupported("8-bit index buffer")),
-                    };
-                    pass.set_index_buffer(
-                        buffer.slice(region.range.offset()..region.range.end()),
-                        format,
-                    );
-                    pass.draw_indexed(
-                        first_index..first_index + index_count,
-                        vertex_offset,
-                        first_instance..first_instance + instance_count,
+                    pass.set_vertex_buffer(
+                        u32::try_from(slot)
+                            .map_err(|_| unsupported("vertex buffer slot overflow"))?,
+                        buffer.slice(layout.buffer.range.offset()..layout.buffer.range.end()),
                     );
                 }
+                for (group, bind_group) in draw_bind_groups[draw_index].iter().enumerate() {
+                    pass.set_bind_group(
+                        u32::try_from(group)
+                            .map_err(|_| unsupported("descriptor-table group overflow"))?,
+                        bind_group,
+                        &[],
+                    );
+                }
+                if let Some(viewport) = draw.prepared.viewport_transform {
+                    let viewport = webgpu_viewport(viewport)?;
+                    pass.set_viewport(
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height,
+                        viewport.min_depth,
+                        viewport.max_depth,
+                    );
+                }
+                match draw.arguments {
+                    DrawArguments::NonIndexed {
+                        first_vertex,
+                        vertex_count,
+                        first_instance,
+                        instance_count,
+                    } => {
+                        let (first_vertex, vertex_count) =
+                            match draw.prepared.triangle_rasterization {
+                                TriangleRasterization::Fill => (first_vertex, vertex_count),
+                                TriangleRasterization::FillRectangle => (
+                                    first_vertex.checked_mul(2).ok_or_else(|| {
+                                        unsupported("fill-rectangle first vertex overflow")
+                                    })?,
+                                    vertex_count.checked_mul(2).ok_or_else(|| {
+                                        unsupported("fill-rectangle vertex count overflow")
+                                    })?,
+                                ),
+                            };
+                        pass.draw(
+                            first_vertex..first_vertex + vertex_count,
+                            first_instance..first_instance + instance_count,
+                        );
+                    }
+                    DrawArguments::Indexed {
+                        first_index,
+                        index_count,
+                        vertex_offset,
+                        first_instance,
+                        instance_count,
+                    } => {
+                        let (region, index_type) = draw
+                            .prepared
+                            .index_buffer
+                            .ok_or_else(|| unsupported("missing index buffer"))?;
+                        let buffer = self.buffer(dependency_handle(
+                            dependencies,
+                            ResourceDependency::Buffer(region.buffer),
+                        )?)?;
+                        let format = match index_type {
+                            IndexType::Uint16 => IndexFormat::Uint16,
+                            IndexType::Uint32 => IndexFormat::Uint32,
+                            IndexType::Uint8 => return Err(unsupported("8-bit index buffer")),
+                        };
+                        pass.set_index_buffer(
+                            buffer.slice(region.range.offset()..region.range.end()),
+                            format,
+                        );
+                        pass.draw_indexed(
+                            first_index..first_index + index_count,
+                            vertex_offset,
+                            first_instance..first_instance + instance_count,
+                        );
+                    }
+                }
+                draw_index += 1;
             }
-            draw_index += 1;
+            drop(pass);
         }
-        drop(pass);
+        self.render_attachment_views = views;
         for groups in &mut draw_bind_groups {
             groups.clear();
         }
         self.draw_bind_groups = draw_bind_groups;
+        self.draw_pipelines = draw_pipelines;
         Ok(())
     }
 
     fn create_draw_bind_groups(
         &mut self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
-        attachments: &[RenderAttachment],
+        dependencies: &ResolvedBackendResources,
         draw: &DrawOperation,
+        prepared: &PreparedRenderPipeline,
         groups: &mut Vec<BindGroup>,
     ) -> Result<(), BackendDriverError> {
-        let (pipeline_handle, pipeline_fingerprint) =
-            self.render_pipeline_location(dependencies, attachments, draw)?;
-        let (pipeline, pipeline_serial) = {
-            let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
-                return Err(kind_mismatch(pipeline_handle));
-            };
-            let cached = render
-                .get(pipeline_fingerprint)
-                .ok_or_else(|| unsupported("render pipeline was not compiled"))?;
-            (cached.pipeline.clone(), cached.serial)
-        };
-        groups.reserve(draw.descriptor_tables.len() + 1);
-        for (group, table) in draw.descriptor_tables.iter().enumerate() {
+        let pipeline_handle = prepared.location.pipeline;
+        let pipeline_fingerprint = prepared.location.fingerprint;
+        let pipeline = &prepared.pipeline;
+        let pipeline_serial = prepared.serial;
+        groups.reserve(draw.prepared.descriptor_tables.len() + 1);
+        for (group, table) in draw.prepared.descriptor_tables.iter().enumerate() {
             let group =
                 u32::try_from(group).map_err(|_| unsupported("descriptor-table group overflow"))?;
             let table_handle =
@@ -1610,26 +1924,27 @@ impl WgpuBackendDriver {
             );
             groups.push(bind_group);
         }
-        if draw.vertex_buffers.iter().any(|layout| {
+        if draw.prepared.vertex_buffers.iter().any(|layout| {
             layout
                 .attributes
                 .iter()
                 .any(|attribute| attribute.format.requires_vertex_pulling())
         }) {
-            let group = u32::try_from(draw.descriptor_tables.len())
+            let group = u32::try_from(draw.prepared.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
             let mut key = std::mem::take(&mut self.vertex_pull_binding_key);
             key.clear();
-            for (slot, layout) in draw
-                .vertex_buffers
-                .iter()
-                .enumerate()
-                .filter(|(_, layout)| {
-                    layout
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.format.requires_vertex_pulling())
-                })
+            for (slot, layout) in
+                draw.prepared
+                    .vertex_buffers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, layout)| {
+                        layout
+                            .attributes
+                            .iter()
+                            .any(|attribute| attribute.format.requires_vertex_pulling())
+                    })
             {
                 key.push((
                     u32::try_from(slot).map_err(|_| unsupported("vertex-pull binding overflow"))?,
@@ -1647,8 +1962,7 @@ impl WgpuBackendDriver {
                     return Err(kind_mismatch(pipeline_handle));
                 };
                 let cached = render
-                    .records
-                    .get_mut(&pipeline_fingerprint)
+                    .record_mut(pipeline_fingerprint)
                     .expect("compiled render pipeline remains resident")
                     .vertex_pull_bind_groups
                     .get_mut(&fingerprint);
@@ -1693,8 +2007,7 @@ impl WgpuBackendDriver {
                 return Err(kind_mismatch(pipeline_handle));
             };
             let cache = &mut render
-                .records
-                .get_mut(&pipeline_fingerprint)
+                .record_mut(pipeline_fingerprint)
                 .expect("compiled render pipeline remains resident")
                 .vertex_pull_bind_groups;
             if cache.len() == capacity {
@@ -1724,14 +2037,17 @@ impl WgpuBackendDriver {
 
     fn render_pipeline_location(
         &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
+        operation: usize,
         attachments: &[RenderAttachment],
         draw: &DrawOperation,
-    ) -> Result<(BackendResourceHandle, u128), BackendDriverError> {
-        let pipeline =
-            dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let vertex = self.shader_handle_for_stage(dependencies, ShaderStage::Vertex)?;
-        let fragment = self.shader_handle_for_stage(dependencies, ShaderStage::Fragment)?;
+    ) -> Result<RenderPipelineLocation, BackendDriverError> {
+        let pipeline = dependency_handle(
+            dependencies,
+            ResourceDependency::Pipeline(draw.prepared.pipeline),
+        )?;
+        let vertex = shader_handle_for_stage(dependencies, operation, ShaderStage::Vertex)?;
+        let fragment = shader_handle_for_stage(dependencies, operation, ShaderStage::Fragment)?;
         let color_format = attachments
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
@@ -1741,75 +2057,82 @@ impl WgpuBackendDriver {
             .iter()
             .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
             .map(|attachment| attachment.format);
-        Ok((
+        let fingerprint = match self.resource(pipeline)? {
+            Resource::Pipeline { render, .. } => render
+                .current_fingerprint(vertex, fragment, color_format, depth_format, draw)
+                .unwrap_or_else(|| {
+                    render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw)
+                }),
+            _ => return Err(kind_mismatch(pipeline)),
+        };
+        Ok(RenderPipelineLocation {
             pipeline,
-            render_pipeline_fingerprint(vertex, fragment, color_format, depth_format, draw),
-        ))
+            vertex,
+            fragment,
+            color_format,
+            depth_format,
+            fingerprint,
+        })
     }
 
     fn ensure_render_pipeline(
         &mut self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
-        attachments: &[RenderAttachment],
+        dependencies: &ResolvedBackendResources,
+        operation: usize,
         draw: &DrawOperation,
-    ) -> Result<(), BackendDriverError> {
-        let pipeline_handle =
-            dependency_handle(dependencies, ResourceDependency::Pipeline(draw.pipeline))?;
-        let vertex_handle = self.shader_handle_for_stage(dependencies, ShaderStage::Vertex)?;
-        let fragment_handle = self.shader_handle_for_stage(dependencies, ShaderStage::Fragment)?;
-        let color_format = attachments
-            .iter()
-            .find(|attachment| attachment.kind == nixe_gpu::ImageKind::Color)
-            .map(|attachment| attachment.format)
-            .ok_or_else(|| unsupported("graphics draw without a color attachment"))?;
-        let depth_format = attachments
-            .iter()
-            .find(|attachment| attachment.kind == nixe_gpu::ImageKind::DepthStencil)
-            .map(|attachment| attachment.format);
+        location: RenderPipelineLocation,
+    ) -> Result<PreparedRenderPipeline, BackendDriverError> {
+        let pipeline_handle = location.pipeline;
+        let vertex_handle = location.vertex;
+        let fragment_handle = location.fragment;
         let Resource::Pipeline { description, .. } = self.resource(pipeline_handle)? else {
             return Err(kind_mismatch(pipeline_handle));
         };
         if description.kind != PipelineKind::Graphics {
             return Err(unsupported("compute pipeline used for draw"));
         }
-        let fingerprint = render_pipeline_fingerprint(
-            vertex_handle,
-            fragment_handle,
-            color_format,
-            depth_format,
-            draw,
-        );
+        let fingerprint = location.fingerprint;
         let cache_use = self.take_cache_use()?;
         let pipeline_variant_capacity = self.cache_configuration.pipeline_variants_per_resource();
-        let cache_hit = {
+        let cached = {
             let record = self.resource_record_mut(pipeline_handle)?;
             let Some(Resource::Pipeline { render, .. }) = record.host.as_mut() else {
                 return Err(kind_mismatch(pipeline_handle));
             };
             let cached = render.touch(fingerprint, cache_use);
             #[cfg(debug_assertions)]
-            if let Some(cached) = cached {
+            if cached.is_some()
+                && let Some(cached) = render.current_record()
+            {
                 assert!(
                     cached.key.matches(
                         vertex_handle,
                         fragment_handle,
-                        color_format,
-                        depth_format,
+                        location.color_format,
+                        location.depth_format,
                         draw,
                     ),
                     "XXH3-128 collision or incomplete WGPU pipeline cache key"
                 );
             }
-            cached.is_some()
+            cached
         };
-        if cache_hit {
-            return Ok(());
+        if let Some((pipeline, serial)) = cached {
+            return Ok(PreparedRenderPipeline {
+                location,
+                pipeline,
+                serial,
+            });
         }
         log::debug!(
             "WGPU pipeline cache miss; compiling host pipeline: neutral={pipeline_handle} fingerprint={fingerprint:032x}"
         );
-        let (_, vertex, vertex_ir) = self.shader_for_stage(dependencies, ShaderStage::Vertex)?;
-        let (_, fragment, _) = self.shader_for_stage(dependencies, ShaderStage::Fragment)?;
+        let (_, vertex, vertex_ir) =
+            self.shader_for_stage(dependencies, operation, ShaderStage::Vertex)?;
+        let (_, fragment, _) =
+            self.shader_for_stage(dependencies, operation, ShaderStage::Fragment)?;
+        let color_format = location.color_format;
+        let depth_format = location.depth_format;
         #[cfg(debug_assertions)]
         let key = RenderPipelineKey::new(
             vertex_handle,
@@ -1831,10 +2154,11 @@ impl WgpuBackendDriver {
                     format: texture_format(format)
                         .ok_or_else(|| unsupported("depth attachment format"))?,
                     depth_write_enabled: Some(
-                        draw.depth_state.test_enabled && draw.depth_state.write_enabled,
+                        draw.prepared.depth_state.test_enabled
+                            && draw.prepared.depth_state.write_enabled,
                     ),
-                    depth_compare: Some(if draw.depth_state.test_enabled {
-                        compare_function(draw.depth_state.compare)
+                    depth_compare: Some(if draw.prepared.depth_state.test_enabled {
+                        compare_function(draw.prepared.depth_state.compare)
                     } else {
                         CompareFunction::Always
                     }),
@@ -1844,18 +2168,18 @@ impl WgpuBackendDriver {
             })
             .transpose()?;
         let scope = self.device.push_error_scope(ErrorFilter::Validation);
-        let uses_vertex_pulling = draw.vertex_buffers.iter().any(|layout| {
+        let uses_vertex_pulling = draw.prepared.vertex_buffers.iter().any(|layout| {
             layout
                 .attributes
                 .iter()
                 .any(|attribute| attribute.format.requires_vertex_pulling())
         });
         let vertex = if uses_vertex_pulling {
-            let group = u32::try_from(draw.descriptor_tables.len())
+            let group = u32::try_from(draw.prepared.descriptor_tables.len())
                 .map_err(|_| unsupported("vertex-pull bind group overflow"))?;
             let module = nixe_gpu::lower_shader_ir_to_wgsl_with_vertex_pulling(
                 vertex_ir.ir(),
-                &draw.vertex_buffers,
+                &draw.prepared.vertex_buffers,
                 group,
             )
             .map_err(|error| {
@@ -1869,6 +2193,7 @@ impl WgpuBackendDriver {
             vertex
         };
         let attribute_storage = draw
+            .prepared
             .vertex_buffers
             .iter()
             .map(|layout| {
@@ -1886,6 +2211,7 @@ impl WgpuBackendDriver {
             })
             .collect::<Vec<_>>();
         let vertex_buffers = draw
+            .prepared
             .vertex_buffers
             .iter()
             .zip(&attribute_storage)
@@ -1900,7 +2226,7 @@ impl WgpuBackendDriver {
                 })
             })
             .collect::<Vec<_>>();
-        let alpha_constants = draw.alpha_test.map(|test| {
+        let alpha_constants = draw.prepared.alpha_test.map(|test| {
             [(
                 "nixe_alpha_reference",
                 f64::from(f32::from_bits(test.reference_bits)),
@@ -1915,13 +2241,13 @@ impl WgpuBackendDriver {
                     module: &vertex,
                     entry_point: Some(vertex_entry_point(
                         uses_vertex_pulling,
-                        draw.triangle_rasterization,
+                        draw.prepared.triangle_rasterization,
                     )),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &vertex_buffers,
                 },
                 primitive: PrimitiveState {
-                    topology: primitive_topology(draw.topology)?,
+                    topology: primitive_topology(draw.prepared.topology)?,
                     strip_index_format: None,
                     front_face: FrontFace::Ccw,
                     cull_mode: None,
@@ -1933,7 +2259,7 @@ impl WgpuBackendDriver {
                 multisample: MultisampleState::default(),
                 fragment: Some(FragmentState {
                     module: &fragment,
-                    entry_point: Some(alpha_test_entry_point(draw.alpha_test)),
+                    entry_point: Some(alpha_test_entry_point(draw.prepared.alpha_test)),
                     compilation_options: PipelineCompilationOptions {
                         constants: alpha_constants.as_ref().map_or(&[], |values| values),
                         ..PipelineCompilationOptions::default()
@@ -1948,16 +2274,24 @@ impl WgpuBackendDriver {
         self.next_pipeline_serial = self.next_pipeline_serial.checked_add(1).ok_or_else(|| {
             BackendDriverError::failure("wgpu compiled-pipeline identity exhausted")
         })?;
-        let Some(ResourceRecord {
+        let ResourceRecord {
             host: Some(Resource::Pipeline { render, .. }),
             ..
-        }) = self.resources.get_mut(&pipeline_handle)
+        } = self.resource_record_mut(pipeline_handle)?
         else {
             return Err(kind_mismatch(pipeline_handle));
         };
+        let prepared_pipeline = pipeline.clone();
         let evicted = render.insert(
             fingerprint,
             CachedRenderPipeline {
+                identity: PreparedPipelineIdentity {
+                    draw: Arc::clone(&draw.prepared),
+                    vertex: vertex_handle,
+                    fragment: fragment_handle,
+                    color_format,
+                    depth_format,
+                },
                 #[cfg(debug_assertions)]
                 key,
                 pipeline,
@@ -1972,60 +2306,17 @@ impl WgpuBackendDriver {
                 "WGPU pipeline cache evicted LRU variant: neutral={pipeline_handle} serial={evicted_serial} fingerprint={evicted_fingerprint:032x}"
             );
         }
-        Ok(())
-    }
-
-    fn cached_render_pipeline(
-        &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
-        attachments: &[RenderAttachment],
-        draw: &DrawOperation,
-    ) -> Result<&CachedRenderPipeline, BackendDriverError> {
-        let (pipeline_handle, fingerprint) =
-            self.render_pipeline_location(dependencies, attachments, draw)?;
-        let Resource::Pipeline { render, .. } = self.resource(pipeline_handle)? else {
-            return Err(kind_mismatch(pipeline_handle));
-        };
-        render
-            .get(fingerprint)
-            .ok_or_else(|| unsupported("render pipeline was not compiled"))
-    }
-
-    fn render_pipeline(
-        &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
-        attachments: &[RenderAttachment],
-        draw: &DrawOperation,
-    ) -> Result<&RenderPipeline, BackendDriverError> {
-        self.cached_render_pipeline(dependencies, attachments, draw)
-            .map(|cached| &cached.pipeline)
-    }
-
-    fn shader_handle_for_stage(
-        &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
-        stage: ShaderStage,
-    ) -> Result<BackendResourceHandle, BackendDriverError> {
-        let mut found = None;
-        for handle in dependencies.values().copied() {
-            if let Some(ResourceRecord {
-                host: Some(Resource::Shader { neutral, .. }),
-                ..
-            }) = self.resources.get(&handle)
-                && neutral.stage() == stage
-            {
-                if found.is_some() {
-                    return Err(unsupported("multiple shaders for one pipeline stage"));
-                }
-                found = Some(handle);
-            }
-        }
-        found.ok_or_else(|| unsupported("missing shader stage"))
+        Ok(PreparedRenderPipeline {
+            location,
+            pipeline: prepared_pipeline,
+            serial,
+        })
     }
 
     fn shader_for_stage(
         &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        dependencies: &ResolvedBackendResources,
+        operation: usize,
         stage: ShaderStage,
     ) -> Result<
         (
@@ -2035,7 +2326,7 @@ impl WgpuBackendDriver {
         ),
         BackendDriverError,
     > {
-        let handle = self.shader_handle_for_stage(dependencies, stage)?;
+        let handle = shader_handle_for_stage(dependencies, operation, stage)?;
         let Resource::Shader { module, neutral } = self.resource(handle)? else {
             return Err(kind_mismatch(handle));
         };
@@ -2296,15 +2587,29 @@ impl WgpuBackendDriver {
     }
 
     fn attachment_view(
-        &self,
-        dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        &mut self,
+        dependencies: &ResolvedBackendResources,
         attachment: RenderAttachment,
     ) -> Result<wgpu::TextureView, BackendDriverError> {
         let handle = dependency_handle(dependencies, ResourceDependency::Image(attachment.image))?;
-        let Resource::Image { texture, .. } = self.resource(handle)? else {
+        let ResourceRecord {
+            host:
+                Some(Resource::Image {
+                    texture,
+                    attachment_views,
+                    ..
+                }),
+            ..
+        } = self.resource_record_mut(handle)?
+        else {
             return Err(kind_mismatch(handle));
         };
-        Ok(texture.create_view(&texture_view_descriptor(attachment.subresources)))
+        Ok(attachment_views
+            .entry(attachment.subresources)
+            .or_insert_with(|| {
+                texture.create_view(&texture_view_descriptor(attachment.subresources))
+            })
+            .clone())
     }
 
     fn buffer(&self, handle: BackendResourceHandle) -> Result<&Buffer, BackendDriverError> {
@@ -2325,15 +2630,25 @@ impl WgpuBackendDriver {
         &self,
         handle: BackendResourceHandle,
     ) -> Result<&ResourceRecord, BackendDriverError> {
-        self.resources.get(&handle).ok_or_else(|| missing(handle))
+        let index = usize::try_from(handle.slot()).map_err(|_| missing(handle))?;
+        self.resources
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.handle == handle)
+            .map(|slot| &slot.record)
+            .ok_or_else(|| missing(handle))
     }
 
     fn resource_record_mut(
         &mut self,
         handle: BackendResourceHandle,
     ) -> Result<&mut ResourceRecord, BackendDriverError> {
+        let index = usize::try_from(handle.slot()).map_err(|_| missing(handle))?;
         self.resources
-            .get_mut(&handle)
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .filter(|slot| slot.handle == handle)
+            .map(|slot| &mut slot.record)
             .ok_or_else(|| missing(handle))
     }
 
@@ -2352,7 +2667,15 @@ impl WgpuBackendDriver {
     }
 
     fn remove_resource_record(&mut self, handle: BackendResourceHandle) -> Option<ResourceRecord> {
-        let record = self.resources.remove(&handle)?;
+        let index = usize::try_from(handle.slot()).ok()?;
+        let slot = self.resources.get_mut(index)?.as_ref()?;
+        if slot.handle != handle {
+            return None;
+        }
+        let record = self.resources[index]
+            .take()
+            .expect("validated WGPU resource slot")
+            .record;
         if let Some(key) = presentation_image_key(&record.immutable)
             && let Some(handles) = self.presentation_images.get_mut(&key)
         {
@@ -2368,63 +2691,332 @@ impl WgpuBackendDriver {
         Some(record)
     }
 
+    fn remove_presentation_import(
+        &mut self,
+        key: PresentationImportKey,
+    ) -> Option<PresentationImport> {
+        let import = self.presentation_imports.remove(&key)?;
+        self.resident_resources -= 1;
+        self.resident_resource_bytes -= import.resident_bytes;
+        Some(import)
+    }
+
     fn acquire_presentable(
         &mut self,
         request: PresentationImageRequest,
     ) -> Result<ResidentImage, BackendDriverError> {
         self.require_device()?;
-        let key = PresentationImageKey::from(request);
-        let selected = self
-            .presentation_images
-            .get(&key)
-            .into_iter()
-            .flatten()
-            .filter_map(|handle| {
-                let record = self.resources.get(handle)?;
-                let content = record.content.as_ref()?;
-                let newest_write = content
-                    .device_writes
-                    .iter()
-                    .filter_map(|write| match write.region {
-                        DeviceWriteRegion::ImageBinding(binding)
-                            if presentation_binding_key(&record.immutable, binding)
-                                == Some(key) =>
-                        {
-                            Some(write.serial)
-                        }
-                        _ => None,
-                    })
-                    .max()?;
-                let last_use = record.last_use?;
-                let Resource::Image {
-                    texture,
-                    description,
-                    ..
-                } = record.host.as_ref()?
-                else {
-                    return None;
-                };
-                Some((
-                    newest_write,
-                    *handle,
-                    *description,
-                    last_use.submission,
-                    texture.clone(),
-                ))
-            })
-            .max_by_key(|candidate| candidate.0);
-        let Some((_, handle, description, completion, texture)) = selected else {
-            return Err(unsupported(
-                "no device-authored resident image matches the presentation request",
+        validate_presentation_request(&request)?;
+        let import_key = PresentationImportKey::from(&request);
+        let cpu_contents_unchanged = self
+            .presentation_imports
+            .get(&import_key)
+            .filter(|import| import.initialized)
+            .and_then(|import| import.cpu_writes.as_ref())
+            .map_or_else(
+                || request.cpu_writes.remains_current(),
+                nixe_memory::CanonicalCpuWriteDependency::remains_current,
+            );
+        if cpu_contents_unchanged
+            && let Some(key) = direct_presentation_key(&request)
+            && let Some((description, texture)) = self
+                .presentation_images
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter_map(|handle| {
+                    let record = self.resource_record(*handle).ok()?;
+                    let content = record.content.as_ref()?;
+                    let newest_write = content
+                        .device_writes
+                        .iter()
+                        .filter_map(|write| match write.region {
+                            DeviceWriteRegion::ImageBinding(binding)
+                                if presentation_binding_key(&record.immutable, binding)
+                                    == Some(key) =>
+                            {
+                                Some(write.serial)
+                            }
+                            _ => None,
+                        })
+                        .max()?;
+                    let Resource::Image {
+                        texture,
+                        description,
+                        ..
+                    } = record.host.as_ref()?
+                    else {
+                        return None;
+                    };
+                    Some((newest_write, *description, texture.clone()))
+                })
+                .max_by_key(|candidate| candidate.0)
+                .map(|(_, description, texture)| (description, texture))
+        {
+            return Ok(ResidentImage::new(
+                self.backend,
+                description,
+                Arc::new(crate::WgpuResidentImage::new(texture)),
             ));
+        }
+
+        let mut import = match self.presentation_imports.remove(&import_key) {
+            Some(import) => import,
+            None => self.create_presentation_import(&request)?,
         };
+        let result = self.refresh_presentation_import(&request, &mut import);
+        self.presentation_imports.insert(import_key, import);
+        let texture = result?;
+        let description = ImageDescription::new(
+            ImageDimension::Two,
+            nixe_gpu::ImageExtent {
+                width: request.width,
+                height: request.height,
+                depth: 1,
+            },
+            ImageFormat::Rgba8Unorm,
+            nixe_gpu::ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .map_err(|error| BackendDriverError::failure(error.to_string()))?;
         Ok(ResidentImage::new(
-            completion.instance(),
-            handle,
+            self.backend,
             description,
-            completion,
             Arc::new(crate::WgpuResidentImage::new(texture)),
         ))
+    }
+
+    fn create_presentation_import(
+        &mut self,
+        request: &PresentationImageRequest,
+    ) -> Result<PresentationImport, BackendDriverError> {
+        let source_size = align_u64(request.backing.size(), 4)?;
+        let output_size = u64::from(request.width)
+            .checked_mul(u64::from(request.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| unsupported("presentation import size overflow"))?;
+        let resident_bytes = source_size
+            .checked_add(output_size)
+            .and_then(|bytes| bytes.checked_add(32))
+            .ok_or_else(|| unsupported("presentation import size overflow"))?;
+        self.ensure_residency_budget(1, resident_bytes, None)?;
+        let source = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Nixe presentation canonical source"),
+            size: source_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("Nixe imported presentation image"),
+            size: Extent3d {
+                width: request.width,
+                height: request.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::COPY_SRC
+                | TextureUsages::STORAGE_BINDING
+                | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let (layout, block_height_log2) = match request.layout {
+            ImageMemoryLayout::PitchLinear { .. } => (0, 0),
+            ImageMemoryLayout::BlockLinear(blocks) => (1, u32::from(blocks.block_height_log2)),
+        };
+        let parameters = [
+            request.width,
+            request.height,
+            request.row_pitch,
+            u32::try_from(request.backing.size())
+                .map_err(|_| unsupported("presentation source size"))?,
+            presentation_format_code(request.format),
+            layout,
+            block_height_log2,
+            presentation_bytes_per_texel(request.format),
+        ];
+        let mut parameter_bytes = Vec::with_capacity(parameters.len() * 4);
+        for parameter in parameters {
+            parameter_bytes.extend_from_slice(&parameter.to_ne_bytes());
+        }
+        let parameter_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("Nixe presentation import parameters"),
+            size: parameter_bytes.len() as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&parameter_buffer, 0, &parameter_bytes);
+        let pipeline = self.presentation_import_pipeline()?;
+        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Nixe presentation import bindings"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: source.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(
+                        &texture.create_view(&TextureViewDescriptor::default()),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: parameter_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.resident_resources += 1;
+        self.resident_resource_bytes += resident_bytes;
+        Ok(PresentationImport {
+            source,
+            texture,
+            bind_group,
+            uploaded: request
+                .backing
+                .range()
+                .segments()
+                .iter()
+                .map(|segment| segment.current_content_generation())
+                .collect(),
+            cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range()),
+            initialized: false,
+            last_used: 0,
+            resident_bytes,
+        })
+    }
+
+    fn presentation_import_pipeline(&mut self) -> Result<ComputePipeline, BackendDriverError> {
+        if let Some(pipeline) = &self.presentation_import_pipeline {
+            return Ok(pipeline.clone());
+        }
+        let scope = self.device.push_error_scope(ErrorFilter::Validation);
+        let module = self.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Nixe presentation import shader"),
+            source: ShaderSource::Wgsl(include_str!("presentation_import.wgsl").into()),
+        });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("Nixe presentation import pipeline"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                cache: self.pipeline_cache.as_ref(),
+            });
+        self.capture_error_scope(scope)?;
+        self.presentation_import_pipeline = Some(pipeline.clone());
+        Ok(pipeline)
+    }
+
+    fn refresh_presentation_import(
+        &mut self,
+        request: &PresentationImageRequest,
+        import: &mut PresentationImport,
+    ) -> Result<Texture, BackendDriverError> {
+        import.last_used = self.take_resource_use()?;
+        if import.initialized
+            && import
+                .cpu_writes
+                .as_ref()
+                .is_some_and(nixe_memory::CanonicalCpuWriteDependency::remains_current)
+        {
+            return Ok(import.texture.clone());
+        }
+        for segment in request.backing.range().segments() {
+            match segment.visibility_state() {
+                VisibilityState::Clean | VisibilityState::CpuNewer => {}
+                VisibilityState::GpuNewer { .. } => {
+                    return Err(unsupported(
+                        "device-authored presentation source has no compatible resident image",
+                    ));
+                }
+                VisibilityState::Conflicting => {
+                    return Err(unsupported(
+                        "presentation source has conflicting authorities",
+                    ));
+                }
+                VisibilityState::Invalid => {
+                    return Err(unsupported("presentation source visibility is invalid"));
+                }
+            }
+        }
+        self.transfer_ranges.clear();
+        if !import.initialized {
+            self.transfer_ranges.push(TransferRange {
+                offset: 0,
+                size: align_u64(request.backing.size(), 4)?,
+            });
+        } else if request.backing.size().is_multiple_of(4) {
+            collect_dirty_buffer_ranges(
+                request.backing.range(),
+                &import.uploaded,
+                0,
+                &mut self.cpu_dirty_ranges,
+                &mut self.transfer_ranges,
+            )?;
+        } else if ranges_need_upload([request.backing.range()], &import.uploaded)? {
+            self.transfer_ranges.push(TransferRange {
+                offset: 0,
+                size: align_u64(request.backing.size(), 4)?,
+            });
+        }
+        if self.transfer_ranges.is_empty() {
+            import.cpu_writes =
+                nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range());
+            return Ok(import.texture.clone());
+        }
+
+        self.upload_bytes = 0;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Nixe presentation import"),
+            });
+        let ranges = std::mem::take(&mut self.transfer_ranges);
+        let mut upload = std::mem::take(&mut self.upload_canonical);
+        for range in &ranges {
+            let size = usize_from_u64(range.size, "presentation upload size")?;
+            upload.clear();
+            upload.resize(size, 0);
+            let available = request.backing.size().saturating_sub(range.offset);
+            let read_size = range.size.min(available);
+            request
+                .backing
+                .range()
+                .read(
+                    range.offset,
+                    &mut upload[..usize_from_u64(read_size, "presentation source range")?],
+                )
+                .map_err(|error| BackendDriverError::failure(error.to_string()))?;
+            self.stage_buffer_upload(&mut encoder, &import.source, range.offset, &upload)?;
+        }
+        self.upload_canonical = upload;
+        let pipeline = self.presentation_import_pipeline()?;
+        {
+            let mut compute = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Nixe presentation image conversion"),
+                timestamp_writes: None,
+            });
+            compute.set_pipeline(&pipeline);
+            compute.set_bind_group(0, &import.bind_group, &[]);
+            compute.dispatch_workgroups(request.width.div_ceil(8), request.height.div_ceil(8), 1);
+        }
+        self.upload_staging.finish_and_recall_on_submit(&encoder);
+        self.queue.submit([encoder.finish()]);
+        record_uploaded([request.backing.range()], &mut import.uploaded);
+        import.cpu_writes =
+            nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range());
+        import.initialized = true;
+        self.transfer_ranges = ranges;
+        Ok(import.texture.clone())
     }
 
     fn create_host_resource(
@@ -2468,6 +3060,7 @@ impl WgpuBackendDriver {
                     }),
                     description: *description,
                     view: view.clone(),
+                    attachment_views: HashMap::new(),
                 }
             }
             BackendResourceCreateInfo::Sampler { description, .. } => Resource::Sampler {
@@ -2511,7 +3104,7 @@ impl WgpuBackendDriver {
         &mut self,
         additional_count: usize,
         additional_bytes: u64,
-        protected: Option<&BTreeMap<ResourceDependency, BackendResourceHandle>>,
+        protected: Option<&ResolvedBackendResources>,
     ) -> Result<(), BackendDriverError> {
         if additional_bytes > MAX_RESIDENT_RESOURCE_BYTES {
             return Err(BackendDriverError::failure(
@@ -2524,48 +3117,79 @@ impl WgpuBackendDriver {
                 .checked_add(additional_bytes)
                 .is_none_or(|bytes| bytes > MAX_RESIDENT_RESOURCE_BYTES)
         {
-            let candidate = self
+            let resource_candidate = self
                 .resources
                 .iter()
-                .filter(|(handle, record)| {
+                .flatten()
+                .filter(|slot| {
+                    let handle = slot.handle;
+                    let record = &slot.record;
                     record.host.is_some()
                         && !protected.is_some_and(|resources| {
-                            resources.values().any(|protected| protected == *handle)
+                            resources.values().any(|protected| *protected == handle)
                         })
                         && record
                             .content
                             .as_ref()
                             .is_none_or(|content| !content.has_device_writes())
                 })
-                .min_by_key(|(_, record)| record.last_use.map_or(0, |last_use| last_use.serial))
-                .map(|(handle, _)| *handle)
-                .ok_or_else(|| {
-                    BackendDriverError::failure(
-                        "resident resource budget is exhausted by active device contents",
+                .min_by_key(|slot| slot.record.last_use.map_or(0, |last_use| last_use.serial))
+                .map(|slot| {
+                    (
+                        slot.record.last_use.map_or(0, |last_use| last_use.serial),
+                        ResidencyCandidate::Resource(slot.handle),
                     )
-                })?;
-            let record = self
-                .resources
-                .get_mut(&candidate)
-                .expect("residency candidate came from the resource map");
-            record.host = None;
-            if let Some(content) = record.content.as_mut() {
-                content.initialized = false;
+                });
+            let presentation_candidate = self
+                .presentation_imports
+                .iter()
+                .min_by_key(|(_, import)| import.last_used)
+                .map(|(key, import)| (import.last_used, ResidencyCandidate::Presentation(*key)));
+            let candidate = match (resource_candidate, presentation_candidate) {
+                (Some(resource), Some(presentation)) => {
+                    if resource.0 <= presentation.0 {
+                        resource.1
+                    } else {
+                        presentation.1
+                    }
+                }
+                (Some(resource), None) => resource.1,
+                (None, Some(presentation)) => presentation.1,
+                (None, None) => {
+                    return Err(BackendDriverError::failure(
+                        "resident resource budget is exhausted by active device contents",
+                    ));
+                }
+            };
+            match candidate {
+                ResidencyCandidate::Resource(handle) => {
+                    let resident_bytes = {
+                        let record = self
+                            .resource_record_mut(handle)
+                            .expect("residency candidate came from the resource table");
+                        record.host = None;
+                        if let Some(content) = record.content.as_mut() {
+                            content.initialized = false;
+                        }
+                        record.resident_bytes
+                    };
+                    self.resident_resources -= 1;
+                    self.resident_resource_bytes -= resident_bytes;
+                }
+                ResidencyCandidate::Presentation(key) => {
+                    self.remove_presentation_import(key);
+                }
             }
-            self.resident_resources -= 1;
-            self.resident_resource_bytes -= record.resident_bytes;
         }
         Ok(())
     }
 
     fn ensure_resident(
         &mut self,
-        resources: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        resources: &ResolvedBackendResources,
     ) -> Result<(), BackendDriverError> {
         for handle in resources.values().copied() {
-            let Some(record) = self.resources.get(&handle) else {
-                return Err(missing(handle));
-            };
+            let record = self.resource_record(handle)?;
             if record.host.is_some() {
                 continue;
             }
@@ -2573,8 +3197,7 @@ impl WgpuBackendDriver {
             let resident_bytes = record.resident_bytes;
             self.ensure_residency_budget(1, resident_bytes, Some(resources))?;
             let host = self.create_host_resource(&info)?;
-            self.resources
-                .get_mut(&handle)
+            self.resource_record_mut(handle)
                 .expect("logical resource remains live while becoming resident")
                 .host = Some(host);
             self.resident_resources += 1;
@@ -2588,8 +3211,8 @@ impl WgpuBackendDriver {
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendDriverError> {
         let mut demanded = Vec::new();
-        for (handle, record) in &self.resources {
-            collect_demanded_writebacks(*handle, record, request.page, &mut demanded)?;
+        for slot in self.resources.iter().flatten() {
+            collect_demanded_writebacks(slot.handle, &slot.record, request.page, &mut demanded)?;
         }
         prepare_demanded_writebacks(&mut demanded);
         if !demanded.is_empty() {
@@ -2618,8 +3241,7 @@ impl WgpuBackendDriver {
             self.finish_writebacks(writebacks)?;
             for writeback in &demanded {
                 let record = self
-                    .resources
-                    .get_mut(&writeback.handle())
+                    .resource_record_mut(writeback.handle())
                     .expect("demanded read-back resource remains live");
                 complete_demanded_writeback(record, *writeback);
             }
@@ -2631,8 +3253,7 @@ impl WgpuBackendDriver {
                     let BackendResourceCreateInfo::Image {
                         view: Some(view), ..
                     } = &self
-                        .resources
-                        .get(&handle)
+                        .resource_record(handle)
                         .expect("demanded image remains live")
                         .immutable
                     else {
@@ -2650,7 +3271,7 @@ impl WgpuBackendDriver {
             for writeback in demanded {
                 let handle = writeback.handle();
                 if !retired.contains(&handle)
-                    && self.resources.get(&handle).is_some_and(|record| {
+                    && self.resource_record(handle).is_ok_and(|record| {
                         record.retired
                             && record
                                 .content
@@ -2717,9 +3338,22 @@ impl BackendDriver for WgpuBackendDriver {
         self.ensure_residency_budget(1, resident_bytes, None)?;
         let resource = self.create_host_resource(info)?;
         self.capture_error_scope(scope)?;
-        self.resources.insert(
+        let index = usize::try_from(handle.slot())
+            .map_err(|_| BackendDriverError::failure("WGPU resource slot does not fit usize"))?;
+        if index >= self.resources.len() {
+            self.resources
+                .try_reserve(index + 1 - self.resources.len())
+                .map_err(|_| BackendDriverError::failure("WGPU resource table exhausted"))?;
+            self.resources.resize_with(index + 1, || None);
+        }
+        if self.resources[index].is_some() {
+            return Err(BackendDriverError::failure(format!(
+                "WGPU resource slot is already occupied: {handle}"
+            )));
+        }
+        self.resources[index] = Some(WgpuResourceSlot {
             handle,
-            ResourceRecord {
+            record: ResourceRecord {
                 content: ResourceContent::new(info),
                 immutable: info.clone(),
                 host: Some(resource),
@@ -2727,7 +3361,7 @@ impl BackendDriver for WgpuBackendDriver {
                 retired: false,
                 resident_bytes,
             },
-        );
+        });
         self.index_presentable_image(handle, info);
         self.resident_resources += 1;
         self.resident_resource_bytes = self
@@ -2742,7 +3376,22 @@ impl BackendDriver for WgpuBackendDriver {
         handle: BackendResourceHandle,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        if let Some(record) = self.resources.get_mut(&handle) {
+        if let Some(BackendResourceCreateInfo::Allocation { id, .. }) = self
+            .resource_record(handle)
+            .ok()
+            .map(|record| &record.immutable)
+        {
+            let imports = self
+                .presentation_imports
+                .keys()
+                .copied()
+                .filter(|key| key.image.allocation == *id)
+                .collect::<Vec<_>>();
+            for key in imports {
+                self.remove_presentation_import(key);
+            }
+        }
+        if let Ok(record) = self.resource_record_mut(handle) {
             record.retired = true;
             if record
                 .content
@@ -2761,11 +3410,7 @@ impl BackendDriver for WgpuBackendDriver {
         accepted: &AcceptedBackendSubmission<'_>,
     ) -> Result<(), BackendDriverError> {
         self.require_device()?;
-        let use_serial = self.next_use;
-        self.next_use = self
-            .next_use
-            .checked_add(1)
-            .ok_or_else(|| BackendDriverError::failure("wgpu resource-use timeline exhausted"))?;
+        let use_serial = self.take_resource_use()?;
         let dependencies = accepted.resources();
         self.ensure_resident(dependencies)?;
         self.upload_bytes = 0;
@@ -2791,7 +3436,7 @@ impl BackendDriver for WgpuBackendDriver {
             let _ = completed.send(token);
         });
         for handle in dependencies.values() {
-            if let Some(record) = self.resources.get_mut(handle) {
+            if let Ok(record) = self.resource_record_mut(*handle) {
                 record.last_use = Some(ResourceUse {
                     serial: use_serial,
                     submission: token,
@@ -2804,7 +3449,7 @@ impl BackendDriver for WgpuBackendDriver {
                     continue;
                 }
                 let handle = dependency_handle(dependencies, access.target().dependency())?;
-                if let Some(record) = self.resources.get_mut(&handle) {
+                if let Ok(record) = self.resource_record_mut(handle) {
                     record_device_write(record, access.target(), use_serial)?;
                 }
             }
@@ -3231,11 +3876,23 @@ fn color_value(value: [f32; 4]) -> Color {
 }
 
 fn dependency_handle(
-    dependencies: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+    dependencies: &ResolvedBackendResources,
     dependency: ResourceDependency,
 ) -> Result<BackendResourceHandle, BackendDriverError> {
     dependencies.get(&dependency).copied().ok_or_else(|| {
         BackendDriverError::failure(format!("missing resolved resource: {dependency:?}"))
+    })
+}
+
+fn shader_handle_for_stage(
+    dependencies: &ResolvedBackendResources,
+    operation: usize,
+    stage: ShaderStage,
+) -> Result<BackendResourceHandle, BackendDriverError> {
+    dependencies.shader(operation, stage).ok_or_else(|| {
+        BackendDriverError::failure(format!(
+            "operation {operation} has no resolved {stage:?} shader"
+        ))
     })
 }
 

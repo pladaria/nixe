@@ -1278,12 +1278,14 @@ impl MaxwellGpuAddressSpace {
     /// Reports whether a retained mapping still names the active generation.
     #[must_use]
     pub fn retained_mapping_is_current(&self, retained: &MaxwellGpuMapping) -> bool {
-        self.mappings.values().any(|mapping| {
-            mapping.id == retained.id
-                && mapping.generation == retained.generation
-                && mapping.offset == retained.offset
-                && mapping.size == retained.size
-        })
+        self.mappings
+            .get(&retained.offset())
+            .is_some_and(|mapping| {
+                mapping.id == retained.id
+                    && mapping.generation == retained.generation
+                    && mapping.offset == retained.offset
+                    && mapping.size == retained.size
+            })
     }
 
     #[must_use]

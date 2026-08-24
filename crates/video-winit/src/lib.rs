@@ -331,7 +331,7 @@ impl Presenter {
 
     fn bind_frame(&mut self, frame: Arc<PresentationFrame>) -> Result<(), WindowError> {
         let image = frame.image();
-        if image.backend() != self.backend || image.completion().instance() != self.backend {
+        if image.backend() != self.backend {
             return Err(WindowError::resident(
                 "resident frame belongs to a different GPU backend instance",
             ));

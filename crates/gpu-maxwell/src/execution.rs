@@ -1,6 +1,9 @@
 //! Transactional lowering boundary for one completely decoded submission.
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
 
 use nixe_gpu::{
     BackendResourceCreateInfo, CacheMaintenanceOperation, CapabilityRequirements,
@@ -10,10 +13,7 @@ use nixe_gpu::{
 };
 use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
 
-use crate::engines::{
-    lower_maxwell_three_d_operation_into_cache,
-    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache,
-};
+use crate::engines::lower_maxwell_three_d_operation_into_cache;
 use crate::{
     MaxwellComputeSynchronizationPlan, MaxwellDmaCopyError, MaxwellDmaCopyOperation,
     MaxwellEngineOperation, MaxwellEnginePacketDispatch, MaxwellGpuAccessError,
@@ -21,8 +21,7 @@ use crate::{
     MaxwellShaderTranslationError, MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache,
     MaxwellThreeDLoweringError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
-    lower_maxwell_three_d_synchronization,
-    shader::{MaxwellStagedShaderWrite, prepare_maxwell_shader_translation_source},
+    lower_maxwell_three_d_synchronization, shader::MaxwellStagedShaderWrite,
 };
 
 /// One ordered operation whose inputs have been resolved without side effects.
@@ -57,7 +56,6 @@ pub struct MaxwellSubmissionExecutionPlan {
     steps: Box<[MaxwellSubmissionExecutionStep]>,
     staged_writes: CanonicalWriteBatch,
     write_source: Option<CanonicalWriteSource>,
-    staged_cache: MaxwellThreeDLoweringCache,
     completion: Option<GuestTimelinePoint>,
 }
 
@@ -70,15 +68,6 @@ impl MaxwellSubmissionExecutionPlan {
     #[must_use]
     pub fn steps(&self) -> &[MaxwellSubmissionExecutionStep] {
         &self.steps
-    }
-
-    #[must_use]
-    pub const fn staged_cache(&self) -> &MaxwellThreeDLoweringCache {
-        &self.staged_cache
-    }
-
-    pub fn take_staged_cache(&mut self) -> MaxwellThreeDLoweringCache {
-        std::mem::take(&mut self.staged_cache)
     }
 
     #[must_use]
@@ -260,19 +249,19 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 
 /// Preflights a decoded submission in original packet and method-effect order.
 ///
-/// This function clones the frontend cache and returns the candidate. It never
-/// publishes an inline payload, invokes a backend, changes scheduler state,
-/// or consumes/publishes `completion`. Earlier writes are retained only in an
-/// atomically discardable transaction so later operations can read them.
+/// This function mutates only frontend-derived caches. It never publishes an
+/// inline payload, invokes a backend, changes scheduler state, or
+/// consumes/publishes `completion`. A preflight failure is terminal for the
+/// submission, so duplicating the complete cache solely to roll memoized data
+/// back would add steady-state work without preserving guest-visible state.
 pub fn preflight_maxwell_submission_execution(
     packets: &[MaxwellEnginePacketDispatch],
     address_space: &MaxwellGpuAddressSpace,
     frontend: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     completion: Option<&ReservedTimelinePoint>,
-    cache: &MaxwellThreeDLoweringCache,
+    cache: &mut MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionError> {
-    let mut staged_cache = cache.clone();
     let mut steps = Vec::new();
     let mut prior_work_pending = false;
     let mut completion_signal_count = 0_u32;
@@ -454,71 +443,95 @@ pub fn preflight_maxwell_submission_execution(
                     operation.trigger(),
                     crate::MaxwellThreeDOperationTrigger::DrawVertexArray { .. }
                 ) {
-                    let source = prepare_maxwell_shader_translation_source(
-                        operation.state(),
-                        &staged_shader_writes,
-                    )
-                    .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
-                    let programs = staged_cache
-                        .resolve_shader_translation_source(source, address_space)
-                        .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
-                    let translated = staged_cache
-                        .stage_shader_translations(&programs)
-                        .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
-                    let mut required_roles = translated
-                        .resources()
-                        .iter()
-                        .map(|resource| resource.role())
-                        .collect::<Vec<_>>();
+                    let translated = if let Some(translated) = cache
+                        .reuse_translated_shaders_for_state(
+                            operation.state(),
+                            &staged_shader_writes,
+                            address_space,
+                        ) {
+                        translated
+                    } else {
+                        let programs = cache
+                            .resolve_shader_translation_for_state(
+                                operation.state(),
+                                &staged_shader_writes,
+                                address_space,
+                            )
+                            .map_err(MaxwellSubmissionExecutionError::ShaderTranslation)?;
+                        let translated = Arc::new(
+                            cache
+                                .stage_shader_translations(&programs)
+                                .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?,
+                        );
+                        cache.retain_translated_shader_state(&programs, Arc::clone(&translated));
+                        translated
+                    };
+                    let mut required_roles = cache.take_resource_roles();
+                    required_roles.extend(
+                        translated
+                            .resources()
+                            .iter()
+                            .map(|resource| resource.role()),
+                    );
                     operation
                         .trigger()
                         .append_resource_roles(operation.state(), &mut required_roles);
-                    let resources =
-                        resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+                    required_roles.sort_unstable();
+                    required_roles.dedup();
+                    let resource_cache_limit = cache.resource_cache_limit();
+                    let resources = cache
+                        .resolved_resources_mut()
+                        .resolve(
                             operation.state(),
                             address_space,
                             &required_roles,
                             Some(&staged_memory_writes),
                             false,
-                            Some(staged_cache.retained_backings_mut()),
+                            resource_cache_limit,
                         )
                         .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                    cache.recycle_resource_roles(required_roles);
                     let work = lower_maxwell_three_d_operation_into_cache(
                         operation.state(),
-                        &resources,
+                        resources.as_ref(),
                         operation.trigger(),
-                        Some(&translated),
+                        Some(translated.as_ref()),
                         frontend,
                         predecessors.clone(),
-                        &mut staged_cache,
+                        cache,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
                     steps.push(MaxwellSubmissionExecutionStep::ThreeD(work));
                     prior_work_pending = true;
                     continue;
                 }
-                let mut required_roles = Vec::new();
+                let mut required_roles = cache.take_resource_roles();
                 operation
                     .trigger()
                     .append_resource_roles(operation.state(), &mut required_roles);
-                let resources =
-                    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache(
+                required_roles.sort_unstable();
+                required_roles.dedup();
+                let resource_cache_limit = cache.resource_cache_limit();
+                let resources = cache
+                    .resolved_resources_mut()
+                    .resolve(
                         operation.state(),
                         address_space,
                         &required_roles,
                         Some(&staged_memory_writes),
                         false,
-                        Some(staged_cache.retained_backings_mut()),
+                        resource_cache_limit,
                     )
                     .map_err(MaxwellSubmissionExecutionError::ThreeDResource)?;
+                cache.recycle_resource_roles(required_roles);
                 let work = lower_maxwell_three_d_operation_into_cache(
                     operation.state(),
-                    &resources,
+                    resources.as_ref(),
                     operation.trigger(),
                     None,
                     frontend,
                     predecessors.clone(),
-                    &mut staged_cache,
+                    cache,
                 )
                 .map_err(MaxwellSubmissionExecutionError::ThreeDLowering)?;
                 steps.push(MaxwellSubmissionExecutionStep::ThreeD(work));
@@ -595,7 +608,6 @@ pub fn preflight_maxwell_submission_execution(
         steps: steps.into_boxed_slice(),
         staged_writes: staged_memory_writes,
         write_source,
-        staged_cache,
         completion: completion.map(ReservedTimelinePoint::point),
     })
 }
@@ -1332,9 +1344,9 @@ mod tests {
         AttachmentLoad, AttachmentStore, CapabilityRequirements, DrawArguments, DrawOperation,
         FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
         GuestTimeline, ImageFormat, ImageId, ImageKind, ImageSubresourceRange, MappingGeneration,
-        PipelineId, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
-        RenderPassDescription, RenderPassId, RenderPassOperation, SampleCount, TimelineInstanceId,
-        TimelineOwnerId,
+        PipelineId, PreparedDraw, PrimitiveTopology, RenderAttachment,
+        RenderPassAttachmentDescription, RenderPassDescription, RenderPassId, RenderPassOperation,
+        SampleCount, TimelineInstanceId, TimelineOwnerId,
     };
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
 
@@ -1460,12 +1472,17 @@ mod tests {
             GpuOperation::new(
                 GpuCommand::Draw(
                     DrawOperation::new(
-                        PipelineId::new(1),
-                        pass,
-                        PrimitiveTopology::Triangles,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
+                        Arc::new(
+                            PreparedDraw::new(
+                                PipelineId::new(1),
+                                pass,
+                                PrimitiveTopology::Triangles,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                            )
+                            .unwrap(),
+                        ),
                         DrawArguments::NonIndexed {
                             first_vertex: 0,
                             vertex_count: 3,
@@ -1572,13 +1589,12 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert!(plan.steps().is_empty());
         assert!(!plan.has_deferred_canonical_writes());
         assert_eq!(plan.completion(), None);
-        assert_eq!(plan.staged_cache().revision(), 0);
     }
 
     #[test]
@@ -1636,7 +1652,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert!(plan.has_deferred_canonical_writes());
@@ -1667,7 +1683,7 @@ mod tests {
                 FrontendSubmissionId::new(2),
                 Vec::new(),
                 Some(&reservation),
-                &MaxwellThreeDLoweringCache::default(),
+                &mut MaxwellThreeDLoweringCache::default(),
             ),
             Err(MaxwellSubmissionExecutionError::MissingCompletionSignal {
                 reserved,
@@ -1707,7 +1723,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             Some(&reservation),
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert_eq!(plan.completion(), Some(reservation.point()));
@@ -1721,7 +1737,7 @@ mod tests {
                 FrontendSubmissionId::new(2),
                 Vec::new(),
                 Some(&reservation),
-                &MaxwellThreeDLoweringCache::default(),
+                &mut MaxwellThreeDLoweringCache::default(),
             ),
             Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
                 reserved,
@@ -1783,7 +1799,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             Some(&reservation),
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
 
@@ -1904,7 +1920,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert!(plan.has_deferred_canonical_writes());
@@ -1971,7 +1987,7 @@ mod tests {
             frontend,
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
 
@@ -2073,7 +2089,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert!(matches!(
@@ -2157,7 +2173,7 @@ mod tests {
             frontend,
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
 
@@ -2284,7 +2300,7 @@ mod tests {
             FrontendSubmissionId::new(2),
             Vec::new(),
             None,
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         )
         .unwrap();
         assert!(matches!(

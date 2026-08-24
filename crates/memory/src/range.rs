@@ -24,7 +24,6 @@ pub struct CanonicalBackingSegment {
     size: u64,
     permissions: MemoryPermissions,
     content_generation: ContentGeneration,
-    cpu_write_epoch: CpuWriteEpoch,
     mapping_generation: MappingGeneration,
 }
 
@@ -42,7 +41,6 @@ impl CanonicalBackingSegment {
         content_generation: ContentGeneration,
         mapping_generation: MappingGeneration,
     ) -> Result<Self, CanonicalRangeError> {
-        let cpu_write_epoch = backing.cpu_write_epoch();
         if content_generation != backing.content_generation() {
             return Err(CanonicalRangeError::StaleContentGeneration);
         }
@@ -52,7 +50,6 @@ impl CanonicalBackingSegment {
             size,
             permissions,
             content_generation,
-            cpu_write_epoch,
             mapping_generation,
         )
     }
@@ -64,10 +61,6 @@ impl CanonicalBackingSegment {
         permissions: MemoryPermissions,
         mapping_generation: MappingGeneration,
     ) -> Result<Self, CanonicalRangeError> {
-        // Capture the coarse epoch before the page generation. If a write
-        // races this snapshot, an older epoch can only force the exact slow
-        // path; it can never hide the write.
-        let cpu_write_epoch = backing.cpu_write_epoch();
         let content_generation = backing.content_generation();
         Self::new_captured(
             backing,
@@ -75,7 +68,6 @@ impl CanonicalBackingSegment {
             size,
             permissions,
             content_generation,
-            cpu_write_epoch,
             mapping_generation,
         )
     }
@@ -86,7 +78,6 @@ impl CanonicalBackingSegment {
         size: u64,
         permissions: MemoryPermissions,
         content_generation: ContentGeneration,
-        cpu_write_epoch: CpuWriteEpoch,
         mapping_generation: MappingGeneration,
     ) -> Result<Self, CanonicalRangeError> {
         let end = offset
@@ -101,7 +92,6 @@ impl CanonicalBackingSegment {
             size,
             permissions,
             content_generation,
-            cpu_write_epoch,
             mapping_generation,
         })
     }
@@ -124,6 +114,12 @@ impl CanonicalBackingSegment {
         self.size
     }
 
+    /// Returns whether this segment reaches the end of its canonical page.
+    #[must_use]
+    pub fn ends_at_page_boundary(&self) -> bool {
+        self.offset + self.size == self.backing.size() as u64
+    }
+
     /// Returns the permissions of the CPU mapping used for translation.
     #[must_use]
     pub const fn permissions(&self) -> MemoryPermissions {
@@ -142,12 +138,6 @@ impl CanonicalBackingSegment {
     #[must_use]
     pub fn current_content_generation(&self) -> ContentGeneration {
         self.backing.content_generation()
-    }
-
-    /// Returns the store CPU-write epoch captured before generation validation.
-    #[must_use]
-    pub const fn captured_cpu_write_epoch(&self) -> CpuWriteEpoch {
-        self.cpu_write_epoch
     }
 
     /// Returns the mapping generation captured during translation.
@@ -231,6 +221,12 @@ impl CanonicalCpuWriteDependency {
     }
 
     /// Captures several ranges as one dependency domain.
+    ///
+    /// Each store epoch is observed before its current page generations. A
+    /// concurrent write can therefore cause conservative invalidation, but it
+    /// cannot be hidden. The ranges may themselves have been translated at
+    /// different times; their old snapshot epochs are irrelevant to a new
+    /// dependency captured at this boundary.
     #[must_use]
     pub fn capture_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
@@ -246,26 +242,26 @@ impl CanonicalCpuWriteDependency {
         for range in ranges {
             for segment in range.segments() {
                 let store_id = segment.page().store();
-                let observed_epoch = segment.captured_cpu_write_epoch();
                 let end = segment.offset().checked_add(segment.size())?;
                 if let Some(current) = stores.get_mut(&store_id) {
-                    if current.observed_epoch != observed_epoch {
-                        return None;
-                    }
                     current
                         .intervals
                         .push((segment.page(), segment.offset(), end));
-                    current
-                        .pages
-                        .push((segment.backing().clone(), segment.content_generation()));
+                    current.pages.push((
+                        segment.backing().clone(),
+                        segment.current_content_generation(),
+                    ));
                 } else {
                     stores.insert(
                         store_id,
                         StoreBuilder {
                             store: segment.backing.store().clone(),
-                            observed_epoch,
+                            observed_epoch: segment.backing.cpu_write_epoch(),
                             intervals: vec![(segment.page(), segment.offset(), end)],
-                            pages: vec![(segment.backing().clone(), segment.content_generation())],
+                            pages: vec![(
+                                segment.backing().clone(),
+                                segment.current_content_generation(),
+                            )],
                         },
                     );
                 }
@@ -280,14 +276,7 @@ impl CanonicalCpuWriteDependency {
             normalize_cpu_write_intervals(&mut store.intervals);
             store
                 .pages
-                .sort_unstable_by_key(|(page, _)| page.identity());
-            if store
-                .pages
-                .windows(2)
-                .any(|pair| pair[0].0.identity() == pair[1].0.identity() && pair[0].1 != pair[1].1)
-            {
-                return None;
-            }
+                .sort_unstable_by_key(|(page, generation)| (page.identity(), *generation));
             store.pages.dedup_by_key(|(page, _)| page.identity());
             dependencies.push(CpuWriteDependencyStore {
                 store: store.store,
@@ -1025,6 +1014,23 @@ mod tests {
         allocation.write(0x280, &[1]).unwrap();
         assert!(dependency.remains_current());
         allocation.write(0x380, &[2]).unwrap();
+        assert!(!dependency.remains_current());
+    }
+
+    #[test]
+    fn cpu_write_dependency_captures_ranges_translated_at_different_epochs() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let mapped = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let first = mapped.snapshot_subrange(0, 0x1000).unwrap();
+        allocation.write(0x1000, &[1]).unwrap();
+        let second = mapped.snapshot_subrange(0x1000, 0x1000).unwrap();
+
+        let dependency = CanonicalCpuWriteDependency::capture_ranges([&first, &second]).unwrap();
+
+        assert!(dependency.remains_current());
+        allocation.write(0x100, &[2]).unwrap();
         assert!(!dependency.remains_current());
     }
 
