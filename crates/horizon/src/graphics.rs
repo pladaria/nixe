@@ -6,16 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nixe_gpu::{
-    GpuAllocationId, GpuCacheConfiguration, GuestSyncpointId, GuestSyncpointValue,
-    GuestTimelinePoint, NeutralBackendRuntime, PresentationImageFormat, PresentationImageRequest,
+    BackingView, BlockLinearLayout, GpuAllocationDescription, GpuAllocationId,
+    GpuCacheConfiguration, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint,
+    ImageMemoryLayout, NeutralBackendRuntime, PresentationImageFormat, PresentationImageRequest,
     ResidentImage,
 };
+use nixe_memory::CanonicalCpuWriteDependency;
 use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, FrameCrop, FrameMailbox, FrameTransform, PresentationFrame};
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
 use crate::{
-    GraphicsEventSource, NvDrvSession, NvMapExportedId, NvMapImageViewMetadata, NvMapObjectId,
+    GraphicsEventSource, NvDrvSession, NvMapExportedId, NvMapImageViewMetadata, NvMapObject,
     NvMapPlaneMetadata,
 };
 
@@ -530,13 +532,16 @@ impl VideoSystem {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .presenter
                 .is_some();
+            let mut presentation_source = request.presentation_source;
             let presentation = if presenting {
+                let source = match &presentation_source {
+                    Some(source) => source.clone(),
+                    None => presentable_image_request(&request.buffer, &object)?,
+                };
                 let image = nvdrv
-                    .acquire_presentable_image(presentable_image_request(
-                        &request.buffer,
-                        object.id(),
-                    )?)
+                    .acquire_presentable_image(source.clone())
                     .map_err(FramebufferError::Backend)?;
+                presentation_source = Some(source);
                 Some(PendingPresentation {
                     image,
                     crop: frame_crop(crop)?,
@@ -556,7 +561,7 @@ impl VideoSystem {
                 .ok_or(FramebufferError::Malformed(
                     "unknown Binder producer object",
                 ))?;
-            if !queue.commit_queue(request.slot) {
+            if !queue.commit_queue(request.slot, presentation_source) {
                 return Err(FramebufferError::Malformed(
                     "QueueBuffer reservation lost slot ownership",
                 ));
@@ -741,6 +746,7 @@ struct CropRect {
 pub(crate) struct QueuedBufferRequest {
     slot: i32,
     buffer: GraphicBuffer,
+    presentation_source: Option<PresentationImageRequest>,
     input: QueueBufferInput,
 }
 
@@ -748,6 +754,7 @@ pub(crate) struct QueuedBufferRequest {
 struct BufferSlot {
     ownership: SlotOwnership,
     buffer: GraphicBuffer,
+    presentation_source: Option<PresentationImageRequest>,
     release_fences: Box<[NvFence]>,
 }
 
@@ -896,6 +903,7 @@ impl BufferQueue {
                 queued = Some(QueuedBufferRequest {
                     slot: slot_index,
                     buffer: slot.buffer.clone(),
+                    presentation_source: slot.presentation_source.clone(),
                     input,
                 });
                 write_buffer_output(&mut writer, self.pending_count());
@@ -970,6 +978,7 @@ impl BufferQueue {
                         BufferSlot {
                             ownership: SlotOwnership::Free,
                             buffer,
+                            presentation_source: None,
                             release_fences: Box::default(),
                         },
                     );
@@ -1039,12 +1048,19 @@ impl BufferQueue {
         true
     }
 
-    fn commit_queue(&mut self, slot_index: i32) -> bool {
+    fn commit_queue(
+        &mut self,
+        slot_index: i32,
+        presentation_source: Option<PresentationImageRequest>,
+    ) -> bool {
         let Some(slot) = self.slots.get_mut(&slot_index) else {
             return false;
         };
         if slot.ownership != SlotOwnership::Queueing {
             return false;
+        }
+        if presentation_source.is_some() {
+            slot.presentation_source = presentation_source;
         }
         slot.ownership = SlotOwnership::Queued;
         true
@@ -1225,6 +1241,7 @@ fn validate_present_descriptor(
     }
     let plane = buffer.primary_plane();
     let bytes_per_pixel = present_format(buffer, plane)?.bytes_per_pixel();
+    let required_size = required_present_plane_size(plane, bytes_per_pixel);
     if plane.width == 0
         || plane.height == 0
         || plane.width > MAX_DIMENSION
@@ -1234,6 +1251,7 @@ fn validate_present_descriptor(
         || plane.pitch < plane.width.saturating_mul(bytes_per_pixel)
         || (plane.layout == 3 && (!plane.pitch.is_multiple_of(64) || plane.kind != 0xfe))
         || (plane.layout != 1 && plane.layout != 3)
+        || required_size.is_none_or(|required| required > plane.size)
     {
         return Err(FramebufferError::Malformed(
             "queued image dimensions or memory layout are invalid",
@@ -1243,6 +1261,22 @@ fn validate_present_descriptor(
         validate_crop(crop, plane.width, plane.height)?;
     }
     Ok(())
+}
+
+fn required_present_plane_size(plane: &GraphicBufferPlane, bytes_per_pixel: u32) -> Option<u64> {
+    let row_bytes = u64::from(plane.width).checked_mul(u64::from(bytes_per_pixel))?;
+    if plane.layout == 1 {
+        return u64::from(plane.height.checked_sub(1)?)
+            .checked_mul(u64::from(plane.pitch))?
+            .checked_add(row_bytes);
+    }
+    let block_height_gobs = 1_u64.checked_shl(plane.block_height_log2)?;
+    let block_rows = 8_u64.checked_mul(block_height_gobs)?;
+    let block_row_count = u64::from(plane.height).div_ceil(block_rows);
+    block_row_count
+        .checked_mul(u64::from(plane.pitch) / 64)?
+        .checked_mul(512)?
+        .checked_mul(block_height_gobs)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1284,24 +1318,65 @@ fn present_format(
 
 fn presentable_image_request(
     buffer: &GraphicBuffer,
-    object: NvMapObjectId,
+    object: &NvMapObject,
 ) -> Result<PresentationImageRequest, FramebufferError> {
     let plane = buffer.primary_plane();
     let format = match present_format(buffer, plane)? {
-        PresentFormat::Rgba8 | PresentFormat::Rgbx8 => PresentationImageFormat::Rgba8,
+        PresentFormat::Rgba8 => PresentationImageFormat::Rgba8,
+        PresentFormat::Rgbx8 => PresentationImageFormat::Rgbx8,
         PresentFormat::Bgra8 => PresentationImageFormat::Bgra8,
-        PresentFormat::Rgb565 | PresentFormat::Rgba4444 => {
-            return Err(FramebufferError::Unsupported(
-                "queued image format cannot be exported as a resident presentation image",
-            ));
-        }
+        PresentFormat::Rgb565 => PresentationImageFormat::Rgb565,
+        PresentFormat::Rgba4444 => PresentationImageFormat::Rgba4444,
     };
+    let layout = if plane.layout == 1 {
+        ImageMemoryLayout::PitchLinear {
+            row_pitch: u64::from(plane.pitch),
+            layer_stride: plane.size,
+        }
+    } else {
+        ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: u8::try_from(plane.block_height_log2)
+                .expect("validated block height fits u8"),
+            block_depth_log2: 0,
+            layer_stride: plane.size,
+        })
+    };
+    let backing = object
+        .backing()
+        .ok_or(FramebufferError::Malformed(
+            "queued graphic buffer has no canonical storage",
+        ))?
+        .snapshot_subrange(u64::from(plane.offset), plane.size)
+        .map_err(|_| FramebufferError::Malformed("queued image plane range is invalid"))?;
+    let allocation = GpuAllocationDescription::new(
+        u64::from(object.size()),
+        u64::from(
+            object
+                .allocation_metadata()
+                .expect("a canonically backed nvmap object has allocation metadata")
+                .alignment(),
+        ),
+    )
+    .map_err(|_| FramebufferError::Malformed("queued nvmap allocation is invalid"))?;
+    let backing = BackingView::new(
+        GpuAllocationId::new(object.id().raw()),
+        allocation,
+        u64::from(plane.offset),
+        backing,
+    )
+    .map_err(|_| FramebufferError::Malformed("queued presentation view is invalid"))?;
+    let cpu_writes = CanonicalCpuWriteDependency::capture(backing.range()).ok_or(
+        FramebufferError::Malformed("queued presentation dependency could not be captured"),
+    )?;
     Ok(PresentationImageRequest {
-        allocation: GpuAllocationId::new(object.raw()),
-        allocation_offset: u64::from(plane.offset),
+        backing,
         width: plane.width,
         height: plane.height,
         format,
+        layout,
+        row_pitch: plane.pitch,
+        cpu_writes,
     })
 }
 
@@ -1382,10 +1457,9 @@ mod tests {
     use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
     use nixe_gpu::{
         BackendCapabilities, BackendExecutionCompletion, BackendFeatures, BackendInstanceId,
-        BackendLimits, BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
-        BackendRuntimeError, BackendSubmissionToken, ImageDescription, ImageDimension, ImageExtent,
-        ImageFormat, ImageKind, OperationSubmission, QueryKind, ResourceDependency, SampleCount,
-        ShaderStage,
+        BackendLimits, BackendResourceCreateInfo, BackendRuntimeError, BackendSubmissionToken,
+        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, OperationSubmission,
+        QueryKind, ResourceDependency, SampleCount, ShaderStage,
     };
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
     use nixe_video::FrameNotifier;
@@ -1420,6 +1494,32 @@ mod tests {
 
     fn video_with_rgba_nvmap() -> (VideoSystem, i32, GraphicBuffer) {
         configure_rgba_nvmap(VideoSystem::default())
+    }
+
+    fn rgb565_block_buffer(nvmap_id: u32) -> GraphicBuffer {
+        GraphicBuffer {
+            nvmap_id,
+            stride_pixels: 32,
+            format: 4,
+            external_format: 4,
+            usage: 0x100,
+            total_size: 0x1000,
+            planes: vec![GraphicBufferPlane {
+                width: 32,
+                height: 16,
+                color_format: 0x010a_881210,
+                layout: 3,
+                pitch: 64,
+                offset: 0,
+                kind: 0xfe,
+                block_height_log2: 0,
+                scan_format: 0,
+                second_field_offset: 0,
+                flags: 0,
+                size: 0x1000,
+            }]
+            .into_boxed_slice(),
+        }
     }
 
     fn configure_rgba_nvmap(video: VideoSystem) -> (VideoSystem, i32, GraphicBuffer) {
@@ -1544,7 +1644,10 @@ mod tests {
                     depth: 1,
                 },
                 match request.format {
-                    PresentationImageFormat::Rgba8 => ImageFormat::Rgba8Unorm,
+                    PresentationImageFormat::Rgba8
+                    | PresentationImageFormat::Rgbx8
+                    | PresentationImageFormat::Rgb565
+                    | PresentationImageFormat::Rgba4444 => ImageFormat::Rgba8Unorm,
                     PresentationImageFormat::Bgra8 => ImageFormat::Bgra8Unorm,
                 },
                 ImageKind::Color,
@@ -1553,13 +1656,7 @@ mod tests {
                 SampleCount::One,
             )
             .unwrap();
-            Ok(ResidentImage::new(
-                instance,
-                BackendResourceHandle::new(instance, 3, 1, BackendResourceKind::Image),
-                description,
-                BackendSubmissionToken::new(instance, 4, 1),
-                Arc::new(()),
-            ))
+            Ok(ResidentImage::new(instance, description, Arc::new(())))
         }
 
         fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
@@ -1580,6 +1677,31 @@ mod tests {
         assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), 12);
         assert_eq!(u32::from_le_bytes(encoded[4..8].try_into().unwrap()), 16);
         assert_eq!(i32::from_le_bytes(encoded[24..28].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    fn software_framebuffer_becomes_a_retained_gpu_import_request() {
+        let (video, _, rgba) = video_with_rgba_nvmap();
+        let buffer = rgb565_block_buffer(rgba.nvmap_id);
+        let object = video
+            .nvdrv()
+            .nvmap_object_by_id(NvMapExportedId::new(buffer.nvmap_id))
+            .unwrap();
+
+        let request = presentable_image_request(&buffer, &object).unwrap();
+
+        assert_eq!(request.format, PresentationImageFormat::Rgb565);
+        assert_eq!(request.backing.size(), 0x1000);
+        assert_eq!(request.row_pitch, 64);
+        assert_eq!(
+            request.layout,
+            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+                block_width_log2: 0,
+                block_height_log2: 0,
+                block_depth_log2: 0,
+                layer_stride: 0x1000,
+            })
+        );
     }
 
     #[test]
@@ -1772,6 +1894,7 @@ mod tests {
             BufferSlot {
                 ownership: SlotOwnership::Queueing,
                 buffer,
+                presentation_source: None,
                 release_fences: Box::default(),
             },
         );
@@ -1780,8 +1903,8 @@ mod tests {
         assert_eq!(queue.slots[&2].ownership, SlotOwnership::Dequeued);
         assert!(!queue.release(2));
         queue.slots.get_mut(&2).unwrap().ownership = SlotOwnership::Queueing;
-        assert!(queue.commit_queue(2));
-        assert!(!queue.commit_queue(2));
+        assert!(queue.commit_queue(2, None));
+        assert!(!queue.commit_queue(2, None));
         assert!(queue.release(2));
         assert_eq!(queue.slots[&2].ownership, SlotOwnership::Free);
     }
@@ -1798,6 +1921,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    presentation_source: None,
                     release_fences: Box::default(),
                 },
             );
@@ -1808,6 +1932,7 @@ mod tests {
                 QueuedBufferRequest {
                     slot: 0,
                     buffer,
+                    presentation_source: None,
                     input: QueueBufferInput {
                         timestamp: 0,
                         auto_timestamp: true,
@@ -1862,6 +1987,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    presentation_source: None,
                     release_fences: Box::default(),
                 },
             );
@@ -1872,6 +1998,7 @@ mod tests {
                 QueuedBufferRequest {
                     slot: 0,
                     buffer,
+                    presentation_source: None,
                     input: QueueBufferInput {
                         timestamp: 0,
                         auto_timestamp: true,
@@ -1897,10 +2024,12 @@ mod tests {
         assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
         let frame = mailbox.take_latest().unwrap();
         assert_eq!((frame.width(), frame.height()), (4, 4));
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
-            SlotOwnership::Queued
-        );
+        {
+            let state = video.state.lock().unwrap();
+            let slot = &state.queues[&binder_id].slots[&0];
+            assert_eq!(slot.ownership, SlotOwnership::Queued);
+            assert!(slot.presentation_source.is_some());
+        }
 
         drop(frame);
         video.advance(Duration::ZERO).unwrap();
@@ -1924,6 +2053,7 @@ mod tests {
                     BufferSlot {
                         ownership: SlotOwnership::Queueing,
                         buffer: buffer.clone(),
+                        presentation_source: None,
                         release_fences: Box::default(),
                     },
                 );
@@ -1939,6 +2069,7 @@ mod tests {
                     QueuedBufferRequest {
                         slot,
                         buffer: buffer.clone(),
+                        presentation_source: None,
                         input: QueueBufferInput {
                             timestamp: frame as i64,
                             auto_timestamp: false,
@@ -1993,6 +2124,7 @@ mod tests {
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
                     buffer: buffer.clone(),
+                    presentation_source: None,
                     release_fences: Box::default(),
                 },
             );
@@ -2003,6 +2135,7 @@ mod tests {
                 QueuedBufferRequest {
                     slot: 0,
                     buffer,
+                    presentation_source: None,
                     input: QueueBufferInput {
                         timestamp: 0,
                         auto_timestamp: true,

@@ -180,13 +180,14 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
     }
     let draw = dispatch(0x0d78, 3);
     let draws = [draw];
+    let mut first_cache = MaxwellThreeDLoweringCache::default();
     let plan = preflight_maxwell_submission_execution(
         &draws,
         &address_space,
         FrontendSubmissionId::new(2),
         Vec::new(),
         None,
-        &MaxwellThreeDLoweringCache::default(),
+        &mut first_cache,
     )
     .unwrap();
     let [MaxwellSubmissionExecutionStep::ThreeD(work)] = plan.steps() else {
@@ -225,7 +226,6 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
         .unwrap();
     }
 
-    let first_cache = plan.staged_cache().clone();
     shader_allocation
         .write(0, &vertex_header[0].to_le_bytes())
         .unwrap();
@@ -235,7 +235,7 @@ fn captured_shader_families_reach_neutral_draw_work_and_backend_modules() {
         FrontendSubmissionId::new(3),
         Vec::new(),
         None,
-        &first_cache,
+        &mut first_cache,
     )
     .unwrap();
     let [MaxwellSubmissionExecutionStep::ThreeD(replacement_work)] = replacement.steps() else {

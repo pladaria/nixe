@@ -2,18 +2,19 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use nixe_gpu::{
     AttachmentLoad, AttachmentStore, BackendInstanceId, BackendResourceCreateInfo,
-    BackendVisibilityRequester, BackingView, BufferDescription, BufferId, BufferRange,
-    BufferRegion, BufferView, CapabilityRequirements, ClearOperation, ClearValue, CopyOperation,
-    DrawArguments, DrawOperation, FrontendSubmissionId, GpuAllocationDescription, GpuAllocationId,
-    GpuCommand, GpuOperation, ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageId,
-    ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView, NeutralBackendRuntime,
-    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PresentationImageFormat,
-    PresentationImageRequest, PrimitiveTopology, RenderAttachment, RenderPassAttachmentDescription,
-    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceDependency, SampleCount,
-    ShaderDescription, ShaderId, ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation,
-    ShaderIoLocation, ShaderIr, ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType,
-    ShaderSourceLocation, ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
+    BackendVisibilityRequester, BackingView, BlockLinearLayout, BufferDescription, BufferId,
+    BufferRange, BufferRegion, BufferView, CapabilityRequirements, ClearOperation, ClearValue,
+    CopyOperation, DrawArguments, DrawOperation, FrontendSubmissionId, GpuAllocationDescription,
+    GpuAllocationId, GpuCommand, GpuOperation, ImageDescription, ImageDimension, ImageExtent,
+    ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageSubresourceRange, ImageView,
+    NeutralBackendRuntime, OperationSubmission, PipelineDescription, PipelineId, PipelineKind,
+    PreparedDraw, PresentationImageFormat, PresentationImageRequest, PrimitiveTopology,
+    RenderAttachment, RenderPassAttachmentDescription, RenderPassDescription, RenderPassId,
+    RenderPassOperation, ResourceDependency, SampleCount, ShaderDescription, ShaderId,
+    ShaderInstruction, ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation, ShaderIr,
+    ShaderOperation, ShaderPredicate, ShaderRegister, ShaderScalarType, ShaderSourceLocation,
+    ShaderStage, Swizzle, VerifiedShaderIr, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexStepMode, ViewportTransform, lower_shader_ir_to_wgsl,
 };
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend, resident_texture};
 use nixe_memory::{
@@ -25,6 +26,124 @@ use nixe_memory::{
 
 struct RuntimeOwner {
     runtime: Mutex<Box<dyn NeutralBackendRuntime>>,
+}
+
+#[test]
+fn cpu_authored_rgb565_is_converted_by_a_reusable_gpu_import() {
+    let _guard = accelerated_test_guard();
+    let device_id = NonCpuDeviceId::new(0x15);
+    let Ok(initialized) = initialize_backend(
+        BackendInstanceId::new(0x15),
+        device_id,
+        WgpuBackendConfiguration::default(),
+    ) else {
+        eprintln!("Vulkan adapter is unavailable; skipping accelerated acceptance test");
+        return;
+    };
+    let mut bytes = vec![0_u8; 512];
+    for (offset, pixel) in [(0, 0xf800_u16), (2, 0x07e0), (4, 0x001f), (6, 0xffff)] {
+        bytes[offset..offset + 2].copy_from_slice(&pixel.to_le_bytes());
+    }
+    let page = initialized_page(&bytes);
+    let allocation = GpuAllocationId::new(5);
+    let description = GpuAllocationDescription::new(512, 4).unwrap();
+    let source = backing(allocation, description, &page);
+    let presentation = initialized.presentation_context();
+    let runtime = RuntimeOwner::new(initialized.into_runtime());
+    let request = PresentationImageRequest {
+        cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(source.range()).unwrap(),
+        backing: source,
+        width: 4,
+        height: 2,
+        format: PresentationImageFormat::Rgb565,
+        layout: ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            layer_stride: 512,
+        }),
+        row_pitch: 64,
+    };
+
+    let first = runtime
+        .runtime()
+        .acquire_presentable_image(request.clone())
+        .unwrap();
+    let second = runtime
+        .runtime()
+        .acquire_presentable_image(request.clone())
+        .unwrap();
+    let generation = page.content_generation();
+    page.prepare_write().unwrap();
+    page.write_preflighted(
+        0,
+        &0x07e0_u16.to_le_bytes(),
+        generation,
+        generation.next().unwrap(),
+    )
+    .unwrap();
+    let updated = runtime
+        .runtime()
+        .acquire_presentable_image(request)
+        .unwrap();
+
+    assert_eq!(first.description().format(), ImageFormat::Rgba8Unorm);
+    assert_eq!(second.description(), first.description());
+    assert_eq!(updated.description(), first.description());
+    assert!(resident_texture(&first).is_some());
+    let texture = resident_texture(&updated).unwrap();
+    let readback = presentation
+        .device()
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nixe presentation import test readback"),
+            size: 512,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+    let mut encoder =
+        presentation
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Nixe presentation import test copy"),
+            });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(2),
+            },
+        },
+        wgpu::Extent3d {
+            width: 4,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+    );
+    presentation.queue().submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    readback.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = sender.send(result);
+    });
+    presentation
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = readback.get_mapped_range(..).unwrap();
+    assert_eq!(
+        &mapped[0..16],
+        &[
+            0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255
+        ]
+    );
 }
 
 struct RuntimeRequester(Weak<RuntimeOwner>);
@@ -558,7 +677,7 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
     };
     let begin =
         RenderPassOperation::begin(render_pass, render_pass_description, vec![attachment]).unwrap();
-    let draw = DrawOperation::new(
+    let prepared = PreparedDraw::new(
         pipeline,
         render_pass,
         PrimitiveTopology::Triangles,
@@ -587,6 +706,13 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
             .unwrap(),
         ],
         None,
+    )
+    .unwrap()
+    .with_viewport_transform(
+        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5], [0.0, 1.0]).unwrap(),
+    );
+    let draw = DrawOperation::new(
+        Arc::new(prepared),
         DrawArguments::NonIndexed {
             first_vertex: 0,
             vertex_count: 3,
@@ -594,10 +720,7 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
             instance_count: 1,
         },
     )
-    .unwrap()
-    .with_viewport_transform(
-        ViewportTransform::new([16.0, -16.0, 0.5], [16.0, 16.0, 0.5], [0.0, 1.0]).unwrap(),
-    );
+    .unwrap();
     let submission = OperationSubmission::new(
         FrontendSubmissionId::new(2),
         vec![],
@@ -627,21 +750,26 @@ fn accelerated_triangle_draw_matches_geometry_clear_and_interpolation_contract()
         ],
     )
     .unwrap();
-    let token = runtime
+    runtime
         .runtime()
         .submit(&creations, &[], &submission)
         .unwrap();
     let resident = runtime
         .runtime()
         .acquire_presentable_image(PresentationImageRequest {
-            allocation,
-            allocation_offset: 0,
+            cpu_writes: nixe_memory::CanonicalCpuWriteDependency::capture(image_backing.range())
+                .unwrap(),
+            backing: image_backing.clone(),
             width: WIDTH,
             height: HEIGHT,
             format: PresentationImageFormat::Rgba8,
+            layout: ImageMemoryLayout::PitchLinear {
+                row_pitch: u64::from(WIDTH * 4),
+                layer_stride: u64::from(WIDTH * HEIGHT * 4),
+            },
+            row_pitch: WIDTH * 4,
         })
         .unwrap();
-    assert_eq!(resident.completion(), token);
     assert!(resident_texture(&resident).is_some());
     let mut pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     image_backing.range().read(0, &mut pixels).unwrap();

@@ -10,7 +10,7 @@ use nixe_gpu_maxwell::{
     MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellMapRequest,
     MaxwellMappingId, MaxwellPushbufferWord, MaxwellThreeDLoweringCache,
     MaxwellThreeDTriggeredOperation, SWITCH_1_GM20B_PROFILE, decode_maxwell_pushbuffer,
-    dispatch_maxwell_engine_pushbuffer, preflight_maxwell_three_d_operation,
+    dispatch_maxwell_engine_pushbuffer, lower_maxwell_three_d_operation,
     resolve_maxwell_three_d_resources,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
@@ -164,7 +164,7 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
     let mut cache = MaxwellThreeDLoweringCache::default();
     let clear_resources =
         resolve_maxwell_three_d_resources(clear[0].state(), &address_space).unwrap();
-    let clear_plan = preflight_maxwell_three_d_operation(
+    let clear_plan = lower_maxwell_three_d_operation(
         clear[0].state(),
         &clear_resources,
         clear[0].trigger(),
@@ -172,7 +172,7 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
         FrontendSubmissionId::new(10),
         Vec::new(),
         &capabilities,
-        &cache,
+        &mut cache,
     )
     .unwrap();
     for creation in clear_plan.resource_creations() {
@@ -181,7 +181,6 @@ fn synthetic_maxwell_clear_executes_through_headless_contract() {
         handles.push((dependency, handle));
     }
     let clear_token = backend.submit(clear_plan.submission()).unwrap();
-    clear_plan.commit_cache(&mut cache).unwrap();
 
     assert!(!backend.has_completed(clear_token).unwrap());
     completion.complete(clear_token).unwrap();

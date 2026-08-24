@@ -104,11 +104,10 @@ fn enabled_z_compression_without_a_depth_target_does_not_block_draw_preflight() 
     program_three_d(&mut channel, 0x121c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -119,11 +118,10 @@ fn enabled_z_compression_without_a_depth_target_does_not_block_draw_preflight() 
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -354,14 +352,13 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             .any(|resource| { resource.role() == MaxwellThreeDResourceRole::ColorTarget(0) })
     );
     let mut cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
 
     let draw_source = channel.three_d().render_targets().color()[0]
         .compression()
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -372,16 +369,15 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
     ));
-    assert_eq!(cache, cache_before);
 
     let clear_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &clear_dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -389,17 +385,16 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             FrontendSubmissionId::new(11),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
     ));
-    assert_eq!(cache, cache_before);
 
     program_three_d(&mut channel, 0x10f8, 0);
     let full_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let full = &full_dispatch.operations()[0];
     let full_resources = resolve_maxwell_three_d_resources(full.state(), &address_space).unwrap();
-    let plan = preflight_maxwell_three_d_operation(
+    let plan = lower_maxwell_three_d_operation(
         full.state(),
         &full_resources,
         full.trigger(),
@@ -407,7 +402,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         FrontendSubmissionId::new(12),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
+        &mut cache,
     )
     .unwrap();
     assert!(plan.resource_creations().iter().any(|creation| matches!(
@@ -421,9 +416,8 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             ..
         })
     ));
-    plan.commit_cache(&mut cache).unwrap();
 
-    let partial_after_materialization = preflight_maxwell_three_d_operation(
+    let partial_after_materialization = lower_maxwell_three_d_operation(
         triggered.state(),
         &resources,
         triggered.trigger(),
@@ -431,32 +425,13 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         FrontendSubmissionId::new(13),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
+        &mut cache,
     )
     .unwrap();
     assert!(
         partial_after_materialization
             .resource_creations()
             .is_empty()
-    );
-
-    cache.evict_views_for_test();
-    let after_host_view_eviction = preflight_maxwell_three_d_operation(
-        triggered.state(),
-        &resources,
-        triggered.trigger(),
-        None,
-        FrontendSubmissionId::new(14),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
-    )
-    .unwrap();
-    assert!(
-        after_host_view_eviction
-            .resource_creations()
-            .iter()
-            .any(|creation| matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. }))
     );
 
     // Rebinding the same canonical bytes through a different GPU allocation
@@ -477,7 +452,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
     let remapped = &remapped_dispatch.operations()[0];
     let remapped_resources =
         resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
-    preflight_maxwell_three_d_operation(
+    lower_maxwell_three_d_operation(
         remapped.state(),
         &remapped_resources,
         remapped.trigger(),
@@ -485,7 +460,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         FrontendSubmissionId::new(15),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
+        &mut cache,
     )
     .unwrap();
 
@@ -512,7 +487,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
 
     let resources_after_writeback =
         resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    let after_writeback = preflight_maxwell_three_d_operation(
+    let after_writeback = lower_maxwell_three_d_operation(
         triggered.state(),
         &resources_after_writeback,
         triggered.trigger(),
@@ -520,14 +495,10 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         FrontendSubmissionId::new(16),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
+        &mut cache,
     )
     .unwrap();
-    assert!(
-        after_writeback.resource_creations().iter().any(|creation| {
-            matches!(creation, nixe_gpu::BackendResourceCreateInfo::Image { .. })
-        })
-    );
+    assert!(after_writeback.resource_creations().is_empty());
 
     // The canonical store retains 256 exact write records; one additional
     // write forces validation through authoritative page generations.
@@ -536,7 +507,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
     }
     let resources_after_disjoint_journal_overflow =
         resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    preflight_maxwell_three_d_operation(
+    lower_maxwell_three_d_operation(
         triggered.state(),
         &resources_after_disjoint_journal_overflow,
         triggered.trigger(),
@@ -544,7 +515,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
         FrontendSubmissionId::new(17),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &cache,
+        &mut cache,
     )
     .unwrap();
 
@@ -552,7 +523,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
     let resources_after_cpu_write =
         resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources_after_cpu_write,
             triggered.trigger(),
@@ -560,7 +531,7 @@ fn compressed_color_full_clear_materializes_and_exports_generic_canonical_bytes(
             FrontendSubmissionId::new(18),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::CLEAR),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target: 0 })
     ));
@@ -577,7 +548,7 @@ fn color_compression_does_not_block_a_different_clear_target() {
     let triggered = &dispatch.operations()[0];
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -585,7 +556,7 @@ fn color_compression_does_not_block_a_different_clear_target() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
@@ -765,7 +736,7 @@ fn malformed_color_target_selection_and_failed_packet_keeps_valid_prefix() {
 
 #[test]
 fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
     let address_space = resource_address_space();
     let mut channel = three_d_channel();
@@ -789,7 +760,7 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
             .color_target_selection()
             .source()
             .unwrap();
-        let result = preflight_maxwell_three_d_operation(
+        let result = lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -800,7 +771,7 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         );
         let error = match result {
             Err(error) => error,
@@ -819,7 +790,7 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -830,14 +801,14 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ColorTargetRouteDisabled { slot: 0, target: 0 })
     ));
 
     program_three_d(&mut channel, 0x0810, 0xd5);
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -848,7 +819,7 @@ fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ColorTargetRouteIncomplete { slot: 0, target: 0 })
     ));
@@ -1141,7 +1112,7 @@ fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    let plan = preflight_maxwell_three_d_operation(
+    let plan = lower_maxwell_three_d_operation(
         triggered.state(),
         &resources,
         triggered.trigger(),
@@ -1149,7 +1120,7 @@ fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
         FrontendSubmissionId::new(10),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::CLEAR),
-        &MaxwellThreeDLoweringCache::default(),
+        &mut MaxwellThreeDLoweringCache::default(),
     )
     .unwrap();
     let target = plan
@@ -1171,7 +1142,7 @@ fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
     let empty = &empty_dispatch.operations()[0];
     let empty_resources = resolve_maxwell_three_d_resources(empty.state(), &address_space).unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             empty.state(),
             &empty_resources,
             empty.trigger(),
@@ -1179,7 +1150,7 @@ fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::CLEAR),
-            &MaxwellThreeDLoweringCache::default(),
+            &mut MaxwellThreeDLoweringCache::default(),
         ),
         Err(MaxwellThreeDLoweringError::EmptyClearRectangle)
     ));
@@ -1339,8 +1310,7 @@ fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let source = channel
         .three_d()
         .fixed_function()
@@ -1348,7 +1318,7 @@ fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1359,7 +1329,7 @@ fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedWindowClipSemantics)
     ));
@@ -1367,7 +1337,7 @@ fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -1375,13 +1345,12 @@ fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -1466,8 +1435,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let disabled_source = channel
         .three_d()
         .fixed_function()
@@ -1475,7 +1443,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1486,7 +1454,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
@@ -1499,7 +1467,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1510,7 +1478,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedClipIdTestSemantics)
     ));
@@ -1518,7 +1486,7 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -1526,13 +1494,12 @@ fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -1606,7 +1573,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let disabled_source = channel
         .three_d()
         .fixed_function()
@@ -1614,7 +1581,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1625,7 +1592,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
@@ -1651,7 +1618,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -1662,7 +1629,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
@@ -1670,7 +1637,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -1678,7 +1645,7 @@ fn viewport_scale_offset_draw_validation_follows_enable_only() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
@@ -3301,8 +3268,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
     program_three_d(&mut channel, 0x160c, 0);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let source = channel
         .three_d()
         .shader_bindings()
@@ -3312,7 +3278,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
         .unwrap();
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3323,7 +3289,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteDraw(
             "SET_PROGRAM_REGION_A/B"
@@ -3333,7 +3299,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -3341,7 +3307,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
             FrontendSubmissionId::new(11),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
@@ -3350,7 +3316,7 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
 
     program_three_d(&mut channel, 0x1608, 4);
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3361,11 +3327,10 @@ fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() 
             FrontendSubmissionId::new(12),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]

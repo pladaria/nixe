@@ -5,38 +5,35 @@
 //! module never treats Maxwell code as a neutral or host shader.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     fmt::{Display, Formatter},
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use nixe_gpu::{
     AccessMode, AccessScope, AccessTarget, AlphaCompareOperation, AlphaTest, AttachmentLoad,
     AttachmentStore, BackendCapabilities, BackendCapabilityError, BackendResourceCreateInfo,
-    BarrierOperation, BufferId, BufferRange, BufferRegion, BufferView, CapabilityAgreement,
-    CapabilityRequirements, ClearOperation, ClearValue, CommandDescriptionError,
-    DepthCompareOperation, DepthState, DescriptorKind, DescriptorTableBinding,
-    DescriptorTableDescription, DescriptorTableId, DrawArguments, DrawOperation,
-    FrontendSubmissionId, GpuCacheConfiguration, GpuCommand, GpuOperation, ImageId, ImageOrigin,
-    ImageRegion, ImageSubresourceRange, ImageView, OperationSubmission, PipelineDescription,
-    PipelineId, PipelineKind, PipelineStages, PrimitiveTopology, RenderAttachment,
-    RenderPassDescription, RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency,
-    ResourceTransition, ResourceUsage, SamplerId, ShaderDescription, ShaderId, ShaderResourceKind,
-    ShaderStage, TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
-    VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
+    BarrierOperation, BufferId, BufferRange, BufferRegion, BufferView, CapabilityRequirements,
+    ClearOperation, ClearValue, CommandDescriptionError, DepthCompareOperation, DepthState,
+    DescriptorKind, DescriptorTableBinding, DescriptorTableDescription, DescriptorTableId,
+    DrawArguments, DrawOperation, FrontendSubmissionId, GpuCacheConfiguration, GpuCommand,
+    GpuOperation, ImageId, ImageOrigin, ImageRegion, ImageSubresourceRange, ImageView,
+    OperationSubmission, PipelineDescription, PipelineId, PipelineKind, PipelineStages,
+    PreparedDraw, PrimitiveTopology, RenderAttachment, RenderPassDescription, RenderPassId,
+    RenderPassOperation, ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage,
+    SamplerId, ShaderDescription, ShaderId, ShaderResourceKind, ShaderStage, TriangleRasterization,
+    VertexAttribute, VertexBufferLayout, VertexComponentCount, VertexComponentWidth, VertexFormat,
+    VertexStepMode, ViewportTransform,
 };
 use nixe_memory::CanonicalCpuWriteDependency;
 
 use crate::MaxwellMethodSource;
 use crate::shader::{
     MaxwellShaderTranslationError, MaxwellShaderTranslationInputs,
-    MaxwellShaderTranslationSourceKey, MaxwellTranslatedShaderProgram,
+    MaxwellShaderTranslationSourceKey, MaxwellStagedShaderWrite, MaxwellTranslatedShaderProgram,
     prepare_maxwell_shader_translation_inputs_from_source,
-    translate_prepared_maxwell_shader_programs,
+    prepare_maxwell_shader_translation_source, translate_prepared_maxwell_shader_programs,
 };
 #[cfg(debug_assertions)]
 use crate::shader::{MaxwellShaderTranslationKey, MaxwellShaderTranslationSource};
@@ -252,6 +249,7 @@ impl MaxwellThreeDShaderResourceUse {
 /// fabricated shader or an empty pipeline.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MaxwellThreeDTranslatedShaders {
+    identity: Arc<()>,
     shaders: Box<[MaxwellThreeDTranslatedShader]>,
     resources: Box<[MaxwellThreeDShaderResourceUse]>,
 }
@@ -279,6 +277,7 @@ impl MaxwellThreeDTranslatedShaders {
             }
         }
         Ok(Self {
+            identity: Arc::new(()),
             shaders: shaders.into_boxed_slice(),
             resources: resources.into_boxed_slice(),
         })
@@ -290,6 +289,14 @@ impl MaxwellThreeDTranslatedShaders {
     #[must_use]
     pub fn resources(&self) -> &[MaxwellThreeDShaderResourceUse] {
         &self.resources
+    }
+
+    fn identity(&self) -> Arc<()> {
+        Arc::clone(&self.identity)
+    }
+
+    fn has_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
     }
 }
 
@@ -549,6 +556,68 @@ struct DescriptorRecord {
     id: DescriptorTableId,
 }
 
+#[derive(Debug)]
+struct PreparedDrawRecord {
+    state: super::state::MaxwellThreeDDrawStateIdentity,
+    resources: Arc<()>,
+    shaders: Arc<()>,
+    draw: Arc<PreparedDraw>,
+    render_pass_description: RenderPassDescription,
+    attachments: Box<[RenderAttachment]>,
+    shader_accesses: Box<[ResourceAccess]>,
+    shader_dependencies: Box<[ResourceDependency]>,
+    requirements: CapabilityRequirements,
+    dirty_images: Box<[usize]>,
+}
+
+impl PreparedDrawRecord {
+    fn matches(
+        &self,
+        state: &MaxwellThreeDState,
+        resources: &MaxwellThreeDResolvedResources,
+        shaders: &MaxwellThreeDTranslatedShaders,
+    ) -> bool {
+        self.state.matches(state)
+            && resources.has_identity(&self.resources)
+            && shaders.has_identity(&self.shaders)
+    }
+
+    fn operations(
+        &self,
+        arguments: DrawArguments,
+    ) -> Result<Vec<GpuOperation>, MaxwellThreeDLoweringError> {
+        let draw = DrawOperation::new(Arc::clone(&self.draw), arguments)
+            .map_err(MaxwellThreeDLoweringError::Command)?;
+        Ok(vec![
+            GpuOperation::new(
+                GpuCommand::RenderPass(
+                    RenderPassOperation::begin(
+                        self.draw.render_pass,
+                        self.render_pass_description.clone(),
+                        self.attachments.to_vec(),
+                    )
+                    .map_err(MaxwellThreeDLoweringError::Command)?,
+                ),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ),
+            GpuOperation::new(
+                GpuCommand::Draw(draw),
+                self.shader_accesses.iter().copied(),
+                self.shader_dependencies.iter().copied(),
+                self.requirements.clone(),
+            ),
+            GpuOperation::new(
+                GpuCommand::RenderPass(RenderPassOperation::end(self.draw.render_pass)),
+                [],
+                [],
+                CapabilityRequirements::none(),
+            ),
+        ])
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SamplerRecord {
     sampler: super::MaxwellThreeDResolvedSampler,
@@ -579,93 +648,66 @@ struct ShaderTranslationSourceRecord {
     programs: Arc<[MaxwellTranslatedShaderProgram]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShaderStateRecord {
+    state: super::MaxwellThreeDShaderStateIdentity,
+    inputs: MaxwellShaderTranslationInputs,
+    programs: Arc<[MaxwellTranslatedShaderProgram]>,
+    translated: Option<Arc<MaxwellThreeDTranslatedShaders>>,
+}
+
 #[derive(Debug)]
 struct FingerprintedRecord<T> {
     value: T,
-    last_used: AtomicU64,
+    last_used: Cell<u64>,
 }
 
-impl<T: Clone> Clone for FingerprintedRecord<T> {
-    fn clone(&self) -> Self {
-        Self {
-            value: self.value.clone(),
-            last_used: AtomicU64::new(self.last_used.load(Ordering::Relaxed)),
-        }
-    }
-}
-
-impl<T: PartialEq> PartialEq for FingerprintedRecord<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
-impl<T: Eq> Eq for FingerprintedRecord<T> {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FingerprintCacheData<T> {
+/// Owner-local fingerprint cache with O(1), allocation-free hits and exact LRU
+/// stamps. It is mutated only by ordered Maxwell lowering.
+#[derive(Debug)]
+struct FingerprintCache<T> {
     records: HashMap<u128, FingerprintedRecord<T>>,
+    next_use: Cell<u64>,
 }
 
-/// Copy-on-write storage with O(1), allocation-free hits and exact LRU stamps.
-/// Recency is policy rather than guest state, so candidates share its monotonic
-/// clock and may record an attempted hit before their transactional commit.
-#[derive(Clone, Debug)]
-struct SharedFingerprintCache<T> {
-    data: Arc<FingerprintCacheData<T>>,
-    next_use: Arc<AtomicU64>,
-}
-
-impl<T: PartialEq> PartialEq for SharedFingerprintCache<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
-    }
-}
-
-impl<T: Eq> Eq for SharedFingerprintCache<T> {}
-
-impl<T> Default for SharedFingerprintCache<T> {
+impl<T> Default for FingerprintCache<T> {
     fn default() -> Self {
         Self {
-            data: Arc::new(FingerprintCacheData {
-                records: HashMap::new(),
-            }),
-            next_use: Arc::new(AtomicU64::new(1)),
+            records: HashMap::new(),
+            next_use: Cell::new(1),
         }
     }
 }
 
-impl<T> SharedFingerprintCache<T> {
+impl<T> FingerprintCache<T> {
     fn len(&self) -> usize {
-        self.data.records.len()
+        self.records.len()
     }
 
     fn get(&self, fingerprint: u128) -> Option<&T> {
-        let record = self.data.records.get(&fingerprint)?;
-        record.last_used.store(self.take_use(), Ordering::Relaxed);
+        let record = self.records.get(&fingerprint)?;
+        record.last_used.set(self.take_use());
         Some(&record.value)
     }
 
     fn take_use(&self) -> u64 {
-        self.next_use
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .expect("GPU cache LRU sequence exhausted")
+        let next = self.next_use.get();
+        self.next_use.set(
+            next.checked_add(1)
+                .expect("GPU cache LRU sequence exhausted"),
+        );
+        next
     }
-}
 
-impl<T: Clone> SharedFingerprintCache<T> {
     fn push(&mut self, fingerprint: u128, value: T) {
         let last_used = self.take_use();
-        let data = Arc::make_mut(&mut self.data);
         assert!(
-            data.records
+            self.records
                 .insert(
                     fingerprint,
                     FingerprintedRecord {
                         value,
-                        last_used: AtomicU64::new(last_used),
+                        last_used: Cell::new(last_used),
                     }
                 )
                 .is_none(),
@@ -675,38 +717,35 @@ impl<T: Clone> SharedFingerprintCache<T> {
 
     fn get_mut(&mut self, fingerprint: u128) -> Option<&mut T> {
         let last_used = self.take_use();
-        let data = Arc::make_mut(&mut self.data);
-        let record = data.records.get_mut(&fingerprint)?;
-        record.last_used.store(last_used, Ordering::Relaxed);
+        let record = self.records.get_mut(&fingerprint)?;
+        record.last_used.set(last_used);
         Some(&mut record.value)
     }
 
     fn replace(&mut self, fingerprint: u128, value: T) {
         let last_used = self.take_use();
-        let data = Arc::make_mut(&mut self.data);
-        if let Some(record) = data.records.get_mut(&fingerprint) {
+        if let Some(record) = self.records.get_mut(&fingerprint) {
             record.value = value;
-            record.last_used.store(last_used, Ordering::Relaxed);
+            record.last_used.set(last_used);
         } else {
-            data.records.insert(
+            self.records.insert(
                 fingerprint,
                 FingerprintedRecord {
                     value,
-                    last_used: AtomicU64::new(last_used),
+                    last_used: Cell::new(last_used),
                 },
             );
         }
     }
 
     fn remove_lru(&mut self) -> (u128, T) {
-        let data = Arc::make_mut(&mut self.data);
-        let fingerprint = data
+        let fingerprint = self
             .records
             .iter()
-            .min_by_key(|(_, record)| record.last_used.load(Ordering::Relaxed))
+            .min_by_key(|(_, record)| record.last_used.get())
             .map(|(fingerprint, _)| *fingerprint)
             .expect("LRU eviction requires a non-empty cache");
-        let removed = data
+        let removed = self
             .records
             .remove(&fingerprint)
             .expect("selected LRU fingerprint remains present");
@@ -714,79 +753,32 @@ impl<T: Clone> SharedFingerprintCache<T> {
     }
 }
 
-/// Copy-on-write storage for transactional cache collections.
-///
-/// Lowering plans retain a candidate cache until backend work succeeds. A
-/// candidate therefore shares every untouched collection with the committed
-/// cache and copies only the collections it actually changes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SharedCacheVec<T>(Arc<Vec<T>>);
-
-impl<T> Default for SharedCacheVec<T> {
-    fn default() -> Self {
-        Self(Arc::new(Vec::new()))
-    }
-}
-
-impl<T> Deref for SharedCacheVec<T> {
-    type Target = Vec<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T: Clone> SharedCacheVec<T> {
-    fn push(&mut self, value: T) {
-        Arc::make_mut(&mut self.0).push(value);
-    }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        Arc::make_mut(&mut self.0).clear();
-    }
-
-    fn retain(&mut self, predicate: impl FnMut(&T) -> bool) {
-        Arc::make_mut(&mut self.0).retain(predicate);
-    }
-
-    fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
-        Arc::make_mut(&mut self.0).iter_mut()
-    }
-
-    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        Arc::make_mut(&mut self.0).get_mut(index)
-    }
-
-    fn take(&mut self) -> Vec<T> {
-        let retained = std::mem::take(&mut self.0);
-        Arc::try_unwrap(retained).unwrap_or_else(|shared| (*shared).clone())
-    }
-}
-
 /// Frontend-owned derived identity cache. It contains no backend handles and
-/// changes only through [`MaxwellThreeDLoweringPlan::commit_cache`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// changes only while lowering ordered frontend work.
+#[derive(Debug)]
 pub struct MaxwellThreeDLoweringCache {
     configuration: GpuCacheConfiguration,
     revision: u64,
     next_identity: u64,
-    allocations: SharedCacheVec<(
+    allocations: Vec<(
         nixe_gpu::GpuAllocationId,
         nixe_gpu::GpuAllocationDescription,
     )>,
-    views: SharedCacheVec<ViewRecord>,
-    color_materializations: SharedCacheVec<ColorRepresentationRecord>,
+    views: Vec<ViewRecord>,
+    color_materializations: Vec<ColorRepresentationRecord>,
     graphics_pipeline: Option<PipelineId>,
-    render_passes: SharedCacheVec<RenderPassRecord>,
-    descriptors: SharedCacheVec<DescriptorRecord>,
-    samplers: SharedCacheVec<SamplerRecord>,
-    shader_translation_sets: SharedFingerprintCache<ShaderTranslationSetRecord>,
-    shader_translation_sources: SharedFingerprintCache<ShaderTranslationSourceRecord>,
-    shader_translations: SharedFingerprintCache<ShaderTranslationRecord>,
-    retired_resources: SharedCacheVec<ResourceDependency>,
-    accesses: SharedCacheVec<(AccessTarget, AccessScope)>,
-    retained_backings: super::MaxwellThreeDRetainedBackingCache,
+    render_passes: Vec<RenderPassRecord>,
+    descriptors: Vec<DescriptorRecord>,
+    prepared_draw: Option<PreparedDrawRecord>,
+    samplers: Vec<SamplerRecord>,
+    shader_translation_sets: FingerprintCache<ShaderTranslationSetRecord>,
+    shader_translation_sources: FingerprintCache<ShaderTranslationSourceRecord>,
+    shader_state: Option<ShaderStateRecord>,
+    shader_translations: FingerprintCache<ShaderTranslationRecord>,
+    retired_resources: Vec<ResourceDependency>,
+    accesses: Vec<(AccessTarget, AccessScope)>,
+    resolved_resources: super::MaxwellThreeDResolvedResourceCache,
+    resource_roles: Vec<MaxwellThreeDResourceRole>,
 }
 
 impl Default for MaxwellThreeDLoweringCache {
@@ -802,19 +794,22 @@ impl MaxwellThreeDLoweringCache {
             configuration,
             revision: 0,
             next_identity: 1,
-            allocations: SharedCacheVec::default(),
-            views: SharedCacheVec::default(),
-            color_materializations: SharedCacheVec::default(),
+            allocations: Vec::new(),
+            views: Vec::new(),
+            color_materializations: Vec::new(),
             graphics_pipeline: None,
-            render_passes: SharedCacheVec::default(),
-            descriptors: SharedCacheVec::default(),
-            samplers: SharedCacheVec::default(),
-            shader_translation_sets: SharedFingerprintCache::default(),
-            shader_translation_sources: SharedFingerprintCache::default(),
-            shader_translations: SharedFingerprintCache::default(),
-            retired_resources: SharedCacheVec::default(),
-            accesses: SharedCacheVec::default(),
-            retained_backings: super::MaxwellThreeDRetainedBackingCache::default(),
+            render_passes: Vec::new(),
+            descriptors: Vec::new(),
+            prepared_draw: None,
+            samplers: Vec::new(),
+            shader_translation_sets: FingerprintCache::default(),
+            shader_translation_sources: FingerprintCache::default(),
+            shader_state: None,
+            shader_translations: FingerprintCache::default(),
+            retired_resources: Vec::new(),
+            accesses: Vec::new(),
+            resolved_resources: super::MaxwellThreeDResolvedResourceCache::default(),
+            resource_roles: Vec::new(),
         }
     }
     #[must_use]
@@ -825,15 +820,24 @@ impl MaxwellThreeDLoweringCache {
     pub fn view_count(&self) -> usize {
         self.views.len()
     }
-    pub(crate) fn retained_backings_mut(
+    pub(crate) fn resolved_resources_mut(
         &mut self,
-    ) -> &mut super::MaxwellThreeDRetainedBackingCache {
-        &mut self.retained_backings
+    ) -> &mut super::MaxwellThreeDResolvedResourceCache {
+        &mut self.resolved_resources
     }
 
-    #[cfg(test)]
-    pub(crate) fn evict_views_for_test(&mut self) {
-        self.views.clear();
+    pub(crate) const fn resource_cache_limit(&self) -> usize {
+        self.configuration.pipeline_entries()
+    }
+
+    pub(crate) fn take_resource_roles(&mut self) -> Vec<MaxwellThreeDResourceRole> {
+        let mut roles = std::mem::take(&mut self.resource_roles);
+        roles.clear();
+        roles
+    }
+
+    pub(crate) fn recycle_resource_roles(&mut self, roles: Vec<MaxwellThreeDResourceRole>) {
+        self.resource_roles = roles;
     }
 
     #[cfg(test)]
@@ -847,8 +851,7 @@ impl MaxwellThreeDLoweringCache {
     }
 
     /// Reuses a complete translation before rebuilding verified IR or WGSL.
-    /// The versioned input snapshot is frontend-owned and remains transactional
-    /// with the rest of the lowering cache.
+    /// The frontend owns and updates the versioned input snapshot directly.
     pub(crate) fn resolve_shader_translation_inputs(
         &mut self,
         inputs: MaxwellShaderTranslationInputs,
@@ -922,6 +925,73 @@ impl MaxwellThreeDLoweringCache {
             log::debug!("Maxwell shader source cache evicted LRU set: fingerprint={evicted:032x}");
         }
         Ok(programs)
+    }
+
+    /// Reuses the shader set directly from the retained semantic state before
+    /// constructing or hashing a source key. Ordered writes only invalidate
+    /// this path when they overlap bytes which were actually decoded.
+    pub(crate) fn resolve_shader_translation_for_state(
+        &mut self,
+        state: &MaxwellThreeDState,
+        staged_writes: &[MaxwellStagedShaderWrite],
+        address_space: &crate::MaxwellGpuAddressSpace,
+    ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
+        if let Some(record) = &self.shader_state
+            && record.state.matches(state)
+            && record.inputs.source_is_current(address_space)
+            && record.inputs.staged_writes_are_irrelevant(staged_writes)
+        {
+            return Ok(Arc::clone(&record.programs));
+        }
+
+        let source = prepare_maxwell_shader_translation_source(state, staged_writes)?;
+        let fingerprint = source.fingerprint();
+        let programs = self.resolve_shader_translation_source(source, address_space)?;
+        let inputs = self
+            .shader_translation_sources
+            .get(fingerprint)
+            .expect("resolved shader source was retained")
+            .inputs
+            .clone();
+        self.shader_state = Some(ShaderStateRecord {
+            state: state.shader_state_identity(),
+            inputs,
+            programs: Arc::clone(&programs),
+            translated: None,
+        });
+        Ok(programs)
+    }
+
+    pub(crate) fn reuse_translated_shaders_for_state(
+        &self,
+        state: &MaxwellThreeDState,
+        staged_writes: &[MaxwellStagedShaderWrite],
+        address_space: &crate::MaxwellGpuAddressSpace,
+    ) -> Option<Arc<MaxwellThreeDTranslatedShaders>> {
+        let record = self.shader_state.as_ref()?;
+        if !record.state.matches(state)
+            || !record.inputs.source_is_current(address_space)
+            || !record.inputs.staged_writes_are_irrelevant(staged_writes)
+        {
+            return None;
+        }
+        record.translated.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn retain_translated_shader_state(
+        &mut self,
+        programs: &Arc<[MaxwellTranslatedShaderProgram]>,
+        translated: Arc<MaxwellThreeDTranslatedShaders>,
+    ) {
+        let record = self
+            .shader_state
+            .as_mut()
+            .expect("translated shaders follow a resolved shader state");
+        assert!(
+            Arc::ptr_eq(&record.programs, programs),
+            "translated shaders must describe the current shader state"
+        );
+        record.translated = Some(translated);
     }
 
     /// Resolves immutable T10 products to stable logical shader identities.
@@ -1079,6 +1149,13 @@ impl MaxwellThreeDLoweringCache {
             if !retired.published {
                 continue;
             }
+            if self.prepared_draw.as_ref().is_some_and(|prepared| {
+                prepared
+                    .shader_dependencies
+                    .contains(&ResourceDependency::Shader(retired.id))
+            }) {
+                self.prepared_draw = None;
+            }
             self.retired_resources
                 .push(ResourceDependency::Shader(retired.id));
         }
@@ -1122,143 +1199,6 @@ impl MaxwellThreeDLoweringCache {
     }
 }
 
-/// Immutable preflight result. Resource creation, backend submission, and
-/// cache publication remain separate caller-controlled phases.
-pub struct MaxwellThreeDUnnegotiatedLoweringPlan {
-    expected_revision: u64,
-    candidate: MaxwellThreeDLoweringCache,
-    creations: Box<[BackendResourceCreateInfo]>,
-    invalidations: Box<[ResourceDependency]>,
-    submission: OperationSubmission,
-    dirty_images: Box<[usize]>,
-}
-
-impl MaxwellThreeDUnnegotiatedLoweringPlan {
-    #[must_use]
-    pub fn resource_creations(&self) -> &[BackendResourceCreateInfo] {
-        &self.creations
-    }
-
-    #[must_use]
-    pub fn resource_invalidations(&self) -> &[ResourceDependency] {
-        &self.invalidations
-    }
-
-    #[must_use]
-    pub const fn submission(&self) -> &OperationSubmission {
-        &self.submission
-    }
-
-    #[must_use]
-    pub fn dirty_images(&self) -> &[usize] {
-        &self.dirty_images
-    }
-
-    /// Negotiates the already complete neutral description with one real
-    /// backend capability set, without changing frontend cache state.
-    pub fn negotiate(
-        self,
-        capabilities: &BackendCapabilities,
-    ) -> Result<MaxwellThreeDLoweringPlan, MaxwellThreeDLoweringError> {
-        for creation in &self.creations {
-            let requirements = creation
-                .capability_requirements()
-                .map_err(|_| MaxwellThreeDLoweringError::InvalidResourceCreation)?;
-            capabilities
-                .negotiate(&requirements)
-                .map_err(MaxwellThreeDLoweringError::Capability)?;
-        }
-        let agreement = capabilities
-            .negotiate_all(&self.submission.capability_requirements())
-            .map_err(MaxwellThreeDLoweringError::Capability)?;
-        Ok(MaxwellThreeDLoweringPlan {
-            expected_revision: self.expected_revision,
-            candidate: self.candidate,
-            creations: self.creations,
-            invalidations: self.invalidations,
-            submission: self.submission,
-            agreement,
-            dirty_images: self.dirty_images,
-        })
-    }
-}
-
-/// Immutable preflight result negotiated with one backend capability set.
-pub struct MaxwellThreeDLoweringPlan {
-    expected_revision: u64,
-    candidate: MaxwellThreeDLoweringCache,
-    creations: Box<[BackendResourceCreateInfo]>,
-    invalidations: Box<[ResourceDependency]>,
-    submission: OperationSubmission,
-    agreement: CapabilityAgreement,
-    dirty_images: Box<[usize]>,
-}
-
-impl MaxwellThreeDLoweringPlan {
-    #[must_use]
-    pub fn resource_creations(&self) -> &[BackendResourceCreateInfo] {
-        &self.creations
-    }
-    #[must_use]
-    pub fn resource_invalidations(&self) -> &[ResourceDependency] {
-        &self.invalidations
-    }
-    #[must_use]
-    pub const fn submission(&self) -> &OperationSubmission {
-        &self.submission
-    }
-    #[must_use]
-    pub const fn capability_agreement(&self) -> CapabilityAgreement {
-        self.agreement
-    }
-    #[must_use]
-    pub fn dirty_images(&self) -> &[usize] {
-        &self.dirty_images
-    }
-
-    /// Publishes derived identities only after the caller has successfully
-    /// completed its resource-ownership and backend-submission phases.
-    pub fn commit_cache(
-        self,
-        cache: &mut MaxwellThreeDLoweringCache,
-    ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
-        commit_lowering_cache(
-            self.expected_revision,
-            self.candidate,
-            self.creations,
-            self.invalidations,
-            self.submission,
-            self.dirty_images,
-            cache,
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn commit_lowering_cache(
-    expected_revision: u64,
-    candidate: MaxwellThreeDLoweringCache,
-    creations: Box<[BackendResourceCreateInfo]>,
-    invalidations: Box<[ResourceDependency]>,
-    submission: OperationSubmission,
-    dirty_images: Box<[usize]>,
-    cache: &mut MaxwellThreeDLoweringCache,
-) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
-    if cache.revision != expected_revision {
-        return Err(MaxwellThreeDLoweringError::CacheChanged {
-            expected: expected_revision,
-            actual: cache.revision,
-        });
-    }
-    *cache = candidate;
-    Ok(MaxwellThreeDLoweredWork {
-        creations,
-        invalidations,
-        submission,
-        dirty_images,
-    })
-}
-
 /// Committed frontend record retained independently from backend handles.
 pub struct MaxwellThreeDLoweredWork {
     creations: Box<[BackendResourceCreateInfo]>,
@@ -1286,10 +1226,13 @@ impl MaxwellThreeDLoweredWork {
     }
 }
 
-/// Preflights one exact trigger without changing resolved resources, cache, or
-/// any concrete backend.
+/// Lowers one exact trigger directly into frontend-owned derived caches.
+///
+/// A lowering failure is terminal for the guest submission. Derived caches are
+/// not guest-visible state, so cloning them for rollback would only preserve a
+/// path which cannot resume.
 #[allow(clippy::too_many_arguments)]
-pub fn preflight_maxwell_three_d_operation(
+pub fn lower_maxwell_three_d_operation(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     trigger: MaxwellThreeDOperationTrigger,
@@ -1297,34 +1240,8 @@ pub fn preflight_maxwell_three_d_operation(
     submission: FrontendSubmissionId,
     predecessors: Vec<FrontendSubmissionId>,
     capabilities: &BackendCapabilities,
-    cache: &MaxwellThreeDLoweringCache,
-) -> Result<MaxwellThreeDLoweringPlan, MaxwellThreeDLoweringError> {
-    preflight_maxwell_three_d_operation_unnegotiated(
-        state,
-        resources,
-        trigger,
-        translated_shaders,
-        submission,
-        predecessors,
-        cache,
-    )?
-    .negotiate(capabilities)
-}
-
-/// Produces a complete neutral operation description before selecting or
-/// claiming support from a concrete backend.
-#[allow(clippy::too_many_arguments)]
-pub fn preflight_maxwell_three_d_operation_unnegotiated(
-    state: &MaxwellThreeDState,
-    resources: &MaxwellThreeDResolvedResources,
-    trigger: MaxwellThreeDOperationTrigger,
-    translated_shaders: Option<&MaxwellThreeDTranslatedShaders>,
-    submission: FrontendSubmissionId,
-    predecessors: Vec<FrontendSubmissionId>,
-    cache: &MaxwellThreeDLoweringCache,
-) -> Result<MaxwellThreeDUnnegotiatedLoweringPlan, MaxwellThreeDLoweringError> {
-    let expected_revision = cache.revision;
-    let mut candidate = cache.clone();
+    cache: &mut MaxwellThreeDLoweringCache,
+) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
     let work = lower_maxwell_three_d_operation_into_cache(
         state,
         resources,
@@ -1332,19 +1249,23 @@ pub fn preflight_maxwell_three_d_operation_unnegotiated(
         translated_shaders,
         submission,
         predecessors,
-        &mut candidate,
+        cache,
     )?;
-    Ok(MaxwellThreeDUnnegotiatedLoweringPlan {
-        expected_revision,
-        candidate,
-        creations: work.creations,
-        invalidations: work.invalidations,
-        submission: work.submission,
-        dirty_images: work.dirty_images,
-    })
+    for creation in work.resource_creations() {
+        let requirements = creation
+            .capability_requirements()
+            .map_err(|_| MaxwellThreeDLoweringError::InvalidResourceCreation)?;
+        capabilities
+            .negotiate(&requirements)
+            .map_err(MaxwellThreeDLoweringError::Capability)?;
+    }
+    capabilities
+        .negotiate_all(&work.submission().capability_requirements())
+        .map_err(MaxwellThreeDLoweringError::Capability)?;
+    Ok(work)
 }
 
-/// Lowers into a cache which is already isolated by the caller's transaction.
+/// Lowers into the frontend-owned cache used by ordered execution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     state: &MaxwellThreeDState,
@@ -1355,6 +1276,34 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
     predecessors: Vec<FrontendSubmissionId>,
     cache: &mut MaxwellThreeDLoweringCache,
 ) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
+    if let (MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. }, Some(shaders)) =
+        (trigger, translated_shaders)
+    {
+        let arguments = draw_arguments(state, vertex_count)?;
+        let prepared = cache
+            .prepared_draw
+            .as_ref()
+            .filter(|prepared| prepared.matches(state, resources, shaders))
+            .map(|prepared| {
+                Ok::<_, MaxwellThreeDLoweringError>((
+                    prepared.operations(arguments)?,
+                    prepared.dirty_images.to_vec(),
+                ))
+            })
+            .transpose()?;
+        if let Some((commands, dirty_images)) = prepared {
+            let invalidations = std::mem::take(&mut cache.retired_resources);
+            return finish_lowered_work(
+                cache,
+                submission,
+                predecessors,
+                Vec::new(),
+                invalidations,
+                commands,
+                dirty_images,
+            );
+        }
+    }
     if let Some(mode) = state.render_enable().execution_mode()
         && mode != MaxwellThreeDRenderEnableMode::Enabled
     {
@@ -1890,7 +1839,7 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
         shaders,
     )?;
     let mut creations = Vec::new();
-    let mut invalidations = cache.retired_resources.take();
+    let mut invalidations = std::mem::take(&mut cache.retired_resources);
     let resource_bindings = prepare_resources(
         resources,
         &resource_indices,
@@ -1927,6 +1876,27 @@ pub(crate) fn lower_maxwell_three_d_operation_into_cache(
             lowered
         }
     };
+    finish_lowered_work(
+        cache,
+        submission,
+        predecessors,
+        creations,
+        invalidations,
+        commands,
+        dirty_images,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_lowered_work(
+    cache: &mut MaxwellThreeDLoweringCache,
+    submission: FrontendSubmissionId,
+    predecessors: Vec<FrontendSubmissionId>,
+    creations: Vec<BackendResourceCreateInfo>,
+    invalidations: Vec<ResourceDependency>,
+    commands: Vec<GpuOperation>,
+    dirty_images: Vec<usize>,
+) -> Result<MaxwellThreeDLoweredWork, MaxwellThreeDLoweringError> {
     let operations = sequence_with_transitions(commands, cache)?;
     let submission = OperationSubmission::new(submission, predecessors, operations)
         .map_err(MaxwellThreeDLoweringError::Command)?;
@@ -2001,8 +1971,7 @@ fn validate_draw_blending_state(
     state: &MaxwellThreeDState,
     attachments: &DrawAttachmentSelection,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let active_targets = attachments.color_targets().collect::<Vec<_>>();
-    if active_targets.is_empty() {
+    if attachments.colors.is_empty() {
         return Ok(());
     }
 
@@ -2040,7 +2009,7 @@ fn validate_draw_blending_state(
     }
 
     let mut enabled_target = None;
-    for target in active_targets {
+    for target in attachments.color_targets() {
         match state.fixed_function().blend_enable()[target as usize].value() {
             None => {
                 return Err(MaxwellThreeDLoweringError::IncompleteBlendState {
@@ -2510,18 +2479,25 @@ fn record_clear_materialization(
     }
     if surface.depth() || surface.stencil() {
         let index = resource_index(resources, MaxwellThreeDResourceRole::DepthStencilTarget)?;
-        let record = cache
+        let position = cache
             .views
-            .iter_mut()
-            .find(|record| record.key.matches_resource(&resources.resources()[index]))
+            .iter()
+            .position(|record| record.key.matches_resource(&resources.resources()[index]))
             .ok_or(MaxwellThreeDLoweringError::InvalidResolvedView {
                 role: MaxwellThreeDResourceRole::DepthStencilTarget,
             })?;
-        if let ViewMaterialization::CompressedDepthStencil { depth, stencil } =
-            &mut record.materialization
-        {
-            *depth |= surface.depth();
-            *stencil |= surface.stencil();
+        let materialization = cache.views[position].materialization;
+        if let ViewMaterialization::CompressedDepthStencil { depth, stencil } = materialization {
+            let depth = depth || surface.depth();
+            let stencil = stencil || surface.stencil();
+            if materialization != (ViewMaterialization::CompressedDepthStencil { depth, stencil }) {
+                cache
+                    .views
+                    .get_mut(position)
+                    .expect("depth view position came from the same cache")
+                    .materialization =
+                    ViewMaterialization::CompressedDepthStencil { depth, stencil };
+            }
         }
     }
     Ok(())
@@ -2576,54 +2552,61 @@ fn validate_compressed_color_materialization(
     draw_attachments: Option<&DrawAttachmentSelection>,
     cache: &MaxwellThreeDLoweringCache,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let consumed_targets = match trigger {
-        MaxwellThreeDOperationTrigger::ClearSurface { .. } => state
-            .render_targets()
-            .clear()
-            .last_surface()
-            .value()
-            .filter(|surface| surface.color_mask() != 0)
-            .map(|surface| vec![surface.color_target()])
-            .unwrap_or_default(),
-        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => draw_attachments
-            .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?
-            .color_targets()
-            .filter(|target| {
-                state.render_targets().color()[*target as usize]
-                    .compression()
-                    .value()
-                    == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-            })
-            .collect(),
-    };
-    for target in consumed_targets.into_iter().filter(|target| {
-        state.render_targets().color()[*target as usize]
-            .compression()
-            .value()
-            == Some(&MaxwellThreeDColorCompressionMode::Enabled)
-    }) {
-        let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
-        let image = resolved_image(resources, index)?;
-        if cache
-            .color_materializations
-            .iter()
-            .any(|previous| previous.remains_materialized_for(image))
-        {
-            continue;
-        }
-        let full_clear = matches!(trigger, MaxwellThreeDOperationTrigger::ClearSurface { .. })
-            && state
+    match trigger {
+        MaxwellThreeDOperationTrigger::ClearSurface { .. } => {
+            if let Some(surface) = state
                 .render_targets()
                 .clear()
                 .last_surface()
                 .value()
-                .is_some_and(|surface| surface.color_mask() == 0xf)
-            && clear_fully_covers_image(state, image)?;
-        if !full_clear {
-            return Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target });
+                .filter(|surface| surface.color_mask() != 0)
+            {
+                validate_compressed_color_target(
+                    state,
+                    resources,
+                    cache,
+                    surface.color_target(),
+                    surface.color_mask() == 0xf,
+                )?;
+            }
+        }
+        MaxwellThreeDOperationTrigger::DrawVertexArray { .. } => {
+            for target in draw_attachments
+                .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("SET_CT_SELECT"))?
+                .color_targets()
+            {
+                validate_compressed_color_target(state, resources, cache, target, false)?;
+            }
         }
     }
     Ok(())
+}
+
+fn validate_compressed_color_target(
+    state: &MaxwellThreeDState,
+    resources: &MaxwellThreeDResolvedResources,
+    cache: &MaxwellThreeDLoweringCache,
+    target: u8,
+    complete_clear: bool,
+) -> Result<(), MaxwellThreeDLoweringError> {
+    if state.render_targets().color()[target as usize]
+        .compression()
+        .value()
+        != Some(&MaxwellThreeDColorCompressionMode::Enabled)
+    {
+        return Ok(());
+    }
+    let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
+    let image = resolved_image(resources, index)?;
+    if cache
+        .color_materializations
+        .iter()
+        .any(|previous| previous.remains_materialized_for(image))
+        || (complete_clear && clear_fully_covers_image(state, image)?)
+    {
+        return Ok(());
+    }
+    Err(MaxwellThreeDLoweringError::CompressedColorImportRequired { target })
 }
 
 fn operation_resource_indices(
@@ -3537,9 +3520,10 @@ fn lower_draw(
     cache: &mut MaxwellThreeDLoweringCache,
     creations: &mut Vec<BackendResourceCreateInfo>,
 ) -> Result<(Vec<GpuOperation>, Vec<usize>), MaxwellThreeDLoweringError> {
-    if vertex_count == 0 {
-        return Err(MaxwellThreeDLoweringError::EmptyDraw);
-    }
+    let arguments = draw_arguments(state, vertex_count)?;
+    let DrawArguments::NonIndexed { first_vertex, .. } = arguments else {
+        unreachable!("Maxwell vertex-array draw arguments are non-indexed")
+    };
     validate_shader_stages(state, shaders)?;
     for translated in &shaders.shaders {
         let record = cache
@@ -3577,24 +3561,6 @@ fn lower_draw(
             .copied()
             .ok_or(MaxwellThreeDLoweringError::IncompleteDraw("BEGIN"))?,
     )?;
-    let first_vertex = *state
-        .vertex_input()
-        .primitive()
-        .vertex_array_start()
-        .value()
-        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
-            "VERTEX_ARRAY_START",
-        ))?;
-    let base_instance = state
-        .vertex_input()
-        .assembly()
-        .global_base_instance_index()
-        .value()
-        .copied()
-        .unwrap_or(0);
-    let relative_instance = state.vertex_input().primitive().instance_index();
-    let first_instance = neutral_first_instance(base_instance, relative_instance)?;
-
     let mut vertex_buffers = Vec::new();
     for (index, stream) in state.vertex_input().streams().iter().enumerate() {
         let Some(stream_format) = stream.format().value().filter(|value| value.enabled()) else {
@@ -3849,19 +3815,13 @@ fn lower_draw(
             })?,
         ));
     }
-    let mut draw = DrawOperation::new(
+    let mut draw = PreparedDraw::new(
         pipeline,
         render_pass,
         topology,
         descriptor_tables,
         vertex_buffers,
         None,
-        DrawArguments::NonIndexed {
-            first_vertex,
-            vertex_count,
-            first_instance,
-            instance_count: 1,
-        },
     )
     .map_err(MaxwellThreeDLoweringError::Command)?;
     draw = draw.with_triangle_rasterization(triangle_rasterization);
@@ -3874,34 +3834,26 @@ fn lower_draw(
     if attachment_selection.depth_stencil.is_some() {
         draw = draw.with_depth_state(draw_depth_state(state)?);
     }
-    let begin = RenderPassOperation::begin(render_pass, render_pass_description, attachments)
-        .map_err(MaxwellThreeDLoweringError::Command)?;
-    let operations = vec![
-        GpuOperation::new(
-            GpuCommand::RenderPass(begin),
-            [],
-            [],
-            CapabilityRequirements::none(),
+    let record = PreparedDrawRecord {
+        state: state.draw_state_identity(),
+        resources: resources.identity(),
+        shaders: shaders.identity(),
+        draw: Arc::new(draw),
+        render_pass_description,
+        attachments: attachments.into_boxed_slice(),
+        shader_accesses: shader_accesses.into_boxed_slice(),
+        shader_dependencies: shader_dependencies.into_boxed_slice(),
+        requirements: CapabilityRequirements::new(
+            shaders
+                .shaders
+                .iter()
+                .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
         ),
-        GpuOperation::new(
-            GpuCommand::Draw(draw),
-            shader_accesses,
-            shader_dependencies,
-            CapabilityRequirements::new(
-                shaders
-                    .shaders
-                    .iter()
-                    .map(|shader| nixe_gpu::CapabilityRequirement::ShaderStage(shader.stage)),
-            ),
-        ),
-        GpuOperation::new(
-            GpuCommand::RenderPass(RenderPassOperation::end(render_pass)),
-            [],
-            [],
-            CapabilityRequirements::none(),
-        ),
-    ];
-    let dirty = attachment_selection.attachment_indices();
+        dirty_images: attachment_selection.attachment_indices().into_boxed_slice(),
+    };
+    let operations = record.operations(arguments)?;
+    let dirty = record.dirty_images.to_vec();
+    cache.prepared_draw = Some(record);
     Ok((operations, dirty))
 }
 
@@ -3937,13 +3889,19 @@ fn sequence_with_transitions(
             ));
         }
         for access in command.accesses() {
-            if let Some((_, scope)) = cache
+            let previous = cache
                 .accesses
-                .iter_mut()
+                .iter()
                 .find(|(target, _)| *target == access.target())
-            {
+                .map(|(_, scope)| *scope);
+            if previous.is_some_and(|scope| scope != access.scope()) {
+                let (_, scope) = cache
+                    .accesses
+                    .iter_mut()
+                    .find(|(target, _)| *target == access.target())
+                    .expect("access found immediately before mutation");
                 *scope = access.scope();
-            } else {
+            } else if previous.is_none() {
                 cache.accesses.push((access.target(), access.scope()));
             }
         }
@@ -3956,7 +3914,7 @@ fn validate_shader_stages(
     state: &MaxwellThreeDState,
     shaders: &MaxwellThreeDTranslatedShaders,
 ) -> Result<(), MaxwellThreeDLoweringError> {
-    let mut expected = Vec::new();
+    let mut expected_count = 0;
     for pipeline in state.shader_bindings().pipeline() {
         if pipeline.enabled().value() != Some(&true) {
             continue;
@@ -3977,14 +3935,12 @@ fn validate_shader_stages(
                 ));
             }
         };
-        expected.push(stage);
+        expected_count += 1;
+        if !shaders.shaders.iter().any(|shader| shader.stage == stage) {
+            return Err(MaxwellThreeDLoweringError::TranslatedShaderStageMismatch);
+        }
     }
-    if expected.is_empty()
-        || expected.len() != shaders.shaders.len()
-        || expected
-            .iter()
-            .any(|stage| !shaders.shaders.iter().any(|shader| shader.stage == *stage))
-    {
+    if expected_count == 0 || expected_count != shaders.shaders.len() {
         return Err(MaxwellThreeDLoweringError::TranslatedShaderStageMismatch);
     }
     Ok(())
@@ -4029,6 +3985,37 @@ fn primitive_topology(
 fn neutral_first_instance(base: u32, relative: u32) -> Result<u32, MaxwellThreeDLoweringError> {
     base.checked_add(relative)
         .ok_or(MaxwellThreeDLoweringError::InstanceIndexOverflow { base, relative })
+}
+
+fn draw_arguments(
+    state: &MaxwellThreeDState,
+    vertex_count: u32,
+) -> Result<DrawArguments, MaxwellThreeDLoweringError> {
+    if vertex_count == 0 {
+        return Err(MaxwellThreeDLoweringError::EmptyDraw);
+    }
+    let first_vertex = *state
+        .vertex_input()
+        .primitive()
+        .vertex_array_start()
+        .value()
+        .ok_or(MaxwellThreeDLoweringError::IncompleteDraw(
+            "VERTEX_ARRAY_START",
+        ))?;
+    let base_instance = state
+        .vertex_input()
+        .assembly()
+        .global_base_instance_index()
+        .value()
+        .copied()
+        .unwrap_or(0);
+    let relative_instance = state.vertex_input().primitive().instance_index();
+    Ok(DrawArguments::NonIndexed {
+        first_vertex,
+        vertex_count,
+        first_instance: neutral_first_instance(base_instance, relative_instance)?,
+        instance_count: 1,
+    })
 }
 
 fn neutral_vertex_format(
@@ -4493,10 +4480,6 @@ pub enum MaxwellThreeDLoweringError {
     InvalidResourceCreation,
     Command(CommandDescriptionError),
     Capability(BackendCapabilityError),
-    CacheChanged {
-        expected: u64,
-        actual: u64,
-    },
     ResourceExhausted,
 }
 
@@ -4885,10 +4868,6 @@ impl Display for MaxwellThreeDLoweringError {
                 formatter,
                 "backend capabilities cannot represent complete 3D operation: {error}"
             ),
-            Self::CacheChanged { expected, actual } => write!(
-                formatter,
-                "3D lowering cache changed after preflight: expected-revision={expected} actual-revision={actual}"
-            ),
             Self::ResourceExhausted => {
                 formatter.write_str("3D lowering exhausted host resources or identities")
             }
@@ -4900,26 +4879,24 @@ impl std::error::Error for MaxwellThreeDLoweringError {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use nixe_gpu::{
-        BufferId, DepthCompareOperation, GpuCacheConfiguration, PrimitiveTopology,
-        ResourceDependency, ShaderId, ShaderInstruction, ShaderIr, ShaderOperation,
-        ShaderPredicate, ShaderSourceLocation, ShaderStage, VerifiedShaderIr, VertexComponentCount,
+        DepthCompareOperation, GpuCacheConfiguration, PrimitiveTopology, ResourceDependency,
+        ShaderId, ShaderInstruction, ShaderIr, ShaderOperation, ShaderPredicate,
+        ShaderSourceLocation, ShaderStage, VerifiedShaderIr, VertexComponentCount,
         VertexComponentWidth, VertexFormat,
     };
 
     use crate::{MaxwellThreeDBegin, MaxwellThreeDCompareOp, MaxwellThreeDVertexAttributeFormat};
 
     use super::{
-        MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError, ShaderTranslationRecord,
-        SharedFingerprintCache, depth_stencil_attachment_required, neutral_depth_compare,
+        FingerprintCache, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
+        ShaderTranslationRecord, depth_stencil_attachment_required, neutral_depth_compare,
         neutral_first_instance, neutral_vertex_format, primitive_topology,
     };
 
     #[test]
     fn fingerprint_index_tracks_hits_for_lru_eviction() {
-        let mut cache = SharedFingerprintCache::default();
+        let mut cache = FingerprintCache::default();
         cache.push(11, "first");
         cache.push(22, "second");
 
@@ -4965,32 +4942,6 @@ mod tests {
             cache.retired_resources.as_slice(),
             [ResourceDependency::Shader(ShaderId::new(1))]
         );
-    }
-
-    #[test]
-    fn lowering_cache_candidates_copy_only_modified_collections() {
-        let cache = MaxwellThreeDLoweringCache::default();
-        let mut candidate = cache.clone();
-
-        assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
-        assert!(Arc::ptr_eq(
-            &cache.shader_translations.data,
-            &candidate.shader_translations.data
-        ));
-        candidate
-            .retired_resources
-            .push(ResourceDependency::Buffer(BufferId::new(7)));
-
-        assert!(cache.retired_resources.is_empty());
-        assert!(!Arc::ptr_eq(
-            &cache.retired_resources.0,
-            &candidate.retired_resources.0
-        ));
-        assert!(Arc::ptr_eq(&cache.views.0, &candidate.views.0));
-        assert!(Arc::ptr_eq(
-            &cache.shader_translations.data,
-            &candidate.shader_translations.data
-        ));
     }
 
     #[test]

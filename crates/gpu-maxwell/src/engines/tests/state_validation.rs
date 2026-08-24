@@ -2133,9 +2133,9 @@ fn enabled_conditional_load_stops_before_neutral_lowering() {
     let resources =
         resolve_maxwell_three_d_resources(disabled_triggered.state(), &resource_address_space())
             .unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             disabled_triggered.state(),
             &resources,
             disabled_triggered.trigger(),
@@ -2143,7 +2143,7 @@ fn enabled_conditional_load_stops_before_neutral_lowering() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
@@ -2160,10 +2160,9 @@ fn enabled_conditional_load_stops_before_neutral_lowering() {
     let resources =
         resolve_maxwell_three_d_resources(enabled_triggered.state(), &resource_address_space())
             .unwrap();
-    let cache_before = cache.clone();
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             enabled_triggered.state(),
             &resources,
             enabled_triggered.trigger(),
@@ -2171,11 +2170,10 @@ fn enabled_conditional_load_stops_before_neutral_lowering() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedConditionalLoadConstantBufferSemantics)
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2236,11 +2234,10 @@ fn non_enabled_three_d_render_modes_stop_before_neutral_lowering() {
         let resources =
             resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space())
                 .unwrap();
-        let cache = MaxwellThreeDLoweringCache::default();
-        let cache_before = cache.clone();
+        let mut cache = MaxwellThreeDLoweringCache::default();
 
         assert!(matches!(
-            preflight_maxwell_three_d_operation(
+            lower_maxwell_three_d_operation(
                 channel.three_d(),
                 &resources,
                 MaxwellThreeDOperationTrigger::ClearSurface {
@@ -2250,12 +2247,10 @@ fn non_enabled_three_d_render_modes_stop_before_neutral_lowering() {
                 FrontendSubmissionId::new(10),
                 Vec::new(),
                 &lowering_capabilities(BackendFeatures::empty()),
-                &cache,
-            ),
+                &mut cache,            ),
             Err(MaxwellThreeDLoweringError::UnsupportedRenderEnableMode(mode))
                 if mode == expected
         ));
-        assert_eq!(cache, cache_before);
     }
 }
 
@@ -2316,10 +2311,9 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
     let triggered = &dispatch.operations()[0];
     let resources =
         resolve_maxwell_three_d_resources(triggered.state(), &resource_address_space()).unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -2327,13 +2321,12 @@ fn l1_configuration_is_typed_source_preserving_shader_memory_state() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2509,7 +2502,7 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
     program_three_d(&mut channel, 0x0790, 4);
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let partial_source = channel
         .three_d()
         .shader_execution()
@@ -2518,7 +2511,7 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2529,7 +2522,7 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
             FrontendSubmissionId::new(9),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteDraw(
             "SET_SHADER_LOCAL_MEMORY_A-D"
@@ -2554,7 +2547,7 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
         .unwrap();
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2565,15 +2558,14 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
 
     program_three_d(&mut channel, 0x07a0, 0x100);
-    let cache_before = cache.clone();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2584,18 +2576,16 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
-        ),
+            &mut cache,        ),
         Err(MaxwellThreeDLoweringError::UnsupportedShaderLocalMemorySemantics {
             default_size_per_warp,
         }) if default_size_per_warp.bytes() == 0x100
     ));
-    assert_eq!(cache, cache_before);
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -2603,13 +2593,12 @@ fn active_shader_local_memory_blocks_only_draws_before_effects() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &lowering_capabilities(BackendFeatures::empty()),
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2712,7 +2701,7 @@ fn finite_visible_call_limits_defer_draw_validation_until_t10_evidence() {
     let mut channel = three_d_channel();
     let address_space = resource_address_space();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     program_three_d(&mut channel, 0x121c, 0);
 
     for argument in [0, 8] {
@@ -2725,10 +2714,9 @@ fn finite_visible_call_limits_defer_draw_validation_until_t10_evidence() {
             .unwrap();
         let resources =
             resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-        let cache_before = cache.clone();
 
         assert!(matches!(
-            preflight_maxwell_three_d_operation(
+            lower_maxwell_three_d_operation(
                 channel.three_d(),
                 &resources,
                 MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2739,19 +2727,17 @@ fn finite_visible_call_limits_defer_draw_validation_until_t10_evidence() {
                 FrontendSubmissionId::new(10),
                 Vec::new(),
                 &capabilities,
-                &cache,
+                &mut cache,
             ),
             Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
         ));
-        assert_eq!(cache, cache_before);
     }
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    let cache_before = cache.clone();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -2759,13 +2745,12 @@ fn finite_visible_call_limits_defer_draw_validation_until_t10_evidence() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2781,9 +2766,8 @@ fn visible_call_no_check_does_not_invent_a_draw_limit() {
         .unwrap();
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
-    let result = preflight_maxwell_three_d_operation(
+    let mut cache = MaxwellThreeDLoweringCache::default();
+    let result = lower_maxwell_three_d_operation(
         channel.three_d(),
         &resources,
         MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2794,14 +2778,13 @@ fn visible_call_no_check_does_not_invent_a_draw_limit() {
         FrontendSubmissionId::new(10),
         Vec::new(),
         &lowering_capabilities(BackendFeatures::empty()),
-        &cache,
+        &mut cache,
     );
 
     assert!(matches!(
         result,
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -2960,7 +2943,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let source = channel
         .three_d()
         .fixed_function()
@@ -2968,7 +2951,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -2979,7 +2962,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedStencilTestSemantics { two_sided: true })
     ));
@@ -2992,7 +2975,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
         .source()
         .unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3003,7 +2986,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::UnsupportedStencilTestSemantics { two_sided: false })
     ));
@@ -3012,7 +2995,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -3020,7 +3003,7 @@ fn two_sided_stencil_state_affects_only_enabled_stencil_draws() {
             FrontendSubmissionId::new(12),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
@@ -3036,12 +3019,11 @@ fn active_zcull_region_without_region_storage_does_not_change_draw_or_clear_sema
     let resources =
         resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
-    let cache_before = cache.clone();
+    let mut cache = MaxwellThreeDLoweringCache::default();
     let source = channel.three_d().zcull().active_region().source().unwrap();
 
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             channel.three_d(),
             &resources,
             MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3052,7 +3034,7 @@ fn active_zcull_region_without_region_storage_does_not_change_draw_or_clear_sema
             FrontendSubmissionId::new(10),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::ShaderTranslationRequired)
     ));
@@ -3060,7 +3042,7 @@ fn active_zcull_region_without_region_storage_does_not_change_draw_or_clear_sema
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -3068,13 +3050,12 @@ fn active_zcull_region_without_region_storage_does_not_change_draw_or_clear_sema
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 }
 
 #[test]
@@ -3225,13 +3206,12 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
     let mut channel = three_d_channel();
     let address_space = resource_address_space();
     let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let cache = MaxwellThreeDLoweringCache::default();
+    let mut cache = MaxwellThreeDLoweringCache::default();
 
     program_three_d(&mut channel, 0x151c, 1);
     let source = channel.three_d().zcull().stats_enable().source().unwrap();
     let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    let cache_before = cache.clone();
-    let result = preflight_maxwell_three_d_operation(
+    let result = lower_maxwell_three_d_operation(
         channel.three_d(),
         &resources,
         MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3242,7 +3222,7 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
         FrontendSubmissionId::new(10),
         Vec::new(),
         &capabilities,
-        &cache,
+        &mut cache,
     );
     assert_eq!(
         result.err(),
@@ -3252,13 +3232,12 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
         channel.three_d().zcull().stats_enable().value(),
         Some(&MaxwellThreeDZCullStatsEnable::Enabled)
     );
-    assert_eq!(cache, cache_before);
 
     let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
     let triggered = &dispatch.operations()[0];
     let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
     assert!(matches!(
-        preflight_maxwell_three_d_operation(
+        lower_maxwell_three_d_operation(
             triggered.state(),
             &resources,
             triggered.trigger(),
@@ -3266,18 +3245,17 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
             FrontendSubmissionId::new(11),
             Vec::new(),
             &capabilities,
-            &cache,
+            &mut cache,
         ),
         Err(MaxwellThreeDLoweringError::IncompleteClear(
             "horizontal rectangle"
         ))
     ));
-    assert_eq!(cache, cache_before);
 
     program_three_d(&mut channel, 0x151c, 0);
     let source = channel.three_d().zcull().stats_enable().source().unwrap();
     let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    let result = preflight_maxwell_three_d_operation(
+    let result = lower_maxwell_three_d_operation(
         channel.three_d(),
         &resources,
         MaxwellThreeDOperationTrigger::DrawVertexArray {
@@ -3288,7 +3266,7 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
         FrontendSubmissionId::new(12),
         Vec::new(),
         &capabilities,
-        &cache,
+        &mut cache,
     );
     assert_eq!(
         result.err(),
@@ -3298,7 +3276,6 @@ fn zcull_stats_are_preserved_instrumentation_policy_without_draw_semantics() {
         channel.three_d().zcull().stats_enable().value(),
         Some(&MaxwellThreeDZCullStatsEnable::Disabled)
     );
-    assert_eq!(cache, cache_before);
 }
 
 #[test]

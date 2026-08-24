@@ -4,7 +4,7 @@
 //! lifecycle validation. A concrete [`BackendDriver`] observes a resource or
 //! submission only after the complete request has passed those checks.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -240,11 +240,58 @@ impl BackendResourceCreateInfo {
 }
 
 /// Completely validated submission view passed to a concrete backend.
+pub struct ResolvedBackendResources<'a> {
+    entries: &'a [(ResourceDependency, BackendResourceHandle)],
+    shader_stages: &'a [[Option<BackendResourceHandle>; 6]],
+}
+
+impl<'a> ResolvedBackendResources<'a> {
+    fn new(
+        entries: &'a [(ResourceDependency, BackendResourceHandle)],
+        shader_stages: &'a [[Option<BackendResourceHandle>; 6]],
+    ) -> Self {
+        Self {
+            entries,
+            shader_stages,
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, dependency: &ResourceDependency) -> Option<&BackendResourceHandle> {
+        self.entries
+            .binary_search_by_key(dependency, |(candidate, _)| *candidate)
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &BackendResourceHandle> {
+        self.entries.iter().map(|(_, handle)| handle)
+    }
+
+    #[must_use]
+    pub fn shader(&self, operation: usize, stage: ShaderStage) -> Option<BackendResourceHandle> {
+        self.shader_stages
+            .get(operation)
+            .and_then(|stages| stages[shader_stage_index(stage)])
+    }
+}
+
+const fn shader_stage_index(stage: ShaderStage) -> usize {
+    match stage {
+        ShaderStage::Vertex => 0,
+        ShaderStage::TessellationControl => 1,
+        ShaderStage::TessellationEvaluation => 2,
+        ShaderStage::Geometry => 3,
+        ShaderStage::Fragment => 4,
+        ShaderStage::Compute => 5,
+    }
+}
+
 pub struct AcceptedBackendSubmission<'a> {
     token: BackendSubmissionToken,
     submission: &'a OperationSubmission,
     agreement: CapabilityAgreement,
-    resources: &'a BTreeMap<ResourceDependency, BackendResourceHandle>,
+    resources: ResolvedBackendResources<'a>,
 }
 
 impl AcceptedBackendSubmission<'_> {
@@ -264,8 +311,8 @@ impl AcceptedBackendSubmission<'_> {
     }
 
     #[must_use]
-    pub const fn resources(&self) -> &BTreeMap<ResourceDependency, BackendResourceHandle> {
-        self.resources
+    pub const fn resources(&self) -> &ResolvedBackendResources<'_> {
+        &self.resources
     }
 }
 
@@ -403,6 +450,8 @@ pub struct Backend<D> {
     device_loss_reason: Option<Box<str>>,
     resources: Vec<ResourceSlot>,
     resources_by_dependency: HashMap<ResourceDependency, BackendResourceHandle>,
+    shader_stage_scratch: Vec<[Option<BackendResourceHandle>; 6]>,
+    resolved_resource_scratch: Vec<(ResourceDependency, BackendResourceHandle)>,
     submissions: Vec<SubmissionSlot>,
     accepted_frontends: HashSet<FrontendSubmissionId>,
     active_frontend: Option<ActiveFrontendSubmission>,
@@ -419,6 +468,8 @@ impl<D: BackendDriver> Backend<D> {
             device_loss_reason: None,
             resources: Vec::new(),
             resources_by_dependency: HashMap::new(),
+            shader_stage_scratch: Vec::new(),
+            resolved_resource_scratch: Vec::new(),
             submissions: Vec::new(),
             accepted_frontends: HashSet::new(),
             active_frontend: None,
@@ -621,8 +672,23 @@ impl<D: BackendDriver> Backend<D> {
             .negotiate_all(&requirements)
             .map_err(BackendError::Capability)?;
 
-        let mut resolved = BTreeMap::new();
-        for operation in submission.operations() {
+        let mut shader_stages = std::mem::take(&mut self.shader_stage_scratch);
+        shader_stages.clear();
+        let mut entries = std::mem::take(&mut self.resolved_resource_scratch);
+        entries.clear();
+        let dependency_count = submission
+            .operations()
+            .iter()
+            .map(|operation| operation.dependencies().len())
+            .sum();
+        entries
+            .try_reserve(dependency_count)
+            .map_err(|_| BackendError::ResourceExhausted)?;
+        shader_stages
+            .try_reserve_exact(submission.operations().len())
+            .map_err(|_| BackendError::ResourceExhausted)?;
+        for (operation_index, operation) in submission.operations().iter().enumerate() {
+            let mut operation_shaders = [None; 6];
             for access in operation.accesses() {
                 self.validate_access_target(access.target())?;
             }
@@ -632,9 +698,30 @@ impl<D: BackendDriver> Backend<D> {
                 }
             }
             for dependency in operation.dependencies() {
-                resolved.insert(*dependency, self.resolve_dependency(*dependency)?);
+                let handle = if let Some((_, handle)) =
+                    entries.iter().find(|(resolved, _)| resolved == dependency)
+                {
+                    *handle
+                } else {
+                    let handle = self.resolve_dependency(*dependency)?;
+                    entries.push((*dependency, handle));
+                    handle
+                };
+                let record = self.validate_resource_handle(handle)?;
+                if let BackendResourceCreateInfo::Shader { description, .. } = &record.info {
+                    let stage_index = shader_stage_index(description.stage);
+                    if operation_shaders[stage_index].replace(handle).is_some() {
+                        return Err(BackendError::DuplicateShaderStage {
+                            operation: operation_index,
+                            stage: description.stage,
+                        });
+                    }
+                }
             }
+            shader_stages.push(operation_shaders);
         }
+        entries.sort_unstable_by_key(|(dependency, _)| *dependency);
+        let resolved = ResolvedBackendResources::new(&entries, &shader_stages);
         let (slot, generation) = next_submission_slot(&self.submissions)?;
         let token = BackendSubmissionToken::new(self.instance, slot, generation);
         self.submissions
@@ -650,18 +737,20 @@ impl<D: BackendDriver> Backend<D> {
             token,
             submission,
             agreement,
-            resources: &resolved,
+            resources: resolved,
         };
         if let Err(error) = self.driver.submit(&accepted) {
             return Err(self.handle_driver_error(error));
         }
         let record = SubmissionRecord {
-            resources: resolved
-                .values()
-                .copied()
+            resources: entries
+                .iter()
+                .map(|(_, handle)| *handle)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
+        self.shader_stage_scratch = shader_stages;
+        self.resolved_resource_scratch = entries;
         commit_submission_slot(&mut self.submissions, slot, generation, record);
         if submission.is_final_segment() {
             self.active_frontend = None;
@@ -1209,6 +1298,10 @@ pub enum BackendError {
     UnknownResource(ResourceDependency),
     AccessOutOfBounds(crate::AccessTarget),
     AccessOutsideBacking(crate::AccessTarget),
+    DuplicateShaderStage {
+        operation: usize,
+        stage: ShaderStage,
+    },
     ResourceInUse(BackendResourceHandle),
     ResourceKindMismatch(BackendResourceHandle),
     StaleResource(BackendResourceHandle),
@@ -1254,6 +1347,10 @@ impl Display for BackendError {
                     "resource access lies outside its backing view: {target:?}"
                 )
             }
+            Self::DuplicateShaderStage { operation, stage } => write!(
+                formatter,
+                "operation {operation} contains multiple {stage:?} shaders"
+            ),
             Self::ResourceInUse(handle) => write!(formatter, "resource is still in use: {handle}"),
             Self::ResourceKindMismatch(handle) => {
                 write!(

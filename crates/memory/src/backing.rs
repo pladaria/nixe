@@ -1079,6 +1079,61 @@ impl CanonicalWriteBatch {
         self.pages.is_empty()
     }
 
+    /// Returns whether this transaction modifies any byte in one logical
+    /// canonical subrange.
+    pub fn overlaps(
+        &self,
+        range: &CanonicalBackingRange,
+        offset: u64,
+        size: u64,
+    ) -> Result<bool, CanonicalWriteBatchError> {
+        let end = offset
+            .checked_add(size)
+            .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+        if end > range.size() {
+            return Err(CanonicalWriteBatchError::OutOfBounds {
+                offset,
+                size,
+                range_size: range.size(),
+            });
+        }
+        if size == 0 || self.pages.is_empty() {
+            return Ok(false);
+        }
+
+        let mut logical_start = 0_u64;
+        for segment in range.segments() {
+            let logical_end = logical_start
+                .checked_add(segment.size())
+                .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+            let read_start = offset.max(logical_start);
+            let read_end = end.min(logical_end);
+            if read_start < read_end
+                && let Some(pending) = self.pages.get(&segment.page())
+            {
+                let page_start = segment
+                    .offset()
+                    .checked_add(read_start - logical_start)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                let page_end = page_start
+                    .checked_add(read_end - read_start)
+                    .ok_or(CanonicalWriteBatchError::RangeOverflow)?;
+                if pending
+                    .dirty_ranges
+                    .iter()
+                    .any(|&(start, end)| start < page_end && page_start < end)
+                {
+                    return Ok(true);
+                }
+            }
+            logical_start = logical_end;
+            if logical_start >= end {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
     /// Reads canonical bytes with this transaction's earlier writes overlaid.
     ///
     /// Ordered device operations can therefore consume preceding writes while
@@ -2200,6 +2255,10 @@ mod tests {
             .unwrap();
         let mut batch = CanonicalWriteBatch::new();
         batch.stage(&range, 0x0ffe, &[1, 2, 3, 4]).unwrap();
+
+        assert!(!batch.overlaps(&range, 0x100, 0x100).unwrap());
+        assert!(batch.overlaps(&range, 0x0fff, 2).unwrap());
+        assert!(batch.overlaps(&range, 0x1001, 1).unwrap());
 
         let mut staged = [0xff; 6];
         batch.read_staged(&range, 0x0ffd, &mut staged).unwrap();

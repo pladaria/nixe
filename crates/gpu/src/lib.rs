@@ -25,13 +25,13 @@ pub use access::{
 };
 pub use address::{GpuVirtualAddress, GpuVirtualAddressError};
 pub use allocation::{
-    AllocationDescriptionError, BackingView, BackingViewError, GpuAllocationDescription,
-    GpuAllocationId,
+    AllocationDescriptionError, BackingView, BackingViewError, CanonicalBackingSpan,
+    GpuAllocationDescription, GpuAllocationId,
 };
 pub use backend::{
     AcceptedBackendSubmission, Backend, BackendDriver, BackendDriverError, BackendError,
     BackendResourceCreateInfo, BackendResourceHandle, BackendResourceKind,
-    BackendResourceValidationError, BackendState,
+    BackendResourceValidationError, BackendState, ResolvedBackendResources,
 };
 pub use cache::{
     DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
@@ -48,9 +48,9 @@ pub use command::{
     BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue, CommandDescriptionError,
     CopyOperation, DepthCompareOperation, DepthState, DispatchOperation, DrawArguments,
     DrawOperation, GpuCommand, GpuOperation, ImageOrigin, ImageRegion, IndexType,
-    OperationSubmission, PrimitiveTopology, QueryOperation, RenderAttachment, RenderPassOperation,
-    TriangleRasterization, VertexAttribute, VertexBufferLayout, VertexComponentCount,
-    VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
+    OperationSubmission, PreparedDraw, PrimitiveTopology, QueryOperation, RenderAttachment,
+    RenderPassOperation, TriangleRasterization, VertexAttribute, VertexBufferLayout,
+    VertexComponentCount, VertexComponentWidth, VertexFormat, VertexStepMode, ViewportTransform,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,

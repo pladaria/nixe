@@ -1,6 +1,6 @@
 //! Atomic validation of neutral resources and submissions.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +8,8 @@ use nixe_gpu::{
     AcceptedBackendSubmission, AccessScope, AccessTarget, BackendDriver, BackendDriverError,
     BackendResourceCreateInfo, BackendResourceHandle, BackendSubmissionToken, BackingView,
     BufferId, BufferRange, FrontendSubmissionId, GpuCommand, ImageId, ImageSubresourceRange,
-    QueryPoolId, QueryRange, RenderPassId, RenderPassOperation, ResourceAccess, ResourceDependency,
+    QueryPoolId, QueryRange, RenderPassId, RenderPassOperation, ResolvedBackendResources,
+    ResourceAccess, ResourceDependency,
 };
 
 use crate::timeline::{HeadlessCompletionController, SharedTimeline, TimelineState};
@@ -139,7 +140,7 @@ impl HeadlessBackendDriver {
     fn resolve_footprint(
         &self,
         target: AccessTarget,
-        resources: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        resources: &ResolvedBackendResources,
     ) -> Result<Footprint, HeadlessValidationError> {
         match target {
             AccessTarget::Buffer { buffer, range } => {
@@ -204,7 +205,7 @@ impl HeadlessBackendDriver {
     fn resource<'a>(
         &'a self,
         dependency: ResourceDependency,
-        resources: &BTreeMap<ResourceDependency, BackendResourceHandle>,
+        resources: &ResolvedBackendResources,
     ) -> Result<(BackendResourceHandle, &'a ResourceRecord), HeadlessValidationError> {
         let handle = resources
             .get(&dependency)
@@ -378,10 +379,10 @@ fn validate_operation_order(
             }
             state.active_render_pass = None;
         }
-        GpuCommand::Draw(draw) if state.active_render_pass != Some(draw.render_pass) => {
+        GpuCommand::Draw(draw) if state.active_render_pass != Some(draw.prepared.render_pass) => {
             return Err(HeadlessValidationError::DrawOutsideRenderPass {
                 operation_index,
-                requested: draw.render_pass,
+                requested: draw.prepared.render_pass,
                 active: state.active_render_pass,
             });
         }

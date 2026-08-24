@@ -61,10 +61,8 @@ pub use coverage::{
 pub(crate) use draw::lower_maxwell_three_d_operation_into_cache;
 pub use draw::{
     MaxwellThreeDLoweredWork, MaxwellThreeDLoweringCache, MaxwellThreeDLoweringError,
-    MaxwellThreeDLoweringPlan, MaxwellThreeDOperationTrigger, MaxwellThreeDShaderResourceUse,
-    MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
-    MaxwellThreeDUnnegotiatedLoweringPlan, preflight_maxwell_three_d_operation,
-    preflight_maxwell_three_d_operation_unnegotiated,
+    MaxwellThreeDOperationTrigger, MaxwellThreeDShaderResourceUse, MaxwellThreeDTranslatedShader,
+    MaxwellThreeDTranslatedShaders, lower_maxwell_three_d_operation,
 };
 pub use falcon::{
     MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
@@ -144,6 +142,7 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
     MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
+pub(crate) use resource::MaxwellThreeDResolvedResourceCache;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use resource::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
@@ -155,10 +154,6 @@ pub use resource::{
     MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureDimension,
     MaxwellThreeDTextureReference, resolve_maxwell_three_d_resources,
     resolve_maxwell_three_d_resources_for_roles,
-};
-pub(crate) use resource::{
-    MaxwellThreeDRetainedBackingCache,
-    resolve_maxwell_three_d_resources_for_roles_with_staged_writes_and_cache,
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
@@ -172,7 +167,6 @@ pub use shader_execution::{
     MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDSubtilingPerfKnobA,
     MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDVisibleCallLimit,
 };
-pub(crate) use state::MaxwellThreeDFrontendState;
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAttributePointSize, MaxwellThreeDConservativeRasterEnable, MaxwellThreeDEdgeFlag,
@@ -182,6 +176,10 @@ pub use state::{
     MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin, MaxwellThreeDState,
     MaxwellThreeDStateWrite, MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState,
     MaxwellThreeDViewportZClipRange,
+};
+pub(crate) use state::{
+    MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity,
+    MaxwellThreeDShaderStateIdentity,
 };
 pub use tiled_cache::{
     MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite,
@@ -1193,8 +1191,12 @@ fn preflight_with_shadow(
             .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
         method = method.with_effective_argument(effective_argument);
     }
+    let register_changed = candidate
+        .raw_register(method.source().method())
+        .is_none_or(|register| register.raw() != Some(method.source().argument()));
     let prepared = preflight_register(profile, method, candidate)?;
     if prepared.writes_state {
+        candidate.refresh_semantic_identities(register_changed);
         candidate.record_raw_register(prepared.method.source());
     }
     if apply_shadow_ram {

@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     fmt::{Display, Formatter},
+    sync::Arc,
 };
 
 use crate::{
@@ -577,8 +578,11 @@ impl DepthState {
     }
 }
 
+/// Immutable neutral state shared by draws which differ only in direct draw
+/// arguments. Frontends retain this record across unchanged draws so vertex
+/// layouts and pipeline state are not rebuilt for every submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DrawOperation {
+pub struct PreparedDraw {
     pub pipeline: PipelineId,
     pub render_pass: RenderPassId,
     pub topology: PrimitiveTopology,
@@ -589,10 +593,17 @@ pub struct DrawOperation {
     pub index_buffer: Option<(BufferRegion, IndexType)>,
     pub viewport_transform: Option<ViewportTransform>,
     pub depth_state: DepthState,
+    accesses: Box<[ResourceAccess]>,
+    dependencies: Box<[ResourceDependency]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrawOperation {
+    pub prepared: Arc<PreparedDraw>,
     pub arguments: DrawArguments,
 }
 
-impl DrawOperation {
+impl PreparedDraw {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pipeline: PipelineId,
@@ -601,14 +612,7 @@ impl DrawOperation {
         descriptor_tables: Vec<DescriptorTableId>,
         vertex_buffers: Vec<VertexBufferLayout>,
         index_buffer: Option<(BufferRegion, IndexType)>,
-        arguments: DrawArguments,
     ) -> Result<Self, CommandDescriptionError> {
-        if arguments.is_empty() {
-            return Err(CommandDescriptionError::EmptyDraw);
-        }
-        if arguments.is_indexed() != index_buffer.is_some() {
-            return Err(CommandDescriptionError::IndexBufferMismatch);
-        }
         let mut shader_locations = BTreeSet::new();
         for layout in &vertex_buffers {
             for attribute in &layout.attributes {
@@ -616,6 +620,43 @@ impl DrawOperation {
                     return Err(CommandDescriptionError::DuplicateVertexShaderLocation);
                 }
             }
+        }
+        let mut accesses = vertex_buffers
+            .iter()
+            .map(|layout| {
+                ResourceAccess::new(
+                    layout.buffer.target(),
+                    scope(
+                        PipelineStages::VERTEX_INPUT,
+                        AccessMode::Read,
+                        ResourceUsage::VertexBuffer,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some((buffer, _)) = index_buffer {
+            accesses.push(ResourceAccess::new(
+                buffer.target(),
+                scope(
+                    PipelineStages::VERTEX_INPUT,
+                    AccessMode::Read,
+                    ResourceUsage::IndexBuffer,
+                ),
+            ));
+        }
+        let mut dependencies = vec![
+            ResourceDependency::Pipeline(pipeline),
+            ResourceDependency::RenderPass(render_pass),
+        ];
+        extend_unique(
+            &mut dependencies,
+            descriptor_tables
+                .iter()
+                .copied()
+                .map(ResourceDependency::DescriptorTable),
+        );
+        for access in &accesses {
+            push_target_dependency(&mut dependencies, access.target());
         }
         Ok(Self {
             pipeline,
@@ -628,7 +669,8 @@ impl DrawOperation {
             index_buffer,
             viewport_transform: None,
             depth_state: DepthState::DISABLED,
-            arguments,
+            accesses: accesses.into_boxed_slice(),
+            dependencies: dependencies.into_boxed_slice(),
         })
     }
 
@@ -657,6 +699,24 @@ impl DrawOperation {
     pub const fn with_alpha_test(mut self, alpha_test: AlphaTest) -> Self {
         self.alpha_test = Some(alpha_test);
         self
+    }
+}
+
+impl DrawOperation {
+    pub fn new(
+        prepared: Arc<PreparedDraw>,
+        arguments: DrawArguments,
+    ) -> Result<Self, CommandDescriptionError> {
+        if arguments.is_empty() {
+            return Err(CommandDescriptionError::EmptyDraw);
+        }
+        if arguments.is_indexed() != prepared.index_buffer.is_some() {
+            return Err(CommandDescriptionError::IndexBufferMismatch);
+        }
+        Ok(Self {
+            prepared,
+            arguments,
+        })
     }
 }
 
@@ -966,18 +1026,7 @@ impl GpuCommand {
                 }
             }
             Self::Draw(draw) => {
-                dependencies.push(ResourceDependency::Pipeline(draw.pipeline));
-                dependencies.push(ResourceDependency::RenderPass(draw.render_pass));
-                extend_unique(
-                    &mut dependencies,
-                    draw.descriptor_tables
-                        .iter()
-                        .copied()
-                        .map(ResourceDependency::DescriptorTable),
-                );
-                for access in draw_accesses(draw) {
-                    push_target_dependency(&mut dependencies, access.target());
-                }
+                dependencies.extend_from_slice(&draw.prepared.dependencies);
             }
             Self::Dispatch(dispatch) => {
                 dependencies.push(ResourceDependency::Pipeline(dispatch.pipeline));
@@ -1288,31 +1337,7 @@ fn clear_accesses(clear: &ClearOperation) -> Vec<ResourceAccess> {
 }
 
 fn draw_accesses(draw: &DrawOperation) -> Vec<ResourceAccess> {
-    let mut accesses = draw
-        .vertex_buffers
-        .iter()
-        .map(|layout| {
-            ResourceAccess::new(
-                layout.buffer.target(),
-                scope(
-                    PipelineStages::VERTEX_INPUT,
-                    AccessMode::Read,
-                    ResourceUsage::VertexBuffer,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    if let Some((buffer, _)) = draw.index_buffer {
-        accesses.push(ResourceAccess::new(
-            buffer.target(),
-            scope(
-                PipelineStages::VERTEX_INPUT,
-                AccessMode::Read,
-                ResourceUsage::IndexBuffer,
-            ),
-        ));
-    }
-    accesses
+    draw.prepared.accesses.to_vec()
 }
 
 fn query_accesses(query: &QueryOperation) -> Vec<ResourceAccess> {
@@ -1464,12 +1489,17 @@ mod tests {
     fn draw_and_dispatch_reject_incomplete_direct_arguments() {
         assert_eq!(
             DrawOperation::new(
-                PipelineId::new(1),
-                RenderPassId::new(1),
-                PrimitiveTopology::Triangles,
-                vec![],
-                vec![],
-                None,
+                Arc::new(
+                    PreparedDraw::new(
+                        PipelineId::new(1),
+                        RenderPassId::new(1),
+                        PrimitiveTopology::Triangles,
+                        vec![],
+                        vec![],
+                        None,
+                    )
+                    .unwrap(),
+                ),
                 DrawArguments::Indexed {
                     first_index: 0,
                     index_count: 3,
@@ -1779,19 +1809,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            DrawOperation::new(
+            PreparedDraw::new(
                 PipelineId::new(1),
                 RenderPassId::new(1),
                 PrimitiveTopology::Points,
                 vec![],
                 vec![first, second],
                 None,
-                DrawArguments::NonIndexed {
-                    first_vertex: 0,
-                    vertex_count: 1,
-                    first_instance: 0,
-                    instance_count: 1,
-                },
             ),
             Err(CommandDescriptionError::DuplicateVertexShaderLocation)
         );
