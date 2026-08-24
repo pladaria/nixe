@@ -15,7 +15,7 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{
     CrossVcpuRequest, DomainRequest, EngineDomain, EngineExecutor, EngineExecutorId, EngineExit,
-    EngineProvider, EngineTimer, ExecutorRequest, RunRequest, TimerSnapshot, TracePolicy,
+    EngineProvider, EngineTimer, RunRequest, TimerSnapshot,
 };
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
@@ -28,7 +28,6 @@ pub const CONFORMANCE_FALLBACK_ENCODING: u32 = 0xd420_0000;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ConformanceCase {
     CapabilityTruthfulness,
-    InstructionTrace,
     CanonicalState,
     PreciseException,
     InterpretOneFallback,
@@ -86,7 +85,6 @@ pub fn run_provider_conformance(
         skipped: Vec::new(),
     };
     suite.capability_truthfulness()?;
-    suite.instruction_trace()?;
     suite.canonical_state()?;
     suite.precise_exception()?;
     suite.interpret_one_fallback()?;
@@ -169,13 +167,7 @@ impl Suite {
         let id = EngineExecutorId::new(self.next_executor);
         self.next_executor = self.next_executor.saturating_add(1);
         let executor = domain
-            .create_executor(ExecutorRequest {
-                executor: id,
-                trace: TracePolicy {
-                    enabled: false,
-                    detailed: false,
-                },
-            })
+            .create_executor(id)
             .map_err(|error| Self::fail(case, error.to_string()))?;
         if executor.executor_id() != id {
             return Err(Self::fail(
@@ -244,42 +236,6 @@ impl Suite {
             return Err(Self::fail(
                 case,
                 "advertised asynchronous controls have no control path",
-            ));
-        }
-        drop(executor);
-        domain
-            .shutdown()
-            .map_err(|error| Self::fail(case, error.to_string()))?;
-        self.passed.push(case);
-        Ok(())
-    }
-
-    fn instruction_trace(&mut self) -> Result<(), ConformanceFailure> {
-        let case = ConformanceCase::InstructionTrace;
-        if !self.provider.descriptor().capabilities.instruction_trace {
-            self.skipped.push(case);
-            return Ok(());
-        }
-        let mut domain = self.domain(case)?;
-        let id = EngineExecutorId::new(self.next_executor);
-        self.next_executor = self.next_executor.saturating_add(1);
-        let mut executor = domain
-            .create_executor(ExecutorRequest {
-                executor: id,
-                trace: TracePolicy {
-                    enabled: true,
-                    detailed: true,
-                },
-            })
-            .map_err(|error| Self::fail(case, error.to_string()))?;
-        let memory = fixture_memory(&[0xd503_201f], 0);
-        let mut state = state_at(CODE);
-        let report = run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
-            .map_err(|error| Self::fail(case, error))?;
-        if !report.trace.enabled || report.trace.entries.len() != 1 {
-            return Err(Self::fail(
-                case,
-                "advertised instruction tracing did not record one instruction",
             ));
         }
         drop(executor);

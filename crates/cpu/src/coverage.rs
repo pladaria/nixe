@@ -371,48 +371,13 @@ pub struct MissingInstructionFixture {
     pub execution_state: ExecutionState,
 }
 
-/// Amount of missing-instruction context retained and exported by the CPU.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum MissingInstructionReportDetail {
-    /// Keep and export the bounded surrounding instruction window.
-    #[default]
-    Detailed,
-    /// Discard the surrounding window and export only minimal identifiers.
-    Sanitized,
-}
-
-/// Narrow diagnostic policy consumed by CPU frontend resources.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CpuDiagnosticsConfig {
-    pub missing_instruction_reports: bool,
-    pub report_detail: MissingInstructionReportDetail,
-}
-
-impl CpuDiagnosticsConfig {
-    /// Returns whether the runtime should fetch surrounding bytes for reports.
-    #[must_use]
-    pub const fn captures_surrounding_instruction_bytes(self) -> bool {
-        self.missing_instruction_reports
-            && matches!(self.report_detail, MissingInstructionReportDetail::Detailed)
-    }
-}
-
-impl Default for CpuDiagnosticsConfig {
-    fn default() -> Self {
-        Self {
-            missing_instruction_reports: true,
-            report_detail: MissingInstructionReportDetail::Detailed,
-        }
-    }
-}
-
 /// Process- or title-local missing-instruction counts.
 ///
 /// Callers create one tracker per isolation scope. Keys are stable coverage IDs
 /// plus exact raw encodings; repeated observations increment frequency without
 /// replacing the first actionable context.
+#[derive(Default)]
 pub struct MissingInstructionTracker {
-    config: CpuDiagnosticsConfig,
     records: BTreeMap<MissingInstructionKey, MissingInstructionRecord>,
     total_observations: u64,
 }
@@ -423,29 +388,8 @@ impl MissingInstructionTracker {
         Self::default()
     }
 
-    /// Creates a tracker using the runtime-derived CPU diagnostics policy.
-    #[must_use]
-    pub fn with_config(config: CpuDiagnosticsConfig) -> Self {
-        Self {
-            config,
-            records: BTreeMap::new(),
-            total_observations: 0,
-        }
-    }
-
-    #[must_use]
-    pub const fn config(&self) -> CpuDiagnosticsConfig {
-        self.config
-    }
-
     /// Records an observation and returns whether it was unique in this scope.
-    pub fn record(&mut self, mut observation: MissingInstructionObservation) -> bool {
-        if !self.config.missing_instruction_reports {
-            return false;
-        }
-        if self.config.report_detail == MissingInstructionReportDetail::Sanitized {
-            observation.surrounding_bytes = Box::new([]);
-        }
+    pub fn record(&mut self, observation: MissingInstructionObservation) -> bool {
         self.total_observations = self.total_observations.saturating_add(1);
         let key = MissingInstructionKey::new(observation.coverage_id, observation.encoding);
         if !self.records.contains_key(&key) && self.records.len() >= MAX_MISSING_INSTRUCTION_RECORDS
@@ -475,10 +419,7 @@ impl MissingInstructionTracker {
         terminator: &crate::ir::terminator::Terminator,
         module: ModuleIdentity,
         surrounding_bytes: impl Into<Box<[u8]>>,
-    ) -> Result<Option<bool>, InstructionContextTooLarge> {
-        if !self.config.missing_instruction_reports {
-            return Ok(None);
-        }
+    ) -> Result<bool, InstructionContextTooLarge> {
         let crate::ir::terminator::Terminator::UnsupportedInstruction {
             source,
             encoding,
@@ -486,7 +427,7 @@ impl MissingInstructionTracker {
             ..
         } = terminator
         else {
-            return Ok(None);
+            return Ok(false);
         };
         let observation = MissingInstructionObservation::new(
             CoverageId::new(*coverage_id),
@@ -496,7 +437,7 @@ impl MissingInstructionTracker {
             source.execution_state,
             surrounding_bytes,
         )?;
-        Ok(Some(self.record(observation)))
+        Ok(self.record(observation))
     }
 
     #[must_use]
@@ -513,43 +454,12 @@ impl MissingInstructionTracker {
         self.records.values()
     }
 
-    /// Exports deterministic debug text with no code window, title data, paths,
-    /// host pointers, or caller-provided strings.
+    /// Exports diagnostics including the bounded surrounding byte window.
     #[must_use]
-    pub fn export_sanitized(&self) -> String {
+    pub fn export(&self) -> String {
         use fmt::Write;
 
-        let mut output = String::from("nixe-missing-instructions-v1\n");
-        writeln!(
-            output,
-            "unique={} observations={}",
-            self.unique_instructions(),
-            self.total_observations
-        )
-        .expect("writing to a String cannot fail");
-        for record in self.records.values() {
-            let first = &record.first;
-            writeln!(
-                output,
-                "coverage={} encoding={} state={} pc={} module={} occurrences={}",
-                first.coverage_id,
-                first.encoding,
-                first.execution_state,
-                first.pc,
-                first.module,
-                record.occurrences
-            )
-            .expect("writing to a String cannot fail");
-        }
-        output
-    }
-
-    /// Exports local diagnostics including the bounded surrounding byte window.
-    #[must_use]
-    pub fn export_detailed(&self) -> String {
-        use fmt::Write;
-
-        let mut output = String::from("nixe-missing-instructions-detailed-v1\n");
+        let mut output = String::from("nixe-missing-instructions-v2\n");
         writeln!(
             output,
             "unique={} observations={}",
@@ -577,28 +487,12 @@ impl MissingInstructionTracker {
         }
         output
     }
-
-    /// Exports using the detail level selected by the runtime policy.
-    #[must_use]
-    pub fn export(&self) -> String {
-        match self.config.report_detail {
-            MissingInstructionReportDetail::Detailed => self.export_detailed(),
-            MissingInstructionReportDetail::Sanitized => self.export_sanitized(),
-        }
-    }
-}
-
-impl Default for MissingInstructionTracker {
-    fn default() -> Self {
-        Self::with_config(CpuDiagnosticsConfig::default())
-    }
 }
 
 impl fmt::Debug for MissingInstructionTracker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MissingInstructionTracker")
-            .field("config", &self.config)
             .field("unique_instructions", &self.unique_instructions())
             .field("total_observations", &self.total_observations)
             .finish()
@@ -897,52 +791,12 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_export_and_debug_never_include_context_bytes() {
-        let mut tracker = MissingInstructionTracker::with_config(CpuDiagnosticsConfig {
-            missing_instruction_reports: true,
-            report_detail: MissingInstructionReportDetail::Sanitized,
-        });
-        tracker.record(observation(0x1000, &[0xde, 0xad, 0xbe, 0xef]));
-        let export = tracker.export();
-        assert!(export.contains("coverage=insn-00000038"));
-        assert!(export.contains("occurrences=1"));
-        assert!(!export.contains("deadbeef"));
-        assert!(
-            tracker
-                .records()
-                .next()
-                .unwrap()
-                .first_observation()
-                .surrounding_bytes()
-                .is_empty()
-        );
-        assert!(!format!("{tracker:?}").contains("deadbeef"));
-    }
-
-    #[test]
-    fn detailed_reports_are_default_and_include_bounded_context() {
+    fn reports_include_bounded_context() {
         let mut tracker = MissingInstructionTracker::new();
-        assert_eq!(
-            tracker.config().report_detail,
-            MissingInstructionReportDetail::Detailed
-        );
-        assert!(tracker.config().captures_surrounding_instruction_bytes());
         tracker.record(observation(0x1000, &[0xde, 0xad, 0xbe, 0xef]));
         let export = tracker.export();
-        assert!(export.starts_with("nixe-missing-instructions-detailed-v1"));
+        assert!(export.starts_with("nixe-missing-instructions-v2"));
         assert!(export.contains("context=deadbeef"));
-    }
-
-    #[test]
-    fn disabled_reports_do_not_retain_observations() {
-        let mut tracker = MissingInstructionTracker::with_config(CpuDiagnosticsConfig {
-            missing_instruction_reports: false,
-            report_detail: MissingInstructionReportDetail::Detailed,
-        });
-        assert!(!tracker.record(observation(0x1000, &[1, 2, 3, 4])));
-        assert_eq!(tracker.unique_instructions(), 0);
-        assert_eq!(tracker.total_observations(), 0);
-        assert!(!tracker.config().captures_surrounding_instruction_bytes());
     }
 
     #[test]
@@ -960,11 +814,10 @@ mod tests {
             reason: "missing semantics".into(),
         };
         let mut tracker = MissingInstructionTracker::new();
-        assert_eq!(
+        assert!(
             tracker
                 .record_terminator(&terminator, ModuleIdentity::new(9), &[1, 2, 3, 4][..])
-                .unwrap(),
-            Some(true)
+                .unwrap()
         );
         let record = tracker.records().next().unwrap();
         assert_eq!(record.first_observation().pc, source.pc);
@@ -1016,8 +869,7 @@ mod tests {
             tracker.unique_instructions(),
             MAX_MISSING_INSTRUCTION_RECORDS
         );
-        assert!(tracker.export_sanitized().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
-        assert!(tracker.export_detailed().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
+        assert!(tracker.export().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
     }
 
     fn entry(table: &[CoverageEntry], id: CoverageId) -> &CoverageEntry {

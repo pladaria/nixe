@@ -9,11 +9,10 @@ use nixe_gpu::{
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
-    MaxwellFrontendDispatchBoundary, MaxwellFrontendFailure, MaxwellGpfifoDecodeError,
-    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
-    MaxwellInvalidGpfifoSubmission, MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler,
-    MaxwellZCullMode, capture_maxwell_frontend_dispatch, decode_gpfifo_submission,
-    resolve_gpfifo_submission,
+    MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
+    MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
+    decode_gpfifo_submission, dispatch_maxwell_frontend, resolve_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -569,20 +568,16 @@ fn submit_gpfifo(
         .dispatch_next(dependency_reached, dispatch_address_space)
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let (capture, replay) =
-        capture_maxwell_frontend_dispatch(&dispatch, channel, dispatch_address_space);
-    if !matches!(
-        replay.failure(),
-        MaxwellFrontendFailure::ExecutionUnavailable
-    ) {
-        let boundary = MaxwellFrontendDispatchBoundary::Frontend {
-            dispatch: Box::new(dispatch),
-            capture: Box::new(capture),
-            replay: Box::new(replay),
-            execution_failure: None,
-        };
-        return Err(unsupported_frontend_boundary(descriptor, request, boundary));
-    }
+    let packets = match dispatch_maxwell_frontend(&dispatch, channel, dispatch_address_space) {
+        Ok(packets) => packets,
+        Err(failure) => {
+            let boundary = MaxwellFrontendDispatchBoundary::Frontend {
+                dispatch: Box::new(dispatch),
+                failure,
+            };
+            return Err(unsupported_frontend_boundary(descriptor, request, boundary));
+        }
+    };
     let frontend = dispatch.scheduled().frontend();
     let expected_completion = dispatch
         .scheduled()
@@ -593,7 +588,7 @@ fn submit_gpfifo(
         descriptor,
         request,
         frontend,
-        replay.packets().to_vec().into_boxed_slice(),
+        packets,
         dispatch_address_space.clone(),
         reservation.clone(),
         Arc::clone(resources.control),

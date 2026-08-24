@@ -645,6 +645,24 @@ pub trait CpuMemory: InstructionMemory {
 /// narrower extension only while applying validated mapping operations, which
 /// keeps Horizon concepts out of the CPU crate.
 pub trait ProcessMemory: CpuMemory {
+    /// Copies a checked RAM range into host storage while resolving each
+    /// spanned mapping under one bounded memory transaction.
+    fn read_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        output: &mut [u8],
+    ) -> Result<(), DataAccessFault>;
+
+    /// Atomically copies host bytes into a completely validated writable RAM
+    /// range and publishes one content mutation per affected physical page.
+    fn write_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+    ) -> Result<(), DataAccessFault>;
+
     /// Atomically resizes a zero-initialized mapping from its fixed base.
     fn resize_zeroed_mapping(
         &self,

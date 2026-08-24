@@ -1030,6 +1030,213 @@ impl CpuMemory for SyntheticMemory {
 }
 
 impl ProcessMemory for SyntheticMemory {
+    fn read_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        output: &mut [u8],
+    ) -> Result<(), DataAccessFault> {
+        let size = u64::try_from(output.len()).map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let end = address.get().checked_add(size).ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let inner = self.lock_inner();
+        if let Some(((.., fault_address, _), reason)) = inner
+            .data_faults
+            .iter()
+            .filter(|((space, current, kind), _)| {
+                *space == address_space
+                    && *kind == DataAccessKind::Read
+                    && current.get() >= address.get()
+                    && current.get() < end
+            })
+            .min_by_key(|((_, current, _), _)| *current)
+        {
+            return Err(DataAccessFault::new(
+                address_space,
+                *fault_address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::Injected(reason.clone()),
+            ));
+        }
+        let mut copied = 0;
+        while copied < output.len() {
+            let current = address
+                .checked_add(copied as u64)
+                .expect("bulk read range was checked");
+            let mapping = mapping_at(&inner, address_space, current).ok_or_else(|| {
+                DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::Unmapped,
+                )
+            })?;
+            if !mapping.permissions.contains(MemoryPermissions::READ) {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::ReadPermissionDenied,
+                ));
+            }
+            let PhysicalPage::Ram { bytes, .. } = inner
+                .pages
+                .get(&mapping.physical_page)
+                .expect("mapped physical page exists")
+            else {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Read,
+                    DataAccessFaultReason::Device("bulk guest-memory reads require RAM".into()),
+                ));
+            };
+            let offset = page_offset(current);
+            let count = (SYNTHETIC_PAGE_SIZE - offset).min(output.len() - copied);
+            if let Some(bytes) = bytes {
+                output[copied..copied + count].copy_from_slice(&bytes[offset..offset + count]);
+            } else {
+                output[copied..copied + count].fill(0);
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
+    fn write_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+    ) -> Result<(), DataAccessFault> {
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let end = address.get().checked_add(size).ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let mut inner = self.lock_inner();
+        if let Some(((.., fault_address, _), reason)) = inner
+            .data_faults
+            .iter()
+            .filter(|((space, current, kind), _)| {
+                *space == address_space
+                    && *kind == DataAccessKind::Write
+                    && current.get() >= address.get()
+                    && current.get() < end
+            })
+            .min_by_key(|((_, current, _), _)| *current)
+        {
+            return Err(DataAccessFault::new(
+                address_space,
+                *fault_address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::Injected(reason.clone()),
+            ));
+        }
+        let mut next_generations = BTreeMap::new();
+        let mut cursor = address.get();
+        while cursor < end {
+            let current = GuestVirtualAddress::new(cursor);
+            let mapping = mapping_at(&inner, address_space, current).ok_or_else(|| {
+                DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::Unmapped,
+                )
+            })?;
+            if !mapping.permissions.contains(MemoryPermissions::WRITE) {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::WritePermissionDenied,
+                ));
+            }
+            let PhysicalPage::Ram { generation, .. } = inner
+                .pages
+                .get(&mapping.physical_page)
+                .expect("mapped physical page exists")
+            else {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    current,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::Device("bulk guest-memory writes require RAM".into()),
+                ));
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                next_generations.entry(mapping.physical_page)
+            {
+                entry.insert(generation.next().map_err(|_| {
+                    DataAccessFault::new(
+                        address_space,
+                        current,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::ContentGenerationExhausted,
+                    )
+                })?);
+            }
+            cursor +=
+                (SYNTHETIC_PAGE_SIZE - page_offset(current)).min((end - cursor) as usize) as u64;
+        }
+
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let current = address
+                .checked_add(copied as u64)
+                .expect("bulk write range was checked");
+            let mapping = mapping_at(&inner, address_space, current)
+                .expect("bulk write mapping was validated");
+            let offset = page_offset(current);
+            let count = (SYNTHETIC_PAGE_SIZE - offset).min(bytes.len() - copied);
+            let PhysicalPage::Ram {
+                bytes: contents, ..
+            } = inner
+                .pages
+                .get_mut(&mapping.physical_page)
+                .expect("bulk write RAM page was validated")
+            else {
+                unreachable!("bulk write RAM page was validated")
+            };
+            contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]))
+                [offset..offset + count]
+                .copy_from_slice(&bytes[copied..copied + count]);
+            copied += count;
+        }
+        for (page, next) in next_generations {
+            let Some(PhysicalPage::Ram { generation, .. }) = inner.pages.get_mut(&page) else {
+                unreachable!("bulk write RAM page was validated")
+            };
+            *generation = next;
+        }
+        Ok(())
+    }
+
     fn resize_zeroed_mapping(
         &self,
         address_space: AddressSpaceId,
@@ -2129,6 +2336,33 @@ mod tests {
             execution.read(data_space, cross_page, unaligned_word),
             "a cross-page store fault must not commit its first bytes"
         );
+
+        for memory in [
+            &synthetic as &dyn ProcessMemory,
+            &execution as &dyn ProcessMemory,
+        ] {
+            let fault = memory
+                .write_bytes(data_space, cross_page, &[0x11, 0x22, 0x33, 0x44])
+                .unwrap_err();
+            assert_eq!(fault.address, GuestVirtualAddress::new(0x2000));
+            assert_eq!(fault.reason, DataAccessFaultReason::WritePermissionDenied);
+        }
+
+        let bulk_address = ALIAS.checked_add(0x20).unwrap();
+        let bulk_bytes = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        for memory in [
+            &synthetic as &dyn ProcessMemory,
+            &execution as &dyn ProcessMemory,
+        ] {
+            memory
+                .write_bytes(SPACE, bulk_address, &bulk_bytes)
+                .unwrap();
+            let mut observed = [0; 6];
+            memory
+                .read_bytes(SPACE, bulk_address, &mut observed)
+                .unwrap();
+            assert_eq!(observed, bulk_bytes);
+        }
 
         assert_eq!(
             synthetic.write(

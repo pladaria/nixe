@@ -1,9 +1,7 @@
 //! Provider, domain, executor, bounded dispatch, and trace implementation.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
 
-use nixe_cpu::decode::{DecodeResult, decode, disassemble};
 use nixe_cpu::error::InstructionFetchFault;
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{
@@ -16,8 +14,7 @@ use nixe_cpu_engine::{
     CapabilityRejection, CapabilityRejectionReason, CapabilityReport, DomainRequest,
     EngineCapabilities, EngineDescriptor, EngineDomain, EngineDomainId, EngineExecutor,
     EngineExecutorId, EngineFault, EngineFaultKind, EngineId, EngineKind, EngineProvider,
-    ExecutionReport, ExecutorRequest, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_TRACE_DISASSEMBLY_BYTES, RunRequest, TracePolicy,
+    ExecutionReport, RunRequest,
 };
 use nixe_memory::GuestVirtualAddress;
 
@@ -83,7 +80,6 @@ const fn capabilities() -> EngineCapabilities {
         a64: true,
         a32: true,
         t32: true,
-        instruction_trace: true,
         interpret_one_fallback: false,
         concurrent_executors: true,
         max_safepoint_instructions: std::num::NonZeroU64::new(1),
@@ -116,12 +112,9 @@ impl EngineDomain for InterpreterDomain {
 
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        Ok(Box::new(InterpreterExecutor::new(
-            request.executor,
-            request.trace,
-        )))
+        Ok(Box::new(InterpreterExecutor::new(executor)))
     }
 }
 
@@ -129,16 +122,14 @@ pub struct InterpreterExecutor {
     id: EngineExecutorId,
     exclusive_monitor: RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
     control: nixe_cpu_engine::EngineControl,
-    trace: TraceRecorder,
 }
 
 impl InterpreterExecutor {
-    fn new(id: EngineExecutorId, trace: TracePolicy) -> Self {
+    fn new(id: EngineExecutorId) -> Self {
         Self {
             id,
             exclusive_monitor: RefCell::new(Default::default()),
             control: nixe_cpu_engine::EngineControl::default(),
-            trace: TraceRecorder::new(trace),
         }
     }
 }
@@ -155,6 +146,10 @@ impl EngineExecutor for InterpreterExecutor {
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault> {
         let mut remaining = request.instruction_budget;
         let mut executed = 0_u64;
+        let context = InterpreterContext::new(request.cpu)
+            .with_memory(request.memory)
+            .with_exclusive_monitor(&self.exclusive_monitor)
+            .with_architectural_timer_provider(request.timer);
         loop {
             if let Some((source, result_code)) =
                 loader_return_observation(request.cpu, request.state, request.loader_return)
@@ -207,11 +202,6 @@ impl EngineExecutor for InterpreterExecutor {
                     ));
                 }
             };
-            let source = current_location(request.cpu, request.state);
-            let context = InterpreterContext::new(request.cpu)
-                .with_memory(request.memory)
-                .with_exclusive_monitor(&self.exclusive_monitor)
-                .with_architectural_timer_provider(request.timer);
             let outcome = match execute_one_with_context(context, request.state, encoding) {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UnsupportedInstruction {
@@ -241,7 +231,6 @@ impl EngineExecutor for InterpreterExecutor {
                     });
                 }
             };
-            self.trace.record(request.cpu, source, encoding);
             executed += 1;
             remaining -= 1;
             let stop = match outcome {
@@ -309,56 +298,6 @@ impl InterpreterExecutor {
             instructions_executed,
             stop,
             context: state.register_context(),
-            trace: self.trace.snapshot(),
-        }
-    }
-}
-
-struct TraceRecorder {
-    policy: TracePolicy,
-    entries: VecDeque<InstructionTraceEntry>,
-    next_sequence: u64,
-    discarded: u64,
-}
-impl TraceRecorder {
-    fn new(policy: TracePolicy) -> Self {
-        Self {
-            policy,
-            entries: VecDeque::new(),
-            next_sequence: 0,
-            discarded: 0,
-        }
-    }
-    fn record(
-        &mut self,
-        cpu: ProcessCpuContext,
-        source: LocationDescriptor,
-        encoding: InstructionEncoding,
-    ) {
-        if !self.policy.enabled {
-            return;
-        }
-        if self.entries.len() == MAX_INSTRUCTION_TRACE_ENTRIES {
-            self.entries.pop_front();
-            self.discarded = self.discarded.saturating_add(1);
-        }
-        let disassembly = self
-            .policy
-            .detailed
-            .then(|| instruction_description(cpu, source, encoding));
-        self.entries.push_back(InstructionTraceEntry {
-            sequence: self.next_sequence,
-            source,
-            encoding,
-            disassembly,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-    fn snapshot(&self) -> InstructionTrace {
-        InstructionTrace {
-            enabled: self.policy.enabled,
-            entries: self.entries.iter().cloned().collect(),
-            discarded: self.discarded,
         }
     }
 }
@@ -407,34 +346,4 @@ fn fetch_current(
             }
         }
     }
-}
-
-fn instruction_description(
-    cpu: ProcessCpuContext,
-    source: LocationDescriptor,
-    encoding: InstructionEncoding,
-) -> Box<str> {
-    let description = match decode(&cpu.profile(), source, encoding) {
-        DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
-            disassemble(&decoded.instruction).to_string()
-        }
-        DecodeResult::Unallocated { reason, .. } => format!("<unallocated: {reason}>"),
-        DecodeResult::Reserved { name, reason, .. } => format!("<{name}: reserved: {reason}>"),
-        DecodeResult::ProfileDisabled {
-            name, rejection, ..
-        } => format!("<{name}: profile-disabled: {rejection}>"),
-    };
-    truncate_utf8(description, MAX_TRACE_DISASSEMBLY_BYTES).into()
-}
-
-fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
-    if value.len() <= maximum_bytes {
-        return value;
-    }
-    let mut boundary = maximum_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
-    value
 }

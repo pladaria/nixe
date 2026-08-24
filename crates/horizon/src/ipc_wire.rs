@@ -218,7 +218,7 @@ pub(crate) fn connect_to_named_port(
 ) -> Result<NamedPortResult, IpcWireError> {
     let mut name = [0_u8; NAMED_PORT_NAME_SIZE];
     for (index, byte) in name.iter_mut().enumerate() {
-        *byte = read_u8(process, add(name_address, index)?)?;
+        *byte = read_byte(process, add(name_address, index)?)?;
         if *byte == 0 {
             let port_name = &name[..index];
             if port_name != b"sm:" {
@@ -421,7 +421,7 @@ pub(crate) fn send_sync_request_from_buffer(
             IpcWireError::Malformed(error.0)
         }
     })?;
-    log::debug!(
+    log::trace!(
         "SendSyncRequest handle={handle:#x} type={} command={} send_pid={} descriptors={}/{}/{}/{} handles={}/{}",
         request.command_type,
         request.command_id,
@@ -2331,7 +2331,7 @@ fn dispatch_binder_relay(
                             )
                         }
                     })?;
-            log::debug!(
+            log::trace!(
                 "Binder producer {binder_id} completed transaction {code:#x}{}",
                 if transaction.queued.is_some() {
                     " and queued a frame"
@@ -3778,10 +3778,10 @@ pub(crate) fn read_bytes(
     start: GuestVirtualAddress,
     output: &mut [u8],
 ) -> Result<(), IpcWireError> {
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = read_u8(process, add(start, index)?)?;
-    }
-    Ok(())
+    process
+        .memory()
+        .read_bytes(process.cpu().address_space_id(), start, output)
+        .map_err(IpcWireError::GuestMemory)
 }
 
 pub(crate) fn write_bytes(
@@ -3789,18 +3789,10 @@ pub(crate) fn write_bytes(
     start: GuestVirtualAddress,
     bytes: &[u8],
 ) -> Result<(), IpcWireError> {
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        process
-            .memory()
-            .write(
-                process.cpu().address_space_id(),
-                add(start, index)?,
-                MemoryAccess::normal(MemoryAccessSize::Byte),
-                MemoryValue::U8(byte),
-            )
-            .map_err(IpcWireError::GuestMemory)?;
-    }
-    Ok(())
+    process
+        .memory()
+        .write_bytes(process.cpu().address_space_id(), start, bytes)
+        .map_err(IpcWireError::GuestMemory)
 }
 
 pub(crate) fn validate_writable_ram_range(
@@ -3878,7 +3870,7 @@ fn write_response(
     })
 }
 
-fn read_u8(
+fn read_byte(
     process: &ExceptionProcessContext<'_>,
     address: GuestVirtualAddress,
 ) -> Result<u8, IpcWireError> {

@@ -629,7 +629,7 @@ impl VideoSystem {
                     .as_ref()
                     .expect("a pending presentation retains its presenter")
                     .publish(frame);
-                log::debug!(
+                log::trace!(
                     "latched resident frame from Binder producer {} slot {} at VSync {}",
                     pending.binder_id,
                     pending.slot,

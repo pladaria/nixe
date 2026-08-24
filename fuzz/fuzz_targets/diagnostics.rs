@@ -45,6 +45,5 @@ fuzz_target!(|data: &[u8]| {
     }
 
     assert!(tracker.unique_instructions() <= MAX_MISSING_INSTRUCTION_RECORDS);
-    assert!(tracker.export_sanitized().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
-    assert!(tracker.export_detailed().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
+    assert!(tracker.export().len() <= MAX_MISSING_INSTRUCTION_EXPORT_BYTES);
 });

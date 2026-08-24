@@ -51,11 +51,9 @@ impl EngineDomain for LyingDomain {
 
     fn create_executor(
         &mut self,
-        request: ExecutorRequest,
+        executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        Ok(Box::new(LyingExecutor {
-            id: request.executor,
-        }))
+        Ok(Box::new(LyingExecutor { id: executor }))
     }
 }
 
@@ -77,11 +75,6 @@ impl EngineExecutor for LyingExecutor {
             instructions_executed: 0,
             stop: EngineExit::BudgetExhausted,
             context: request.state.register_context(),
-            trace: InstructionTrace {
-                enabled: false,
-                entries: Box::new([]),
-                discarded: 0,
-            },
         })
     }
 

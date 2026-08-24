@@ -22,7 +22,6 @@ pub struct EngineCapabilities {
     pub a64: bool,
     pub a32: bool,
     pub t32: bool,
-    pub instruction_trace: bool,
     /// The engine can stop at a canonical boundary and request that the
     /// reference engine execute exactly one guest instruction.
     pub interpret_one_fallback: bool,
@@ -65,7 +64,6 @@ impl EngineCapabilities {
         (!required.a64 || self.a64)
             && (!required.a32 || self.a32)
             && (!required.t32 || self.t32)
-            && (!required.instruction_trace || self.instruction_trace)
             && (!required.interpret_one_fallback || self.interpret_one_fallback)
             && (!required.concurrent_executors || self.concurrent_executors)
             && match (

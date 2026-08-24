@@ -1,7 +1,7 @@
 //! Lock-free cross-vCPU control publication and acknowledgement.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const CONTROL_PREEMPT: u32 = 1 << 0;
 const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;
@@ -37,6 +37,7 @@ impl ControlSnapshot {
 
 #[derive(Default)]
 struct EngineControlState {
+    pending: AtomicBool,
     requests: AtomicU32,
     events: AtomicU32,
     invalidation_epoch: AtomicU64,
@@ -79,10 +80,15 @@ impl EngineControl {
         self.state
             .requests
             .fetch_or(request.bit(), Ordering::Release);
+        self.state.pending.store(true, Ordering::Release);
     }
 
     pub fn post_event(&self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
         self.state.events.fetch_or(mask, Ordering::Release);
+        self.state.pending.store(true, Ordering::Release);
     }
 
     pub fn request_invalidation(&self, epoch: u64) {
@@ -94,6 +100,11 @@ impl EngineControl {
 
     #[must_use]
     pub fn take_pending(&self) -> Option<ControlSnapshot> {
+        if !self.state.pending.load(Ordering::Acquire)
+            || !self.state.pending.swap(false, Ordering::AcqRel)
+        {
+            return None;
+        }
         let requests = self.state.requests.swap(0, Ordering::AcqRel);
         let event_mask = self.state.events.swap(0, Ordering::AcqRel);
         if requests == 0 && event_mask == 0 {

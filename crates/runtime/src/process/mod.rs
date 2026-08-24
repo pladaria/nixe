@@ -12,10 +12,8 @@ use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
 #[cfg(test)]
 use builder::{a32_register, a64_register, initialize_thread, validate_range};
 pub use execution::{
-    ExecutionReport, ExecutionStop, InstructionTrace, InstructionTraceEntry,
-    MAX_INSTRUCTION_TRACE_ENTRIES, MAX_INSTRUCTION_TRACE_EXPORT_BYTES, MAX_TRACE_DISASSEMBLY_BYTES,
-    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessTeardownFailure,
-    ProcessTeardownReport, ThreadExit,
+    ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExit, ProcessExitCause,
+    ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,

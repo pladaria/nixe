@@ -198,11 +198,9 @@ impl nixe_cpu_engine::EngineDomain for ControlLyingDomain {
 
     fn create_executor(
         &mut self,
-        request: nixe_cpu_engine::ExecutorRequest,
+        executor: nixe_cpu_engine::EngineExecutorId,
     ) -> Result<Box<dyn nixe_cpu_engine::EngineExecutor>, nixe_cpu_engine::EngineFault> {
-        Ok(Box::new(RuntimeFakeExecutor {
-            id: request.executor,
-        }))
+        Ok(Box::new(RuntimeFakeExecutor { id: executor }))
     }
 }
 
@@ -219,11 +217,9 @@ impl nixe_cpu_engine::EngineDomain for RuntimeFakeDomain {
 
     fn create_executor(
         &mut self,
-        request: nixe_cpu_engine::ExecutorRequest,
+        executor: nixe_cpu_engine::EngineExecutorId,
     ) -> Result<Box<dyn nixe_cpu_engine::EngineExecutor>, nixe_cpu_engine::EngineFault> {
-        Ok(Box::new(RuntimeFakeExecutor {
-            id: request.executor,
-        }))
+        Ok(Box::new(RuntimeFakeExecutor { id: executor }))
     }
 }
 
@@ -248,11 +244,6 @@ impl nixe_cpu_engine::EngineExecutor for RuntimeFakeExecutor {
             instructions_executed: 0,
             stop: nixe_cpu_engine::EngineExit::PendingEvent { mask: 0x80 },
             context: request.state.register_context(),
-            trace: nixe_cpu_engine::InstructionTrace {
-                enabled: false,
-                entries: Box::new([]),
-                discarded: 0,
-            },
         })
     }
     fn clear_local_exclusive_reservation(&mut self) {}

@@ -19,7 +19,6 @@ impl RunnableProcess {
         vcpu_count: usize,
     ) -> nixe_cpu_engine::EngineCapabilities {
         let mut required = nixe_cpu_engine::EngineCapabilities {
-            instruction_trace: self.execution.instruction_trace_enabled(),
             deterministic_execution: !parallel,
             concurrent_executors: parallel,
             max_safepoint_instructions: parallel

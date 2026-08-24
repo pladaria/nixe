@@ -8,9 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{
-    CpuEngineSelection, DiagnosticReportDetail, DiagnosticsConfig, InitialOperationMode, TimeMode,
-};
+use nixe_config::{CpuEngineSelection, InitialOperationMode, TimeMode};
 use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
 use nixe_gpu::BackendInstanceId;
@@ -26,10 +24,9 @@ use nixe_input::{
 use nixe_loader_title::NacpLanguage;
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
-    DiagnosticsPolicy, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
-    ReportDetail, RunnableProcess, RuntimeCoordinator, VcpuExecutionMode, VirtualClock,
-    VirtualClockMode,
+    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder, ProcessExit,
+    ProcessExitCause, ProcessRegistration, ProcessTeardownReport, RunnableProcess,
+    RuntimeCoordinator, VcpuExecutionMode, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
@@ -39,6 +36,7 @@ use crate::logging::LogLevel;
 use super::load_config;
 
 const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
+const MAX_EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
 const MAXWELL_PUSHBUFFER_DUMP_FILENAME: &str = "pushbuffer.bin";
@@ -139,12 +137,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     }
 
     log::info!("preparing process memory and initial thread state");
-    let mut diagnostics = diagnostics_policy(config.diagnostics);
-    let instruction_trace = log::log_enabled!(log::Level::Trace);
-    if instruction_trace {
-        diagnostics.instruction_trace = true;
-        log::info!("instruction trace enabled; execution will be substantially slower");
-    }
     let clock_mode = match config.system.time.mode {
         TimeMode::Realtime => VirtualClockMode::Realtime,
         TimeMode::Fixed => VirtualClockMode::Fixed {
@@ -172,13 +164,11 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let process_started = Instant::now();
     let engine_provider = select_cpu_engine(
         config.cpu.engine,
-        diagnostics,
         config.cpu.parallel_vcpus,
         machine_profile.cpu(),
         machine_profile.scheduler().vcpus().len(),
     )?;
     let process = ProcessBuilder::new()
-        .with_diagnostics(diagnostics)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config())
@@ -242,7 +232,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         return finish_execution(execute_worker(
             coordinator,
             process,
-            instruction_trace,
             horizon_environment,
             video_system,
             gamepad_profiles,
@@ -259,7 +248,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             execute_worker(
                 coordinator,
                 process,
-                instruction_trace,
                 horizon_environment,
                 video_system,
                 gamepad_profiles,
@@ -275,17 +263,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|_| "guest execution worker panicked".to_owned())?;
     let execution_result = finish_execution(worker_result);
     frontend_result.and(execution_result)
-}
-
-fn diagnostics_policy(config: DiagnosticsConfig) -> DiagnosticsPolicy {
-    DiagnosticsPolicy {
-        report_detail: match config.report_detail {
-            DiagnosticReportDetail::Detailed => ReportDetail::Detailed,
-            DiagnosticReportDetail::Sanitized => ReportDetail::Sanitized,
-        },
-        instruction_trace: config.instruction_trace,
-        ..DiagnosticsPolicy::default()
-    }
 }
 
 const fn system_language(language: NacpLanguage) -> SystemLanguage {
@@ -311,7 +288,6 @@ const fn system_language(language: NacpLanguage) -> SystemLanguage {
 
 fn select_cpu_engine(
     selection: CpuEngineSelection,
-    diagnostics: DiagnosticsPolicy,
     parallel_vcpus: bool,
     profile: nixe_cpu::profile::GuestCpuProfile,
     vcpu_count: usize,
@@ -329,7 +305,6 @@ fn select_cpu_engine(
                 a64: true,
                 a32: false,
                 t32: false,
-                instruction_trace: diagnostics.instruction_trace,
                 interpret_one_fallback: false,
                 concurrent_executors: parallel_vcpus,
                 max_safepoint_instructions: parallel_vcpus
@@ -357,7 +332,6 @@ mod engine_selection_tests {
         for selection in [CpuEngineSelection::Auto, CpuEngineSelection::Interpreter] {
             let provider = select_cpu_engine(
                 selection,
-                DiagnosticsPolicy::default(),
                 false,
                 profile.cpu(),
                 profile.scheduler().vcpus().len(),
@@ -368,7 +342,6 @@ mod engine_selection_tests {
         assert!(
             select_cpu_engine(
                 CpuEngineSelection::Interpreter,
-                DiagnosticsPolicy::default(),
                 true,
                 profile.cpu(),
                 profile.scheduler().vcpus().len(),
@@ -415,7 +388,6 @@ struct HorizonEnvironment {
 fn execute_worker(
     mut coordinator: RuntimeCoordinator,
     process: RunnableProcess,
-    instruction_trace: bool,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     gamepad_profiles: GamepadProfiles,
@@ -440,7 +412,6 @@ fn execute_worker(
             };
             execute(
                 &mut scheduled,
-                instruction_trace,
                 horizon_environment,
                 execution_video,
                 &mut input,
@@ -520,7 +491,6 @@ struct ScheduledProcess<'a> {
 
 fn execute(
     scheduled: &mut ScheduledProcess<'_>,
-    print_trace: bool,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     input: &mut InputManager<SdlInputBackend>,
@@ -539,12 +509,16 @@ fn execute(
     let mut last_progress_instructions = 0_u64;
     let mut last_progress_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
-    let mut last_trace_sequence = None;
     let mut next_input_poll = Duration::ZERO;
     let mut last_input_poll = Duration::ZERO;
     let mut active_input = None;
     let mut input_observed = false;
     let mut active_buttons = EmulatedButtonState::default();
+    let base_instruction_budget = coordinator
+        .scheduler()
+        .profile()
+        .default_timeslice_instructions();
+    let mut instruction_budget = base_instruction_budget;
     loop {
         dispatcher.synchronize_virtual_time(coordinator.virtual_time_ns());
         coordinator
@@ -596,14 +570,6 @@ fn execute(
             last_input_poll = elapsed;
             next_input_poll = elapsed.saturating_add(INPUT_POLL_INTERVAL);
         }
-        let instruction_budget = if print_trace {
-            1
-        } else {
-            coordinator
-                .scheduler()
-                .profile()
-                .default_timeslice_instructions()
-        };
         let executions = match coordinator.execution_mode() {
             VcpuExecutionMode::Deterministic => coordinator
                 .run_next(instruction_budget)
@@ -619,6 +585,13 @@ fn execute(
                 .map_err(|error| error.to_string())?;
             continue;
         }
+        instruction_budget = next_instruction_budget(
+            instruction_budget,
+            base_instruction_budget,
+            executions
+                .iter()
+                .all(|execution| matches!(execution.report.stop, ExecutionStop::BudgetExhausted)),
+        );
         for execution in executions {
             let thread_id = execution.lease.thread;
             let report = execution.report;
@@ -634,14 +607,6 @@ fn execute(
                 last_progress_instructions = instructions;
                 last_progress_elapsed = elapsed;
                 next_progress = next_progress.saturating_add(EXECUTION_PROGRESS_INTERVAL);
-            }
-            if print_trace {
-                for entry in report.trace.entries() {
-                    if last_trace_sequence.is_none_or(|sequence| entry.sequence > sequence) {
-                        log::trace!("{entry}");
-                        last_trace_sequence = Some(entry.sequence);
-                    }
-                }
             }
             match &report.stop {
                 ExecutionStop::BudgetExhausted
@@ -691,6 +656,16 @@ fn execute(
     }
 }
 
+fn next_instruction_budget(current: u64, baseline: u64, uninterrupted: bool) -> u64 {
+    if uninterrupted {
+        current
+            .saturating_mul(2)
+            .min(MAX_EXECUTION_SLICE_INSTRUCTIONS.max(baseline))
+    } else {
+        baseline
+    }
+}
+
 fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
     let HorizonSvcFault::Ipc { fault, .. } = fault else {
         return;
@@ -700,8 +675,16 @@ fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
     else {
         return;
     };
-    let Some(capture) = boundary.frontend_capture() else {
+    if boundary.frontend_failure().is_none() {
         return;
+    }
+    let diagnostic = match boundary.frontend_diagnostic() {
+        Ok(Some(diagnostic)) => diagnostic,
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!("cannot reconstruct failed Maxwell pushbuffer: {error}");
+            return;
+        }
     };
     let directory = PathBuf::from(MAXWELL_PUSHBUFFER_DUMP_DIRECTORY);
     let path = directory.join(MAXWELL_PUSHBUFFER_DUMP_FILENAME);
@@ -710,16 +693,17 @@ fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
         std::fs::create_dir_all(&directory)?;
         let file = File::create(&path)?;
         let mut writer = BufWriter::new(file);
-        write_nv_push_dump_words(&mut writer, capture.words().iter().map(|word| word.value()))?;
+        write_nv_push_dump_words(&mut writer, diagnostic.words().iter().copied())?;
         writer.flush()
     })();
 
     match result {
         Ok(()) => log::info!(
-            "Maxwell pushbuffer dumped for nv_push_dump: path={} words={} complete={}",
+            "Maxwell pushbuffer dumped for nv_push_dump: path={} words={} total={} complete={}",
             path.display(),
-            capture.words().len(),
-            capture.is_complete(),
+            diagnostic.words().len(),
+            diagnostic.total_words(),
+            diagnostic.is_complete(),
         ),
         Err(error) => log::warn!(
             "cannot dump Maxwell pushbuffer to {}: {error}",
@@ -959,6 +943,17 @@ mod tests {
             host_service_wait_duration(Duration::from_millis(13), Duration::from_millis(12)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn execution_budget_grows_only_across_uninterrupted_slices() {
+        let baseline = 10_000;
+        let mut budget = baseline;
+        for expected in [20_000, 40_000, 80_000, 100_000, 100_000] {
+            budget = next_instruction_budget(budget, baseline, true);
+            assert_eq!(budget, expected);
+        }
+        assert_eq!(next_instruction_budget(budget, baseline, false), baseline);
     }
 
     #[test]

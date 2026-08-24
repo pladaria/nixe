@@ -3,7 +3,6 @@ use super::*;
 /// Builds an emulated process from a prepared launch plan.
 #[derive(Default)]
 pub struct ProcessBuilder {
-    diagnostics: crate::DiagnosticsPolicy,
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
@@ -15,7 +14,6 @@ impl std::fmt::Debug for ProcessBuilder {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ProcessBuilder")
-            .field("diagnostics", &self.diagnostics)
             .field("config", &self.config)
             .field("virtual_clock", &self.virtual_clock)
             .field("sd_card_root", &self.sd_card_root)
@@ -38,19 +36,13 @@ impl std::fmt::Debug for ProcessBuilder {
 }
 
 impl ProcessBuilder {
-    /// Creates a process builder using detailed diagnostics and Switch 1 defaults.
+    /// Creates a process builder using Switch 1 defaults.
     ///
     /// The application must inject a selected CPU engine provider before
     /// [`Self::build`]; runtime deliberately has no concrete-engine default.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[must_use]
-    pub const fn with_diagnostics(mut self, diagnostics: crate::DiagnosticsPolicy) -> Self {
-        self.diagnostics = diagnostics;
-        self
     }
 
     #[must_use]
@@ -117,7 +109,7 @@ impl ProcessBuilder {
         let abi = metadata.abi;
         let random_entropy = generate_process_entropy()?;
         let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
-        let required = engine_requirements(execution_state, self.diagnostics.instruction_trace);
+        let required = engine_requirements(execution_state);
         let report = engine_provider.probe(self.config.cpu_profile, required);
         if !report.available
             || report.descriptor != engine_provider.descriptor()
@@ -139,9 +131,9 @@ impl ProcessBuilder {
         if let Some(fallback) = self.fallback_engine_provider.as_deref() {
             let report = fallback.probe(
                 self.config.cpu_profile,
-                engine_requirements(execution_state, false),
+                engine_requirements(execution_state),
             );
-            let fallback_required = engine_requirements(execution_state, false);
+            let fallback_required = engine_requirements(execution_state);
             if !report.available
                 || report.descriptor != fallback.descriptor()
                 || !report.descriptor.capabilities.is_coherent()
@@ -367,7 +359,6 @@ impl ProcessBuilder {
             .transpose()?;
         let execution = execution::ProcessExecutionControl::with_provider(
             execution::ProcessExecutionConfiguration {
-                diagnostics: self.diagnostics,
                 virtual_clock: self.virtual_clock.clone(),
                 timer_frequency: self.config.architectural_timer_frequency,
                 cpu,
@@ -415,15 +406,11 @@ impl ProcessBuilder {
     }
 }
 
-fn engine_requirements(
-    state: ExecutionState,
-    instruction_trace: bool,
-) -> nixe_cpu_engine::EngineCapabilities {
+fn engine_requirements(state: ExecutionState) -> nixe_cpu_engine::EngineCapabilities {
     nixe_cpu_engine::EngineCapabilities {
         a64: state == ExecutionState::A64,
         a32: state == ExecutionState::A32,
         t32: state == ExecutionState::T32,
-        instruction_trace,
         deterministic_execution: true,
         ..Default::default()
     }

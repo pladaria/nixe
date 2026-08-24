@@ -13,8 +13,9 @@ use std::{
 use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
-    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, ContentGeneration,
-    ContentMutationEpoch, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
+    ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId, GuestVirtualAddress,
+    MappingGeneration,
 };
 
 use crate::{
@@ -662,56 +663,76 @@ impl ExecutionMemory {
         address: GuestVirtualAddress,
         bytes: &[u8],
     ) -> bool {
-        self.write_mapped_ram_checked(address_space, address, bytes, false)
+        self.overwrite_bytes_checked(address_space, address, bytes)
+            .is_ok()
     }
 
-    /// Atomically writes a fully validated guest-writable RAM range. No byte
-    /// is changed when any page is unmapped, non-RAM, read-only, or unable to
-    /// publish its next content generation.
-    pub fn write_mapped_ram(
+    fn overwrite_bytes_checked(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         bytes: &[u8],
-    ) -> bool {
-        self.write_mapped_ram_checked(address_space, address, bytes, true)
-    }
-
-    fn write_mapped_ram_checked(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        bytes: &[u8],
-        require_write: bool,
-    ) -> bool {
-        let Some(end) = address.get().checked_add(bytes.len() as u64) else {
-            return false;
-        };
+    ) -> Result<(), DataAccessFault> {
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let end = address.get().checked_add(size).ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
         let inner = self.lock_inner();
         let mut cursor = address.get();
         let mut pending_generations = BTreeMap::new();
         while cursor < end {
             let virtual_address = GuestVirtualAddress::new(cursor);
-            let Some(mapping) = inner.mapping_at(address_space, virtual_address) else {
-                return false;
-            };
-            if require_write && !mapping.permissions.contains(MemoryPermissions::WRITE) {
-                return false;
-            }
+            let mapping = inner
+                .mapping_at(address_space, virtual_address)
+                .ok_or_else(|| {
+                    DataAccessFault::new(
+                        address_space,
+                        virtual_address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::Unmapped,
+                    )
+                })?;
             let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
             else {
-                return false;
+                return Err(DataAccessFault::new(
+                    address_space,
+                    virtual_address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::Device("bulk guest-memory writes require RAM".into()),
+                ));
             };
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 pending_generations.entry(mapping.physical_slot)
             {
-                if backing.prepare_write().is_err() {
-                    return false;
-                }
+                backing.prepare_write().map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        virtual_address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?;
                 let current = backing.content_generation();
-                let Ok(next) = current.next() else {
-                    return false;
-                };
+                let next = current.next().map_err(|_| {
+                    DataAccessFault::new(
+                        address_space,
+                        virtual_address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::ContentGenerationExhausted,
+                    )
+                })?;
                 entry.insert((current, next));
             }
             let remaining_in_page = SYNTHETIC_PAGE_SIZE - page_offset(virtual_address);
@@ -738,12 +759,17 @@ impl ExecutionMemory {
             } else {
                 backing.write_fragment_preflighted(offset, &bytes[copied..copied + count], next)
             };
-            if result.is_err() {
-                return false;
-            }
+            result.map_err(|reason| {
+                DataAccessFault::new(
+                    address_space,
+                    virtual_address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?;
             copied += count;
         }
-        true
+        Ok(())
     }
 
     /// Publishes an alias mapping for an existing physical page.
@@ -1032,6 +1058,29 @@ fn resolve_access(
         };
         Some((mapping, mapping.permissions, region))
     })
+}
+
+fn bulk_translation_fault(
+    error: CanonicalRangeTranslationError,
+    kind: DataAccessKind,
+) -> DataAccessFault {
+    let reason = match error.reason {
+        CanonicalRangeTranslationErrorReason::AddressOverflow
+        | CanonicalRangeTranslationErrorReason::Empty => DataAccessFaultReason::AddressOverflow,
+        CanonicalRangeTranslationErrorReason::Unmapped => DataAccessFaultReason::Unmapped,
+        CanonicalRangeTranslationErrorReason::PermissionDenied => match kind {
+            DataAccessKind::Read => DataAccessFaultReason::ReadPermissionDenied,
+            DataAccessKind::Write => DataAccessFaultReason::WritePermissionDenied,
+        },
+        CanonicalRangeTranslationErrorReason::DeviceMemory => {
+            DataAccessFaultReason::Device("bulk guest-memory transfers require RAM".into())
+        }
+        CanonicalRangeTranslationErrorReason::InconsistentBacking
+        | CanonicalRangeTranslationErrorReason::ResourceExhausted => {
+            DataAccessFaultReason::HostBacking(error.to_string().into())
+        }
+    };
+    DataAccessFault::new(error.address_space, error.address, kind, reason)
 }
 
 impl CpuMemory for ExecutionMemory {
@@ -1532,6 +1581,76 @@ impl CpuMemory for ExecutionMemory {
 }
 
 impl ProcessMemory for ExecutionMemory {
+    fn read_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        output: &mut [u8],
+    ) -> Result<(), DataAccessFault> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let size = u64::try_from(output.len()).map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let range = self
+            .translate_canonical_range(address_space, address, size, MemoryPermissions::READ)
+            .map_err(|error| bulk_translation_fault(error, DataAccessKind::Read))?;
+        range.read(0, output).map_err(|error| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::HostBacking(error.to_string().into()),
+            )
+        })
+    }
+
+    fn write_bytes(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        bytes: &[u8],
+    ) -> Result<(), DataAccessFault> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let range = self
+            .translate_canonical_range(address_space, address, size, MemoryPermissions::WRITE)
+            .map_err(|error| bulk_translation_fault(error, DataAccessKind::Write))?;
+        let mut batch = CanonicalWriteBatch::new();
+        batch.stage(&range, 0, bytes).map_err(|error| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::HostBacking(error.to_string().into()),
+            )
+        })?;
+        batch.commit().map_err(|error| {
+            let reason = match error {
+                nixe_memory::CanonicalWriteBatchError::GenerationExhausted(_) => {
+                    DataAccessFaultReason::ContentGenerationExhausted
+                }
+                error => DataAccessFaultReason::HostBacking(error.to_string().into()),
+            };
+            DataAccessFault::new(address_space, address, DataAccessKind::Write, reason)
+        })
+    }
+
     fn resize_zeroed_mapping(
         &self,
         address_space: AddressSpaceId,
@@ -1908,7 +2027,13 @@ mod tests {
                 MemoryPermissions::READ,
             )
             .unwrap();
-        assert!(!memory.write_mapped_ram(space, GuestVirtualAddress::new(0x1fff), &[0xaa, 0xbb],));
+        assert_eq!(
+            memory
+                .write_bytes(space, GuestVirtualAddress::new(0x1fff), &[0xaa, 0xbb])
+                .unwrap_err()
+                .reason,
+            DataAccessFaultReason::WritePermissionDenied
+        );
         assert_eq!(
             memory
                 .read(

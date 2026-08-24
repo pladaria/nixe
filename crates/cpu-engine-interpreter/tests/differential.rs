@@ -4,7 +4,7 @@ use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a64::A64State};
 use nixe_cpu_engine::{
     DomainRequest, EngineDomain, EngineDomainId, EngineExecutorId, EngineExit, EngineTimer,
-    ExecutorRequest, RunRequest, TimerSnapshot, TracePolicy,
+    RunRequest, TimerSnapshot,
 };
 use nixe_cpu_engine_interpreter::InterpreterDomain;
 use nixe_cpu_engine_interpreter::{
@@ -26,7 +26,7 @@ impl EngineTimer for FixedTimer {
 }
 
 #[test]
-fn engine_domain_matches_direct_single_step_state_counts_stops_and_trace() {
+fn engine_domain_matches_direct_single_step_state_counts_and_stops() {
     for (encoding, expected_exception) in [(0x9100_0400_u32, false), (0xd400_0541, true)] {
         let cpu = ProcessCpuContext::new(GuestCpuProfile::switch_1(), AddressSpaceId::new(1));
         let memory = memory(encoding);
@@ -41,15 +41,7 @@ fn engine_domain_matches_direct_single_step_state_counts_stops_and_trace() {
 
         let mut adapted = initial;
         let mut domain = InterpreterDomain::new(EngineDomainId::new(1));
-        let mut executor = domain
-            .create_executor(ExecutorRequest {
-                executor: EngineExecutorId::new(1),
-                trace: TracePolicy {
-                    enabled: true,
-                    detailed: true,
-                },
-            })
-            .unwrap();
+        let mut executor = domain.create_executor(EngineExecutorId::new(1)).unwrap();
         let report = executor
             .run_slice(RunRequest {
                 cpu,
@@ -62,11 +54,6 @@ fn engine_domain_matches_direct_single_step_state_counts_stops_and_trace() {
             .unwrap();
         assert_eq!(adapted, direct);
         assert_eq!(report.instructions_executed, 1);
-        assert_eq!(report.trace.entries().len(), 1);
-        assert_eq!(
-            report.trace.entries()[0].encoding,
-            InstructionEncoding::from_u32(encoding)
-        );
         assert_eq!(
             matches!(report.stop, EngineExit::SupervisorCall { .. }),
             expected_exception

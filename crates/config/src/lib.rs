@@ -102,8 +102,6 @@ impl NixeConfig {
             },
             diagnostics: DiagnosticsConfig {
                 log_level: raw.diagnostics.log_level,
-                report_detail: raw.diagnostics.report_detail,
-                instruction_trace: raw.diagnostics.instruction_trace,
             },
             cpu: CpuConfig {
                 engine: raw.cpu.engine,
@@ -208,17 +206,6 @@ pub enum InitialOperationMode {
     Docked,
 }
 
-/// User preference for the amount of context retained in diagnostic reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DiagnosticReportDetail {
-    /// Retain bounded local context useful during emulator development.
-    #[default]
-    Detailed,
-    /// Retain only minimal context suitable for public sharing.
-    Sanitized,
-}
-
 /// Minimum severity emitted by application loggers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -236,10 +223,6 @@ pub enum DiagnosticLogLevel {
 pub struct DiagnosticsConfig {
     /// Minimum severity emitted by application loggers.
     pub log_level: DiagnosticLogLevel,
-    /// Detail level requested for CPU, backend, GPU, and runtime reports.
-    pub report_detail: DiagnosticReportDetail,
-    /// Whether runtimes retain a bounded recent guest-instruction trace.
-    pub instruction_trace: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -483,10 +466,6 @@ impl Default for RawTimeConfig {
 struct RawDiagnosticsConfig {
     #[serde(default)]
     log_level: DiagnosticLogLevel,
-    #[serde(default)]
-    report_detail: DiagnosticReportDetail,
-    #[serde(default)]
-    instruction_trace: bool,
 }
 
 const fn default_recursive_scan() -> bool {
@@ -756,12 +735,7 @@ mod tests {
         assert_eq!(config.system.time.mode, TimeMode::Realtime);
         assert_eq!(config.system.time.timezone, "UTC");
         assert_eq!(config.system.time.fixed_unix_timestamp, None);
-        assert_eq!(
-            config.diagnostics.report_detail,
-            DiagnosticReportDetail::Detailed
-        );
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
-        assert!(!config.diagnostics.instruction_trace);
         assert_eq!(config.gpu, GpuCacheConfiguration::default());
         assert!(config.input.profiles.is_empty());
     }
@@ -787,38 +761,6 @@ mod tests {
             config.filesystem.sd_card,
             file.path.parent().unwrap().join("./storage/sdmc")
         );
-        assert_eq!(
-            config.diagnostics.report_detail,
-            DiagnosticReportDetail::Detailed
-        );
-        assert!(!config.diagnostics.instruction_trace);
-    }
-
-    #[test]
-    fn loads_explicit_sanitized_diagnostic_policy() {
-        let file = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [diagnostics]
-                log_level = "trace"
-                report_detail = "sanitized"
-                instruction_trace = true
-            "#,
-        );
-
-        let config = NixeConfig::load(&file.path).unwrap();
-        assert_eq!(
-            config.diagnostics.report_detail,
-            DiagnosticReportDetail::Sanitized
-        );
-        assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Trace);
-        assert!(config.diagnostics.instruction_trace);
     }
 
     #[test]
