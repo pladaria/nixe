@@ -2,19 +2,23 @@
 
 mod a32;
 mod a64;
-pub mod block;
+mod aarch32;
+mod block;
 pub mod observability;
+pub mod region;
 mod t32;
 
-pub use block::{
-    AddressCalculationError, BlockTranslationConfig, MAX_GUEST_INSTRUCTIONS_PER_BLOCK,
-    MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION, a32_interworking_target, conditional_terminator,
-    direct_branch_target, emit_call, indirect_interworking_target, indirect_target,
-    translate_block,
-};
 pub use observability::{
-    BlockReportEndReason, BlockTranslationFailureReason, BlockTranslationReport,
-    translate_block_report, translate_raw_block_report,
+    RegionTranslationFailureReason, RegionTranslationReport, translate_raw_region_report,
+    translate_region_report,
+};
+pub use region::{
+    DEFAULT_MAX_BLOCKS_PER_REGION, DEFAULT_MAX_CODE_DEPENDENCIES_PER_REGION,
+    DEFAULT_MAX_GUEST_BYTES_PER_REGION, DEFAULT_MAX_GUEST_INSTRUCTIONS_PER_BASIC_BLOCK,
+    DEFAULT_MAX_GUEST_INSTRUCTIONS_PER_REGION, DEFAULT_MAX_IR_OPERATIONS_PER_REGION,
+    MAX_BLOCKS_PER_REGION, MAX_CODE_DEPENDENCIES_PER_REGION, MAX_GUEST_BYTES_PER_REGION,
+    MAX_GUEST_INSTRUCTIONS_PER_BASIC_BLOCK, MAX_GUEST_INSTRUCTIONS_PER_REGION,
+    MAX_IR_OPERATIONS_PER_REGION, RegionTranslationConfig, translate_region,
 };
 
 #[cfg(test)]

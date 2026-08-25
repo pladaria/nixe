@@ -140,7 +140,7 @@ pub struct FetchedCode<T> {
 /// Contiguous virtual extent of one code page.
 ///
 /// The extent belongs to the memory backend rather than a CPU profile: real
-/// process mappings may use different page sizes, and frontend block formation
+/// process mappings may use different page sizes, and frontend region formation
 /// must not assume the synthetic backend's 4 KiB granule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CodePageSpan {

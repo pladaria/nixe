@@ -15,7 +15,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .lowered(),
+    .lowered()
+    .fixture32(0x9100_0000),
     pattern(
         "move-wide",
         0x1f80_0000,
@@ -25,7 +26,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "add-sub-shifted",
         0x1f20_0000,
@@ -35,7 +36,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "add-sub-extended",
         0x1f20_0000,
@@ -45,7 +46,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "add-sub-carry",
         0x1fe0_fc00,
@@ -55,7 +56,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "logical-immediate",
         0x1f80_0000,
@@ -65,7 +66,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "logical-shifted",
         0x1f00_0000,
@@ -75,7 +76,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "bitfield",
         0x1f80_0000,
@@ -85,7 +86,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "extract",
         0x1f80_0000,
@@ -95,7 +96,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "data-processing-two-source",
         0x1fe0_0000,
@@ -105,7 +106,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0x9ac1_2000),
     pattern(
         "conditional-compare-register",
         0x1fe0_0c00,
@@ -115,7 +117,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "conditional-compare-immediate",
         0x1fe0_0c00,
@@ -125,7 +127,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "conditional-select",
         0x1fe0_0000,
@@ -135,7 +137,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "data-processing-three-source",
         0x1f00_0000,
@@ -145,7 +147,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0x9b01_0800),
     pattern(
         "data-processing-one-source",
         0x5fe0_0000,
@@ -155,7 +158,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xdac0_1000),
     pattern(
         "adr",
         0x9f00_0000,

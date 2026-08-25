@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn block_level_ir_errors_mark_missing_instruction_context() {
+    fn structural_ir_errors_mark_missing_instruction_context() {
         let error = InvalidIr::new(None, "block has no terminator");
 
         assert_eq!(

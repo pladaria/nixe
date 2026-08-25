@@ -1,18 +1,20 @@
-//! Explicit control-flow terminators for one translation unit.
+//! Explicit control-flow terminators for one IR basic block.
 
 use nixe_memory::GuestVirtualAddress;
 
-use crate::location::{ExecutionState, InstructionEncoding, LocationDescriptor};
+use crate::{
+    exception::ExceptionKind,
+    location::{ExecutionState, InstructionEncoding, LocationDescriptor},
+};
 
-// Preserve the original public path while the architectural type lives outside
-// the IR. New engine-independent code should import `crate::exception`.
-pub use crate::exception::ExceptionKind;
-
-use super::value::Operand;
+use super::{block::BlockId, value::Operand};
 
 /// Direct or computed guest control target.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ControlTarget {
+    /// A direct edge to another block in the same formed region. This edge
+    /// never commits and reimports canonical architectural state.
+    Internal { block: BlockId },
     /// Statically known guest PC and execution state.
     Direct {
         pc: GuestVirtualAddress,
@@ -26,6 +28,15 @@ pub enum ControlTarget {
     /// A32 `BX`/`BLX`-style target whose bit zero selects T32 versus A32 at
     /// runtime. The execution engine masks the address for the selected state.
     A32Interworking { address: Operand },
+}
+
+impl ControlTarget {
+    /// Whether following this target leaves the region and therefore requires
+    /// canonical architectural state to be committed before dispatch.
+    #[must_use]
+    pub const fn requires_state_commit(self) -> bool {
+        !matches!(self, Self::Internal { .. })
+    }
 }
 
 /// Reason execution stops without choosing another guest block.
@@ -49,6 +60,14 @@ pub enum Terminator {
         taken: ControlTarget,
         fallthrough: ControlTarget,
     },
+    /// Predicated call after the frontend has represented a conditional link
+    /// update. A false predicate follows `fallthrough` without call effects.
+    ConditionalCall {
+        condition: Operand,
+        target: ControlTarget,
+        fallthrough: ControlTarget,
+        return_address: GuestVirtualAddress,
+    },
     /// Unconditional computed branch.
     Indirect { target: ControlTarget },
     /// Call after the frontend has represented the architectural link update.
@@ -63,6 +82,15 @@ pub enum Terminator {
         source: LocationDescriptor,
         kind: ExceptionKind,
         syndrome: Option<u64>,
+    },
+    /// Predicated synchronous exception used by AArch32 conditional
+    /// execution. A false predicate follows the explicit fallthrough.
+    ConditionalException {
+        condition: Operand,
+        source: LocationDescriptor,
+        kind: ExceptionKind,
+        syndrome: Option<u64>,
+        fallthrough: ControlTarget,
     },
     /// Execute exactly one instruction using the reference interpreter.
     InterpretOne {
@@ -94,11 +122,13 @@ impl Terminator {
     pub const fn source(&self) -> Option<LocationDescriptor> {
         match self {
             Self::Exception { source, .. }
+            | Self::ConditionalException { source, .. }
             | Self::InterpretOne { source, .. }
             | Self::UnsupportedInstruction { source, .. }
             | Self::Stop { source, .. } => Some(*source),
             Self::Direct { .. }
             | Self::Conditional { .. }
+            | Self::ConditionalCall { .. }
             | Self::Indirect { .. }
             | Self::Call { .. }
             | Self::Return { .. } => None,

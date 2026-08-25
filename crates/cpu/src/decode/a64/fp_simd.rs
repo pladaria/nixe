@@ -17,7 +17,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         130,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4e01_0c20),
     // Arm A64 DUP (element) broadcasts one selected vector element across all
     // active destination lanes. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/DUP--element---Duplicate-vector-element-to-vector-or-scalar-
@@ -29,7 +30,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         174,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x0e04_07ff),
     pattern(
         "fp-simd-load-store-pair",
         0x3e00_0000,
@@ -57,7 +59,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 ADD (vector) and SUB (vector) allocation and operation,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADD--vector---Add-vector-
@@ -71,7 +73,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 Advanced SIMD pairwise integer operations,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
@@ -289,7 +291,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .recognized_unimplemented(),
     pattern(
         "fp-simd-load-store-unsigned",
         0x3f00_0000,
@@ -299,7 +301,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-simd-load-store-unscaled",
         0x3f20_0c00,
@@ -309,7 +311,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-scalar-move",
         0xffbf_fc00,
@@ -319,7 +321,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 FMOV (register), optional half-precision form. The base S/D
     // forms above remain available with Advanced SIMD while H is explicitly
     // gated by FEAT_FP16. Arm ARM DDI 0602 (2025-12):
@@ -421,7 +423,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-compare-zero",
         0xffbf_fc0f,
@@ -431,7 +433,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 FCCMP/FCCMPE conditionally compare scalar S/D operands or copy
     // an immediate NZCV value. FCCMPE signals every NaN while FCCMP signals
     // only signaling NaNs. Optional half precision remains feature-gated
@@ -485,7 +487,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         133,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4e08_3c01),
     // Arm A64 INS copies either another vector element or a general-purpose
     // register into one vector element while preserving every other element,
     // Arm ARM DDI 0602 (2025-12):
@@ -499,7 +502,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         160,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x6e03_07be),
     pattern(
         "simd-insert-general",
         0xffe0_fc00,
@@ -508,7 +512,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         159,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4e03_1d28),
     // Arm A64 Advanced SIMD two-source permutes, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP1--vector---Zip-vectors--primary--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ZIP2--vector---Zip-vectors--secondary--
@@ -524,7 +529,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         161,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4e1d_3bde),
     // Arm A64 EXT selects a byte-aligned window from the concatenation of two
     // 64-bit or 128-bit vectors, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/EXT--Extract-vector-from-pair-of-vectors-
@@ -548,7 +554,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         162,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x0f0c_8400),
     // Arm A64 SSHR/USHR shift each signed or unsigned lane right by an
     // immediate in the range 1..=element size. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHR--Signed-shift-right--immediate--
@@ -561,7 +568,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         203,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x7f60_07fe),
     pattern(
         "simd-vector-shift-right-immediate",
         0x9f80_fc00,
@@ -570,7 +578,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         202,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x2f0f_0420),
     // Arm A64 SHL shifts each scalar or vector lane left by an immediate in
     // the range 0..element size - 1. Keep U fixed here so the neighboring SLI
     // encoding retains its distinct destination-preserving semantics:
@@ -583,7 +592,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         208,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x5f60_57de),
     pattern(
         "simd-vector-shift-left-immediate",
         0xbf80_fc00,
@@ -592,7 +602,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         207,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4f3f_556a),
     // Arm A64 SSHL/USHL use the signed low byte of each shift-count lane to
     // select a left (non-negative) or right (negative) shift independently.
     // The data interpretation only differs for right shifts. Arm ARM DDI 0602
@@ -667,7 +678,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         135,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4c40_a020),
     pattern(
         "simd-load-store-multiple-structures-post-index",
         0xbfa0_0000,
@@ -676,7 +688,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         136,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x4cdf_a041),
     // Arm A64 LD1/ST1 single-structure lane transfers, including immediate
     // and register post-index forms, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LD1--single-structure---Load-one-single-element-structure-to-one-lane-of-one-register-
@@ -689,7 +702,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         158,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x0d40_183d),
     pattern(
         "simd-load-store-single-structure-post-index",
         0xbfa0_0000,
@@ -698,7 +712,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         157,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x0ddf_1e30),
     // Arm A64 Advanced SIMD integer-to-floating-point vector conversions,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--vector---Signed-integer-Convert-to-Floating-point--vector--
@@ -812,7 +827,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD,
     ),
     // Arm A64 FADD/FSUB (scalar), base single/double precision forms. They
-    // supersede the broad legacy scalar-two-source classifier while optional
+    // supersede the broad scalar-two-source classifier while optional
     // half precision remains behind that typed boundary. Arm ARM DDI 0602
     // (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FADD--scalar---Floating-point-Add--scalar--
@@ -990,7 +1005,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-unsigned-int-to-float",
         0x5fbf_fc00,
@@ -1000,7 +1015,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 FCVTZS/FCVTZU (scalar, integer), covering the base S/D-to-W/X
     // forms. Both operations round toward zero and return a saturated integer
     // for an out-of-range operand. Arm ARM DDI 0602 (2025-12):
@@ -1037,7 +1052,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         176,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x1e18_e027),
     pattern(
         "fp-float-to-unsigned-fixed-int",
         0x7fbf_0000,
@@ -1046,7 +1062,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         175,
         &[],
         SIMD,
-    ),
+    )
+    .fixture32(0x1e19_e027),
     // Arm A64 scalar floating-point to integer conversions with an explicit
     // rounding direction. These cover the base S/D-to-W/X forms; optional
     // FP16 forms remain classified by the feature-gated fallback. Arm ARM
@@ -1140,7 +1157,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-move-from-general",
         0x5f37_fc00,
@@ -1150,7 +1167,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     // Arm A64 LDR/STR (immediate, SIMD&FP) allocation and operation,
     // including the signed pre-index and post-index forms, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LDR--immediate--SIMD-FP---Load-SIMD-FP-register--immediate-offset--
@@ -1164,7 +1181,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-simd-load-store-pre-index",
         0x3f20_0c00,
@@ -1174,7 +1191,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "fp-simd-load-store-register",
         0x3f20_0c00,
@@ -1184,7 +1201,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0x3c22_4820),
     pattern(
         "fp-simd-load-literal",
         0x3f00_0000,
@@ -1194,7 +1212,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .encoding_dependent_lowering(),
+    .recognized_unimplemented(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

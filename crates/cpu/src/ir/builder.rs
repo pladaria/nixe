@@ -11,7 +11,7 @@ use super::{
     terminator::Terminator,
     types::IrType,
     value::{Value, ValueId},
-    verify::{VerificationError, verify_block, verify_operation_for_builder},
+    verify::{VerificationError, verify_basic_block, verify_operation_for_builder},
 };
 
 /// Failure to construct a structurally and semantically valid IR block.
@@ -30,7 +30,7 @@ impl fmt::Display for BuildError {
             Self::TooManyResults { requested } => {
                 write!(
                     formatter,
-                    "operation requested {requested} results; the maximum is three"
+                    "operation requested {requested} results; the maximum is four"
                 )
             }
             Self::ValueIdExhausted => formatter.write_str("block-local IR value IDs are exhausted"),
@@ -50,7 +50,7 @@ impl From<VerificationError> for BuildError {
     }
 }
 
-/// Single-use builder for one SSA-like translation block.
+/// Single-use builder for one SSA-like basic block within a region.
 pub struct IrBuilder {
     metadata: BlockMetadata,
     operations: Vec<IrOperation>,
@@ -100,13 +100,13 @@ impl IrBuilder {
         if self.terminator.is_some() {
             return Err(BuildError::AlreadyTerminated);
         }
-        if result_types.len() > 3 {
+        if result_types.len() > 4 {
             return Err(BuildError::TooManyResults {
                 requested: result_types.len(),
             });
         }
 
-        let mut values = [None; 3];
+        let mut values = [None; 4];
         let mut next_value = self.next_value;
         for (slot, ty) in values.iter_mut().zip(result_types) {
             *slot = Some(Value::new(ValueId::new(next_value), *ty));
@@ -115,11 +115,14 @@ impl IrBuilder {
                 .ok_or(BuildError::ValueIdExhausted)?;
         }
         let results = match values {
-            [None, None, None] => OperationResults::NONE,
-            [Some(first), None, None] => OperationResults::one(first),
-            [Some(first), Some(second), None] => OperationResults::two(first, second),
-            [Some(first), Some(second), Some(third)] => {
+            [None, None, None, None] => OperationResults::NONE,
+            [Some(first), None, None, None] => OperationResults::one(first),
+            [Some(first), Some(second), None, None] => OperationResults::two(first, second),
+            [Some(first), Some(second), Some(third), None] => {
                 OperationResults::three(first, second, third)
+            }
+            [Some(first), Some(second), Some(third), Some(fourth)] => {
+                OperationResults::four(first, second, third, fourth)
             }
             _ => unreachable!("result slots are filled contiguously"),
         };
@@ -151,7 +154,7 @@ impl IrBuilder {
     pub fn finish(self) -> Result<IrBlock, BuildError> {
         let terminator = self.terminator.ok_or(BuildError::MissingTerminator)?;
         let block = IrBlock::new(self.metadata, self.operations, terminator);
-        verify_block(&block)?;
+        verify_basic_block(&block)?;
         Ok(block)
     }
 }
@@ -165,7 +168,7 @@ mod tests {
 
     use crate::{
         ir::{
-            block::{BlockExit, BlockExitKind, InstructionSource},
+            block::InstructionSource,
             op::{IntegerBinaryKind, ScalarOperation},
             terminator::ControlTarget,
             value::Immediate,
@@ -193,11 +196,6 @@ mod tests {
             location(),
             4,
             1,
-            vec![BlockExit {
-                kind: BlockExitKind::Direct,
-                target: Some(GuestVirtualAddress::new(0x1004)),
-            }],
-            vec![dependency],
             vec![InstructionSource::new(
                 location(),
                 InstructionEncoding::from_u32(0xd503_201f),

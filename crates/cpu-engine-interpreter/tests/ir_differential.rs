@@ -3,7 +3,7 @@ mod support;
 use std::num::NonZeroU32;
 
 use nixe_cpu::{
-    ir::terminator::ExceptionKind,
+    exception::ExceptionKind,
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{
         CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
@@ -15,7 +15,7 @@ use nixe_cpu::{
         a32::{A32GeneralRegister, Cpsr},
         a64::{A64GeneralRegister, A64Register, Nzcv},
     },
-    translate::{BlockTranslationConfig, translate_block},
+    translate::{RegionTranslationConfig, translate_region},
 };
 use nixe_cpu_engine_interpreter::{
     InterpreterContext, InterpreterOutcome, execute_one_with_context,
@@ -88,9 +88,12 @@ fn run_case(case: &DifferentialCase) {
                         case.name
                     )
                 });
-        let block = translate_block(
-            BlockTranslationConfig {
+        let region = translate_region(
+            RegionTranslationConfig {
+                max_blocks: NonZeroU32::new(1).unwrap(),
                 max_guest_instructions: NonZeroU32::new(1).unwrap(),
+                max_guest_instructions_per_block: NonZeroU32::new(1).unwrap(),
+                ..RegionTranslationConfig::default()
             },
             &case.profile,
             ADDRESS_SPACE,
@@ -104,7 +107,7 @@ fn run_case(case: &DifferentialCase) {
             )
         });
         let reference = evaluator
-            .execute(&mut reference_state, &block)
+            .execute(&mut reference_state, &region)
             .unwrap_or_else(|error| {
                 panic!(
                     "{} instruction {index} IR evaluation failure: {error}",
@@ -379,9 +382,11 @@ fn normalize_interpreter(outcome: &InterpreterOutcome) -> NormalizedOutcome {
             source: *source,
             fault: fault.clone(),
         },
-        InterpreterOutcome::Scheduled { .. } => panic!("scheduled instruction is outside MVP"),
+        InterpreterOutcome::Scheduled { .. } => {
+            panic!("scheduled instruction is outside generated differential coverage")
+        }
         InterpreterOutcome::ProfileDisabled(_) | InterpreterOutcome::Unallocated(_) => {
-            panic!("decode rejection is outside generated MVP")
+            panic!("decode rejection is outside generated differential coverage")
         }
     }
 }

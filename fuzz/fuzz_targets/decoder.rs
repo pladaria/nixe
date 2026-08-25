@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 use libfuzzer_sys::fuzz_target;
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     decode::{self, DecodeResult, OperandValue},
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     profile::GuestCpuProfile,
@@ -14,6 +13,7 @@ use nixe_cpu::{
         shifts::{self, A32ShiftKind, ShiftKind},
     },
 };
+use nixe_memory::GuestVirtualAddress;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 4_096 {

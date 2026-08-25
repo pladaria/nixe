@@ -35,7 +35,7 @@ fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
     for forbidden in ["cranelift-jit", "cranelift-module", "dynasm", "iced-x86"] {
         assert!(
             !manifest.contains(forbidden),
-            "obsolete or parallel native-code generator dependency: {forbidden}"
+            "unexpected native-code dependency: {forbidden}"
         );
     }
 }

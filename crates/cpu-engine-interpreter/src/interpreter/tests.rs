@@ -30,7 +30,7 @@ fn source(
 }
 
 #[test]
-fn interpreter_only_t32_movs_executes_once_and_resumes_at_next_pc() {
+fn t32_movs_executes_once_and_resumes_at_next_pc() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A32(Box::new(nixe_cpu::state::A32State::t32()));
     let ThreadCpuState::A32(a32) = &mut state else {
@@ -63,7 +63,7 @@ fn interpreter_only_t32_movs_executes_once_and_resumes_at_next_pc() {
 }
 
 #[test]
-fn a32_mvp_executes_predicated_integer_flags_and_interworking() {
+fn a32_executes_predicated_integer_flags_and_interworking() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A32(Box::default());
     let ThreadCpuState::A32(a32) = &mut state else {
@@ -92,7 +92,34 @@ fn a32_mvp_executes_predicated_integer_flags_and_interworking() {
 }
 
 #[test]
-fn a32_and_t32_mvp_memory_families_use_the_shared_process_context() {
+fn a32_vfp_binary32_uses_exact_lane_bits_and_fpscr_state() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.set_instruction_address(0x1000).unwrap();
+    assert!(a32.write_d(
+        0,
+        u64::from(1.5_f32.to_bits()) | (u64::from((-0.0_f32).to_bits()) << 32),
+    ));
+
+    // VADD.F32 D0,D0,D0. Arm ARM DDI 0602 AArch32 VADD (floating-point):
+    // https://developer.arm.com/documentation/ddi0602/latest/AArch32-Instructions/VADD--floating-point-
+    execute_one(&profile, &mut state, 0xee00_0a00_u32.into()).unwrap();
+
+    let ThreadCpuState::A32(a32) = state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a32.read_d(0),
+        Some(u64::from(3.0_f32.to_bits()) | (u64::from((-0.0_f32).to_bits()) << 32))
+    );
+    assert_eq!(a32.fpscr(), 0);
+}
+
+#[test]
+fn a32_and_t32_memory_families_use_the_shared_process_context() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(47);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(94);
     let profile = GuestCpuProfile::switch_1();
@@ -147,7 +174,7 @@ fn a32_and_t32_mvp_memory_families_use_the_shared_process_context() {
 }
 
 #[test]
-fn t32_mvp_tracks_it_and_executes_wide_branch_link() {
+fn t32_tracks_it_and_executes_wide_branch_link() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A32(Box::new(nixe_cpu::state::A32State::t32()));
     let ThreadCpuState::A32(t32) = &mut state else {
@@ -2241,7 +2268,7 @@ fn a64_simd_integer_to_float_obeys_fpcr_rounding_direction() {
 }
 
 #[test]
-fn a64_simd_integer_to_float_trap_boundary_is_atomic_and_interpreter_only() {
+fn a64_simd_integer_to_float_trap_boundary_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x4e21_dbfc);
     let mut state = ThreadCpuState::A64(Box::default());
@@ -2500,7 +2527,7 @@ fn a64_scalar_float_to_integer_saturates_and_handles_subnormal_inputs() {
 }
 
 #[test]
-fn a64_scalar_float_to_integer_enabled_exception_is_atomic_and_interpreter_only() {
+fn a64_scalar_float_to_integer_enabled_exception_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x9e79_03a2); // FCVTZU X2,D29
     let mut state = ThreadCpuState::A64(Box::default());
@@ -2577,7 +2604,7 @@ fn a64_scalar_unsigned_rounding_checks_range_after_rounding() {
 }
 
 #[test]
-fn a64_scalar_float_to_integer_directional_trap_is_atomic_and_interpreter_only() {
+fn a64_scalar_float_to_integer_directional_trap_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x9e71_0381); // FCVTMU X1,D28
     let mut state = ThreadCpuState::A64(Box::default());
@@ -2788,7 +2815,7 @@ fn a64_scalar_fmov_immediate_executes_all_allocated_precisions() {
 }
 
 #[test]
-fn a64_scalar_fmov_immediate_is_interpreter_only_and_profile_gating_is_atomic() {
+fn a64_scalar_fmov_immediate_profile_gating_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
@@ -2892,7 +2919,7 @@ fn a64_scalar_fcvt_obeys_rounding_and_reports_special_value_status() {
 }
 
 #[test]
-fn a64_scalar_fcvt_enabled_exception_is_atomic_and_interpreter_only() {
+fn a64_scalar_fcvt_enabled_exception_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e22_c020); // FCVT D0,S1
     let mut state = ThreadCpuState::A64(Box::default());
@@ -2942,7 +2969,7 @@ fn a64_scalar_fdiv_executes_single_double_family_and_clears_upper_bits() {
 }
 
 #[test]
-fn a64_scalar_fdiv_enabled_exception_is_atomic_and_interpreter_only() {
+fn a64_scalar_fdiv_enabled_exception_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_1820); // FDIV D0,D1,D2
     let mut state = ThreadCpuState::A64(Box::default());
@@ -3257,7 +3284,7 @@ fn a64_scalar_fadd_obeys_rounding_and_signed_zero_rules() {
 }
 
 #[test]
-fn a64_scalar_fadd_enabled_invalid_exception_is_atomic_and_interpreter_only() {
+fn a64_scalar_fadd_enabled_invalid_exception_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_2820); // FADD D0,D1,D2
     let mut state = ThreadCpuState::A64(Box::default());
@@ -3347,7 +3374,7 @@ fn a64_scalar_fmul_obeys_rounding_and_flush_to_zero_controls() {
 }
 
 #[test]
-fn a64_scalar_fmul_enabled_invalid_exception_is_atomic_and_interpreter_only() {
+fn a64_scalar_fmul_enabled_invalid_exception_is_atomic() {
     let profile = GuestCpuProfile::switch_1();
     let encoding = InstructionEncoding::from_u32(0x1e62_0820); // FMUL D0,D1,D2
     let mut state = ThreadCpuState::A64(Box::default());

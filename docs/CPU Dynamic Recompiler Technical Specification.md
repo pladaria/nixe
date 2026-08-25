@@ -97,9 +97,8 @@ Nixe therefore retains a specialized typed IR for Arm semantics and emulator
 effects, then lowers that IR exclusively through Cranelift. Cranelift does not
 own emulator dispatch, cache lifetime, link tables, invalidation, memory
 authority, or architectural-state commitment; those facilities remain
-JIT-private Nixe integration code around the compiler. Nixe does not implement
-a parallel direct host-ISA emitter, register allocator, or instruction encoder.
-LLVM and a second optimizing tier are outside the production plan.
+JIT-private Nixe integration code around the compiler. LLVM and a second
+optimizing tier are outside the production plan.
 
 ## 4. Verified facts, profiles, and assumptions
 
@@ -381,13 +380,15 @@ ITSTATE, PC rules, and halfword assembly remain T32-owned. Family lifters and
 reference-interpreter modules consume normalized instructions and must never
 re-extract fields from `InstructionEncoding`.
 
-The scalar Switch 1 MVP includes predicated A32 integer execution, common T32
-16-bit forms, selected T32 32-bit forms, ordinary, multiple, and initial NEON
-memory transfers, exceptions, calls, and A32/T32 interworking. Exact A32 VFP
-semantics remain explicit fallback until the architectural FP provider exists.
-A32 acquire/release and exclusive execution remains tracked by `JIT-004` and
-`JIT-012`; recognizing an encoding must not be mistaken for implementing its
-memory-model semantics.
+The Switch 1 frontend includes predicated A32 integer execution, common T32
+16-bit forms, selected T32 32-bit forms, ordinary and multiple memory transfers,
+initial VFP/NEON, exceptions, calls, A32/T32 interworking, and A32
+acquire/release and exclusive operations. Predication is explicit in IR so a
+false condition cannot perform a memory access, alter exclusive state, or raise
+an instruction exception. Exact typed helpers preserve the implemented VFP
+status/control behavior where direct IR is insufficient. Full FP/SIMD breadth
+and specialization remain owned by `JIT-011`; multicore memory-model completion
+remains owned by `JIT-012`.
 
 Generated conformance tests should enumerate boundary encodings and verify that
 decoder patterns neither overlap unexpectedly nor leave declared instructions
@@ -404,6 +405,13 @@ and code pages may change. Region formation internalizes profitable direct and
 conditional edges while preserving arbitrary entry points, exact code
 dependencies, precise fault locations, execution-state changes, and bounded
 safepoints.
+
+Architectural-state read and write operations express guest semantics; they do
+not require a canonical-frame load or store at each operation. A guest-visible
+region entry imports canonical state, an internal edge passes the current
+virtual state directly, and an external exit commits all guest-visible state
+and the exact retired-instruction count. This distinction removes block-boundary
+state traffic without exposing a native frame layout in Nixe IR.
 
 Required scalar and vector types include:
 
@@ -492,7 +500,8 @@ The textual IR printer is a required debugging interface, not optional tooling.
 Initial block discovery ends at the earliest of:
 
 - An unconditional or indirect control-flow transfer.
-- A conditional branch, unless represented as a bounded extended block.
+- A conditional branch, whose eligible successors are considered by region
+  formation.
 - A syscall, exception-generating instruction, or execution-mode change.
 - An instruction requiring interpreter fallback.
 - A configured instruction or byte limit.
@@ -502,33 +511,37 @@ The region key is conceptually:
 
 ```rust,ignore
 pub struct RegionKey {
-    pub guest_pc: u64,
     pub address_space_id: u64,
-    pub profile_id: u32,
-    pub execution_state: ExecutionState,
-    pub translation_context: TranslationContext,
-    pub code_dependencies: CodeDependencies,
+    pub guest_location: LocationDescriptor,
+    pub translation_mode: TranslationMode,
+    pub root_code_mapping: CodePageDependency,
 }
 ```
 
 Only context that can change translation semantics belongs in the key. Runtime
 data such as general registers must not fragment the cache. Resolving a virtual
 PC to a physical code-page identity before the main lookup prevents unrelated
-mapping changes from invalidating the entire code cache. A region spanning more
-than one page records every physical page and generation as dependencies in its
-metadata rather than expanding the hot lookup key without bound.
-
-`translation_context` contains only additional state that changes decoding or
-lifting at block entry, such as T32 IT state when applicable. It is not a bag of
-arbitrary vCPU state. Direct branch exits retain the destination guest address
-and destination execution state; the dispatcher resolves those to native
-regions.
+mapping changes from invalidating the entire code cache. The root mapping in the
+hot key disambiguates aliases and remaps without storing a variable-length key.
+A region spanning more than one page records the exact ordered dependency set
+in its immutable metadata and reverse invalidation indexes. `translation_mode`
+contains only an explicitly selected frontend mode, never arbitrary vCPU state.
+Direct branch exits retain the destination guest address and destination
+execution state; the dispatcher resolves those to native regions.
 
 The region builder may internalize bounded direct successors and both sides of
 a conditional branch. Indirect edges, required observable exits, and edges that
 would exceed instruction, byte, IR, page-dependency, or safepoint limits remain
 external. `nixe-cpu` owns region formation for the JIT; the interpreter and
 future NCE providers do not depend on the region representation.
+
+Every formed basic-block start is a guest-visible entry. When a newly discovered
+target coincides with an instruction boundary inside an existing block, the
+block is cut and both paths share the target block; a genuinely distinct
+overlapping AArch32 decode remains a separate entry. Each entry is a safepoint,
+as is every backward internal edge. Failure to fetch the requested root is a
+precise translation failure, while failure to fetch a speculative successor
+leaves that edge external for normal dispatch.
 
 ## 11. Cranelift lowering and the native ABI
 
@@ -544,8 +557,7 @@ an instruction is legal; the JIT's capability probe and guarded lowering decide
 whether Cranelift may use a native operation with identical semantics. Otherwise
 lowering invokes an exact typed helper. Cranelift owns host instruction
 selection, register allocation, calling-convention details, and emission for
-supported x86-64 and AArch64 hosts. Nixe has no host-feature tier, direct
-instruction encoder, or second code-generation path.
+supported x86-64 and AArch64 hosts.
 
 Particularly sensitive operations include saturation and narrowing, FP NaNs and
 status, vector shifts and table lookups, exclusives and atomics, cache
@@ -1079,11 +1091,13 @@ cache-maintenance callbacks will be added to this context only when those runtim
 contracts exist. Until then, instructions requiring them remain explicit
 fallbacks rather than approximate no-ops.
 
-The completed scalar frontend foundation covers A64 control flow,
-integer/address generation, supported user-visible system registers and
-barriers, and ordinary scalar memory including acquire/release accesses.
-FP/SIMD, exclusives, atomics, and the multicore memory model remain tracked
-JIT/interpreter-parity work and do not weaken the completed frontend claim.
+The completed frontend covers every A64, A32, and T32 family implemented by the
+reference interpreter for the selected Switch 1 profile, including its current
+FP/SIMD, acquire/release, and exclusive subsets. The registry mechanically
+requires each such family to decode and lift without `InterpretOne`. Scheduler
+events, cache maintenance, broader FP/SIMD, atomics, and the multicore memory
+model remain explicitly tracked semantic work; their absence cannot be hidden
+by a frontend completion claim.
 
 ## 23. Fallback policy
 
@@ -1189,23 +1203,23 @@ Instrumentation is inserted through IR or region hooks selected before
 translation. Production regions contain no unconditional callback on every
 instruction.
 
-The frontend exposes a separate opt-in block-report path. Normal translation
+The frontend exposes a separate opt-in region-report path. Normal translation
 does not construct disassembly strings. When requested, the report records each
 instruction's guest PC, execution state, raw encoding, deterministic
-disassembly, the verified pre-optimization IR, the exact semantic or policy
-reason the block ended, and the ordered physical code-page identities and
-generations observed by instruction fetch. Page-boundary and instruction-limit
-cuts remain distinguishable from guest direct branches even though all three
-resume through a direct guest target.
+disassembly, the verified pre-optimization region, each basic block's exact cut
+reason, the region entries and exits, and the ordered physical code-page
+identities and generations observed by instruction fetch. Page-boundary and
+instruction-limit cuts remain distinguishable from guest direct branches even
+though all three resume through a direct guest target.
 
 IR dumps carry an explicit `pre-optimization` or `post-optimization` stage. The
 frontend currently produces only the former; the latter is an interface
-contract for future passes. Fetch failures produce a structured block report
-with a `fetch-fault` end reason rather than a partial valid IR block. Reports use
-only guest-domain and stable semantic identities, deterministic ordering, and
-no raw host pointers. A raw-byte helper supplies the same report for bounded
-single-block commands and regression fixtures without bypassing the ordinary
-decoder, lifter, builder, or verifier.
+contract for future passes. Root fetch failures produce a structured region
+report with a `fetch-fault` reason rather than a partial valid region. Reports
+use only guest-domain and stable semantic identities, deterministic ordering,
+and no raw host pointers. A raw-byte helper supplies the same bounded-region
+report for commands and regression fixtures without bypassing the ordinary
+decoder, lifter, region former, or verifier.
 
 ## 25. Validation strategy
 
@@ -1333,9 +1347,7 @@ Justification: Cranelift supplies maintained x86-64 and AArch64 instruction
 selection, register allocation, ABI handling, verification, and native emission
 with compilation latency suitable for the baseline JIT. Nixe retains the
 emulator-specific dispatcher, state frame, helpers, cache, linking, memory fast
-path, and invalidation that a general compiler cannot own. A direct host-ISA
-emitter or alternative compiler tier would duplicate semantics and lifetime
-paths and is not part of the architecture.
+path, and invalidation that a general compiler cannot own.
 
 ### D3: Keep native-code machinery inside the JIT provider
 
@@ -1407,11 +1419,13 @@ four-vCPU invariant.
 
 The sole ordered implementation and release plan is
 [`notes/jit.md`](../notes/jit.md). Its
-Cranelift provider, private native ABI, and secure executable-memory owner are
-established; the remaining order continues with frontend parity and ends with
-complete differential, release, and performance gates. This specification defines the
-architecture those tasks must preserve; it does not maintain a parallel set of
-phases or accept completion through a transitional execution path.
+Cranelift provider, private native ABI, secure executable-memory owner, and
+frontend parity and bounded region formation are established; the remaining
+order starts with Cranelift lowering and ends with complete differential,
+release, and performance gates.
+This specification defines the architecture those tasks must preserve; it does
+not maintain a parallel set of phases or accept completion through a
+transitional execution path.
 
 A completed slice removes every superseded implementation, adapter, cache,
 invalidation mechanism, and test that existed only for the old path. The final

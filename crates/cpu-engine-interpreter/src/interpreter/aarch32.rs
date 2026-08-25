@@ -247,7 +247,7 @@ pub(super) fn execute_single(
     };
     if instruction.writeback {
         write_register(state, instruction.rn, offset_address)
-            .expect("writeback base cannot be PC in MVP");
+            .expect("normalized writeback base cannot be PC");
     }
     Ok(control)
 }

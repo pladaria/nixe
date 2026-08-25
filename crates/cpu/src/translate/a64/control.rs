@@ -39,12 +39,12 @@ pub(super) fn lift(
         ControlInstruction::TestBranch(_) => lift_test_branch(builder, decoded, fields)?,
         ControlInstruction::SupervisorCall(_) => LiftOutcome::Terminate(exception(
             source,
-            crate::ir::terminator::ExceptionKind::SupervisorCall,
+            crate::exception::ExceptionKind::SupervisorCall,
             Some(u64::from(fields.immediate_16)),
         )),
         ControlInstruction::Breakpoint(_) => LiftOutcome::Terminate(exception(
             source,
-            crate::ir::terminator::ExceptionKind::Breakpoint,
+            crate::exception::ExceptionKind::Breakpoint,
             Some(u64::from(fields.immediate_16)),
         )),
     })

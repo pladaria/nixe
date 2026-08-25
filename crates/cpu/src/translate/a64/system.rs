@@ -32,16 +32,12 @@ fn lift_hint(
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let immediate = u32::from(fields.hint);
-    if immediate == 0 {
+    if matches!(immediate, 0 | 32 | 34 | 36 | 38) {
         return Ok(LiftOutcome::Continue);
     }
     let name = match immediate {
         1 => "a64.hint.yield",
-        2 => "a64.hint.wfe",
-        3 => "a64.hint.wfi",
-        4 => "a64.hint.sev",
-        5 => "a64.hint.sevl",
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     helper(
         builder,
@@ -70,27 +66,41 @@ fn lift_mrs(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let Some(register) = system_register(fields.system_key) else {
-        return Ok(interpret(decoded));
-    };
-    let value = emit_one(
-        builder,
-        decoded.location,
-        register.ty(),
-        OperationKind::ReadState(register),
-    )?;
-    let value = if register.ty() == IrType::I32 {
-        scalar(
+    let value = if let Some(register) = system_register(fields.system_key) {
+        let value = emit_one(
             builder,
             decoded.location,
-            IrType::I64,
-            ScalarOperation::ZeroExtend {
-                value: value.into(),
-                to: IrType::I64,
-            },
-        )?
+            register.ty(),
+            OperationKind::ReadState(register),
+        )?;
+        if register.ty() == IrType::I32 {
+            scalar(
+                builder,
+                decoded.location,
+                IrType::I64,
+                ScalarOperation::ZeroExtend {
+                    value: value.into(),
+                    to: IrType::I64,
+                },
+            )?
+        } else {
+            value.into()
+        }
+    } else if matches!(
+        fields.system_key,
+        0xd53b_0020 | 0xd53b_00e0 | 0xd53b_e000 | 0xd53b_e020
+    ) {
+        helper(
+            builder,
+            decoded.location,
+            "a64.system.read-runtime-register",
+            vec![Immediate::I32(fields.system_key).into()],
+            &[IrType::I64],
+            OperationEffects::new(EffectSet::HELPER, true),
+        )?[0]
+            .into()
     } else {
-        value.into()
+        return Ok(unsupported(decoded));
     };
     write_gpr(
         builder,
@@ -108,10 +118,10 @@ fn lift_msr(
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let Some(register) = system_register(fields.system_key) else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     if register == StateRegister::A64TpidrroEl0 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let mut value = read_gpr(
         builder,
@@ -175,7 +185,7 @@ fn lift_barrier(
     let operation = match opcode {
         4 | 5 => {
             let Some((domain, access)) = barrier_scope(option) else {
-                return Ok(interpret(decoded));
+                return Ok(unsupported(decoded));
             };
             if opcode == 4 {
                 BarrierOperation::DataSynchronization { domain, access }
@@ -184,7 +194,7 @@ fn lift_barrier(
             }
         }
         6 if option == 15 => BarrierOperation::InstructionSynchronization,
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     builder.emit(decoded.location, &[], OperationKind::Barrier(operation))?;
     Ok(LiftOutcome::Continue)
@@ -201,7 +211,7 @@ fn lift_system(
         0xd508_7620 => (CacheMaintenanceKind::DataInvalidate, true),         // DC IVAC
         0xd50b_7b20 => (CacheMaintenanceKind::DataClean, true),              // DC CVAU
         0xd50b_7e20 => (CacheMaintenanceKind::DataCleanAndInvalidate, true), // DC CIVAC
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     let address = if uses_address {
         let raw = read_gpr(

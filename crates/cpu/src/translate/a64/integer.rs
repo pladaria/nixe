@@ -67,7 +67,7 @@ fn lift_move_wide(
     let width = integer_width(fields);
     let hw = u32::from(fields.opcode_2);
     if width == IrType::I32 && hw >= 2 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let shift = hw * 16;
     let imm = u64::from(u32::from(fields.immediate_16)) << shift;
@@ -99,7 +99,7 @@ fn lift_move_wide(
                 immediate_for(width, imm).into(),
             )?
         }
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     write_gpr(
         builder,
@@ -257,11 +257,11 @@ fn lift_add_sub_shifted(
     fields: IntegerOperands,
 ) -> Result<LiftOutcome, BuildError> {
     if u32::from(fields.shift_kind) == 3 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let width = integer_width(fields);
     let Some(rhs) = shifted_register(builder, decoded.location, fields, width, fields.rm)? else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     let lhs = read_gpr(
         builder,
@@ -294,7 +294,7 @@ fn lift_add_sub_extended(
     let width = integer_width(fields);
     let shift = u32::from(fields.small_shift);
     if shift > 4 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let rm = read_gpr(
         builder,
@@ -454,7 +454,7 @@ fn lift_logical_immediate(
         (u32::from(fields.shift_amount)) as u8,
         size,
     ) else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     let lhs = read_gpr(
         builder,
@@ -492,7 +492,7 @@ fn lift_logical_shifted(
     let width = integer_width(fields);
     let Some(mut rhs) = shifted_register(builder, decoded.location, fields, width, fields.rm)?
     else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     if fields.invert {
         rhs = binary(
@@ -533,11 +533,11 @@ fn lift_bitfield(
     let width = integer_width(fields);
     let n = fields.n;
     if n != (width == IrType::I64) || (width == IrType::I32 && fields.subtract_product) {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
     if opc == 3 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let source_value = read_gpr(
         builder,
@@ -590,7 +590,7 @@ fn lift_extract(
     let width = integer_width(fields);
     let lsb = u32::from(fields.shift_amount);
     if (fields.n) != (width == IrType::I64) || (width == IrType::I32 && lsb >= 32) {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let first = read_gpr(
         builder,
@@ -685,7 +685,7 @@ fn lift_two_source(
             value: lhs,
             amount: rhs,
         },
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     let value = scalar(builder, decoded.location, width, operation)?;
     write_gpr(
@@ -868,7 +868,7 @@ fn lift_three_source(
     let opcode = u32::from(fields.opcode_3);
     if opcode != 0 {
         if matches!(opcode, 2 | 6) && (u32::from(fields.ra)) != 31 {
-            return Ok(interpret(decoded));
+            return Ok(unsupported(decoded));
         }
         let name = match (opcode, fields.subtract_product) {
             (1, false) => "a64.smaddl",
@@ -877,7 +877,7 @@ fn lift_three_source(
             (5, false) => "a64.umaddl",
             (5, true) => "a64.umsubl",
             (6, false) => "a64.umulh",
-            _ => return Ok(interpret(decoded)),
+            _ => return Ok(unsupported(decoded)),
         };
         let operand_width = if matches!(opcode, 1 | 5) {
             IrType::I32
@@ -1020,7 +1020,7 @@ fn lift_one_source(
             )?[0]
                 .into()
         }
-        _ => return Ok(interpret(decoded)),
+        _ => return Ok(unsupported(decoded)),
     };
     write_gpr(
         builder,

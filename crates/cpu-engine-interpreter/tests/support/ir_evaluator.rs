@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use nixe_cpu::{
+    exception::ExceptionKind,
     ir::{
-        block::IrBlock,
+        block::{BlockId, IrBlock},
         op::{
             AddressOperation, ByteOrder, FlagOperation, IntegerBinaryKind, IntegerPredicate,
             MemoryOperation, OperationKind, ScalarOperation, ShiftKind, StateRegister,
         },
-        terminator::{ControlTarget, ExceptionKind, Terminator},
+        region::IrRegion,
+        terminator::{ControlTarget, Terminator},
         types::IrType,
         value::{Immediate, Operand, ValueId},
     },
@@ -34,6 +36,11 @@ pub enum ReferenceOutcome {
         source: LocationDescriptor,
         fault: DataAccessFault,
     },
+}
+
+enum RegionControl {
+    Internal(BlockId),
+    Exit(ReferenceOutcome),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,9 +87,36 @@ impl<'a> IrReferenceEvaluator<'a> {
     pub fn execute(
         &mut self,
         state: &mut ThreadCpuState,
-        block: &IrBlock,
+        region: &IrRegion,
     ) -> Result<ReferenceOutcome, String> {
-        self.values.clear();
+        let mut block_id = region.metadata.entries[0].block;
+        let mut traversed = 0_u32;
+        loop {
+            traversed = traversed
+                .checked_add(1)
+                .ok_or_else(|| "IR region traversal count overflow".to_string())?;
+            if traversed > region.metadata.guest_instruction_count.saturating_add(1) {
+                return Err("IR reference evaluator reached a backward region edge".into());
+            }
+            let block = region
+                .block(block_id)
+                .ok_or_else(|| format!("missing IR region block {}", block_id.index()))?;
+            self.values.clear();
+            if let Some(outcome) = self.execute_operations(state, block)? {
+                return Ok(outcome);
+            }
+            match self.terminate(state, region, block)? {
+                RegionControl::Internal(next) => block_id = next,
+                RegionControl::Exit(outcome) => return Ok(outcome),
+            }
+        }
+    }
+
+    fn execute_operations(
+        &mut self,
+        state: &mut ThreadCpuState,
+        block: &IrBlock,
+    ) -> Result<Option<ReferenceOutcome>, String> {
         for operation in &block.operations {
             let results = match &operation.kind {
                 OperationKind::Constant(immediate) => vec![immediate_value(*immediate)],
@@ -98,10 +132,10 @@ impl<'a> IrReferenceEvaluator<'a> {
                 OperationKind::Memory(memory_operation) => match self.memory(memory_operation) {
                     Ok(results) => results,
                     Err(fault) => {
-                        return Ok(ReferenceOutcome::DataAbort {
+                        return Ok(Some(ReferenceOutcome::DataAbort {
                             source: operation.source,
                             fault,
-                        });
+                        }));
                     }
                 },
                 OperationKind::Barrier(_) | OperationKind::CacheMaintenance(_) => Vec::new(),
@@ -134,7 +168,7 @@ impl<'a> IrReferenceEvaluator<'a> {
                 self.values.insert(value.id, result);
             }
         }
-        self.terminate(state, block)
+        Ok(None)
     }
 
     fn operand(&self, operand: Operand) -> Result<RuntimeValue, String> {
@@ -448,14 +482,44 @@ impl<'a> IrReferenceEvaluator<'a> {
                 )?;
                 Ok(Vec::new())
             }
+            MemoryOperation::GuardedLoad {
+                predicate,
+                address,
+                fallback,
+                descriptor,
+            } => {
+                if !self.operand(predicate).unwrap().is_true().unwrap() {
+                    return Ok(vec![self.operand(fallback).unwrap()]);
+                }
+                self.memory(&MemoryOperation::Load {
+                    address,
+                    descriptor,
+                })
+            }
+            MemoryOperation::GuardedStore {
+                predicate,
+                address,
+                value,
+                descriptor,
+            } => {
+                if !self.operand(predicate).unwrap().is_true().unwrap() {
+                    return Ok(Vec::new());
+                }
+                self.memory(&MemoryOperation::Store {
+                    address,
+                    value,
+                    descriptor,
+                })
+            }
         }
     }
 
     fn terminate(
         &self,
         state: &mut ThreadCpuState,
+        region: &IrRegion,
         block: &IrBlock,
-    ) -> Result<ReferenceOutcome, String> {
+    ) -> Result<RegionControl, String> {
         let target = match &block.terminator {
             Terminator::Direct { target }
             | Terminator::Indirect { target }
@@ -472,16 +536,44 @@ impl<'a> IrReferenceEvaluator<'a> {
                     fallthrough
                 }
             }
+            Terminator::ConditionalCall {
+                condition,
+                target,
+                fallthrough,
+                ..
+            } => {
+                if self.operand(*condition)?.is_true()? {
+                    target
+                } else {
+                    fallthrough
+                }
+            }
             Terminator::Exception {
                 source,
                 kind,
                 syndrome,
             } => {
-                return Ok(ReferenceOutcome::Exception {
+                return Ok(RegionControl::Exit(ReferenceOutcome::Exception {
                     source: *source,
                     kind: *kind,
                     syndrome: *syndrome,
-                });
+                }));
+            }
+            Terminator::ConditionalException {
+                condition,
+                source,
+                kind,
+                syndrome,
+                fallthrough,
+            } => {
+                if self.operand(*condition)?.is_true()? {
+                    return Ok(RegionControl::Exit(ReferenceOutcome::Exception {
+                        source: *source,
+                        kind: *kind,
+                        syndrome: *syndrome,
+                    }));
+                }
+                fallthrough
             }
             Terminator::InterpretOne { .. }
             | Terminator::UnsupportedInstruction { .. }
@@ -492,10 +584,23 @@ impl<'a> IrReferenceEvaluator<'a> {
                 ));
             }
         };
+        if let ControlTarget::Internal { block: target } = target {
+            let destination = region
+                .block(*target)
+                .ok_or_else(|| format!("missing IR region block {}", target.index()))?;
+            let direct = ControlTarget::Direct {
+                pc: destination.metadata.start.pc,
+                execution_state: destination.metadata.start.execution_state,
+            };
+            install_target(state, block.metadata.start, &direct, |operand| {
+                self.operand(operand).map(|value| value.bits as u64)
+            })?;
+            return Ok(RegionControl::Internal(*target));
+        }
         let location = install_target(state, block.metadata.start, target, |operand| {
             self.operand(operand).map(|value| value.bits as u64)
         })?;
-        Ok(ReferenceOutcome::Resume(location))
+        Ok(RegionControl::Exit(ReferenceOutcome::Resume(location)))
     }
 }
 
@@ -639,6 +744,9 @@ fn install_target(
     resolve: impl Fn(Operand) -> Result<u64, String>,
 ) -> Result<LocationDescriptor, String> {
     let (pc, execution_state) = match *target {
+        ControlTarget::Internal { .. } => {
+            return Err("internal region target was not resolved by the evaluator".into());
+        }
         ControlTarget::Direct {
             pc,
             execution_state,

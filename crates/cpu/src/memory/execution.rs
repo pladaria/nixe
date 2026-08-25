@@ -223,10 +223,9 @@ impl ExecutionMemoryInner {
 /// neither its storage nor any instruction/data hot path delegates to it.
 ///
 /// Semantic accesses are serialized by one process-memory transaction lock.
-/// This intentionally conservative Phase-D policy makes cross-page validation,
-/// canonical-page generation changes, MMIO callbacks, and mapping lookup one
-/// indivisible operation while permitting the memory object to be shared by
-/// future vCPU workers.
+/// One process-memory transaction makes cross-page validation, canonical-page
+/// generation changes, MMIO callbacks, and mapping lookup indivisible while
+/// permitting the memory object to be shared by concurrent vCPU workers.
 pub struct ExecutionMemory {
     backing_store: Option<CanonicalBackingStore>,
     inner: Mutex<ExecutionMemoryInner>,

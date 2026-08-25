@@ -87,11 +87,14 @@ fn qemu_user_mode_matches_adds_for_a64_a32_and_t32() {
 #[test]
 #[ignore = "requires the optional QEMU user-mode and AArch64 cross-toolchain dependencies"]
 fn qemu_a64_single_step_oracle_preserves_bfm_destination_bits() {
-    let mut fixture = A64OracleFixture::new();
     for (encoding, destination, source, expected, name) in [
         (0x331b_0c20, 0xa5a5_a5a5, 0xf, 0xa5a5_a5e5, "BFI"),
         (0x3300_1020, 0xdead_bee0, 0x1234_567f, 0xdead_beff, "BFXIL"),
     ] {
+        // QEMU user-mode can reject a second GDB write to a translated code
+        // page. Each semantic vector gets a fresh stopped inferior so the
+        // oracle never depends on rewriting already executed code.
+        let mut fixture = A64OracleFixture::new();
         fixture.oracle.write_instruction(fixture.slot, encoding);
         fixture.oracle.write_register(0, destination);
         fixture.oracle.write_register(1, source);

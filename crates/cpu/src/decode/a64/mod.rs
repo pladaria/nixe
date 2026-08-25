@@ -1,4 +1,4 @@
-//! Declarative A64 instruction table for the minimum viable frontend.
+//! Declarative A64 instruction table and authoritative frontend coverage.
 
 pub mod control;
 pub mod fp_simd;
@@ -16,7 +16,10 @@ use crate::{
 
 use super::{
     DecodeResult, DecodedOpcode,
-    table::{DecodeSupport, DecoderTable, InstructionPattern, LoweringAvailability, OperandField},
+    table::{
+        DecodeSupport, DecoderTable, InstructionPattern, LoweringAvailability, OperandField,
+        RegressionFixture,
+    },
 };
 
 /// Opaque payload forwarded to exact helpers without being decoded by a
@@ -94,8 +97,10 @@ pub(super) const fn pattern(
         coverage_id: CoverageId::new(id),
         priority,
         decoder: DecodeSupport::Ready,
-        lowering: LoweringAvailability::Missing,
-        regression_fixture: None,
+        lowering: LoweringAvailability::Implemented,
+        regression_fixture: Some(RegressionFixture {
+            encoding: InstructionEncoding::from_u32(value),
+        }),
     }
 }
 
@@ -152,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn representative_mvp_encodings_select_the_intended_family() {
+    fn representative_registered_encodings_select_the_intended_family() {
         let profile = GuestCpuProfile::switch_1();
         let cases = [
             (0x9400_0000, "bl"),

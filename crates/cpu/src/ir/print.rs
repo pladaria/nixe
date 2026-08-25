@@ -2,7 +2,12 @@
 
 use core::fmt::Write;
 
-use super::{block::IrBlock, types::IrType, value::Value};
+use super::{
+    block::{BlockId, IrBlock},
+    region::IrRegion,
+    types::IrType,
+    value::Value,
+};
 
 /// Position of an IR dump in the Nixe IR optimization pipeline.
 ///
@@ -40,16 +45,75 @@ impl Default for IrPrintOptions {
     }
 }
 
-/// Prints a block using only stable guest and semantic identities.
+/// Prints a region using only stable guest and semantic identities.
 ///
 /// The format deliberately excludes host pointers and hash iteration order, so
 /// it is suitable for golden tests and can be pasted directly into bug reports.
 #[must_use]
-pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
+pub fn print_region(region: &IrRegion, options: IrPrintOptions) -> String {
     let mut output = String::new();
     writeln!(
         output,
-        "block {} {} {} bytes={} instructions={}",
+        "region {} {} {} bytes={} instructions={} operations={} blocks={}",
+        region.metadata.start.pc,
+        region.metadata.start.execution_state,
+        region.metadata.start.profile_id,
+        region.metadata.guest_byte_count,
+        region.metadata.guest_instruction_count,
+        region.metadata.ir_operation_count,
+        region.blocks.len()
+    )
+    .expect("writing to a String cannot fail");
+
+    for dependency in &region.metadata.code_dependencies {
+        writeln!(
+            output,
+            "  dependency {} {} {}",
+            dependency.page, dependency.generation, dependency.mapping_generation
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for entry in &region.metadata.entries {
+        writeln!(
+            output,
+            "  entry {} -> b{}",
+            entry.location,
+            entry.block.index()
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for safepoint in &region.metadata.safepoints {
+        writeln!(
+            output,
+            "  safepoint {:?} block=b{} target={:?}",
+            safepoint.kind,
+            safepoint.block.index(),
+            safepoint.target.map(BlockId::index)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, block) in region.blocks.iter().enumerate() {
+        write_block(&mut output, BlockId::new(index as u32), block, options);
+    }
+    for exit in &region.metadata.exits {
+        writeln!(
+            output,
+            "  exit b{} {:?} target={:?}",
+            exit.block.index(),
+            exit.kind,
+            exit.target
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output.push_str("end-region\n");
+    output
+}
+
+fn write_block(output: &mut String, id: BlockId, block: &IrBlock, options: IrPrintOptions) {
+    writeln!(
+        output,
+        "block b{} {} {} {} bytes={} instructions={}",
+        id.index(),
         block.metadata.start.pc,
         block.metadata.start.execution_state,
         block.metadata.start.profile_id,
@@ -75,20 +139,12 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
         }
         output.push('\n');
     }
-    for dependency in &block.metadata.code_dependencies {
-        writeln!(
-            output,
-            "  dependency {} {} {}",
-            dependency.page, dependency.generation, dependency.mapping_generation
-        )
-        .expect("writing to a String cannot fail");
-    }
     writeln!(output, "  end-reason {}", block.metadata.end_reason)
         .expect("writing to a String cannot fail");
     for (index, operation) in block.operations.iter().enumerate() {
         output.push_str("  ");
         write_results(
-            &mut output,
+            output,
             operation.results.iter().collect::<Vec<_>>().as_slice(),
         );
         writeln!(
@@ -100,23 +156,18 @@ pub fn print_block(block: &IrBlock, options: IrPrintOptions) -> String {
     }
     writeln!(output, "  terminator {:?}", block.terminator)
         .expect("writing to a String cannot fail");
-    for exit in &block.metadata.exits {
-        writeln!(output, "  exit {:?} target={:?}", exit.kind, exit.target)
-            .expect("writing to a String cannot fail");
-    }
-    output.push_str("end\n");
-    output
+    output.push_str("end-block\n");
 }
 
 /// Prints a stable stage-labelled IR dump.
 ///
-/// Callers pass the block produced at the named stage. No optimization is
+/// Callers pass the region produced at the named stage. No optimization is
 /// performed by this function, and printing remains entirely opt-in.
 #[must_use]
-pub fn print_ir_dump(block: &IrBlock, stage: IrDumpStage, options: IrPrintOptions) -> String {
+pub fn print_ir_dump(region: &IrRegion, stage: IrDumpStage, options: IrPrintOptions) -> String {
     let mut output = String::new();
     writeln!(output, "ir-dump stage={stage}").expect("writing to a String cannot fail");
-    output.push_str(&print_block(block, options));
+    output.push_str(&print_region(region, options));
     output
 }
 
@@ -161,8 +212,12 @@ mod tests {
 
     use crate::{
         ir::{
-            block::{BlockExit, BlockExitKind, BlockMetadata, InstructionSource},
+            block::{BlockMetadata, InstructionSource},
             op::{IrOperation, OperationKind, OperationResults},
+            region::{
+                RegionEntry, RegionExit, RegionExitKind, RegionMetadata, RegionSafepoint,
+                RegionSafepointKind,
+            },
             terminator::{ControlTarget, Terminator},
             value::{Immediate, Value, ValueId},
         },
@@ -171,7 +226,7 @@ mod tests {
         profile::CpuProfileId,
     };
 
-    fn block() -> IrBlock {
+    fn region() -> IrRegion {
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
@@ -182,16 +237,15 @@ mod tests {
             generation: ContentGeneration::new(3),
             mapping_generation: MappingGeneration::new(1),
         };
-        IrBlock::new(
+        let target = ControlTarget::Direct {
+            pc: GuestVirtualAddress::new(0x1004),
+            execution_state: ExecutionState::A64,
+        };
+        let block = IrBlock::new(
             BlockMetadata::new(
                 location,
                 4,
                 1,
-                vec![BlockExit {
-                    kind: BlockExitKind::Direct,
-                    target: Some(GuestVirtualAddress::new(0x1004)),
-                }],
-                vec![dependency],
                 vec![
                     InstructionSource::new(
                         location,
@@ -206,37 +260,62 @@ mod tests {
                 OperationResults::one(Value::new(ValueId::new(0), IrType::I64)),
                 OperationKind::Constant(Immediate::I64(7)),
             )],
-            Terminator::Direct {
-                target: ControlTarget::Direct {
-                    pc: GuestVirtualAddress::new(0x1004),
-                    execution_state: ExecutionState::A64,
-                },
+            Terminator::Direct { target },
+        );
+        IrRegion::new(
+            RegionMetadata {
+                start: location,
+                guest_byte_count: 4,
+                guest_instruction_count: 1,
+                ir_operation_count: 1,
+                entries: vec![RegionEntry {
+                    location,
+                    block: BlockId::new(0),
+                }]
+                .into_boxed_slice(),
+                exits: vec![RegionExit {
+                    block: BlockId::new(0),
+                    kind: RegionExitKind::Direct,
+                    target: Some(target),
+                }]
+                .into_boxed_slice(),
+                code_dependencies: vec![dependency].into_boxed_slice(),
+                safepoints: vec![RegionSafepoint {
+                    block: BlockId::new(0),
+                    target: None,
+                    kind: RegionSafepointKind::Entry,
+                }]
+                .into_boxed_slice(),
             },
+            vec![block],
         )
     }
 
     #[test]
     fn printer_is_deterministic_and_has_a_golden_format() {
-        let actual = print_block(&block(), IrPrintOptions::default());
+        let actual = print_region(&region(), IrPrintOptions::default());
         let expected = concat!(
-            "block 0x0000000000001000 A64 profile=0x0000000000000001 bytes=4 instructions=1\n",
+            "region 0x0000000000001000 A64 profile=0x0000000000000001 bytes=4 instructions=1 operations=1 blocks=1\n",
+            "  dependency page=0x0000000000000002 generation=0x0000000000000003 mapping-generation=1\n",
+            "  entry pc=0x0000000000001000 state=A64 profile=0x0000000000000001 -> b0\n",
+            "  safepoint Entry block=b0 target=None\n",
+            "block b0 0x0000000000001000 A64 profile=0x0000000000000001 bytes=4 instructions=1\n",
             "  source pc=0x0000000000001000 state=A64 ; raw=0xd503201f ; guest=\"nop\"\n",
-            "  dependency page=0x0000000000000002 generation=0x0000000000000003 \
-             mapping-generation=1\n",
             "  end-reason explicit-terminator\n",
             "  %0:i64 = op0 Constant(I64(7)) effects=OperationEffects { side_effects: EffectSet(0), may_fault: false } source=0x0000000000001000\n",
             "  terminator Direct { target: Direct { pc: GuestVirtualAddress(4100), execution_state: A64 } }\n",
-            "  exit Direct target=Some(GuestVirtualAddress(4100))\n",
-            "end\n",
+            "end-block\n",
+            "  exit b0 Direct target=Some(Direct { pc: GuestVirtualAddress(4100), execution_state: A64 })\n",
+            "end-region\n",
         );
         assert_eq!(actual, expected);
-        assert_eq!(actual, print_block(&block(), IrPrintOptions::default()));
+        assert_eq!(actual, print_region(&region(), IrPrintOptions::default()));
     }
 
     #[test]
     fn raw_encoding_and_disassembly_comments_are_optional() {
-        let output = print_block(
-            &block(),
+        let output = print_region(
+            &region(),
             IrPrintOptions {
                 raw_encoding_comments: false,
                 disassembly_comments: false,
@@ -250,12 +329,12 @@ mod tests {
     #[test]
     fn staged_dump_api_distinguishes_pre_and_post_optimization_ir() {
         let pre = print_ir_dump(
-            &block(),
+            &region(),
             IrDumpStage::PreOptimization,
             IrPrintOptions::default(),
         );
         let post = print_ir_dump(
-            &block(),
+            &region(),
             IrDumpStage::PostOptimization,
             IrPrintOptions::default(),
         );

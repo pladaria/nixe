@@ -132,14 +132,24 @@ pub struct MultipleTransfer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExclusiveTransfer {
-    pub load: bool,
-    pub size: MemorySize,
-    pub rn: u8,
-    pub rt: u8,
-    pub status: Option<u8>,
-    pub acquire: bool,
-    pub release: bool,
+pub enum ExclusiveTransfer {
+    Load {
+        size: MemorySize,
+        rn: u8,
+        rt: u8,
+    },
+    Store {
+        size: MemorySize,
+        rn: u8,
+        rt: u8,
+        status: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcquireReleaseTransfer {
+    Load { size: MemorySize, rn: u8, rt: u8 },
+    Store { size: MemorySize, rn: u8, rt: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +186,6 @@ pub struct VectorTransfer {
     pub load: bool,
     pub rn: u8,
     pub vd: u8,
-    pub register_count: u8,
     pub writeback_rm: Option<u8>,
 }
 

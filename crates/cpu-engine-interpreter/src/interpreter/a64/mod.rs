@@ -1,7 +1,7 @@
 //! A64 reference interpretation split by architectural instruction family.
 
 mod control;
-mod fp_simd;
+pub(super) mod fp_simd;
 mod integer;
 mod memory;
 mod system;

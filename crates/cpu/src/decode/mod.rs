@@ -354,7 +354,7 @@ mod tests {
         let a32_simd = InstructionEncoding::from_u32(0xee00_0a00);
         assert!(matches!(
             decode(&enabled, location(enabled, ExecutionState::A32), a32_simd),
-            DecodeResult::RecognizedUnimplemented(_)
+            DecodeResult::Decoded(_)
         ));
         assert!(matches!(
             decode(&disabled, location(disabled, ExecutionState::A32), a32_simd),

@@ -1,4 +1,8 @@
-//! A64-to-IR translation for the minimum viable instruction subset.
+//! Encoding-independent A64-to-IR semantic construction.
+//!
+//! Instruction semantics follow the Arm ARM A64 definitions (DDI 0602):
+//! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions
+//! https://developer.arm.com/documentation/ddi0602/latest/SIMD-FP-Instructions
 
 mod control;
 mod fp_simd;
@@ -9,6 +13,7 @@ use nixe_memory::GuestVirtualAddress;
 
 use crate::{
     decode::{DecodedOpcode, a64::A64Instruction},
+    exception::ExceptionKind,
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
@@ -19,7 +24,7 @@ use crate::{
             MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation, ShiftKind,
             StateRegister, Volatility,
         },
-        terminator::{ControlTarget, ExceptionKind, Terminator},
+        terminator::{ControlTarget, Terminator},
         types::IrType,
         value::{Immediate, Operand, Value},
     },
@@ -55,13 +60,23 @@ fn lift_inner(
         A64Instruction::Integer(instruction) => integer::lift(builder, decoded, instruction)?,
         A64Instruction::Memory(instruction) => memory::lift(builder, decoded, instruction)?,
         A64Instruction::FpSimd(instruction) => fp_simd::lift(builder, decoded, instruction)?,
-        A64Instruction::RecognizedFallback { .. } => interpret(decoded),
+        A64Instruction::RecognizedFallback { .. } => {
+            LiftOutcome::Interpret(decoded.instruction.coverage_id())
+        }
     };
     Ok(outcome)
 }
 
-fn interpret(decoded: &DecodedInstruction<DecodedOpcode>) -> LiftOutcome {
-    LiftOutcome::Interpret(decoded.instruction.coverage_id())
+fn unsupported(decoded: &DecodedInstruction<DecodedOpcode>) -> LiftOutcome {
+    LiftOutcome::Terminate(Terminator::UnsupportedInstruction {
+        source: decoded.location,
+        encoding: decoded.encoding,
+        coverage_id: decoded.instruction.coverage_id().get(),
+        disassembly: crate::decode::disassemble(&decoded.instruction)
+            .to_string()
+            .into(),
+        reason: "recognized encoding has no interpreter semantics".into(),
+    })
 }
 
 fn next_pc(source: LocationDescriptor) -> GuestVirtualAddress {
@@ -367,11 +382,11 @@ mod tests {
     use nixe_memory::{AddressSpaceId, GuestPhysicalPageId};
 
     use crate::{
-        ir::{block::BlockExitKind, op::OperationKind},
+        ir::op::OperationKind,
         location::ExecutionState,
         memory::{MemoryPermissions, SyntheticMemory},
         profile::GuestCpuProfile,
-        translate::{BlockTranslationConfig, translate_block},
+        translate::block::{BasicBlockLimits, translate_basic_block},
     };
 
     const SPACE: AddressSpaceId = AddressSpaceId::new(11);
@@ -415,8 +430,8 @@ mod tests {
                 &word.to_le_bytes(),
             ));
         }
-        translate_block(
-            BlockTranslationConfig::default(),
+        translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             LocationDescriptor::new(
@@ -444,19 +459,15 @@ mod tests {
                 .iter()
                 .any(|operation| matches!(operation.kind, OperationKind::Flags(_)))
         );
-        assert_eq!(block.metadata.exits.len(), 2);
-        assert_eq!(
-            block.metadata.exits[0].kind,
-            BlockExitKind::ConditionalTaken
-        );
-        assert_eq!(
-            block.metadata.exits[0].target,
-            Some(GuestVirtualAddress::new(0x1004))
-        );
-        assert_eq!(
-            block.metadata.exits[1].target,
-            Some(GuestVirtualAddress::new(0x100c))
-        );
+        assert!(matches!(
+            block.terminator,
+            Terminator::Conditional {
+                taken: ControlTarget::Direct { pc: taken, .. },
+                fallthrough: ControlTarget::Direct { pc: fallthrough, .. },
+                ..
+            } if taken == GuestVirtualAddress::new(0x1004)
+                && fallthrough == GuestVirtualAddress::new(0x100c)
+        ));
     }
 
     #[test]
@@ -523,7 +534,7 @@ mod tests {
         ));
 
         // The same architectural write is visible before a deterministic
-        // engine-neutral fallback boundary for an unlowered hint.
+        // unsupported boundary for a hint implemented by neither engine.
         let fallback = translate(&[0xf100_0400, 0xd503_20df]);
         assert!(fallback.operations.iter().any(|operation| matches!(
             operation.kind,
@@ -534,7 +545,7 @@ mod tests {
         )));
         assert!(matches!(
             fallback.terminator,
-            Terminator::InterpretOne { .. }
+            Terminator::UnsupportedInstruction { .. }
         ));
     }
 
@@ -833,7 +844,7 @@ mod tests {
                 0x4e20_1c00, // and v0.16b,v0.16b,v0.16b
                 0x4e20_8400, // add v0.16b,v0.16b,v0.16b
                 0x1e60_4000, // fmov d0,d0
-                0x1e61_4800, // fmax d0,d0,d1
+                0x1e61_2800, // fadd s0,s0,s1
                 0x1e61_2000, // fcmp d0,d1
                 0x9e62_0000, // scvtf d0,x0
                 0x9e63_0001, // ucvtf d1,x0
@@ -846,7 +857,7 @@ mod tests {
         assert_eq!(block.metadata.guest_instruction_count, 11);
         assert!(block.operations.iter().any(|operation| matches!(
             operation.kind,
-            OperationKind::Helper(ref helper) if helper.helper.as_ref() == "a64.fp.scalar-arithmetic"
+            OperationKind::Helper(ref helper) if helper.helper.as_ref() == "a64.fp-simd.semantic-vector"
         )));
         assert!(block.operations.iter().any(|operation| matches!(
             operation.kind,

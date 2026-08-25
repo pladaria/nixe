@@ -14,7 +14,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "load-store-unsigned",
         0x3f00_0000,
@@ -24,7 +24,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "load-store-unscaled",
         0x3f20_0c00,
@@ -34,7 +34,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "load-store-post-index",
         0x3f20_0c00,
@@ -44,7 +44,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0x3800_0401),
     pattern(
         "load-store-pre-index",
         0x3f20_0c00,
@@ -54,7 +55,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0x3800_0c01),
     pattern(
         "load-store-register",
         0x3f20_0c00,
@@ -64,7 +66,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xf861_6800),
     pattern(
         "load-store-pair",
         0x3e00_0000,
@@ -74,7 +77,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "load-acquire",
         0x3fe0_fc00,
@@ -84,7 +87,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "store-release",
         0x3fe0_fc00,
@@ -94,7 +97,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "load-exclusive",
         0x3fe0_7c00,
@@ -104,7 +107,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
     pattern(
         "store-exclusive",
         0x3f20_7c00,
@@ -114,7 +117,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered(),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

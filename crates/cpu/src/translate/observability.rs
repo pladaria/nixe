@@ -1,4 +1,4 @@
-//! Opt-in deterministic reports for one frontend translation block.
+//! Opt-in deterministic reports for one frontend translation region.
 
 use nixe_memory::{
     AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
@@ -9,8 +9,8 @@ use crate::{
         FrontendError, FrontendInternalError, InstructionFetchFault, InstructionFetchFaultReason,
     },
     ir::{
-        block::{BlockEndReason, IrBlock},
         print::{IrDumpStage, IrPrintOptions, print_ir_dump},
+        region::IrRegion,
     },
     location::{ExecutionState, LocationDescriptor},
     memory::{
@@ -20,14 +20,14 @@ use crate::{
     profile::GuestCpuProfile,
 };
 
-use super::{BlockTranslationConfig, block::translate_block_with_disassembly};
+use super::region::{RegionTranslationConfig, translate_region_with_disassembly};
 
 /// Stable address-space identity used only by raw-byte diagnostic fixtures.
 const RAW_DIAGNOSTIC_ADDRESS_SPACE: AddressSpaceId = AddressSpaceId::new(0x5357_4954_5844_4247);
 
-/// Reason translation failed before a valid IR block existed.
+/// Reason translation failed before a valid IR region existed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BlockTranslationFailureReason {
+pub enum RegionTranslationFailureReason {
     /// Instruction memory could not provide the requested bytes.
     FetchFault,
     /// Configuration, address validation, IR verification, or an internal
@@ -35,7 +35,7 @@ pub enum BlockTranslationFailureReason {
     TranslationFailure,
 }
 
-impl core::fmt::Display for BlockTranslationFailureReason {
+impl core::fmt::Display for RegionTranslationFailureReason {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
             Self::FetchFault => "fetch-fault",
@@ -44,52 +44,25 @@ impl core::fmt::Display for BlockTranslationFailureReason {
     }
 }
 
-/// Complete reason represented by a successful or failed block report.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BlockReportEndReason {
-    /// A verified block ended for the contained semantic or policy reason.
-    Block(BlockEndReason),
-    /// Translation failed before a valid block existed.
-    Failure(BlockTranslationFailureReason),
-}
-
-impl core::fmt::Display for BlockReportEndReason {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Block(reason) => reason.fmt(formatter),
-            Self::Failure(reason) => reason.fmt(formatter),
-        }
-    }
-}
-
-/// Result of an opt-in single-block diagnostic translation.
+/// Result of an opt-in bounded-region diagnostic translation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BlockTranslationReport {
-    /// A verified pre-optimization IR block was produced.
-    Translated(IrBlock),
-    /// Translation stopped before a valid block could be produced.
+pub enum RegionTranslationReport {
+    /// A verified pre-optimization IR region was produced.
+    Translated(IrRegion),
+    /// Translation stopped before a valid region could be produced.
     Failed {
         start: LocationDescriptor,
-        end_reason: BlockTranslationFailureReason,
+        reason: RegionTranslationFailureReason,
         error: FrontendError,
     },
 }
 
-impl BlockTranslationReport {
-    /// Returns the exact semantic, policy, or failure reason which ended work.
+impl RegionTranslationReport {
+    /// Returns the verified region when translation succeeded.
     #[must_use]
-    pub const fn end_reason(&self) -> BlockReportEndReason {
+    pub const fn region(&self) -> Option<&IrRegion> {
         match self {
-            Self::Translated(block) => BlockReportEndReason::Block(block.metadata.end_reason),
-            Self::Failed { end_reason, .. } => BlockReportEndReason::Failure(*end_reason),
-        }
-    }
-
-    /// Returns the verified block when translation succeeded.
-    #[must_use]
-    pub const fn block(&self) -> Option<&IrBlock> {
-        match self {
-            Self::Translated(block) => Some(block),
+            Self::Translated(region) => Some(region),
             Self::Failed { .. } => None,
         }
     }
@@ -104,9 +77,9 @@ impl BlockTranslationReport {
     }
 
     /// Converts the report back into the ordinary translation result surface.
-    pub fn into_result(self) -> Result<IrBlock, FrontendError> {
+    pub fn into_result(self) -> Result<IrRegion, FrontendError> {
         match self {
-            Self::Translated(block) => Ok(block),
+            Self::Translated(region) => Ok(region),
             Self::Failed { error, .. } => Err(error),
         }
     }
@@ -116,32 +89,34 @@ impl BlockTranslationReport {
     pub fn print(&self) -> String {
         use core::fmt::Write;
 
-        let mut output = String::from("nixe-frontend-block-report-v1\n");
+        let mut output = String::from("nixe-frontend-region-report-v1\n");
         match self {
-            Self::Translated(block) => {
+            Self::Translated(region) => {
                 writeln!(
                     output,
                     "start={} state={} {}",
-                    block.metadata.start.pc,
-                    block.metadata.start.execution_state,
-                    block.metadata.start.profile_id
+                    region.metadata.start.pc,
+                    region.metadata.start.execution_state,
+                    region.metadata.start.profile_id
                 )
                 .expect("writing to a String cannot fail");
                 writeln!(
                     output,
-                    "outcome=translated end={}",
-                    block.metadata.end_reason
+                    "outcome=translated blocks={} entries={} exits={}",
+                    region.blocks.len(),
+                    region.metadata.entries.len(),
+                    region.metadata.exits.len()
                 )
                 .expect("writing to a String cannot fail");
                 output.push_str(&print_ir_dump(
-                    block,
+                    region,
                     IrDumpStage::PreOptimization,
                     IrPrintOptions::default(),
                 ));
             }
             Self::Failed {
                 start,
-                end_reason,
+                reason,
                 error,
             } => {
                 writeln!(
@@ -150,7 +125,7 @@ impl BlockTranslationReport {
                     start.pc, start.execution_state, start.profile_id
                 )
                 .expect("writing to a String cannot fail");
-                writeln!(output, "outcome=failed end={end_reason}")
+                writeln!(output, "outcome=failed reason={reason}")
                     .expect("writing to a String cannot fail");
                 writeln!(output, "error={error}").expect("writing to a String cannot fail");
             }
@@ -160,21 +135,21 @@ impl BlockTranslationReport {
     }
 }
 
-/// Translates one process-memory block while collecting optional source text.
+/// Translates one process-memory region while collecting optional source text.
 ///
-/// Unlike [`super::translate_block`], this path constructs a disassembly string
+/// Unlike [`super::translate_region`], this path constructs a disassembly string
 /// for each recognized source instruction. Callers should invoke it only when a
 /// diagnostic report or IR dump has been requested.
 #[must_use]
-pub fn translate_block_report(
-    config: BlockTranslationConfig,
+pub fn translate_region_report(
+    config: RegionTranslationConfig,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &impl InstructionMemory,
-) -> BlockTranslationReport {
-    match translate_block_with_disassembly(config, profile, address_space, start, memory) {
-        Ok(block) => BlockTranslationReport::Translated(block),
+) -> RegionTranslationReport {
+    match translate_region_with_disassembly(config, profile, address_space, start, memory) {
+        Ok(region) => RegionTranslationReport::Translated(region),
         Err(error) => failure(start, error),
     }
 }
@@ -186,19 +161,19 @@ pub fn translate_block_report(
 /// identities, not host addresses. This helper is intended for commands,
 /// regression tests, and bug reproduction, never as process memory.
 #[must_use]
-pub fn translate_raw_block_report(
-    config: BlockTranslationConfig,
+pub fn translate_raw_region_report(
+    config: RegionTranslationConfig,
     profile: &GuestCpuProfile,
     base_pc: GuestVirtualAddress,
     execution_state: ExecutionState,
     bytes: &[u8],
-) -> BlockTranslationReport {
+) -> RegionTranslationReport {
     let start = LocationDescriptor::new(base_pc, execution_state, profile.id());
     let memory = match RawInstructionMemory::new(base_pc, bytes) {
         Ok(memory) => memory,
         Err(error) => return failure(start, error),
     };
-    translate_block_report(
+    translate_region_report(
         config,
         profile,
         RAW_DIAGNOSTIC_ADDRESS_SPACE,
@@ -207,15 +182,15 @@ pub fn translate_raw_block_report(
     )
 }
 
-fn failure(start: LocationDescriptor, error: FrontendError) -> BlockTranslationReport {
-    let end_reason = if matches!(error, FrontendError::InstructionFetch(_)) {
-        BlockTranslationFailureReason::FetchFault
+fn failure(start: LocationDescriptor, error: FrontendError) -> RegionTranslationReport {
+    let reason = if matches!(error, FrontendError::InstructionFetch(_)) {
+        RegionTranslationFailureReason::FetchFault
     } else {
-        BlockTranslationFailureReason::TranslationFailure
+        RegionTranslationFailureReason::TranslationFailure
     };
-    BlockTranslationReport::Failed {
+    RegionTranslationReport::Failed {
         start,
-        end_reason,
+        reason,
         error,
     }
 }
@@ -369,15 +344,16 @@ mod tests {
             0x1f, 0x20, 0x03, 0xd5, // nop
             0x01, 0x00, 0x00, 0xd4, // svc #0
         ];
-        let report = translate_raw_block_report(
-            BlockTranslationConfig::default(),
+        let report = translate_raw_region_report(
+            RegionTranslationConfig::default(),
             &profile,
             GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
             &bytes,
         );
 
-        let block = report.block().expect("raw block should translate");
+        let region = report.region().expect("raw region should translate");
+        let block = region.entry_block();
         assert_eq!(block.metadata.end_reason, BlockEndReason::Exception);
         assert_eq!(block.metadata.sources.len(), 2);
         assert_eq!(
@@ -395,7 +371,7 @@ mod tests {
 
         let output = report.print();
         assert_eq!(output, report.print());
-        assert!(output.contains("outcome=translated end=exception"));
+        assert!(output.contains("outcome=translated blocks=1 entries=1 exits=1"));
         assert!(output.contains("ir-dump stage=pre-optimization"));
         assert!(
             output.contains(
@@ -414,7 +390,7 @@ mod tests {
         assert!(!output.contains("0x7f"));
 
         let post = print_ir_dump(
-            block,
+            region,
             IrDumpStage::PostOptimization,
             IrPrintOptions::default(),
         );
@@ -424,90 +400,101 @@ mod tests {
     #[test]
     fn raw_helper_covers_a32_t32_limits_and_page_dependencies() {
         let profile = GuestCpuProfile::switch_1();
-        let a32 = translate_raw_block_report(
-            BlockTranslationConfig::default(),
+        let a32 = translate_raw_region_report(
+            RegionTranslationConfig::default(),
             &profile,
             GuestVirtualAddress::new(0x2000),
             ExecutionState::A32,
             &0xeaff_ffff_u32.to_le_bytes(),
         );
         assert_eq!(
-            a32.end_reason(),
-            BlockReportEndReason::Block(BlockEndReason::DirectBranch)
+            a32.region().unwrap().entry_block().metadata.end_reason,
+            BlockEndReason::DirectBranch
         );
         assert!(a32.print().contains("state=A32"));
 
-        let t32 = translate_raw_block_report(
-            BlockTranslationConfig {
+        let t32 = translate_raw_region_report(
+            RegionTranslationConfig {
+                max_blocks: NonZeroU32::new(1).unwrap(),
                 max_guest_instructions: NonZeroU32::new(1).unwrap(),
+                max_guest_instructions_per_block: NonZeroU32::new(1).unwrap(),
+                ..RegionTranslationConfig::default()
             },
             &profile,
             GuestVirtualAddress::new(0x2ffe),
             ExecutionState::T32,
             &[0xaf, 0xf3, 0x00, 0x80],
         );
-        let block = t32
-            .block()
+        let region = t32
+            .region()
             .expect("cross-page T32 instruction should translate");
+        let block = region.entry_block();
         assert_eq!(
             block.metadata.end_reason,
             BlockEndReason::InstructionLimitAtPageBoundary
         );
-        assert_eq!(block.metadata.code_dependencies.len(), 2);
+        assert_eq!(region.metadata.code_dependencies.len(), 2);
         assert_eq!(block.metadata.sources[0].dependencies.iter().count(), 2);
     }
 
     #[test]
     fn fetch_faults_and_other_failures_have_distinct_compact_reports() {
         let profile = GuestCpuProfile::switch_1();
-        let fetch = translate_raw_block_report(
-            BlockTranslationConfig::default(),
+        let fetch = translate_raw_region_report(
+            RegionTranslationConfig::default(),
             &profile,
             GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
             &[],
         );
-        assert_eq!(
-            fetch.end_reason(),
-            BlockReportEndReason::Failure(BlockTranslationFailureReason::FetchFault)
-        );
+        assert!(matches!(
+            &fetch,
+            RegionTranslationReport::Failed {
+                reason: RegionTranslationFailureReason::FetchFault,
+                ..
+            }
+        ));
         assert!(matches!(
             fetch.error(),
             Some(FrontendError::InstructionFetch(_))
         ));
-        assert!(fetch.print().contains("outcome=failed end=fetch-fault"));
+        assert!(fetch.print().contains("outcome=failed reason=fetch-fault"));
 
-        let invalid = translate_raw_block_report(
-            BlockTranslationConfig::default(),
+        let invalid = translate_raw_region_report(
+            RegionTranslationConfig::default(),
             &profile,
             GuestVirtualAddress::new(0x1002),
             ExecutionState::A64,
             &0xd503_201f_u32.to_le_bytes(),
         );
-        assert_eq!(
-            invalid.end_reason(),
-            BlockReportEndReason::Failure(BlockTranslationFailureReason::TranslationFailure)
-        );
+        assert!(matches!(
+            &invalid,
+            RegionTranslationReport::Failed {
+                reason: RegionTranslationFailureReason::TranslationFailure,
+                ..
+            }
+        ));
         assert!(
             invalid
                 .print()
-                .contains("outcome=failed end=translation-failure")
+                .contains("outcome=failed reason=translation-failure")
         );
     }
 
     #[test]
     fn architectural_decode_rejections_keep_source_context_in_reports() {
         let profile = GuestCpuProfile::switch_1();
-        let report = translate_raw_block_report(
-            BlockTranslationConfig::default(),
+        let report = translate_raw_region_report(
+            RegionTranslationConfig::default(),
             &profile,
             GuestVirtualAddress::new(0x4000),
             ExecutionState::A64,
             &0_u32.to_le_bytes(),
         );
         let block = report
-            .block()
-            .expect("undefined instruction forms an exception block");
+            .region()
+            .expect("undefined instruction forms an exception region")
+            .entry_block();
         assert_eq!(block.metadata.end_reason, BlockEndReason::Exception);
         assert!(
             block.metadata.sources[0]

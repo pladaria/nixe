@@ -3,10 +3,18 @@ use crate::decode::InstructionPattern;
 use crate::decode::aarch32::{MemoryOffset, MemorySize, MultipleTransfer, SingleTransfer};
 
 pub static PATTERNS_16: &[InstructionPattern] = &[
-    pattern16("load-literal", 0xf800, 0x4800, 0x0002_0020, 5, &[]),
-    pattern16("load-store-register", 0xf000, 0x5000, 0x0002_0021, 1, &[]),
-    pattern16("load-store-immediate", 0xe000, 0x6000, 0x0002_0022, 1, &[]),
-    pattern16("load-store-halfword", 0xf000, 0x8000, 0x0002_0023, 1, &[]),
+    pattern16("load-literal", 0xf800, 0x4800, 0x0002_0020, 5, &[])
+        .lowered()
+        .fixture16(0x4800),
+    pattern16("load-store-register", 0xf000, 0x5000, 0x0002_0021, 1, &[])
+        .lowered()
+        .fixture16(0x5000),
+    pattern16("load-store-immediate", 0xe000, 0x6000, 0x0002_0022, 1, &[])
+        .lowered()
+        .fixture16(0x6000),
+    pattern16("load-store-halfword", 0xf000, 0x8000, 0x0002_0023, 1, &[])
+        .lowered()
+        .fixture16(0x8000),
     pattern16(
         "load-store-sp-relative",
         0xf000,
@@ -14,11 +22,21 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0024,
         1,
         &[],
-    ),
-    pattern16("push", 0xfe00, 0xb400, 0x0002_0025, 10, &[]),
-    pattern16("pop", 0xfe00, 0xbc00, 0x0002_0026, 10, &[]),
-    pattern16("store-multiple", 0xf800, 0xc000, 0x0002_0027, 1, &[]),
-    pattern16("load-multiple", 0xf800, 0xc800, 0x0002_0028, 1, &[]),
+    )
+    .lowered()
+    .fixture16(0x9000),
+    pattern16("push", 0xfe00, 0xb400, 0x0002_0025, 10, &[])
+        .lowered()
+        .fixture16(0xb401),
+    pattern16("pop", 0xfe00, 0xbc00, 0x0002_0026, 10, &[])
+        .lowered()
+        .fixture16(0xbc01),
+    pattern16("store-multiple", 0xf800, 0xc000, 0x0002_0027, 1, &[])
+        .lowered()
+        .fixture16(0xc001),
+    pattern16("load-multiple", 0xf800, 0xc800, 0x0002_0028, 1, &[])
+        .lowered()
+        .fixture16(0xc801),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
     pattern32(
@@ -28,7 +46,9 @@ pub static PATTERNS_32: &[InstructionPattern] = &[
         0x0002_0029,
         5,
         &[],
-    ),
+    )
+    .lowered()
+    .fixture32(0xf8d00000),
     pattern32(
         "store-word-immediate.w",
         0xfff0_0000,
@@ -36,7 +56,9 @@ pub static PATTERNS_32: &[InstructionPattern] = &[
         0x0002_002a,
         5,
         &[],
-    ),
+    )
+    .lowered()
+    .fixture32(0xf8c00000),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -66,7 +66,6 @@ pub enum DecoderCoverage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoweringCoverage {
     Implemented,
-    EncodingDependent,
     Missing,
 }
 
@@ -190,7 +189,6 @@ fn decoder_coverage(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> 
 const fn lowering_coverage(availability: LoweringAvailability) -> LoweringCoverage {
     match availability {
         LoweringAvailability::Implemented => LoweringCoverage::Implemented,
-        LoweringAvailability::EncodingDependent => LoweringCoverage::EncodingDependent,
         LoweringAvailability::Missing => LoweringCoverage::Missing,
     }
 }
@@ -505,9 +503,9 @@ mod tests {
     use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 
     use crate::{
-        ir::{print::print_block, terminator::Terminator},
+        ir::{print::print_region, terminator::Terminator},
         memory::{MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory},
-        translate::{BlockTranslationConfig, translate_block},
+        translate::{RegionTranslationConfig, translate_region},
     };
 
     #[test]
@@ -520,7 +518,7 @@ mod tests {
 
         let integer = entry(&switch_1, CoverageId::new(0x0000_0003));
         assert_eq!(integer.lifter, LoweringCoverage::Implemented);
-        assert_eq!(integer.completion, CompletionCoverage::Incomplete);
+        assert_eq!(integer.completion, CompletionCoverage::Lifted);
 
         let simd = entry(&switch_1, CoverageId::new(0x0000_0030));
         assert_eq!(simd.decoder, DecoderCoverage::Available);
@@ -539,6 +537,19 @@ mod tests {
             entry(&switch_2, CoverageId::new(0x0001_0001)).decoder,
             DecoderCoverage::ExecutionStateDisabled
         );
+
+        for entry in switch_1
+            .iter()
+            .filter(|entry| entry.decoder == DecoderCoverage::Available)
+        {
+            assert_eq!(
+                entry.completion,
+                CompletionCoverage::Lifted,
+                "{} {} is available to the Switch 1 interpreter but lacks complete frontend evidence",
+                entry.execution_state,
+                entry.coverage_id
+            );
+        }
     }
 
     #[test]
@@ -582,14 +593,12 @@ mod tests {
                     && matches!(coverage.decoder, DecoderCoverage::Available)
             );
 
-            let block = translate_registered_encoding(&profile, &decoded);
+            let region = translate_registered_encoding(&profile, &decoded);
+            let block = region.entry_block();
             match pattern.lowering {
                 LoweringAvailability::Implemented => assert!(
-                    !matches!(
-                        block.terminator,
-                        Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
-                    ),
-                    "{} {} declares IR lowering but routed to {:?}",
+                    !matches!(block.terminator, Terminator::InterpretOne { .. }),
+                    "{} {} declares an exhaustive IR classifier but routed to {:?}",
                     pattern.execution_state,
                     pattern.coverage_id,
                     block.terminator
@@ -604,7 +613,6 @@ mod tests {
                     pattern.coverage_id,
                     block.terminator
                 ),
-                LoweringAvailability::EncodingDependent => {}
             }
         }
     }
@@ -612,7 +620,7 @@ mod tests {
     fn translate_registered_encoding(
         profile: &GuestCpuProfile,
         decoded: &crate::location::DecodedInstruction<crate::decode::DecodedOpcode>,
-    ) -> crate::ir::block::IrBlock {
+    ) -> crate::ir::region::IrRegion {
         let mut memory = SyntheticMemory::new();
         assert!(memory.add_ram_page(GuestPhysicalPageId::new(1)));
         assert!(memory.map_page(
@@ -633,9 +641,12 @@ mod tests {
             (_, InstructionSize::Bits32) => decoded.encoding.bits().to_le_bytes().to_vec(),
         };
         assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &bytes));
-        translate_block(
-            BlockTranslationConfig {
+        translate_region(
+            RegionTranslationConfig {
+                max_blocks: core::num::NonZeroU32::new(1).unwrap(),
                 max_guest_instructions: core::num::NonZeroU32::new(1).unwrap(),
+                max_guest_instructions_per_block: core::num::NonZeroU32::new(1).unwrap(),
+                ..RegionTranslationConfig::default()
             },
             profile,
             AddressSpaceId::new(1),
@@ -688,7 +699,14 @@ mod tests {
         for pattern in all_pattern_tables()
             .into_iter()
             .flatten()
-            .filter(|pattern| pattern.regression_fixture.is_some())
+            .filter(|pattern| {
+                pattern.regression_fixture.is_some()
+                    && pattern.decoder == DecodeSupport::Ready
+                    && matches!(
+                        decoder_coverage(&profile, pattern),
+                        DecoderCoverage::Available
+                    )
+            })
         {
             let fixture = pattern.regression_fixture.unwrap();
             let decoded = match decode::decode(
@@ -701,7 +719,10 @@ mod tests {
                 fixture.encoding,
             ) {
                 decode::DecodeResult::Decoded(decoded) => decoded,
-                other => panic!("completion fixture did not decode: {other:?}"),
+                other => panic!(
+                    "completion fixture for {} {} did not decode: {other:?}",
+                    pattern.execution_state, pattern.coverage_id
+                ),
             };
             assert_eq!(decoded.instruction.coverage_id(), pattern.coverage_id);
 
@@ -725,9 +746,12 @@ mod tests {
             };
             assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &bytes));
             assert_eq!(SYNTHETIC_PAGE_SIZE, 4096);
-            let block = translate_block(
-                BlockTranslationConfig {
+            let region = translate_region(
+                RegionTranslationConfig {
+                    max_blocks: core::num::NonZeroU32::new(1).unwrap(),
                     max_guest_instructions: core::num::NonZeroU32::new(1).unwrap(),
+                    max_guest_instructions_per_block: core::num::NonZeroU32::new(1).unwrap(),
+                    ..RegionTranslationConfig::default()
                 },
                 &profile,
                 AddressSpaceId::new(1),
@@ -737,15 +761,15 @@ mod tests {
             .unwrap();
             assert!(
                 !matches!(
-                    block.terminator,
+                    region.entry_block().terminator,
                     Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
                 ),
                 "completion fixture {:?} {} lowered to {:?}",
                 pattern.execution_state,
                 pattern.coverage_id,
-                block.terminator
+                region.entry_block().terminator
             );
-            let printed = print_block(&block, Default::default());
+            let printed = print_region(&region, Default::default());
             assert!(printed.contains("source pc=0x0000000000001000 state="));
             assert!(printed.contains(" ; raw="));
             assert!(printed.contains("terminator "));
