@@ -21,10 +21,10 @@ use nixe_cpu_engine::{
 use nixe_memory::GuestVirtualAddress;
 
 use crate::abi::{
-    EXIT_ARCHITECTURAL, EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERPRET_ONE,
-    EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT, EXIT_SCHEDULED,
-    EXIT_UNSUPPORTED, ExecutionFrame, FrameError, NativeExit, NativeGateway, SCHEDULE_SEND_EVENT,
-    SCHEDULE_WAIT_FOR_EVENT, SCHEDULE_WAIT_FOR_INTERRUPT, SCHEDULE_YIELD,
+    EXIT_ARCHITECTURAL, EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERNAL,
+    EXIT_INTERPRET_ONE, EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT,
+    EXIT_SCHEDULED, EXIT_UNSUPPORTED, ExecutionFrame, FrameError, NativeExit, NativeGateway,
+    SCHEDULE_SEND_EVENT, SCHEDULE_WAIT_FOR_EVENT, SCHEDULE_WAIT_FOR_INTERRUPT, SCHEDULE_YIELD,
 };
 use crate::cache::{
     CacheError, DomainCodeCache, ExecutorEpoch, LocalLookupCache, PendingRegion, RegionKey,
@@ -32,6 +32,7 @@ use crate::cache::{
 };
 use crate::compiler::{CompiledRegionMetadata, CompilerContext, SideExit, compile_gateway};
 use crate::configuration::JitConfiguration;
+use crate::diagnostics::JitDiagnostics;
 use crate::executable_memory::{
     ExecutableMemoryError, PublishedCode, SharedExecutableMemory, process_executable_memory,
 };
@@ -195,6 +196,25 @@ impl EngineProvider for JitProvider {
 
     fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
         let (isa, executable_memory) = self.available_resources(request.cpu)?;
+        let diagnostics = self
+            .configuration
+            .dump_directory()
+            .map(|directory| {
+                JitDiagnostics::new(
+                    directory,
+                    request.domain,
+                    self.configuration.max_cached_regions(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()
+            .map_err(|detail| domain_fault(request.cpu, EngineFaultKind::Unavailable, detail))?;
+        if let Some(diagnostics) = &diagnostics {
+            log::info!(
+                "JIT compilation dumps enabled: directory={}",
+                diagnostics.directory().display()
+            );
+        }
         let (gateway, gateway_code) =
             compile_gateway(&isa, &executable_memory).map_err(|error| {
                 domain_fault(
@@ -210,7 +230,8 @@ impl EngineProvider for JitProvider {
             executable_memory: Some(executable_memory),
             gateway: Some(gateway),
             gateway_code: Some(gateway_code),
-            code_cache: Some(Arc::new(DomainCodeCache::new(self.configuration))),
+            code_cache: Some(Arc::new(DomainCodeCache::new(self.configuration.clone()))),
+            diagnostics,
             controls: Vec::new(),
             binding: None,
             stopping: false,
@@ -236,6 +257,7 @@ struct JitDomain {
     gateway: Option<NativeGateway>,
     gateway_code: Option<PublishedCode>,
     code_cache: Option<Arc<DomainCodeCache>>,
+    diagnostics: Option<Arc<JitDiagnostics>>,
     controls: Vec<EngineControl>,
     binding: Option<BoundMemory>,
     stopping: bool,
@@ -304,6 +326,7 @@ impl EngineDomain for JitDomain {
                 .expect("live domain retains its native gateway publication")
                 .clone(),
             code_cache,
+            diagnostics: self.diagnostics.clone(),
             executor_epoch,
             local_lookup: LocalLookupCache::new(),
             control,
@@ -376,6 +399,7 @@ impl EngineDomain for JitDomain {
         self.gateway = None;
         self.gateway_code = None;
         self.code_cache = None;
+        self.diagnostics = None;
         self.controls.clear();
         Ok(())
     }
@@ -393,6 +417,7 @@ struct JitExecutor {
     gateway: NativeGateway,
     _gateway_code: PublishedCode,
     code_cache: Arc<DomainCodeCache>,
+    diagnostics: Option<Arc<JitDiagnostics>>,
     executor_epoch: ExecutorEpoch,
     local_lookup: LocalLookupCache,
     control: EngineControl,
@@ -429,6 +454,7 @@ impl EngineExecutor for JitExecutor {
                 request.state,
             ));
         }
+        let trace_jit = log::log_enabled!(log::Level::Trace);
 
         self.frame.import_state(request.state);
         self.frame.memory = self
@@ -515,6 +541,8 @@ impl EngineExecutor for JitExecutor {
                     Ok(region)
                 } else {
                     let cache = Arc::clone(&self.code_cache);
+                    let diagnostics = self.diagnostics.clone();
+                    let profile = request.cpu.profile();
                     let compile_cursor = request.memory.invalidation_cursor();
                     let result = cache.resolve(key, |cancellation| {
                         cancellation.check()?;
@@ -525,6 +553,20 @@ impl EngineExecutor for JitExecutor {
                             location,
                             request.memory,
                         )?;
+                        if trace_jit {
+                            log::trace!(
+                                "JIT region compilation started: executor={:?} start=[{}] blocks={} entries={} exits={} guest_instructions={} guest_bytes={} ir_operations={} code_dependencies={}",
+                                self.id,
+                                region.metadata.start,
+                                region.blocks.len(),
+                                region.metadata.entries.len(),
+                                region.metadata.exits.len(),
+                                region.metadata.guest_instruction_count,
+                                region.metadata.guest_byte_count,
+                                region.metadata.ir_operation_count,
+                                region.metadata.code_dependencies.len(),
+                            );
+                        }
                         cancellation.check()?;
                         if request.memory.invalidation_cursor() != compile_cursor {
                             return Err(CacheError::Stale);
@@ -534,9 +576,34 @@ impl EngineExecutor for JitExecutor {
                             &self.executable_memory,
                             cancellation,
                         )?;
+                        if trace_jit {
+                            log::trace!(
+                                "JIT region compilation completed: executor={:?} start=[{}] native_entry={:#x} native_bytes={} sources={} side_exits={} link_sites={}",
+                                self.id,
+                                compiled.metadata.start,
+                                compiled.entry_address(),
+                                compiled.mapped_len(),
+                                compiled.metadata.sources.len(),
+                                compiled.metadata.side_exits.len(),
+                                compiled.metadata.link_sites.len(),
+                            );
+                        }
                         cancellation.check()?;
                         if request.memory.invalidation_cursor() != compile_cursor {
                             return Err(CacheError::Stale);
+                        }
+                        if let Some(diagnostics) = &diagnostics {
+                            let dump = diagnostics
+                                .dump_region(&profile, &region, &compiled)
+                                .map_err(CacheError::Internal)?;
+                            if trace_jit {
+                                log::trace!(
+                                    "JIT region compilation dumped: executor={:?} start=[{}] directory={}",
+                                    self.id,
+                                    region.metadata.start,
+                                    dump.display()
+                                );
+                            }
                         }
                         PendingRegion::new(
                             request.cpu.address_space_id(),
@@ -614,12 +681,46 @@ impl EngineExecutor for JitExecutor {
                     &HELPER_TABLE,
                     std::ptr::from_mut(&mut native_context).cast(),
                 );
+                let entry_region = cached.id();
+                if trace_jit {
+                    log::trace!(
+                        "JIT native region execution started: executor={:?} region={} start=[{}] entry_pc={:#018x} budget={} native_bytes={}",
+                        self.id,
+                        entry_region,
+                        compiled.metadata.start,
+                        self.frame.current_pc(),
+                        self.frame.control.instruction_budget,
+                        compiled.mapped_len(),
+                    );
+                }
                 let native_exit = contain_rust_boundary(|| {
                     // SAFETY: the live cached region and imported frame remain
                     // valid for this complete non-unwinding native call.
                     unsafe { compiled.execute(self.gateway, &raw mut self.frame) };
                     self.frame.exit
                 });
+                if trace_jit {
+                    match &native_exit {
+                        Ok(exit) => log::trace!(
+                            "JIT native region execution completed: executor={:?} entry_region={} final_region={} instructions={} exit={}({}) detail={} source_pc={:#018x} next_pc={:#018x}",
+                            self.id,
+                            entry_region,
+                            self.frame.dispatch.region_id,
+                            exit.instructions_executed,
+                            native_exit_kind_name(exit.kind),
+                            exit.kind,
+                            exit.detail,
+                            exit.source_pc,
+                            self.frame.current_pc(),
+                        ),
+                        Err(()) => log::trace!(
+                            "JIT native region execution completed: executor={:?} entry_region={} outcome=panic next_pc={:#018x}",
+                            self.id,
+                            entry_region,
+                            self.frame.current_pc(),
+                        ),
+                    }
+                }
                 self.frame.clear_host_context();
                 let data_fault = native_context.data_fault.take();
                 let native_pending = native_context.control_snapshot.take();
@@ -772,6 +873,24 @@ impl EngineExecutor for JitExecutor {
 
     fn clear_local_exclusive_reservation(&mut self) {
         self.exclusive_monitor.clear();
+    }
+}
+
+const fn native_exit_kind_name(kind: u32) -> &'static str {
+    match kind {
+        EXIT_NONE => "none",
+        EXIT_INTERPRET_ONE => "interpret-one",
+        EXIT_BUDGET_EXHAUSTED => "budget-exhausted",
+        EXIT_SAFEPOINT => "safepoint",
+        EXIT_PENDING_EVENT => "pending-event",
+        EXIT_LOADER_RETURN => "loader-return",
+        EXIT_DISPATCH => "dispatch",
+        EXIT_ARCHITECTURAL => "architectural",
+        EXIT_UNSUPPORTED => "unsupported",
+        EXIT_DATA_FAULT => "data-fault",
+        EXIT_SCHEDULED => "scheduled",
+        EXIT_INTERNAL => "internal",
+        _ => "unknown",
     }
 }
 
@@ -1268,6 +1387,9 @@ fn fault(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use nixe_cpu::memory::{
@@ -1277,7 +1399,9 @@ mod tests {
     };
     use nixe_cpu::state::a32::{A32GeneralRegister as A32Register, A32State};
     use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv};
-    use nixe_cpu_engine::{EngineProvider, EngineTimer, TimerSnapshot};
+    use nixe_cpu_engine::{
+        CrossVcpuRequest, EngineControl, EngineProvider, EngineTimer, TimerSnapshot,
+    };
     use nixe_memory::{
         AddressSpaceId, CanonicalRangeTranslator, GuestPhysicalPageId, MemoryInvalidationSource,
     };
@@ -1285,6 +1409,35 @@ mod tests {
     use super::*;
 
     const SPACE: AddressSpaceId = AddressSpaceId::new(7);
+    static NEXT_DUMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDumpDirectory {
+        path: PathBuf,
+    }
+
+    impl TemporaryDumpDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DUMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "nixe-jit-dump-test-{}-{sequence}",
+                    std::process::id()
+                )),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TemporaryDumpDirectory {
+        fn drop(&mut self) {
+            if self.path.exists() {
+                fs::remove_dir_all(&self.path).unwrap();
+            }
+        }
+    }
 
     struct FixedTimer;
 
@@ -1312,7 +1465,13 @@ mod tests {
     }
 
     fn bound_executor() -> (Box<dyn EngineDomain>, Box<dyn EngineExecutor>) {
-        let provider = JitProvider::new();
+        bound_executor_with_configuration(JitConfiguration::default())
+    }
+
+    fn bound_executor_with_configuration(
+        configuration: JitConfiguration,
+    ) -> (Box<dyn EngineDomain>, Box<dyn EngineExecutor>) {
+        let provider = JitProvider::with_configuration(configuration);
         let mut domain = provider
             .create_domain(DomainRequest {
                 domain: EngineDomainId::new(9),
@@ -1331,6 +1490,70 @@ mod tests {
             .unwrap();
         let executor = domain.create_executor(EngineExecutorId::new(11)).unwrap();
         (domain, executor)
+    }
+
+    #[test]
+    fn configured_dump_directory_receives_complete_compilation_artifacts() {
+        let dump = TemporaryDumpDirectory::new();
+        let configuration =
+            JitConfiguration::default().with_dump_directory(Some(dump.path().to_path_buf()));
+        let (_domain, mut executor) = bound_executor_with_configuration(configuration);
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(79);
+        assert!(memory.add_ram_page(code_page));
+        assert!(memory.initialize_ram(code_page, 0, &0x1400_0000_u32.to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let mut a64 = A64State::default();
+        a64.set_pc(0x1000);
+        let mut state = ThreadCpuState::A64(Box::new(a64));
+
+        executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
+
+        let session = only_directory(dump.path());
+        let region = only_directory(&session);
+        assert!(region.join("complete").is_file());
+        assert!(region.join("metadata.txt").is_file());
+        assert!(region.join("guest.asm").is_file());
+        assert!(region.join("nixe-ir.txt").is_file());
+        assert_eq!(
+            fs::read(region.join("block-000-0000000000001000.bin")).unwrap(),
+            0x1400_0000_u32.to_le_bytes()
+        );
+        assert!(
+            fs::read_to_string(region.join("guest.asm"))
+                .unwrap()
+                .contains("0x0000000000001000")
+        );
+        assert!(
+            fs::read_to_string(region.join("nixe-ir.txt"))
+                .unwrap()
+                .contains("raw=0x14000000")
+        );
+    }
+
+    fn only_directory(parent: &Path) -> PathBuf {
+        let entries: Vec<_> = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        entries.into_iter().next().unwrap()
     }
 
     fn executor_for_execution_memory(
@@ -2558,6 +2781,91 @@ mod tests {
             unreachable!()
         };
         assert_eq!(state.pc(), 0x1000);
+    }
+
+    struct PreemptingMmio {
+        control: EngineControl,
+    }
+
+    impl SyntheticMmio for PreemptingMmio {
+        fn read(&mut self, _offset: u64, _access: MemoryAccess) -> Result<MemoryValue, Box<str>> {
+            Ok(MemoryValue::U64(0))
+        }
+
+        fn write(
+            &mut self,
+            _offset: u64,
+            _access: MemoryAccess,
+            _value: MemoryValue,
+        ) -> Result<(), Box<str>> {
+            self.control.request(CrossVcpuRequest::Preempt);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn internal_entry_safepoint_exports_the_entry_resume_pc() {
+        let (_domain, mut executor) = bound_executor();
+        let control = executor.control().unwrap();
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(83);
+        let device_page = GuestPhysicalPageId::new(84);
+        assert!(memory.add_ram_page(code_page));
+        // STR X1,[X0]; ADD X2,X2,#1; B 0x1010; NOP; B 0x1004.
+        // Discovering the final edge splits 0x1004 into a secondary region
+        // entry reached internally after the MMIO write requests preemption.
+        for (offset, encoding) in [
+            (0, 0xf900_0001_u32),
+            (4, 0x9100_0442_u32),
+            (8, 0x1400_0002_u32),
+            (12, 0xd503_201f_u32),
+            (16, 0x17ff_fffd_u32),
+        ] {
+            assert!(memory.initialize_ram(code_page, offset, &encoding.to_le_bytes()));
+        }
+        assert!(memory.add_mmio_page(device_page, PreemptingMmio { control }));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x8000),
+            device_page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        let mut a64 = A64State::default();
+        a64.set_pc(0x1000);
+        a64.write_x(
+            A64Register::General(A64GeneralRegister::new(0).unwrap()),
+            0x8000,
+        );
+        a64.write_x(
+            A64Register::General(A64GeneralRegister::new(1).unwrap()),
+            0x1234_5678_9abc_def0,
+        );
+        let mut state = ThreadCpuState::A64(Box::new(a64));
+
+        let report = executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 10,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
+
+        assert_eq!(report.instructions_executed, 1);
+        assert_eq!(report.stop, nixe_cpu_engine::EngineExit::Safepoint);
+        let ThreadCpuState::A64(state) = state else {
+            unreachable!()
+        };
+        assert_eq!(state.pc(), 0x1004);
     }
 
     #[test]

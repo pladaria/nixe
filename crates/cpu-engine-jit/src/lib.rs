@@ -8,6 +8,7 @@ mod abi;
 mod cache;
 mod compiler;
 mod configuration;
+mod diagnostics;
 mod engine;
 mod executable_memory;
 mod helpers;

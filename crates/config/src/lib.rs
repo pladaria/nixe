@@ -66,9 +66,6 @@ impl NixeConfig {
         }
         validate_time_config(path, &raw.system.time)?;
         validate_input_config(path, &raw.input)?;
-        let cpu = cpu_configuration(path, raw.cpu)?;
-        let gpu = gpu_cache_configuration(path, raw.gpu)?;
-
         let source_path = absolute_path(path).map_err(|source| ConfigError::Io {
             path: path.to_owned(),
             source,
@@ -76,6 +73,8 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
+        let cpu = cpu_configuration(path, base_directory, raw.cpu)?;
+        let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         Ok(Self {
             version: raw.version,
@@ -223,7 +222,7 @@ pub struct DiagnosticsConfig {
     pub log_level: DiagnosticLogLevel,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CpuConfig {
     pub engine: CpuEngineSelection,
     /// Enables capability-gated host-parallel execution. Deterministic
@@ -242,13 +241,15 @@ pub enum CpuEngineSelection {
     Interpreter,
 }
 
-/// Product-level JIT resource bounds. Compiler implementation details remain
-/// private to the selected provider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Product-level JIT resource and diagnostic policy. Compiler implementation
+/// details remain private to the selected provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuJitConfig {
     pub max_cached_regions: usize,
     pub max_cache_bytes: usize,
     pub max_concurrent_compilations: usize,
+    /// Optional directory for guest-code and neutral-IR compilation dumps.
+    pub dump_directory: Option<PathBuf>,
 }
 
 impl Default for CpuJitConfig {
@@ -257,6 +258,7 @@ impl Default for CpuJitConfig {
             max_cached_regions: DEFAULT_JIT_MAX_CACHED_REGIONS,
             max_cache_bytes: DEFAULT_JIT_CACHE_MIB * 1024 * 1024,
             max_concurrent_compilations: DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS,
+            dump_directory: None,
         }
     }
 }
@@ -419,6 +421,8 @@ struct RawCpuJitConfig {
     cache_mib: usize,
     #[serde(default = "default_jit_max_concurrent_compilations")]
     max_concurrent_compilations: usize,
+    #[serde(default)]
+    dump_directory: Option<String>,
 }
 
 impl Default for RawCpuJitConfig {
@@ -427,6 +431,7 @@ impl Default for RawCpuJitConfig {
             max_cached_regions: default_jit_max_cached_regions(),
             cache_mib: default_jit_cache_mib(),
             max_concurrent_compilations: default_jit_max_concurrent_compilations(),
+            dump_directory: None,
         }
     }
 }
@@ -594,7 +599,11 @@ fn gpu_cache_configuration(
     })
 }
 
-fn cpu_configuration(path: &Path, raw: RawCpuConfig) -> Result<CpuConfig, ConfigError> {
+fn cpu_configuration(
+    path: &Path,
+    base_directory: &Path,
+    raw: RawCpuConfig,
+) -> Result<CpuConfig, ConfigError> {
     if !(1..=MAX_JIT_MAX_CACHED_REGIONS).contains(&raw.jit.max_cached_regions) {
         return Err(ConfigError::InvalidCpu {
             path: path.to_owned(),
@@ -632,6 +641,12 @@ fn cpu_configuration(path: &Path, raw: RawCpuConfig) -> Result<CpuConfig, Config
             max_cached_regions: raw.jit.max_cached_regions,
             max_cache_bytes,
             max_concurrent_compilations: raw.jit.max_concurrent_compilations,
+            dump_directory: raw
+                .jit
+                .dump_directory
+                .filter(|directory| !directory.trim().is_empty())
+                .map(PathBuf::from)
+                .map(|directory| resolve_path(base_directory, directory)),
         },
     })
 }
@@ -943,6 +958,7 @@ mod tests {
                 max_cached_regions = 256
                 cache_mib = 16
                 max_concurrent_compilations = 2
+                dump_directory = "./diagnostics/jit"
             "#,
         );
         let jit = NixeConfig::load(&jit_file.path).unwrap().cpu;
@@ -953,7 +969,30 @@ mod tests {
                 max_cached_regions: 256,
                 max_cache_bytes: 16 * 1024 * 1024,
                 max_concurrent_compilations: 2,
+                dump_directory: Some(jit_file.path.parent().unwrap().join("./diagnostics/jit")),
             }
+        );
+
+        let empty_dump = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [cpu.jit]
+                dump_directory = ""
+            "#,
+        );
+        assert_eq!(
+            NixeConfig::load(&empty_dump.path)
+                .unwrap()
+                .cpu
+                .jit
+                .dump_directory,
+            None
         );
 
         let invalid_engine = TemporaryConfig::new(

@@ -186,6 +186,10 @@ pub(crate) struct CachedRegion {
 }
 
 impl CachedRegion {
+    pub(crate) const fn id(&self) -> RegionId {
+        self.id
+    }
+
     pub(crate) fn compiled(&self) -> &CompiledRegion {
         &self.compiled
     }
@@ -237,7 +241,7 @@ struct CacheLimits {
 }
 
 impl CacheLimits {
-    const fn from_configuration(configuration: JitConfiguration) -> Self {
+    const fn from_configuration(configuration: &JitConfiguration) -> Self {
         Self {
             max_live_segments: configuration.max_cached_regions(),
             max_live_mapped_bytes: configuration.max_cache_bytes(),
@@ -589,7 +593,7 @@ impl Drop for NativeEpochGuard {
 impl DomainCodeCache {
     pub(crate) fn new(configuration: JitConfiguration) -> Self {
         Self {
-            limits: CacheLimits::from_configuration(configuration),
+            limits: CacheLimits::from_configuration(&configuration),
             state: Mutex::new(CacheState::new()),
             compilation_ready: Condvar::new(),
         }

@@ -71,7 +71,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
-    let cpu_configuration = effective_cpu_configuration(config.cpu, cpu_engine_override);
+    let cpu_configuration = effective_cpu_configuration(config.cpu.clone(), cpu_engine_override);
     if let Some(engine) = cpu_engine_override {
         log::info!("CPU engine selection overridden by CLI: {engine:?}");
     }
@@ -306,7 +306,7 @@ struct SelectedCpuEngines {
     fallback: Option<Arc<dyn EngineProvider>>,
 }
 
-const fn effective_cpu_configuration(
+fn effective_cpu_configuration(
     configuration: CpuConfig,
     engine_override: Option<CpuEngineSelection>,
 ) -> CpuConfig {
@@ -330,7 +330,8 @@ fn select_cpu_engines(
         configuration.jit.max_cache_bytes,
         configuration.jit.max_concurrent_compilations,
     )
-    .map_err(|error| format!("invalid JIT resource configuration: {error}"))?;
+    .map_err(|error| format!("invalid JIT resource configuration: {error}"))?
+    .with_dump_directory(configuration.jit.dump_directory.clone());
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
     let jit: Arc<dyn EngineProvider> = Arc::new(JitProvider::with_configuration(jit_configuration));
     let registry = EngineRegistry::new([Arc::clone(&jit), Arc::clone(&interpreter)]);
@@ -400,15 +401,19 @@ mod engine_selection_tests {
                 max_cached_regions: 7,
                 max_cache_bytes: 8 * 1024 * 1024,
                 max_concurrent_compilations: 2,
+                dump_directory: Some("jit-diagnostics".into()),
             },
         };
 
-        assert_eq!(effective_cpu_configuration(configured, None), configured);
         assert_eq!(
-            effective_cpu_configuration(configured, Some(CpuEngineSelection::Jit)),
+            effective_cpu_configuration(configured.clone(), None),
+            configured
+        );
+        assert_eq!(
+            effective_cpu_configuration(configured.clone(), Some(CpuEngineSelection::Jit)),
             CpuConfig {
                 engine: CpuEngineSelection::Jit,
-                ..configured
+                ..configured.clone()
             }
         );
     }
