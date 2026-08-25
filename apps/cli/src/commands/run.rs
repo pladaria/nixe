@@ -46,6 +46,7 @@ pub struct Arguments {
     pub log_level_override: Option<LogLevel>,
     pub identifier: String,
     pub headless: bool,
+    pub cpu_engine_override: Option<CpuEngineSelection>,
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
@@ -54,6 +55,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         log_level_override,
         identifier,
         headless,
+        cpu_engine_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
     let (frontend, frontend_control, presenter) = if headless {
@@ -69,6 +71,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
+    let cpu_configuration = effective_cpu_configuration(config.cpu, cpu_engine_override);
+    if let Some(engine) = cpu_engine_override {
+        log::info!("CPU engine selection overridden by CLI: {engine:?}");
+    }
     log::info!(
         "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
         config.gpu.shader_entries(),
@@ -148,7 +154,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         },
     };
     let virtual_clock = VirtualClock::new(clock_mode);
-    let execution_mode = if config.cpu.parallel_vcpus {
+    let execution_mode = if cpu_configuration.parallel_vcpus {
         VcpuExecutionMode::Parallel
     } else {
         VcpuExecutionMode::Deterministic
@@ -163,12 +169,14 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
     let SelectedCpuEngines { primary, fallback } = select_cpu_engines(
-        config.cpu,
+        cpu_configuration,
         machine_profile.cpu(),
         plan.initial_execution_state(),
         machine_profile.scheduler().vcpus().len(),
     )?;
     let selected_engine = primary.descriptor();
+    let trace_interpreter =
+        selected_engine.id == INTERPRETER_ENGINE_ID && log::log_enabled!(log::Level::Trace);
     let mut process_builder = ProcessBuilder::new()
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
@@ -240,6 +248,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             horizon_environment,
             video_system,
             gamepad_profiles,
+            trace_interpreter,
         ));
     };
     let frontend = frontend.with_gpu_context(presentation_context);
@@ -256,6 +265,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 horizon_environment,
                 video_system,
                 gamepad_profiles,
+                trace_interpreter,
             )
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
@@ -294,6 +304,19 @@ const fn system_language(language: NacpLanguage) -> SystemLanguage {
 struct SelectedCpuEngines {
     primary: Arc<dyn EngineProvider>,
     fallback: Option<Arc<dyn EngineProvider>>,
+}
+
+const fn effective_cpu_configuration(
+    configuration: CpuConfig,
+    engine_override: Option<CpuEngineSelection>,
+) -> CpuConfig {
+    CpuConfig {
+        engine: match engine_override {
+            Some(engine) => engine,
+            None => configuration.engine,
+        },
+        ..configuration
+    }
 }
 
 fn select_cpu_engines(
@@ -367,6 +390,28 @@ fn cpu_engine_requirements(
 #[cfg(test)]
 mod engine_selection_tests {
     use super::*;
+
+    #[test]
+    fn cli_engine_override_has_priority_without_replacing_other_cpu_policy() {
+        let configured = CpuConfig {
+            engine: CpuEngineSelection::Interpreter,
+            parallel_vcpus: true,
+            jit: nixe_config::CpuJitConfig {
+                max_cached_regions: 7,
+                max_cache_bytes: 8 * 1024 * 1024,
+                max_concurrent_compilations: 2,
+            },
+        };
+
+        assert_eq!(effective_cpu_configuration(configured, None), configured);
+        assert_eq!(
+            effective_cpu_configuration(configured, Some(CpuEngineSelection::Jit)),
+            CpuConfig {
+                engine: CpuEngineSelection::Jit,
+                ..configured
+            }
+        );
+    }
 
     #[test]
     fn application_composition_selects_real_engines_and_semantic_fallback_by_capability() {
@@ -478,6 +523,7 @@ fn execute_worker(
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     gamepad_profiles: GamepadProfiles,
+    trace_interpreter: bool,
 ) -> WorkerResult {
     let registration = ProcessRegistration {
         priority: process.initial_thread_priority(),
@@ -502,6 +548,7 @@ fn execute_worker(
                 horizon_environment,
                 execution_video,
                 &mut input,
+                trace_interpreter,
             )
         });
     log::debug!(
@@ -581,6 +628,7 @@ fn execute(
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     input: &mut InputManager<SdlInputBackend>,
+    trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
@@ -670,6 +718,15 @@ fn execute(
         for execution in executions {
             let report = execution.report;
             instructions = instructions.saturating_add(report.instructions_executed);
+            if trace_interpreter {
+                log::trace!(
+                    "interpreter slice completed: process={:?} thread={:?} vcpu={:?} generation={:?} {report}",
+                    execution.lease.process,
+                    execution.lease.thread,
+                    execution.lease.vcpu,
+                    execution.lease.generation,
+                );
+            }
             if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
                 let elapsed = execution_started.elapsed();
                 let interval_instructions = instructions.saturating_sub(last_progress_instructions);
@@ -688,9 +745,33 @@ fn execute(
                 | ExecutionStop::PendingEvent { .. } => {}
                 ExecutionStop::Scheduled { .. } => {}
                 ExecutionStop::SupervisorCall { .. } => {
+                    if trace_interpreter {
+                        log::trace!(
+                            "interpreter SVC dispatch started: process={:?} thread={:?} vcpu={:?} stop=[{}]",
+                            execution.lease.process,
+                            execution.lease.thread,
+                            execution.lease.vcpu,
+                            report.stop,
+                        );
+                    }
                     let handling = dispatcher
                         .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
                         .map_err(|error| error.to_string())?;
+                    if trace_interpreter {
+                        let outcome = match &handling {
+                            ExceptionHandlingResult::Resumed => "resumed",
+                            ExceptionHandlingResult::Suspended => "suspended",
+                            ExceptionHandlingResult::Rejected(_) => "rejected",
+                            ExceptionHandlingResult::Terminated { .. } => "terminated",
+                            ExceptionHandlingResult::Fault(_) => "fault",
+                        };
+                        log::trace!(
+                            "interpreter SVC dispatch completed: process={:?} thread={:?} vcpu={:?} outcome={outcome}",
+                            execution.lease.process,
+                            execution.lease.thread,
+                            execution.lease.vcpu,
+                        );
+                    }
                     match handling {
                         ExceptionHandlingResult::Resumed => {}
                         ExceptionHandlingResult::Rejected(error) => {

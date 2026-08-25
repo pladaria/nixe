@@ -687,6 +687,46 @@ mod tests {
     }
 
     #[test]
+    fn pair_offset_mode_applies_scaled_immediate_before_both_transfers() {
+        let block = translate(&[
+            0x6941_0820, // ldpsw x0,x2,[x1,#8]
+            0xd400_0001, // svc #0
+        ]);
+        let offsets = block
+            .operations
+            .iter()
+            .filter(|operation| operation.source.pc == GuestVirtualAddress::new(0x1000))
+            .filter_map(|operation| match operation.kind {
+                OperationKind::Address(AddressOperation::Offset {
+                    offset: Operand::Immediate(Immediate::I64(offset)),
+                    ..
+                }) => Some(offset as i64),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(offsets, [8, 4]);
+        assert_eq!(
+            block
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation.source.pc == GuestVirtualAddress::new(0x1000)
+                        && matches!(operation.kind, OperationKind::Memory(_))
+                })
+                .count(),
+            2
+        );
+        assert!(!block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteState {
+                register: StateRegister::A64X(register),
+                ..
+            } if register.index() == 1
+        )));
+    }
+
+    #[test]
     fn memory_ir_keeps_guest_addresses_descriptors_and_fault_ordering() {
         let block = translate(&[
             0x1000_0000, // adr x0, #0

@@ -45,7 +45,7 @@ engine = "auto"
 # Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
 # selected engine provides concurrent executors, bounded safepoints, and
 # acknowledged semantic memory invalidation. False keeps deterministic serialization.
-parallel_vcpus = true
+parallel_vcpus = false
 
 [cpu.jit]
 # Per-process-domain native-code working set. Values may lower, but never exceed,
