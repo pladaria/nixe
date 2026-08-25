@@ -395,6 +395,23 @@ pub enum MemoryOperation {
         value: Operand,
         descriptor: MemoryDescriptor,
     },
+    /// Conditionally reads one complete architectural access. When the
+    /// predicate is false no translation, permission check, or memory effect
+    /// occurs and `fallback` is returned.
+    GuardedLoad {
+        predicate: Operand,
+        address: Operand,
+        fallback: Operand,
+        descriptor: MemoryDescriptor,
+    },
+    /// Conditionally writes one complete architectural access. A false
+    /// predicate suppresses the access, including every possible fault.
+    GuardedStore {
+        predicate: Operand,
+        address: Operand,
+        value: Operand,
+        descriptor: MemoryDescriptor,
+    },
 }
 
 /// Barrier domain.
@@ -455,6 +472,22 @@ pub enum ExclusiveOperation {
     Store {
         address: Operand,
         value: Operand,
+        descriptor: MemoryDescriptor,
+    },
+    /// Predicated exclusive load with an explicit no-access result.
+    GuardedLoad {
+        predicate: Operand,
+        address: Operand,
+        fallback: Operand,
+        descriptor: MemoryDescriptor,
+    },
+    /// Predicated exclusive store. A false predicate neither consults nor
+    /// changes the local monitor and returns `fallback`.
+    GuardedStore {
+        predicate: Operand,
+        address: Operand,
+        value: Operand,
+        fallback: Operand,
         descriptor: MemoryDescriptor,
     },
     Clear,
@@ -748,26 +781,32 @@ impl OperationEffects {
     }
 }
 
-/// Up to three typed results without allocating per ordinary operation.
+/// Up to four typed results without allocating per ordinary operation.
+/// Four is required by atomic Advanced SIMD structure loads.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct OperationResults([Option<Value>; 3]);
+pub struct OperationResults([Option<Value>; 4]);
 
 impl OperationResults {
-    pub const NONE: Self = Self([None, None, None]);
+    pub const NONE: Self = Self([None, None, None, None]);
 
     #[must_use]
     pub const fn one(first: Value) -> Self {
-        Self([Some(first), None, None])
+        Self([Some(first), None, None, None])
     }
 
     #[must_use]
     pub const fn two(first: Value, second: Value) -> Self {
-        Self([Some(first), Some(second), None])
+        Self([Some(first), Some(second), None, None])
     }
 
     #[must_use]
     pub const fn three(first: Value, second: Value, third: Value) -> Self {
-        Self([Some(first), Some(second), Some(third)])
+        Self([Some(first), Some(second), Some(third), None])
+    }
+
+    #[must_use]
+    pub const fn four(first: Value, second: Value, third: Value, fourth: Value) -> Self {
+        Self([Some(first), Some(second), Some(third), Some(fourth)])
     }
 
     /// Iterates defined results in declaration order.
@@ -836,12 +875,14 @@ impl OperationKind {
             }
             Self::ReadState(_) => OperationEffects::new(EffectSet::READ_STATE, false),
             Self::WriteState { .. } => OperationEffects::new(EffectSet::WRITE_STATE, false),
-            Self::Memory(MemoryOperation::Load { descriptor, .. }) => {
-                memory_effects(EffectSet::READ_MEMORY, *descriptor)
-            }
-            Self::Memory(MemoryOperation::Store { descriptor, .. }) => {
-                memory_effects(EffectSet::WRITE_MEMORY, *descriptor)
-            }
+            Self::Memory(
+                MemoryOperation::Load { descriptor, .. }
+                | MemoryOperation::GuardedLoad { descriptor, .. },
+            ) => memory_effects(EffectSet::READ_MEMORY, *descriptor),
+            Self::Memory(
+                MemoryOperation::Store { descriptor, .. }
+                | MemoryOperation::GuardedStore { descriptor, .. },
+            ) => memory_effects(EffectSet::WRITE_MEMORY, *descriptor),
             Self::Barrier(_) => OperationEffects::new(EffectSet::BARRIER, false),
             Self::CacheMaintenance(operation) => {
                 OperationEffects::new(EffectSet::CACHE, operation.address.is_some())
@@ -849,11 +890,17 @@ impl OperationKind {
             Self::Exclusive(ExclusiveOperation::Clear) => {
                 OperationEffects::new(EffectSet::EXCLUSIVE, false)
             }
-            Self::Exclusive(ExclusiveOperation::Load { descriptor, .. }) => memory_effects(
+            Self::Exclusive(
+                ExclusiveOperation::Load { descriptor, .. }
+                | ExclusiveOperation::GuardedLoad { descriptor, .. },
+            ) => memory_effects(
                 EffectSet::READ_MEMORY.union(EffectSet::EXCLUSIVE),
                 *descriptor,
             ),
-            Self::Exclusive(ExclusiveOperation::Store { descriptor, .. }) => memory_effects(
+            Self::Exclusive(
+                ExclusiveOperation::Store { descriptor, .. }
+                | ExclusiveOperation::GuardedStore { descriptor, .. },
+            ) => memory_effects(
                 EffectSet::WRITE_MEMORY.union(EffectSet::EXCLUSIVE),
                 *descriptor,
             ),

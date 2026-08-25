@@ -33,9 +33,6 @@ pub(super) fn execute(
         let Some(memory) = context.memory() else {
             return Err(super::super::unsupported(decoded));
         };
-        if transfer.register_count != 1 {
-            return Err(super::super::unsupported(decoded));
-        }
         let base = super::super::aarch32::read_register(state, transfer.rn, false);
         let address = GuestVirtualAddress::new(u64::from(base));
         let access = MemoryAccess::new(
@@ -99,7 +96,33 @@ pub(super) fn execute(
         VectorOperation::AddInteger { lane_bits } => lanes(lhs, rhs, width, lane_bits, false),
         VectorOperation::SubtractInteger { lane_bits } => lanes(lhs, rhs, width, lane_bits, true),
         VectorOperation::AddF32 | VectorOperation::SubtractF32 | VectorOperation::MultiplyF32 => {
-            return Err(super::super::unsupported(decoded));
+            let operation = match data.operation {
+                VectorOperation::AddF32 => super::super::a64::fp_simd::Binary32Operation::Add,
+                VectorOperation::SubtractF32 => {
+                    super::super::a64::fp_simd::Binary32Operation::Subtract
+                }
+                VectorOperation::MultiplyF32 => {
+                    super::super::a64::fp_simd::Binary32Operation::Multiply
+                }
+                _ => unreachable!(),
+            };
+            let mut result = 0_u128;
+            let mut status = nixe_cpu::semantics::floating_point::FpStatus::default();
+            for shift in (0..width).step_by(32) {
+                let (lane, lane_status) = super::super::a64::fp_simd::binary32(
+                    operation,
+                    (lhs >> shift) as u32,
+                    (rhs >> shift) as u32,
+                    state.fpscr(),
+                );
+                result |= u128::from(lane) << shift;
+                merge_status(&mut status, lane_status);
+            }
+            if super::super::a64::fp_simd::fp_status_traps(status, state.fpscr()) {
+                return Err(super::super::unsupported(decoded));
+            }
+            state.set_fpscr(state.fpscr() | super::super::a64::fp_simd::fp_status_bits(status));
+            result
         }
     } & mask;
     match data.size {
@@ -111,6 +134,18 @@ pub(super) fn execute(
         }
     }
     Ok(Execution::Control(SemanticControl::Continue))
+}
+
+fn merge_status(
+    destination: &mut nixe_cpu::semantics::floating_point::FpStatus,
+    source: nixe_cpu::semantics::floating_point::FpStatus,
+) {
+    destination.invalid_operation |= source.invalid_operation;
+    destination.divide_by_zero |= source.divide_by_zero;
+    destination.overflow |= source.overflow;
+    destination.underflow |= source.underflow;
+    destination.inexact |= source.inexact;
+    destination.input_denormal |= source.input_denormal;
 }
 
 fn lanes(lhs: u128, rhs: u128, width: u8, lane_bits: u8, subtract: bool) -> u128 {

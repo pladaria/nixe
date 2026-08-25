@@ -839,8 +839,8 @@ mod tests {
         let owner = process_executable_memory().expect("host supports executable memory");
         let mut owner = owner.lock().unwrap();
 
-        // Fixed host-ABI bytes are an allocator test fixture, not a production
-        // emitter or a second JIT lowering path.
+        // Fixed host-ABI bytes isolate executable-memory publication from the
+        // compiler tested elsewhere.
         #[cfg(target_arch = "x86_64")]
         let code_bytes: &[u8] = &[0xb8, 42, 0, 0, 0, 0xc3]; // mov eax, 42; ret
         #[cfg(target_arch = "aarch64")]

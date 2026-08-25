@@ -51,7 +51,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         BRANCH,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xeb000000),
     pattern(
         "bx",
         0x0fff_fff0,
@@ -60,7 +62,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         CONDITION_ONLY,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe12fff10),
     pattern(
         "blx-register",
         0x0fff_fff0,
@@ -69,7 +73,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         CONDITION_ONLY,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe12fff30),
     pattern(
         "blx-immediate",
         0xfe00_0000,
@@ -78,7 +84,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         NONE,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xfa000000),
     pattern(
         "svc",
         0x0f00_0000,
@@ -87,7 +95,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         2,
         CONDITION_ONLY,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xef000000),
     pattern(
         "bkpt",
         0x0ff0_00f0,
@@ -96,7 +106,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         30,
         CONDITION_ONLY,
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe1200070),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

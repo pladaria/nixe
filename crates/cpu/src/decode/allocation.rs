@@ -549,7 +549,8 @@ mod tests {
                 ExecutionState::T32,
                 InstructionEncoding::from_u16(0xbf10)
             ),
-            DecodeResult::Decoded(decoded) if decoded.instruction.pattern().name == "hint"
+            DecodeResult::RecognizedUnimplemented(decoded)
+                if decoded.instruction.pattern().name == "hint"
         ));
         assert!(matches!(
             classify(ExecutionState::T32, InstructionEncoding::from_u16(0xbfe8)),

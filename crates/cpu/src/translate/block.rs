@@ -1,15 +1,13 @@
-//! State-independent translation-block formation and cut policy.
+//! State-independent basic-block discovery used only by region formation.
 
-use core::{fmt, num::NonZeroU32};
+use core::num::NonZeroU32;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::{
-    decode::{DecodeResult, DecodedOpcode, OperandId, OperandValue},
+    decode::{DecodeResult, DecodedOpcode},
     error::{FrontendError, FrontendInternalError, InvalidIr},
     ir::{
-        block::{
-            BlockEndReason, BlockExit, BlockExitKind, BlockMetadata, InstructionSource, IrBlock,
-        },
+        block::{BlockEndReason, BlockMetadata, InstructionSource, IrBlock},
         builder::{BuildError, IrBuilder},
         op::{OperationKind, StateRegister},
         terminator::{ControlTarget, Terminator},
@@ -21,10 +19,10 @@ use crate::{
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
 
-/// Default maximum number of guest instructions in one translation block.
+/// Default local instruction cut for one discovered basic block.
 pub const DEFAULT_MAX_GUEST_INSTRUCTIONS: NonZeroU32 = NonZeroU32::new(64).unwrap();
 
-/// Absolute allocation bound accepted for one translation block.
+/// Absolute allocation bound accepted for one discovered basic block.
 ///
 /// Normal runtime policy uses [`DEFAULT_MAX_GUEST_INSTRUCTIONS`]. This larger
 /// ceiling prevents malformed configuration from turning translation into an
@@ -39,50 +37,19 @@ pub const MAX_GUEST_INSTRUCTIONS_PER_BLOCK: u32 = 4_096;
 /// allowing an accidental expansion loop to consume unbounded memory.
 pub const MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION: usize = 64;
 
-/// Bounded policy used by the lazy block translator.
+/// Bounded policy used by the region former's basic-block discovery primitive.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BlockTranslationConfig {
+pub(crate) struct BasicBlockLimits {
     pub max_guest_instructions: NonZeroU32,
 }
 
-impl Default for BlockTranslationConfig {
+impl Default for BasicBlockLimits {
     fn default() -> Self {
         Self {
             max_guest_instructions: DEFAULT_MAX_GUEST_INSTRUCTIONS,
         }
     }
 }
-
-/// Failure to calculate an architectural instruction or branch address.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum AddressCalculationError {
-    AddressOverflow,
-    MissingBranchDisplacement,
-    MisalignedTarget {
-        target: GuestVirtualAddress,
-        execution_state: ExecutionState,
-    },
-}
-
-impl fmt::Display for AddressCalculationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AddressOverflow => formatter.write_str("guest instruction address overflow"),
-            Self::MissingBranchDisplacement => {
-                formatter.write_str("decoded branch has no signed displacement")
-            }
-            Self::MisalignedTarget {
-                target,
-                execution_state,
-            } => write!(
-                formatter,
-                "target {target} is misaligned for {execution_state}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AddressCalculationError {}
 
 pub(crate) enum LiftOutcome {
     Continue,
@@ -95,28 +62,28 @@ pub(crate) enum LiftOutcome {
 /// Fetch provenance remains in guest domains, each instruction is dispatched
 /// through the decoder and state-specific lifter, and the returned IR has
 /// already passed the common verifier.
-pub fn translate_block(
-    config: BlockTranslationConfig,
+pub(crate) fn translate_basic_block(
+    config: BasicBlockLimits,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &impl InstructionMemory,
 ) -> Result<IrBlock, FrontendError> {
-    translate_block_internal(config, profile, address_space, start, memory, false)
+    translate_basic_block_internal(config, profile, address_space, start, memory, false)
 }
 
-pub(crate) fn translate_block_with_disassembly(
-    config: BlockTranslationConfig,
+pub(crate) fn translate_basic_block_with_disassembly(
+    config: BasicBlockLimits,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &impl InstructionMemory,
 ) -> Result<IrBlock, FrontendError> {
-    translate_block_internal(config, profile, address_space, start, memory, true)
+    translate_basic_block_internal(config, profile, address_space, start, memory, true)
 }
 
-fn translate_block_internal(
-    config: BlockTranslationConfig,
+fn translate_basic_block_internal(
+    config: BasicBlockLimits,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
@@ -136,10 +103,9 @@ fn translate_block_internal(
         ));
     }
 
-    let provisional = BlockMetadata::new(start, 0, 0, [], [], []);
+    let provisional = BlockMetadata::new(start, 0, 0, []);
     let mut builder = IrBuilder::new(provisional);
     let mut sources = Vec::new();
-    let mut dependencies = Vec::new();
     let mut pc = start.pc;
     let (terminator, end_reason) = loop {
         if !sources.is_empty() && !first_page.contains(pc) {
@@ -155,11 +121,6 @@ fn translate_block_internal(
         let location = LocationDescriptor::new(pc, start.execution_state, profile.id());
         let (encoding, fetched_dependencies) = fetch_instruction(memory, address_space, location)?;
         let next_pc = advance_pc(location, encoding)?;
-        for dependency in fetched_dependencies.iter() {
-            if !dependencies.contains(&dependency) {
-                dependencies.push(dependency);
-            }
-        }
         let mut source = InstructionSource::new(location, encoding, fetched_dependencies);
 
         let operations_before_lift = builder.operation_count();
@@ -186,7 +147,7 @@ fn translate_block_internal(
                 }
                 LiftOutcome::Terminate(Terminator::Exception {
                     source: location,
-                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    kind: crate::exception::ExceptionKind::UndefinedInstruction,
                     syndrome: None,
                 })
             }
@@ -196,7 +157,7 @@ fn translate_block_internal(
                 }
                 LiftOutcome::Terminate(Terminator::Exception {
                     source: location,
-                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    kind: crate::exception::ExceptionKind::UndefinedInstruction,
                     syndrome: None,
                 })
             }
@@ -209,7 +170,7 @@ fn translate_block_internal(
                 }
                 LiftOutcome::Terminate(Terminator::Exception {
                     source: location,
-                    kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                    kind: crate::exception::ExceptionKind::UndefinedInstruction,
                     syndrome: None,
                 })
             }
@@ -271,8 +232,6 @@ fn translate_block_internal(
         start,
         guest_byte_count.ok_or_else(|| internal("translated byte count overflow"))?,
         guest_instruction_count.ok_or_else(|| internal("translated instruction count overflow"))?,
-        exits_for_terminator(&terminator),
-        dependencies,
         sources,
     )
     .with_end_reason(end_reason);
@@ -286,9 +245,11 @@ const fn end_reason_for_terminator(terminator: &Terminator) -> BlockEndReason {
         Terminator::Direct { .. } => BlockEndReason::DirectBranch,
         Terminator::Conditional { .. } => BlockEndReason::ConditionalBranch,
         Terminator::Indirect { .. } => BlockEndReason::IndirectBranch,
-        Terminator::Call { .. } => BlockEndReason::Call,
+        Terminator::Call { .. } | Terminator::ConditionalCall { .. } => BlockEndReason::Call,
         Terminator::Return { .. } => BlockEndReason::Return,
-        Terminator::Exception { .. } => BlockEndReason::Exception,
+        Terminator::Exception { .. } | Terminator::ConditionalException { .. } => {
+            BlockEndReason::Exception
+        }
         Terminator::InterpretOne { .. } => BlockEndReason::InterpreterFallback,
         Terminator::UnsupportedInstruction { .. } => BlockEndReason::UnsupportedInstruction,
         Terminator::Stop { .. } => BlockEndReason::RuntimeStop,
@@ -383,61 +344,6 @@ pub(crate) const fn direct_branch(target: ControlTarget) -> Terminator {
     Terminator::Direct { target }
 }
 
-fn exits_for_terminator(terminator: &Terminator) -> Vec<BlockExit> {
-    let target = |kind, target: &ControlTarget| BlockExit {
-        kind,
-        target: match target {
-            ControlTarget::Direct { pc, .. } => Some(*pc),
-            ControlTarget::Indirect { .. } | ControlTarget::A32Interworking { .. } => None,
-        },
-    };
-    match terminator {
-        Terminator::Direct {
-            target: destination,
-        } => {
-            vec![target(BlockExitKind::Direct, destination)]
-        }
-        Terminator::Conditional {
-            taken, fallthrough, ..
-        } => vec![
-            target(BlockExitKind::ConditionalTaken, taken),
-            target(BlockExitKind::ConditionalFallthrough, fallthrough),
-        ],
-        Terminator::Indirect {
-            target: destination,
-        } => {
-            vec![target(BlockExitKind::Indirect, destination)]
-        }
-        Terminator::Call {
-            target: destination,
-            ..
-        } => {
-            vec![target(BlockExitKind::Call, destination)]
-        }
-        Terminator::Return {
-            target: destination,
-        } => {
-            vec![target(BlockExitKind::Return, destination)]
-        }
-        Terminator::Exception { .. } => vec![BlockExit {
-            kind: BlockExitKind::Exception,
-            target: None,
-        }],
-        Terminator::InterpretOne { .. } => vec![BlockExit {
-            kind: BlockExitKind::Interpreter,
-            target: None,
-        }],
-        Terminator::UnsupportedInstruction { .. } => vec![BlockExit {
-            kind: BlockExitKind::UnsupportedInstruction,
-            target: None,
-        }],
-        Terminator::Stop { .. } => vec![BlockExit {
-            kind: BlockExitKind::Stop,
-            target: None,
-        }],
-    }
-}
-
 fn advance_pc(
     location: LocationDescriptor,
     encoding: InstructionEncoding,
@@ -447,71 +353,11 @@ fn advance_pc(
         ExecutionState::A64 => location
             .pc
             .checked_add(increment)
-            .ok_or_else(|| internal(AddressCalculationError::AddressOverflow.to_string())),
+            .ok_or_else(|| internal("guest instruction address overflow")),
         ExecutionState::A32 | ExecutionState::T32 => Ok(GuestVirtualAddress::new(u64::from(
             (location.pc.get() as u32).wrapping_add(increment as u32),
         ))),
     }
-}
-
-/// Calculates an immediate branch target using the current execution state's
-/// PC bias, address width, scaling already applied by the decoder, and target
-/// alignment.
-pub fn direct_branch_target(
-    decoded: &DecodedInstruction<DecodedOpcode>,
-) -> Result<ControlTarget, AddressCalculationError> {
-    let OperandValue::Signed(displacement) = decoded
-        .instruction
-        .operands()
-        .get(OperandId::Immediate)
-        .ok_or(AddressCalculationError::MissingBranchDisplacement)?
-    else {
-        return Err(AddressCalculationError::MissingBranchDisplacement);
-    };
-    let state = decoded.location.execution_state;
-    let pc = decoded.location.pc;
-    let target = match state {
-        ExecutionState::A64 => pc.wrapping_offset(displacement),
-        ExecutionState::A32 => GuestVirtualAddress::new(u64::from(
-            (pc.get() as u32)
-                .wrapping_add(8)
-                .wrapping_add(displacement as u32),
-        )),
-        ExecutionState::T32 => GuestVirtualAddress::new(u64::from(
-            (pc.get() as u32)
-                .wrapping_add(4)
-                .wrapping_add(displacement as u32),
-        )),
-    };
-    if !state.is_instruction_address_aligned(target) {
-        return Err(AddressCalculationError::MisalignedTarget {
-            target,
-            execution_state: state,
-        });
-    }
-    Ok(ControlTarget::Direct {
-        pc: target,
-        execution_state: state,
-    })
-}
-
-/// Converts an AArch32 BX-like raw address into an aligned A32 or T32 target.
-pub fn a32_interworking_target(
-    raw_address: GuestVirtualAddress,
-) -> Result<ControlTarget, AddressCalculationError> {
-    if raw_address.get() > u64::from(u32::MAX) {
-        return Err(AddressCalculationError::AddressOverflow);
-    }
-    let raw = raw_address.get() as u32;
-    let (address, execution_state) = if raw & 1 != 0 {
-        (raw & !1, ExecutionState::T32)
-    } else {
-        (raw & !3, ExecutionState::A32)
-    };
-    Ok(ControlTarget::Direct {
-        pc: GuestVirtualAddress::new(u64::from(address)),
-        execution_state,
-    })
 }
 
 /// Forms a host-independent computed target in the guest address domain.
@@ -521,14 +367,6 @@ pub const fn indirect_target(address: Operand, execution_state: ExecutionState) 
         address,
         execution_state,
     }
-}
-
-/// Forms a computed A32/T32 interworking target. Its guest address bit zero is
-/// deliberately interpreted by the execution engine, never converted to a host
-/// pointer.
-#[must_use]
-pub const fn indirect_interworking_target(address: Operand) -> ControlTarget {
-    ControlTarget::A32Interworking { address }
 }
 
 /// Creates a conditional exit with both CFG successors retained explicitly.
@@ -650,43 +488,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lazy_operands_preserve_direct_branch_targets_for_all_execution_states() {
-        let profile = GuestCpuProfile::switch_1();
-        let cases = [
-            (ExecutionState::A64, 0x1400_0002_u32.into(), 0x1008),
-            (ExecutionState::A32, 0xeaff_ffff_u32.into(), 0x1004),
-            (
-                ExecutionState::T32,
-                InstructionEncoding::from_u16(0xe7ff),
-                0x1002,
-            ),
-        ];
-
-        for (state, encoding, expected_pc) in cases {
-            let location = start(profile, 0x1000, state);
-            let decoded = match crate::decode::decode(&profile, location, encoding) {
-                DecodeResult::Decoded(decoded) => decoded,
-                result => panic!("expected decoded branch, got {result:?}"),
-            };
-            assert_eq!(
-                direct_branch_target(&decoded).unwrap(),
-                ControlTarget::Direct {
-                    pc: GuestVirtualAddress::new(expected_pc),
-                    execution_state: state,
-                }
-            );
-        }
-    }
-
     fn terminator_family(terminator: &Terminator) -> &'static str {
         match terminator {
             Terminator::Direct { .. } => "direct",
             Terminator::Conditional { .. } => "conditional",
+            Terminator::ConditionalCall { .. } => "conditional-call",
             Terminator::Indirect { .. } => "indirect",
             Terminator::Call { .. } => "call",
             Terminator::Return { .. } => "return",
             Terminator::Exception { .. } => "exception",
+            Terminator::ConditionalException { .. } => "conditional-exception",
             Terminator::InterpretOne { .. } => "interpret-one",
             Terminator::UnsupportedInstruction { .. } => "unsupported",
             Terminator::Stop { .. } => "stop",
@@ -697,8 +508,8 @@ mod tests {
     fn rejects_configuration_above_the_hard_allocation_bound() {
         let profile = GuestCpuProfile::switch_1();
         let memory = memory_with_pages(0x1000, 1);
-        let result = translate_block(
-            BlockTranslationConfig {
+        let result = translate_basic_block(
+            BasicBlockLimits {
                 max_guest_instructions: NonZeroU32::new(MAX_GUEST_INSTRUCTIONS_PER_BLOCK + 1)
                     .unwrap(),
             },
@@ -781,24 +592,24 @@ mod tests {
             },
             Case {
                 state: ExecutionState::A32,
-                bytes: &[0x01, 0x00, 0xa0, 0xe3],
-                expected_sources: &["data-processing"],
-                required_operation: None,
-                expected_terminator: "interpret-one",
+                bytes: &[0x01, 0x00, 0xa0, 0xe3, 0x00, 0x00, 0x00, 0xef],
+                expected_sources: &["data-processing", "svc cond=#14"],
+                required_operation: Some("helper"),
+                expected_terminator: "exception",
             },
             Case {
                 state: ExecutionState::A32,
-                bytes: &[0x00, 0x10, 0x90, 0xe5],
-                expected_sources: &["load-store-single"],
-                required_operation: None,
-                expected_terminator: "interpret-one",
+                bytes: &[0x00, 0x10, 0x90, 0xe5, 0x00, 0x00, 0x00, 0xef],
+                expected_sources: &["load-store-single", "svc cond=#14"],
+                required_operation: Some("memory"),
+                expected_terminator: "exception",
             },
             Case {
                 state: ExecutionState::A32,
-                bytes: &[0x10, 0x01, 0x00, 0xf2],
-                expected_sources: &["neon-bitwise"],
-                required_operation: None,
-                expected_terminator: "interpret-one",
+                bytes: &[0x10, 0x01, 0x00, 0xf2, 0x00, 0x00, 0x00, 0xef],
+                expected_sources: &["neon-bitwise", "svc cond=#14"],
+                required_operation: Some("helper"),
+                expected_terminator: "exception",
             },
             Case {
                 state: ExecutionState::T32,
@@ -809,17 +620,17 @@ mod tests {
             },
             Case {
                 state: ExecutionState::T32,
-                bytes: &[0x7f, 0x23],
-                expected_sources: &["movs dst=r3, imm=#127"],
-                required_operation: None,
-                expected_terminator: "interpret-one",
+                bytes: &[0x7f, 0x23, 0x00, 0xdf],
+                expected_sources: &["movs dst=r3, imm=#127", "svc"],
+                required_operation: Some("helper"),
+                expected_terminator: "conditional-exception",
             },
             Case {
                 state: ExecutionState::T32,
-                bytes: &[0x01, 0x48],
-                expected_sources: &["load-literal"],
-                required_operation: None,
-                expected_terminator: "interpret-one",
+                bytes: &[0x01, 0x48, 0x00, 0xdf],
+                expected_sources: &["load-literal", "svc"],
+                required_operation: Some("memory"),
+                expected_terminator: "conditional-exception",
             },
         ];
 
@@ -827,8 +638,8 @@ mod tests {
         for case in cases {
             let mut memory = memory_with_pages(0x1000, 1);
             put(&mut memory, 1, 0, case.bytes);
-            let block = translate_block(
-                BlockTranslationConfig::default(),
+            let block = translate_basic_block(
+                BasicBlockLimits::default(),
                 &profile,
                 SPACE,
                 start(profile, 0x1000, case.state),
@@ -878,12 +689,7 @@ mod tests {
                 );
             }
 
-            let printed =
-                crate::ir::print::print_block(&block, crate::ir::print::IrPrintOptions::default());
-            assert_eq!(
-                printed,
-                crate::ir::print::print_block(&block, crate::ir::print::IrPrintOptions::default())
-            );
+            assert_eq!(format!("{block:?}"), format!("{block:?}"));
         }
     }
 
@@ -931,8 +737,8 @@ mod tests {
         for (state, encoding, expected, end_reason) in cases {
             let mut memory = memory_with_pages(0x1000, 1);
             put(&mut memory, 1, 0, &encoding.to_le_bytes());
-            let block = translate_block(
-                BlockTranslationConfig::default(),
+            let block = translate_basic_block(
+                BasicBlockLimits::default(),
                 &profile,
                 SPACE,
                 start(profile, 0x1000, state),
@@ -944,33 +750,14 @@ mod tests {
             assert_eq!(block.metadata.guest_instruction_count, 1);
         }
 
-        for (encoding, expected) in [(0x2001_u16, "interpret-one"), (0x0000, "interpret-one")] {
-            let mut memory = memory_with_pages(0x1000, 1);
-            put(&mut memory, 1, 0, &encoding.to_le_bytes());
-            let block = translate_block(
-                BlockTranslationConfig::default(),
-                &profile,
-                SPACE,
-                start(profile, 0x1000, ExecutionState::T32),
-                &memory,
-            )
-            .unwrap();
-            assert_eq!(terminator_family(&block.terminator), expected);
-            assert_eq!(
-                block.metadata.end_reason,
-                BlockEndReason::InterpreterFallback
-            );
-            assert_eq!(block.metadata.guest_instruction_count, 1);
-        }
-
-        let mut fallback = memory_with_pages(0x1000, 1);
-        put(&mut fallback, 1, 0, &0xd503_20df_u32.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let mut future_fallback = memory_with_pages(0x1000, 1);
+        put(&mut future_fallback, 1, 0, &0xbf10_u16.to_le_bytes());
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
-            start(profile, 0x1000, ExecutionState::A64),
-            &fallback,
+            start(profile, 0x1000, ExecutionState::T32),
+            &future_fallback,
         )
         .unwrap();
         assert_eq!(terminator_family(&block.terminator), "interpret-one");
@@ -980,21 +767,30 @@ mod tests {
         );
         assert_eq!(block.metadata.guest_instruction_count, 1);
 
-        // Stop is a dispatcher boundary rather than an instruction-produced
-        // exit, but its block metadata classification is still part of the IR
-        // contract.
+        let mut fallback = memory_with_pages(0x1000, 1);
+        put(&mut fallback, 1, 0, &0xd503_20df_u32.to_le_bytes());
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
+            &profile,
+            SPACE,
+            start(profile, 0x1000, ExecutionState::A64),
+            &fallback,
+        )
+        .unwrap();
+        assert_eq!(terminator_family(&block.terminator), "unsupported");
+        assert_eq!(
+            block.metadata.end_reason,
+            BlockEndReason::UnsupportedInstruction
+        );
+        assert_eq!(block.metadata.guest_instruction_count, 1);
+
+        // Stop is a dispatcher boundary rather than an instruction-produced exit.
         let stop = Terminator::Stop {
             source: start(profile, 0x1000, ExecutionState::A64),
             reason: crate::ir::terminator::StopReason::TranslationLimit,
         };
         assert_eq!(terminator_family(&stop), "stop");
-        assert!(matches!(
-            exits_for_terminator(&stop).as_slice(),
-            [BlockExit {
-                kind: BlockExitKind::Stop,
-                target: None,
-            }]
-        ));
+        assert!(matches!(stop, Terminator::Stop { .. }));
     }
 
     #[test]
@@ -1007,8 +803,8 @@ mod tests {
         for (state, encoding, expected) in cases {
             let mut memory = memory_with_pages(0x1000, 1);
             put(&mut memory, 1, 0, &encoding.to_le_bytes());
-            let block = translate_block(
-                BlockTranslationConfig::default(),
+            let block = translate_basic_block(
+                BasicBlockLimits::default(),
                 &profile,
                 SPACE,
                 start(profile, 0x1000, state),
@@ -1026,8 +822,8 @@ mod tests {
 
         let mut memory = memory_with_pages(0x1000, 1);
         put(&mut memory, 1, 0, &0xe001_u16.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x1000, ExecutionState::T32),
@@ -1056,8 +852,8 @@ mod tests {
         let profile = GuestCpuProfile::switch_1();
         let mut memory = memory_with_pages(0x1000, 1);
         put(&mut memory, 1, 0, &0x1a00_0000_u32.to_le_bytes()); // b.ne +0
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x1000, ExecutionState::A32),
@@ -1093,8 +889,8 @@ mod tests {
         let mut memory = memory_with_pages(0x1000, 1);
         put(&mut memory, 1, 0, &0xbf08_u16.to_le_bytes()); // it eq
         put(&mut memory, 1, 2, &0xe001_u16.to_le_bytes()); // b +2
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x1000, ExecutionState::T32),
@@ -1128,14 +924,14 @@ mod tests {
     }
 
     #[test]
-    fn cuts_at_limit_and_annotates_budget_and_fallthrough() {
+    fn basic_block_discovery_cuts_at_its_local_limit_and_preserves_fallthrough() {
         let profile = GuestCpuProfile::switch_1();
         let mut memory = memory_with_pages(0x1000, 1);
         for offset in (0..12).step_by(4) {
             put(&mut memory, 1, offset, &0xd503_201f_u32.to_le_bytes());
         }
-        let block = translate_block(
-            BlockTranslationConfig {
+        let block = translate_basic_block(
+            BasicBlockLimits {
                 max_guest_instructions: NonZeroU32::new(2).unwrap(),
             },
             &profile,
@@ -1146,11 +942,12 @@ mod tests {
         .unwrap();
         assert_eq!(block.metadata.guest_instruction_count, 2);
         assert_eq!(block.metadata.guest_byte_count, 8);
-        assert_eq!(block.metadata.budget_safepoint.guest_instruction_cost, 2);
-        assert_eq!(
-            block.metadata.exits[0].target,
-            Some(GuestVirtualAddress::new(0x1008))
-        );
+        assert!(matches!(
+            block.terminator,
+            Terminator::Direct {
+                target: ControlTarget::Direct { pc, .. }
+            } if pc == GuestVirtualAddress::new(0x1008)
+        ));
         assert_eq!(block.metadata.end_reason, BlockEndReason::InstructionLimit);
     }
 
@@ -1163,8 +960,8 @@ mod tests {
         put(&mut memory, 1, offset, &0xf3af_u16.to_le_bytes());
         put(&mut memory, 2, 0, &0x8000_u16.to_le_bytes());
         put(&mut memory, 2, 2, &0xbf00_u16.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, base + offset as u64, ExecutionState::T32),
@@ -1173,23 +970,23 @@ mod tests {
         .unwrap();
         assert_eq!(block.metadata.guest_instruction_count, 1);
         assert_eq!(block.metadata.guest_byte_count, 4);
-        assert_eq!(block.metadata.code_dependencies.len(), 2);
+        assert_eq!(block.metadata.sources[0].dependencies.iter().count(), 2);
         assert_eq!(block.metadata.end_reason, BlockEndReason::PageBoundary);
-        assert_eq!(
-            block.metadata.exits[0].target,
-            Some(GuestVirtualAddress::new(
-                base + SYNTHETIC_PAGE_SIZE as u64 + 2
-            ))
-        );
+        assert!(matches!(
+            block.terminator,
+            Terminator::Direct {
+                target: ControlTarget::Direct { pc, .. }
+            } if pc == GuestVirtualAddress::new(base + SYNTHETIC_PAGE_SIZE as u64 + 2)
+        ));
     }
 
     #[test]
-    fn exceptions_and_engine_neutral_fallbacks_cut_immediately() {
+    fn exceptions_unsupported_instructions_and_future_fallbacks_cut_immediately() {
         let profile = GuestCpuProfile::switch_1();
         let mut unallocated = memory_with_pages(0x1000, 1);
         put(&mut unallocated, 1, 0, &0_u32.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x1000, ExecutionState::A64),
@@ -1199,17 +996,16 @@ mod tests {
         assert!(matches!(
             block.terminator,
             Terminator::Exception {
-                kind: crate::ir::terminator::ExceptionKind::UndefinedInstruction,
+                kind: crate::exception::ExceptionKind::UndefinedInstruction,
                 ..
             }
         ));
 
         let mut recognized = memory_with_pages(0x2000, 1);
-        // A recognized architectural hint whose precise behavior is not yet
-        // among the frontend's supported scheduling hints.
+        // This recognized hint has semantics in neither execution engine.
         put(&mut recognized, 1, 0, &0xd503_20df_u32.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x2000, ExecutionState::A64),
@@ -1218,43 +1014,26 @@ mod tests {
         .unwrap();
         assert!(matches!(
             block.terminator,
-            Terminator::InterpretOne { source, encoding, .. }
+            Terminator::UnsupportedInstruction { source, encoding, .. }
                 if source == start(profile, 0x2000, ExecutionState::A64)
                     && encoding == InstructionEncoding::from_u32(0xd503_20df)
         ));
 
-        let mut interpreter_only = memory_with_pages(0x3000, 1);
-        put(&mut interpreter_only, 1, 0, &0x2001_u16.to_le_bytes());
-        let block = translate_block(
-            BlockTranslationConfig::default(),
+        let mut future_fallback = memory_with_pages(0x3000, 1);
+        put(&mut future_fallback, 1, 0, &0xbf10_u16.to_le_bytes());
+        let block = translate_basic_block(
+            BasicBlockLimits::default(),
             &profile,
             SPACE,
             start(profile, 0x3000, ExecutionState::T32),
-            &interpreter_only,
+            &future_fallback,
         )
         .unwrap();
         assert!(matches!(block.terminator, Terminator::InterpretOne { .. }));
     }
 
     #[test]
-    fn aarch32_wrap_and_interworking_keep_guest_state_explicit() {
-        let a32 = a32_interworking_target(GuestVirtualAddress::new(0x2002)).unwrap();
-        let t32 = a32_interworking_target(GuestVirtualAddress::new(0x2003)).unwrap();
-        assert_eq!(
-            a32,
-            ControlTarget::Direct {
-                pc: GuestVirtualAddress::new(0x2000),
-                execution_state: ExecutionState::A32,
-            }
-        );
-        assert_eq!(
-            t32,
-            ControlTarget::Direct {
-                pc: GuestVirtualAddress::new(0x2002),
-                execution_state: ExecutionState::T32,
-            }
-        );
-
+    fn aarch32_instruction_address_wraps_in_the_guest_domain() {
         let wrapped = advance_pc(
             start(
                 GuestCpuProfile::switch_1(),
@@ -1277,10 +1056,6 @@ mod tests {
                 execution_state: ExecutionState::A64,
             }
         );
-        assert_eq!(
-            indirect_interworking_target(address),
-            ControlTarget::A32Interworking { address }
-        );
     }
 
     #[test]
@@ -1301,11 +1076,6 @@ mod tests {
             source,
             4,
             1,
-            [BlockExit {
-                kind: BlockExitKind::Call,
-                target: Some(GuestVirtualAddress::new(0x2000)),
-            }],
-            [dependency],
             [InstructionSource::new(
                 source,
                 InstructionEncoding::from_u32(0xf000_f800),

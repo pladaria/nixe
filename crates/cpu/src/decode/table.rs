@@ -28,7 +28,6 @@ pub enum DecodeSupport {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LoweringAvailability {
     Implemented,
-    EncodingDependent,
     Missing,
 }
 
@@ -118,12 +117,6 @@ impl InstructionPattern {
     }
 
     #[must_use]
-    pub const fn encoding_dependent_lowering(mut self) -> Self {
-        self.lowering = LoweringAvailability::EncodingDependent;
-        self
-    }
-
-    #[must_use]
     pub const fn fixture32(mut self, bits: u32) -> Self {
         self.regression_fixture = Some(RegressionFixture {
             encoding: InstructionEncoding::from_u32(bits),
@@ -142,6 +135,7 @@ impl InstructionPattern {
     #[must_use]
     pub const fn recognized_unimplemented(mut self) -> Self {
         self.decoder = DecodeSupport::RecognizedUnimplemented;
+        self.lowering = LoweringAvailability::Missing;
         self
     }
 }

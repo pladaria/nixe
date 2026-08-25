@@ -4,6 +4,7 @@ pub mod block;
 pub mod builder;
 pub mod op;
 pub mod print;
+pub mod region;
 pub mod terminator;
 pub mod types;
 pub mod value;

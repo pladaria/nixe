@@ -2,7 +2,6 @@
 
 use libfuzzer_sys::fuzz_target;
 use nixe_cpu::{
-    address::GuestVirtualAddress,
     coverage::{
         CoverageId, MAX_MISSING_INSTRUCTION_EXPORT_BYTES, MAX_MISSING_INSTRUCTION_RECORDS,
         MAX_SURROUNDING_INSTRUCTION_BYTES, MissingInstructionObservation,
@@ -10,6 +9,7 @@ use nixe_cpu::{
     },
     location::{ExecutionState, InstructionEncoding},
 };
+use nixe_memory::GuestVirtualAddress;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 64 * 1024 {

@@ -172,7 +172,7 @@ fn lift_literal_load(
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let Some((size, load)) = crate::semantics::a64::literal_load(fields.size) else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     let address = Immediate::Address(
         decoded
@@ -234,7 +234,7 @@ fn lift_load_store_unsigned(
         address,
         descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal),
     )? {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     Ok(LiftOutcome::Continue)
 }
@@ -249,7 +249,7 @@ fn lift_load_store_indexed(
     let rn = fields.rn;
     let rt = fields.rt;
     if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) && rn != 31 && rn == rt {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let base = base_address(builder, decoded.location, rn)?;
     let offset = sign_extend(u64::from(u32::from(fields.immediate_9)), 9);
@@ -268,7 +268,7 @@ fn lift_load_store_indexed(
         address,
         descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal),
     )? {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     if !matches!(instruction, A64MemoryInstruction::Unscaled(_)) {
         let updated_address = address_add(builder, decoded.location, base, offset)?;
@@ -300,7 +300,7 @@ fn lift_load_store_register(
     )?;
     let option = u32::from(fields.option);
     if option & 2 == 0 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let shift = if fields.scaled {
         size.bytes().trailing_zeros() as u8
@@ -327,7 +327,7 @@ fn lift_load_store_register(
         address,
         descriptor(size, MemoryOrdering::Relaxed, MemoryAccessClass::Normal),
     )? {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     Ok(LiftOutcome::Continue)
 }
@@ -338,7 +338,7 @@ fn lift_load_store_pair(
     fields: MemoryOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     };
     let width = if size == MemoryAccessSize::Word {
         IrType::I32
@@ -351,7 +351,7 @@ fn lift_load_store_pair(
     let mode = u32::from(fields.mode);
     let load = fields.load;
     if (load && rt == rt2) || (matches!(mode, 1 | 3) && rn != 31 && (rn == rt || rn == rt2)) {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let base = base_address(builder, decoded.location, rn)?;
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;

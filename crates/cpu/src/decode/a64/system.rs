@@ -14,7 +14,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xd503_203f),
     pattern(
         "mrs",
         0xfff0_0000,
@@ -24,7 +25,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xd53b_4200),
     pattern(
         "msr-register",
         0xfff0_0000,
@@ -34,7 +36,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xd51b_4200),
     pattern(
         "barrier",
         0xffff_f01f,
@@ -44,7 +47,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xd503_3bbf),
     pattern(
         "system",
         0xffc0_0000,
@@ -54,7 +58,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .encoding_dependent_lowering(),
+    .lowered()
+    .fixture32(0xd508_7500),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

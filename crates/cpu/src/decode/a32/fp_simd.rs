@@ -14,7 +14,8 @@ pub static PATTERNS: &[InstructionPattern] = &[
         &[],
         SIMD,
     )
-    .recognized_unimplemented(),
+    .lowered()
+    .fixture32(0xee000a00),
     pattern(
         "neon-bitwise",
         0xfe00_0110,
@@ -23,7 +24,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         5,
         &[],
         SIMD,
-    ),
+    )
+    .lowered()
+    .fixture32(0xf2000150),
     pattern(
         "neon-integer",
         0xfe00_0800,
@@ -32,7 +35,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         1,
         &[],
         SIMD,
-    ),
+    )
+    .lowered()
+    .fixture32(0xf2000840),
     pattern(
         "neon-memory",
         0xff00_0000,
@@ -41,7 +46,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         5,
         &[],
         SIMD,
-    ),
+    )
+    .lowered()
+    .fixture32(0xf400070f),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +64,6 @@ pub(super) fn normalize(id: u32, bits: u32) -> Instruction {
             load: bits & (1 << 21) != 0,
             rn: ((bits >> 16) & 0xf) as u8,
             vd: (((bits >> 12) & 0xf) | ((bits >> 18) & 0x10)) as u8,
-            register_count: 1,
             writeback_rm: (rm != 15).then_some(rm),
         });
     }

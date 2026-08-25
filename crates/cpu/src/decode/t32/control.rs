@@ -22,17 +22,27 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
     pattern16("it", 0xff00, 0xbf00, 0x0002_0005, 20, IT_IMM)
         .lowered()
         .fixture16(0xbf08),
-    pattern16("hint", 0xff0f, 0xbf00, 0x0002_0006, 10, NONE),
-    pattern16("b-conditional", 0xf000, 0xd000, 0x0002_0007, 1, NONE),
+    pattern16("hint", 0xff0f, 0xbf00, 0x0002_0006, 10, NONE).recognized_unimplemented(),
+    pattern16("b-conditional", 0xf000, 0xd000, 0x0002_0007, 1, NONE)
+        .lowered()
+        .fixture16(0xd000),
     pattern16("b", 0xf800, 0xe000, 0x0002_0002, 1, B_IMM)
         .lowered()
         .fixture16(0xe000),
-    pattern16("branch-exchange", 0xff00, 0x4700, 0x0002_0008, 10, NONE),
-    pattern16("svc", 0xff00, 0xdf00, 0x0002_000a, 20, NONE),
-    pattern16("bkpt", 0xff00, 0xbe00, 0x0002_000b, 20, NONE),
+    pattern16("branch-exchange", 0xff00, 0x4700, 0x0002_0008, 10, NONE)
+        .lowered()
+        .fixture16(0x4700),
+    pattern16("svc", 0xff00, 0xdf00, 0x0002_000a, 20, NONE)
+        .lowered()
+        .fixture16(0xdf00),
+    pattern16("bkpt", 0xff00, 0xbe00, 0x0002_000b, 20, NONE)
+        .lowered()
+        .fixture16(0xbe00),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
-    pattern32("bl", 0xf800_d000, 0xf000_d000, 0x0002_0009, 5, NONE),
+    pattern32("bl", 0xf800_d000, 0xf000_d000, 0x0002_0009, 5, NONE)
+        .lowered()
+        .fixture32(0xf000f800),
     pattern32("nop.w", u32::MAX, 0xf3af_8000, 0x0002_0004, 30, NONE)
         .lowered()
         .fixture32(0xf3af8000),

@@ -29,8 +29,7 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nixe_cpu::ir::block::IrBlock;
-use nixe_cpu::ir::print::{IrPrintOptions, print_block};
+use nixe_cpu::ir::print::{IrPrintOptions, print_region};
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::memory::{
     CpuMemory, ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError,
@@ -40,7 +39,7 @@ use nixe_cpu::memory::{
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
 use nixe_cpu::translate::{
-    BlockTranslationConfig, BlockTranslationReport, translate_block, translate_block_report,
+    RegionTranslationConfig, RegionTranslationReport, translate_region_report,
 };
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
@@ -571,24 +570,12 @@ impl RunnableProcess {
         self.execution.request_safepoint();
     }
 
-    /// Translates and verifies the initialized entry block through process memory.
-    pub fn translate_entry(&self) -> Result<IrBlock, ProcessBuildError> {
-        translate_block(
-            BlockTranslationConfig::default(),
-            &self.cpu.profile(),
-            self.cpu.address_space_id(),
-            self.entry_location(),
-            self.memory.as_ref(),
-        )
-        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))
-    }
-
-    /// Translates the entry block with source disassembly and a structured
+    /// Translates the entry region with source disassembly and a structured
     /// failure report. This path is opt-in and never runs during normal build.
     #[must_use]
-    pub fn translate_entry_report(&self) -> BlockTranslationReport {
-        translate_block_report(
-            BlockTranslationConfig::default(),
+    fn translate_entry_report(&self) -> RegionTranslationReport {
+        translate_region_report(
+            RegionTranslationConfig::default(),
             &self.cpu.profile(),
             self.cpu.address_space_id(),
             self.entry_location(),
@@ -598,11 +585,11 @@ impl RunnableProcess {
 
     /// Produces the deterministic verified-IR dump used by the first integration milestone.
     pub fn print_entry_ir(&self) -> Result<String, ProcessBuildError> {
-        let block = self
+        let region = self
             .translate_entry_report()
             .into_result()
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))?;
-        Ok(print_block(&block, IrPrintOptions::default()))
+        Ok(print_region(&region, IrPrintOptions::default()))
     }
 
     /// Produces the compact source, dependency, end-reason, and IR report used

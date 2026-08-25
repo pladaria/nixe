@@ -16,7 +16,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         20,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe0000090),
     pattern(
         "movw",
         0x0ff0_0000,
@@ -25,7 +27,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         15,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe3000000),
     pattern(
         "movt",
         0x0ff0_0000,
@@ -34,7 +38,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         15,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe3400000),
     pattern(
         "data-processing",
         0x0c00_0000,
@@ -43,7 +49,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe0000000),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

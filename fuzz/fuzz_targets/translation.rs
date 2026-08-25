@@ -4,16 +4,13 @@ use core::num::NonZeroU32;
 
 use libfuzzer_sys::fuzz_target;
 use nixe_cpu::{
-    address::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress},
-    ir::{print::print_block, verify::verify_block},
+    ir::{print::print_region, verify::verify_region},
     location::{ExecutionState, LocationDescriptor},
     memory::{MemoryPermissions, SYNTHETIC_PAGE_SIZE, SyntheticMemory},
     profile::GuestCpuProfile,
-    translate::{
-        BlockTranslationConfig, MAX_GUEST_INSTRUCTIONS_PER_BLOCK,
-        MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION, translate_block,
-    },
+    translate::{MAX_GUEST_INSTRUCTIONS_PER_REGION, RegionTranslationConfig, translate_region},
 };
+use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
 
 const MAX_INPUT_BYTES: usize = 2 * SYNTHETIC_PAGE_SIZE + 16;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
@@ -84,10 +81,12 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let instruction_limit = u32::from(header[7] % 64) + 1;
-    let config = BlockTranslationConfig {
+    let config = RegionTranslationConfig {
         max_guest_instructions: NonZeroU32::new(instruction_limit).unwrap(),
+        max_guest_instructions_per_block: NonZeroU32::new(instruction_limit).unwrap(),
+        ..RegionTranslationConfig::default()
     };
-    let result = translate_block(
+    let result = translate_region(
         config,
         &profile,
         address_space,
@@ -96,17 +95,13 @@ fuzz_target!(|data: &[u8]| {
     );
     assert!(memory.physical_page_count() <= 2);
     match result {
-        Ok(block) => {
-            let instruction_count = block.metadata.guest_instruction_count as usize;
+        Ok(region) => {
+            let instruction_count = region.metadata.guest_instruction_count as usize;
             assert!(instruction_count <= instruction_limit as usize);
-            assert!(instruction_count <= MAX_GUEST_INSTRUCTIONS_PER_BLOCK as usize);
-            assert!(block.metadata.sources.len() == instruction_count);
-            assert!(
-                block.operations.len()
-                    <= instruction_count * MAX_IR_OPERATIONS_PER_GUEST_INSTRUCTION
-            );
-            assert!(verify_block(&block).is_ok());
-            assert!(print_block(&block, Default::default()).len() <= MAX_DIAGNOSTIC_BYTES);
+            assert!(instruction_count <= MAX_GUEST_INSTRUCTIONS_PER_REGION as usize);
+            assert!(region.metadata.ir_operation_count as usize <= instruction_count * 64);
+            assert!(verify_region(&region).is_ok());
+            assert!(print_region(&region, Default::default()).len() <= MAX_DIAGNOSTIC_BYTES);
         }
         Err(error) => assert!(error.to_string().len() <= 4_096),
     }

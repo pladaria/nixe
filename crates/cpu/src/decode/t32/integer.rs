@@ -28,8 +28,12 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
                 kind: OperandKind::Unsigned,
             },
         ],
-    ),
-    pattern16("shift-immediate", 0xe000, 0x0000, 0x0002_0010, 1, &[]),
+    )
+    .lowered()
+    .fixture16(0x2000),
+    pattern16("shift-immediate", 0xe000, 0x0000, 0x0002_0010, 1, &[])
+        .lowered()
+        .fixture16(0x0000),
     pattern16(
         "add-subtract-three-register",
         0xf800,
@@ -37,7 +41,9 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0011,
         10,
         &[],
-    ),
+    )
+    .lowered()
+    .fixture16(0x1800),
     pattern16(
         "immediate-data-processing",
         0xe000,
@@ -45,7 +51,9 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0012,
         1,
         &[],
-    ),
+    )
+    .lowered()
+    .fixture16(0x2800),
     pattern16(
         "data-processing-register",
         0xfc00,
@@ -53,7 +61,9 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0013,
         1,
         &[],
-    ),
+    )
+    .lowered()
+    .fixture16(0x4000),
     pattern16(
         "special-data-processing",
         0xfc00,
@@ -61,13 +71,23 @@ pub static PATTERNS_16: &[InstructionPattern] = &[
         0x0002_0014,
         1,
         &[],
-    ),
-    pattern16("add-pc-sp", 0xf000, 0xa000, 0x0002_0015, 1, &[]),
-    pattern16("adjust-sp", 0xff00, 0xb000, 0x0002_0016, 10, &[]),
+    )
+    .lowered()
+    .fixture16(0x4400),
+    pattern16("add-pc-sp", 0xf000, 0xa000, 0x0002_0015, 1, &[])
+        .lowered()
+        .fixture16(0xa000),
+    pattern16("adjust-sp", 0xff00, 0xb000, 0x0002_0016, 10, &[])
+        .lowered()
+        .fixture16(0xb000),
 ];
 pub static PATTERNS_32: &[InstructionPattern] = &[
-    pattern32("movw", 0xfbf0_8000, 0xf240_0000, 0x0002_0017, 10, &[]),
-    pattern32("movt", 0xfbf0_8000, 0xf2c0_0000, 0x0002_0018, 10, &[]),
+    pattern32("movw", 0xfbf0_8000, 0xf240_0000, 0x0002_0017, 10, &[])
+        .lowered()
+        .fixture32(0xf2400000),
+    pattern32("movt", 0xfbf0_8000, 0xf2c0_0000, 0x0002_0018, 10, &[])
+        .lowered()
+        .fixture32(0xf2c00000),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

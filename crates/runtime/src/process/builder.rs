@@ -401,7 +401,6 @@ impl ProcessBuilder {
             address_waits: crate::AddressWaitRegistry::default(),
             execution,
         };
-        process.translate_entry()?;
         Ok(process)
     }
 }

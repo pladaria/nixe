@@ -3,15 +3,20 @@
 use crate::{
     decode::{
         DecodedOpcode,
-        t32::{T32Instruction, control::Instruction as ControlInstruction, normalize},
+        t32::{
+            T32Instruction, control::Instruction as ControlInstruction,
+            integer::Instruction as IntegerInstruction, memory::Instruction as MemoryInstruction,
+            normalize,
+        },
     },
+    exception::ExceptionKind,
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
             FlagOperation, IntegerBinaryKind, IntegerPredicate, OperationKind, ScalarOperation,
             ShiftKind, StateRegister,
         },
-        terminator::ControlTarget,
+        terminator::{ControlTarget, Terminator},
         types::IrType,
         value::{Immediate, Operand, Value},
     },
@@ -19,7 +24,7 @@ use crate::{
     state::a32::{Cpsr, ItState},
 };
 
-use super::block::{LiftOutcome, conditional_terminator};
+use super::{aarch32, block::LiftOutcome};
 
 pub(crate) fn lift(
     builder: &mut IrBuilder,
@@ -32,21 +37,224 @@ fn lift_inner(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<LiftOutcome, BuildError> {
-    match normalize(&decoded.instruction, decoded.encoding) {
-        T32Instruction::Control(ControlInstruction::It {
-            first_condition,
-            mask,
-        }) => lift_it(builder, decoded, first_condition, mask),
-        T32Instruction::Control(ControlInstruction::Nop) => {
-            advance_it_state(builder, decoded.location)?;
-            Ok(LiftOutcome::Continue)
-        }
-        T32Instruction::Control(ControlInstruction::Branch {
-            condition: None,
-            displacement,
-        }) => lift_branch(builder, decoded, displacement),
-        _ => Ok(LiftOutcome::Interpret(decoded.instruction.coverage_id())),
+    let instruction = normalize(&decoded.instruction, decoded.encoding);
+    if let T32Instruction::Control(ControlInstruction::It {
+        first_condition,
+        mask,
+    }) = instruction
+    {
+        return lift_it(builder, decoded, first_condition, mask);
     }
+    let predicate = current_it_condition(builder, decoded.location)?;
+    let fallthrough = ControlTarget::Direct {
+        pc: decoded
+            .location
+            .pc
+            .wrapping_offset(i64::from(decoded.encoding.size().bytes())),
+        execution_state: ExecutionState::T32,
+    };
+    match instruction {
+        T32Instruction::Control(ControlInstruction::It { .. }) => {
+            unreachable!("IT was handled before ordinary predication")
+        }
+        T32Instruction::Control(instruction) => {
+            lift_control(builder, decoded, predicate, fallthrough, instruction)
+        }
+        T32Instruction::Integer(IntegerInstruction::DataProcessing(instruction)) => {
+            aarch32::lift_data_processing(
+                builder,
+                decoded.location,
+                predicate,
+                instruction,
+                fallthrough,
+                true,
+            )
+        }
+        T32Instruction::Integer(IntegerInstruction::Multiply(instruction)) => {
+            aarch32::lift_multiply(
+                builder,
+                decoded.location,
+                predicate,
+                instruction,
+                fallthrough,
+                true,
+            )
+        }
+        T32Instruction::Integer(IntegerInstruction::MoveWide { rd, immediate, top }) => {
+            aarch32::lift_move_wide(builder, decoded.location, predicate, rd, immediate, top)
+        }
+        T32Instruction::Memory(MemoryInstruction::Single(transfer)) => {
+            aarch32::lift_single_transfer(
+                builder,
+                decoded.location,
+                predicate,
+                transfer,
+                fallthrough,
+            )
+        }
+        T32Instruction::Memory(MemoryInstruction::Multiple(transfer)) => {
+            aarch32::lift_multiple_transfer(
+                builder,
+                decoded.location,
+                predicate,
+                transfer,
+                fallthrough,
+            )
+        }
+    }
+}
+
+fn lift_control(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    mut predicate: Operand,
+    fallthrough: ControlTarget,
+    instruction: ControlInstruction,
+) -> Result<LiftOutcome, BuildError> {
+    let source = decoded.location;
+    Ok(match instruction {
+        ControlInstruction::Nop => LiftOutcome::Continue,
+        ControlInstruction::Hint { .. } => {
+            unreachable!("recognized-unimplemented T32 hints never reach the lifter")
+        }
+        ControlInstruction::It { .. } => unreachable!("IT was handled before predication"),
+        ControlInstruction::Branch {
+            condition,
+            displacement,
+        } => {
+            if let Some(condition) = condition {
+                let branch_condition = evaluate_encoded_condition(builder, source, condition)?;
+                predicate = emit_one(
+                    builder,
+                    source,
+                    IrType::I1,
+                    OperationKind::Scalar(ScalarOperation::Binary {
+                        kind: IntegerBinaryKind::And,
+                        lhs: predicate,
+                        rhs: branch_condition,
+                    }),
+                )?
+                .into();
+            }
+            let target = ControlTarget::Direct {
+                pc: nixe_memory::GuestVirtualAddress::new(u64::from(
+                    (source.pc.get() as u32)
+                        .wrapping_add(4)
+                        .wrapping_add_signed(displacement),
+                )),
+                execution_state: ExecutionState::T32,
+            };
+            LiftOutcome::Terminate(Terminator::Conditional {
+                condition: predicate,
+                taken: target,
+                fallthrough,
+            })
+        }
+        ControlInstruction::Exchange { link, rm } => {
+            if link {
+                let _ = aarch32::write_register(
+                    builder,
+                    source,
+                    14,
+                    Immediate::I32((source.pc.get().wrapping_add(2) as u32) | 1).into(),
+                    predicate,
+                )?;
+            }
+            let bits = aarch32::read_register(builder, source, rm, false)?;
+            let address = emit_one(
+                builder,
+                source,
+                IrType::Address,
+                OperationKind::Address(crate::ir::op::AddressOperation::FromInteger {
+                    value: bits,
+                    width: crate::ir::op::GuestAddressWidth::Bits32,
+                }),
+            )?;
+            let target = ControlTarget::A32Interworking {
+                address: address.into(),
+            };
+            if link {
+                LiftOutcome::Terminate(Terminator::ConditionalCall {
+                    condition: predicate,
+                    target,
+                    fallthrough,
+                    return_address: source.pc.wrapping_offset(2),
+                })
+            } else {
+                LiftOutcome::Terminate(Terminator::Conditional {
+                    condition: predicate,
+                    taken: target,
+                    fallthrough,
+                })
+            }
+        }
+        ControlInstruction::BranchLink { displacement } => {
+            let return_address = source.pc.wrapping_offset(4);
+            let _ = aarch32::write_register(
+                builder,
+                source,
+                14,
+                Immediate::I32((return_address.get() as u32) | 1).into(),
+                predicate,
+            )?;
+            let target = ControlTarget::Direct {
+                pc: nixe_memory::GuestVirtualAddress::new(u64::from(
+                    (source.pc.get() as u32)
+                        .wrapping_add(4)
+                        .wrapping_add_signed(displacement),
+                )),
+                execution_state: ExecutionState::T32,
+            };
+            LiftOutcome::Terminate(Terminator::ConditionalCall {
+                condition: predicate,
+                target,
+                fallthrough,
+                return_address,
+            })
+        }
+        ControlInstruction::Svc { immediate } => {
+            LiftOutcome::Terminate(Terminator::ConditionalException {
+                condition: predicate,
+                source,
+                kind: ExceptionKind::SupervisorCall,
+                syndrome: Some(u64::from(immediate)),
+                fallthrough,
+            })
+        }
+        ControlInstruction::Breakpoint { immediate } => {
+            LiftOutcome::Terminate(Terminator::ConditionalException {
+                condition: predicate,
+                source,
+                kind: ExceptionKind::Breakpoint,
+                syndrome: Some(u64::from(immediate)),
+                fallthrough,
+            })
+        }
+    })
+}
+
+fn evaluate_encoded_condition(
+    builder: &mut IrBuilder,
+    source: LocationDescriptor,
+    condition: u8,
+) -> Result<Operand, BuildError> {
+    let cpsr = read_cpsr(builder, source)?;
+    let flags = emit_one(
+        builder,
+        source,
+        IrType::Flags,
+        OperationKind::Flags(FlagOperation::FromPacked { value: cpsr.into() }),
+    )?;
+    Ok(emit_one(
+        builder,
+        source,
+        IrType::I1,
+        OperationKind::Flags(FlagOperation::Evaluate {
+            flags: flags.into(),
+            condition: crate::ir::op::Condition::from_encoding(condition),
+        }),
+    )?
+    .into())
 }
 
 fn lift_it(
@@ -55,9 +263,8 @@ fn lift_it(
     first_condition: u8,
     mask: u8,
 ) -> Result<LiftOutcome, BuildError> {
-    let Some(it_state) = ItState::from_encoding(first_condition, mask) else {
-        return Ok(LiftOutcome::Interpret(decoded.instruction.coverage_id()));
-    };
+    let it_state = ItState::from_encoding(first_condition, mask)
+        .expect("allocation validation rejects reserved IT encodings");
 
     let cpsr = read_cpsr(builder, decoded.location)?;
     let packed = pack_it_state(
@@ -68,31 +275,6 @@ fn lift_it(
     )?;
     write_cpsr(builder, decoded.location, packed.into())?;
     Ok(LiftOutcome::Continue)
-}
-
-fn lift_branch(
-    builder: &mut IrBuilder,
-    decoded: &DecodedInstruction<DecodedOpcode>,
-    displacement: i32,
-) -> Result<LiftOutcome, BuildError> {
-    let target = ControlTarget::Direct {
-        pc: nixe_memory::GuestVirtualAddress::new(u64::from(
-            (decoded.location.pc.get() as u32)
-                .wrapping_add(4)
-                .wrapping_add_signed(displacement),
-        )),
-        execution_state: ExecutionState::T32,
-    };
-    let condition = current_it_condition(builder, decoded.location)?;
-    let fallthrough = ControlTarget::Direct {
-        pc: decoded.location.pc.wrapping_offset(2),
-        execution_state: ExecutionState::T32,
-    };
-    Ok(LiftOutcome::Terminate(conditional_terminator(
-        condition,
-        target,
-        fallthrough,
-    )))
 }
 
 /// Returns the current IT predicate and advances ITSTATE before any observable
@@ -152,14 +334,6 @@ fn current_it_condition(
     let packed = pack_it_state(builder, source, cpsr.into(), advanced.into())?;
     write_cpsr(builder, source, packed.into())?;
     Ok(predicate.into())
-}
-
-fn advance_it_state(builder: &mut IrBuilder, source: LocationDescriptor) -> Result<(), BuildError> {
-    let cpsr = read_cpsr(builder, source)?;
-    let it_state = unpack_it_state(builder, source, cpsr.into())?;
-    let advanced = advance_it_value(builder, source, it_state.into())?;
-    let packed = pack_it_state(builder, source, cpsr.into(), advanced.into())?;
-    write_cpsr(builder, source, packed.into())
 }
 
 fn advance_it_value(

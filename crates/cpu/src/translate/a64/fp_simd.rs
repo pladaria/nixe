@@ -20,15 +20,9 @@ pub(super) fn lift(
     match instruction {
         FpSimdInstruction::DuplicateGeneral(_)
         | FpSimdInstruction::DuplicateElement(_)
-        | FpSimdInstruction::MemoryPair(_)
         | FpSimdInstruction::ModifiedImmediate(_)
-        | FpSimdInstruction::UnsignedMoveToGeneral(_)
         | FpSimdInstruction::InsertElement(_)
         | FpSimdInstruction::InsertGeneral(_)
-        | FpSimdInstruction::MemoryMultipleStructures(_)
-        | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
-        | FpSimdInstruction::MemorySingleStructure(_)
-        | FpSimdInstruction::MemorySingleStructurePostIndex(_)
         | FpSimdInstruction::PermuteTwoSource(_)
         | FpSimdInstruction::Extract(_)
         | FpSimdInstruction::ExtractNarrow(_)
@@ -56,17 +50,23 @@ pub(super) fn lift(
         | FpSimdInstruction::ScalarFloatFusedMultiplyAdd(_)
         | FpSimdInstruction::ScalarFloatSquareRoot(_)
         | FpSimdInstruction::ScalarFloatConditionalSelect(_)
-        | FpSimdInstruction::ConditionalCompare(_) => Ok(interpret(decoded)),
-        FpSimdInstruction::ScalarAbsolute(_) | FpSimdInstruction::ScalarNegate(_) => {
-            Ok(interpret(decoded))
-        }
-        FpSimdInstruction::ShiftRightNarrow(_)
+        | FpSimdInstruction::ScalarAbsolute(_)
+        | FpSimdInstruction::ScalarNegate(_)
+        | FpSimdInstruction::ShiftRightNarrow(_)
         | FpSimdInstruction::ScalarShiftRightImmediate(_)
         | FpSimdInstruction::VectorShiftRightImmediate(_)
         | FpSimdInstruction::ScalarShiftLeftImmediate(_)
-        | FpSimdInstruction::VectorShiftLeftImmediate(_) => Ok(interpret(decoded)),
-        FpSimdInstruction::CountBits(_) => Ok(interpret(decoded)),
-        FpSimdInstruction::AddAcrossVector(_) => Ok(interpret(decoded)),
+        | FpSimdInstruction::VectorShiftLeftImmediate(_)
+        | FpSimdInstruction::CountBits(_)
+        | FpSimdInstruction::AddAcrossVector(_) => {
+            lift_semantic_vector_helper(builder, decoded, fields, instruction)
+        }
+        FpSimdInstruction::ConditionalCompare(_) => {
+            lift_semantic_compare_helper(builder, decoded, fields)
+        }
+        FpSimdInstruction::UnsignedMoveToGeneral(_) => {
+            lift_semantic_general_helper(builder, decoded, fields)
+        }
         FpSimdInstruction::Bitwise(_)
         | FpSimdInstruction::Integer(_)
         | FpSimdInstruction::ScalarTwoSource(_)
@@ -81,6 +81,13 @@ pub(super) fn lift(
         | FpSimdInstruction::MoveFromGeneral(_) => {
             lift_fp_conversion(builder, decoded, fields, instruction)
         }
+        FpSimdInstruction::MemoryPair(_)
+        | FpSimdInstruction::MemoryMultipleStructures(_)
+        | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+        | FpSimdInstruction::MemorySingleStructure(_)
+        | FpSimdInstruction::MemorySingleStructurePostIndex(_) => {
+            lift_fp_simd_complex_memory(builder, decoded, fields, instruction)
+        }
         FpSimdInstruction::MemoryUnsigned(_)
         | FpSimdInstruction::MemoryUnscaled(_)
         | FpSimdInstruction::MemoryPostIndex(_)
@@ -90,6 +97,297 @@ pub(super) fn lift(
             lift_fp_simd_memory(builder, decoded, fields, instruction)
         }
     }
+}
+
+fn lift_fp_simd_complex_memory(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    fields: FpSimdOperands,
+    operation: FpSimdInstruction,
+) -> Result<LiftOutcome, BuildError> {
+    let source = decoded.location;
+    let base = memory::base_address(builder, source, fields.rn)?;
+    let pair = matches!(operation, FpSimdInstruction::MemoryPair(_));
+    let post_index = matches!(
+        operation,
+        FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+            | FpSimdInstruction::MemorySingleStructurePostIndex(_)
+    );
+    let offset_register = if !pair && post_index && fields.rm != 31 {
+        read_gpr(builder, source, fields.rm, IrType::I64, Register31::Zero)?
+    } else {
+        Immediate::I64(0).into()
+    };
+    let register_count = if pair { 2 } else { 4 };
+    let writeback = match operation {
+        FpSimdInstruction::MemoryPair(_) => matches!(fields.mode, 1 | 3),
+        FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+        | FpSimdInstruction::MemorySingleStructurePostIndex(_) => true,
+        _ => false,
+    };
+    let updated_address = if writeback {
+        let offset = if pair {
+            let bytes = match fields.size {
+                0 => MemoryAccessSize::Word.bytes(),
+                1 => MemoryAccessSize::Doubleword.bytes(),
+                2 => MemoryAccessSize::Quadword.bytes(),
+                _ => return Ok(unsupported(decoded)),
+            };
+            Immediate::I64((sign_extend(u64::from(fields.immediate_7), 7) * bytes as i64) as u64)
+                .into()
+        } else if fields.rm != 31 {
+            offset_register
+        } else if matches!(
+            operation,
+            FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+        ) {
+            let count = match fields.structure_opcode {
+                0b0010 => 4,
+                0b0110 => 3,
+                0b1010 => 2,
+                0b0111 => 1,
+                _ => return Ok(unsupported(decoded)),
+            };
+            let bytes = if fields.vector_128 { 16 } else { 8 };
+            Immediate::I64(count * bytes).into()
+        } else {
+            let bytes = match fields.structure_opcode >> 1 {
+                0 => 1,
+                2 => 2,
+                4 if fields.element_size == 0 => 4,
+                4 => 8,
+                _ => return Ok(unsupported(decoded)),
+            };
+            Immediate::I64(bytes).into()
+        };
+        Some(guest_address_offset(builder, source, base, offset)?)
+    } else {
+        None
+    };
+    let mut arguments = Vec::with_capacity(register_count + 3);
+    arguments.push(base);
+    arguments.push(offset_register);
+    for offset in 0..register_count {
+        let register = if pair && offset == 1 {
+            fields.rt2
+        } else {
+            fields.rd.wrapping_add(offset as u8) & 31
+        };
+        arguments.push(vector_read(builder, source, register)?);
+    }
+    arguments.push(Immediate::I32(fields.helper_token.helper_abi_value()).into());
+
+    let mut result_types = Vec::with_capacity(if fields.load { register_count } else { 0 });
+    if fields.load {
+        result_types.resize(register_count, IrType::V128);
+    }
+    let results = helper(
+        builder,
+        source,
+        if pair {
+            "a64.simd.pair-memory"
+        } else {
+            "a64.simd.structure-memory"
+        },
+        arguments,
+        &result_types,
+        OperationEffects::new(
+            EffectSet::HELPER.union(if fields.load {
+                EffectSet::READ_MEMORY
+            } else {
+                EffectSet::WRITE_MEMORY
+            }),
+            true,
+        ),
+    )?;
+    if fields.load {
+        for (offset, result) in results.iter().take(register_count).enumerate() {
+            let register = if pair && offset == 1 {
+                fields.rt2
+            } else {
+                fields.rd.wrapping_add(offset as u8) & 31
+            };
+            vector_write(builder, source, register, (*result).into())?;
+        }
+    }
+
+    if let Some(updated_address) = updated_address {
+        let updated = guest_address_to_integer(builder, source, updated_address)?;
+        write_gpr(
+            builder,
+            source,
+            fields.rn,
+            updated,
+            Register31::StackPointer,
+        )?;
+    }
+    Ok(LiftOutcome::Continue)
+}
+
+fn lift_semantic_vector_helper(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    fields: FpSimdOperands,
+    instruction: FpSimdInstruction,
+) -> Result<LiftOutcome, BuildError> {
+    let fp = matches!(
+        instruction,
+        FpSimdInstruction::VectorSignedIntToFloat(_)
+            | FpSimdInstruction::VectorUnsignedIntToFloat(_)
+            | FpSimdInstruction::ScalarVectorSignedIntToFloat(_)
+            | FpSimdInstruction::ScalarVectorUnsignedIntToFloat(_)
+            | FpSimdInstruction::VectorFloatDivide(_)
+            | FpSimdInstruction::VectorFloatImmediate(_)
+            | FpSimdInstruction::VectorFloatAbsolute(_)
+            | FpSimdInstruction::VectorFloatNegate(_)
+            | FpSimdInstruction::ScalarFloatImmediate(_)
+            | FpSimdInstruction::ScalarFloatConvert(_)
+            | FpSimdInstruction::ScalarFloatDivide(_)
+            | FpSimdInstruction::ScalarFloatRound(_)
+            | FpSimdInstruction::ScalarFloatAdd(_)
+            | FpSimdInstruction::ScalarFloatMultiply(_)
+            | FpSimdInstruction::ScalarFloatFusedMultiplyAdd(_)
+            | FpSimdInstruction::ScalarFloatSquareRoot(_)
+            | FpSimdInstruction::ScalarFloatConditionalSelect(_)
+    );
+    let source = decoded.location;
+    let fpcr = emit_one(
+        builder,
+        source,
+        IrType::I32,
+        OperationKind::ReadState(StateRegister::A64Fpcr),
+    )?;
+    let fpsr = emit_one(
+        builder,
+        source,
+        IrType::I32,
+        OperationKind::ReadState(StateRegister::A64Fpsr),
+    )?;
+    let rn = vector_read(builder, source, fields.rn)?;
+    let rm = vector_read(builder, source, fields.rm)?;
+    let ra = vector_read(builder, source, fields.ra)?;
+    let rd = vector_read(builder, source, fields.rd)?;
+    let general_rn = read_gpr(builder, source, fields.rn, IrType::I64, Register31::Zero)?;
+    let results = helper(
+        builder,
+        source,
+        "a64.fp-simd.semantic-vector",
+        vec![
+            rn,
+            rm,
+            ra,
+            rd,
+            general_rn,
+            fpcr.into(),
+            fpsr.into(),
+            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+        ],
+        &[IrType::V128, IrType::I32],
+        OperationEffects::new(
+            if fp {
+                EffectSet::HELPER
+                    .union(EffectSet::READ_FPCR)
+                    .union(EffectSet::WRITE_FPSR)
+            } else {
+                EffectSet::HELPER
+            },
+            fp,
+        ),
+    )?;
+    vector_write(builder, source, fields.rd, results[0].into())?;
+    if fp {
+        builder.emit(
+            source,
+            &[],
+            OperationKind::WriteState {
+                register: StateRegister::A64Fpsr,
+                value: results[1].into(),
+            },
+        )?;
+    }
+    Ok(LiftOutcome::Continue)
+}
+
+fn lift_semantic_compare_helper(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    fields: FpSimdOperands,
+) -> Result<LiftOutcome, BuildError> {
+    let source = decoded.location;
+    let fpcr = emit_one(
+        builder,
+        source,
+        IrType::I32,
+        OperationKind::ReadState(StateRegister::A64Fpcr),
+    )?;
+    let fpsr = emit_one(
+        builder,
+        source,
+        IrType::I32,
+        OperationKind::ReadState(StateRegister::A64Fpsr),
+    )?;
+    let rn = vector_read(builder, source, fields.rn)?;
+    let rm = vector_read(builder, source, fields.rm)?;
+    let results = helper(
+        builder,
+        source,
+        "a64.fp.semantic-conditional-compare",
+        vec![
+            rn,
+            rm,
+            fpcr.into(),
+            fpsr.into(),
+            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+        ],
+        &[IrType::Flags, IrType::I32],
+        OperationEffects::new(
+            EffectSet::HELPER
+                .union(EffectSet::READ_FPCR)
+                .union(EffectSet::WRITE_FPSR),
+            true,
+        ),
+    )?;
+    write_flags(builder, source, results[0].into())?;
+    builder.emit(
+        source,
+        &[],
+        OperationKind::WriteState {
+            register: StateRegister::A64Fpsr,
+            value: results[1].into(),
+        },
+    )?;
+    Ok(LiftOutcome::Continue)
+}
+
+fn lift_semantic_general_helper(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    fields: FpSimdOperands,
+) -> Result<LiftOutcome, BuildError> {
+    let rn = vector_read(builder, decoded.location, fields.rn)?;
+    let result = helper(
+        builder,
+        decoded.location,
+        "a64.simd.unsigned-move-to-general",
+        vec![
+            rn,
+            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+        ],
+        &[if fields.vector_128 {
+            IrType::I64
+        } else {
+            IrType::I32
+        }],
+        OperationEffects::new(EffectSet::HELPER, false),
+    )?[0];
+    write_gpr(
+        builder,
+        decoded.location,
+        fields.rd,
+        result.into(),
+        Register31::Zero,
+    )?;
+    Ok(LiftOutcome::Continue)
 }
 
 fn vector_read(
@@ -234,7 +532,7 @@ fn lift_fp_conversion(
     operation: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
     if u32::from(fields.opc) > 1 {
-        return Ok(interpret(decoded));
+        return Ok(unsupported(decoded));
     }
     let width = if fields.size & 2 != 0 {
         IrType::I64
@@ -378,7 +676,7 @@ fn lift_fp_simd_memory(
             0 => MemoryAccessSize::Word,
             1 => MemoryAccessSize::Doubleword,
             2 => MemoryAccessSize::Quadword,
-            _ => return Ok(interpret(decoded)),
+            _ => return Ok(unsupported(decoded)),
         }
     } else if fields.quad {
         MemoryAccessSize::Quadword
@@ -398,7 +696,7 @@ fn lift_fp_simd_memory(
         if matches!(operation, FpSimdInstruction::MemoryRegister(_)) {
             let option = u32::from(fields.option);
             if option & 2 == 0 {
-                return Ok(interpret(decoded));
+                return Ok(unsupported(decoded));
             }
             let raw_offset = read_gpr(
                 builder,

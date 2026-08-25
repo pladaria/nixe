@@ -28,6 +28,41 @@ use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcom
 
 type MemoryStep = Result<(), DataAccessFault>;
 
+#[derive(Clone, Copy)]
+pub(crate) enum Binary32Operation {
+    Add,
+    Subtract,
+    Multiply,
+}
+
+pub(crate) fn binary32(
+    operation: Binary32Operation,
+    lhs: u32,
+    rhs: u32,
+    control: u32,
+) -> (u32, FpStatus) {
+    let outcome = match operation {
+        Binary32Operation::Add => add_ieee_lane(
+            u64::from(lhs),
+            u64::from(rhs),
+            FpFormat::Binary32,
+            control,
+            false,
+        ),
+        Binary32Operation::Subtract => add_ieee_lane(
+            u64::from(lhs),
+            u64::from(rhs),
+            FpFormat::Binary32,
+            control,
+            true,
+        ),
+        Binary32Operation::Multiply => {
+            multiply_ieee_lane(u64::from(lhs), u64::from(rhs), FpFormat::Binary32, control)
+        }
+    };
+    (outcome.bits as u32, outcome.status)
+}
+
 pub(super) fn execute(
     context: InterpreterContext<'_>,
     state: &mut A64State,
@@ -2161,25 +2196,38 @@ fn scalar_float_add(
     } else {
         u64::MAX
     };
-    let mut lhs = DecodedFloat::new(
-        state
-            .vector(fields.rn)
-            .expect("normalized scalar addition first operand") as u64
-            & mask,
-        format,
-    );
-    let mut rhs = DecodedFloat::new(
-        state
-            .vector(fields.rm)
-            .expect("normalized scalar addition second operand") as u64
-            & mask,
-        format,
-    );
-    if matches!(operation, FloatAddOperation::Subtract) {
+    let lhs = state
+        .vector(fields.rn)
+        .expect("normalized scalar addition first operand") as u64
+        & mask;
+    let rhs = state
+        .vector(fields.rm)
+        .expect("normalized scalar addition second operand") as u64
+        & mask;
+    add_ieee_lane(
+        lhs,
+        rhs,
+        fp_format,
+        state.fpcr(),
+        matches!(operation, FloatAddOperation::Subtract),
+    )
+}
+
+fn add_ieee_lane(
+    lhs_bits: u64,
+    rhs_bits: u64,
+    fp_format: FpFormat,
+    fpcr: u32,
+    subtract: bool,
+) -> FpLaneOutcome {
+    let format = BinaryFormat::new(fp_format);
+    let mut lhs = DecodedFloat::new(lhs_bits, format);
+    let mut rhs = DecodedFloat::new(rhs_bits, format);
+    if subtract {
         rhs.bits ^= format.sign_mask();
         rhs.sign = !rhs.sign;
     }
-    let control = FpAddControl::from_fpcr(state.fpcr());
+    let control = FpAddControl::from_fpcr(fpcr);
     let mut status = FpStatus::default();
 
     if lhs.is_nan(format) || rhs.is_nan(format) {
@@ -2975,7 +3023,7 @@ fn merge_fp_status(destination: &mut FpStatus, source: FpStatus) {
     destination.input_denormal |= source.input_denormal;
 }
 
-fn fp_status_bits(status: FpStatus) -> u32 {
+pub(crate) fn fp_status_bits(status: FpStatus) -> u32 {
     u32::from(status.invalid_operation)
         | (u32::from(status.divide_by_zero) << 1)
         | (u32::from(status.overflow) << 2)
@@ -2984,7 +3032,7 @@ fn fp_status_bits(status: FpStatus) -> u32 {
         | (u32::from(status.input_denormal) << 7)
 }
 
-fn fp_status_traps(status: FpStatus, fpcr: u32) -> bool {
+pub(crate) fn fp_status_traps(status: FpStatus, fpcr: u32) -> bool {
     let status = fp_status_bits(status);
     let enables = ((fpcr >> 8) & 0x1f) | (((fpcr >> 15) & 1) << 7);
     status & enables != 0

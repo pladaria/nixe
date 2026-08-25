@@ -86,7 +86,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         194,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .recognized_unimplemented(),
     pattern(
         "drps",
         u32::MAX,
@@ -95,7 +96,8 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         194,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .recognized_unimplemented(),
     pattern(
         "b.cond",
         0xff00_0010,

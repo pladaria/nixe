@@ -2,23 +2,28 @@
 
 use libfuzzer_sys::fuzz_target;
 use nixe_cpu::{
-    address::{CodeGeneration, GuestPhysicalPageId, GuestVirtualAddress},
+    exception::ExceptionKind,
     ir::{
-        block::{BlockExit, BlockExitKind, BlockMetadata, InstructionSource, IrBlock},
+        block::{BlockId, BlockMetadata, InstructionSource, IrBlock},
         op::{
             IntegerBinaryKind, IrOperation, OperationEffects, OperationKind, OperationResults,
             ScalarOperation, StateRegister,
         },
-        terminator::{ControlTarget, ExceptionKind, Terminator},
+        region::{
+            IrRegion, RegionEntry, RegionExit, RegionExitKind, RegionMetadata, RegionSafepoint,
+            RegionSafepointKind,
+        },
+        terminator::{ControlTarget, Terminator},
         types::IrType,
         value::{Immediate, Operand, Value, ValueId},
-        verify::verify_block,
+        verify::verify_region,
     },
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::{CodeDependencies, CodePageDependency},
     profile::GuestCpuProfile,
     state::a64::A64GeneralRegister,
 };
+use nixe_memory::{ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
 
 const MAX_OPERATIONS: usize = 64;
 const MAX_SOURCES: usize = 8;
@@ -40,7 +45,8 @@ fuzz_target!(|data: &[u8]| {
     );
     let dependency = CodePageDependency {
         page: GuestPhysicalPageId::new(1),
-        generation: CodeGeneration::new(u64::from(header[0])),
+        generation: ContentGeneration::new(u64::from(header[0])),
+        mapping_generation: MappingGeneration::new(u64::from(header[0])),
     };
     let source_count = usize::from(header[1]) % (MAX_SOURCES + 1);
     let mut sources = Vec::with_capacity(source_count);
@@ -130,9 +136,10 @@ fuzz_target!(|data: &[u8]| {
     let exits = if header[5] & 1 == 0 {
         Vec::new()
     } else {
-        vec![BlockExit {
-            kind: BlockExitKind::Direct,
-            target: Some(GuestVirtualAddress::new(0x1000 + source_count as u64 * 4)),
+        vec![RegionExit {
+            block: BlockId::new(0),
+            kind: RegionExitKind::Direct,
+            target: Some(direct_target),
         }]
     };
     let metadata = BlockMetadata::new(
@@ -147,16 +154,37 @@ fuzz_target!(|data: &[u8]| {
         } else {
             u32::from(header[7])
         },
-        exits,
-        if source_count == 0 {
-            Vec::new()
-        } else {
-            vec![dependency]
-        },
         sources,
     );
     let block = IrBlock::new(metadata, operations, terminator);
-    if let Err(error) = verify_block(&block) {
+    let region = IrRegion::new(
+        RegionMetadata {
+            start,
+            guest_byte_count: block.metadata.guest_byte_count,
+            guest_instruction_count: block.metadata.guest_instruction_count,
+            ir_operation_count: block.operations.len() as u32,
+            entries: vec![RegionEntry {
+                location: start,
+                block: BlockId::new(0),
+            }]
+            .into_boxed_slice(),
+            exits: exits.into_boxed_slice(),
+            code_dependencies: if source_count == 0 {
+                Vec::new()
+            } else {
+                vec![dependency]
+            }
+            .into_boxed_slice(),
+            safepoints: vec![RegionSafepoint {
+                block: BlockId::new(0),
+                target: None,
+                kind: RegionSafepointKind::Entry,
+            }]
+            .into_boxed_slice(),
+        },
+        vec![block],
+    );
+    if let Err(error) = verify_region(&region) {
         assert!(error.to_string().len() <= 4_096);
     }
 });

@@ -1,13 +1,28 @@
 //! Manually constructible typed IR blocks and translation metadata.
 
-use nixe_memory::GuestVirtualAddress;
-
 use crate::{
     location::{InstructionEncoding, LocationDescriptor},
-    memory::{CodeDependencies, CodePageDependency},
+    memory::CodeDependencies,
 };
 
 use super::{op::IrOperation, terminator::Terminator};
+
+/// Stable identity of one basic block inside a formed IR region.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct BlockId(u32);
+
+impl BlockId {
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 
 /// Source instruction represented in a block.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -42,40 +57,6 @@ impl InstructionSource {
         self.disassembly = Some(disassembly.into());
         self
     }
-}
-
-/// Semantic class of an exit recorded in block metadata.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BlockExitKind {
-    Direct,
-    ConditionalTaken,
-    ConditionalFallthrough,
-    Indirect,
-    Call,
-    Return,
-    Exception,
-    Interpreter,
-    UnsupportedInstruction,
-    Stop,
-}
-
-/// One guest or runtime exit recorded for code-cache and diagnostics use.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BlockExit {
-    /// Semantic exit classification.
-    pub kind: BlockExitKind,
-    /// Guest PC when statically known; indirect exits use `None`.
-    pub target: Option<GuestVirtualAddress>,
-}
-
-/// JIT-visible dispatch budget and safepoint annotation.
-///
-/// JIT lowering polls at the block boundary and charges the completed guest
-/// instruction count. The frontend records policy only; it does not access a
-/// scheduler or vCPU budget directly.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BudgetSafepoint {
-    pub guest_instruction_cost: u32,
 }
 
 /// Exact frontend policy or semantic event which ended a translated block.
@@ -133,7 +114,7 @@ impl core::fmt::Display for BlockEndReason {
     }
 }
 
-/// Metadata collected while translating one bounded unit.
+/// Metadata collected while translating one basic block in a region.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockMetadata {
     /// Full architectural location of the first instruction.
@@ -142,14 +123,8 @@ pub struct BlockMetadata {
     pub guest_byte_count: u32,
     /// Number of guest instructions represented.
     pub guest_instruction_count: u32,
-    /// Dispatch budget charged when this block executes.
-    pub budget_safepoint: BudgetSafepoint,
     /// Exact reason translation stopped after the recorded sources.
     pub end_reason: BlockEndReason,
-    /// Ordered static exits; indirect and runtime exits remain explicit entries.
-    pub exits: Box<[BlockExit]>,
-    /// Physical code pages and generations observed during translation.
-    pub code_dependencies: Box<[CodePageDependency]>,
     /// Ordered source locations, raw encodings, and fetch provenance.
     pub sources: Box<[InstructionSource]>,
 }
@@ -161,20 +136,13 @@ impl BlockMetadata {
         start: LocationDescriptor,
         guest_byte_count: u32,
         guest_instruction_count: u32,
-        exits: impl Into<Box<[BlockExit]>>,
-        code_dependencies: impl Into<Box<[CodePageDependency]>>,
         sources: impl Into<Box<[InstructionSource]>>,
     ) -> Self {
         Self {
             start,
             guest_byte_count,
             guest_instruction_count,
-            budget_safepoint: BudgetSafepoint {
-                guest_instruction_cost: guest_instruction_count,
-            },
             end_reason: BlockEndReason::ExplicitTerminator,
-            exits: exits.into(),
-            code_dependencies: code_dependencies.into(),
             sources: sources.into(),
         }
     }
@@ -187,11 +155,12 @@ impl BlockMetadata {
     }
 }
 
-/// One typed SSA-like translation unit with exactly one stored terminator.
+/// One typed SSA-like basic block with exactly one stored terminator.
 ///
 /// Frontends should construct this through [`super::builder::IrBuilder`]. The
-/// public representation remains intentionally constructible so verifier
-/// negative tests and external diagnostic tools can inspect malformed IR.
+/// Blocks are nodes of an [`super::region::IrRegion`], not independent JIT
+/// compilation units. The public representation remains constructible so
+/// verifier negative tests and diagnostic tools can inspect malformed IR.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IrBlock {
     pub metadata: BlockMetadata,
@@ -218,21 +187,24 @@ impl IrBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::{ContentGeneration, GuestPhysicalPageId, MappingGeneration};
+    use nixe_memory::{
+        ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    };
 
     use crate::{
+        exception::ExceptionKind,
         ir::{
             op::{
                 ByteOrder, Condition, FlagOperation, IntegerBinaryKind, IrOperation, LaneType,
                 MemoryDescriptor, MemoryOperation, OperationKind, OperationResults,
                 ScalarOperation, VectorArrangement, VectorOperation, Volatility,
             },
-            terminator::{ExceptionKind, StopReason},
+            terminator::StopReason,
             types::IrType,
             value::{Immediate, Value, ValueId},
         },
         location::ExecutionState,
-        memory::{MemoryAccess, MemoryAccessSize},
+        memory::{CodePageDependency, MemoryAccess, MemoryAccessSize},
         profile::CpuProfileId,
     };
 
@@ -249,15 +221,6 @@ mod tests {
             location(0x1000),
             8,
             2,
-            vec![BlockExit {
-                kind: BlockExitKind::Direct,
-                target: Some(GuestVirtualAddress::new(0x1008)),
-            }],
-            vec![CodePageDependency {
-                page: GuestPhysicalPageId::new(5),
-                generation: ContentGeneration::new(9),
-                mapping_generation: MappingGeneration::new(1),
-            }],
             vec![
                 InstructionSource::new(
                     location(0x1000),
@@ -361,7 +324,7 @@ mod tests {
         assert_eq!(block.operations.len(), 5);
         assert_eq!(block.metadata.guest_instruction_count, 2);
         assert_eq!(block.metadata.sources.len(), 2);
-        assert_eq!(block.metadata.code_dependencies.len(), 1);
+        assert_eq!(block.metadata.sources[0].dependencies.iter().count(), 1);
     }
 
     #[test]

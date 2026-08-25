@@ -2,15 +2,16 @@
 
 use core::fmt;
 use nixe_memory::GuestVirtualAddress;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::{
     location::{ExecutionState, InstructionSize, LocationDescriptor},
     memory::MemoryAccessClass,
 };
 
+use super::region::{IrRegion, RegionExit, RegionExitKind, RegionSafepoint, RegionSafepointKind};
 use super::{
-    block::{BlockEndReason, BlockExit, BlockExitKind, IrBlock},
+    block::{BlockEndReason, BlockId, IrBlock},
     op::{
         AddressOperation, AtomicOperation, CacheMaintenanceOperation, ExclusiveOperation,
         FlagOperation, FloatingPointOperation, GuestAddressWidth, IrOperation, LaneType,
@@ -74,8 +75,8 @@ impl fmt::Display for VerificationError {
 
 impl std::error::Error for VerificationError {}
 
-/// Verifies a complete single-block IR unit.
-pub fn verify_block(block: &IrBlock) -> Result<(), VerificationError> {
+/// Verifies one basic block while it is being assembled for a region.
+pub(crate) fn verify_basic_block(block: &IrBlock) -> Result<(), VerificationError> {
     verify_metadata(block)?;
 
     let mut definitions = BTreeMap::new();
@@ -103,7 +104,6 @@ pub fn verify_block(block: &IrBlock) -> Result<(), VerificationError> {
     }
     verify_terminator(&block.terminator, &definitions, block)?;
     verify_end_reason(block)?;
-    verify_exits(block)?;
     Ok(())
 }
 
@@ -116,9 +116,15 @@ fn verify_end_reason(block: &IrBlock) -> Result<(), VerificationError> {
             matches!(block.terminator, Terminator::Conditional { .. })
         }
         BlockEndReason::IndirectBranch => matches!(block.terminator, Terminator::Indirect { .. }),
-        BlockEndReason::Call => matches!(block.terminator, Terminator::Call { .. }),
+        BlockEndReason::Call => matches!(
+            block.terminator,
+            Terminator::Call { .. } | Terminator::ConditionalCall { .. }
+        ),
         BlockEndReason::Return => matches!(block.terminator, Terminator::Return { .. }),
-        BlockEndReason::Exception => matches!(block.terminator, Terminator::Exception { .. }),
+        BlockEndReason::Exception => matches!(
+            block.terminator,
+            Terminator::Exception { .. } | Terminator::ConditionalException { .. }
+        ),
         BlockEndReason::InterpreterFallback => {
             matches!(block.terminator, Terminator::InterpretOne { .. })
         }
@@ -164,11 +170,6 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
             metadata.sources.len()
         )));
     }
-    if metadata.budget_safepoint.guest_instruction_cost != metadata.guest_instruction_count {
-        return Err(VerificationError::metadata(
-            "budget safepoint cost does not match the guest instruction count",
-        ));
-    }
     if metadata.sources[0].location != metadata.start {
         return Err(VerificationError::metadata(
             "the first instruction source does not match the block start",
@@ -177,7 +178,6 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
 
     let mut next_pc = metadata.start.pc;
     let mut byte_count = 0_u32;
-    let mut observed_dependencies = Vec::new();
     let mut generations = BTreeMap::new();
     for (index, source) in metadata.sources.iter().enumerate() {
         if source.location.pc != next_pc {
@@ -237,9 +237,6 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
                     dependency.page
                 )));
             }
-            if !observed_dependencies.contains(&dependency) {
-                observed_dependencies.push(dependency);
-            }
         }
     }
     if byte_count != metadata.guest_byte_count {
@@ -247,22 +244,6 @@ fn verify_metadata(block: &IrBlock) -> Result<(), VerificationError> {
             "guest_byte_count is {}, but source encodings cover {byte_count} bytes",
             metadata.guest_byte_count
         )));
-    }
-    if observed_dependencies.as_slice() != metadata.code_dependencies.as_ref() {
-        return Err(VerificationError::metadata(
-            "block code_dependencies are not the ordered union of per-instruction fetch dependencies",
-        ));
-    }
-
-    let mut unique = BTreeSet::new();
-    if metadata
-        .code_dependencies
-        .iter()
-        .any(|dependency| !unique.insert((dependency.page, dependency.mapping_generation)))
-    {
-        return Err(VerificationError::metadata(
-            "block code_dependencies contain a duplicate physical mapping",
-        ));
     }
     Ok(())
 }
@@ -390,8 +371,8 @@ fn verify_operation_types(index: usize, operation: &IrOperation) -> Result<(), V
             if helper.helper.is_empty() {
                 return Err(error("helper name must not be empty"));
             }
-            if results.len() > 3 {
-                return Err(error("an operation cannot define more than three results"));
+            if results.len() > 4 {
+                return Err(error("an operation cannot define more than four results"));
             }
             Ok(())
         }
@@ -602,6 +583,35 @@ fn verify_memory(
             verify_memory_class(index, descriptor.access.class, descriptor.volatility, false)?;
             expect_results(index, results, &[])
         }
+        MemoryOperation::GuardedLoad {
+            predicate,
+            address,
+            fallback,
+            descriptor,
+        } => {
+            expect_type(index, predicate, IrType::I1, "guarded-load predicate")?;
+            expect_type(index, address, IrType::Address, "guarded-load address")?;
+            expect_type(
+                index,
+                fallback,
+                descriptor.value_type(),
+                "guarded-load fallback",
+            )?;
+            verify_memory_class(index, descriptor.access.class, descriptor.volatility, false)?;
+            expect_results(index, results, &[descriptor.value_type()])
+        }
+        MemoryOperation::GuardedStore {
+            predicate,
+            address,
+            value,
+            descriptor,
+        } => {
+            expect_type(index, predicate, IrType::I1, "guarded-store predicate")?;
+            expect_type(index, address, IrType::Address, "guarded-store address")?;
+            expect_type(index, value, descriptor.value_type(), "guarded-store value")?;
+            verify_memory_class(index, descriptor.access.class, descriptor.volatility, false)?;
+            expect_results(index, results, &[])
+        }
     }
 }
 
@@ -630,6 +640,67 @@ fn verify_exclusive(
                 value,
                 descriptor.value_type(),
                 "exclusive-store value",
+            )?;
+            verify_memory_class(index, descriptor.access.class, descriptor.volatility, true)?;
+            expect_results(index, results, &[IrType::I1])
+        }
+        ExclusiveOperation::GuardedLoad {
+            predicate,
+            address,
+            fallback,
+            descriptor,
+        } => {
+            expect_type(
+                index,
+                predicate,
+                IrType::I1,
+                "guarded exclusive-load predicate",
+            )?;
+            expect_type(
+                index,
+                address,
+                IrType::Address,
+                "guarded exclusive-load address",
+            )?;
+            expect_type(
+                index,
+                fallback,
+                descriptor.value_type(),
+                "guarded exclusive-load fallback",
+            )?;
+            verify_memory_class(index, descriptor.access.class, descriptor.volatility, true)?;
+            expect_results(index, results, &[descriptor.value_type()])
+        }
+        ExclusiveOperation::GuardedStore {
+            predicate,
+            address,
+            value,
+            fallback,
+            descriptor,
+        } => {
+            expect_type(
+                index,
+                predicate,
+                IrType::I1,
+                "guarded exclusive-store predicate",
+            )?;
+            expect_type(
+                index,
+                address,
+                IrType::Address,
+                "guarded exclusive-store address",
+            )?;
+            expect_type(
+                index,
+                value,
+                descriptor.value_type(),
+                "guarded exclusive-store value",
+            )?;
+            expect_type(
+                index,
+                fallback,
+                IrType::I1,
+                "guarded exclusive-store fallback",
             )?;
             verify_memory_class(index, descriptor.access.class, descriptor.volatility, true)?;
             expect_results(index, results, &[IrType::I1])
@@ -1046,11 +1117,44 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
         OperationKind::Memory(operation) => match *operation {
             MemoryOperation::Load { address, .. } => operands.push(address),
             MemoryOperation::Store { address, value, .. } => operands.extend([address, value]),
+            MemoryOperation::GuardedLoad {
+                predicate,
+                address,
+                fallback,
+                ..
+            } => {
+                operands.extend([predicate, address, fallback]);
+            }
+            MemoryOperation::GuardedStore {
+                predicate,
+                address,
+                value,
+                ..
+            } => {
+                operands.extend([predicate, address, value]);
+            }
         },
         OperationKind::CacheMaintenance(operation) => operands.extend(operation.address),
         OperationKind::Exclusive(operation) => match *operation {
             ExclusiveOperation::Load { address, .. } => operands.push(address),
             ExclusiveOperation::Store { address, value, .. } => operands.extend([address, value]),
+            ExclusiveOperation::GuardedLoad {
+                predicate,
+                address,
+                fallback,
+                ..
+            } => {
+                operands.extend([predicate, address, fallback]);
+            }
+            ExclusiveOperation::GuardedStore {
+                predicate,
+                address,
+                value,
+                fallback,
+                ..
+            } => {
+                operands.extend([predicate, address, value, fallback]);
+            }
             ExclusiveOperation::Clear => {}
         },
         OperationKind::Atomic(operation) => match *operation {
@@ -1127,7 +1231,27 @@ fn verify_terminator(
             check_target(taken)?;
             check_target(fallthrough)
         }
+        Terminator::ConditionalCall {
+            condition,
+            target,
+            fallthrough,
+            ..
+        } => {
+            verify_terminator_operand(*condition, definitions, IrType::I1, "call condition")?;
+            check_target(target)?;
+            check_target(fallthrough)
+        }
         Terminator::Call { target, .. } => check_target(target),
+        Terminator::ConditionalException {
+            condition,
+            source,
+            fallthrough,
+            ..
+        } => {
+            verify_terminator_operand(*condition, definitions, IrType::I1, "exception condition")?;
+            verify_terminator_source(*source, block)?;
+            check_target(fallthrough)
+        }
         Terminator::Exception { source, .. } | Terminator::Stop { source, .. } => {
             verify_terminator_source(*source, block)
         }
@@ -1204,48 +1328,344 @@ fn verify_terminator_source(
     Ok(())
 }
 
-fn verify_exits(block: &IrBlock) -> Result<(), VerificationError> {
-    let target_exit = |kind, target: &ControlTarget| BlockExit {
-        kind,
-        target: match target {
-            ControlTarget::Direct { pc, .. } => Some(*pc),
-            ControlTarget::Indirect { .. } | ControlTarget::A32Interworking { .. } => None,
-        },
-    };
-    let expected: Vec<_> = match &block.terminator {
-        Terminator::Direct { target } => vec![target_exit(BlockExitKind::Direct, target)],
-        Terminator::Conditional {
-            taken, fallthrough, ..
-        } => vec![
-            target_exit(BlockExitKind::ConditionalTaken, taken),
-            target_exit(BlockExitKind::ConditionalFallthrough, fallthrough),
-        ],
-        Terminator::Indirect { target } => vec![target_exit(BlockExitKind::Indirect, target)],
-        Terminator::Call { target, .. } => vec![target_exit(BlockExitKind::Call, target)],
-        Terminator::Return { target } => vec![target_exit(BlockExitKind::Return, target)],
-        Terminator::Exception { .. } => vec![BlockExit {
-            kind: BlockExitKind::Exception,
-            target: None,
-        }],
-        Terminator::InterpretOne { .. } => vec![BlockExit {
-            kind: BlockExitKind::Interpreter,
-            target: None,
-        }],
-        Terminator::UnsupportedInstruction { .. } => vec![BlockExit {
-            kind: BlockExitKind::UnsupportedInstruction,
-            target: None,
-        }],
-        Terminator::Stop { .. } => vec![BlockExit {
-            kind: BlockExitKind::Stop,
-            target: None,
-        }],
-    };
-    if block.metadata.exits.as_ref() != expected {
+/// Verifies a complete bounded region, including cross-block metadata.
+pub fn verify_region(region: &IrRegion) -> Result<(), VerificationError> {
+    if region.blocks.is_empty() {
         return Err(VerificationError::metadata(
-            "recorded block exits do not match the terminator",
+            "a region must contain at least one basic block",
+        ));
+    }
+    if region.metadata.start != region.blocks[0].metadata.start {
+        return Err(VerificationError::metadata(
+            "region start does not match block 0",
+        ));
+    }
+
+    let mut starts = Vec::new();
+    let mut guest_bytes = 0_u32;
+    let mut guest_instructions = 0_u32;
+    let mut ir_operations = 0_u32;
+    let mut dependencies = Vec::new();
+    let mut page_generations = BTreeMap::new();
+    for (index, block) in region.blocks.iter().enumerate() {
+        verify_basic_block(block).map_err(|error| VerificationError {
+            context: error.context,
+            message: format!("block {index}: {}", error.message).into(),
+        })?;
+        if starts.contains(&block.metadata.start) {
+            return Err(VerificationError::metadata(format!(
+                "block {index} duplicates a guest entry location"
+            )));
+        }
+        starts.push(block.metadata.start);
+        if block.metadata.start.profile_id != region.metadata.start.profile_id {
+            return Err(VerificationError::metadata(format!(
+                "block {index} changes CPU profile inside a region"
+            )));
+        }
+        guest_bytes = guest_bytes
+            .checked_add(block.metadata.guest_byte_count)
+            .ok_or_else(|| VerificationError::metadata("region guest byte count overflow"))?;
+        guest_instructions = guest_instructions
+            .checked_add(block.metadata.guest_instruction_count)
+            .ok_or_else(|| VerificationError::metadata("region instruction count overflow"))?;
+        ir_operations = ir_operations
+            .checked_add(u32::try_from(block.operations.len()).map_err(|_| {
+                VerificationError::metadata("region operation count does not fit in u32")
+            })?)
+            .ok_or_else(|| VerificationError::metadata("region operation count overflow"))?;
+        for source in &block.metadata.sources {
+            for dependency in source.dependencies.iter() {
+                if let Some(generation) =
+                    page_generations.insert(dependency.page, dependency.generation)
+                    && generation != dependency.generation
+                {
+                    return Err(VerificationError::metadata(format!(
+                        "physical {} appears with conflicting code generations",
+                        dependency.page
+                    )));
+                }
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
+                }
+            }
+        }
+        verify_internal_targets(region, BlockId::new(index as u32), &block.terminator)?;
+        verify_internalized_direct_edges(region, &block.terminator)?;
+    }
+
+    if region.metadata.guest_byte_count != guest_bytes
+        || region.metadata.guest_instruction_count != guest_instructions
+        || region.metadata.ir_operation_count != ir_operations
+    {
+        return Err(VerificationError::metadata(
+            "region aggregate counts do not match its basic blocks",
+        ));
+    }
+    if region.metadata.code_dependencies.as_ref() != dependencies {
+        return Err(VerificationError::metadata(
+            "region code dependencies are not the ordered union of instruction fetch dependencies",
+        ));
+    }
+
+    let expected_entries: Vec<_> = region
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| super::region::RegionEntry {
+            location: block.metadata.start,
+            block: BlockId::new(index as u32),
+        })
+        .collect();
+    if region.metadata.entries.as_ref() != expected_entries {
+        return Err(VerificationError::metadata(
+            "region entries do not expose every basic-block start exactly once",
+        ));
+    }
+    let expected_exits = expected_region_exits(region);
+    if region.metadata.exits.as_ref() != expected_exits {
+        return Err(VerificationError::metadata(
+            "region exits do not match external terminator edges",
+        ));
+    }
+    let expected_safepoints = expected_region_safepoints(region);
+    if region.metadata.safepoints.as_ref() != expected_safepoints {
+        return Err(VerificationError::metadata(
+            "region safepoints do not match entries and backward internal edges",
         ));
     }
     Ok(())
+}
+
+fn verify_internalized_direct_edges(
+    region: &IrRegion,
+    terminator: &Terminator,
+) -> Result<(), VerificationError> {
+    let verify = |target: &ControlTarget| {
+        let ControlTarget::Direct {
+            pc,
+            execution_state,
+        } = target
+        else {
+            return Ok(());
+        };
+        let location =
+            LocationDescriptor::new(*pc, *execution_state, region.metadata.start.profile_id);
+        if region
+            .metadata
+            .entries
+            .iter()
+            .any(|entry| entry.location == location)
+        {
+            Err(VerificationError::terminator(
+                "eligible direct edge to a formed entry was not internalized",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match terminator {
+        Terminator::Direct { target } => verify(target),
+        Terminator::Conditional {
+            taken, fallthrough, ..
+        } => {
+            verify(taken)?;
+            verify(fallthrough)
+        }
+        Terminator::ConditionalCall { fallthrough, .. }
+        | Terminator::ConditionalException { fallthrough, .. } => verify(fallthrough),
+        Terminator::Indirect { .. }
+        | Terminator::Call { .. }
+        | Terminator::Return { .. }
+        | Terminator::Exception { .. }
+        | Terminator::InterpretOne { .. }
+        | Terminator::UnsupportedInstruction { .. }
+        | Terminator::Stop { .. } => Ok(()),
+    }
+}
+
+fn verify_internal_targets(
+    region: &IrRegion,
+    source: BlockId,
+    terminator: &Terminator,
+) -> Result<(), VerificationError> {
+    let verify = |target: &ControlTarget| {
+        let ControlTarget::Internal { block } = target else {
+            return Ok(());
+        };
+        let destination = region.block(*block).ok_or_else(|| {
+            VerificationError::terminator(format!(
+                "block {} targets missing internal block {}",
+                source.index(),
+                block.index()
+            ))
+        })?;
+        if destination.metadata.start.profile_id != region.metadata.start.profile_id {
+            return Err(VerificationError::terminator(
+                "internal edge changes CPU profile",
+            ));
+        }
+        Ok(())
+    };
+    match terminator {
+        Terminator::Direct { target } => verify(target),
+        Terminator::Conditional {
+            taken, fallthrough, ..
+        } => {
+            verify(taken)?;
+            verify(fallthrough)
+        }
+        Terminator::ConditionalCall {
+            target,
+            fallthrough,
+            ..
+        } => {
+            if matches!(target, ControlTarget::Internal { .. }) {
+                return Err(VerificationError::terminator(
+                    "call targets cannot be internal region edges",
+                ));
+            }
+            verify(fallthrough)
+        }
+        Terminator::Indirect { target }
+        | Terminator::Call { target, .. }
+        | Terminator::Return { target } => {
+            if matches!(target, ControlTarget::Internal { .. }) {
+                Err(VerificationError::terminator(
+                    "indirect, call, and return targets cannot be internal region edges",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Terminator::ConditionalException { fallthrough, .. } => verify(fallthrough),
+        Terminator::Exception { .. }
+        | Terminator::InterpretOne { .. }
+        | Terminator::UnsupportedInstruction { .. }
+        | Terminator::Stop { .. } => Ok(()),
+    }
+}
+
+fn expected_region_exits(region: &IrRegion) -> Vec<RegionExit> {
+    let mut exits = Vec::new();
+    for (index, block) in region.blocks.iter().enumerate() {
+        let id = BlockId::new(index as u32);
+        let push_target = |exits: &mut Vec<RegionExit>, kind, target: &ControlTarget| {
+            if !matches!(target, ControlTarget::Internal { .. }) {
+                exits.push(RegionExit {
+                    block: id,
+                    kind,
+                    target: Some(*target),
+                });
+            }
+        };
+        let push_exit = |exits: &mut Vec<RegionExit>, kind| {
+            exits.push(RegionExit {
+                block: id,
+                kind,
+                target: None,
+            });
+        };
+        match &block.terminator {
+            Terminator::Direct { target } => {
+                push_target(&mut exits, RegionExitKind::Direct, target)
+            }
+            Terminator::Conditional {
+                taken, fallthrough, ..
+            } => {
+                push_target(&mut exits, RegionExitKind::ConditionalTaken, taken);
+                push_target(
+                    &mut exits,
+                    RegionExitKind::ConditionalFallthrough,
+                    fallthrough,
+                );
+            }
+            Terminator::ConditionalCall {
+                target,
+                fallthrough,
+                ..
+            } => {
+                push_target(&mut exits, RegionExitKind::Call, target);
+                push_target(
+                    &mut exits,
+                    RegionExitKind::ConditionalFallthrough,
+                    fallthrough,
+                );
+            }
+            Terminator::Indirect { target } => {
+                push_target(&mut exits, RegionExitKind::Indirect, target)
+            }
+            Terminator::Call { target, .. } => {
+                push_target(&mut exits, RegionExitKind::Call, target)
+            }
+            Terminator::Return { target } => {
+                push_target(&mut exits, RegionExitKind::Return, target)
+            }
+            Terminator::Exception { .. } => push_exit(&mut exits, RegionExitKind::Exception),
+            Terminator::ConditionalException { fallthrough, .. } => {
+                push_exit(&mut exits, RegionExitKind::Exception);
+                push_target(
+                    &mut exits,
+                    RegionExitKind::ConditionalFallthrough,
+                    fallthrough,
+                );
+            }
+            Terminator::InterpretOne { .. } => push_exit(&mut exits, RegionExitKind::Interpreter),
+            Terminator::UnsupportedInstruction { .. } => {
+                push_exit(&mut exits, RegionExitKind::UnsupportedInstruction)
+            }
+            Terminator::Stop { .. } => push_exit(&mut exits, RegionExitKind::Stop),
+        }
+    }
+    exits
+}
+
+fn expected_region_safepoints(region: &IrRegion) -> Vec<RegionSafepoint> {
+    let mut safepoints: Vec<_> = region
+        .metadata
+        .entries
+        .iter()
+        .map(|entry| RegionSafepoint {
+            block: entry.block,
+            target: None,
+            kind: RegionSafepointKind::Entry,
+        })
+        .collect();
+    for (index, block) in region.blocks.iter().enumerate() {
+        let source = BlockId::new(index as u32);
+        for target in internal_targets(&block.terminator) {
+            if target <= source {
+                safepoints.push(RegionSafepoint {
+                    block: source,
+                    target: Some(target),
+                    kind: RegionSafepointKind::BackwardEdge,
+                });
+            }
+        }
+    }
+    safepoints
+}
+
+fn internal_targets(terminator: &Terminator) -> Vec<BlockId> {
+    let mut targets = Vec::new();
+    let mut push = |target: &ControlTarget| {
+        if let ControlTarget::Internal { block } = target {
+            targets.push(*block);
+        }
+    };
+    match terminator {
+        Terminator::Direct { target } => push(target),
+        Terminator::Conditional {
+            taken, fallthrough, ..
+        } => {
+            push(taken);
+            push(fallthrough);
+        }
+        Terminator::ConditionalCall { fallthrough, .. }
+        | Terminator::ConditionalException { fallthrough, .. } => push(fallthrough),
+        _ => {}
+    }
+    targets
 }
 
 fn state_register_matches(register: StateRegister, state: ExecutionState) -> bool {
@@ -1374,11 +1794,6 @@ mod tests {
                 location(0x1000),
                 4,
                 1,
-                vec![BlockExit {
-                    kind: BlockExitKind::Direct,
-                    target: Some(GuestVirtualAddress::new(0x1004)),
-                }],
-                vec![dependency()],
                 vec![InstructionSource::new(
                     location(0x1000),
                     InstructionEncoding::from_u32(0xd503_201f),
@@ -1402,7 +1817,7 @@ mod tests {
                 rhs: Immediate::I64(1).into(),
             }),
         );
-        let error = verify_block(&valid_block(vec![operation])).unwrap_err();
+        let error = verify_basic_block(&valid_block(vec![operation])).unwrap_err();
         assert_eq!(error.context, VerificationContext::Operation(0));
         assert!(
             error
@@ -1420,7 +1835,7 @@ mod tests {
             OperationResults::one(Value::new(ValueId::new(0), IrType::I64)),
             OperationKind::Constant(Immediate::I64(2)),
         );
-        let error = verify_block(&valid_block(vec![first, second])).unwrap_err();
+        let error = verify_basic_block(&valid_block(vec![first, second])).unwrap_err();
         assert!(error.to_string().contains("%0 is defined more than once"));
     }
 
@@ -1432,7 +1847,7 @@ mod tests {
             OperationKind::Constant(Immediate::I64(1)),
         );
         assert!(
-            verify_block(&valid_block(vec![wrong_result]))
+            verify_basic_block(&valid_block(vec![wrong_result]))
                 .unwrap_err()
                 .to_string()
                 .contains("expected [I64]")
@@ -1444,7 +1859,7 @@ mod tests {
             OperationKind::ReadState(StateRegister::A32Cpsr),
         );
         assert!(
-            verify_block(&valid_block(vec![wrong_state]))
+            verify_basic_block(&valid_block(vec![wrong_state]))
                 .unwrap_err()
                 .to_string()
                 .contains("not available in A64")
@@ -1462,7 +1877,7 @@ mod tests {
                 execution_state: ExecutionState::A64,
             },
         };
-        let error = verify_block(&block).unwrap_err();
+        let error = verify_basic_block(&block).unwrap_err();
         assert_eq!(error.context, VerificationContext::Terminator);
         assert!(error.to_string().contains("branch condition"));
     }
@@ -1521,30 +1936,21 @@ mod tests {
         ];
         for operation in &mut malformed {
             operation.effects = OperationEffects::new(EffectSet::NONE, false);
-            let error = verify_block(&valid_block(vec![operation.clone()])).unwrap_err();
+            let error = verify_basic_block(&valid_block(vec![operation.clone()])).unwrap_err();
             assert_eq!(error.context, VerificationContext::Operation(0));
             assert!(error.to_string().contains("effect annotation"));
         }
     }
 
     #[test]
-    fn verifier_requires_exact_instruction_byte_and_page_coverage() {
+    fn verifier_requires_exact_instruction_byte_coverage() {
         let mut wrong_bytes = valid_block(Vec::new());
         wrong_bytes.metadata.guest_byte_count = 8;
         assert!(
-            verify_block(&wrong_bytes)
+            verify_basic_block(&wrong_bytes)
                 .unwrap_err()
                 .to_string()
                 .contains("cover 4 bytes")
-        );
-
-        let mut missing_page = valid_block(Vec::new());
-        missing_page.metadata.code_dependencies = Vec::new().into_boxed_slice();
-        assert!(
-            verify_block(&missing_page)
-                .unwrap_err()
-                .to_string()
-                .contains("ordered union")
         );
     }
 
@@ -1553,7 +1959,7 @@ mod tests {
         let mut wrong_branch = valid_block(Vec::new());
         wrong_branch.metadata.end_reason = BlockEndReason::ConditionalBranch;
         assert!(
-            verify_block(&wrong_branch)
+            verify_basic_block(&wrong_branch)
                 .unwrap_err()
                 .to_string()
                 .contains("conditional-branch is inconsistent")
@@ -1567,7 +1973,7 @@ mod tests {
             OperationResults::one(Value::new(ValueId::new(0), IrType::I64)),
             OperationKind::Constant(Immediate::I64(1)),
         );
-        let error = verify_block(&valid_block(vec![operation])).unwrap_err();
+        let error = verify_basic_block(&valid_block(vec![operation])).unwrap_err();
         assert!(
             error
                 .to_string()

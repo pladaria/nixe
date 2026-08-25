@@ -1,7 +1,7 @@
 use crate::decode::InstructionPattern;
 use crate::decode::aarch32::{
-    ExclusiveTransfer, MemoryOffset, MemorySize, MultipleTransfer, SingleTransfer,
-    decode_immediate_shift,
+    AcquireReleaseTransfer, ExclusiveTransfer, MemoryOffset, MemorySize, MultipleTransfer,
+    SingleTransfer, decode_immediate_shift,
 };
 
 use super::{NO_FEATURES, pattern};
@@ -15,7 +15,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe1930f9f),
     pattern(
         "load-store-extra",
         0x0e00_0090,
@@ -24,7 +26,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         10,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe1d000b0),
     pattern(
         "load-store-single",
         0x0c00_0000,
@@ -33,7 +37,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe5900000),
     pattern(
         "load-store-multiple",
         0x0e00_0000,
@@ -42,7 +48,9 @@ pub static PATTERNS: &[InstructionPattern] = &[
         0,
         &[],
         NO_FEATURES,
-    ),
+    )
+    .lowered()
+    .fixture32(0xe8900001),
     pattern(
         "load-store-acquire-release",
         0x0f00_00f0,
@@ -52,7 +60,8 @@ pub static PATTERNS: &[InstructionPattern] = &[
         &[],
         NO_FEATURES,
     )
-    .recognized_unimplemented(),
+    .lowered()
+    .fixture32(0xe1900e8f),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +69,7 @@ pub enum Instruction {
     Single(SingleTransfer),
     Multiple(MultipleTransfer),
     Exclusive(ExclusiveTransfer),
-    AcquireRelease(ExclusiveTransfer),
+    AcquireRelease(AcquireReleaseTransfer),
 }
 
 pub(super) fn normalize(id: u32, bits: u32) -> Instruction {
@@ -77,23 +86,36 @@ pub(super) fn normalize(id: u32, bits: u32) -> Instruction {
         }),
         0x0001_0022 | 0x0001_0024 => {
             let load = bits & (1 << 20) != 0;
-            let transfer = ExclusiveTransfer {
-                load,
-                size: MemorySize::Word,
-                rn: ((bits >> 16) & 0xf) as u8,
-                rt: if load {
-                    ((bits >> 12) & 0xf) as u8
-                } else {
-                    (bits & 0xf) as u8
-                },
-                status: (!load).then_some(((bits >> 12) & 0xf) as u8),
-                acquire: id == 0x0001_0022 && load,
-                release: id == 0x0001_0022 && !load,
-            };
+            let rn = ((bits >> 16) & 0xf) as u8;
             if id == 0x0001_0022 {
-                Instruction::AcquireRelease(transfer)
+                Instruction::AcquireRelease(if load {
+                    AcquireReleaseTransfer::Load {
+                        size: MemorySize::Word,
+                        rn,
+                        rt: ((bits >> 12) & 0xf) as u8,
+                    }
+                } else {
+                    AcquireReleaseTransfer::Store {
+                        size: MemorySize::Word,
+                        rn,
+                        rt: (bits & 0xf) as u8,
+                    }
+                })
             } else {
-                Instruction::Exclusive(transfer)
+                Instruction::Exclusive(if load {
+                    ExclusiveTransfer::Load {
+                        size: MemorySize::Word,
+                        rn,
+                        rt: ((bits >> 12) & 0xf) as u8,
+                    }
+                } else {
+                    ExclusiveTransfer::Store {
+                        size: MemorySize::Word,
+                        rn,
+                        rt: (bits & 0xf) as u8,
+                        status: ((bits >> 12) & 0xf) as u8,
+                    }
+                })
             }
         }
         _ => unreachable!(),

@@ -154,7 +154,7 @@ fn a32_created_thread_initialization_uses_create_thread_abi() {
 }
 
 #[test]
-fn synthetic_launch_translates_entry_only_through_process_memory() {
+fn synthetic_launch_diagnoses_its_entry_region_only_through_process_memory() {
     let (_directory, plan) = plan();
     let process = reference_process_builder().build(&plan).unwrap();
     let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
@@ -171,8 +171,8 @@ fn synthetic_launch_translates_entry_only_through_process_memory() {
     assert!(dump.contains("raw=0x14000020"));
     assert!(dump.contains("guest=\"b imm=#128\""));
     let report = process.print_entry_report();
-    assert!(report.starts_with("nixe-frontend-block-report-v1\n"));
-    assert!(report.contains("outcome=translated end=direct-branch"));
+    assert!(report.starts_with("nixe-frontend-region-report-v1\n"));
+    assert!(report.contains("outcome=translated blocks="));
     assert!(report.contains("ir-dump stage=pre-optimization"));
     assert!(report.contains("dependency page="));
     assert_eq!(
@@ -397,16 +397,30 @@ fn image_base_is_relocatable_without_changing_pc_relative_translation() {
         second.entry_module().entry_address() - first.entry_module().entry_address(),
         0x0100_0000
     );
-    let first_block = first.translate_entry().unwrap();
-    let second_block = second.translate_entry().unwrap();
-    let direct_target = |block: &IrBlock| match block.terminator {
-        Terminator::Direct {
-            target: ControlTarget::Direct { pc, .. },
-        } => pc.get(),
-        ref terminator => panic!("unexpected terminator {terminator:?}"),
+    let translate_entry = |process: &RunnableProcess| {
+        nixe_cpu::translate::translate_region(
+            nixe_cpu::translate::RegionTranslationConfig::default(),
+            &process.cpu.profile(),
+            process.cpu.address_space_id(),
+            process.entry_location(),
+            process.memory.as_ref(),
+        )
+        .unwrap()
     };
+    let first_region = translate_entry(&first);
+    let second_region = translate_entry(&second);
+    let direct_target =
+        |region: &nixe_cpu::ir::region::IrRegion| match region.entry_block().terminator {
+            Terminator::Direct {
+                target: ControlTarget::Direct { pc, .. },
+            } => pc.get(),
+            Terminator::Direct {
+                target: ControlTarget::Internal { block },
+            } => region.block(block).unwrap().metadata.start.pc.get(),
+            ref terminator => panic!("unexpected terminator {terminator:?}"),
+        };
     assert_eq!(
-        direct_target(&second_block) - direct_target(&first_block),
+        direct_target(&second_region) - direct_target(&first_region),
         0x0100_0000
     );
     assert_eq!(
