@@ -45,7 +45,7 @@ fn lift_inner(
     {
         return lift_it(builder, decoded, first_condition, mask);
     }
-    let predicate = current_it_condition(builder, decoded.location)?;
+    let (predicate, in_it_block) = current_it_condition(builder, decoded.location)?;
     let fallthrough = ControlTarget::Direct {
         pc: decoded
             .location
@@ -67,7 +67,7 @@ fn lift_inner(
                 predicate,
                 instruction,
                 fallthrough,
-                true,
+                in_it_block,
             )
         }
         T32Instruction::Integer(IntegerInstruction::Multiply(instruction)) => {
@@ -77,7 +77,7 @@ fn lift_inner(
                 predicate,
                 instruction,
                 fallthrough,
-                true,
+                in_it_block,
             )
         }
         T32Instruction::Integer(IntegerInstruction::MoveWide { rd, immediate, top }) => {
@@ -151,15 +151,6 @@ fn lift_control(
             })
         }
         ControlInstruction::Exchange { link, rm } => {
-            if link {
-                let _ = aarch32::write_register(
-                    builder,
-                    source,
-                    14,
-                    Immediate::I32((source.pc.get().wrapping_add(2) as u32) | 1).into(),
-                    predicate,
-                )?;
-            }
             let bits = aarch32::read_register(builder, source, rm, false)?;
             let address = emit_one(
                 builder,
@@ -172,6 +163,7 @@ fn lift_control(
             )?;
             let target = ControlTarget::A32Interworking {
                 address: address.into(),
+                source,
             };
             if link {
                 LiftOutcome::Terminate(Terminator::ConditionalCall {
@@ -190,13 +182,6 @@ fn lift_control(
         }
         ControlInstruction::BranchLink { displacement } => {
             let return_address = source.pc.wrapping_offset(4);
-            let _ = aarch32::write_register(
-                builder,
-                source,
-                14,
-                Immediate::I32((return_address.get() as u32) | 1).into(),
-                predicate,
-            )?;
             let target = ControlTarget::Direct {
                 pc: nixe_memory::GuestVirtualAddress::new(u64::from(
                     (source.pc.get() as u32)
@@ -282,7 +267,7 @@ fn lift_it(
 fn current_it_condition(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
-) -> Result<Operand, BuildError> {
+) -> Result<(Operand, Operand), BuildError> {
     let cpsr = read_cpsr(builder, source)?;
     let it_state = unpack_it_state(builder, source, cpsr.into())?;
     let encoded = scalar(
@@ -300,6 +285,16 @@ fn current_it_condition(
         IrType::I1,
         OperationKind::Scalar(ScalarOperation::Compare {
             predicate: IntegerPredicate::Equal,
+            lhs: it_state.into(),
+            rhs: Immediate::I32(0).into(),
+        }),
+    )?;
+    let active = emit_one(
+        builder,
+        source,
+        IrType::I1,
+        OperationKind::Scalar(ScalarOperation::Compare {
+            predicate: IntegerPredicate::NotEqual,
             lhs: it_state.into(),
             rhs: Immediate::I32(0).into(),
         }),
@@ -333,7 +328,7 @@ fn current_it_condition(
     let advanced = advance_it_value(builder, source, it_state.into())?;
     let packed = pack_it_state(builder, source, cpsr.into(), advanced.into())?;
     write_cpsr(builder, source, packed.into())?;
-    Ok(predicate.into())
+    Ok((predicate.into(), active.into()))
 }
 
 fn advance_it_value(

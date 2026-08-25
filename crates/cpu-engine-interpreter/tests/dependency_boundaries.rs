@@ -17,7 +17,10 @@ fn crate_physically_owns_the_reference_interpreter() {
     assert!(root.join("src/interpreter/a32/mod.rs").is_file());
     assert!(root.join("src/interpreter/t32/mod.rs").is_file());
     assert!(root.join("src/engine.rs").is_file());
-    assert!(root.join("tests/ir_differential.rs").is_file());
+    assert!(root.join("tests/differential.rs").is_file());
+    assert!(root.join("tests/conformance.rs").is_file());
+    assert!(!root.join("tests/ir_differential.rs").exists());
+    assert!(!root.join("tests/support/ir_evaluator.rs").exists());
 
     let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
     assert!(!library.contains("pub(crate) use nixe_cpu"));

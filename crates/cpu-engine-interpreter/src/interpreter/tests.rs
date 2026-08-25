@@ -29,6 +29,17 @@ fn source(
     LocationDescriptor::new(GuestVirtualAddress::new(pc), execution_state, profile.id())
 }
 
+fn assert_floating_point_exception(outcome: InterpreterOutcome) {
+    assert!(matches!(
+        outcome,
+        InterpreterOutcome::Exception {
+            kind: nixe_cpu::exception::ExceptionKind::FloatingPoint,
+            syndrome: None,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn t32_movs_executes_once_and_resumes_at_next_pc() {
     let profile = GuestCpuProfile::switch_1();
@@ -119,6 +130,37 @@ fn a32_vfp_binary32_uses_exact_lane_bits_and_fpscr_state() {
 }
 
 #[test]
+fn a32_vfp_enabled_exception_is_precise_and_atomic() {
+    let profile = GuestCpuProfile::switch_1();
+    let mut state = ThreadCpuState::A32(Box::default());
+    let ThreadCpuState::A32(a32) = &mut state else {
+        unreachable!()
+    };
+    a32.set_instruction_address(0x1000).unwrap();
+    a32.set_fpscr((1 << 8) | 0x80); // IOE plus preserved cumulative state.
+    assert!(a32.write_d(0, u64::MAX));
+    assert!(a32.write_d(
+        1,
+        u64::from(f32::INFINITY.to_bits()) | (u64::from(f32::INFINITY.to_bits()) << 32),
+    ));
+    assert!(a32.write_d(
+        2,
+        u64::from(f32::NEG_INFINITY.to_bits()) | (u64::from(f32::NEG_INFINITY.to_bits()) << 32),
+    ));
+
+    // VADD.F32 D0,D1,D2. Both lanes raise invalid for +inf + -inf.
+    let outcome = execute_one(&profile, &mut state, 0xee01_0a02_u32.into()).unwrap();
+    assert_floating_point_exception(outcome);
+
+    let ThreadCpuState::A32(a32) = state else {
+        unreachable!()
+    };
+    assert_eq!(a32.instruction_address(), 0x1000);
+    assert_eq!(a32.read_d(0), Some(u64::MAX));
+    assert_eq!(a32.fpscr(), (1 << 8) | 0x80);
+}
+
+#[test]
 fn a32_and_t32_memory_families_use_the_shared_process_context() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(47);
     const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(94);
@@ -171,6 +213,109 @@ fn a32_and_t32_memory_families_use_the_shared_process_context() {
         unreachable!()
     };
     assert_eq!(t32.read_r(A32GeneralRegister::new(2).unwrap()), 0x1234_5678);
+}
+
+#[test]
+fn a64_lse_atomics_use_one_physical_memory_transaction() {
+    const SPACE: AddressSpaceId = AddressSpaceId::new(48);
+    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(95);
+    let profile = GuestCpuProfile::switch_1().with_instruction_feature(
+        InstructionFeature::LargeSystemExtensions,
+        CapabilityStatus::Enabled,
+    );
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(PAGE));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(0x1000),
+        PAGE,
+        MemoryPermissions::READ_WRITE,
+    ));
+    assert!(memory.initialize_ram(PAGE, 0, &5_u32.to_le_bytes()));
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, SPACE)).with_memory(&memory);
+    let mut state = ThreadCpuState::A64(Box::default());
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    a64.set_pc(0x2000);
+    a64.write_x(A64Register::General(A64GeneralRegister::new(0).unwrap()), 3);
+    a64.write_x(
+        A64Register::General(A64GeneralRegister::new(2).unwrap()),
+        0x1000,
+    );
+
+    execute_one_with_context(context, &mut state, 0xb8e0_0041_u32.into()).unwrap(); // LDADDAL W0,W1,[X2]
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    assert_eq!(
+        a64.read_x(A64Register::General(A64GeneralRegister::new(1).unwrap())),
+        5
+    );
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1000),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(8)
+    );
+
+    a64.write_x(A64Register::General(A64GeneralRegister::new(0).unwrap()), 8);
+    a64.write_x(A64Register::General(A64GeneralRegister::new(1).unwrap()), 9);
+    execute_one_with_context(context, &mut state, 0x88e0_fc41_u32.into()).unwrap(); // CASAL W0,W1,[X2]
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1000),
+                MemoryAccess::normal(MemoryAccessSize::Word),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U32(9)
+    );
+
+    let expected = 0x1111_2222_3333_4444_u128 | (0x5555_6666_7777_8888_u128 << 64);
+    memory
+        .write(
+            SPACE,
+            GuestVirtualAddress::new(0x1010),
+            MemoryAccess::normal(MemoryAccessSize::Quadword),
+            MemoryValue::U128(expected),
+        )
+        .unwrap();
+    let ThreadCpuState::A64(a64) = &mut state else {
+        unreachable!()
+    };
+    for (register, value) in [
+        (0, expected as u64),
+        (1, (expected >> 64) as u64),
+        (2, 0xaaaa_bbbb_cccc_dddd),
+        (3, 0xeeee_ffff_0000_1111),
+        (4, 0x1010),
+    ] {
+        a64.write_x(
+            A64Register::General(A64GeneralRegister::new(register).unwrap()),
+            value,
+        );
+    }
+    execute_one_with_context(context, &mut state, 0x4860_fc82_u32.into()).unwrap(); // CASPAL X0,X1,X2,X3,[X4]
+    assert_eq!(
+        memory
+            .read(
+                SPACE,
+                GuestVirtualAddress::new(0x1010),
+                MemoryAccess::normal(MemoryAccessSize::Quadword),
+            )
+            .unwrap()
+            .value,
+        MemoryValue::U128(0xaaaa_bbbb_cccc_dddd_u128 | (0xeeee_ffff_0000_1111_u128 << 64))
+    );
 }
 
 #[test]
@@ -584,15 +729,27 @@ fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
 }
 
 #[test]
-fn a64_cache_maintenance_is_a_coherent_memory_no_op() {
+fn a64_cache_maintenance_uses_the_canonical_memory_contract() {
     let profile = GuestCpuProfile::switch_1();
+    let space = AddressSpaceId::new(0);
+    let mut memory = SyntheticMemory::new();
+    let page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(page));
+    assert!(memory.map_page(
+        space,
+        GuestVirtualAddress::new(0x1234_5000),
+        page,
+        MemoryPermissions::READ_WRITE,
+    ));
     let mut state = ThreadCpuState::A64(Box::default());
     let ThreadCpuState::A64(a64) = &mut state else {
         unreachable!()
     };
     a64.write_x(x(8), 0x1234_5000);
 
-    execute_one(&profile, &mut state, 0xd50b_7e28_u32.into()).unwrap(); // DC CIVAC,X8
+    let context =
+        InterpreterContext::new(ProcessCpuContext::new(profile, space)).with_memory(&memory);
+    execute_one_with_context(context, &mut state, 0xd50b_7e28_u32.into()).unwrap(); // DC CIVAC,X8
 
     let ThreadCpuState::A64(a64) = state else {
         unreachable!()
@@ -2280,11 +2437,7 @@ fn a64_simd_integer_to_float_trap_boundary_is_atomic() {
     a64.set_fpcr(1 << 12);
     a64.set_fpsr(0x2);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2331,11 +2484,7 @@ fn a64_scalar_simd_integer_to_float_enabled_inexact_exception_is_atomic() {
     a64.set_fpcr(1 << 12); // IXE
     a64.set_fpsr(0x82);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2411,11 +2560,7 @@ fn a64_scalar_integer_to_float_obeys_fpcr_rounding_and_trap_is_atomic() {
     assert!(a64.set_vector(0, u128::MAX));
     a64.set_fpcr(1 << 12);
     a64.set_fpsr(0x82);
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2539,11 +2684,7 @@ fn a64_scalar_float_to_integer_enabled_exception_is_atomic() {
     a64.set_fpcr(1 << 8);
     a64.set_fpsr(0x82);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2616,11 +2757,7 @@ fn a64_scalar_float_to_integer_directional_trap_is_atomic() {
     a64.set_fpcr(1 << 8); // IOE
     a64.set_fpsr(0x82);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2734,11 +2871,7 @@ fn a64_simd_float_divide_nan_controls_and_trap_boundary_are_precise() {
     a64.set_fpcr(1 << 9); // DZE
     a64.set_fpsr(0x80);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2931,11 +3064,7 @@ fn a64_scalar_fcvt_enabled_exception_is_atomic() {
     a64.set_fpcr(1 << 8); // IOE
     a64.set_fpsr(0x80);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -2982,11 +3111,7 @@ fn a64_scalar_fdiv_enabled_exception_is_atomic() {
     a64.set_fpcr(1 << 8); // IOE
     a64.set_fpsr(0x80);
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3055,11 +3180,9 @@ fn a64_scalar_fcmp_nan_signaling_and_enabled_exception_are_atomic() {
     a64.set_fpcr(1 << 8); // IOE
     a64.set_fpsr(0x80);
     a64.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(1 << 31));
-    let error = execute_one(&profile, &mut state, 0x1e61_2010_u32.into()).unwrap_err(); // FCMPE D0,D1
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(
+        execute_one(&profile, &mut state, 0x1e61_2010_u32.into()).unwrap(),
+    ); // FCMPE D0,D1
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3117,11 +3240,9 @@ fn a64_scalar_fccmpe_enabled_exception_is_atomic() {
     a64.set_fpsr(0x80);
     a64.set_nzcv(nixe_cpu::state::a64::Nzcv::from_bits(0));
 
-    let error = execute_one(&profile, &mut state, 0x1e23_e45f_u32.into()).unwrap_err(); // FCCMPE S2,S3,#15,AL
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(
+        execute_one(&profile, &mut state, 0x1e23_e45f_u32.into()).unwrap(),
+    ); // FCCMPE S2,S3,#15,AL
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3211,11 +3332,7 @@ fn a64_scalar_frint_enabled_exceptions_are_atomic() {
     assert!(a64.set_vector(1, u128::from(1.5_f64.to_bits())));
     assert!(a64.set_vector(0, u128::MAX));
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3297,11 +3414,7 @@ fn a64_scalar_fadd_enabled_invalid_exception_is_atomic() {
     assert!(a64.set_vector(2, u128::from(f64::NEG_INFINITY.to_bits())));
     assert!(a64.set_vector(0, u128::MAX));
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3387,11 +3500,7 @@ fn a64_scalar_fmul_enabled_invalid_exception_is_atomic() {
     assert!(a64.set_vector(2, 0));
     assert!(a64.set_vector(0, u128::MAX));
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = &state else {
         unreachable!()
     };
@@ -3462,11 +3571,7 @@ fn a64_scalar_fused_multiply_add_enabled_inexact_exception_is_atomic() {
     assert!(a64.set_vector(2, u128::from(1.0_f32.to_bits())));
     assert!(a64.set_vector(3, 0x3380_0000)); // 2^-24, halfway below the next f32.
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = state else {
         unreachable!()
     };
@@ -3526,11 +3631,7 @@ fn a64_scalar_square_root_enabled_invalid_exception_is_atomic() {
     assert!(a64.set_vector(0, u128::MAX));
     assert!(a64.set_vector(1, u128::from((-1.0_f32).to_bits())));
 
-    let error = execute_one(&profile, &mut state, encoding).unwrap_err();
-    assert!(matches!(
-        error,
-        InterpreterError::UnsupportedInstruction { .. }
-    ));
+    assert_floating_point_exception(execute_one(&profile, &mut state, encoding).unwrap());
     let ThreadCpuState::A64(a64) = state else {
         unreachable!()
     };

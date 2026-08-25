@@ -3,7 +3,8 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_memory::{
-    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
+    GuestVirtualAddress, MappingGeneration,
 };
 
 use crate::error::{InstructionFetchFault, InstructionFetchFaultReason};
@@ -190,6 +191,12 @@ impl CodePageSpan {
 /// operation. Returned integers are canonical bit patterns; implementations
 /// must decode guest bytes explicitly and never rely on host endianness.
 pub trait InstructionMemory: Send + Sync {
+    /// Returns the latest completely published canonical-content mutation.
+    ///
+    /// This address-space-wide value is an O(1) rejection filter. Exact code
+    /// dependencies remain authoritative when a consumer observes a change.
+    fn content_mutation_epoch(&self) -> ContentMutationEpoch;
+
     /// Returns the virtual code-page extent containing `address`.
     ///
     /// Translators use this only as a block-cut boundary. Fetch methods remain
@@ -309,6 +316,156 @@ pub enum MemoryOrdering {
     SequentiallyConsistent,
 }
 
+impl MemoryOrdering {
+    /// Returns whether operations before this access must be published before
+    /// its write component.
+    #[must_use]
+    pub const fn has_release(self) -> bool {
+        matches!(
+            self,
+            Self::Release | Self::AcquireRelease | Self::SequentiallyConsistent
+        )
+    }
+
+    /// Returns whether operations after this access must observe its read
+    /// component before proceeding.
+    #[must_use]
+    pub const fn has_acquire(self) -> bool {
+        matches!(
+            self,
+            Self::Acquire | Self::AcquireRelease | Self::SequentiallyConsistent
+        )
+    }
+}
+
+pub(crate) fn begin_ordered_write(ordering: MemoryOrdering) {
+    use core::sync::atomic::{Ordering, fence};
+
+    match ordering {
+        MemoryOrdering::SequentiallyConsistent => fence(Ordering::SeqCst),
+        ordering if ordering.has_release() => fence(Ordering::Release),
+        _ => {}
+    }
+}
+
+pub(crate) fn complete_ordered_read(ordering: MemoryOrdering) {
+    use core::sync::atomic::{Ordering, fence};
+
+    match ordering {
+        MemoryOrdering::SequentiallyConsistent => fence(Ordering::SeqCst),
+        ordering if ordering.has_acquire() => fence(Ordering::Acquire),
+        _ => {}
+    }
+}
+
+/// Shareability domain encoded by an architectural memory barrier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BarrierDomain {
+    NonShareable,
+    InnerShareable,
+    OuterShareable,
+    FullSystem,
+}
+
+/// Access directions ordered by an architectural memory barrier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BarrierAccess {
+    Reads,
+    Writes,
+    ReadsAndWrites,
+}
+
+/// Engine-neutral barrier semantics shared by interpreters, JITs, and future
+/// native-code execution providers.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BarrierOperation {
+    DataMemory {
+        domain: BarrierDomain,
+        access: BarrierAccess,
+    },
+    DataSynchronization {
+        domain: BarrierDomain,
+        access: BarrierAccess,
+    },
+    InstructionSynchronization,
+}
+
+/// Applies the portable host-fence baseline for an architectural barrier.
+/// Engines with a native guest execution context may map the same neutral
+/// descriptor directly instead.
+pub fn apply_host_memory_barrier(barrier: BarrierOperation) {
+    use core::sync::atomic::{Ordering, compiler_fence, fence};
+
+    match barrier {
+        BarrierOperation::DataMemory { access, .. }
+        | BarrierOperation::DataSynchronization { access, .. } => fence(match access {
+            BarrierAccess::Reads => Ordering::Acquire,
+            BarrierAccess::Writes => Ordering::Release,
+            BarrierAccess::ReadsAndWrites => Ordering::AcqRel,
+        }),
+        BarrierOperation::InstructionSynchronization => compiler_fence(Ordering::SeqCst),
+    }
+}
+
+/// Atomic read/modify/write function, independent of any engine lowering.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AtomicRmwKind {
+    Add,
+    Clear,
+    Xor,
+    Set,
+    SignedMaximum,
+    SignedMinimum,
+    UnsignedMaximum,
+    UnsignedMinimum,
+    Swap,
+}
+
+impl AtomicRmwKind {
+    /// Applies the architectural fixed-width transform. Width mismatch is
+    /// rejected by the memory authority before any write can occur.
+    #[must_use]
+    pub fn apply(self, current: MemoryValue, operand: MemoryValue) -> Option<MemoryValue> {
+        if current.size() != operand.size() {
+            return None;
+        }
+        let size = current.size();
+        let bits = size.bytes() * 8;
+        let mask = if bits == 128 {
+            u128::MAX
+        } else {
+            (1_u128 << bits) - 1
+        };
+        let current_bits = current.bits();
+        let operand_bits = operand.bits();
+        let signed_key = |value: u128| value ^ (1_u128 << (bits - 1));
+        let result = match self {
+            Self::Add => current_bits.wrapping_add(operand_bits) & mask,
+            Self::Clear => current_bits & !operand_bits & mask,
+            Self::Xor => current_bits ^ operand_bits,
+            Self::Set => current_bits | operand_bits,
+            Self::SignedMaximum => {
+                if signed_key(current_bits) >= signed_key(operand_bits) {
+                    current_bits
+                } else {
+                    operand_bits
+                }
+            }
+            Self::SignedMinimum => {
+                if signed_key(current_bits) <= signed_key(operand_bits) {
+                    current_bits
+                } else {
+                    operand_bits
+                }
+            }
+            Self::UnsignedMaximum => current_bits.max(operand_bits),
+            Self::UnsignedMinimum => current_bits.min(operand_bits),
+            Self::Swap => operand_bits,
+        };
+        Some(MemoryValue::from_bits(size, result))
+    }
+}
+
 /// Semantic class used to select ordinary, atomic, exclusive, or volatile paths.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryAccessClass {
@@ -392,6 +549,30 @@ impl MemoryValue {
         }
     }
 
+    /// Returns the zero-extended bit pattern.
+    #[must_use]
+    pub const fn bits(self) -> u128 {
+        match self {
+            Self::U8(value) => value as u128,
+            Self::U16(value) => value as u128,
+            Self::U32(value) => value as u128,
+            Self::U64(value) => value as u128,
+            Self::U128(value) => value,
+        }
+    }
+
+    /// Constructs a value of `size`, truncating high bits architecturally.
+    #[must_use]
+    pub const fn from_bits(size: MemoryAccessSize, bits: u128) -> Self {
+        match size {
+            MemoryAccessSize::Byte => Self::U8(bits as u8),
+            MemoryAccessSize::Halfword => Self::U16(bits as u16),
+            MemoryAccessSize::Word => Self::U32(bits as u32),
+            MemoryAccessSize::Doubleword => Self::U64(bits as u64),
+            MemoryAccessSize::Quadword => Self::U128(bits),
+        }
+    }
+
     pub(super) fn from_le_slice(size: MemoryAccessSize, bytes: &[u8]) -> Self {
         let mut value = [0_u8; 16];
         value[..bytes.len()].copy_from_slice(bytes);
@@ -456,6 +637,15 @@ pub enum MemoryMappingPurpose {
 }
 
 impl MemoryMappingPurpose {
+    /// Returns whether the runtime classifies the mapping as guest code.
+    #[must_use]
+    pub const fn is_code(self) -> bool {
+        matches!(
+            self,
+            Self::CodeStatic | Self::CodeMutable | Self::ModuleCodeStatic | Self::ModuleCodeMutable
+        )
+    }
+
     /// Returns whether the mapping state permits SVC-style reprotection.
     #[must_use]
     pub const fn allows_reprotect(self) -> bool {
@@ -521,6 +711,18 @@ pub struct DataWriteResult {
     pub region: MemoryRegionKind,
 }
 
+/// Result of one indivisible atomic memory transaction.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AtomicMemoryResult {
+    /// Value observed before the optional write.
+    pub previous: MemoryValue,
+    /// Whether the transaction committed a write. RMW operations always do;
+    /// compare/exchange reports false when comparison failed.
+    pub stored: bool,
+    /// Kind of backing that serviced the transaction.
+    pub region: MemoryRegionKind,
+}
+
 /// Kind of failed data operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DataAccessKind {
@@ -546,6 +748,10 @@ pub enum DataAccessFaultReason {
     AddressOverflow,
     /// Value width did not equal the access width.
     ValueSizeMismatch,
+    /// Atomic operations require the atomic class and natural alignment.
+    InvalidAtomicAccess,
+    /// Atomicity is not defined for a cross-page or device transaction.
+    AtomicRegionUnsupported,
     /// An access cannot span distinct RAM/device regions.
     MixedRegions,
     /// The backing content version cannot advance without observable reuse.
@@ -589,8 +795,34 @@ impl DataAccessFault {
     }
 }
 
-/// Interpreter-facing semantic memory contract.
-pub trait CpuMemory: InstructionMemory {
+/// Engine-neutral cache-maintenance operation issued by a guest CPU.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CacheMaintenanceKind {
+    InstructionInvalidate,
+    DataInvalidate,
+    DataClean,
+    DataCleanAndInvalidate,
+    InstructionPrefetch,
+}
+
+/// Engine-facing semantic memory contract shared by every CPU provider.
+pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
+    /// Derives a retained canonical RAM lease for engine-private acceleration.
+    ///
+    /// The default is intentionally unavailable for diagnostic or device-only
+    /// memory implementations. Production memory may return a lease only when
+    /// the complete physical page is CPU-visible, ordinarily cacheable, and
+    /// unobserved by executable mappings. Engines remain responsible for their
+    /// own mapping-epoch, page-boundary, access-class, and ordering checks.
+    fn direct_access(
+        &self,
+        _address_space: AddressSpaceId,
+        _page: GuestVirtualAddress,
+        _kind: DataAccessKind,
+    ) -> Option<nixe_memory::CanonicalDirectAccessLease> {
+        None
+    }
+
     /// Performs one complete architectural read.
     fn read(
         &self,
@@ -607,6 +839,49 @@ pub trait CpuMemory: InstructionMemory {
         access: MemoryAccess,
         value: MemoryValue,
     ) -> Result<DataWriteResult, DataAccessFault>;
+
+    /// Atomically reads, transforms, and writes one naturally aligned RAM
+    /// scalar. The transaction linearizes by canonical physical identity, so
+    /// every virtual alias and every CPU engine observes one modification
+    /// order. Device atomics require a future explicit device contract.
+    fn atomic_read_modify_write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: AtomicRmwKind,
+        operand: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault>;
+
+    /// Atomically compares the complete scalar bit pattern and conditionally
+    /// replaces it. The returned `previous` value is the architectural result.
+    fn atomic_compare_exchange(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault>;
+
+    /// Applies the host-side ordering required by an architectural barrier.
+    /// Domain and access remain explicit so a future NCE can map the barrier
+    /// to native execution without depending on JIT-private helpers.
+    fn memory_barrier(&self, barrier: BarrierOperation) {
+        apply_host_memory_barrier(barrier);
+    }
+
+    /// Applies one architecturally visible cache-maintenance operation.
+    ///
+    /// Canonical RAM is coherent, so data maintenance reconciles ownership
+    /// rather than modelling a host cache. Instruction invalidation publishes
+    /// through the neutral memory-invalidation stream consumed by every engine.
+    fn maintain_cache(
+        &self,
+        address_space: AddressSpaceId,
+        kind: CacheMaintenanceKind,
+        address: Option<GuestVirtualAddress>,
+    ) -> Result<(), DataAccessFault>;
 
     /// Queries the maximal contiguous mapping state containing `address`.
     ///
@@ -741,4 +1016,55 @@ pub trait SyntheticMmio: Send {
         access: MemoryAccess,
         value: MemoryValue,
     ) -> Result<(), Box<str>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicRmwKind, MemoryValue};
+
+    #[test]
+    fn every_atomic_rmw_transform_uses_the_exact_fixed_width_bit_pattern() {
+        let apply = |kind: AtomicRmwKind, current: u8, operand: u8| {
+            kind.apply(MemoryValue::U8(current), MemoryValue::U8(operand))
+                .expect("equal-width atomic operands")
+        };
+
+        assert_eq!(apply(AtomicRmwKind::Add, 250, 10), MemoryValue::U8(4));
+        assert_eq!(
+            apply(AtomicRmwKind::Clear, 0b1111, 0b0101),
+            MemoryValue::U8(0b1010)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::Xor, 0b1100, 0b1010),
+            MemoryValue::U8(0b0110)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::Set, 0b1100, 0b0011),
+            MemoryValue::U8(0b1111)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::SignedMaximum, 0x80, 0x7f),
+            MemoryValue::U8(0x7f)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::SignedMinimum, 0x80, 0x7f),
+            MemoryValue::U8(0x80)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::UnsignedMaximum, 1, 2),
+            MemoryValue::U8(2)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::UnsignedMinimum, 1, 2),
+            MemoryValue::U8(1)
+        );
+        assert_eq!(
+            apply(AtomicRmwKind::Swap, 0xaa, 0x55),
+            MemoryValue::U8(0x55)
+        );
+        assert_eq!(
+            AtomicRmwKind::Add.apply(MemoryValue::U8(1), MemoryValue::U16(1)),
+            None
+        );
+    }
 }

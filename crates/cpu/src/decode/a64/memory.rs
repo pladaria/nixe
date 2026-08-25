@@ -1,8 +1,11 @@
 //! Normalized integer memory instructions.
 
 use crate::decode::table::InstructionPattern;
+use crate::profile::InstructionFeature;
 
 use super::{NO_FEATURES, pattern};
+
+const LSE: &[InstructionFeature] = &[InstructionFeature::LargeSystemExtensions];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
@@ -118,6 +121,44 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         NO_FEATURES,
     )
     .lowered(),
+    // Armv8.1-A FEAT_LSE atomic memory operations. The generic RMW pattern is
+    // narrowed to allocated operations by the architectural allocation pass.
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDADD--LDADDA--LDADDAL--LDADDL--Atomic-add-on-word-or-doubleword-in-memory-
+    pattern(
+        "atomic-read-modify-write",
+        0x3f20_0c00,
+        0x3820_0000,
+        0x0000_002d,
+        151,
+        &[],
+        LSE,
+    )
+    .lowered()
+    .fixture32(0xb8e0_0041),
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/CAS--CASA--CASAL--CASL--Compare-and-swap-word-or-doubleword-in-memory-
+    pattern(
+        "compare-and-swap",
+        0x3fa0_7c00,
+        0x08a0_7c00,
+        0x0000_002e,
+        153,
+        &[],
+        LSE,
+    )
+    .lowered()
+    .fixture32(0x88e0_fc41),
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/CASP--CASPA--CASPAL--CASPL--Compare-and-swap-pair-of-words-or-doublewords-in-memory-
+    pattern(
+        "compare-and-swap-pair",
+        0xbfa0_7c00,
+        0x0820_7c00,
+        0x0000_002f,
+        152,
+        &[],
+        LSE,
+    )
+    .lowered()
+    .fixture32(0x4860_fc82),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +178,9 @@ pub struct Operands {
     pub load: bool,
     pub ordered: bool,
     pub scaled: bool,
+    pub acquire: bool,
+    pub release: bool,
+    pub atomic_opcode: u8,
 }
 
 macro_rules! instructions {
@@ -165,9 +209,17 @@ instructions!(
     StoreRelease,
     LoadExclusive,
     StoreExclusive,
+    AtomicReadModifyWrite,
+    CompareAndSwap,
+    CompareAndSwapPair,
 );
 
 pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
+    let (acquire, release) = match instruction_id {
+        0x0000_002d => (bits & (1 << 23) != 0, bits & (1 << 22) != 0),
+        0x0000_002e | 0x0000_002f => (bits & (1 << 22) != 0, bits & (1 << 15) != 0),
+        _ => (false, false),
+    };
     let operands = Operands {
         rt: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -184,6 +236,9 @@ pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         load: bits & (1 << 22) != 0,
         ordered: bits & (1 << 15) != 0,
         scaled: bits & (1 << 12) != 0,
+        acquire,
+        release,
+        atomic_opcode: ((bits >> 12) & 0xf) as u8,
     };
     match instruction_id {
         0x0000_0022 => Instruction::Literal(operands),
@@ -197,6 +252,9 @@ pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_002a => Instruction::StoreRelease(operands),
         0x0000_002b => Instruction::LoadExclusive(operands),
         0x0000_002c => Instruction::StoreExclusive(operands),
+        0x0000_002d => Instruction::AtomicReadModifyWrite(operands),
+        0x0000_002e => Instruction::CompareAndSwap(operands),
+        0x0000_002f => Instruction::CompareAndSwapPair(operands),
         _ => unreachable!("memory semantic ID was routed to the wrong family"),
     }
 }

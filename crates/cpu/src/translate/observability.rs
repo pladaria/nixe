@@ -146,7 +146,7 @@ pub fn translate_region_report(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
 ) -> RegionTranslationReport {
     match translate_region_with_disassembly(config, profile, address_space, start, memory) {
         Ok(region) => RegionTranslationReport::Translated(region),
@@ -252,6 +252,10 @@ impl<'a> RawInstructionMemory<'a> {
 }
 
 impl InstructionMemory for RawInstructionMemory<'_> {
+    fn content_mutation_epoch(&self) -> nixe_memory::ContentMutationEpoch {
+        nixe_memory::ContentMutationEpoch::INITIAL
+    }
+
     fn code_page_span(
         &self,
         address_space: AddressSpaceId,

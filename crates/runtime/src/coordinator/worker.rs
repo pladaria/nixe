@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use nixe_cpu_engine::{EngineDomainId, EngineExecutor};
 use nixe_scheduler::{Lease, ProcessId, VirtualCpuId};
 
-use crate::process::execution::VcpuExecutionState;
+use crate::process::execution::{ExecutorTeardownState, VcpuExecutionState};
 use crate::{ExecutionReport, ProcessExecutionError};
+
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct WorkerRequest {
     pub(super) lease: Lease,
@@ -39,7 +42,7 @@ pub(super) struct WorkerDispatchFailure {
     pub(super) request: WorkerRequest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerFailure {
     EnginePanicked,
     Lost(VirtualCpuId),
@@ -52,6 +55,12 @@ pub enum WorkerFailure {
         process: ProcessId,
         vcpu: VirtualCpuId,
     },
+    ExecutorTeardownFailed {
+        process: ProcessId,
+        vcpu: VirtualCpuId,
+        fault: Box<nixe_cpu_engine::EngineFault>,
+    },
+    TeardownTimedOut(VirtualCpuId),
 }
 
 enum WorkerCommand {
@@ -60,13 +69,10 @@ enum WorkerCommand {
         executor: Box<dyn EngineExecutor>,
         reply: SyncSender<Result<(), Box<dyn EngineExecutor>>>,
     },
-    Remove {
-        key: WorkerExecutorKey,
-        reply: SyncSender<Option<Box<dyn EngineExecutor>>>,
-    },
     RetireProcess {
         process: ProcessId,
-        reply: SyncSender<usize>,
+        preparation: ExecutorTeardownState,
+        reply: SyncSender<Result<usize, nixe_cpu_engine::EngineFault>>,
     },
     ClearLocalExclusive {
         key: WorkerExecutorKey,
@@ -80,11 +86,12 @@ struct WorkerHandle {
     commands: SyncSender<WorkerCommand>,
     results: Receiver<WorkerResult>,
     thread: Option<JoinHandle<()>>,
+    shutdown_sent: bool,
 }
 
 pub(super) struct VcpuWorkerPool {
     workers: BTreeMap<VirtualCpuId, WorkerHandle>,
-    stopped: bool,
+    stop_requested: bool,
 }
 
 impl VcpuWorkerPool {
@@ -119,12 +126,13 @@ impl VcpuWorkerPool {
                     commands,
                     results,
                     thread: Some(thread),
+                    shutdown_sent: false,
                 },
             );
         }
         Ok(Self {
             workers,
-            stopped: false,
+            stop_requested: false,
         })
     }
 
@@ -132,7 +140,7 @@ impl VcpuWorkerPool {
         &self,
         request: WorkerRequest,
     ) -> Result<(), Box<WorkerDispatchFailure>> {
-        if self.stopped {
+        if self.stop_requested {
             return Err(Box::new(WorkerDispatchFailure {
                 failure: WorkerFailure::Stopped,
                 request,
@@ -184,37 +192,46 @@ impl VcpuWorkerPool {
         }
     }
 
-    pub(super) fn remove_executor(
-        &self,
-        vcpu: VirtualCpuId,
-        key: WorkerExecutorKey,
-    ) -> Result<Box<dyn EngineExecutor>, WorkerFailure> {
-        let worker = self.workers.get(&vcpu).ok_or(WorkerFailure::Lost(vcpu))?;
-        let (reply, result) = sync_channel(1);
-        worker
-            .commands
-            .send(WorkerCommand::Remove { key, reply })
-            .map_err(|_| WorkerFailure::Lost(vcpu))?;
-        result.recv().map_err(|_| WorkerFailure::Lost(vcpu))?.ok_or(
-            WorkerFailure::ExecutorUnavailable {
-                process: key.process,
-                vcpu,
-            },
-        )
-    }
-
     pub(super) fn retire_process(
         &self,
         vcpu: VirtualCpuId,
         process: ProcessId,
+        preparation: ExecutorTeardownState,
     ) -> Result<usize, WorkerFailure> {
         let worker = self.workers.get(&vcpu).ok_or(WorkerFailure::Lost(vcpu))?;
         let (reply, result) = sync_channel(1);
-        worker
-            .commands
-            .send(WorkerCommand::RetireProcess { process, reply })
-            .map_err(|_| WorkerFailure::Lost(vcpu))?;
-        result.recv().map_err(|_| WorkerFailure::Lost(vcpu))
+        let deadline = Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
+        let mut command = WorkerCommand::RetireProcess {
+            process,
+            preparation,
+            reply,
+        };
+        loop {
+            match worker.commands.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(WorkerFailure::Lost(vcpu));
+                }
+                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    command = returned;
+                    std::thread::yield_now();
+                }
+                Err(TrySendError::Full(_)) => {
+                    return Err(WorkerFailure::TeardownTimedOut(vcpu));
+                }
+            }
+        }
+        result
+            .recv_timeout(WORKER_SHUTDOWN_TIMEOUT)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => WorkerFailure::TeardownTimedOut(vcpu),
+                RecvTimeoutError::Disconnected => WorkerFailure::Lost(vcpu),
+            })?
+            .map_err(|fault| WorkerFailure::ExecutorTeardownFailed {
+                process,
+                vcpu,
+                fault: Box::new(fault),
+            })
     }
 
     pub(super) fn clear_local_exclusive(
@@ -248,21 +265,51 @@ impl VcpuWorkerPool {
     }
 
     pub(super) fn shutdown(&mut self) -> Result<(), WorkerFailure> {
-        if self.stopped {
+        self.shutdown_with_timeout(WORKER_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), WorkerFailure> {
+        if self.workers.values().all(|worker| worker.thread.is_none()) {
             return Ok(());
         }
-        self.stopped = true;
-        for worker in self.workers.values() {
-            let _ = worker.commands.send(WorkerCommand::Shutdown);
+        self.stop_requested = true;
+        let deadline = Instant::now() + timeout;
+        for (vcpu, worker) in &mut self.workers {
+            while !worker.shutdown_sent {
+                match worker.commands.try_send(WorkerCommand::Shutdown) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => {
+                        worker.shutdown_sent = true;
+                    }
+                    Err(TrySendError::Full(_)) if Instant::now() < deadline => {
+                        std::thread::yield_now();
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        return Err(WorkerFailure::TeardownTimedOut(*vcpu));
+                    }
+                }
+            }
         }
         let mut failure = None;
         for (vcpu, worker) in &mut self.workers {
-            if worker
+            while worker
                 .thread
-                .take()
-                .is_some_and(|thread| thread.join().is_err())
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+                && Instant::now() < deadline
             {
-                failure.get_or_insert(WorkerFailure::Lost(*vcpu));
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            match worker.thread.take() {
+                Some(thread) if thread.is_finished() => {
+                    if thread.join().is_err() {
+                        failure.get_or_insert(WorkerFailure::Lost(*vcpu));
+                    }
+                }
+                Some(thread) => {
+                    worker.thread = Some(thread);
+                    failure.get_or_insert(WorkerFailure::TeardownTimedOut(*vcpu));
+                }
+                None => {}
             }
         }
         failure.map_or(Ok(()), Err)
@@ -298,14 +345,30 @@ fn worker_main(
                 let _ = reply.send(result);
                 continue;
             }
-            WorkerCommand::Remove { key, reply } => {
-                let _ = reply.send(executors.remove(&key));
-                continue;
-            }
-            WorkerCommand::RetireProcess { process, reply } => {
-                let before = executors.len();
-                executors.retain(|key, _| key.process != process);
-                let _ = reply.send(before - executors.len());
+            WorkerCommand::RetireProcess {
+                process,
+                preparation,
+                reply,
+            } => {
+                let keys: Vec<_> = executors
+                    .keys()
+                    .filter(|key| key.process == process)
+                    .copied()
+                    .collect();
+                let prepared = keys.iter().try_for_each(|key| {
+                    preparation.prepare(
+                        executors
+                            .get_mut(key)
+                            .expect("a collected executor key remains installed")
+                            .as_mut(),
+                    )
+                });
+                if prepared.is_ok() {
+                    for key in &keys {
+                        executors.remove(key);
+                    }
+                }
+                let _ = reply.send(prepared.map(|()| keys.len()));
                 continue;
             }
             WorkerCommand::ClearLocalExclusive { key, reply } => {
@@ -416,6 +479,11 @@ mod tests {
 
     struct PanickingExecutor;
 
+    struct BlockingExecutor {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
     impl EngineExecutor for PanickingExecutor {
         fn descriptor(&self) -> EngineDescriptor {
             EngineDescriptor {
@@ -435,6 +503,36 @@ mod tests {
             _request: RunRequest<'_>,
         ) -> Result<ExecutionReport, nixe_cpu_engine::EngineFault> {
             panic!("injected engine panic")
+        }
+
+        fn clear_local_exclusive_reservation(&mut self) {}
+    }
+
+    impl EngineExecutor for BlockingExecutor {
+        fn descriptor(&self) -> EngineDescriptor {
+            EngineDescriptor {
+                id: EngineId::new(405),
+                name: "blocking-test-engine".into(),
+                kind: EngineKind::Test,
+                capabilities: EngineCapabilities::default(),
+            }
+        }
+
+        fn executor_id(&self) -> EngineExecutorId {
+            EngineExecutorId::new(1)
+        }
+
+        fn run_slice(
+            &mut self,
+            request: RunRequest<'_>,
+        ) -> Result<ExecutionReport, nixe_cpu_engine::EngineFault> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(ExecutionReport {
+                instructions_executed: 0,
+                stop: nixe_cpu_engine::EngineExit::Safepoint,
+                context: request.state.register_context(),
+            })
         }
 
         fn clear_local_exclusive_reservation(&mut self) {}
@@ -465,6 +563,7 @@ mod tests {
                 address_space_end: nixe_memory::GuestVirtualAddress::new(1_u64 << 39),
                 instruction_budget: 1,
                 loader_return: None,
+                events: nixe_cpu_engine::VcpuEventState::default(),
             },
         }
     }
@@ -491,5 +590,34 @@ mod tests {
         pool.shutdown().unwrap();
         pool.shutdown().unwrap();
         assert!(matches!(pool.receive(vcpu), Err(WorkerFailure::Lost(id)) if id == vcpu));
+    }
+
+    #[test]
+    fn worker_shutdown_reports_a_bound_instead_of_waiting_for_a_stuck_engine() {
+        let vcpu = VirtualCpuId::new(2);
+        let mut pool = VcpuWorkerPool::start([vcpu], true).unwrap();
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        pool.install_executor(
+            vcpu,
+            WorkerExecutorKey {
+                process: ProcessId::new(1),
+                domain: nixe_cpu_engine::EngineDomainId::new(1),
+            },
+            Box::new(BlockingExecutor {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        )
+        .unwrap();
+        assert!(pool.dispatch(request(vcpu)).is_ok());
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            pool.shutdown_with_timeout(Duration::from_millis(10)),
+            Err(WorkerFailure::TeardownTimedOut(id)) if id == vcpu
+        ));
+        release_tx.send(()).unwrap();
+        let _ = pool.receive(vcpu).unwrap();
+        pool.shutdown().unwrap();
     }
 }

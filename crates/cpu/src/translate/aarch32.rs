@@ -119,6 +119,7 @@ pub(super) fn write_register(
         )?;
         return Ok(Some(ControlTarget::A32Interworking {
             address: address.into(),
+            source,
         }));
     }
     let register = StateRegister::A32R(
@@ -141,7 +142,7 @@ pub(super) fn lift_data_processing(
     predicate: Operand,
     instruction: DataProcessing,
     fallthrough: ControlTarget,
-    suppress_flags_in_it: bool,
+    suppress_flags: Operand,
 ) -> Result<LiftOutcome, BuildError> {
     let lhs = read_register(builder, source, instruction.rn, false)?;
     let old_destination = read_register(builder, source, instruction.rd, false)?;
@@ -182,7 +183,7 @@ pub(super) fn lift_data_processing(
             cpsr,
             Immediate::I32(data_operation_code(instruction.operation)).into(),
             Immediate::I32(u32::from(instruction.set_flags)).into(),
-            Immediate::I32(u32::from(suppress_flags_in_it)).into(),
+            suppress_flags,
             Immediate::I32(u32::from(shift_kind)).into(),
             Immediate::I32(u32::from(shift_by_register)).into(),
             Immediate::I32(u32::from(rotation)).into(),
@@ -216,7 +217,7 @@ pub(super) fn lift_multiply(
     predicate: Operand,
     instruction: Multiply,
     fallthrough: ControlTarget,
-    suppress_flags_in_it: bool,
+    suppress_flags: Operand,
 ) -> Result<LiftOutcome, BuildError> {
     let old = read_register(builder, source, instruction.rd, false)?;
     let rm = read_register(builder, source, instruction.rm, false)?;
@@ -239,7 +240,7 @@ pub(super) fn lift_multiply(
             addend,
             cpsr,
             Immediate::I32(u32::from(instruction.set_flags)).into(),
-            Immediate::I32(u32::from(suppress_flags_in_it)).into(),
+            suppress_flags,
         ],
         &[IrType::I32, IrType::I32],
         OperationEffects::new(EffectSet::HELPER, false),

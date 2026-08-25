@@ -24,10 +24,16 @@ pub enum ControlTarget {
     Indirect {
         address: Operand,
         execution_state: ExecutionState,
+        /// Instruction which reports a misaligned computed destination.
+        source: LocationDescriptor,
     },
     /// A32 `BX`/`BLX`-style target whose bit zero selects T32 versus A32 at
     /// runtime. The execution engine masks the address for the selected state.
-    A32Interworking { address: Operand },
+    A32Interworking {
+        address: Operand,
+        /// Instruction which reports an invalid A32 destination alignment.
+        source: LocationDescriptor,
+    },
 }
 
 impl ControlTarget {
@@ -186,10 +192,12 @@ mod tests {
             address: super::super::value::Immediate::Address(GuestVirtualAddress::new(0x3000))
                 .into(),
             execution_state: ExecutionState::A64,
+            source: location(),
         };
         let interworking = ControlTarget::A32Interworking {
             address: super::super::value::Immediate::Address(GuestVirtualAddress::new(0x3001))
                 .into(),
+            source: location(),
         };
         let exits = [
             Terminator::Direct { target: direct },

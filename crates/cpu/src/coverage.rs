@@ -556,7 +556,11 @@ mod tests {
     fn every_catalog_entry_routes_through_decode_normalization_and_disassembly() {
         let profile = GuestCpuProfile::switch_1()
             .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled)
-            .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
+            .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled)
+            .with_instruction_feature(
+                InstructionFeature::LargeSystemExtensions,
+                CapabilityStatus::Enabled,
+            );
         let table = coverage_table(&profile);
         let expected_entries: usize = all_pattern_tables()
             .iter()

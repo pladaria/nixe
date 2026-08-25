@@ -276,29 +276,6 @@ fn reference_execution_observes_safepoints_before_fetch() {
 }
 
 #[test]
-fn reference_execution_observes_pending_events_before_fetch() {
-    let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    let entry = process.entry_module().entry_address();
-    process.post_event(0b0001);
-    process.post_event(0b0100);
-
-    let report = process.run(10).unwrap();
-    assert_eq!(report.instructions_executed, 0);
-    assert_eq!(
-        report.stop,
-        crate::ExecutionStop::PendingEvent { mask: 0b0101 }
-    );
-    let next = process.run(1).unwrap();
-    assert_eq!(next.instructions_executed, 1);
-    assert_eq!(next.stop, crate::ExecutionStop::BudgetExhausted);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
-    assert_eq!(state.pc(), entry + 0x80);
-}
-
-#[test]
 fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
@@ -325,7 +302,7 @@ fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() 
     let (_directory, plan) = plan();
 
     let mut unsupported = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut unsupported, 0xd503_205f); // WFE
+    replace_entry_instruction(&mut unsupported, 0xd503_20df); // unimplemented reserved HINT #6
     let report = unsupported.run(1).unwrap();
     assert!(matches!(
         report.stop,

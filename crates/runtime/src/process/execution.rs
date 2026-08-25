@@ -1,10 +1,11 @@
 //! Process-local execution domain and per-vCPU executor ownership.
 
+use nixe_memory::MemoryInvalidationSource;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::memory::ExecutionMemory;
@@ -12,7 +13,7 @@ use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu_engine::{
     DomainRequest, EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault,
-    EngineProvider, EngineTimer, RunRequest, TimerSnapshot,
+    EngineProvider, EngineTimer, RunRequest, TimerSnapshot, VcpuEventState,
 };
 use nixe_memory::GuestVirtualAddress;
 
@@ -158,23 +159,58 @@ impl Error for ProcessTeardownFailure {}
 pub(crate) struct ProcessExecutionControl {
     domain: Box<dyn EngineDomain>,
     fallback: Option<FallbackExecutionControl>,
-    controls: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_cpu_engine::EngineControl>,
+    controls: BTreeMap<nixe_scheduler::VirtualCpuId, ExecutorControls>,
     cpu: ProcessCpuContext,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
     address_space_end: nixe_memory::GuestVirtualAddress,
     shutdown_result: Option<Result<(), EngineFault>>,
+    stopping: bool,
     pending_safepoint: AtomicBool,
-    pending_events: AtomicU32,
 }
 
 struct FallbackExecutionControl {
     domain: Box<dyn EngineDomain>,
 }
 
+struct ExecutorControls {
+    primary: Option<nixe_cpu_engine::EngineControl>,
+    fallback: Option<nixe_cpu_engine::EngineControl>,
+}
+
+impl ExecutorControls {
+    fn iter(&self) -> impl Iterator<Item = &nixe_cpu_engine::EngineControl> {
+        self.primary.iter().chain(self.fallback.iter())
+    }
+}
+
 pub(crate) struct WorkerExecutors {
     pub(crate) primary: Box<dyn EngineExecutor>,
     pub(crate) fallback: Option<Box<dyn EngineExecutor>>,
+}
+
+/// Owned canonical context used by a worker to quiesce executor-private state
+/// without retaining a borrow into the process or coordinator.
+pub(crate) struct ExecutorTeardownState {
+    memory: Arc<ExecutionMemory>,
+    cpu: ProcessCpuContext,
+    address_space_end: GuestVirtualAddress,
+    state: ThreadCpuState,
+}
+
+impl ExecutorTeardownState {
+    pub(crate) fn prepare(&self, executor: &mut dyn EngineExecutor) -> Result<(), EngineFault> {
+        executor.prepare_shutdown(
+            nixe_cpu_engine::DomainMemoryBinding {
+                address_space: self.cpu.address_space_id(),
+                end_exclusive: self.address_space_end,
+                memory: self.memory.as_ref(),
+                mapping_epoch: self.memory.mapping_epoch().get(),
+                invalidation_cursor: self.memory.invalidation_cursor(),
+            },
+            &self.state,
+        )
+    }
 }
 
 pub(crate) struct ProcessExecutionConfiguration {
@@ -206,7 +242,8 @@ impl ProcessExecutionControl {
             address_space: cpu.address_space_id(),
             end_exclusive: address_space_end,
             memory,
-            invalidation_generation: memory.mapping_epoch().get(),
+            mapping_epoch: memory.mapping_epoch().get(),
+            invalidation_cursor: memory.invalidation_cursor(),
         };
         if let Err(fault) = domain.bind_memory(binding) {
             let _ = domain.shutdown();
@@ -273,13 +310,19 @@ impl ProcessExecutionControl {
             architectural_timer_frequency: timer_frequency,
             address_space_end,
             shutdown_result: None,
+            stopping: false,
             pending_safepoint: AtomicBool::new(false),
-            pending_events: AtomicU32::new(0),
         })
     }
 
     pub(crate) fn engine_descriptor(&self) -> nixe_cpu_engine::EngineDescriptor {
         self.domain.descriptor()
+    }
+
+    pub(crate) fn fallback_engine_descriptor(&self) -> Option<nixe_cpu_engine::EngineDescriptor> {
+        self.fallback
+            .as_ref()
+            .map(|fallback| fallback.domain.descriptor())
     }
 
     pub(crate) fn domain_id(&self) -> EngineDomainId {
@@ -296,16 +339,31 @@ impl ProcessExecutionControl {
             self.pending_safepoint.store(true, Ordering::Release);
             return;
         }
-        for control in self.controls.values() {
+        for control in self.controls.values().flat_map(ExecutorControls::iter) {
             control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
         }
+    }
+
+    pub(crate) fn request_stop(&mut self) -> Result<(), EngineFault> {
+        if self.stopping {
+            return Ok(());
+        }
+        self.request_safepoint();
+        let primary_result = self.domain.request_stop();
+        let fallback_result = self
+            .fallback
+            .as_mut()
+            .map_or(Ok(()), |fallback| fallback.domain.request_stop());
+        primary_result.and(fallback_result)?;
+        self.stopping = true;
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), EngineFault> {
         if let Some(result) = &self.shutdown_result {
             return result.clone();
         }
-        self.request_safepoint();
+        self.request_stop()?;
         let primary_result = self.domain.shutdown();
         let fallback_result = self
             .fallback
@@ -316,36 +374,47 @@ impl ProcessExecutionControl {
         result
     }
     pub(crate) fn request_mapping_safepoint(&self) {
-        for control in self.controls.values() {
+        for control in self.controls.values().flat_map(ExecutorControls::iter) {
             if control.execution_active() {
                 control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
             }
         }
     }
-    pub(crate) fn publish_mapping_invalidation(&self, epoch: nixe_cpu::memory::MappingEpoch) {
-        for control in self.controls.values() {
-            control.request_invalidation(epoch.get());
-        }
-    }
-    pub(crate) fn mapping_invalidation_acknowledged(
+    pub(crate) fn publish_memory_invalidation(
         &self,
-        epoch: nixe_cpu::memory::MappingEpoch,
-    ) -> bool {
-        self.controls.values().next().is_some_and(|_| {
-            self.controls
-                .values()
-                .all(|control| control.acknowledged_invalidation(epoch.get()))
-        })
+        cursor: nixe_memory::MemoryInvalidationCursor,
+    ) {
+        for control in self.controls.values().flat_map(ExecutorControls::iter) {
+            control.request_invalidation(cursor.get());
+        }
     }
-    #[cfg(test)]
-    pub(crate) fn post_event(&self, mask: u32) {
-        if self.controls.is_empty() {
-            self.pending_events.fetch_or(mask, Ordering::Release);
-            return;
-        }
-        for control in self.controls.values() {
-            control.post_event(mask);
-        }
+    pub(crate) fn memory_invalidation_acknowledged(
+        &self,
+        cursor: nixe_memory::MemoryInvalidationCursor,
+    ) -> bool {
+        let primary_required = self
+            .domain
+            .descriptor()
+            .capabilities
+            .acknowledged_invalidation;
+        let fallback_required = self.fallback.as_ref().is_some_and(|fallback| {
+            fallback
+                .domain
+                .descriptor()
+                .capabilities
+                .acknowledged_invalidation
+        });
+        let mut required = self.controls.values().flat_map(|controls| {
+            controls
+                .primary
+                .iter()
+                .filter(move |_| primary_required)
+                .chain(controls.fallback.iter().filter(move |_| fallback_required))
+        });
+        required.next().is_some_and(|first| {
+            first.acknowledged_invalidation(cursor.get())
+                && required.all(|control| control.acknowledged_invalidation(cursor.get()))
+        })
     }
     fn executor_id(vcpu: nixe_scheduler::VirtualCpuId) -> EngineExecutorId {
         EngineExecutorId::new(u64::from(vcpu.get()) + 1)
@@ -354,15 +423,22 @@ impl ProcessExecutionControl {
         &mut self,
         vcpu: nixe_scheduler::VirtualCpuId,
     ) -> Result<WorkerExecutors, EngineFault> {
+        if self.stopping {
+            return Err(engine_fault(
+                self.cpu,
+                self.domain.descriptor().id,
+                nixe_cpu_engine::EngineFaultKind::Unavailable,
+                "CPU engine domain is stopping",
+            ));
+        }
         let primary = self.domain.create_executor(Self::executor_id(vcpu))?;
-        if let Some(control) = primary.control() {
-            self.publish_pending_control(&control);
-            self.controls.insert(vcpu, control);
-        } else if self
-            .domain
-            .descriptor()
-            .capabilities
-            .requires_control_path()
+        let primary_control = primary.control();
+        if primary_control.is_none()
+            && self
+                .domain
+                .descriptor()
+                .capabilities
+                .requires_control_path()
         {
             return Err(missing_control_path_fault(
                 self.cpu,
@@ -374,17 +450,92 @@ impl ProcessExecutionControl {
             .as_mut()
             .map(|fallback| fallback.domain.create_executor(Self::executor_id(vcpu)))
             .transpose()?;
+        let fallback_control = fallback.as_ref().and_then(|executor| executor.control());
+        if fallback_control.is_none()
+            && self.fallback.as_ref().is_some_and(|fallback| {
+                fallback
+                    .domain
+                    .descriptor()
+                    .capabilities
+                    .requires_control_path()
+            })
+        {
+            return Err(missing_control_path_fault(
+                self.cpu,
+                self.fallback
+                    .as_ref()
+                    .expect("a validated fallback domain exists")
+                    .domain
+                    .descriptor()
+                    .id,
+            ));
+        }
+        if self.pending_safepoint.swap(false, Ordering::AcqRel) {
+            for control in primary_control.iter().chain(fallback_control.iter()) {
+                control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+            }
+        }
+        self.controls.insert(
+            vcpu,
+            ExecutorControls {
+                primary: primary_control,
+                fallback: fallback_control,
+            },
+        );
         Ok(WorkerExecutors { primary, fallback })
     }
 
-    fn publish_pending_control(&self, control: &nixe_cpu_engine::EngineControl) {
-        if self.pending_safepoint.swap(false, Ordering::AcqRel) {
-            control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+    pub(crate) fn executor_teardown_state(
+        &self,
+        memory: Arc<ExecutionMemory>,
+        state: ThreadCpuState,
+    ) -> ExecutorTeardownState {
+        ExecutorTeardownState {
+            memory,
+            cpu: self.cpu,
+            address_space_end: self.address_space_end,
+            state,
         }
-        let events = self.pending_events.swap(0, Ordering::AcqRel);
-        if events != 0 {
-            control.post_event(events);
+    }
+
+    pub(crate) fn complete_executor_retirement(
+        &mut self,
+        cursor: nixe_memory::MemoryInvalidationCursor,
+    ) -> Result<(), EngineFault> {
+        let primary_required = self
+            .domain
+            .descriptor()
+            .capabilities
+            .acknowledged_invalidation;
+        let fallback_required = self.fallback.as_ref().is_some_and(|fallback| {
+            fallback
+                .domain
+                .descriptor()
+                .capabilities
+                .acknowledged_invalidation
+        });
+        let missing_acknowledgement = self.controls.values().any(|controls| {
+            (primary_required
+                && controls
+                    .primary
+                    .as_ref()
+                    .is_none_or(|control| !control.acknowledged_invalidation(cursor.get())))
+                || (fallback_required
+                    && controls
+                        .fallback
+                        .as_ref()
+                        .is_none_or(|control| !control.acknowledged_invalidation(cursor.get())))
+        });
+        if missing_acknowledgement {
+            return Err(engine_fault(
+                self.cpu,
+                self.domain.descriptor().id,
+                nixe_cpu_engine::EngineFaultKind::Internal,
+                "executor retirement did not acknowledge the final invalidation cursor",
+            ));
         }
+        self.controls.clear();
+        Ok(())
     }
 
     pub(crate) fn execution_environment(
@@ -432,13 +583,13 @@ impl Drop for ProcessExecutionControl {
     }
 }
 
-impl crate::exception_dispatch::MappingInvalidationControl for ProcessExecutionControl {
+impl crate::exception_dispatch::MemoryMutationControl for ProcessExecutionControl {
     fn request_mapping_safepoint(&self) {
         Self::request_mapping_safepoint(self);
     }
 
-    fn publish_mapping_invalidation(&self, epoch: nixe_cpu::memory::MappingEpoch) {
-        Self::publish_mapping_invalidation(self, epoch);
+    fn publish_memory_invalidation(&self, cursor: nixe_memory::MemoryInvalidationCursor) {
+        Self::publish_memory_invalidation(self, cursor);
     }
 }
 
@@ -490,6 +641,9 @@ pub(crate) struct VcpuExecutionState {
     pub(crate) address_space_end: GuestVirtualAddress,
     pub(crate) instruction_budget: u64,
     pub(crate) loader_return: Option<GuestVirtualAddress>,
+    /// Physical-PE event/interrupt state. It is shared by every process slice
+    /// dispatched on this vCPU and is never process- or engine-owned.
+    pub(crate) events: VcpuEventState,
 }
 
 impl VcpuExecutionState {
@@ -512,7 +666,8 @@ impl VcpuExecutionState {
                     address_space: self.cpu.address_space_id(),
                     end_exclusive: self.address_space_end,
                     memory: self.memory.as_ref(),
-                    invalidation_generation: memory_lease.epoch().get(),
+                    mapping_epoch: memory_lease.epoch().get(),
+                    invalidation_cursor: self.memory.invalidation_cursor(),
                 },
                 &self.thread,
             )
@@ -529,6 +684,7 @@ impl VcpuExecutionState {
             instruction_budget,
             loader_return: self.loader_return,
             timer: &timer,
+            events: self.events.clone(),
         });
         result.map_err(|fault| ProcessExecutionError::Engine { fault })
     }

@@ -10,11 +10,11 @@ use nixe_cpu::state::a64::{
 };
 use nixe_cpu::state::{A32State, A64State, ThreadCpuState};
 
-pub(crate) const NATIVE_ABI_VERSION: u32 = 1;
+pub(crate) const NATIVE_ABI_VERSION: u32 = 3;
 
-const EXECUTION_STATE_A64: u32 = 0;
-const EXECUTION_STATE_A32: u32 = 1;
-const EXECUTION_STATE_T32: u32 = 2;
+pub(crate) const EXECUTION_STATE_A64: u32 = 0;
+pub(crate) const EXECUTION_STATE_A32: u32 = 1;
+pub(crate) const EXECUTION_STATE_T32: u32 = 2;
 
 pub(crate) const EXIT_NONE: u32 = 0;
 pub(crate) const EXIT_INTERPRET_ONE: u32 = 1;
@@ -22,6 +22,31 @@ pub(crate) const EXIT_BUDGET_EXHAUSTED: u32 = 2;
 pub(crate) const EXIT_SAFEPOINT: u32 = 3;
 pub(crate) const EXIT_PENDING_EVENT: u32 = 4;
 pub(crate) const EXIT_LOADER_RETURN: u32 = 5;
+pub(crate) const EXIT_DISPATCH: u32 = 6;
+pub(crate) const EXIT_ARCHITECTURAL: u32 = 7;
+pub(crate) const EXIT_UNSUPPORTED: u32 = 8;
+pub(crate) const EXIT_DATA_FAULT: u32 = 9;
+pub(crate) const EXIT_SCHEDULED: u32 = 10;
+pub(crate) const EXIT_INTERNAL: u32 = 11;
+
+pub(crate) const SCHEDULE_YIELD: u32 = 1;
+pub(crate) const SCHEDULE_WAIT_FOR_EVENT: u32 = 2;
+pub(crate) const SCHEDULE_WAIT_FOR_INTERRUPT: u32 = 3;
+pub(crate) const SCHEDULE_SEND_EVENT: u32 = 4;
+
+pub(crate) const SYSTEM_POLL: u32 = 0;
+pub(crate) const SYSTEM_CACHE_INSTRUCTION_INVALIDATE: u32 = 1;
+pub(crate) const SYSTEM_CACHE_DATA_INVALIDATE: u32 = 2;
+pub(crate) const SYSTEM_CACHE_DATA_CLEAN: u32 = 3;
+pub(crate) const SYSTEM_CACHE_DATA_CLEAN_INVALIDATE: u32 = 4;
+pub(crate) const SYSTEM_CACHE_INSTRUCTION_PREFETCH: u32 = 5;
+pub(crate) const SYSTEM_READ_RUNTIME_REGISTER: u32 = 6;
+pub(crate) const SYSTEM_WAIT_FOR_EVENT: u32 = 7;
+pub(crate) const SYSTEM_WAIT_FOR_INTERRUPT: u32 = 8;
+pub(crate) const SYSTEM_SEND_EVENT_LOCAL: u32 = 9;
+
+pub(crate) const MAX_HELPER_ARGUMENTS: usize = 16;
+pub(crate) const MAX_HELPER_RESULTS: usize = 4;
 
 /// Stable two-limb representation used instead of a compiler-specific `u128`
 /// ABI decision.
@@ -30,6 +55,16 @@ pub(crate) const EXIT_LOADER_RETURN: u32 = 5;
 pub(crate) struct AbiU128 {
     pub(crate) low: u64,
     pub(crate) high: u64,
+}
+
+/// Fixed scratch storage used only while crossing one typed helper boundary.
+/// Generated code never passes compiler-specific vector or 128-bit aggregate
+/// conventions through the C ABI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C, align(16))]
+pub(crate) struct HelperScratch {
+    pub(crate) arguments: [AbiU128; MAX_HELPER_ARGUMENTS],
+    pub(crate) results: [AbiU128; MAX_HELPER_RESULTS],
 }
 
 impl From<u128> for AbiU128 {
@@ -109,8 +144,6 @@ pub(crate) struct MemoryAcceleration {
 #[repr(C)]
 pub(crate) struct NativeControl {
     pub(crate) instruction_budget: u64,
-    pub(crate) timer_counter: u64,
-    pub(crate) timer_frequency: u64,
     pub(crate) loader_return: u64,
     pub(crate) invalidation_epoch: u64,
     pub(crate) request_flags: u32,
@@ -128,6 +161,18 @@ pub(crate) struct NativeExit {
     pub(crate) payload0: u64,
     pub(crate) payload1: u64,
     pub(crate) instructions_executed: u64,
+}
+
+/// Link-chain state that is private to one executor invocation. Native regions
+/// carry this state across tail calls; Rust resets the retired count whenever
+/// the sole link resolver regains control.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct NativeDispatch {
+    pub(crate) link_table: usize,
+    pub(crate) metadata: usize,
+    pub(crate) region_id: u64,
+    pub(crate) retired: u64,
 }
 
 macro_rules! define_helper_abi {
@@ -168,14 +213,25 @@ define_helper_abi! {
         frame: *mut ExecutionFrame,
         address: u64,
         descriptor: u64,
-        value: AbiU128,
+        value: *const AbiU128,
     ) -> u32;
     atomic: AtomicHelper(
         frame: *mut ExecutionFrame,
         address: u64,
         descriptor: u64,
-        operand: AbiU128,
+        operand: *const AbiU128,
         result: *mut AbiU128,
+    ) -> u32;
+    exclusive: ExclusiveHelper(
+        frame: *mut ExecutionFrame,
+        address: u64,
+        descriptor: u64,
+        value: *const AbiU128,
+        result: *mut AbiU128,
+    ) -> u32;
+    semantic: SemanticHelper(
+        frame: *mut ExecutionFrame,
+        operation: u32,
     ) -> u32;
     system: SystemHelper(
         frame: *mut ExecutionFrame,
@@ -184,8 +240,12 @@ define_helper_abi! {
     ) -> u32;
 }
 
-/// Published code uses the C calling convention and has no unwind-capable ABI.
-pub(crate) type NativeEntry = unsafe extern "C" fn(frame: *mut ExecutionFrame);
+/// Tail-convention entries are never invoked directly by Rust.
+pub(crate) type NativeEntryAddress = usize;
+
+/// The Cranelift-generated gateway is the sole C-ABI entry into a native chain.
+pub(crate) type NativeGateway =
+    unsafe extern "C" fn(frame: *mut ExecutionFrame, entry: NativeEntryAddress);
 
 pub(crate) static EMPTY_HELPER_TABLE: HelperTable = HelperTable {
     abi_version: NATIVE_ABI_VERSION,
@@ -193,6 +253,8 @@ pub(crate) static EMPTY_HELPER_TABLE: HelperTable = HelperTable {
     memory_read: None,
     memory_write: None,
     atomic: None,
+    exclusive: None,
+    semantic: None,
     system: None,
 };
 
@@ -208,8 +270,10 @@ pub(crate) struct ExecutionFrame {
     a32: A32Frame,
     pub(crate) memory: MemoryAcceleration,
     pub(crate) control: NativeControl,
+    pub(crate) dispatch: NativeDispatch,
     pub(crate) helpers: usize,
     pub(crate) host_context: usize,
+    pub(crate) scratch: HelperScratch,
     pub(crate) exit: NativeExit,
 }
 
@@ -224,8 +288,10 @@ impl Default for ExecutionFrame {
             a32: A32Frame::default(),
             memory: MemoryAcceleration::default(),
             control: NativeControl::default(),
+            dispatch: NativeDispatch::default(),
             helpers: std::ptr::from_ref(&EMPTY_HELPER_TABLE).addr(),
             host_context: 0,
+            scratch: HelperScratch::default(),
             exit: NativeExit::default(),
         }
     }
@@ -239,6 +305,16 @@ pub(crate) enum FrameError {
 }
 
 impl ExecutionFrame {
+    pub(crate) fn install_host_context(&mut self, helpers: &'static HelperTable, context: *mut ()) {
+        self.helpers = std::ptr::from_ref(helpers).addr();
+        self.host_context = context.addr();
+    }
+
+    pub(crate) fn clear_host_context(&mut self) {
+        self.helpers = std::ptr::from_ref(&EMPTY_HELPER_TABLE).addr();
+        self.host_context = 0;
+    }
+
     pub(crate) fn import_state(&mut self, state: &ThreadCpuState) {
         self.exit = NativeExit::default();
         match state {
@@ -366,6 +442,7 @@ impl ExecutionFrame {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FrameOffsets {
+    pub(crate) execution_state: usize,
     pub(crate) a64_x: usize,
     pub(crate) a64_sp: usize,
     pub(crate) a64_pc: usize,
@@ -388,15 +465,19 @@ pub(crate) struct FrameOffsets {
     pub(crate) memory_tlb_entry_count: usize,
     pub(crate) memory_tlb_index_mask: usize,
     pub(crate) control_instruction_budget: usize,
-    pub(crate) control_timer_counter: usize,
-    pub(crate) control_timer_frequency: usize,
     pub(crate) control_loader_return: usize,
     pub(crate) control_invalidation_epoch: usize,
     pub(crate) control_request_flags: usize,
     pub(crate) control_event_mask: usize,
     pub(crate) control_loader_return_valid: usize,
+    pub(crate) dispatch_link_table: usize,
+    pub(crate) dispatch_metadata: usize,
+    pub(crate) dispatch_region_id: usize,
+    pub(crate) dispatch_retired: usize,
     pub(crate) helpers: usize,
     pub(crate) host_context: usize,
+    pub(crate) scratch_arguments: usize,
+    pub(crate) scratch_results: usize,
     pub(crate) exit_kind: usize,
     pub(crate) exit_detail: usize,
     pub(crate) exit_source_pc: usize,
@@ -406,6 +487,7 @@ pub(crate) struct FrameOffsets {
 }
 
 pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
+    execution_state: offset_of!(ExecutionFrame, execution_state),
     a64_x: offset_of!(ExecutionFrame, a64) + offset_of!(A64Frame, x),
     a64_sp: offset_of!(ExecutionFrame, a64) + offset_of!(A64Frame, sp),
     a64_pc: offset_of!(ExecutionFrame, a64) + offset_of!(A64Frame, pc),
@@ -433,10 +515,6 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
         + offset_of!(MemoryAcceleration, tlb_index_mask),
     control_instruction_budget: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, instruction_budget),
-    control_timer_counter: offset_of!(ExecutionFrame, control)
-        + offset_of!(NativeControl, timer_counter),
-    control_timer_frequency: offset_of!(ExecutionFrame, control)
-        + offset_of!(NativeControl, timer_frequency),
     control_loader_return: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, loader_return),
     control_invalidation_epoch: offset_of!(ExecutionFrame, control)
@@ -446,8 +524,16 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
     control_event_mask: offset_of!(ExecutionFrame, control) + offset_of!(NativeControl, event_mask),
     control_loader_return_valid: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, loader_return_valid),
+    dispatch_link_table: offset_of!(ExecutionFrame, dispatch)
+        + offset_of!(NativeDispatch, link_table),
+    dispatch_metadata: offset_of!(ExecutionFrame, dispatch) + offset_of!(NativeDispatch, metadata),
+    dispatch_region_id: offset_of!(ExecutionFrame, dispatch)
+        + offset_of!(NativeDispatch, region_id),
+    dispatch_retired: offset_of!(ExecutionFrame, dispatch) + offset_of!(NativeDispatch, retired),
     helpers: offset_of!(ExecutionFrame, helpers),
     host_context: offset_of!(ExecutionFrame, host_context),
+    scratch_arguments: offset_of!(ExecutionFrame, scratch) + offset_of!(HelperScratch, arguments),
+    scratch_results: offset_of!(ExecutionFrame, scratch) + offset_of!(HelperScratch, results),
     exit_kind: offset_of!(ExecutionFrame, exit) + offset_of!(NativeExit, kind),
     exit_detail: offset_of!(ExecutionFrame, exit) + offset_of!(NativeExit, detail),
     exit_source_pc: offset_of!(ExecutionFrame, exit) + offset_of!(NativeExit, source_pc),
@@ -458,8 +544,9 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
 };
 
 impl FrameOffsets {
-    pub(crate) const fn all(self) -> [usize; 37] {
+    pub(crate) const fn all(self) -> [usize; 42] {
         [
+            self.execution_state,
             self.a64_x,
             self.a64_sp,
             self.a64_pc,
@@ -482,15 +569,19 @@ impl FrameOffsets {
             self.memory_tlb_entry_count,
             self.memory_tlb_index_mask,
             self.control_instruction_budget,
-            self.control_timer_counter,
-            self.control_timer_frequency,
             self.control_loader_return,
             self.control_invalidation_epoch,
             self.control_request_flags,
             self.control_event_mask,
             self.control_loader_return_valid,
+            self.dispatch_link_table,
+            self.dispatch_metadata,
+            self.dispatch_region_id,
+            self.dispatch_retired,
             self.helpers,
             self.host_context,
+            self.scratch_arguments,
+            self.scratch_results,
             self.exit_kind,
             self.exit_detail,
             self.exit_source_pc,
@@ -508,6 +599,8 @@ pub(crate) struct HelperOffsets {
     pub(crate) memory_read: usize,
     pub(crate) memory_write: usize,
     pub(crate) atomic: usize,
+    pub(crate) exclusive: usize,
+    pub(crate) semantic: usize,
     pub(crate) system: usize,
 }
 
@@ -517,17 +610,21 @@ pub(crate) const HELPER_OFFSETS: HelperOffsets = HelperOffsets {
     memory_read: offset_of!(HelperTable, memory_read),
     memory_write: offset_of!(HelperTable, memory_write),
     atomic: offset_of!(HelperTable, atomic),
+    exclusive: offset_of!(HelperTable, exclusive),
+    semantic: offset_of!(HelperTable, semantic),
     system: offset_of!(HelperTable, system),
 };
 
 impl HelperOffsets {
-    pub(crate) const fn all(self) -> [usize; 6] {
+    pub(crate) const fn all(self) -> [usize; 8] {
         [
             self.abi_version,
             self.byte_size,
             self.memory_read,
             self.memory_write,
             self.atomic,
+            self.exclusive,
+            self.semantic,
             self.system,
         ]
     }
@@ -536,7 +633,7 @@ impl HelperOffsets {
 const _: () = assert!(align_of::<ExecutionFrame>() == 16);
 const _: () = assert!(size_of::<ExecutionFrame>() <= u32::MAX as usize);
 const _: () = assert!(size_of::<HelperTable>() <= u32::MAX as usize);
-const _: () = assert!(size_of::<NativeEntry>() == size_of::<usize>());
+const _: () = assert!(size_of::<NativeGateway>() == size_of::<usize>());
 
 #[cfg(test)]
 mod tests {
@@ -563,6 +660,14 @@ mod tests {
         assert_eq!(
             FRAME_OFFSETS.control_instruction_budget,
             offset_of!(ExecutionFrame, control) + offset_of!(NativeControl, instruction_budget)
+        );
+        assert_eq!(
+            FRAME_OFFSETS.dispatch_link_table,
+            offset_of!(ExecutionFrame, dispatch) + offset_of!(NativeDispatch, link_table)
+        );
+        assert_eq!(
+            FRAME_OFFSETS.dispatch_retired,
+            offset_of!(ExecutionFrame, dispatch) + offset_of!(NativeDispatch, retired)
         );
         assert_eq!(FRAME_OFFSETS.helpers, offset_of!(ExecutionFrame, helpers));
         assert_eq!(
@@ -676,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_table_is_versioned_and_contains_no_placeholder_entrypoints() {
+    fn detached_helper_table_is_versioned_and_exposes_no_entrypoints() {
         assert_eq!(EMPTY_HELPER_TABLE.abi_version, NATIVE_ABI_VERSION);
         assert_eq!(
             EMPTY_HELPER_TABLE.byte_size as usize,
@@ -685,6 +790,8 @@ mod tests {
         assert!(EMPTY_HELPER_TABLE.memory_read.is_none());
         assert!(EMPTY_HELPER_TABLE.memory_write.is_none());
         assert!(EMPTY_HELPER_TABLE.atomic.is_none());
+        assert!(EMPTY_HELPER_TABLE.exclusive.is_none());
+        assert!(EMPTY_HELPER_TABLE.semantic.is_none());
         assert!(EMPTY_HELPER_TABLE.system.is_none());
     }
 }

@@ -1,7 +1,8 @@
 //! Portable CPU memory contracts and backends.
 //!
-//! Frontends fetch from the final process address space through these traits.
-//! They never consume loader images, file storage, or mutable host pointers.
+//! Frontends and engines reach the final process address space through these
+//! traits. They never consume loader images or file storage; retained direct
+//! backing addresses remain canonical-memory acceleration facts.
 
 mod common;
 mod contracts;

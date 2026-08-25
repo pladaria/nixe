@@ -9,7 +9,7 @@ use crate::{
     location::DecodedInstruction,
 };
 
-use super::{LiftOutcome, direct_target, emit_call, next_pc, sign_extend};
+use super::{LiftOutcome, call_terminator, direct_target, next_pc, sign_extend};
 
 pub(super) fn lift(
     builder: &mut IrBuilder,
@@ -29,7 +29,7 @@ pub(super) fn lift(
         ControlInstruction::BranchLinkImmediate(_) => {
             let target =
                 direct_target(source, sign_extend(u64::from(fields.immediate_26), 26) << 2);
-            LiftOutcome::Terminate(emit_call(builder, source, target, next_pc(source))?)
+            LiftOutcome::Terminate(call_terminator(target, next_pc(source)))
         }
         ControlInstruction::BranchRegister(_) => lift_branch_register(builder, decoded, fields)?,
         ControlInstruction::ConditionalBranch(_) => {
@@ -63,10 +63,10 @@ fn lift_branch_register(
     }
     let address_bits = read_gpr(builder, source, rn, IrType::I64, Register31::Zero)?;
     let address = guest_address_from_integer(builder, source, address_bits)?;
-    let target = indirect_target(address, ExecutionState::A64);
+    let target = indirect_target(address, ExecutionState::A64, source);
     Ok(match masked {
         0xd61f_0000 => LiftOutcome::Terminate(Terminator::Indirect { target }),
-        0xd63f_0000 => LiftOutcome::Terminate(emit_call(builder, source, target, next_pc(source))?),
+        0xd63f_0000 => LiftOutcome::Terminate(call_terminator(target, next_pc(source))),
         0xd65f_0000 => LiftOutcome::Terminate(Terminator::Return { target }),
         _ => unreachable!(),
     })

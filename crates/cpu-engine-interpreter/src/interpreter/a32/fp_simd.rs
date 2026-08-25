@@ -18,6 +18,7 @@ use nixe_memory::GuestVirtualAddress;
 pub(super) enum Execution {
     Control(SemanticControl),
     Fault(nixe_cpu::memory::DataAccessFault),
+    FloatingPointException,
 }
 
 pub(super) fn execute(
@@ -97,19 +98,19 @@ pub(super) fn execute(
         VectorOperation::SubtractInteger { lane_bits } => lanes(lhs, rhs, width, lane_bits, true),
         VectorOperation::AddF32 | VectorOperation::SubtractF32 | VectorOperation::MultiplyF32 => {
             let operation = match data.operation {
-                VectorOperation::AddF32 => super::super::a64::fp_simd::Binary32Operation::Add,
+                VectorOperation::AddF32 => nixe_cpu::semantics::a64_fp_simd::Binary32Operation::Add,
                 VectorOperation::SubtractF32 => {
-                    super::super::a64::fp_simd::Binary32Operation::Subtract
+                    nixe_cpu::semantics::a64_fp_simd::Binary32Operation::Subtract
                 }
                 VectorOperation::MultiplyF32 => {
-                    super::super::a64::fp_simd::Binary32Operation::Multiply
+                    nixe_cpu::semantics::a64_fp_simd::Binary32Operation::Multiply
                 }
                 _ => unreachable!(),
             };
             let mut result = 0_u128;
             let mut status = nixe_cpu::semantics::floating_point::FpStatus::default();
             for shift in (0..width).step_by(32) {
-                let (lane, lane_status) = super::super::a64::fp_simd::binary32(
+                let (lane, lane_status) = nixe_cpu::semantics::a64_fp_simd::binary32(
                     operation,
                     (lhs >> shift) as u32,
                     (rhs >> shift) as u32,
@@ -118,10 +119,12 @@ pub(super) fn execute(
                 result |= u128::from(lane) << shift;
                 merge_status(&mut status, lane_status);
             }
-            if super::super::a64::fp_simd::fp_status_traps(status, state.fpscr()) {
-                return Err(super::super::unsupported(decoded));
+            if nixe_cpu::semantics::a64_fp_simd::fp_status_traps(status, state.fpscr()) {
+                return Ok(Execution::FloatingPointException);
             }
-            state.set_fpscr(state.fpscr() | super::super::a64::fp_simd::fp_status_bits(status));
+            state.set_fpscr(
+                state.fpscr() | nixe_cpu::semantics::a64_fp_simd::fp_status_bits(status),
+            );
             result
         }
     } & mask;

@@ -712,6 +712,7 @@ The primary source files are:
 | Device-neutral identities and generations | [`crates/memory/src/lib.rs`](../../crates/memory/src/lib.rs) |
 | Device-neutral permissions and access declarations | [`crates/memory/src/access.rs`](../../crates/memory/src/access.rs) |
 | CPU/device visibility contracts | [`crates/memory/src/visibility.rs`](../../crates/memory/src/visibility.rs) |
+| Bounded engine-neutral invalidation stream | [`crates/memory/src/invalidation.rs`](../../crates/memory/src/invalidation.rs) |
 | Retained canonical RAM and allocations | [`crates/memory/src/backing.rs`](../../crates/memory/src/backing.rs) |
 | Checked pointer-free backing ranges | [`crates/memory/src/range.rs`](../../crates/memory/src/range.rs) |
 | Public memory-module facade and re-exports | [`crates/cpu/src/memory/mod.rs`](../../crates/cpu/src/memory/mod.rs) |
@@ -942,7 +943,7 @@ The second halfword can fault independently at its exact address.
 
 ### CpuMemory
 
-`CpuMemory` is the interpreter-facing data contract. Each access explicitly
+`CpuMemory` is the engine-facing semantic data contract. Each access explicitly
 describes:
 
 - byte width from 1 through 16;
@@ -1066,13 +1067,16 @@ This is a software lookup structure, not an emulation of Arm translation-table
 descriptor levels. Its shape was selected for the interpreter's workload:
 large sparse guest spaces with many neighboring code/data pages.
 
-### Execution leases and serialized semantic transactions
+### Execution leases and canonical transactions
 
 The `CpuMemory` contract performs guest writes and MMIO callbacks through
 `&self`, and parallel workers may share one execution-memory instance.
-`ExecutionMemory` therefore serializes semantic mapping, RAM, MMIO, and
-cross-page transactions with one recoverable mutex. This conservative policy
-keeps complete accesses indivisible while permitting one executor per vCPU.
+`ExecutionMemory` uses one recoverable mapping/semantic mutex for virtual
+resolution, MMIO callbacks, and compound cross-page slow paths. Naturally
+aligned ordinary RAM can instead use a retained canonical lease, while atomic
+read/modify/write and compare/exchange linearize at the canonical physical
+page. The mapping mutex is not a guest memory barrier and is not the authority
+for an atomic modification order.
 
 A separate lease state records the active bounded execution slices, whether a
 mapping mutation has closed admission, and the current mapping epoch. A mapping
@@ -1085,9 +1089,12 @@ a fetch no longer performs one associative lookup for the virtual mapping and
 a second associative lookup for the physical page. After resolving the sparse
 leaf, the mapping contains a directly indexable physical slot.
 
-This mutex is the current semantic slow path, not the future JIT software TLB.
-Fast entries must use explicit retained leases and invalidation rather than
-unchecked interior mutability or a borrow held across arbitrary helpers.
+The semantic mutex is not the JIT software TLB. Fast entries use explicit
+retained leases and invalidation rather than unchecked interior mutability or a
+borrow held across arbitrary helpers. Atomic helpers bypass TLB-local identity
+and operate on canonical backing; successful writes advance physical
+generation and epochs, so already-installed ordinary TLB entries observe the
+same bytes and exclusive reservations become stale through every alias.
 
 ### Virtual entries
 
@@ -1309,11 +1316,15 @@ generation without changing the content generation. Code dependencies retain
 both values, so a block compiled under an old executable view becomes stale
 without falsely recording a byte write.
 
-The translator already attaches these dependencies to IR blocks. The current
-reference executor and the established pre-code JIT executor do not maintain a
-native-code cache. JIT-007 and JIT-010 add the one domain cache which retains
-the complete dependency set for every region and invalidates it through the
-engine-neutral stream before stale code can be entered.
+The translator attaches these dependencies to IR regions. The reference
+executor maintains no native code. The Cranelift JIT has one bounded domain
+cache: its fixed hot key contains the root mapping, while immutable region
+metadata and reverse indexes retain every physical and virtual-mapping
+dependency. Each domain consumes mapping and physical executable-content
+records through its own cursor, clears affected links and entries through those
+reverse indexes, and acknowledges only after stale code is unreachable. Native
+storage is reused after every potentially executing vCPU passes the retirement
+epoch.
 
 ### Atomic page installation
 
@@ -1508,24 +1519,36 @@ architectural TLB entries, or emulate access/dirty bits. This is acceptable
 while guest-visible faults, permissions, aliases, attributes, and SVC results
 remain correct.
 
-A future host-side software TLB would be an implementation cache, not an
-emulated architectural TLB.
+The JIT's host-side software TLB is an implementation cache, not an emulated
+architectural TLB.
 
-### Memory ordering and caches are not a complete hardware model
+### Memory ordering and cache scope
 
-The access descriptor retains ordering and access class, and exclusive
-reservations use physical identity and generation. The current process model
-executes one guest thread on one vCPU at a time. This serialized behavior is
-retained during scheduler migration as a permanent deterministic policy, which
-models all configured vCPUs while permitting only one guest slice to execute at
-once. Parallel policy will instead use at most one long-lived host worker per
-active vCPU; guest threads remain scheduler-owned runtime objects rather than
-dedicated host threads. Canonical backing records conservative CPU/device
-visibility authority and can invoke an injected reconciliation slow path. Nixe
-does not reproduce the complete multicore Arm memory model, cache hierarchy,
-device coherence, or all cache-maintenance effects.
+The access descriptor retains plain, acquire, release, acquire-release, and
+sequentially consistent order plus normal, atomic, exclusive, or volatile
+class. DMB, DSB, and ISB retain their shareability domain and read/write scope
+in an engine-neutral descriptor. The interpreter, Cranelift JIT, and a future
+NCE map those same facts independently; none imports another engine's helper
+semantics.
 
-## Planned dynamic-recompiler memory path
+Exclusive reservations use canonical physical identity, exact byte offset and
+width, and the observed page generation. Atomic RMW/CAS operations use the
+canonical page writer and publish content generations, store epochs, device
+visibility, and executable invalidation on successful stores. Failed CAS does
+not publish a write. Virtual aliases therefore share one modification order,
+and TLB entries cache access authority rather than creating a second atomic
+identity. Migration clears the monitor owned by the old vCPU executor.
+
+Deterministic scheduling remains a permanent policy and oracle, but the memory
+contract is also exercised by real parallel host workers. Parallel policy uses
+at most one long-lived worker per active vCPU; guest threads remain
+scheduler-owned runtime objects rather than dedicated host threads. Canonical
+backing records conservative CPU/device visibility authority and can invoke an
+injected reconciliation slow path. Nixe still does not reproduce a literal
+guest cache hierarchy or every platform-specific device-coherence and
+cache-maintenance effect.
+
+## Dynamic-recompiler memory path
 
 This section records the canonical-memory side of the production Cranelift JIT
 architecture. Here, *dynamic recompiler* means Nixe translating guest Arm code
@@ -1572,12 +1595,12 @@ JIT helper ABI
 CpuMemory / ExecutionMemory
         │
         ▼
-value, precise fault, or dispatcher exit
+value, precise fault, or normalized engine exit
 ```
 
-The completed production path also has one small software TLB owned by each JIT
-executor. A callback-only load/store path is transitional and is removed when
-the fast path is complete. A conceptual entry contains:
+The production path has one small software TLB owned by each JIT executor. The
+same precise helpers serve misses and special cases; there is no callback-only
+parallel memory implementation. A conceptual entry contains:
 
 ```text
 address-space ID + guest-page tag
@@ -1588,7 +1611,7 @@ address-space ID + guest-page tag
         └── mapping epoch and page identity
 ```
 
-On a hit, generated code may perform an in-page ordinary RAM access directly
+On a hit, generated code performs an in-page ordinary RAM access directly
 after checking the tag, permissions, width, and page boundary. It must produce
 the guest's little-endian result on every supported host. A miss or unsupported
 entry exits to the semantic slow path. The retained lease, not the raw pointer,
@@ -1619,13 +1642,15 @@ ordering, and visibility behavior.
 
 ### Mapping and code-cache invalidation
 
-Every mapping or executable-content mutation publishes one monotonic,
-engine-neutral invalidation record. Mapping, unmapping, changing permissions,
-replacing backing, and code writes describe the semantic address-space or
-canonical-page change without naming a JIT region, TLB entry, link cell, or NCE
-framework object. Each engine domain consumes the stream through its own
-acknowledged cursor. Safepoints provide the boundary at which stale derived
-state becomes unreachable.
+Mapping, unmapping, changing permissions, and replacing backing advance the
+neutral mapping epoch and publish the affected virtual range. Writes to a
+physical page observed through an executable or code-purpose alias publish its
+canonical page identity; `IC` can publish a page or the complete address space.
+Publication of a device-originated write to an observed page emits that same
+physical invalidation before the writeback can become CPU-visible.
+Records never name a JIT region, TLB entry, link cell, or NCE framework object.
+Each engine domain consumes the bounded stream through its own acknowledged
+cursor, with lost history requiring conservative full eviction.
 
 A JIT region cache retains two related dependencies:
 
@@ -1639,31 +1664,41 @@ guest region entry + address-space identity
 
 Writes through any alias must remain visible to every other alias. A direct JIT
 store uses leased canonical metadata to advance the content/reservation
-generation without a Rust callback. The first-write contract separately
-publishes CPU-newer visibility. Executable and observed pages remain on the
+generation and store-wide mutation epochs without a Rust callback. The
+first-write contract separately publishes CPU-newer visibility. Executable and
+observed pages remain on the
 precise path, so optimizing later ordinary stores cannot make self-modifying
 code, writable aliases, or exclusive reservations stale. The JIT invalidates
-link cells and lookup entries before
-retiring affected native regions and reclaims them only after all executors
-pass the retirement epoch.
+link cells and lookup entries before retiring affected native regions, then
+reclaims storage only after all executors pass the retirement epoch.
 
 ### Ownership and concurrency
 
-`ExecutionMemory` currently uses a recoverable mutex for semantic transactions
-and a separate mapping-stable execution lease for every bounded engine slice.
-Generated code cannot hold the transaction mutex while calling arbitrary
-runtime helpers, and an execution lease alone does not authorize unchecked raw
-access.
+`ExecutionMemory` uses a recoverable mutex for mapping resolution, MMIO, and
+compound semantic transactions, plus a mapping-stable execution lease for
+every bounded engine slice. Canonical ordinary RAM accesses and physical atomic
+transactions may run concurrently after resolution. Generated code cannot hold
+the semantic mutex while calling arbitrary runtime helpers, and an execution
+lease alone does not authorize unchecked raw access.
 
-A neutral direct-access API in canonical memory must therefore return a safe
-backing lease plus validity, permissions, visibility, identity, and lifetime
-facts. It must not expose the JIT's TLB representation. Mapping mutation is
+A neutral direct-access API in canonical memory returns a safe backing lease
+plus validity, permissions, visibility, identity, generation, and lifetime
+facts. It does not expose the JIT's TLB representation. Mapping mutation is
 excluded while generated code can use an affected lease and is coordinated
 through control requests, exits, invalidation cursors, and safepoints. The
 existing parallel policy already requires thread-safe generations, exclusives,
 mapping mutation, backing lifetime, bounded controls, and acknowledged
 invalidation. The JIT must satisfy the same capability gate; deterministic
 policy remains the oracle over the same canonical backing and vCPU model.
+
+Teardown closes engine admission before canonical memory is released. Each
+worker makes its executor-local TLB and retained backing leases unreachable,
+acknowledges the final invalidation cursor, and clears its exclusive monitor.
+Only after all executors are dropped may the domain reconcile remaining NCE
+dirty mappings or drain JIT retirement epochs and release its VM/cache. A
+successful coordinator shutdown consumes every process teardown, so no engine
+domain or executor retains the address-space backing afterward. JIT compilation
+cancellation is private cache state and never changes this memory authority.
 
 Every interpreter, JIT, or optional platform NCE engine uses this memory model
 as semantic authority. An NCE domain may mirror or map canonical pages only if

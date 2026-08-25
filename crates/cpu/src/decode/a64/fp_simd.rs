@@ -1431,7 +1431,7 @@ instructions!(
     ScalarFloatConditionalSelect,
 );
 
-pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
+pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
     let operands = Operands {
         rd: (bits & 0x1f) as u8,
         rn: ((bits >> 5) & 0x1f) as u8,
@@ -1448,7 +1448,7 @@ pub(super) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         vector_128: bits & (1 << 30) != 0,
         subtract: bits & (1 << 29) != 0,
         scaled: bits & (1 << 12) != 0,
-        helper_token: A64HelperToken(bits),
+        helper_token: A64HelperToken::new(instruction_id, bits),
         immediate_5: ((bits >> 16) & 0x1f) as u8,
         rt2: ((bits >> 10) & 0x1f) as u8,
         immediate_7: ((bits >> 15) & 0x7f) as u8,

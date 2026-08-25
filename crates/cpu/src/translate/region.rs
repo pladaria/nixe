@@ -77,7 +77,7 @@ pub fn translate_region(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrRegion, FrontendError> {
     translate_region_internal(config, profile, address_space, start, memory, false)
 }
@@ -87,7 +87,7 @@ pub(crate) fn translate_region_with_disassembly(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrRegion, FrontendError> {
     translate_region_internal(config, profile, address_space, start, memory, true)
 }
@@ -97,7 +97,7 @@ fn translate_region_internal(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
     capture_disassembly: bool,
 ) -> Result<IrRegion, FrontendError> {
     validate_config(config)?;
@@ -222,7 +222,7 @@ fn cut_blocks_at_entry(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     entry: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
     capture_disassembly: bool,
 ) -> Result<(), FrontendError> {
     for block in blocks {

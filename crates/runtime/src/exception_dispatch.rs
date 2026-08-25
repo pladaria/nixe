@@ -8,13 +8,14 @@
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::{
     memory::{
-        ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError, MemoryMappingPurpose,
+        ExecutionMemory, MemoryAttributes, MemoryMappingError, MemoryMappingPurpose,
         MemoryPermissions, MemoryProtectionError, ProcessMemory,
     },
     profile::ProcessCpuContext,
     state::ThreadCpuState,
 };
 use nixe_memory::CanonicalRangeTranslator;
+use nixe_memory::MemoryInvalidationSource;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
@@ -68,14 +69,14 @@ impl std::fmt::Debug for GuestBreakPayload {
 
 pub use nixe_cpu_engine::ExceptionDispatchRequest;
 
-pub(crate) trait MappingInvalidationControl {
+pub(crate) trait MemoryMutationControl {
     fn request_mapping_safepoint(&self);
-    fn publish_mapping_invalidation(&self, epoch: MappingEpoch);
+    fn publish_memory_invalidation(&self, cursor: nixe_memory::MemoryInvalidationCursor);
 }
 
 pub(crate) struct ExceptionProcessResources<'a> {
     pub memory: &'a ExecutionMemory,
-    pub mapping_control: &'a dyn MappingInvalidationControl,
+    pub mapping_control: &'a dyn MemoryMutationControl,
     pub canonical_memory: &'a dyn CanonicalRangeTranslator,
     pub mounts: &'a ProcessMountNamespace,
     pub handles: &'a mut HandleTable,
@@ -189,7 +190,7 @@ pub struct ExceptionProcessContext<'a> {
     heap_size: &'a mut u64,
     initial_memory_size: u64,
     memory: &'a ExecutionMemory,
-    mapping_control: &'a dyn MappingInvalidationControl,
+    mapping_control: &'a dyn MemoryMutationControl,
     canonical_memory: &'a dyn CanonicalRangeTranslator,
     mounts: &'a ProcessMountNamespace,
     handles: &'a mut HandleTable,
@@ -305,7 +306,7 @@ impl<'a> ExceptionProcessContext<'a> {
             purpose,
         )?;
         self.mapping_control
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 
@@ -319,7 +320,7 @@ impl<'a> ExceptionProcessContext<'a> {
         self.memory
             .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
         self.mapping_control
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 
@@ -334,7 +335,7 @@ impl<'a> ExceptionProcessContext<'a> {
         self.memory
             .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
         self.mapping_control
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 

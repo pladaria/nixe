@@ -172,8 +172,10 @@ pub struct FakeNceDomain {
     metrics: Arc<FakeNceMetrics>,
     shadow: Arc<Mutex<BTreeMap<EngineExecutorId, ThreadCpuState>>>,
     mappings: Arc<Mutex<Vec<MirroredMapping>>>,
+    controls: Vec<EngineControl>,
     address_space: Option<AddressSpaceId>,
     mapping_generation: u64,
+    stopping: bool,
     torn_down: bool,
 }
 
@@ -186,8 +188,10 @@ impl FakeNceDomain {
             metrics,
             shadow: Arc::new(Mutex::new(BTreeMap::new())),
             mappings: Arc::new(Mutex::new(Vec::new())),
+            controls: Vec::new(),
             address_space: None,
             mapping_generation: 0,
+            stopping: false,
             torn_down: false,
         }
     }
@@ -219,7 +223,7 @@ impl FakeNceDomain {
         let next = snapshot_mappings(binding).map_err(|message| self.fault(message))?;
         publish_mappings(&self.mappings, &self.metrics, next);
         self.address_space = Some(binding.address_space);
-        self.mapping_generation = binding.invalidation_generation;
+        self.mapping_generation = binding.mapping_epoch;
         Ok(())
     }
 }
@@ -234,7 +238,7 @@ impl EngineDomain for FakeNceDomain {
     }
 
     fn bind_memory(&mut self, binding: DomainMemoryBinding<'_>) -> Result<(), EngineFault> {
-        if self.torn_down {
+        if self.stopping || self.torn_down {
             return Err(self.fault("fake NCE domain has been shut down"));
         }
         self.mirror(binding)
@@ -244,10 +248,14 @@ impl EngineDomain for FakeNceDomain {
         &mut self,
         executor: EngineExecutorId,
     ) -> Result<Box<dyn EngineExecutor>, EngineFault> {
-        if self.torn_down || self.address_space.is_none() {
+        if self.stopping || self.torn_down || self.address_space.is_none() {
             return Err(self.fault("fake NCE domain is not bound"));
         }
         let oracle = self.oracle.create_executor(executor)?;
+        let control = oracle
+            .control()
+            .expect("the fake NCE oracle provides a bounded stop control");
+        self.controls.push(control);
         Ok(Box::new(FakeNceExecutor {
             id: executor,
             oracle,
@@ -258,7 +266,16 @@ impl EngineDomain for FakeNceDomain {
         }))
     }
 
+    fn request_stop(&mut self) -> Result<(), EngineFault> {
+        for control in &self.controls {
+            control.request(nixe_cpu_engine::CrossVcpuRequest::Preempt);
+        }
+        self.stopping = true;
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> Result<(), EngineFault> {
+        self.request_stop()?;
         if !self.torn_down {
             self.torn_down = true;
             self.mappings
@@ -269,6 +286,7 @@ impl EngineDomain for FakeNceDomain {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
+            self.controls.clear();
             self.metrics.teardowns.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
@@ -307,6 +325,7 @@ impl EngineExecutor for FakeNceExecutor {
             instruction_budget,
             loader_return,
             timer,
+            events,
         } = request;
         let mut shadow = self
             .shadow
@@ -348,6 +367,7 @@ impl EngineExecutor for FakeNceExecutor {
                 instruction_budget,
                 loader_return,
                 timer,
+                events,
             }),
         };
         if result.is_ok() {
@@ -362,17 +382,17 @@ impl EngineExecutor for FakeNceExecutor {
 
     fn synchronize_invalidation(
         &mut self,
-        epoch: u64,
+        cursor: nixe_memory::MemoryInvalidationCursor,
         state: &ThreadCpuState,
         memory: &dyn CpuMemory,
     ) -> Result<(), EngineFault> {
-        if epoch > self.acknowledged_epoch {
-            self.acknowledged_epoch = epoch;
+        if cursor.get() > self.acknowledged_epoch {
+            self.acknowledged_epoch = cursor.get();
             self.metrics
                 .invalidation_syncs
                 .fetch_add(1, Ordering::AcqRel);
         }
-        self.oracle.synchronize_invalidation(epoch, state, memory)
+        self.oracle.synchronize_invalidation(cursor, state, memory)
     }
 
     fn synchronize_address_space(
@@ -382,7 +402,7 @@ impl EngineExecutor for FakeNceExecutor {
     ) -> Result<(), EngineFault> {
         let next = snapshot_mappings(binding).map_err(|message| executor_fault(state, message))?;
         publish_mappings(&self.mappings, &self.metrics, next);
-        self.synchronize_invalidation(binding.invalidation_generation, state, binding.memory)
+        self.synchronize_invalidation(binding.invalidation_cursor, state, binding.memory)
     }
 
     fn control(&self) -> Option<EngineControl> {

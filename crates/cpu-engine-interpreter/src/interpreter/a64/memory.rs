@@ -5,8 +5,8 @@ use nixe_cpu::{
     },
     location::DecodedInstruction,
     memory::{
-        CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-        MemoryAlignment, MemoryOrdering, MemoryValue,
+        AtomicRmwKind, CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass,
+        MemoryAccessSize, MemoryAlignment, MemoryOrdering, MemoryValue,
     },
     semantics::a64::{
         LoadSpec, ScalarTransfer, literal_load, memory_size, pair_transfer, scalar_transfer,
@@ -45,6 +45,11 @@ pub(super) fn execute(
         Instruction::LoadExclusive(_) | Instruction::StoreExclusive(_) => {
             exclusive(context, memory, address_space, state, fields, instruction)
         }
+        Instruction::AtomicReadModifyWrite(_)
+        | Instruction::CompareAndSwap(_)
+        | Instruction::CompareAndSwapPair(_) => {
+            atomic(memory, address_space, state, fields, instruction)
+        }
     };
     match result {
         Ok(Some(())) => {
@@ -57,6 +62,137 @@ pub(super) fn execute(
             fault,
         }),
     }
+}
+
+fn atomic_ordering(fields: Operands) -> MemoryOrdering {
+    match (fields.acquire, fields.release) {
+        (false, false) => MemoryOrdering::Relaxed,
+        (true, false) => MemoryOrdering::Acquire,
+        (false, true) => MemoryOrdering::Release,
+        (true, true) => MemoryOrdering::AcquireRelease,
+    }
+}
+
+fn atomic(
+    memory: &dyn CpuMemory,
+    address_space: AddressSpaceId,
+    state: &mut A64State,
+    fields: Operands,
+    instruction: Instruction,
+) -> MemoryStep {
+    let address = GuestVirtualAddress::new(read(state, fields.rn, 64, true));
+    let ordering = atomic_ordering(fields);
+    match instruction {
+        Instruction::AtomicReadModifyWrite(_) => {
+            let kind = match fields.atomic_opcode {
+                0 => AtomicRmwKind::Add,
+                1 => AtomicRmwKind::Clear,
+                2 => AtomicRmwKind::Xor,
+                3 => AtomicRmwKind::Set,
+                4 => AtomicRmwKind::SignedMaximum,
+                5 => AtomicRmwKind::SignedMinimum,
+                6 => AtomicRmwKind::UnsignedMaximum,
+                7 => AtomicRmwKind::UnsignedMinimum,
+                8 => AtomicRmwKind::Swap,
+                _ => return Ok(None),
+            };
+            let size = memory_size(fields.size);
+            let descriptor = MemoryAccess::new(
+                size,
+                MemoryAlignment::Natural,
+                ordering,
+                MemoryAccessClass::Atomic,
+            );
+            let operand = register_value(state, fields.rm, size);
+            let result = memory.atomic_read_modify_write(
+                address_space,
+                address,
+                descriptor,
+                kind,
+                operand,
+            )?;
+            write_loaded(
+                state,
+                fields.rt,
+                size,
+                LoadSpec::unsigned(size),
+                result.previous,
+            );
+        }
+        Instruction::CompareAndSwap(_) => {
+            let size = memory_size(fields.size);
+            let descriptor = MemoryAccess::new(
+                size,
+                MemoryAlignment::Natural,
+                ordering,
+                MemoryAccessClass::Atomic,
+            );
+            let result = memory.atomic_compare_exchange(
+                address_space,
+                address,
+                descriptor,
+                register_value(state, fields.rm, size),
+                register_value(state, fields.rt, size),
+            )?;
+            write_loaded(
+                state,
+                fields.rm,
+                size,
+                LoadSpec::unsigned(size),
+                result.previous,
+            );
+        }
+        Instruction::CompareAndSwapPair(_) => {
+            if fields.size > 1 || fields.rm & 1 != 0 || fields.rt & 1 != 0 {
+                return Ok(None);
+            }
+            let element_size = if fields.size == 0 {
+                MemoryAccessSize::Word
+            } else {
+                MemoryAccessSize::Doubleword
+            };
+            let access_size = if fields.size == 0 {
+                MemoryAccessSize::Doubleword
+            } else {
+                MemoryAccessSize::Quadword
+            };
+            let descriptor = MemoryAccess::new(
+                access_size,
+                MemoryAlignment::Natural,
+                ordering,
+                MemoryAccessClass::Atomic,
+            );
+            let pair = |state: &A64State, first: u8| {
+                let low = register_value(state, first, element_size).bits();
+                let high = register_value(state, first + 1, element_size).bits();
+                MemoryValue::from_bits(access_size, low | (high << (element_size.bytes() * 8)))
+            };
+            let result = memory.atomic_compare_exchange(
+                address_space,
+                address,
+                descriptor,
+                pair(state, fields.rm),
+                pair(state, fields.rt),
+            )?;
+            let bits = result.previous.bits();
+            write(
+                state,
+                fields.rm,
+                element_size.bytes() as u8 * 8,
+                false,
+                bits as u64,
+            );
+            write(
+                state,
+                fields.rm + 1,
+                element_size.bytes() as u8 * 8,
+                false,
+                (bits >> (element_size.bytes() * 8)) as u64,
+            );
+        }
+        _ => unreachable!(),
+    }
+    Ok(Some(()))
 }
 
 fn exclusive(

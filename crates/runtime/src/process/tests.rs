@@ -326,7 +326,9 @@ fn worker_slice_moves_thread_state_out_of_the_process_until_reconciliation() {
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(3);
 
-    let execution = process.begin_thread_execution(thread, vcpu, 1).unwrap();
+    let execution = process
+        .begin_thread_execution(thread, vcpu, 1, nixe_cpu_engine::VcpuEventState::default())
+        .unwrap();
     assert!(process.main_thread().state.is_none());
 
     process.abort_thread_execution(thread, vcpu, execution);
@@ -360,13 +362,13 @@ fn runtime_mapping_mutation_requires_engine_acknowledgement_before_reentry() {
             MemoryMappingPurpose::Heap,
         )
         .unwrap();
-    let epoch = process.mapping_epoch();
-    assert!(!process.mapping_invalidation_acknowledged(epoch));
+    let cursor = process.memory.invalidation_cursor();
+    assert!(!process.memory_invalidation_acknowledged(cursor));
     assert_eq!(
         process.run(0).unwrap().stop,
         crate::ExecutionStop::BudgetExhausted
     );
-    assert!(process.mapping_invalidation_acknowledged(epoch));
+    assert!(process.memory_invalidation_acknowledged(cursor));
 }
 
 #[test]
@@ -454,6 +456,15 @@ pub(crate) fn synthetic_process_for_coordinator(process_id: u64) -> RunnableProc
         })
         .build(&plan)
         .unwrap()
+}
+
+pub(crate) fn synthetic_instruction_process_for_coordinator(
+    process_id: u64,
+    encodings: &[u32],
+) -> RunnableProcess {
+    let mut process = synthetic_process_for_coordinator(process_id);
+    replace_entry_instructions(&mut process, encodings);
+    process
 }
 
 pub(crate) fn synthetic_svc_process_for_coordinator(process_id: u64) -> RunnableProcess {

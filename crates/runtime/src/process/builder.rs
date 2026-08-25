@@ -410,7 +410,6 @@ fn engine_requirements(state: ExecutionState) -> nixe_cpu_engine::EngineCapabili
         a64: state == ExecutionState::A64,
         a32: state == ExecutionState::A32,
         t32: state == ExecutionState::T32,
-        deterministic_execution: true,
         ..Default::default()
     }
 }
@@ -458,13 +457,8 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
     match plan.kind() {
         LaunchKind::Packaged(identity) => {
             let npdm = identity.npdm();
-            let state = if npdm.flags().is_64_bit_instruction() {
-                ExecutionState::A64
-            } else {
-                ExecutionState::A32
-            };
             ProcessMetadata {
-                execution_state: state,
+                execution_state: plan.initial_execution_state(),
                 address_space: ProcessAddressSpace::from_npdm(npdm.flags().address_space()),
                 stack_size: u64::from(npdm.main_thread_stack_size()),
                 abi: InitialProcessAbi::Packaged,
@@ -483,7 +477,7 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
             }
         }
         LaunchKind::Homebrew(_) => ProcessMetadata {
-            execution_state: ExecutionState::A64,
+            execution_state: plan.initial_execution_state(),
             address_space: ProcessAddressSpace::Bit64,
             stack_size: DEFAULT_HOME_BREW_STACK_SIZE,
             abi: InitialProcessAbi::Homebrew,

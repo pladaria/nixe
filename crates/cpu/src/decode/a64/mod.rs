@@ -26,12 +26,41 @@ use super::{
 /// lifter. It is not an operand source and deliberately exposes no bit-field
 /// access API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct A64HelperToken(u32);
+pub struct A64HelperToken {
+    instruction_id: u32,
+    encoding: u32,
+}
 
 impl A64HelperToken {
+    pub(super) const fn new(instruction_id: u32, encoding: u32) -> Self {
+        Self {
+            instruction_id,
+            encoding,
+        }
+    }
+
     #[must_use]
     pub const fn helper_abi_value(self) -> u32 {
-        self.0
+        self.encoding
+    }
+
+    /// Stable semantic-helper identity containing the normalized instruction
+    /// family and its opaque encoding. Lifters forward this value unchanged;
+    /// only the architectural semantic provider may unpack it.
+    #[must_use]
+    pub const fn semantic_abi_value(self) -> u64 {
+        (self.instruction_id as u64) << 32 | self.encoding as u64
+    }
+
+    pub(crate) const fn from_semantic_abi_value(value: u64) -> Self {
+        Self {
+            instruction_id: (value >> 32) as u32,
+            encoding: value as u32,
+        }
+    }
+
+    pub(crate) const fn instruction_id(self) -> u32 {
+        self.instruction_id
     }
 }
 
@@ -61,7 +90,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0003 | 0x0000_0010..=0x0000_001d | 0x0000_0020..=0x0000_0021 => {
             A64Instruction::Integer(integer::normalize(instruction_id, bits))
         }
-        0x0000_0022..=0x0000_002c => {
+        0x0000_0022..=0x0000_002f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
         0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
@@ -199,6 +228,37 @@ mod tests {
                 "encoding={bits:#010x}"
             );
         }
+    }
+
+    #[test]
+    fn lse_atomics_are_classified_only_when_the_guest_profile_enables_them() {
+        let base = GuestCpuProfile::switch_1();
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            base.id(),
+        );
+        for bits in [0xb8e0_0041_u32, 0x88e0_fc41, 0x4860_fc82] {
+            assert!(matches!(
+                decode(&base, location, bits.into()),
+                DecodeResult::ProfileDisabled { .. }
+            ));
+        }
+        let enabled = base.with_instruction_feature(
+            InstructionFeature::LargeSystemExtensions,
+            CapabilityStatus::Enabled,
+        );
+        for (bits, name) in [
+            (0xb8e0_0041, "atomic-read-modify-write"),
+            (0x88e0_fc41, "compare-and-swap"),
+            (0x4860_fc82, "compare-and-swap-pair"),
+        ] {
+            assert_eq!(decoded_name(enabled, bits), name);
+        }
+        assert!(matches!(
+            decode(&enabled, location, 0xb8e0_9041_u32.into()),
+            DecodeResult::Unallocated { .. }
+        ));
     }
 
     #[test]

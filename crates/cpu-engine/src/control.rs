@@ -24,7 +24,6 @@ impl CrossVcpuRequest {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ControlSnapshot {
     pub requests: u32,
-    pub event_mask: u32,
     pub invalidation_epoch: u64,
 }
 
@@ -39,7 +38,6 @@ impl ControlSnapshot {
 struct EngineControlState {
     pending: AtomicBool,
     requests: AtomicU32,
-    events: AtomicU32,
     invalidation_epoch: AtomicU64,
     acknowledged_invalidation_epoch: AtomicU64,
     active_executions: AtomicU32,
@@ -83,14 +81,6 @@ impl EngineControl {
         self.state.pending.store(true, Ordering::Release);
     }
 
-    pub fn post_event(&self, mask: u32) {
-        if mask == 0 {
-            return;
-        }
-        self.state.events.fetch_or(mask, Ordering::Release);
-        self.state.pending.store(true, Ordering::Release);
-    }
-
     pub fn request_invalidation(&self, epoch: u64) {
         self.state
             .invalidation_epoch
@@ -106,14 +96,12 @@ impl EngineControl {
             return None;
         }
         let requests = self.state.requests.swap(0, Ordering::AcqRel);
-        let event_mask = self.state.events.swap(0, Ordering::AcqRel);
-        if requests == 0 && event_mask == 0 {
+        if requests == 0 {
             return None;
         }
         let invalidation_epoch = self.state.invalidation_epoch.load(Ordering::Acquire);
         Some(ControlSnapshot {
             requests,
-            event_mask,
             invalidation_epoch,
         })
     }

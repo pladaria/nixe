@@ -1,5 +1,3 @@
-use core::sync::atomic::{Ordering, fence};
-
 use nixe_cpu::{
     decode::{
         DecodedOpcode,
@@ -7,11 +5,13 @@ use nixe_cpu::{
     },
     location::{DecodedInstruction, LocationDescriptor},
     profile::{CapabilityStatus, InstructionFeature},
+    semantics::a64::{HintOperation, RuntimeRegisterRead},
     state::a64::{A64State, Nzcv},
 };
 
 use super::{advance, read, resume, write};
 use crate::interpreter::{InterpreterContext, InterpreterError, InterpreterOutcome};
+use nixe_cpu_engine::SchedulerRequest;
 
 pub(super) fn execute(
     context: InterpreterContext<'_>,
@@ -20,19 +20,25 @@ pub(super) fn execute(
     instruction: Instruction,
 ) -> Result<InterpreterOutcome, InterpreterError> {
     let fields = instruction.operands();
-    if matches!(instruction, Instruction::Hint(_)) && fields.hint == 1 {
-        // Arm YIELD retires before handing control to the runtime scheduler.
-        // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/YIELD--Yield-instruction
-        let source = decoded.location;
-        advance(state);
-        return Ok(InterpreterOutcome::Scheduled { source });
+    if matches!(instruction, Instruction::Hint(_))
+        && let Some(operation) = nixe_cpu::semantics::a64::hint_operation(fields.hint)
+    {
+        return execute_architectural_hint(context, state, decoded, operation);
     }
     let outcome = match instruction {
         Instruction::Hint(_) => execute_hint(context, state, decoded.location, fields),
         Instruction::ReadRegister(_) => execute_mrs(context, state, fields),
         Instruction::WriteRegister(_) => execute_msr(state, fields),
-        Instruction::Barrier(_) => execute_barrier(fields),
-        Instruction::System(_) => execute_system(fields),
+        Instruction::Barrier(_) => execute_barrier(context, fields),
+        Instruction::System(_) => match execute_system(context, state, fields) {
+            Ok(executed) => executed,
+            Err(fault) => {
+                return Ok(InterpreterOutcome::DataAbort {
+                    source: decoded.location,
+                    fault,
+                });
+            }
+        },
     };
     if !outcome {
         return Err(super::super::unsupported(decoded));
@@ -48,10 +54,6 @@ fn execute_hint(
     fields: Operands,
 ) -> bool {
     match fields.hint {
-        0 => true,
-        // WFE/WFI/SEV/SEVL still require verified event callbacks. Treating
-        // them as no-ops would make this reference engine an invalid oracle.
-        2..=5 => false,
         // BTI is encoded in the HINT space. On a profile where FEAT_BTI is
         // absent these encodings retain their architectural hint behavior;
         // enabled or unknown profiles require the future branch-type state.
@@ -66,52 +68,83 @@ fn execute_hint(
     }
 }
 
+fn execute_architectural_hint(
+    context: InterpreterContext<'_>,
+    state: &mut A64State,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    operation: HintOperation,
+) -> Result<InterpreterOutcome, InterpreterError> {
+    let source = decoded.location;
+    let scheduled = |state: &mut A64State, request| {
+        advance(state);
+        Ok(InterpreterOutcome::Scheduled { source, request })
+    };
+    match operation {
+        HintOperation::NoOperation => {}
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/YIELD--Yield-
+        HintOperation::Yield => return scheduled(state, SchedulerRequest::Yield),
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/WFE--Wait-For-Event-
+        HintOperation::WaitForEvent => {
+            let Some(events) = context.vcpu_events() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            if events.consume_event() {
+                advance(state);
+                return Ok(resume(state, decoded));
+            }
+            return scheduled(state, SchedulerRequest::WaitForEvent);
+        }
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/WFI--Wait-For-Interrupt-
+        HintOperation::WaitForInterrupt => {
+            let Some(events) = context.vcpu_events() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            if events.interrupts_pending() {
+                advance(state);
+                return Ok(resume(state, decoded));
+            }
+            return scheduled(state, SchedulerRequest::WaitForInterrupt);
+        }
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/SEV--Send-Event-
+        HintOperation::SendEvent => return scheduled(state, SchedulerRequest::SendEvent),
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/SEVL--Send-Event-Local-
+        HintOperation::SendEventLocal => {
+            let Some(events) = context.vcpu_events() else {
+                return Err(super::super::unsupported(decoded));
+            };
+            events.signal_event();
+        }
+    }
+    advance(state);
+    Ok(resume(state, decoded))
+}
+
 fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Operands) -> bool {
     let value = match fields.system_key {
         0xd53b_4200 => u64::from(state.nzcv().bits()),
         0xd53b_4400 => u64::from(state.fpcr()),
         0xd53b_4420 => u64::from(state.fpsr()),
-        // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
-        // Switch 1's Cortex-A57 exposes 64-byte instruction and data lines,
-        // hence log2(64 / 4) = 4 in both fields. Register definition:
-        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
-        0xd53b_0020 => (4_u64 << 16) | 4,
         0xd53b_d040 => state.tpidr_el0(),
         0xd53b_d060 => state.tpidrro_el0(),
-        // CNTFRQ_EL0 and CNTVCT_EL0 are runtime-owned architectural timer
-        // observations. Encoding and access semantics:
-        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTFRQ-EL0--Counter-timer-Frequency-register
-        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTVCT-EL0--Counter-timer-Virtual-Count-register
-        0xd53b_e000 => {
-            let Some(timer) = context.architectural_timer() else {
-                return false;
-            };
-            timer.frequency
-        }
-        0xd53b_e020 => {
-            let Some(timer) = context.architectural_timer() else {
-                return false;
-            };
-            timer.counter
-        }
-        0xd53b_00e0 => {
-            let profile = context.process().profile().cache_maintenance();
-            let nixe_cpu::profile::ProfileValue::Known(bytes) = profile.data_zero_block_bytes
-            else {
-                return false;
-            };
-            if bytes < 4 || !bytes.is_power_of_two() {
-                return false;
+        system_key => match nixe_cpu::semantics::a64::runtime_register_read(
+            context.process().profile(),
+            system_key,
+        ) {
+            Some(RuntimeRegisterRead::Constant(value)) => value,
+            Some(RuntimeRegisterRead::TimerFrequency) => {
+                let Some(timer) = context.architectural_timer() else {
+                    return false;
+                };
+                timer.frequency
             }
-            let block_size = bytes.trailing_zeros() - 2;
-            let prohibited = match profile.user_cache_maintenance {
-                CapabilityStatus::Enabled => 0,
-                CapabilityStatus::Disabled => 1 << 4,
-                CapabilityStatus::Unknown => return false,
-            };
-            u64::from(prohibited | block_size)
-        }
-        _ => return false,
+            Some(RuntimeRegisterRead::TimerCounter) => {
+                let Some(timer) = context.architectural_timer() else {
+                    return false;
+                };
+                timer.counter
+            }
+            None => return false,
+        },
     };
     write(state, fields.rt, 64, false, value);
     true
@@ -131,34 +164,51 @@ fn execute_msr(state: &mut A64State, fields: Operands) -> bool {
     true
 }
 
-fn execute_barrier(fields: Operands) -> bool {
-    match fields.barrier_opcode {
-        4 | 5 if valid_barrier_option(fields.barrier_option) => {
-            // This supplies the local reference engine's host ordering. Exact
-            // guest multicore behavior remains tracked by JIT-012.
-            fence(Ordering::SeqCst);
-            true
-        }
-        6 if fields.barrier_option == 15 => true,
-        _ => false,
+fn execute_barrier(context: InterpreterContext<'_>, fields: Operands) -> bool {
+    let Some(operation) =
+        nixe_cpu::semantics::a64::barrier_operation(fields.barrier_opcode, fields.barrier_option)
+    else {
+        return false;
+    };
+    if let Some(memory) = context.memory() {
+        memory.memory_barrier(operation);
+    } else {
+        nixe_cpu::memory::apply_host_memory_barrier(operation);
     }
+    true
 }
 
-fn execute_system(fields: Operands) -> bool {
-    // The reference memory interface is coherent and has no separate guest
-    // cache state. Architecturally valid maintenance operations therefore
-    // complete without changing memory, while unknown SYS encodings remain
-    // explicit unsupported semantics.
-    matches!(
-        fields.system_key,
-        0xd508_7500 // IC IALLU
-            | 0xd50b_7520 // IC IVAU
-            | 0xd508_7620 // DC IVAC
-            | 0xd50b_7b20 // DC CVAU
-            | 0xd50b_7e20 // DC CIVAC
-    )
-}
-
-fn valid_barrier_option(option: u8) -> bool {
-    option & 3 != 0 && option >> 2 <= 3
+fn execute_system(
+    context: InterpreterContext<'_>,
+    state: &A64State,
+    fields: Operands,
+) -> Result<bool, nixe_cpu::memory::DataAccessFault> {
+    // Arm defines IC/DC operations as architectural cache-maintenance effects;
+    // the CPU-memory owner synchronizes canonical bytes and derived engine code.
+    // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/IC-IVAU--Instruction-Cache-line-Invalidate-by-VA-to-PoU
+    // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/DC-CIVAC--Data-or-Unified-Cache-Line-Clean-and-Invalidate-by-VA-to-PoC
+    let (kind, uses_address) = match fields.system_key {
+        0xd508_7500 => (
+            nixe_cpu::memory::CacheMaintenanceKind::InstructionInvalidate,
+            false,
+        ),
+        0xd50b_7520 => (
+            nixe_cpu::memory::CacheMaintenanceKind::InstructionInvalidate,
+            true,
+        ),
+        0xd508_7620 => (nixe_cpu::memory::CacheMaintenanceKind::DataInvalidate, true),
+        0xd50b_7b20 => (nixe_cpu::memory::CacheMaintenanceKind::DataClean, true),
+        0xd50b_7e20 => (
+            nixe_cpu::memory::CacheMaintenanceKind::DataCleanAndInvalidate,
+            true,
+        ),
+        _ => return Ok(false),
+    };
+    let Some(memory) = context.memory() else {
+        return Ok(false);
+    };
+    let address = uses_address
+        .then(|| nixe_memory::GuestVirtualAddress::new(read(state, fields.rt, 64, false)));
+    memory.maintain_cache(context.process().address_space_id(), kind, address)?;
+    Ok(true)
 }

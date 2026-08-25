@@ -22,7 +22,7 @@ use nixe_cpu::{
     profile::{GuestCpuProfile, ProcessCpuContext},
     state::ThreadCpuState,
 };
-use nixe_cpu_engine::{EngineTimer, TimerSnapshot};
+use nixe_cpu_engine::{EngineTimer, SchedulerRequest, TimerSnapshot, VcpuEventState};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 /// Policy applied when dispatch reaches an `InterpretOne` terminator.
@@ -45,7 +45,10 @@ pub enum InterpreterOutcome {
     },
     /// The instruction handed control to the scheduler without retiring into
     /// the ordinary dispatcher path.
-    Scheduled { source: LocationDescriptor },
+    Scheduled {
+        source: LocationDescriptor,
+        request: SchedulerRequest,
+    },
     /// A data access raised a precise fault before the instruction completed.
     DataAbort {
         source: LocationDescriptor,
@@ -62,16 +65,15 @@ pub enum InterpreterOutcome {
 
 /// Immutable process and memory services visible to one interpreter step.
 ///
-/// Runtime-owned scheduling and cache-maintenance callbacks will be added as
-/// narrow interfaces when their contracts are implemented. Keeping memory in
-/// this context avoids embedding address-space assumptions in architectural
-/// thread state.
+/// Keeping these services in the step context avoids embedding process, vCPU,
+/// or address-space assumptions in architectural thread state.
 #[derive(Clone, Copy)]
 pub struct InterpreterContext<'a> {
     process: ProcessCpuContext,
     memory: Option<&'a dyn CpuMemory>,
     exclusive_monitor: Option<&'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>>,
     architectural_timer: Option<ArchitecturalTimerSource<'a>>,
+    events: Option<&'a VcpuEventState>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +90,7 @@ impl<'a> InterpreterContext<'a> {
             memory: None,
             exclusive_monitor: None,
             architectural_timer: None,
+            events: None,
         }
     }
 
@@ -127,6 +130,17 @@ impl<'a> InterpreterContext<'a> {
             ArchitecturalTimerSource::Snapshot(snapshot) => Some(snapshot),
             ArchitecturalTimerSource::Provider(provider) => Some(provider.snapshot()),
         }
+    }
+
+    #[must_use]
+    pub const fn with_vcpu_events(mut self, events: &'a VcpuEventState) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    #[must_use]
+    pub const fn vcpu_events(self) -> Option<&'a VcpuEventState> {
+        self.events
     }
 
     #[must_use]

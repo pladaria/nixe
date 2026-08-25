@@ -8,9 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{CpuEngineSelection, InitialOperationMode, TimeMode};
+use nixe_config::{CpuConfig, CpuEngineSelection, InitialOperationMode, TimeMode};
 use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
 use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
+use nixe_cpu_engine_jit::{JIT_ENGINE_ID, JitConfiguration, JitProvider};
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
@@ -36,7 +37,6 @@ use crate::logging::LogLevel;
 use super::load_config;
 
 const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
-const MAX_EXECUTION_SLICE_INSTRUCTIONS: u64 = 100_000;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
 const MAXWELL_PUSHBUFFER_DUMP_FILENAME: &str = "pushbuffer.bin";
@@ -162,17 +162,22 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
-    let engine_provider = select_cpu_engine(
-        config.cpu.engine,
-        config.cpu.parallel_vcpus,
+    let SelectedCpuEngines { primary, fallback } = select_cpu_engines(
+        config.cpu,
         machine_profile.cpu(),
+        plan.initial_execution_state(),
         machine_profile.scheduler().vcpus().len(),
     )?;
-    let process = ProcessBuilder::new()
+    let selected_engine = primary.descriptor();
+    let mut process_builder = ProcessBuilder::new()
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config())
-        .with_engine_provider(engine_provider)
+        .with_engine_provider(primary);
+    if let Some(fallback) = fallback {
+        process_builder = process_builder.with_fallback_engine_provider(fallback);
+    }
+    let process = process_builder
         .build(&plan)
         .map_err(|error| error.to_string())?;
     log::debug!("process prepared in {:?}", process_started.elapsed());
@@ -181,7 +186,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         process.entry_module().entry_address(),
         process.modules().len()
     );
-    log::info!("starting the reference CPU interpreter");
+    log::info!("starting CPU engine {}", selected_engine.name);
 
     let initial_operation_mode = match config.system.initial_operation_mode {
         InitialOperationMode::Handheld => OperationMode::Handheld,
@@ -286,40 +291,77 @@ const fn system_language(language: NacpLanguage) -> SystemLanguage {
     }
 }
 
-fn select_cpu_engine(
-    selection: CpuEngineSelection,
-    parallel_vcpus: bool,
+struct SelectedCpuEngines {
+    primary: Arc<dyn EngineProvider>,
+    fallback: Option<Arc<dyn EngineProvider>>,
+}
+
+fn select_cpu_engines(
+    configuration: CpuConfig,
     profile: nixe_cpu::profile::GuestCpuProfile,
+    execution_state: nixe_cpu::location::ExecutionState,
     vcpu_count: usize,
-) -> Result<Arc<dyn EngineProvider>, String> {
+) -> Result<SelectedCpuEngines, String> {
+    let jit_configuration = JitConfiguration::new(
+        configuration.jit.max_cached_regions,
+        configuration.jit.max_cache_bytes,
+        configuration.jit.max_concurrent_compilations,
+    )
+    .map_err(|error| format!("invalid JIT resource configuration: {error}"))?;
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
-    let registry = EngineRegistry::new([interpreter]);
-    let preference = match selection {
+    let jit: Arc<dyn EngineProvider> = Arc::new(JitProvider::with_configuration(jit_configuration));
+    let registry = EngineRegistry::new([Arc::clone(&jit), Arc::clone(&interpreter)]);
+    let preference = match configuration.engine {
         CpuEngineSelection::Auto => EnginePreference::Auto,
+        CpuEngineSelection::Jit => EnginePreference::Explicit(JIT_ENGINE_ID),
         CpuEngineSelection::Interpreter => EnginePreference::Explicit(INTERPRETER_ENGINE_ID),
     };
-    registry
-        .select(
-            profile,
-            EngineCapabilities {
-                a64: true,
-                a32: false,
-                t32: false,
-                interpret_one_fallback: false,
-                concurrent_executors: parallel_vcpus,
-                max_safepoint_instructions: parallel_vcpus
-                    .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
-                acknowledged_invalidation: parallel_vcpus,
-                deterministic_execution: !parallel_vcpus,
-                canonical_memory_binding: false,
-                max_concurrent_executors: parallel_vcpus.then(|| {
-                    std::num::NonZeroUsize::new(vcpu_count)
-                        .expect("a machine profile contains at least one vCPU")
-                }),
-            },
-            preference,
+    let required =
+        cpu_engine_requirements(execution_state, configuration.parallel_vcpus, vcpu_count);
+    let primary = registry
+        .select(profile, required, preference)
+        .map_err(|error| error.to_string())?;
+    let fallback = if primary.descriptor().capabilities.interpret_one_fallback {
+        Some(
+            registry
+                .select(
+                    profile,
+                    required,
+                    EnginePreference::Explicit(INTERPRETER_ENGINE_ID),
+                )
+                .map_err(|error| format!("semantic fallback unavailable: {error}"))?,
         )
-        .map_err(|error| error.to_string())
+    } else {
+        None
+    };
+    Ok(SelectedCpuEngines { primary, fallback })
+}
+
+fn cpu_engine_requirements(
+    execution_state: nixe_cpu::location::ExecutionState,
+    parallel_vcpus: bool,
+    vcpu_count: usize,
+) -> EngineCapabilities {
+    let mut required = EngineCapabilities {
+        interpret_one_fallback: false,
+        concurrent_executors: parallel_vcpus,
+        max_safepoint_instructions: parallel_vcpus
+            .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
+        acknowledged_invalidation: parallel_vcpus,
+        deterministic_execution: !parallel_vcpus,
+        canonical_memory_binding: false,
+        max_concurrent_executors: parallel_vcpus.then(|| {
+            std::num::NonZeroUsize::new(vcpu_count)
+                .expect("a machine profile contains at least one vCPU")
+        }),
+        ..EngineCapabilities::default()
+    };
+    match execution_state {
+        nixe_cpu::location::ExecutionState::A64 => required.a64 = true,
+        nixe_cpu::location::ExecutionState::A32 => required.a32 = true,
+        nixe_cpu::location::ExecutionState::T32 => required.t32 = true,
+    }
+    required
 }
 
 #[cfg(test)]
@@ -327,27 +369,72 @@ mod engine_selection_tests {
     use super::*;
 
     #[test]
-    fn application_composition_resolves_auto_and_explicit_interpreter() {
+    fn application_composition_selects_real_engines_and_semantic_fallback_by_capability() {
         let profile = switch_1_machine_profile();
-        for selection in [CpuEngineSelection::Auto, CpuEngineSelection::Interpreter] {
-            let provider = select_cpu_engine(
-                selection,
-                false,
+        let interpreter = select_cpu_engines(
+            CpuConfig {
+                engine: CpuEngineSelection::Interpreter,
+                parallel_vcpus: true,
+                ..CpuConfig::default()
+            },
+            profile.cpu(),
+            nixe_cpu::location::ExecutionState::A64,
+            profile.scheduler().vcpus().len(),
+        )
+        .unwrap();
+        assert_eq!(interpreter.primary.descriptor().id, INTERPRETER_ENGINE_ID);
+        assert!(interpreter.fallback.is_none());
+
+        let auto = select_cpu_engines(
+            CpuConfig::default(),
+            profile.cpu(),
+            nixe_cpu::location::ExecutionState::A64,
+            profile.scheduler().vcpus().len(),
+        )
+        .unwrap();
+        let primary = auto.primary.descriptor();
+        let jit_available = JitProvider::new()
+            .probe(
                 profile.cpu(),
-                profile.scheduler().vcpus().len(),
+                cpu_engine_requirements(
+                    nixe_cpu::location::ExecutionState::A64,
+                    false,
+                    profile.scheduler().vcpus().len(),
+                ),
             )
-            .unwrap();
-            assert_eq!(provider.descriptor().id, INTERPRETER_ENGINE_ID);
-        }
-        assert!(
-            select_cpu_engine(
-                CpuEngineSelection::Interpreter,
-                true,
-                profile.cpu(),
-                profile.scheduler().vcpus().len(),
-            )
-            .is_ok()
+            .available;
+        assert_eq!(
+            primary.id,
+            if jit_available {
+                JIT_ENGINE_ID
+            } else {
+                INTERPRETER_ENGINE_ID
+            }
         );
+        assert_eq!(
+            auto.fallback.is_some(),
+            primary.capabilities.interpret_one_fallback
+        );
+
+        let explicit_jit = select_cpu_engines(
+            CpuConfig {
+                engine: CpuEngineSelection::Jit,
+                ..CpuConfig::default()
+            },
+            profile.cpu(),
+            nixe_cpu::location::ExecutionState::A64,
+            profile.scheduler().vcpus().len(),
+        );
+        match explicit_jit {
+            Ok(selection) => {
+                assert_eq!(selection.primary.descriptor().id, JIT_ENGINE_ID);
+                assert_eq!(
+                    selection.fallback.unwrap().descriptor().id,
+                    INTERPRETER_ENGINE_ID
+                );
+            }
+            Err(error) => assert!(error.contains("cranelift-jit"), "{error}"),
+        }
     }
 }
 
@@ -514,11 +601,6 @@ fn execute(
     let mut active_input = None;
     let mut input_observed = false;
     let mut active_buttons = EmulatedButtonState::default();
-    let base_instruction_budget = coordinator
-        .scheduler()
-        .profile()
-        .default_timeslice_instructions();
-    let mut instruction_budget = base_instruction_budget;
     loop {
         dispatcher.synchronize_virtual_time(coordinator.virtual_time_ns());
         coordinator
@@ -572,9 +654,9 @@ fn execute(
         }
         let executions = match coordinator.execution_mode() {
             VcpuExecutionMode::Deterministic => coordinator
-                .run_next(instruction_budget)
+                .run_next_adaptive()
                 .map(|execution| execution.into_iter().collect()),
-            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave(instruction_budget),
+            VcpuExecutionMode::Parallel => coordinator.run_parallel_wave_adaptive(),
         }
         .map_err(|error| error.to_string())?;
         if executions.is_empty() {
@@ -585,15 +667,7 @@ fn execute(
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        instruction_budget = next_instruction_budget(
-            instruction_budget,
-            base_instruction_budget,
-            executions
-                .iter()
-                .all(|execution| matches!(execution.report.stop, ExecutionStop::BudgetExhausted)),
-        );
         for execution in executions {
-            let thread_id = execution.lease.thread;
             let report = execution.report;
             instructions = instructions.saturating_add(report.instructions_executed);
             if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
@@ -612,11 +686,7 @@ fn execute(
                 ExecutionStop::BudgetExhausted
                 | ExecutionStop::Safepoint
                 | ExecutionStop::PendingEvent { .. } => {}
-                ExecutionStop::Scheduled { .. } => {
-                    coordinator
-                        .make_thread_ready(thread_id)
-                        .map_err(|error| error.to_string())?;
-                }
+                ExecutionStop::Scheduled { .. } => {}
                 ExecutionStop::SupervisorCall { .. } => {
                     let handling = dispatcher
                         .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
@@ -653,16 +723,6 @@ fn execute(
                 stop => return Err(execution_stop_error(stop, instructions, &report)),
             }
         }
-    }
-}
-
-fn next_instruction_budget(current: u64, baseline: u64, uninterrupted: bool) -> u64 {
-    if uninterrupted {
-        current
-            .saturating_mul(2)
-            .min(MAX_EXECUTION_SLICE_INSTRUCTIONS.max(baseline))
-    } else {
-        baseline
     }
 }
 
@@ -943,17 +1003,6 @@ mod tests {
             host_service_wait_duration(Duration::from_millis(13), Duration::from_millis(12)),
             Duration::ZERO
         );
-    }
-
-    #[test]
-    fn execution_budget_grows_only_across_uninterrupted_slices() {
-        let baseline = 10_000;
-        let mut budget = baseline;
-        for expected in [20_000, 40_000, 80_000, 100_000, 100_000] {
-            budget = next_instruction_budget(budget, baseline, true);
-            assert_eq!(budget, expected);
-        }
-        assert_eq!(next_instruction_budget(budget, baseline, false), baseline);
     }
 
     #[test]

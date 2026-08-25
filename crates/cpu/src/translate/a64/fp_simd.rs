@@ -39,8 +39,6 @@ pub(super) fn lift(
         | FpSimdInstruction::VectorFloatImmediate(_)
         | FpSimdInstruction::VectorFloatAbsolute(_)
         | FpSimdInstruction::VectorFloatNegate(_)
-        | FpSimdInstruction::FloatToSignedInt(_)
-        | FpSimdInstruction::FloatToUnsignedInt(_)
         | FpSimdInstruction::ScalarFloatImmediate(_)
         | FpSimdInstruction::ScalarFloatConvert(_)
         | FpSimdInstruction::ScalarFloatDivide(_)
@@ -77,6 +75,8 @@ pub(super) fn lift(
         }
         FpSimdInstruction::SignedIntToFloat(_)
         | FpSimdInstruction::UnsignedIntToFloat(_)
+        | FpSimdInstruction::FloatToSignedInt(_)
+        | FpSimdInstruction::FloatToUnsignedInt(_)
         | FpSimdInstruction::MoveToGeneral(_)
         | FpSimdInstruction::MoveFromGeneral(_) => {
             lift_fp_conversion(builder, decoded, fields, instruction)
@@ -108,6 +108,11 @@ fn lift_fp_simd_complex_memory(
     let source = decoded.location;
     let base = memory::base_address(builder, source, fields.rn)?;
     let pair = matches!(operation, FpSimdInstruction::MemoryPair(_));
+    let multiple = matches!(
+        operation,
+        FpSimdInstruction::MemoryMultipleStructures(_)
+            | FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
+    );
     let post_index = matches!(
         operation,
         FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
@@ -118,7 +123,19 @@ fn lift_fp_simd_complex_memory(
     } else {
         Immediate::I64(0).into()
     };
-    let register_count = if pair { 2 } else { 4 };
+    let register_count = if pair {
+        2
+    } else if multiple {
+        match fields.structure_opcode {
+            0b0010 => 4,
+            0b0110 => 3,
+            0b1010 => 2,
+            0b0111 => 1,
+            _ => return Ok(unsupported(decoded)),
+        }
+    } else {
+        1
+    };
     let writeback = match operation {
         FpSimdInstruction::MemoryPair(_) => matches!(fields.mode, 1 | 3),
         FpSimdInstruction::MemoryMultipleStructuresPostIndex(_)
@@ -164,9 +181,21 @@ fn lift_fp_simd_complex_memory(
     } else {
         None
     };
-    let mut arguments = Vec::with_capacity(register_count + 3);
+    let mut arguments = Vec::with_capacity(register_count + 6);
     arguments.push(base);
-    arguments.push(offset_register);
+    if pair {
+        arguments.push(Immediate::I8(fields.size).into());
+        arguments.push(Immediate::I1(fields.load).into());
+        arguments.push(Immediate::I8(fields.mode).into());
+        arguments.push(Immediate::I8(fields.immediate_7).into());
+    } else {
+        arguments.push(Immediate::I1(fields.vector_128).into());
+        arguments.push(Immediate::I1(fields.load).into());
+        arguments.push(Immediate::I8(fields.structure_opcode).into());
+        if !multiple {
+            arguments.push(Immediate::I8(fields.element_size).into());
+        }
+    }
     for offset in 0..register_count {
         let register = if pair && offset == 1 {
             fields.rt2
@@ -175,7 +204,6 @@ fn lift_fp_simd_complex_memory(
         };
         arguments.push(vector_read(builder, source, register)?);
     }
-    arguments.push(Immediate::I32(fields.helper_token.helper_abi_value()).into());
 
     let mut result_types = Vec::with_capacity(if fields.load { register_count } else { 0 });
     if fields.load {
@@ -184,10 +212,10 @@ fn lift_fp_simd_complex_memory(
     let results = helper(
         builder,
         source,
-        if pair {
-            "a64.simd.pair-memory"
-        } else {
-            "a64.simd.structure-memory"
+        match (pair, multiple) {
+            (true, _) => "a64.simd.pair-memory",
+            (false, true) => "a64.simd.multiple-structure-memory",
+            (false, false) => "a64.simd.single-structure-memory",
         },
         arguments,
         &result_types,
@@ -268,6 +296,7 @@ fn lift_semantic_vector_helper(
     let ra = vector_read(builder, source, fields.ra)?;
     let rd = vector_read(builder, source, fields.rd)?;
     let general_rn = read_gpr(builder, source, fields.rn, IrType::I64, Register31::Zero)?;
+    let flags = read_flags(builder, source)?;
     let results = helper(
         builder,
         source,
@@ -278,9 +307,10 @@ fn lift_semantic_vector_helper(
             ra,
             rd,
             general_rn,
+            flags,
             fpcr.into(),
             fpsr.into(),
-            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+            Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
         ],
         &[IrType::V128, IrType::I32],
         OperationEffects::new(
@@ -328,6 +358,7 @@ fn lift_semantic_compare_helper(
     )?;
     let rn = vector_read(builder, source, fields.rn)?;
     let rm = vector_read(builder, source, fields.rm)?;
+    let flags = read_flags(builder, source)?;
     let results = helper(
         builder,
         source,
@@ -335,9 +366,10 @@ fn lift_semantic_compare_helper(
         vec![
             rn,
             rm,
+            flags,
             fpcr.into(),
             fpsr.into(),
-            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+            Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
         ],
         &[IrType::Flags, IrType::I32],
         OperationEffects::new(
@@ -371,7 +403,7 @@ fn lift_semantic_general_helper(
         "a64.simd.unsigned-move-to-general",
         vec![
             rn,
-            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+            Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
         ],
         &[if fields.vector_128 {
             IrType::I64
@@ -441,10 +473,10 @@ fn lift_fp_simd_compute(
             arguments.push(vector_read(builder, decoded.location, fields.rm)?);
             arguments.push(vector_read(builder, decoded.location, fields.rd)?);
         }
-        arguments.push(Immediate::I32(fields.helper_token.helper_abi_value()).into());
+        arguments.push(Immediate::I64(fields.helper_token.semantic_abi_value()).into());
         let name = match operation {
             FpSimdInstruction::Bitwise(_) => "a64.simd.bitwise",
-            FpSimdInstruction::Integer(_) => "a64.simd.integer-arithmetic-compare",
+            FpSimdInstruction::Integer(_) => "a64.simd.integer-add-sub",
             FpSimdInstruction::ScalarMove(_) => "a64.fp.scalar-move",
             _ => unreachable!(),
         };
@@ -499,7 +531,7 @@ fn lift_fp_simd_compute(
             second,
             fpcr.into(),
             fpsr.into(),
-            Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+            Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
         ],
         result_types,
         OperationEffects::new(
@@ -550,7 +582,7 @@ fn lift_fp_conversion(
             "a64.fp.move-to-general",
             vec![
                 vector,
-                Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+                Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
             ],
             &[width],
             OperationEffects::new(EffectSet::HELPER, false),
@@ -566,13 +598,15 @@ fn lift_fp_conversion(
     }
     if matches!(operation, FpSimdInstruction::MoveFromGeneral(_)) {
         let integer = read_gpr(builder, decoded.location, rn, width, Register31::Zero)?;
+        let previous = vector_read(builder, decoded.location, rd)?;
         let result = helper(
             builder,
             decoded.location,
             "a64.fp.move-from-general",
             vec![
                 integer,
-                Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+                previous,
+                Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
             ],
             &[IrType::V128],
             OperationEffects::new(EffectSet::HELPER, false),
@@ -617,7 +651,7 @@ fn lift_fp_conversion(
                 integer,
                 fpcr.into(),
                 fpsr.into(),
-                Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+                Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
             ],
             &[IrType::V128, IrType::I32],
             effects,
@@ -636,7 +670,7 @@ fn lift_fp_conversion(
                 vector,
                 fpcr.into(),
                 fpsr.into(),
-                Immediate::I32(fields.helper_token.helper_abi_value()).into(),
+                Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
             ],
             &[width, IrType::I32],
             effects,

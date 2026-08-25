@@ -31,23 +31,21 @@ fn lift_hint(
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let immediate = u32::from(fields.hint);
-    if matches!(immediate, 0 | 32 | 34 | 36 | 38) {
+    if let Some(operation) = crate::semantics::a64::hint_operation(fields.hint) {
+        if operation == crate::semantics::a64::HintOperation::NoOperation {
+            return Ok(LiftOutcome::Continue);
+        }
+        builder.emit(
+            decoded.location,
+            &[],
+            OperationKind::ProcessorHint(operation),
+        )?;
         return Ok(LiftOutcome::Continue);
     }
-    let name = match immediate {
-        1 => "a64.hint.yield",
-        _ => return Ok(unsupported(decoded)),
-    };
-    helper(
-        builder,
-        decoded.location,
-        name,
-        Box::<[Operand]>::default(),
-        &[],
-        OperationEffects::new(EffectSet::HELPER, false),
-    )?;
-    Ok(LiftOutcome::Continue)
+    if matches!(fields.hint, 32 | 34 | 36 | 38) {
+        return Ok(LiftOutcome::Continue);
+    }
+    Ok(unsupported(decoded))
 }
 
 fn system_register(system_key: u32) -> Option<StateRegister> {
@@ -90,15 +88,13 @@ fn lift_mrs(
         fields.system_key,
         0xd53b_0020 | 0xd53b_00e0 | 0xd53b_e000 | 0xd53b_e020
     ) {
-        helper(
+        emit_one(
             builder,
             decoded.location,
-            "a64.system.read-runtime-register",
-            vec![Immediate::I32(fields.system_key).into()],
-            &[IrType::I64],
-            OperationEffects::new(EffectSet::HELPER, true),
-        )?[0]
-            .into()
+            IrType::I64,
+            OperationKind::RuntimeRegisterRead(fields.system_key),
+        )?
+        .into()
     } else {
         return Ok(unsupported(decoded));
     };
@@ -158,43 +154,15 @@ fn lift_msr(
     Ok(LiftOutcome::Continue)
 }
 
-fn barrier_scope(option: u8) -> Option<(BarrierDomain, BarrierAccess)> {
-    let access = match option & 3 {
-        1 => BarrierAccess::Reads,
-        2 => BarrierAccess::Writes,
-        3 => BarrierAccess::ReadsAndWrites,
-        _ => return None,
-    };
-    let domain = match option >> 2 {
-        0 => BarrierDomain::OuterShareable,
-        1 => BarrierDomain::NonShareable,
-        2 => BarrierDomain::InnerShareable,
-        3 => BarrierDomain::FullSystem,
-        _ => return None,
-    };
-    Some((domain, access))
-}
-
 fn lift_barrier(
     builder: &mut IrBuilder,
     decoded: &DecodedInstruction<DecodedOpcode>,
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
-    let opcode = u32::from(fields.barrier_opcode);
-    let option = fields.barrier_option;
-    let operation = match opcode {
-        4 | 5 => {
-            let Some((domain, access)) = barrier_scope(option) else {
-                return Ok(unsupported(decoded));
-            };
-            if opcode == 4 {
-                BarrierOperation::DataSynchronization { domain, access }
-            } else {
-                BarrierOperation::DataMemory { domain, access }
-            }
-        }
-        6 if option == 15 => BarrierOperation::InstructionSynchronization,
-        _ => return Ok(unsupported(decoded)),
+    let Some(operation) =
+        crate::semantics::a64::barrier_operation(fields.barrier_opcode, fields.barrier_option)
+    else {
+        return Ok(unsupported(decoded));
     };
     builder.emit(decoded.location, &[], OperationKind::Barrier(operation))?;
     Ok(LiftOutcome::Continue)

@@ -38,13 +38,23 @@ timezone = "Europe/Madrid"
 log_level = "debug"
 
 [cpu]
-# CPU engine selected through the capability registry: "auto" or
-# "interpreter". Future engines extend this list without changing runtime.
+# CPU engine selected through the capability registry: "auto", "jit", or
+# "interpreter". Auto prefers the production JIT and falls back to the
+# interpreter only when the host or guest profile cannot satisfy JIT capabilities.
 engine = "auto"
 # Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
 # selected engine provides concurrent executors, bounded safepoints, and
-# acknowledged mapping invalidation. False keeps deterministic serialization.
+# acknowledged semantic memory invalidation. False keeps deterministic serialization.
 parallel_vcpus = true
+
+[cpu.jit]
+# Per-process-domain native-code working set. Values may lower, but never exceed,
+# the architectural hard bounds enforced by the JIT provider.
+max_cached_regions = 1024
+cache_mib = 48
+# Maximum frontend/native compilation jobs admitted concurrently. Further vCPUs
+# wait on a teardown-cancellable domain queue.
+max_concurrent_compilations = 4
 
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by

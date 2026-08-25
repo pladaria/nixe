@@ -408,6 +408,13 @@ impl GuestCpuProfile {
             ExecutionStateSet::A64_A32_T32,
             InstructionFeatures::all_unknown()
                 .with(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled)
+                // Tegra X1 uses Cortex-A57 (Armv8.0-A); FEAT_LSE begins with
+                // Armv8.1-A and is therefore not guest-visible on Switch 1.
+                // https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Understanding%20the%20Armv8.x%20extensions.pdf
+                .with(
+                    InstructionFeature::LargeSystemExtensions,
+                    CapabilityStatus::Disabled,
+                )
                 .with(
                     InstructionFeature::BranchTargetIdentification,
                     CapabilityStatus::Disabled,
@@ -676,6 +683,21 @@ mod tests {
         assert_eq!(
             profile.instruction_feature_status(InstructionFeature::AdvancedSimd),
             CapabilityStatus::Enabled
+        );
+        for feature in [
+            InstructionFeature::Aes,
+            InstructionFeature::Sha1,
+            InstructionFeature::Sha256,
+            InstructionFeature::Crc32,
+        ] {
+            assert_eq!(
+                profile.instruction_feature_status(feature),
+                CapabilityStatus::Unknown
+            );
+        }
+        assert_eq!(
+            profile.instruction_feature_status(InstructionFeature::LargeSystemExtensions),
+            CapabilityStatus::Disabled
         );
 
         for state in [

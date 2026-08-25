@@ -80,18 +80,26 @@ pub(crate) fn verify_basic_block(block: &IrBlock) -> Result<(), VerificationErro
     verify_metadata(block)?;
 
     let mut definitions = BTreeMap::new();
+    let mut previous_source = 0;
     for (index, operation) in block.operations.iter().enumerate() {
-        if !block
+        let Some(operation_source) = block
             .metadata
             .sources
             .iter()
-            .any(|source| source.location == operation.source)
-        {
+            .position(|source| source.location == operation.source)
+        else {
             return Err(VerificationError::operation(
                 index,
                 "operation source is not covered by block instruction metadata",
             ));
+        };
+        if index != 0 && operation_source < previous_source {
+            return Err(VerificationError::operation(
+                index,
+                "operation source order moves backwards within the basic block",
+            ));
         }
+        previous_source = operation_source;
         verify_operation(index, operation, &definitions, block.metadata.start)?;
         for result in operation.results.iter() {
             if definitions.insert(result.id, result.ty).is_some() {
@@ -351,7 +359,10 @@ fn verify_operation_types(index: usize, operation: &IrOperation) -> Result<(), V
         OperationKind::Address(address) => verify_address(index, address, &results),
         OperationKind::Flags(flags) => verify_flags(index, flags, &results),
         OperationKind::Memory(memory) => verify_memory(index, memory, &results),
-        OperationKind::Barrier(_) => expect_results(index, &results, &[]),
+        OperationKind::Barrier(_) | OperationKind::ProcessorHint(_) => {
+            expect_results(index, &results, &[])
+        }
+        OperationKind::RuntimeRegisterRead(_) => expect_results(index, &results, &[IrType::I64]),
         OperationKind::CacheMaintenance(CacheMaintenanceOperation { address, .. }) => {
             if let Some(address) = address {
                 expect_type(
@@ -714,6 +725,48 @@ fn verify_atomic(
     operation: &AtomicOperation,
     results: &[Value],
 ) -> Result<(), VerificationError> {
+    if let AtomicOperation::CompareExchangePair {
+        address,
+        expected_low,
+        expected_high,
+        replacement_low,
+        replacement_high,
+        descriptor,
+    } = *operation
+    {
+        expect_type(index, address, IrType::Address, "atomic pair address")?;
+        let element = match descriptor.access.size {
+            crate::memory::MemoryAccessSize::Doubleword => IrType::I32,
+            crate::memory::MemoryAccessSize::Quadword => IrType::I64,
+            _ => {
+                return Err(VerificationError::operation(
+                    index,
+                    "atomic pair requires an 8- or 16-byte transaction",
+                ));
+            }
+        };
+        if descriptor.byte_order != crate::ir::op::ByteOrder::Little {
+            return Err(VerificationError::operation(
+                index,
+                "atomic pair requires little-endian architectural register halves",
+            ));
+        }
+        for value in [
+            expected_low,
+            expected_high,
+            replacement_low,
+            replacement_high,
+        ] {
+            expect_type(index, value, element, "atomic pair register half")?;
+        }
+        if descriptor.access.class != MemoryAccessClass::Atomic {
+            return Err(VerificationError::operation(
+                index,
+                "atomic operation requires an Atomic memory access class",
+            ));
+        }
+        return expect_results(index, results, &[element, element]);
+    }
     let (address, first, second, descriptor) = match *operation {
         AtomicOperation::ReadModifyWrite {
             address,
@@ -727,6 +780,7 @@ fn verify_atomic(
             replacement,
             descriptor,
         } => (address, expected, Some(replacement), descriptor),
+        AtomicOperation::CompareExchangePair { .. } => unreachable!(),
     };
     expect_type(index, address, IrType::Address, "atomic address")?;
     expect_type(index, first, descriptor.value_type(), "atomic value")?;
@@ -1067,7 +1121,11 @@ fn expect_results(
 fn operands(kind: &OperationKind) -> Vec<Operand> {
     let mut operands = Vec::new();
     match kind {
-        OperationKind::Constant(_) | OperationKind::ReadState(_) | OperationKind::Barrier(_) => {}
+        OperationKind::Constant(_)
+        | OperationKind::ReadState(_)
+        | OperationKind::Barrier(_)
+        | OperationKind::ProcessorHint(_)
+        | OperationKind::RuntimeRegisterRead(_) => {}
         OperationKind::WriteState { value, .. } => operands.push(*value),
         OperationKind::Scalar(operation) => match *operation {
             ScalarOperation::Binary { lhs, rhs, .. }
@@ -1167,6 +1225,20 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
                 replacement,
                 ..
             } => operands.extend([address, expected, replacement]),
+            AtomicOperation::CompareExchangePair {
+                address,
+                expected_low,
+                expected_high,
+                replacement_low,
+                replacement_high,
+                ..
+            } => operands.extend([
+                address,
+                expected_low,
+                expected_high,
+                replacement_low,
+                replacement_high,
+            ]),
         },
         OperationKind::Vector(operation) => match *operation {
             VectorOperation::Arithmetic { lhs, rhs, .. }
@@ -1212,7 +1284,7 @@ fn verify_terminator(
 ) -> Result<(), VerificationError> {
     let check_target = |target: &ControlTarget| {
         if let ControlTarget::Indirect { address, .. }
-        | ControlTarget::A32Interworking { address } = target
+        | ControlTarget::A32Interworking { address, .. } = target
         {
             verify_terminator_operand(*address, definitions, IrType::Address, "indirect target")?;
         }
@@ -1714,17 +1786,16 @@ mod tests {
         ir::{
             block::{BlockMetadata, InstructionSource},
             op::{
-                AddressOperation, AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation,
-                ByteOrder, EffectSet, GuestAddressWidth, IntegerBinaryKind, MemoryDescriptor,
-                OperationEffects, OperationResults, ScalarOperation,
+                AddressOperation, ByteOrder, EffectSet, GuestAddressWidth, IntegerBinaryKind,
+                MemoryDescriptor, OperationEffects, OperationResults, ScalarOperation,
             },
             terminator::ControlTarget,
             value::{Immediate, Value},
         },
         location::InstructionEncoding,
         memory::{
-            CodeDependencies, CodePageDependency, MemoryAccess, MemoryAccessSize, MemoryAlignment,
-            MemoryOrdering,
+            AtomicRmwKind, BarrierAccess, BarrierDomain, BarrierOperation, CodeDependencies,
+            CodePageDependency, MemoryAccess, MemoryAccessSize, MemoryAlignment, MemoryOrdering,
         },
         profile::CpuProfileId,
     };
@@ -1979,5 +2050,43 @@ mod tests {
                 .to_string()
                 .contains("not covered by block instruction metadata")
         );
+    }
+
+    #[test]
+    fn verifier_rejects_operations_which_return_to_an_earlier_instruction() {
+        let sources: Vec<_> = [0x1000, 0x1004]
+            .into_iter()
+            .map(|pc| {
+                InstructionSource::new(
+                    location(pc),
+                    InstructionEncoding::from_u32(0xd503_201f),
+                    CodeDependencies::one(dependency()),
+                )
+            })
+            .collect();
+        let later = IrOperation::new(
+            location(0x1004),
+            OperationResults::one(Value::new(ValueId::new(0), IrType::I64)),
+            OperationKind::Constant(Immediate::I64(2)),
+        );
+        let earlier = IrOperation::new(
+            location(0x1000),
+            OperationResults::one(Value::new(ValueId::new(1), IrType::I64)),
+            OperationKind::Constant(Immediate::I64(1)),
+        );
+        let block = IrBlock::new(
+            BlockMetadata::new(location(0x1000), 8, 2, sources),
+            vec![later, earlier],
+            Terminator::Direct {
+                target: ControlTarget::Direct {
+                    pc: GuestVirtualAddress::new(0x1008),
+                    execution_state: ExecutionState::A64,
+                },
+            },
+        );
+
+        let error = verify_basic_block(&block).unwrap_err();
+        assert_eq!(error.context, VerificationContext::Operation(1));
+        assert!(error.to_string().contains("source order moves backwards"));
     }
 }

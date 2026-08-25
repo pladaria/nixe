@@ -77,6 +77,9 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
                 AllocationStatus::Allocated
             }
         }
+        0x0000_002d if ((bits >> 12) & 0xf) > 8 => {
+            AllocationStatus::Unallocated("unallocated LSE atomic read-modify-write opcode")
+        }
         0x0000_0048 => {
             let immediate = ((bits >> 16) & 0x1f) as u8;
             let quad = bits & (1 << 30) != 0;

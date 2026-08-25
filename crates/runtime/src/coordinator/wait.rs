@@ -215,6 +215,7 @@ impl RuntimeCoordinator {
     }
 
     pub(super) fn release_wait_resources(&mut self, thread: GuestThreadId) {
+        self.cpu_waits.remove(&thread);
         let Some(token) = self
             .scheduler
             .thread(thread)
