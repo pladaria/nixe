@@ -521,6 +521,9 @@ fn lower_block(
         .iter()
         .any(|safepoint| safepoint.block == id && safepoint.kind == RegionSafepointKind::Entry)
     {
+        // Internal edges can reach any published entry, so an entry poll must
+        // export that entry rather than the last instruction in its predecessor.
+        set_current_location(builder, lowering, block.metadata.start)?;
         emit_control_poll(builder, lowering, block.metadata.start)?;
     }
     for source in &block.metadata.sources {

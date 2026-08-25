@@ -1,6 +1,7 @@
-//! Validated resource policy for one production JIT provider.
+//! Validated product policy for one production JIT provider.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Default maximum number of compiled regions retained by one JIT domain.
 pub const DEFAULT_MAX_CACHED_REGIONS: usize = 1_024;
@@ -14,15 +15,16 @@ const MAX_CACHED_REGIONS: usize = DEFAULT_MAX_CACHED_REGIONS;
 const MAX_CACHE_BYTES: usize = DEFAULT_MAX_CACHE_BYTES;
 const MAX_CONCURRENT_COMPILATIONS: usize = 64;
 
-/// Product-configurable JIT resource bounds.
+/// Product-configurable JIT resource and diagnostic policy.
 ///
 /// These values describe implementation-independent resource quantities. They
 /// deliberately expose neither Cranelift settings nor native ABI details.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JitConfiguration {
     max_cached_regions: usize,
     max_cache_bytes: usize,
     max_concurrent_compilations: usize,
+    dump_directory: Option<PathBuf>,
 }
 
 impl JitConfiguration {
@@ -55,22 +57,35 @@ impl JitConfiguration {
             max_cached_regions,
             max_cache_bytes,
             max_concurrent_compilations,
+            dump_directory: None,
         })
     }
 
+    /// Enables compilation diagnostics in the supplied host directory.
     #[must_use]
-    pub const fn max_cached_regions(self) -> usize {
+    pub fn with_dump_directory(mut self, dump_directory: Option<PathBuf>) -> Self {
+        self.dump_directory = dump_directory.filter(|path| !path.as_os_str().is_empty());
+        self
+    }
+
+    #[must_use]
+    pub const fn max_cached_regions(&self) -> usize {
         self.max_cached_regions
     }
 
     #[must_use]
-    pub const fn max_cache_bytes(self) -> usize {
+    pub const fn max_cache_bytes(&self) -> usize {
         self.max_cache_bytes
     }
 
     #[must_use]
-    pub const fn max_concurrent_compilations(self) -> usize {
+    pub const fn max_concurrent_compilations(&self) -> usize {
         self.max_concurrent_compilations
+    }
+
+    #[must_use]
+    pub fn dump_directory(&self) -> Option<&Path> {
+        self.dump_directory.as_deref()
     }
 }
 
@@ -80,6 +95,7 @@ impl Default for JitConfiguration {
             max_cached_regions: DEFAULT_MAX_CACHED_REGIONS,
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             max_concurrent_compilations: DEFAULT_MAX_CONCURRENT_COMPILATIONS,
+            dump_directory: None,
         }
     }
 }
@@ -154,5 +170,11 @@ mod tests {
             JitConfiguration::new(1, MIN_CACHE_BYTES, 0),
             Err(JitConfigurationError::MaxConcurrentCompilations { .. })
         ));
+        assert_eq!(
+            JitConfiguration::default()
+                .with_dump_directory(Some(PathBuf::new()))
+                .dump_directory(),
+            None
+        );
     }
 }

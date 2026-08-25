@@ -1186,6 +1186,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-native",
  "libc",
+ "log",
  "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",

@@ -8,6 +8,7 @@ license.workspace = true
 cranelift-codegen = { version = "=0.134.3", default-features = false, features = ["host-arch", "std"] }
 cranelift-frontend = "=0.134.3"
 cranelift-native = "=0.134.3"
+log.workspace = true
 nixe-cpu.workspace = true
 nixe-cpu-engine.workspace = true
 nixe-memory.workspace = true

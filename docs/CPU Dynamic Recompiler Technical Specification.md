@@ -1346,6 +1346,19 @@ Instrumentation is inserted through IR or region hooks selected before
 translation. Production regions contain no unconditional callback on every
 instruction.
 
+The application may opt into provider-private compilation artifacts through
+`cpu.jit.dump_directory`. An absent or empty path creates no diagnostic owner,
+directory, disassembly, or I/O. The application resolves relative paths from
+the configuration directory and passes the result only to
+`nixe-cpu-engine-jit`; runtime, interpreter, canonical memory, and the neutral
+engine contract do not know the path or artifact format. Each JIT domain writes
+guest block bytes, deterministic guest disassembly, verified pre-optimization
+Nixe IR, and compilation metadata into a session directory. Artifact slots are
+bounded by the configured region-cache capacity and recycled under one
+diagnostic lock, so opt-in observation cannot grow without bound during a
+long-running title. A completion marker distinguishes complete artifacts from
+an interrupted or failed host write.
+
 The frontend exposes a separate opt-in region-report path. Normal translation
 does not construct disassembly strings. When requested, the report records each
 instruction's guest PC, execution state, raw encoding, deterministic

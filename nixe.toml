@@ -55,6 +55,9 @@ cache_mib = 48
 # Maximum frontend/native compilation jobs admitted concurrently. Further vCPUs
 # wait on a teardown-cancellable domain queue.
 max_concurrent_compilations = 4
+# Optional compilation diagnostics. Missing or empty disables all JIT dumps;
+# relative paths are resolved from the directory containing this file.
+dump_directory = "./dump/jit"
 
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by
