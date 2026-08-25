@@ -300,7 +300,9 @@ async fn initialize_backend_async(
             })
         })
     } else {
-        log::debug!("WGPU adapter does not expose persistent pipeline-cache support");
+        log::info!(
+            "WGPU persistent pipeline cache is unavailable; using the in-memory pipeline cache only"
+        );
         None
     };
     let presentation = WgpuPresentationContext {

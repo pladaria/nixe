@@ -505,7 +505,10 @@ fn lift_load_store_pair(
     }
     let base = base_address(builder, decoded.location, rn)?;
     let offset = sign_extend(u64::from(fields.immediate_7), 7) * size.bytes() as i64;
-    let transfer_base = if mode == 3 {
+    // Offset and pre-index addressing apply the scaled immediate before the
+    // transfer; post-index addressing applies it only during writeback.
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDPSW--Load-Pair-of-Registers--signed-word-
+    let transfer_base = if matches!(mode, 2 | 3) {
         address_add(builder, decoded.location, base, offset)?
     } else {
         base

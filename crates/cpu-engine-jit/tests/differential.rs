@@ -194,6 +194,63 @@ fn run_registry_state(execution_state: ExecutionState) {
     assert_ne!(executed, 0, "{execution_state} registry was not exercised");
 }
 
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn ldpsw_offset_uses_the_displaced_address_in_compiled_code() {
+    const CODE_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(0x30_0000);
+    const DATA_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(0x30_0001);
+    const FIRST: u32 = 0x0058_4af0;
+    const SECOND: u32 = 0xff59_8a70;
+
+    let memory = {
+        let mut memory = SyntheticMemory::new();
+        assert!(memory.add_ram_page(CODE_PAGE));
+        assert!(memory.add_ram_page(DATA_PAGE));
+        assert!(memory.initialize_ram(CODE_PAGE, 0, &0x6941_0820_u32.to_le_bytes()));
+        assert!(memory.initialize_ram(CODE_PAGE, 4, &0x1400_0000_u32.to_le_bytes()));
+        assert!(memory.initialize_ram(DATA_PAGE, 0, b"MOD0\0\0\0\0"));
+        assert!(memory.initialize_ram(DATA_PAGE, 8, &FIRST.to_le_bytes()));
+        assert!(memory.initialize_ram(DATA_PAGE, 12, &SECOND.to_le_bytes()));
+        assert!(memory.map_page(SPACE, CODE, CODE_PAGE, MemoryPermissions::READ_EXECUTE));
+        assert!(memory.map_page(SPACE, DATA, DATA_PAGE, MemoryPermissions::READ_WRITE));
+        memory
+    };
+    let initial = {
+        let mut state = A64State::default();
+        state.write_x(
+            A64Register::General(A64GeneralRegister::new(1).unwrap()),
+            DATA.get(),
+        );
+        state.set_pc(CODE.get());
+        ThreadCpuState::A64(Box::new(state))
+    };
+    let mut interpreter_state = initial.clone();
+    let mut jit_state = initial;
+    let mut interpreter = EngineHarness::new(&InterpreterProvider, 0x40, 0x40);
+    let mut jit = EngineHarness::new(&JitProvider::new(), 0x41, 0x41);
+
+    let interpreter_report = interpreter.run(&memory, &mut interpreter_state).unwrap();
+    let jit_report = jit.run(&memory, &mut jit_state).unwrap();
+
+    assert_eq!(jit_report, interpreter_report);
+    assert_eq!(jit_state, interpreter_state);
+    let ThreadCpuState::A64(state) = jit_state else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
+        u64::from(FIRST)
+    );
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(2).unwrap())),
+        SECOND as i32 as i64 as u64
+    );
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(1).unwrap())),
+        DATA.get()
+    );
+}
+
 fn patterns() -> impl Iterator<Item = &'static InstructionPattern> {
     decode::a64::patterns()
         .iter()

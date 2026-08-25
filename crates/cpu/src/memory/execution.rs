@@ -140,13 +140,22 @@ enum ExecutionPhysicalPage {
     Mmio(Box<dyn SyntheticMmio>),
 }
 
+struct ExecutionPhysicalSlot {
+    page: ExecutionPhysicalPage,
+    // Mapping-derived metadata is maintained transactionally with the page
+    // table. Guest data accesses can therefore classify aliases in O(1)
+    // without walking the process address space.
+    mapping_count: usize,
+    executable_content_mapping_count: usize,
+}
+
 #[derive(Default)]
 struct ExecutionMemoryInner {
     // Every published mapping's slot contains a page and its physical ID maps
     // back to that same slot. Aliases intentionally repeat both values. A free
     // slot is absent from all mappings and from `slots_by_id`.
     mappings: ExecutionPageTable,
-    physical_slots: Vec<Option<ExecutionPhysicalPage>>,
+    physical_slots: Vec<Option<ExecutionPhysicalSlot>>,
     free_physical_slots: Vec<usize>,
     slots_by_id: BTreeMap<GuestPhysicalPageId, usize>,
     next_page_id: u64,
@@ -155,11 +164,11 @@ struct ExecutionMemoryInner {
 
 impl ExecutionMemoryInner {
     fn page(&self, slot: usize) -> Option<&ExecutionPhysicalPage> {
-        self.physical_slots.get(slot)?.as_ref()
+        Some(&self.physical_slots.get(slot)?.as_ref()?.page)
     }
 
     fn page_mut(&mut self, slot: usize) -> Option<&mut ExecutionPhysicalPage> {
-        self.physical_slots.get_mut(slot)?.as_mut()
+        Some(&mut self.physical_slots.get_mut(slot)?.as_mut()?.page)
     }
 
     fn push_page(&mut self, id: GuestPhysicalPageId, page: ExecutionPhysicalPage) -> Option<usize> {
@@ -172,11 +181,19 @@ impl ExecutionMemoryInner {
                 .get_mut(slot)
                 .expect("free physical slot belongs to the slot array");
             debug_assert!(destination.is_none());
-            *destination = Some(page);
+            *destination = Some(ExecutionPhysicalSlot {
+                page,
+                mapping_count: 0,
+                executable_content_mapping_count: 0,
+            });
             slot
         } else {
             let slot = self.physical_slots.len();
-            self.physical_slots.push(Some(page));
+            self.physical_slots.push(Some(ExecutionPhysicalSlot {
+                page,
+                mapping_count: 0,
+                executable_content_mapping_count: 0,
+            }));
             slot
         };
         self.slots_by_id.insert(id, slot);
@@ -184,11 +201,177 @@ impl ExecutionMemoryInner {
     }
 
     fn remove_page(&mut self, id: GuestPhysicalPageId, slot: usize) {
+        let physical_slot = self
+            .physical_slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .expect("removed physical slot exists");
+        assert_eq!(physical_slot.mapping_count, 0);
+        assert_eq!(physical_slot.executable_content_mapping_count, 0);
         let removed_id = self.slots_by_id.remove(&id);
         let removed_page = self.physical_slots.get_mut(slot).and_then(Option::take);
         debug_assert_eq!(removed_id, Some(slot));
         debug_assert!(removed_page.is_some());
         self.free_physical_slots.push(slot);
+    }
+
+    fn insert_mapping(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        mapping: ExecutionMapping,
+    ) {
+        assert!(self.mappings.get(address_space, virtual_page).is_none());
+        let previous = self.mappings.insert(address_space, virtual_page, mapping);
+        debug_assert!(previous.is_none());
+        self.register_mapping(mapping);
+    }
+
+    fn remove_mapping(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+    ) -> Option<ExecutionMapping> {
+        let mapping = self.mappings.remove(address_space, virtual_page)?;
+        self.unregister_mapping(mapping);
+        Some(mapping)
+    }
+
+    fn set_mapping_purpose(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        purpose: MemoryMappingPurpose,
+        mapping_generation: MappingGeneration,
+    ) {
+        let (physical_slot, was_executable_content, is_executable_content) = {
+            let mapping = self
+                .mappings
+                .get_mut(address_space, virtual_page)
+                .expect("mapping purpose range was preflighted");
+            let was_executable_content = mapping.observes_executable_content();
+            mapping.purpose = purpose;
+            mapping.mapping_generation = mapping_generation;
+            (
+                mapping.physical_slot,
+                was_executable_content,
+                mapping.observes_executable_content(),
+            )
+        };
+        self.update_executable_content_mapping_count(
+            physical_slot,
+            was_executable_content,
+            is_executable_content,
+        );
+    }
+
+    fn set_mapping_permissions(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        permissions: MemoryPermissions,
+        mapping_generation: MappingGeneration,
+    ) {
+        let (physical_slot, was_executable_content, is_executable_content) = {
+            let mapping = self
+                .mappings
+                .get_mut(address_space, virtual_page)
+                .expect("mapping protection range was preflighted");
+            let was_executable_content = mapping.observes_executable_content();
+            mapping.permissions = permissions;
+            mapping.mapping_generation = mapping_generation;
+            (
+                mapping.physical_slot,
+                was_executable_content,
+                mapping.observes_executable_content(),
+            )
+        };
+        self.update_executable_content_mapping_count(
+            physical_slot,
+            was_executable_content,
+            is_executable_content,
+        );
+    }
+
+    fn executable_content_page(&self, physical_slot: usize) -> Option<GuestPhysicalPageId> {
+        let slot = self.physical_slots.get(physical_slot)?.as_ref()?;
+        if slot.executable_content_mapping_count == 0 {
+            return None;
+        }
+        match &slot.page {
+            ExecutionPhysicalPage::Ram(page) => Some(page.identity().page()),
+            ExecutionPhysicalPage::Mmio(_) => None,
+        }
+    }
+
+    fn mapping_count(&self, physical_slot: usize) -> usize {
+        self.physical_slots
+            .get(physical_slot)
+            .and_then(Option::as_ref)
+            .map_or(0, |slot| slot.mapping_count)
+    }
+
+    fn register_mapping(&mut self, mapping: ExecutionMapping) {
+        let slot = self
+            .physical_slots
+            .get_mut(mapping.physical_slot)
+            .and_then(Option::as_mut)
+            .expect("mapping references an owned physical slot");
+        slot.mapping_count = slot
+            .mapping_count
+            .checked_add(1)
+            .expect("physical mapping count is bounded by guest mappings");
+        if mapping.observes_executable_content() {
+            slot.executable_content_mapping_count = slot
+                .executable_content_mapping_count
+                .checked_add(1)
+                .expect("executable mapping count is bounded by guest mappings");
+        }
+    }
+
+    fn unregister_mapping(&mut self, mapping: ExecutionMapping) {
+        let slot = self
+            .physical_slots
+            .get_mut(mapping.physical_slot)
+            .and_then(Option::as_mut)
+            .expect("mapping references an owned physical slot");
+        slot.mapping_count = slot
+            .mapping_count
+            .checked_sub(1)
+            .expect("physical mapping count tracks every published mapping");
+        if mapping.observes_executable_content() {
+            slot.executable_content_mapping_count = slot
+                .executable_content_mapping_count
+                .checked_sub(1)
+                .expect("executable mapping count tracks every executable alias");
+        }
+    }
+
+    fn update_executable_content_mapping_count(
+        &mut self,
+        physical_slot: usize,
+        was_executable_content: bool,
+        is_executable_content: bool,
+    ) {
+        if was_executable_content == is_executable_content {
+            return;
+        }
+        let slot = self
+            .physical_slots
+            .get_mut(physical_slot)
+            .and_then(Option::as_mut)
+            .expect("mapping references an owned physical slot");
+        if is_executable_content {
+            slot.executable_content_mapping_count = slot
+                .executable_content_mapping_count
+                .checked_add(1)
+                .expect("executable mapping count is bounded by guest mappings");
+        } else {
+            slot.executable_content_mapping_count = slot
+                .executable_content_mapping_count
+                .checked_sub(1)
+                .expect("executable mapping count tracks every executable alias");
+        }
     }
 
     fn mapping_at(
@@ -215,6 +398,12 @@ impl ExecutionMemoryInner {
             mapping.purpose,
             mapping.attributes,
         ))
+    }
+}
+
+impl ExecutionMapping {
+    fn observes_executable_content(self) -> bool {
+        self.permissions.contains(MemoryPermissions::EXECUTE) || self.purpose.is_code()
     }
 }
 
@@ -536,7 +725,7 @@ impl ExecutionMemory {
             let slot = inner
                 .push_page(physical_page, page)
                 .expect("preflight allocated a unique physical identity");
-            let previous = inner.mappings.insert(
+            inner.insert_mapping(
                 address_space,
                 virtual_page,
                 ExecutionMapping {
@@ -548,7 +737,6 @@ impl ExecutionMemory {
                     attributes: MemoryAttributes::NONE,
                 },
             );
-            debug_assert!(previous.is_none());
         }
         inner.next_page_id = next_page_id;
         invalidation.commit();
@@ -609,12 +797,7 @@ impl ExecutionMemory {
             return false;
         };
         for page in range.first..range.end {
-            let mapping = inner
-                .mappings
-                .get_mut(address_space, page)
-                .expect("range was preflighted");
-            mapping.purpose = purpose;
-            mapping.mapping_generation = mapping_generation;
+            inner.set_mapping_purpose(address_space, page, purpose, mapping_generation);
         }
         invalidation.commit();
         true
@@ -696,7 +879,7 @@ impl ExecutionMemory {
         let Ok(next_generation) = generation.next() else {
             return false;
         };
-        let invalidation = match Self::executable_content_page(inner, slot) {
+        let invalidation = match inner.executable_content_page(slot) {
             Some(first) => match invalidations.reserve(MemoryInvalidationKind::ExecutableContent {
                 first,
                 second: None,
@@ -816,7 +999,7 @@ impl ExecutionMemory {
                 )
             })?;
         for physical_slot in pending_generations.keys().copied() {
-            if let Some(first) = Self::executable_content_page(&inner, physical_slot) {
+            if let Some(first) = inner.executable_content_page(physical_slot) {
                 invalidation_kinds.push(MemoryInvalidationKind::ExecutableContent {
                     first,
                     second: None,
@@ -902,7 +1085,7 @@ impl ExecutionMemory {
         else {
             return false;
         };
-        let previous = inner.mappings.insert(
+        inner.insert_mapping(
             address_space,
             virtual_page,
             ExecutionMapping {
@@ -914,7 +1097,6 @@ impl ExecutionMemory {
                 attributes: MemoryAttributes::NONE,
             },
         );
-        debug_assert!(previous.is_none());
         invalidation.commit();
         true
     }
@@ -991,24 +1173,6 @@ impl ExecutionMemory {
         ))
     }
 
-    fn executable_content_page(
-        inner: &ExecutionMemoryInner,
-        physical_slot: usize,
-    ) -> Option<GuestPhysicalPageId> {
-        let observed = inner.mappings.mappings().any(|(_, _, mapping)| {
-            mapping.physical_slot == physical_slot
-                && (mapping.permissions.contains(MemoryPermissions::EXECUTE)
-                    || mapping.purpose.is_code())
-        });
-        if !observed {
-            return None;
-        }
-        inner.page(physical_slot).and_then(|page| match page {
-            ExecutionPhysicalPage::Ram(page) => Some(page.identity().page()),
-            ExecutionPhysicalPage::Mmio(_) => None,
-        })
-    }
-
     fn atomic_transaction(
         &self,
         address_space: AddressSpaceId,
@@ -1051,7 +1215,7 @@ impl ExecutionMemory {
             };
             (
                 backing.clone(),
-                Self::executable_content_page(&inner, resolved.first.physical_slot),
+                inner.executable_content_page(resolved.first.physical_slot),
             )
         };
         backing.prepare_cpu_access().map_err(|reason| {
@@ -1398,14 +1562,10 @@ impl CpuMemory for ExecutionMemory {
         }
         let inner = self.lock_inner();
         let mapping = inner.mapping_at(address_space, page)?;
-        if mapping.permissions.contains(MemoryPermissions::EXECUTE)
-            || mapping.purpose.is_code()
-            || mapping.attributes.contains(MemoryAttributes::UNCACHED)
-            || inner.mappings.mappings().any(|(_, _, candidate)| {
-                candidate.physical_slot == mapping.physical_slot
-                    && (candidate.permissions.contains(MemoryPermissions::EXECUTE)
-                        || candidate.purpose.is_code())
-            })
+        if mapping.attributes.contains(MemoryAttributes::UNCACHED)
+            || inner
+                .executable_content_page(mapping.physical_slot)
+                .is_some()
         {
             return None;
         }
@@ -1576,11 +1736,11 @@ impl CpuMemory for ExecutionMemory {
             });
         }
 
-        let first_code_page = Self::executable_content_page(&inner, resolved.first.physical_slot);
+        let first_code_page = inner.executable_content_page(resolved.first.physical_slot);
         let second_code_page = if let Some(second) = resolved.second
             && second.physical_slot != resolved.first.physical_slot
         {
-            Self::executable_content_page(&inner, second.physical_slot)
+            inner.executable_content_page(second.physical_slot)
         } else {
             None
         };
@@ -1867,7 +2027,8 @@ impl CpuMemory for ExecutionMemory {
             | super::CacheMaintenanceKind::DataClean
             | super::CacheMaintenanceKind::DataCleanAndInvalidate => {
                 let generation = backing.content_generation();
-                let reservation = Self::executable_content_page(&inner, mapping.physical_slot)
+                let reservation = inner
+                    .executable_content_page(mapping.physical_slot)
                     .map(|first| {
                         self.invalidations
                             .reserve(MemoryInvalidationKind::ExecutableContent {
@@ -2073,7 +2234,8 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::ContentGenerationExhausted,
             )
         })?;
-        let invalidation = Self::executable_content_page(&inner, resolved.first.physical_slot)
+        let invalidation = inner
+            .executable_content_page(resolved.first.physical_slot)
             .map(|first| {
                 self.invalidations
                     .reserve(MemoryInvalidationKind::ExecutableContent {
@@ -2215,7 +2377,7 @@ impl ProcessMemory for ExecutionMemory {
                 let mapping = inner
                     .mapping_at(address_space, current)
                     .expect("canonical range translation validated every mapping");
-                if let Some(first) = Self::executable_content_page(&inner, mapping.physical_slot)
+                if let Some(first) = inner.executable_content_page(mapping.physical_slot)
                     && !kinds.iter().any(|kind| {
                         matches!(kind, MemoryInvalidationKind::ExecutableContent { first: page, .. } if *page == first)
                     })
@@ -2335,14 +2497,9 @@ impl ProcessMemory for ExecutionMemory {
                 .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
             for page in new_end_page..old_end_page {
                 let mapping = inner
-                    .mappings
-                    .remove(address_space, page)
+                    .remove_mapping(address_space, page)
                     .expect("shrinking range was preflighted");
-                let still_mapped = inner
-                    .mappings
-                    .mappings()
-                    .any(|(_, _, candidate)| candidate.physical_slot == mapping.physical_slot);
-                if !still_mapped {
+                if inner.mapping_count(mapping.physical_slot) == 0 {
                     inner.remove_page(mapping.physical_page, mapping.physical_slot);
                 }
             }
@@ -2401,7 +2558,7 @@ impl ProcessMemory for ExecutionMemory {
             let slot = inner
                 .push_page(physical_page, ExecutionPhysicalPage::Ram(backing))
                 .expect("allocated physical identity is unique");
-            let previous = inner.mappings.insert(
+            inner.insert_mapping(
                 address_space,
                 page,
                 ExecutionMapping {
@@ -2413,7 +2570,6 @@ impl ProcessMemory for ExecutionMemory {
                     attributes: MemoryAttributes::NONE,
                 },
             );
-            debug_assert!(previous.is_none());
         }
         inner.next_page_id = next_page_id;
         mutation.commit();
@@ -2482,12 +2638,7 @@ impl ProcessMemory for ExecutionMemory {
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in range.first..range.end {
-            let mapping = inner
-                .mappings
-                .get_mut(address_space, page)
-                .expect("protection range was preflighted");
-            mapping.permissions = permissions;
-            mapping.mapping_generation = mapping_generation;
+            inner.set_mapping_permissions(address_space, page, permissions, mapping_generation);
         }
         mutation.commit();
         invalidation.commit();
@@ -2993,6 +3144,125 @@ mod tests {
         let inner = memory.inner_mut();
         assert_eq!(inner.mappings.leaves.len(), 2);
         assert_eq!(inner.mappings.mappings().count(), 2);
+    }
+
+    #[test]
+    fn physical_slots_track_executable_aliases_across_mapping_transitions() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let physical_page = GuestPhysicalPageId::new(1);
+        let writable = GuestVirtualAddress::new(0x1000);
+        let executable_alias = GuestVirtualAddress::new(0x2000);
+        let access = MemoryAccess::normal(MemoryAccessSize::Byte);
+
+        assert!(memory.add_ram_page(physical_page));
+        assert!(memory.map_page(
+            space,
+            writable,
+            physical_page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        assert!(memory.map_page(
+            space,
+            executable_alias,
+            physical_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+
+        let physical_slot = memory.inner_mut().slots_by_id[&physical_page];
+        {
+            let inner = memory.inner_mut();
+            let slot = inner.physical_slots[physical_slot].as_ref().unwrap();
+            assert_eq!(slot.mapping_count, 2);
+            assert_eq!(slot.executable_content_mapping_count, 1);
+        }
+        let before_write = memory.invalidation_cursor();
+        memory
+            .write(space, writable, access, MemoryValue::U8(0x11))
+            .unwrap();
+        let mut invalidations = Vec::new();
+        memory
+            .read_invalidations_since(before_write, &mut invalidations)
+            .unwrap();
+        assert!(matches!(
+            invalidations.as_slice(),
+            [MemoryInvalidation {
+                kind: MemoryInvalidationKind::ExecutableContent {
+                    first,
+                    second: None,
+                },
+                ..
+            }] if *first == physical_page
+        ));
+
+        memory
+            .set_permissions(space, executable_alias, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        assert_eq!(
+            memory.inner_mut().physical_slots[physical_slot]
+                .as_ref()
+                .unwrap()
+                .executable_content_mapping_count,
+            0
+        );
+        let before_plain_write = memory.invalidation_cursor();
+        memory
+            .write(space, writable, access, MemoryValue::U8(0x22))
+            .unwrap();
+        invalidations.clear();
+        memory
+            .read_invalidations_since(before_plain_write, &mut invalidations)
+            .unwrap();
+        assert!(invalidations.is_empty());
+
+        assert!(memory.set_mapping_purpose(
+            space,
+            executable_alias,
+            PAGE_SIZE,
+            MemoryMappingPurpose::CodeStatic,
+        ));
+        assert_eq!(
+            memory.inner_mut().physical_slots[physical_slot]
+                .as_ref()
+                .unwrap()
+                .executable_content_mapping_count,
+            1
+        );
+        assert!(memory.set_mapping_purpose(
+            space,
+            executable_alias,
+            PAGE_SIZE,
+            MemoryMappingPurpose::Normal,
+        ));
+
+        memory
+            .resize_zeroed_mapping(
+                space,
+                writable,
+                PAGE_SIZE,
+                0,
+                MemoryPermissions::READ_WRITE,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        {
+            let inner = memory.lock_inner();
+            let slot = inner.physical_slots[physical_slot].as_ref().unwrap();
+            assert_eq!(slot.mapping_count, 1);
+            assert_eq!(slot.executable_content_mapping_count, 0);
+        }
+        memory
+            .resize_zeroed_mapping(
+                space,
+                executable_alias,
+                PAGE_SIZE,
+                0,
+                MemoryPermissions::READ,
+                MemoryMappingPurpose::Normal,
+            )
+            .unwrap();
+        assert!(!memory.inner_mut().slots_by_id.contains_key(&physical_page));
+        assert!(memory.inner_mut().physical_slots[physical_slot].is_none());
     }
 
     #[test]

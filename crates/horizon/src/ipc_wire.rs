@@ -359,6 +359,42 @@ impl IpcTarget {
             _ => false,
         }
     }
+
+    fn diagnostic_name(&self, request: &CmifRequest<'_>) -> &'static str {
+        let domain_object = match request.domain.as_ref() {
+            Some(
+                DomainRequest::SendMessage { object_id, .. } | DomainRequest::Close { object_id },
+            ) => Some(*object_id),
+            None => None,
+        };
+        match self {
+            Self::ServiceManager(_) => "sm:",
+            Self::SemanticService(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .as_ref()
+                .map_or_else(
+                    || semantic_service_name(session.service()),
+                    semantic_object_name,
+                ),
+            Self::SystemSettings(_) => "set:sys",
+            Self::UserSettings(_) => "set",
+            Self::PerformanceManager(_) => "apm",
+            Self::Performance(_) => "IPerformanceSession",
+            Self::Applet(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .map_or("appletOE", applet_object_name),
+            Self::Account(_) => "acc:u0",
+            Self::Hid(_) => "hid",
+            Self::HidAppletResource(_) => "IAppletResource",
+            Self::Time(_) => "time:u",
+            Self::SystemClock(_) => "ISystemClock",
+            Self::SteadyClock(_) => "ISteadyClock",
+            Self::TimeZone(_) => "ITimeZoneService",
+            Self::Vi(session) => vi_object_name(session.kind()),
+            Self::NvDrv(_) => "nvdrv",
+            Self::SemanticObject(object) => semantic_object_name(object),
+        }
+    }
 }
 
 pub(crate) fn send_sync_request(
@@ -421,18 +457,32 @@ pub(crate) fn send_sync_request_from_buffer(
             IpcWireError::Malformed(error.0)
         }
     })?;
-    log::trace!(
-        "SendSyncRequest handle={handle:#x} type={} command={} send_pid={} descriptors={}/{}/{}/{} handles={}/{}",
-        request.command_type,
-        request.command_id,
-        hipc.pid.is_some(),
-        hipc.send_statics.len(),
-        hipc.send_buffers.len(),
-        hipc.receive_buffers.len(),
-        hipc.exchange_buffers.len(),
-        hipc.copy_handles.len(),
-        hipc.move_handles.len(),
-    );
+    let trace_service =
+        log::log_enabled!(log::Level::Trace).then(|| target.diagnostic_name(&request));
+    if let Some(service) = trace_service {
+        log::trace!(
+            "SendSyncRequest service={service} handle={handle:#x} type={} command={} send_pid={} descriptors={}/{}/{}/{} handles={}/{}",
+            request.command_type,
+            request.command_id,
+            hipc.pid.is_some(),
+            hipc.send_statics.len(),
+            hipc.send_buffers.len(),
+            hipc.receive_buffers.len(),
+            hipc.exchange_buffers.len(),
+            hipc.copy_handles.len(),
+            hipc.move_handles.len(),
+        );
+    }
+    let command_type = request.command_type;
+    let command_id = request.command_id;
+    let trace_completion = |outcome: SyncRequestResult| {
+        if let Some(service) = trace_service {
+            log::trace!(
+                "SendSyncRequest completed service={service} handle={handle:#x} type={command_type} command={command_id} outcome={outcome:?}"
+            );
+        }
+        outcome
+    };
 
     if request.command_type == CMIF_COMMAND_CLOSE {
         // libnx sends a CMIF close before releasing an owned session handle.
@@ -441,7 +491,7 @@ pub(crate) fn send_sync_request_from_buffer(
         // cleanup:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L195-L209
         let _ = process.handles_mut().close(handle);
-        return Ok(SyncRequestResult::Success);
+        return Ok(trace_completion(SyncRequestResult::Success));
     }
     if matches!(
         request.command_type,
@@ -463,7 +513,7 @@ pub(crate) fn send_sync_request_from_buffer(
             )?;
             write_response(process, address, size, &response)?;
             log::debug!("appletOE converted to domain with root object {object_id:#x}");
-            return Ok(SyncRequestResult::Success);
+            return Ok(trace_completion(SyncRequestResult::Success));
         }
         if request.command_id == 0
             && let IpcTarget::SemanticService(service) = &target
@@ -483,7 +533,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 "{:?} converted to domain with root object {object_id:#x}",
                 String::from_utf8_lossy(service.service().name())
             );
-            return Ok(SyncRequestResult::Success);
+            return Ok(trace_completion(SyncRequestResult::Success));
         }
         if matches!(request.command_id, 2 | 4)
             && let IpcTarget::SemanticService(service) = &target
@@ -517,7 +567,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 "{:?} cloned session {handle:#x} as {cloned_handle:#x}",
                 String::from_utf8_lossy(service.service().name())
             );
-            return Ok(SyncRequestResult::Success);
+            return Ok(trace_completion(SyncRequestResult::Success));
         }
         if matches!(request.command_id, 2 | 4)
             && let IpcTarget::Vi(vi) = &target
@@ -533,7 +583,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 Some(cloned_handle),
             )?;
             write_response(process, address, size, &response)?;
-            return Ok(SyncRequestResult::Success);
+            return Ok(trace_completion(SyncRequestResult::Success));
         }
         if matches!(request.command_id, 2 | 4)
             && let IpcTarget::NvDrv(nvdrv) = &target
@@ -558,7 +608,7 @@ pub(crate) fn send_sync_request_from_buffer(
                 Some(cloned_handle),
             )?;
             write_response(process, address, size, &response)?;
-            return Ok(SyncRequestResult::Success);
+            return Ok(trace_completion(SyncRequestResult::Success));
         }
         let response = match request.command_id {
             // QueryPointerBufferSize. Zero makes libnx use map-alias buffers,
@@ -572,7 +622,7 @@ pub(crate) fn send_sync_request_from_buffer(
             command_id => return unsupported_service_command("CMIF control", command_id),
         }?;
         write_response(process, address, size, &response)?;
-        return Ok(SyncRequestResult::Success);
+        return Ok(trace_completion(SyncRequestResult::Success));
     }
     let applet_exit_requested = match &target {
         IpcTarget::Applet(session) => applet_requests_self_exit(session, &request, &hipc),
@@ -623,7 +673,7 @@ pub(crate) fn send_sync_request_from_buffer(
         ) {
             Ok(response) => response,
             Err(IpcWireError::PendingNvDrv(wait)) => {
-                return Ok(SyncRequestResult::PendingNvDrv(wait));
+                return Ok(trace_completion(SyncRequestResult::PendingNvDrv(wait)));
             }
             Err(error) => return Err(error),
         },
@@ -637,11 +687,12 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         return Err(error);
     }
-    Ok(if applet_exit_requested {
+    let outcome = if applet_exit_requested {
         SyncRequestResult::AppletExitRequested
     } else {
         SyncRequestResult::Success
-    })
+    };
+    Ok(trace_completion(outcome))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3901,6 +3952,32 @@ fn add(address: GuestVirtualAddress, offset: usize) -> Result<GuestVirtualAddres
 mod tests {
     use super::*;
     use crate::ipc_message::ReceiveStaticDescriptor;
+
+    #[test]
+    fn ipc_diagnostics_derive_service_names_from_typed_targets() {
+        let request = CmifRequest {
+            command_type: 4,
+            command_id: 3,
+            token: 0,
+            context: None,
+            data: &[],
+            domain: None,
+        };
+
+        assert_eq!(
+            IpcTarget::NvDrv(NvDrvSession::default()).diagnostic_name(&request),
+            "nvdrv"
+        );
+        assert_eq!(
+            IpcTarget::SemanticService(IpcSession::new(IpcService::FileSystem))
+                .diagnostic_name(&request),
+            "fsp-srv"
+        );
+        assert_eq!(
+            IpcTarget::SystemSettings(SystemSettingsSession::new()).diagnostic_name(&request),
+            "set:sys"
+        );
+    }
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
