@@ -5,14 +5,18 @@ use nixe_cpu::error::InstructionFetchFault;
 use nixe_cpu::exclusive::{ExclusiveMonitorState, ExclusiveReservation};
 use nixe_cpu::location::InstructionEncoding;
 use nixe_cpu::memory::{
-    CodePageSpan, CpuMemory, DataAccessFault, DataReadResult, DataWriteResult, FetchedCode,
-    InstructionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryOrdering,
-    MemoryPermissions, MemoryQueryResult, MemoryValue, SyntheticMemory,
+    AtomicMemoryResult, AtomicRmwKind, CacheMaintenanceKind, CodePageSpan, CpuMemory,
+    DataAccessFault, DataReadResult, DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess,
+    MemoryAccessClass, MemoryAccessSize, MemoryOrdering, MemoryPermissions, MemoryQueryResult,
+    MemoryValue, SyntheticMemory,
 };
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister};
 use nixe_cpu_engine_interpreter::{InterpreterContext, execute_one_with_context};
-use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
+use nixe_memory::{
+    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidation,
+    MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationSource,
+};
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(7);
 const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(9);
@@ -42,6 +46,10 @@ impl<'a> ObservedMemory<'a> {
 }
 
 impl InstructionMemory for ObservedMemory<'_> {
+    fn content_mutation_epoch(&self) -> nixe_memory::ContentMutationEpoch {
+        self.inner.content_mutation_epoch()
+    }
+
     fn code_page_span(
         &self,
         address_space: AddressSpaceId,
@@ -67,7 +75,30 @@ impl InstructionMemory for ObservedMemory<'_> {
     }
 }
 
+impl MemoryInvalidationSource for ObservedMemory<'_> {
+    fn invalidation_cursor(&self) -> MemoryInvalidationCursor {
+        self.inner.invalidation_cursor()
+    }
+
+    fn read_invalidations_since(
+        &self,
+        after: MemoryInvalidationCursor,
+        output: &mut Vec<MemoryInvalidation>,
+    ) -> Result<MemoryInvalidationCursor, MemoryInvalidationError> {
+        self.inner.read_invalidations_since(after, output)
+    }
+}
+
 impl CpuMemory for ObservedMemory<'_> {
+    fn maintain_cache(
+        &self,
+        address_space: AddressSpaceId,
+        kind: CacheMaintenanceKind,
+        address: Option<GuestVirtualAddress>,
+    ) -> Result<(), DataAccessFault> {
+        self.inner.maintain_cache(address_space, kind, address)
+    }
+
     fn read(
         &self,
         address_space: AddressSpaceId,
@@ -87,6 +118,32 @@ impl CpuMemory for ObservedMemory<'_> {
     ) -> Result<DataWriteResult, DataAccessFault> {
         self.record(access);
         self.inner.write(address_space, address, access, value)
+    }
+
+    fn atomic_read_modify_write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: AtomicRmwKind,
+        operand: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        self.record(access);
+        self.inner
+            .atomic_read_modify_write(address_space, address, access, kind, operand)
+    }
+
+    fn atomic_compare_exchange(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        self.record(access);
+        self.inner
+            .atomic_compare_exchange(address_space, address, access, expected, replacement)
     }
 
     fn query_memory(

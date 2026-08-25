@@ -66,6 +66,7 @@ impl NixeConfig {
         }
         validate_time_config(path, &raw.system.time)?;
         validate_input_config(path, &raw.input)?;
+        let cpu = cpu_configuration(path, raw.cpu)?;
         let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         let source_path = absolute_path(path).map_err(|source| ConfigError::Io {
@@ -103,10 +104,7 @@ impl NixeConfig {
             diagnostics: DiagnosticsConfig {
                 log_level: raw.diagnostics.log_level,
             },
-            cpu: CpuConfig {
-                engine: raw.cpu.engine,
-                parallel_vcpus: raw.cpu.parallel_vcpus,
-            },
+            cpu,
             gpu,
             input: raw.input,
             source_path,
@@ -231,6 +229,8 @@ pub struct CpuConfig {
     /// Enables capability-gated host-parallel execution. Deterministic
     /// serialized workers remain the default.
     pub parallel_vcpus: bool,
+    /// Resource policy used only when a registered JIT provider is selected.
+    pub jit: CpuJitConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -238,7 +238,27 @@ pub struct CpuConfig {
 pub enum CpuEngineSelection {
     #[default]
     Auto,
+    Jit,
     Interpreter,
+}
+
+/// Product-level JIT resource bounds. Compiler implementation details remain
+/// private to the selected provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuJitConfig {
+    pub max_cached_regions: usize,
+    pub max_cache_bytes: usize,
+    pub max_concurrent_compilations: usize,
+}
+
+impl Default for CpuJitConfig {
+    fn default() -> Self {
+        Self {
+            max_cached_regions: DEFAULT_JIT_MAX_CACHED_REGIONS,
+            max_cache_bytes: DEFAULT_JIT_CACHE_MIB * 1024 * 1024,
+            max_concurrent_compilations: DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS,
+        }
+    }
 }
 
 /// Named mappings from host gamepads to the emulated controller.
@@ -297,6 +317,8 @@ pub enum ConfigError {
     InvalidInput { path: PathBuf, reason: String },
     /// GPU cache capacities are zero or cannot be represented in bytes.
     InvalidGpu { path: PathBuf, reason: String },
+    /// CPU execution-engine resource settings are invalid.
+    InvalidCpu { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -336,6 +358,11 @@ impl Display for ConfigError {
                 "configuration {} has invalid GPU settings: {reason}",
                 path.display()
             ),
+            Self::InvalidCpu { path, reason } => write!(
+                formatter,
+                "configuration {} has invalid CPU settings: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -348,7 +375,8 @@ impl Error for ConfigError {
             Self::UnsupportedVersion { .. }
             | Self::InvalidTime { .. }
             | Self::InvalidInput { .. }
-            | Self::InvalidGpu { .. } => None,
+            | Self::InvalidGpu { .. }
+            | Self::InvalidCpu { .. } => None,
         }
     }
 }
@@ -378,7 +406,37 @@ struct RawCpuConfig {
     engine: CpuEngineSelection,
     #[serde(default)]
     parallel_vcpus: bool,
+    #[serde(default)]
+    jit: RawCpuJitConfig,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpuJitConfig {
+    #[serde(default = "default_jit_max_cached_regions")]
+    max_cached_regions: usize,
+    #[serde(default = "default_jit_cache_mib")]
+    cache_mib: usize,
+    #[serde(default = "default_jit_max_concurrent_compilations")]
+    max_concurrent_compilations: usize,
+}
+
+impl Default for RawCpuJitConfig {
+    fn default() -> Self {
+        Self {
+            max_cached_regions: default_jit_max_cached_regions(),
+            cache_mib: default_jit_cache_mib(),
+            max_concurrent_compilations: default_jit_max_concurrent_compilations(),
+        }
+    }
+}
+
+const DEFAULT_JIT_MAX_CACHED_REGIONS: usize = 1_024;
+const DEFAULT_JIT_CACHE_MIB: usize = 48;
+const DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS: usize = 4;
+const MAX_JIT_MAX_CACHED_REGIONS: usize = DEFAULT_JIT_MAX_CACHED_REGIONS;
+const MAX_JIT_CACHE_MIB: usize = DEFAULT_JIT_CACHE_MIB;
+const MAX_JIT_CONCURRENT_COMPILATIONS: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -472,6 +530,18 @@ const fn default_recursive_scan() -> bool {
     true
 }
 
+const fn default_jit_max_cached_regions() -> usize {
+    DEFAULT_JIT_MAX_CACHED_REGIONS
+}
+
+const fn default_jit_cache_mib() -> usize {
+    DEFAULT_JIT_CACHE_MIB
+}
+
+const fn default_jit_max_concurrent_compilations() -> usize {
+    DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS
+}
+
 fn default_timezone() -> String {
     "UTC".to_owned()
 }
@@ -521,6 +591,48 @@ fn gpu_cache_configuration(
     .map_err(|error| ConfigError::InvalidGpu {
         path: path.to_owned(),
         reason: error.to_string(),
+    })
+}
+
+fn cpu_configuration(path: &Path, raw: RawCpuConfig) -> Result<CpuConfig, ConfigError> {
+    if !(1..=MAX_JIT_MAX_CACHED_REGIONS).contains(&raw.jit.max_cached_regions) {
+        return Err(ConfigError::InvalidCpu {
+            path: path.to_owned(),
+            reason: format!(
+                "cpu.jit.max_cached_regions must be between 1 and {MAX_JIT_MAX_CACHED_REGIONS}"
+            ),
+        });
+    }
+    if !(1..=MAX_JIT_CACHE_MIB).contains(&raw.jit.cache_mib) {
+        return Err(ConfigError::InvalidCpu {
+            path: path.to_owned(),
+            reason: format!("cpu.jit.cache_mib must be between 1 and {MAX_JIT_CACHE_MIB}"),
+        });
+    }
+    if !(1..=MAX_JIT_CONCURRENT_COMPILATIONS).contains(&raw.jit.max_concurrent_compilations) {
+        return Err(ConfigError::InvalidCpu {
+            path: path.to_owned(),
+            reason: format!(
+                "cpu.jit.max_concurrent_compilations must be between 1 and {MAX_JIT_CONCURRENT_COMPILATIONS}"
+            ),
+        });
+    }
+    let max_cache_bytes =
+        raw.jit
+            .cache_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| ConfigError::InvalidCpu {
+                path: path.to_owned(),
+                reason: "cpu.jit.cache_mib does not fit in bytes".to_owned(),
+            })?;
+    Ok(CpuConfig {
+        engine: raw.engine,
+        parallel_vcpus: raw.parallel_vcpus,
+        jit: CpuJitConfig {
+            max_cached_regions: raw.jit.max_cached_regions,
+            max_cache_bytes,
+            max_concurrent_compilations: raw.jit.max_concurrent_compilations,
+        },
     })
 }
 
@@ -764,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_engine_selection_defaults_to_auto_and_accepts_interpreter() {
+    fn cpu_engine_selection_and_jit_budgets_are_typed_and_validated() {
         let default_file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -785,6 +897,10 @@ mod tests {
                 .unwrap()
                 .cpu
                 .parallel_vcpus
+        );
+        assert_eq!(
+            NixeConfig::load(&default_file.path).unwrap().cpu.jit,
+            CpuJitConfig::default()
         );
 
         let explicit_file = TemporaryConfig::new(
@@ -812,7 +928,7 @@ mod tests {
                 .parallel_vcpus
         );
 
-        let invalid_file = TemporaryConfig::new(
+        let jit_file = TemporaryConfig::new(
             r#"
                 version = 2
                 [library]
@@ -823,12 +939,64 @@ mod tests {
                 initial_operation_mode = "handheld"
                 [cpu]
                 engine = "jit"
+                [cpu.jit]
+                max_cached_regions = 256
+                cache_mib = 16
+                max_concurrent_compilations = 2
+            "#,
+        );
+        let jit = NixeConfig::load(&jit_file.path).unwrap().cpu;
+        assert_eq!(jit.engine, CpuEngineSelection::Jit);
+        assert_eq!(
+            jit.jit,
+            CpuJitConfig {
+                max_cached_regions: 256,
+                max_cache_bytes: 16 * 1024 * 1024,
+                max_concurrent_compilations: 2,
+            }
+        );
+
+        let invalid_engine = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [cpu]
+                engine = "native"
             "#,
         );
         assert!(matches!(
-            NixeConfig::load(&invalid_file.path),
+            NixeConfig::load(&invalid_engine.path),
             Err(ConfigError::Parse { .. })
         ));
+
+        for setting in [
+            "max_cached_regions = 0",
+            "cache_mib = 0",
+            "max_concurrent_compilations = 0",
+        ] {
+            let invalid_budget = TemporaryConfig::new(&format!(
+                r#"
+                    version = 2
+                    [library]
+                    paths = []
+                    [system]
+                    preferred_languages = []
+                    keys = "keys"
+                    initial_operation_mode = "handheld"
+                    [cpu.jit]
+                    {setting}
+                "#
+            ));
+            assert!(matches!(
+                NixeConfig::load(&invalid_budget.path),
+                Err(ConfigError::InvalidCpu { .. })
+            ));
+        }
     }
 
     #[test]

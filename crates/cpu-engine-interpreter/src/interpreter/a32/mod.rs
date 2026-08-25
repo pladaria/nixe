@@ -52,6 +52,13 @@ pub(super) fn execute(
                         fault,
                     });
                 }
+                fp_simd::Execution::FloatingPointException => {
+                    return Ok(InterpreterOutcome::Exception {
+                        source: decoded.location,
+                        kind: nixe_cpu::exception::ExceptionKind::FloatingPoint,
+                        syndrome: None,
+                    });
+                }
             }
         }
     };

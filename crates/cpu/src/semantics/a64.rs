@@ -1,6 +1,119 @@
 //! Pure architectural decisions shared by A64 execution engines.
 
-use crate::{memory::MemoryAccessSize, semantics::shifts::ShiftKind};
+use crate::{
+    memory::{BarrierAccess, BarrierDomain, BarrierOperation, MemoryAccessSize},
+    profile::{CapabilityStatus, GuestCpuProfile, ProfileValue},
+    semantics::shifts::ShiftKind,
+};
+
+/// Architecturally meaningful operations allocated in the A64 HINT space.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HintOperation {
+    NoOperation,
+    Yield,
+    WaitForEvent,
+    WaitForInterrupt,
+    SendEvent,
+    SendEventLocal,
+}
+
+/// Normalizes the baseline A64 scheduling and event hints.
+///
+/// Arm A-profile A64 instruction definitions (2025-12):
+/// https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions
+#[must_use]
+pub const fn hint_operation(immediate: u8) -> Option<HintOperation> {
+    match immediate {
+        0 => Some(HintOperation::NoOperation),
+        1 => Some(HintOperation::Yield),
+        2 => Some(HintOperation::WaitForEvent),
+        3 => Some(HintOperation::WaitForInterrupt),
+        4 => Some(HintOperation::SendEvent),
+        5 => Some(HintOperation::SendEventLocal),
+        _ => None,
+    }
+}
+
+/// Runtime-owned component needed to read one user-visible A64 system register.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RuntimeRegisterRead {
+    Constant(u64),
+    TimerFrequency,
+    TimerCounter,
+}
+
+/// Resolves the profile-dependent part of an A64 userspace system-register read.
+#[must_use]
+pub const fn runtime_register_read(
+    profile: GuestCpuProfile,
+    system_key: u32,
+) -> Option<RuntimeRegisterRead> {
+    match system_key {
+        // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
+        // Switch 1's Cortex-A57 profile exposes 64-byte lines.
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
+        0xd53b_0020 => Some(RuntimeRegisterRead::Constant((4_u64 << 16) | 4)),
+        // DCZID_EL0 derives its block size and prohibition bit from the guest
+        // profile rather than the host cache implementation.
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DCZID-EL0--Data-Cache-Zero-ID-Register
+        0xd53b_00e0 => {
+            let cache = profile.cache_maintenance();
+            let ProfileValue::Known(bytes) = cache.data_zero_block_bytes else {
+                return None;
+            };
+            if bytes < 4 || !bytes.is_power_of_two() {
+                return None;
+            }
+            let prohibited = match cache.user_cache_maintenance {
+                CapabilityStatus::Enabled => 0,
+                CapabilityStatus::Disabled => 1 << 4,
+                CapabilityStatus::Unknown => return None,
+            };
+            Some(RuntimeRegisterRead::Constant(
+                prohibited | (bytes.trailing_zeros() - 2) as u64,
+            ))
+        }
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTFRQ-EL0--Counter-timer-Frequency-register
+        0xd53b_e000 => Some(RuntimeRegisterRead::TimerFrequency),
+        // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTVCT-EL0--Counter-timer-Virtual-Count-register
+        0xd53b_e020 => Some(RuntimeRegisterRead::TimerCounter),
+        _ => None,
+    }
+}
+
+/// Normalizes an A64 DSB, DMB, or ISB encoding into the engine-neutral memory
+/// contract.
+#[must_use]
+pub const fn barrier_operation(opcode: u8, option: u8) -> Option<BarrierOperation> {
+    if opcode == 6 {
+        return if option == 15 {
+            Some(BarrierOperation::InstructionSynchronization)
+        } else {
+            None
+        };
+    }
+    if opcode != 4 && opcode != 5 {
+        return None;
+    }
+    let access = match option & 3 {
+        1 => BarrierAccess::Reads,
+        2 => BarrierAccess::Writes,
+        3 => BarrierAccess::ReadsAndWrites,
+        _ => return None,
+    };
+    let domain = match option >> 2 {
+        0 => BarrierDomain::OuterShareable,
+        1 => BarrierDomain::NonShareable,
+        2 => BarrierDomain::InnerShareable,
+        3 => BarrierDomain::FullSystem,
+        _ => return None,
+    };
+    Some(if opcode == 4 {
+        BarrierOperation::DataSynchronization { domain, access }
+    } else {
+        BarrierOperation::DataMemory { domain, access }
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadSpec {

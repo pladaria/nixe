@@ -7,7 +7,9 @@ use nixe_cpu_engine::{
     run_provider_conformance,
 };
 use nixe_cpu_engine_testkit::FakeNceProvider;
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
+use nixe_memory::{
+    AddressSpaceId, GuestVirtualAddress, MemoryInvalidationSource, MemoryPermissions,
+};
 
 #[test]
 fn fake_nce_passes_portable_engine_conformance() {
@@ -37,7 +39,8 @@ fn fake_nce_binds_memory_and_tears_down_once() {
         address_space: space,
         end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
         memory: &memory,
-        invalidation_generation: memory.mapping_epoch().get(),
+        mapping_epoch: memory.mapping_epoch().get(),
+        invalidation_cursor: memory.invalidation_cursor(),
     };
     let mut domain = provider.create_nce_domain(DomainRequest {
         domain: EngineDomainId::new(7),

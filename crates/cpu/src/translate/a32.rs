@@ -47,7 +47,7 @@ fn lift_inner(
                 predicate,
                 instruction,
                 fallthrough,
-                false,
+                Immediate::I1(false).into(),
             )
         }
         A32Instruction::Integer(IntegerInstruction::Multiply(instruction)) => {
@@ -57,7 +57,7 @@ fn lift_inner(
                 predicate,
                 instruction,
                 fallthrough,
-                false,
+                Immediate::I1(false).into(),
             )
         }
         A32Instruction::Integer(IntegerInstruction::MoveWide { rd, immediate, top }) => {
@@ -107,14 +107,6 @@ fn lift_control(
     Ok(match instruction {
         ControlInstruction::Nop => LiftOutcome::Continue,
         ControlInstruction::Branch { link, displacement } => {
-            if link {
-                write_link(
-                    builder,
-                    source,
-                    predicate,
-                    source.pc.get().wrapping_add(4) as u32,
-                )?;
-            }
             let target = direct(
                 nixe_memory::GuestVirtualAddress::new(u64::from(
                     (source.pc.get() as u32)
@@ -132,14 +124,6 @@ fn lift_control(
             )
         }
         ControlInstruction::Exchange { link, rm } => {
-            if link {
-                write_link(
-                    builder,
-                    source,
-                    predicate,
-                    source.pc.get().wrapping_add(4) as u32,
-                )?;
-            }
             let bits = aarch32::read_register(builder, source, rm, false)?;
             let address = builder
                 .emit(
@@ -157,6 +141,7 @@ fn lift_control(
                 predicate,
                 ControlTarget::A32Interworking {
                     address: address.into(),
+                    source,
                 },
                 fallthrough,
                 link,
@@ -164,12 +149,6 @@ fn lift_control(
             )
         }
         ControlInstruction::BlxImmediate { displacement } => {
-            write_link(
-                builder,
-                source,
-                predicate,
-                source.pc.get().wrapping_add(4) as u32,
-            )?;
             let target = nixe_memory::GuestVirtualAddress::new(u64::from(
                 (source.pc.get() as u32)
                     .wrapping_add(8)
@@ -199,16 +178,6 @@ fn lift_control(
             fallthrough,
         ),
     })
-}
-
-fn write_link(
-    builder: &mut IrBuilder,
-    source: LocationDescriptor,
-    predicate: Operand,
-    value: u32,
-) -> Result<(), BuildError> {
-    let _ = aarch32::write_register(builder, source, 14, Immediate::I32(value).into(), predicate)?;
-    Ok(())
 }
 
 fn conditional_control(

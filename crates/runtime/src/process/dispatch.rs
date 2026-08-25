@@ -13,6 +13,10 @@ impl RunnableProcess {
         self.execution.engine_descriptor()
     }
 
+    pub(crate) fn fallback_engine_descriptor(&self) -> Option<nixe_cpu_engine::EngineDescriptor> {
+        self.execution.fallback_engine_descriptor()
+    }
+
     pub(crate) fn engine_requirements(
         &self,
         parallel: bool,
@@ -55,14 +59,27 @@ impl RunnableProcess {
         self.execution.create_worker_executors(vcpu)
     }
 
-    #[cfg(test)]
-    pub(crate) fn request_safepoint(&mut self) {
-        self.execution.request_safepoint();
+    pub(crate) fn request_execution_stop(&mut self) -> Result<(), nixe_cpu_engine::EngineFault> {
+        self.execution.request_stop()
+    }
+
+    pub(crate) fn executor_teardown_state(&self) -> super::execution::ExecutorTeardownState {
+        self.execution.executor_teardown_state(
+            std::sync::Arc::clone(&self.memory),
+            self.main_thread().state().clone(),
+        )
+    }
+
+    pub(crate) fn complete_executor_retirement(
+        &mut self,
+    ) -> Result<(), nixe_cpu_engine::EngineFault> {
+        self.execution
+            .complete_executor_retirement(self.memory.invalidation_cursor())
     }
 
     #[cfg(test)]
-    pub(crate) fn post_event(&self, mask: u32) {
-        self.execution.post_event(mask);
+    pub(crate) fn request_safepoint(&mut self) {
+        self.execution.request_safepoint();
     }
 
     /// Marks the process exited. Resource release occurs in
@@ -121,8 +138,9 @@ impl RunnableProcess {
         instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let vcpu = nixe_scheduler::VirtualCpuId::new(0);
+        let events = nixe_cpu_engine::VcpuEventState::default();
         let mut execution =
-            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget)?;
+            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget, events)?;
         let result = execution.run(executor);
         self.finish_thread_execution(self.main_thread_id, vcpu, execution, result)
     }
@@ -132,6 +150,7 @@ impl RunnableProcess {
         thread_id: nixe_scheduler::GuestThreadId,
         _vcpu: nixe_scheduler::VirtualCpuId,
         instruction_budget: u64,
+        events: nixe_cpu_engine::VcpuEventState,
     ) -> Result<execution::VcpuExecutionState, ProcessExecutionError> {
         let Some(selected) = self.threads.get(thread_id) else {
             return Err(ProcessExecutionError::UnknownThread(thread_id));
@@ -155,6 +174,7 @@ impl RunnableProcess {
             address_space_end,
             instruction_budget,
             loader_return,
+            events,
         })
     }
 

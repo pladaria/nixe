@@ -4,6 +4,7 @@
 //! metadata and link tables are ordinary Rust allocations and must never be
 //! placed in this arena.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -13,8 +14,9 @@ use nixe_cpu_engine::CapabilityRejectionReason;
 const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_SEGMENTS: usize = 4096;
 
-// The capability probe publishes but never enters this unreachable byte. Real
-// native code will come only from Cranelift once JIT-006 connects lowering.
+// The capability probe publishes but never enters this unreachable byte. All
+// executable guest regions published through the other path come from
+// verified Cranelift output.
 const PUBLICATION_PROBE_BYTES: &[u8] = &[0];
 
 pub(crate) type SharedExecutableMemory = Arc<Mutex<ExecutableMemory>>;
@@ -91,14 +93,16 @@ struct PublicationPlan {
     offset: usize,
     code_len: usize,
     mapped_len: usize,
+    reused: bool,
 }
 
 #[derive(Debug)]
 struct AllocationState {
     page_size: usize,
     limits: Limits,
-    used_bytes: usize,
-    segments: usize,
+    high_water: usize,
+    live_segments: usize,
+    free: BTreeMap<usize, usize>,
     poisoned: bool,
 }
 
@@ -125,18 +129,19 @@ impl AllocationState {
         Ok(Self {
             page_size,
             limits,
-            used_bytes: 0,
-            segments: 0,
+            high_water: 0,
+            live_segments: 0,
+            free: BTreeMap::new(),
             poisoned: false,
         })
     }
 
     fn plan(
-        &self,
+        &mut self,
         code_len: usize,
         alignment: usize,
     ) -> Result<PublicationPlan, ExecutableMemoryError> {
-        if self.segments == self.limits.max_segments {
+        if self.live_segments == self.limits.max_segments {
             return Err(ExecutableMemoryError::new(
                 ErrorKind::Exhausted,
                 "executable-memory segment limit exhausted",
@@ -166,7 +171,22 @@ impl AllocationState {
                 "native-code segment size overflowed executable-memory accounting",
             )
         })?;
-        let end = self.used_bytes.checked_add(mapped_len).ok_or_else(|| {
+        if let Some((offset, available)) = self.free.iter().find_map(|(offset, available)| {
+            (*available >= mapped_len).then_some((*offset, *available))
+        }) {
+            self.free.remove(&offset);
+            if available > mapped_len {
+                self.free
+                    .insert(offset + mapped_len, available - mapped_len);
+            }
+            return Ok(PublicationPlan {
+                offset,
+                code_len,
+                mapped_len,
+                reused: true,
+            });
+        }
+        let end = self.high_water.checked_add(mapped_len).ok_or_else(|| {
             ExecutableMemoryError::new(
                 ErrorKind::Exhausted,
                 "executable-memory allocation overflowed its bounded arena",
@@ -179,28 +199,79 @@ impl AllocationState {
             ));
         }
         Ok(PublicationPlan {
-            offset: self.used_bytes,
+            offset: self.high_water,
             code_len,
             mapped_len,
+            reused: false,
         })
     }
 
     fn commit(&mut self, plan: PublicationPlan) {
-        self.used_bytes += plan.mapped_len;
-        self.segments += 1;
+        if !plan.reused {
+            self.high_water += plan.mapped_len;
+        }
+        self.live_segments += 1;
+    }
+
+    fn release(&mut self, offset: usize, mapped_len: usize) {
+        self.live_segments = self
+            .live_segments
+            .checked_sub(1)
+            .expect("every executable allocation is released exactly once");
+        let mut start = offset;
+        let mut len = mapped_len;
+        if let Some((&previous, &previous_len)) = self.free.range(..offset).next_back()
+            && previous + previous_len == offset
+        {
+            self.free.remove(&previous);
+            start = previous;
+            len += previous_len;
+        }
+        if let Some((&next, &next_len)) = self.free.range(start..).next()
+            && start + len == next
+        {
+            self.free.remove(&next);
+            len += next_len;
+        }
+        self.free.insert(start, len);
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PublishedCode {
-    address: NonNull<u8>,
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedCode {
+    // Store the immutable process address as an integer. The allocation
+    // handle below owns the arena range and keeps it live; reconstructing a
+    // pointer happens only at the native-call/publication boundary.
+    pub(crate) address: usize,
+    #[cfg(test)]
     len: usize,
+    pub(crate) mapped_len: usize,
+    _allocation: Arc<PublishedAllocation>,
+}
+
+#[derive(Debug)]
+struct PublishedAllocation {
+    owner: Weak<Mutex<ExecutableMemory>>,
+    offset: usize,
+    mapped_len: usize,
+}
+
+impl Drop for PublishedAllocation {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+                .release(self.offset, self.mapped_len);
+        }
+    }
 }
 
 /// The process-wide owner of the only executable mapping used by the JIT.
 ///
-/// Publication is append-only. Page granularity keeps every published RX page
-/// disjoint from all bytes that can still be written.
+/// Page granularity keeps every live RX publication disjoint from writable
+/// bytes. Retired pages return to the allocator only after cache quiescence.
 pub(crate) struct ExecutableMemory {
     arena: platform::Arena,
     state: AllocationState,
@@ -216,17 +287,17 @@ impl ExecutableMemory {
         // path used for real code while capability probing. This internal
         // publication is charged to both bounds, but its address remains
         // unreachable and immutable for the arena lifetime.
-        let probe = memory.publish(PUBLICATION_PROBE_BYTES, 1)?;
-        let _probe_address = probe.address;
-        debug_assert_eq!(probe.len, PUBLICATION_PROBE_BYTES.len());
+        let (probe_address, probe_len, _, _) = memory.publish_raw(PUBLICATION_PROBE_BYTES, 1)?;
+        let _probe_address = probe_address;
+        debug_assert_eq!(probe_len, PUBLICATION_PROBE_BYTES.len());
         Ok(memory)
     }
 
-    fn publish(
+    fn publish_raw(
         &mut self,
         code: &[u8],
         alignment: usize,
-    ) -> Result<PublishedCode, ExecutableMemoryError> {
+    ) -> Result<(NonNull<u8>, usize, usize, usize), ExecutableMemoryError> {
         let plan = self.state.plan(code.len(), alignment)?;
         let address = match self.arena.publish(plan, code) {
             Ok(address) => address,
@@ -238,18 +309,44 @@ impl ExecutableMemory {
             }
         };
         self.state.commit(plan);
-        Ok(PublishedCode {
-            address,
-            len: code.len(),
-        })
+        Ok((address, code.len(), plan.offset, plan.mapped_len))
     }
 
     #[cfg(test)]
-    unsafe fn bytes(&self, code: PublishedCode) -> &[u8] {
+    unsafe fn bytes(&self, code: &PublishedCode) -> &[u8] {
         // SAFETY: the returned range was committed by this live arena and is
         // immutable for the arena's lifetime.
-        unsafe { std::slice::from_raw_parts(code.address.as_ptr(), code.len) }
+        unsafe { std::slice::from_raw_parts(code.address as *const u8, code.len) }
     }
+}
+
+pub(crate) fn publish_code(
+    owner: &SharedExecutableMemory,
+    code: &[u8],
+    alignment: usize,
+) -> Result<PublishedCode, ExecutableMemoryError> {
+    let (address, code_len, offset, mapped_len) = owner
+        .lock()
+        .map_err(|_| {
+            ExecutableMemoryError::new(
+                ErrorKind::HostUnavailable,
+                "executable-memory owner lock was poisoned",
+            )
+        })?
+        .publish_raw(code, alignment)?;
+    #[cfg(not(test))]
+    let _ = code_len;
+    Ok(PublishedCode {
+        address: address.as_ptr().addr(),
+        #[cfg(test)]
+        len: code_len,
+        mapped_len,
+        _allocation: Arc::new(PublishedAllocation {
+            owner: Arc::downgrade(owner),
+            offset,
+            mapped_len,
+        }),
+    })
 }
 
 /// Returns one shared owner per process while allowing it to be reclaimed when
@@ -349,10 +446,22 @@ mod platform {
             plan: PublicationPlan,
             code: &[u8],
         ) -> Result<NonNull<u8>, ExecutableMemoryError> {
-            // SAFETY: AllocationState confines the range to this mapping and
-            // no published page is reused. Source and destination cannot
-            // overlap because the source is not guest-visible arena storage.
+            // SAFETY: AllocationState confines the range to this mapping.
             let destination = unsafe { self.base.as_ptr().add(plan.offset) };
+            if plan.reused
+                && unsafe {
+                    libc::mprotect(
+                        destination.cast(),
+                        plan.mapped_len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                } != 0
+            {
+                return Err(last_os_error(
+                    "could not reopen retired JIT pages for reuse",
+                ));
+            }
+            unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
             // Linux/Unix write-to-execute transition contract:
             // https://man7.org/linux/man-pages/man2/mprotect.2.html
@@ -515,6 +624,7 @@ mod platform {
             // SAFETY: temporarily disables execute and enables write access on
             // this thread only. The pointer is not published during this span.
             unsafe { (self.write_protect)(0) };
+            unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
             // SAFETY: restores execute-only publication before the address can
             // leave this owner.
@@ -671,17 +781,35 @@ mod platform {
             // Windows requires writable allocation followed by VirtualProtect,
             // then an explicit FlushInstructionCache before execution:
             // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
-            let committed = unsafe {
-                VirtualAlloc(
-                    destination.cast(),
-                    plan.mapped_len,
-                    MEM_COMMIT,
-                    PAGE_READWRITE,
-                )
-            };
-            if committed.is_null() {
-                return Err(last_os_error("could not commit writable JIT pages"));
+            if plan.reused {
+                let mut previous = PAGE_NOACCESS;
+                if unsafe {
+                    VirtualProtect(
+                        destination.cast(),
+                        plan.mapped_len,
+                        PAGE_READWRITE,
+                        &mut previous,
+                    )
+                } == 0
+                {
+                    return Err(last_os_error(
+                        "could not reopen retired JIT pages for reuse",
+                    ));
+                }
+            } else {
+                let committed = unsafe {
+                    VirtualAlloc(
+                        destination.cast(),
+                        plan.mapped_len,
+                        MEM_COMMIT,
+                        PAGE_READWRITE,
+                    )
+                };
+                if committed.is_null() {
+                    return Err(last_os_error("could not commit writable JIT pages"));
+                }
             }
+            unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
             let mut previous = PAGE_NOACCESS;
             // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-flushinstructioncache
@@ -767,8 +895,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.plan(1, 16).unwrap().mapped_len, 4096);
-        state.commit(state.plan(1, 16).unwrap());
-        let before = (state.used_bytes, state.segments);
+        let first = state.plan(1, 16).unwrap();
+        state.commit(first);
+        let before = (state.high_water, state.live_segments, state.free.clone());
 
         assert_eq!(
             state.plan(0, 1).unwrap_err().kind(),
@@ -782,9 +911,13 @@ mod tests {
             state.plan(4097, 1).unwrap_err().kind(),
             ErrorKind::Exhausted
         );
-        assert_eq!((state.used_bytes, state.segments), before);
+        assert_eq!(
+            (state.high_water, state.live_segments, state.free.clone()),
+            before
+        );
 
-        state.commit(state.plan(4096, 4096).unwrap());
+        let second = state.plan(4096, 4096).unwrap();
+        state.commit(second);
         assert_eq!(state.plan(1, 1).unwrap_err().kind(), ErrorKind::Exhausted);
     }
 
@@ -801,7 +934,7 @@ mod tests {
             )
             .is_err()
         );
-        let state = AllocationState::new(
+        let mut state = AllocationState::new(
             4096,
             Limits {
                 max_bytes: usize::MAX & !4095,
@@ -828,16 +961,38 @@ mod tests {
         let probe = state.plan(1, 1).unwrap();
         state.commit(probe);
 
-        assert_eq!(state.used_bytes, 4096);
-        assert_eq!(state.segments, 1);
+        assert_eq!(state.high_water, 4096);
+        assert_eq!(state.live_segments, 1);
         assert_eq!(state.plan(1, 1).unwrap().offset, 4096);
+    }
+
+    #[test]
+    fn released_ranges_coalesce_and_are_reused_before_arena_growth() {
+        let mut state = AllocationState::new(
+            4096,
+            Limits {
+                max_bytes: 12_288,
+                max_segments: 3,
+            },
+        )
+        .unwrap();
+        let first = state.plan(1, 1).unwrap();
+        state.commit(first);
+        let second = state.plan(1, 1).unwrap();
+        state.commit(second);
+        state.release(first.offset, first.mapped_len);
+        state.release(second.offset, second.mapped_len);
+
+        let reused = state.plan(8192, 1).unwrap();
+        assert!(reused.reused);
+        assert_eq!(reused.offset, 0);
+        assert_eq!(state.high_water, 8192);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn platform_publication_is_immutable_readable_and_executable() {
         let owner = process_executable_memory().expect("host supports executable memory");
-        let mut owner = owner.lock().unwrap();
 
         // Fixed host-ABI bytes isolate executable-memory publication from the
         // compiler tested elsewhere.
@@ -849,28 +1004,28 @@ mod tests {
             0xc0, 0x03, 0x5f, 0xd6, // ret
         ];
 
-        let first = owner.publish(code_bytes, 16).unwrap();
-        let second = owner.publish(PUBLICATION_PROBE_BYTES, 16).unwrap();
-        assert_eq!(unsafe { owner.bytes(first) }, code_bytes);
-        assert!(
-            second.address.as_ptr() as usize - first.address.as_ptr() as usize
-                >= owner.state.page_size
-        );
+        let first = publish_code(&owner, code_bytes, 16).unwrap();
+        let second = publish_code(&owner, PUBLICATION_PROBE_BYTES, 16).unwrap();
+        let locked = owner.lock().unwrap();
+        assert_eq!(unsafe { locked.bytes(&first) }, code_bytes);
+        assert!(second.address.abs_diff(first.address) >= locked.state.page_size);
         #[cfg(target_os = "linux")]
         assert_linux_mapping_is_read_execute(first.address);
+        drop(locked);
 
         // SAFETY: the fixture uses the host ABI, was published by the platform
         // path above, and takes no arguments or borrowed state.
         let function = unsafe {
-            std::mem::transmute::<*mut u8, unsafe extern "C" fn() -> u32>(first.address.as_ptr())
+            std::mem::transmute::<*mut u8, unsafe extern "C" fn() -> u32>(
+                std::ptr::with_exposed_provenance_mut(first.address),
+            )
         };
         assert_eq!(unsafe { function() }, 42);
     }
 
     #[cfg(target_os = "linux")]
-    fn assert_linux_mapping_is_read_execute(address: NonNull<u8>) {
+    fn assert_linux_mapping_is_read_execute(address: usize) {
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let address = address.as_ptr() as usize;
         let permissions = maps
             .lines()
             .find_map(|line| {

@@ -127,10 +127,12 @@ Versioned basis: Android Open Source Project
 - Executable memory and supervisor: any implementation would need a supported
   VM payload containing Nixe's supervisor and a lawful shared-memory protocol;
   it cannot assume arbitrary executable payload or direct memslot control.
-- Feasibility: **unsupported profile** for now. Android `auto` must select the
-  interpreter unless a future supported API satisfies the common conformance
-  suite. Direct KVM access on a particular rooted or vendor device is not a
-  portable Android NCE capability.
+- Feasibility: **unsupported NCE profile** for now. Android `auto` may still
+  select the portable JIT when the host ISA and executable-memory policy pass
+  its independent capability probe, otherwise it selects the interpreter. It
+  must not select an NCE until a supported virtualization API satisfies the
+  common conformance suite. Direct KVM access on a particular rooted or vendor
+  device is not a portable Android NCE capability.
 
 ## Contract mapping and decision
 

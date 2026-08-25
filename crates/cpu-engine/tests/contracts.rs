@@ -19,6 +19,7 @@ const ID: EngineId = EngineId::new(70);
 struct FakeProvider {
     id: EngineId,
     available: bool,
+    probes: Option<Arc<AtomicU64>>,
 }
 
 impl EngineProvider for FakeProvider {
@@ -30,6 +31,9 @@ impl EngineProvider for FakeProvider {
         _profile: nixe_cpu::profile::GuestCpuProfile,
         _required: EngineCapabilities,
     ) -> CapabilityReport {
+        if let Some(probes) = &self.probes {
+            probes.fetch_add(1, Ordering::AcqRel);
+        }
         CapabilityReport {
             descriptor: self.descriptor(),
             available: self.available,
@@ -232,7 +236,10 @@ fn fake_engine_is_object_safe_and_reports_normalized_lifecycle_exits() {
         EngineExit::BudgetExhausted,
         EngineExit::Safepoint,
         EngineExit::PendingEvent { mask: 3 },
-        EngineExit::Scheduled { source },
+        EngineExit::Scheduled {
+            source,
+            request: SchedulerRequest::Yield,
+        },
         EngineExit::SupervisorCall {
             source,
             immediate: 7,
@@ -255,6 +262,7 @@ fn fake_engine_is_object_safe_and_reports_normalized_lifecycle_exits() {
     let provider: Arc<dyn EngineProvider> = Arc::new(FakeProvider {
         id: ID,
         available: true,
+        probes: None,
     });
     let mut domain: Box<dyn EngineDomain> = provider
         .create_domain(DomainRequest {
@@ -272,10 +280,12 @@ fn selection_is_deterministic_and_explicit_unavailability_is_typed() {
     let unavailable: Arc<dyn EngineProvider> = Arc::new(FakeProvider {
         id: EngineId::new(1),
         available: false,
+        probes: None,
     });
     let available: Arc<dyn EngineProvider> = Arc::new(FakeProvider {
         id: EngineId::new(2),
         available: true,
+        probes: None,
     });
     let registry = EngineRegistry::new([unavailable, Arc::clone(&available)]);
     let profile = GuestCpuProfile::switch_1();
@@ -306,6 +316,33 @@ fn selection_is_deterministic_and_explicit_unavailability_is_typed() {
 }
 
 #[test]
+fn explicit_selection_probes_only_the_requested_provider() {
+    let unrelated_probes = Arc::new(AtomicU64::new(0));
+    let selected_probes = Arc::new(AtomicU64::new(0));
+    let unrelated: Arc<dyn EngineProvider> = Arc::new(FakeProvider {
+        id: EngineId::new(1),
+        available: true,
+        probes: Some(Arc::clone(&unrelated_probes)),
+    });
+    let selected: Arc<dyn EngineProvider> = Arc::new(FakeProvider {
+        id: EngineId::new(2),
+        available: true,
+        probes: Some(Arc::clone(&selected_probes)),
+    });
+    let registry = EngineRegistry::new([unrelated, selected]);
+    let provider = registry
+        .select(
+            GuestCpuProfile::switch_1(),
+            EngineCapabilities::default(),
+            EnginePreference::Explicit(EngineId::new(2)),
+        )
+        .unwrap();
+    assert_eq!(provider.descriptor().id, EngineId::new(2));
+    assert_eq!(unrelated_probes.load(Ordering::Acquire), 0);
+    assert_eq!(selected_probes.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn interpret_one_forces_one_instruction() {
     let (cpu, mut state) = cpu_and_state();
     let memory = SyntheticMemory::new();
@@ -323,6 +360,7 @@ fn interpret_one_forces_one_instruction() {
             instruction_budget: 99,
             loader_return: None,
             timer: &Timer,
+            events: VcpuEventState::default(),
         },
     )
     .unwrap();
@@ -373,7 +411,8 @@ fn generic_domain_contract_binds_and_shuts_down_memory() {
         address_space: cpu.address_space_id(),
         end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
         memory: &memory,
-        invalidation_generation: 8,
+        mapping_epoch: 8,
+        invalidation_cursor: nixe_memory::MemoryInvalidationCursor::new(8),
     };
     let mut domain = RecordingDomain {
         base: FakeDomain {

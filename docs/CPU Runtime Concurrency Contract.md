@@ -1,6 +1,6 @@
 # CPU Runtime Concurrency Contract
 
-Status: normative for scheduler architecture phases D and E
+Status: normative for the current runtime and scheduler architecture
 
 ## Ownership boundary
 
@@ -9,8 +9,8 @@ process registry, address-wait queues, or Horizon service policy. Each
 registered process owns its threads' CPU state, objects, and exit records. Each
 vCPU worker owns its engine executors. These values are not shared between
 owners: a worker receives only an exclusive thread-state lease, a shared
-CPU-memory view, an immutable CPU context, a timer view, and cloneable
-interrupt/invalidation controls.
+CPU-memory view, an immutable CPU context, an exact timer provider, a cloneable
+physical-vCPU event state, and cloneable preemption/invalidation control.
 
 Ownership moves through bounded messages. A worker never retains a reference
 to a scheduler entry, process table, handle table, Horizon object table, or GPU
@@ -39,6 +39,21 @@ bounded event and must not call back into the coordinator or Horizon.
 No lock is held across host file I/O, backend queue waits, guest execution, or
 another subsystem callback. Poisoned synchronization primitives recover their
 contained state because guest input must not make teardown impossible.
+
+Provider-private locks do not extend this hierarchy into shared crates. The JIT
+cache-state lock is acquired alone: region translation, Cranelift compilation,
+executable publication, and executable-arena reclamation all occur without it.
+Distinct cache misses acquire one finite domain compilation permit before
+frontend/compiler work. Waiting for a permit uses the cache condition variable
+without retaining the cache lock; invalidation or domain stop cancels the flight
+and wakes the queue. Permit release never nests executable-arena ownership under
+cache state.
+Dropping retired publications, which may acquire the executable-arena lock,
+happens only after releasing cache state. Executor-local lookup, software-TLB,
+compiler scratch, native-frame, and exclusive-monitor state has one worker
+owner and therefore requires no lock. A virtualization provider likewise may
+not hold a framework/VM lock while entering canonical memory or waiting for a
+runtime worker.
 
 ## Memory mutation and invalidation
 
@@ -83,25 +98,51 @@ all represented pages before every cache lookup; reconstruction occurs only
 when an entry is created or its retained provenance is invalidated.
 
 The mutation intent closes admission before waiting for active leases, so a
-stream of new slices cannot starve a pending mapping change. Canonical memory
-publishes each committed mapping or executable-content change through one
-monotonic engine-neutral invalidation source. A record describes the semantic
-address-space, mapping, permission, canonical-range, visibility, or generation
-change; it never names a JIT cache object or virtualization framework handle.
+stream of new slices cannot starve a pending mapping change. Runtime mapping
+entry points publish a mapping-change safepoint request and advance the neutral
+mapping epoch after a successful commit. The same failure-atomic mutation
+publishes a range record through the process-memory invalidation stream.
 
-Runtime mapping entry points first publish a mapping-change safepoint request
-and, after a successful commit, make the new record visible. Each engine domain
-consumes the source through its own cursor. Executors acknowledge a record only
-after stale derived mappings, translations, links, and code cannot be
-re-entered. The coordinator must not dispatch the next slice until every
-required control acknowledges the committed cursor. A JIT may evict cache and
-software-TLB state while an NCE provider reconciles VM mappings or traps; those
-mechanisms never enter the shared record.
+The monotonic semantic stream carries mapping ranges, physical executable-page
+content changes, and complete instruction-cache invalidations. It never names a
+JIT cache object or virtualization framework handle. Each engine domain
+consumes the stream through its own cursor and acknowledges it only after stale
+derived mappings, translations, links, and code cannot be re-entered. The JIT
+clears incoming and outgoing native links, removes affected entries through its
+reverse indexes, and reclaims detached payloads and code only after executor
+retirement epochs drain. Lost bounded-stream history forces full eviction. The
+coordinator does not dispatch the next slice until every required control has
+acknowledged the committed cursor. JIT eviction, future NCE reconciliation, and
+other provider-private actions never enter the shared record.
 
-The first parallel implementation deliberately serializes semantic memory
-transactions. This is stronger than guest hardware ordering but cannot expose
-an architecturally forbidden partial cross-page operation. Atomic and
-exclusive operations use the same canonical transaction boundary.
+Ordinary naturally aligned RAM accesses may execute concurrently through
+retained canonical backing. Cross-page accesses, MMIO, and mapping-table slow
+paths retain a recoverable semantic transaction because their callbacks and
+failure-atomic validation cannot be represented as one host scalar. This lock
+is not the Arm memory-order mechanism and no correctness test may rely on it to
+serialize vCPUs.
+
+`MemoryOrdering` is the engine-neutral contract for plain, acquire, release,
+acquire-release, and sequentially consistent accesses. `BarrierOperation`
+separately retains DMB/DSB/ISB, shareability domain, and ordered directions.
+The interpreter applies the portable host-fence mapping, Cranelift lowers the
+same descriptor, and a future NCE may map it to native ordering or traps without
+calling a JIT helper. Relaxed JIT TLB accesses remain relaxed; ordered,
+exclusive, volatile, and atomic operations use the precise path unless a
+provider proves an equivalent direct lowering.
+
+Atomic read/modify/write and compare/exchange transactions linearize at the
+canonical physical backing, not at a virtual mapping or software-TLB entry.
+Successful writes advance the canonical page generation and store epochs and
+publish executable invalidation exactly once; a failed compare/exchange does
+none of those things. Every alias therefore shares one modification order.
+Exclusive loads retain physical page, byte offset, width, and generation in the
+executor-local monitor. Any canonical write may invalidate that observation;
+store-exclusive commits through the same physical writer or fails. A scheduler
+migration clears the old vCPU executor's local monitor before the thread may be
+dispatched elsewhere. TLB entries need no atomic-specific shootdown because
+they retain the same backing and validity authority; mapping changes still use
+the acknowledged mapping invalidation protocol above.
 
 ## Kernel objects and external events
 
@@ -114,6 +155,72 @@ GPU completion, display, input, timer, IPC, and host-stop producers publish
 sequenced events into the bounded external inbox. Publication never acquires a
 scheduler or process lock. Device completion establishes canonical CPU
 visibility before its guest-visible timeline/event notification is published.
+
+## CPU scheduling events, interrupts, timers, and budgets
+
+The runtime owns one `VcpuEventState` for every emulated physical CPU. Its Arm
+event register and normalized pending-interrupt mask persist across guest-thread
+and process dispatches on that vCPU. They do not belong to an engine executor,
+guest thread, process, native frame, or process-wide control object.
+`EngineControl` carries only asynchronous preemption and acknowledged
+invalidation; combining those process/executor controls with physical-CPU
+events is forbidden.
+
+Engines retire processor hints and return typed engine-neutral scheduler
+requests. `YIELD` preempts the current lease. `WFE` atomically consumes a set
+local event or registers an event wait. `WFI` continues only while an interrupt
+is already pending, otherwise it registers an interrupt wait. `SEVL` sets only
+the executing vCPU's event register. `SEV` returns a send-event request which
+the coordinator broadcasts to every configured vCPU and uses to wake event
+waiters. Runtime interrupt injection names one vCPU, sets its event register,
+retains the interrupt mask until an engine observes it, and wakes both WFE and
+WFI waiters. The coordinator serializes exit reconciliation, wait registration,
+event publication, and readiness changes; engines never mutate scheduler
+lifecycle directly.
+
+The timer provider remains runtime-owned and is sampled at the exact guest
+system-register read. An engine may not freeze the counter at slice or region
+entry. Constant profile-defined system values are shared CPU semantics, while
+wall/monotonic clock policy remains outside CPU and engine crates.
+
+Adaptive slice length is coordinator policy shared by deterministic and
+parallel modes. The budget grows within a fixed cap only after uninterrupted
+budget exhaustion and returns to the machine-profile baseline after a
+scheduler, exception, control, or other architectural exit. Exact-budget APIs
+exist for replay and deterministic tests; product loops do not implement a
+second budget policy. Engines poll at entry and bounded backward-edge or region
+safepoints. Atomic event/control publication permits an active worker to stop
+without exchanging a host channel message for each short native region.
+
+## Executor and domain teardown
+
+Process removal and coordinator shutdown use the same ordered lifecycle in
+deterministic and parallel modes:
+
+1. The coordinator closes new dispatch for the process, publishes preemption
+   to every primary and semantic-fallback executor, and calls the domain's
+   non-blocking stop request. A JIT closes cache admission and cancels its
+   single-flight compilations here; this token is private to the JIT. An NCE
+   uses the same neutral phase to stop virtual CPUs.
+2. With no scheduler lease in flight, each worker calls executor preparation
+   while it still has exclusive ownership. The executor makes local mappings,
+   cached code lookups, and TLB entries unreachable, acknowledges the final
+   invalidation cursor, and clears its local exclusive monitor. An NCE executor
+   may also export vCPU state or reconcile its per-vCPU dirty view here.
+3. Runtime verifies required acknowledgements, drops all worker-owned
+   executors, and only then invokes idempotent domain shutdown. The domain may
+   reconcile remaining domain-wide dirty mappings before releasing its VM. The
+   JIT drains retirement epochs and releases link payloads and executable
+   publications; no executor may outlive this phase.
+4. Canonical process memory, mappings, handles, waits, modules, and address-space
+   backing are released only after domain shutdown completes.
+
+These phases never execute guest instructions and therefore cannot fabricate
+retired progress. Compilation cancellation is cooperative at bounded frontend
+and lowering boundaries; a cancelled or invalidated result cannot publish.
+Worker retirement and join operations have a host-time bound and return a typed
+failure while ownership remains intact, so a faulty provider cannot make a
+public teardown call wait forever or falsely report released resources.
 
 ## Capability gate
 

@@ -94,10 +94,12 @@ impl ScheduledProcess {
             .expect("test engine shuts down")
     }
 
-    pub fn into_process(mut self) -> RunnableProcess {
-        self.coordinator
-            .remove_process(self.process)
-            .expect("test process is not in flight")
+    pub const fn scheduler_process_id(&self) -> ProcessId {
+        self.process
+    }
+
+    pub fn coordinator_mut(&mut self) -> &mut RuntimeCoordinator {
+        &mut self.coordinator
     }
 }
 

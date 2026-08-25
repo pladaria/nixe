@@ -1,0 +1,368 @@
+use nixe_cpu::decode::{self, DecodeResult, DecodeSupport, InstructionPattern};
+use nixe_cpu::location::{ExecutionState, InstructionSize, LocationDescriptor};
+use nixe_cpu::memory::{
+    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions,
+    SYNTHETIC_PAGE_SIZE, SyntheticMemory,
+};
+use nixe_cpu::profile::{CapabilityStatus, GuestCpuProfile, ProcessCpuContext};
+use nixe_cpu::state::{
+    ThreadCpuState,
+    a32::{A32GeneralRegister, A32State, Cpsr, GENERAL_REGISTER_COUNT as A32_REGISTER_COUNT},
+    a64::{
+        A64GeneralRegister, A64Register, A64State, GENERAL_REGISTER_COUNT as A64_REGISTER_COUNT,
+        Nzcv, VECTOR_REGISTER_COUNT,
+    },
+};
+use nixe_cpu_engine::{
+    DomainMemoryBinding, DomainRequest, EngineDomain, EngineDomainId, EngineExecutor,
+    EngineExecutorId, EngineProvider, EngineTimer, RunRequest, TimerSnapshot,
+};
+use nixe_cpu_engine_interpreter::InterpreterProvider;
+use nixe_cpu_engine_jit::JitProvider;
+use nixe_memory::{
+    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationSource,
+};
+
+const SPACE: AddressSpaceId = AddressSpaceId::new(0x004a_4954_3136);
+const CODE: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
+const DATA: GuestVirtualAddress = GuestVirtualAddress::new(0x8000);
+
+struct FixedTimer;
+
+impl EngineTimer for FixedTimer {
+    fn snapshot(&self) -> TimerSnapshot {
+        TimerSnapshot {
+            counter: 0x1234_5678,
+            frequency: 19_200_000,
+        }
+    }
+}
+
+struct EngineHarness {
+    domain: Box<dyn EngineDomain>,
+    executor: Option<Box<dyn EngineExecutor>>,
+}
+
+impl EngineHarness {
+    fn new(provider: &dyn EngineProvider, domain_id: u64, executor_id: u64) -> Self {
+        let cpu = cpu();
+        let mut domain = provider
+            .create_domain(DomainRequest {
+                domain: EngineDomainId::new(domain_id),
+                cpu,
+            })
+            .unwrap();
+        let binding = ExecutionMemory::new();
+        domain
+            .bind_memory(DomainMemoryBinding {
+                address_space: SPACE,
+                end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
+                memory: &binding,
+                mapping_epoch: binding.mapping_epoch().get(),
+                invalidation_cursor: binding.invalidation_cursor(),
+            })
+            .unwrap();
+        let executor = domain
+            .create_executor(EngineExecutorId::new(executor_id))
+            .unwrap();
+        Self {
+            domain,
+            executor: Some(executor),
+        }
+    }
+
+    fn run(
+        &mut self,
+        memory: &SyntheticMemory,
+        state: &mut ThreadCpuState,
+    ) -> Result<nixe_cpu_engine::ExecutionReport, nixe_cpu_engine::EngineFault> {
+        self.executor
+            .as_mut()
+            .expect("the harness executor is live")
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory,
+                state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+    }
+}
+
+impl Drop for EngineHarness {
+    fn drop(&mut self) {
+        drop(self.executor.take());
+        self.domain.shutdown().unwrap();
+    }
+}
+
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn every_supported_registry_fixture_matches_the_reference_interpreter() {
+    for execution_state in [
+        ExecutionState::A64,
+        ExecutionState::A32,
+        ExecutionState::T32,
+    ] {
+        run_registry_state(execution_state);
+    }
+}
+
+fn run_registry_state(execution_state: ExecutionState) {
+    let interpreter = InterpreterProvider;
+    let jit = JitProvider::new();
+    let identity = state_index(execution_state) as u64;
+    let mut interpreter = EngineHarness::new(&interpreter, identity * 2 + 1, identity * 2 + 1);
+    let mut jit = EngineHarness::new(&jit, identity * 2 + 2, identity * 2 + 2);
+    let profile = GuestCpuProfile::switch_1();
+    let mut executed = 0_usize;
+
+    for pattern in patterns().filter(|pattern| {
+        pattern.execution_state == execution_state && pattern.decoder == DecodeSupport::Ready
+    }) {
+        if !profile
+            .allowed_execution_states()
+            .contains(pattern.execution_state)
+            || pattern.required_features.iter().any(|feature| {
+                profile.instruction_features().status(*feature) != CapabilityStatus::Enabled
+            })
+        {
+            continue;
+        }
+        let fixture = pattern.regression_fixture.unwrap_or_else(|| {
+            panic!(
+                "{} {} has no differential fixture",
+                pattern.execution_state, pattern.coverage_id
+            )
+        });
+        let location = LocationDescriptor::new(CODE, pattern.execution_state, profile.id());
+        match decode::decode(&profile, location, fixture.encoding) {
+            DecodeResult::Decoded(decoded) => {
+                assert_eq!(decoded.instruction.coverage_id(), pattern.coverage_id)
+            }
+            other => panic!(
+                "{} {} differential fixture did not decode as supported: {other:?}",
+                pattern.execution_state, pattern.coverage_id
+            ),
+        }
+
+        let code_page = GuestPhysicalPageId::new(0x10_0000 + u64::from(pattern.coverage_id.get()));
+        let interpreter_memory = fixture_memory(pattern, code_page);
+        let jit_memory = fixture_memory(pattern, code_page);
+        let initial = initial_state(pattern.execution_state, pattern.coverage_id.get());
+        let mut interpreter_state = initial.clone();
+        let mut jit_state = initial;
+        let identity = format!(
+            "{} {} ({})",
+            pattern.execution_state, pattern.coverage_id, pattern.name
+        );
+        let interpreter_report = interpreter
+            .run(&interpreter_memory, &mut interpreter_state)
+            .unwrap_or_else(|error| panic!("{identity} interpreter failure: {error}"));
+        let jit_report = jit
+            .run(&jit_memory, &mut jit_state)
+            .unwrap_or_else(|error| panic!("{identity} JIT failure: {error}"));
+
+        assert_eq!(jit_report.stop, interpreter_report.stop, "{identity} exit");
+        assert_eq!(
+            jit_report.instructions_executed, interpreter_report.instructions_executed,
+            "{identity} retired instruction count"
+        );
+        assert_eq!(
+            jit_report.context, interpreter_report.context,
+            "{identity} context"
+        );
+        assert_eq!(jit_state, interpreter_state, "{identity} canonical state");
+        assert_eq!(
+            snapshot_data(&jit_memory),
+            snapshot_data(&interpreter_memory),
+            "{identity} memory"
+        );
+        assert!(
+            !matches!(
+                jit_report.stop,
+                nixe_cpu_engine::EngineExit::InterpretOne { .. }
+                    | nixe_cpu_engine::EngineExit::UnsupportedSemantics { .. }
+            ),
+            "{identity} used semantic fallback"
+        );
+        executed += 1;
+    }
+
+    assert_ne!(executed, 0, "{execution_state} registry was not exercised");
+}
+
+fn patterns() -> impl Iterator<Item = &'static InstructionPattern> {
+    decode::a64::patterns()
+        .iter()
+        .chain(decode::a32::patterns())
+        .chain(decode::t32::patterns_16())
+        .chain(decode::t32::patterns_32())
+}
+
+fn cpu() -> ProcessCpuContext {
+    ProcessCpuContext::new(GuestCpuProfile::switch_1(), SPACE)
+}
+
+fn fixture_memory(pattern: &InstructionPattern, code_page: GuestPhysicalPageId) -> SyntheticMemory {
+    let mut memory = SyntheticMemory::new();
+    let first_data_page = GuestPhysicalPageId::new(0x20_0000);
+    let second_data_page = GuestPhysicalPageId::new(0x20_0001);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.add_ram_page(first_data_page));
+    assert!(memory.add_ram_page(second_data_page));
+
+    let mut code = instruction_bytes(pattern);
+    code.extend_from_slice(&terminator_bytes(pattern.execution_state));
+    assert!(memory.initialize_ram(code_page, 0, &code));
+    for (page_index, page) in [first_data_page, second_data_page].into_iter().enumerate() {
+        let bytes: Vec<_> = (0..SYNTHETIC_PAGE_SIZE)
+            .map(|offset| {
+                (offset as u8)
+                    .wrapping_mul(37)
+                    .wrapping_add(page_index as u8 * 53)
+            })
+            .collect();
+        assert!(memory.initialize_ram(page, 0, &bytes));
+    }
+    assert!(memory.map_page(SPACE, CODE, code_page, MemoryPermissions::READ_EXECUTE,));
+    assert!(memory.map_page(SPACE, DATA, first_data_page, MemoryPermissions::READ_WRITE,));
+    assert!(memory.map_page(
+        SPACE,
+        DATA.checked_add(SYNTHETIC_PAGE_SIZE as u64).unwrap(),
+        second_data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+}
+
+fn instruction_bytes(pattern: &InstructionPattern) -> Vec<u8> {
+    let encoding = pattern
+        .regression_fixture
+        .expect("supported patterns have differential fixtures")
+        .encoding;
+    match (pattern.execution_state, encoding.size()) {
+        (ExecutionState::T32, InstructionSize::Bits32) => {
+            let bits = encoding.bits();
+            [(bits >> 16) as u16, bits as u16]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        }
+        (_, InstructionSize::Bits16) => encoding.bits().to_le_bytes()[..2].to_vec(),
+        (_, InstructionSize::Bits32) => encoding.bits().to_le_bytes().to_vec(),
+    }
+}
+
+fn terminator_bytes(state: ExecutionState) -> Vec<u8> {
+    match state {
+        ExecutionState::A64 => 0x1400_0000_u32.to_le_bytes().to_vec(),
+        ExecutionState::A32 => 0xeaff_fffe_u32.to_le_bytes().to_vec(),
+        ExecutionState::T32 => 0xe7fe_u16.to_le_bytes().to_vec(),
+    }
+}
+
+fn initial_state(execution_state: ExecutionState, seed: u32) -> ThreadCpuState {
+    match execution_state {
+        ExecutionState::A64 => {
+            let mut state = A64State::default();
+            for index in 0..A64_REGISTER_COUNT as u8 {
+                let register = A64Register::General(A64GeneralRegister::new(index).unwrap());
+                state.write_x(register, mixed(seed, index));
+            }
+            state.write_x(
+                A64Register::General(A64GeneralRegister::new(0).unwrap()),
+                DATA.get() + 0x800,
+            );
+            state.write_x(A64Register::General(A64GeneralRegister::new(1).unwrap()), 0);
+            state.write_x(A64Register::StackPointer, DATA.get() + 0x900);
+            state.set_pc(CODE.get());
+            state.set_nzcv(Nzcv::from_bits(Nzcv::V));
+            for index in 0..VECTOR_REGISTER_COUNT as u8 {
+                let low = mixed(seed ^ 0xa5a5_5a5a, index);
+                let high = mixed(seed ^ 0x5a5a_a5a5, index);
+                assert!(state.set_vector(index, u128::from(low) | (u128::from(high) << 64)));
+            }
+            state.set_fpcr(0);
+            state.set_fpsr(0x0800_0000);
+            state.set_tpidr_el0(mixed(seed, 61));
+            state.set_tpidrro_el0_from_runtime(mixed(seed, 62));
+            ThreadCpuState::A64(Box::new(state))
+        }
+        ExecutionState::A32 | ExecutionState::T32 => {
+            let mut state = if execution_state == ExecutionState::A32 {
+                A32State::a32()
+            } else {
+                A32State::t32()
+            };
+            for index in 0..A32_REGISTER_COUNT as u8 {
+                state.write_r(
+                    A32GeneralRegister::new(index).unwrap(),
+                    mixed(seed, index) as u32,
+                );
+            }
+            state.write_r(
+                A32GeneralRegister::new(0).unwrap(),
+                (DATA.get() + 0x800) as u32,
+            );
+            state.write_r(A32GeneralRegister::new(1).unwrap(), 0);
+            state.write_r(
+                A32GeneralRegister::new(13).unwrap(),
+                (DATA.get() + 0x900) as u32,
+            );
+            state.set_instruction_address(CODE.get() as u32).unwrap();
+            let execution_bit = if execution_state == ExecutionState::T32 {
+                Cpsr::T
+            } else {
+                0
+            };
+            state.set_cpsr(Cpsr::from_bits(
+                Cpsr::USER_MODE | Cpsr::Z | Cpsr::C | execution_bit,
+            ));
+            for index in 0..32_u8 {
+                assert!(state.write_d(index, mixed(seed ^ 0x1357_9bdf, index)));
+            }
+            state.set_fpscr(0x0800_0000);
+            state.set_tpidrurw(mixed(seed, 61) as u32);
+            state.set_tpidruro_from_runtime(mixed(seed, 62) as u32);
+            ThreadCpuState::A32(Box::new(state))
+        }
+    }
+}
+
+fn mixed(seed: u32, index: u8) -> u64 {
+    let mut value = u64::from(seed) ^ (u64::from(index) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value.wrapping_mul(0x94d0_49bb_1331_11eb) ^ (value >> 31)
+}
+
+fn snapshot_data(memory: &SyntheticMemory) -> Vec<u8> {
+    let mut snapshot = Vec::with_capacity(SYNTHETIC_PAGE_SIZE * 2);
+    for offset in (0..SYNTHETIC_PAGE_SIZE * 2).step_by(16) {
+        snapshot.extend_from_slice(
+            &memory
+                .read(
+                    SPACE,
+                    DATA.checked_add(offset as u64).unwrap(),
+                    MemoryAccess::normal(MemoryAccessSize::Quadword),
+                )
+                .unwrap()
+                .value
+                .bits()
+                .to_le_bytes(),
+        );
+    }
+    snapshot
+}
+
+const fn state_index(state: ExecutionState) -> usize {
+    match state {
+        ExecutionState::A64 => 0,
+        ExecutionState::A32 => 1,
+        ExecutionState::T32 => 2,
+    }
+}

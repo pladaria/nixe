@@ -9,14 +9,12 @@ use crate::{
     ir::{
         block::{BlockEndReason, BlockMetadata, InstructionSource, IrBlock},
         builder::{BuildError, IrBuilder},
-        op::{OperationKind, StateRegister},
         terminator::{ControlTarget, Terminator},
-        value::{Immediate, Operand},
+        value::Operand,
     },
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::InstructionMemory,
     profile::GuestCpuProfile,
-    state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
 
 /// Default local instruction cut for one discovered basic block.
@@ -67,7 +65,7 @@ pub(crate) fn translate_basic_block(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrBlock, FrontendError> {
     translate_basic_block_internal(config, profile, address_space, start, memory, false)
 }
@@ -77,7 +75,7 @@ pub(crate) fn translate_basic_block_with_disassembly(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrBlock, FrontendError> {
     translate_basic_block_internal(config, profile, address_space, start, memory, true)
 }
@@ -87,7 +85,7 @@ fn translate_basic_block_internal(
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
     capture_disassembly: bool,
 ) -> Result<IrBlock, FrontendError> {
     validate_start(profile, start)?;
@@ -289,7 +287,7 @@ fn validate_start(
 }
 
 fn fetch_instruction(
-    memory: &impl InstructionMemory,
+    memory: &(impl InstructionMemory + ?Sized),
     address_space: AddressSpaceId,
     location: LocationDescriptor,
 ) -> Result<(InstructionEncoding, crate::memory::CodeDependencies), FrontendError> {
@@ -362,10 +360,15 @@ fn advance_pc(
 
 /// Forms a host-independent computed target in the guest address domain.
 #[must_use]
-pub const fn indirect_target(address: Operand, execution_state: ExecutionState) -> ControlTarget {
+pub const fn indirect_target(
+    address: Operand,
+    execution_state: ExecutionState,
+    source: LocationDescriptor,
+) -> ControlTarget {
     ControlTarget::Indirect {
         address,
         execution_state,
+        source,
     }
 }
 
@@ -383,41 +386,17 @@ pub const fn conditional_terminator(
     }
 }
 
-/// Emits the architectural link-register update and returns the corresponding
-/// call terminator. Targets remain guest addresses and carry their destination
-/// execution state.
-pub fn emit_call(
-    builder: &mut IrBuilder,
-    source: LocationDescriptor,
+/// Creates a call terminator whose architectural link-register update is
+/// committed atomically with the validated control transfer.
+#[must_use]
+pub const fn call_terminator(
     target: ControlTarget,
     return_address: GuestVirtualAddress,
-) -> Result<Terminator, BuildError> {
-    let (register, value) = match source.execution_state {
-        ExecutionState::A64 => (
-            StateRegister::A64X(A64GeneralRegister::new(30).unwrap()),
-            Immediate::I64(return_address.get()),
-        ),
-        ExecutionState::A32 => (
-            StateRegister::A32R(A32GeneralRegister::new(14).unwrap()),
-            Immediate::I32(return_address.get() as u32),
-        ),
-        ExecutionState::T32 => (
-            StateRegister::A32R(A32GeneralRegister::new(14).unwrap()),
-            Immediate::I32((return_address.get() as u32) | 1),
-        ),
-    };
-    builder.emit(
-        source,
-        &[],
-        OperationKind::WriteState {
-            register,
-            value: value.into(),
-        },
-    )?;
-    Ok(Terminator::Call {
+) -> Terminator {
+    Terminator::Call {
         target,
         return_address,
-    })
+    }
 }
 
 fn build_error(error: BuildError) -> FrontendError {
@@ -479,6 +458,8 @@ mod tests {
             OperationKind::Flags(_) => "flags",
             OperationKind::Memory(_) => "memory",
             OperationKind::Barrier(_) => "barrier",
+            OperationKind::ProcessorHint(_) => "processor_hint",
+            OperationKind::RuntimeRegisterRead(_) => "runtime_register_read",
             OperationKind::CacheMaintenance(_) => "cache-maintenance",
             OperationKind::Exclusive(_) => "exclusive",
             OperationKind::Atomic(_) => "atomic",
@@ -1048,18 +1029,20 @@ mod tests {
 
     #[test]
     fn indirect_targets_never_contain_host_pointers() {
+        let source = start(GuestCpuProfile::switch_1(), 0x1000, ExecutionState::A64);
         let address = crate::ir::value::Immediate::Address(GuestVirtualAddress::new(0x9876)).into();
         assert_eq!(
-            indirect_target(address, ExecutionState::A64),
+            indirect_target(address, ExecutionState::A64, source),
             ControlTarget::Indirect {
                 address,
                 execution_state: ExecutionState::A64,
+                source,
             }
         );
     }
 
     #[test]
-    fn calls_write_the_architectural_link_register_before_terminating() {
+    fn call_terminators_own_the_architectural_link_update() {
         let profile = GuestCpuProfile::switch_1();
         let source = start(profile, 0x1000, ExecutionState::T32);
         let dependency = CodePageDependency {
@@ -1083,16 +1066,10 @@ mod tests {
             )],
         );
         let mut builder = IrBuilder::new(metadata);
-        let terminator = emit_call(&mut builder, source, target, return_address).unwrap();
+        let terminator = call_terminator(target, return_address);
         builder.terminate(terminator).unwrap();
         let block = builder.finish().unwrap();
-        assert!(matches!(
-            block.operations[0].kind,
-            OperationKind::WriteState {
-                register: StateRegister::A32R(register),
-                value: Operand::Immediate(Immediate::I32(0x1005)),
-            } if register.index() == 14
-        ));
+        assert!(block.operations.is_empty());
         assert!(matches!(
             block.terminator,
             Terminator::Call {

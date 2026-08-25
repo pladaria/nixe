@@ -44,6 +44,7 @@ use nixe_cpu::translate::{
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
+use nixe_memory::MemoryInvalidationSource;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use crate::exception_dispatch::{ExceptionProcessMetadata, ExceptionProcessResources};
@@ -156,7 +157,7 @@ impl RunnableProcess {
             purpose,
         )?;
         self.execution
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 
@@ -170,7 +171,7 @@ impl RunnableProcess {
         self.memory
             .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
         self.execution
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 
@@ -185,7 +186,7 @@ impl RunnableProcess {
         self.memory
             .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
         self.execution
-            .publish_mapping_invalidation(self.memory.mapping_epoch());
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
     }
 
@@ -195,8 +196,11 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub fn mapping_invalidation_acknowledged(&self, epoch: MappingEpoch) -> bool {
-        self.execution.mapping_invalidation_acknowledged(epoch)
+    pub fn memory_invalidation_acknowledged(
+        &self,
+        cursor: nixe_memory::MemoryInvalidationCursor,
+    ) -> bool {
+        self.execution.memory_invalidation_acknowledged(cursor)
     }
 
     #[must_use]

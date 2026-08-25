@@ -195,7 +195,12 @@ struct CpuWriteDependencyStore {
     store: crate::CanonicalBackingStore,
     observed_epoch: AtomicU64,
     intervals: Box<[(CanonicalPageId, u64, u64)]>,
-    pages: Box<[(CanonicalBackingPage, ContentGeneration)]>,
+    pages: Box<[CpuWriteDependencyPage]>,
+}
+
+struct CpuWriteDependencyPage {
+    page: CanonicalBackingPage,
+    observed_generation: AtomicU64,
 }
 
 struct CanonicalCpuWriteDependencyInner {
@@ -222,11 +227,11 @@ impl CanonicalCpuWriteDependency {
 
     /// Captures several ranges as one dependency domain.
     ///
-    /// Each store epoch is observed before its current page generations. A
-    /// concurrent write can therefore cause conservative invalidation, but it
-    /// cannot be hidden. The ranges may themselves have been translated at
-    /// different times; their old snapshot epochs are irrelevant to a new
-    /// dependency captured at this boundary.
+    /// Each store epoch and its current page generations are sampled only while
+    /// the canonical active-writer count is zero. A concurrent write retries
+    /// the bounded capture or makes it unavailable; it cannot be hidden. The
+    /// ranges may themselves have been translated at different times; their
+    /// old snapshot epochs are irrelevant to a new dependency captured here.
     #[must_use]
     pub fn capture_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
@@ -278,11 +283,38 @@ impl CanonicalCpuWriteDependency {
                 .pages
                 .sort_unstable_by_key(|(page, generation)| (page.identity(), *generation));
             store.pages.dedup_by_key(|(page, _)| page.identity());
+            let mut stable = false;
+            for _ in 0..64 {
+                if store.store.cpu_writes_active() != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let epoch = store.store.cpu_write_epoch();
+                for (page, generation) in &mut store.pages {
+                    *generation = page.content_generation();
+                }
+                if store.store.cpu_writes_active() == 0 && store.store.cpu_write_epoch() == epoch {
+                    store.observed_epoch = epoch;
+                    stable = true;
+                    break;
+                }
+            }
+            if !stable {
+                return None;
+            }
             dependencies.push(CpuWriteDependencyStore {
                 store: store.store,
                 observed_epoch: AtomicU64::new(store.observed_epoch.get()),
                 intervals: store.intervals.into_boxed_slice(),
-                pages: store.pages.into_boxed_slice(),
+                pages: store
+                    .pages
+                    .into_iter()
+                    .map(|(page, generation)| CpuWriteDependencyPage {
+                        page,
+                        observed_generation: AtomicU64::new(generation.get()),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
             });
         }
         let stores = dependencies.into_boxed_slice();
@@ -299,6 +331,9 @@ impl CanonicalCpuWriteDependency {
     #[must_use]
     pub fn remains_current(&self) -> bool {
         for dependency in &self.inner.stores {
+            if dependency.store.cpu_writes_active() != 0 {
+                return false;
+            }
             let observed = CpuWriteEpoch::new(dependency.observed_epoch.load(Ordering::Acquire));
             if dependency.store.cpu_write_epoch() == observed {
                 continue;
@@ -308,12 +343,19 @@ impl CanonicalCpuWriteDependency {
                 .cpu_write_overlap_since(observed, &dependency.intervals);
             match overlap {
                 CanonicalCpuWriteOverlap::Yes => return false,
-                CanonicalCpuWriteOverlap::Unknown
-                    if page_local_cpu_write_overlap(dependency) != CanonicalCpuWriteOverlap::No =>
-                {
-                    return false;
+                CanonicalCpuWriteOverlap::No | CanonicalCpuWriteOverlap::Unknown
+                    if page_local_cpu_write_overlap(dependency) == CanonicalCpuWriteOverlap::No => {
                 }
-                CanonicalCpuWriteOverlap::No | CanonicalCpuWriteOverlap::Unknown => {}
+                CanonicalCpuWriteOverlap::No | CanonicalCpuWriteOverlap::Unknown => return false,
+            }
+            for page in &dependency.pages {
+                page.observed_generation
+                    .store(page.page.content_generation().get(), Ordering::Release);
+            }
+            if dependency.store.cpu_writes_active() != 0
+                || dependency.store.cpu_write_epoch() != current
+            {
+                return false;
             }
             dependency
                 .observed_epoch
@@ -327,12 +369,16 @@ fn page_local_cpu_write_overlap(dependency: &CpuWriteDependencyStore) -> Canonic
     for (page_id, start, end) in &dependency.intervals {
         let Ok(index) = dependency
             .pages
-            .binary_search_by_key(page_id, |(page, _)| page.identity())
+            .binary_search_by_key(page_id, |page| page.page.identity())
         else {
             return CanonicalCpuWriteOverlap::Unknown;
         };
-        let (page, generation) = &dependency.pages[index];
-        match page.cpu_write_overlap_since(*generation, *start, end - start) {
+        let page = &dependency.pages[index];
+        let generation = ContentGeneration::new(page.observed_generation.load(Ordering::Acquire));
+        match page
+            .page
+            .cpu_write_overlap_since(generation, *start, end - start)
+        {
             Ok(CanonicalCpuWriteOverlap::No) => {}
             Ok(overlap) => return overlap,
             Err(_) => return CanonicalCpuWriteOverlap::Unknown,

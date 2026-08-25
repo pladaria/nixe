@@ -2912,15 +2912,8 @@ fn create_thread_commits_through_a64_abi() {
     write_abi_register(&mut process, 3, stack_top);
     write_abi_register(&mut process, 4, 20);
     write_abi_register(&mut process, 5, (-2_i32) as u32 as u64);
-    let registration = ProcessRegistration {
-        priority: process.initial_thread_priority(),
-        ideal_vcpu: Some(process.initial_ideal_vcpu()),
-        affinity: switch_1_scheduler_profile().all_cores(),
-    };
-    let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
-    let process_id = coordinator
-        .register_process(process.into_process(), registration)
-        .unwrap();
+    let process_id = process.scheduler_process_id();
+    let coordinator = process.coordinator_mut();
     let execution = coordinator.run_next(1).unwrap().unwrap();
     let caller = execution.lease.thread;
     let mut dispatcher = HorizonSvcDispatcher::default();
@@ -2932,7 +2925,7 @@ fn create_thread_commits_through_a64_abi() {
     );
     assert!(
         dispatcher
-            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
+            .apply_pending_runtime_request(coordinator, process_id, caller)
             .unwrap()
     );
     let process = coordinator.process(process_id).unwrap();
@@ -2984,7 +2977,7 @@ fn create_thread_commits_through_a64_abi() {
     );
     assert!(
         dispatcher
-            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
+            .apply_pending_runtime_request(coordinator, process_id, caller)
             .unwrap()
     );
     assert_eq!(

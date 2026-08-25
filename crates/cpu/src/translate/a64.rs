@@ -17,24 +17,24 @@ use crate::{
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
-            AddressOperation, ArithmeticFlagOutput, BarrierAccess, BarrierDomain, BarrierOperation,
-            ByteOrder, CacheMaintenanceKind, CacheMaintenanceOperation, Condition, EffectSet,
-            ExclusiveOperation, FlagOperation, GuestAddressWidth, HelperOperation,
-            IntegerBinaryKind, IntegerPredicate, MemoryDescriptor, MemoryOperation,
-            MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation, ShiftKind,
-            StateRegister, Volatility,
+            AddressOperation, ArithmeticFlagOutput, AtomicOperation, ByteOrder,
+            CacheMaintenanceOperation, Condition, EffectSet, ExclusiveOperation, FlagOperation,
+            GuestAddressWidth, HelperOperation, IntegerBinaryKind, IntegerPredicate,
+            MemoryDescriptor, MemoryOperation, MemoryPrivilege, OperationEffects, OperationKind,
+            ScalarOperation, ShiftKind, StateRegister, Volatility,
         },
         terminator::{ControlTarget, Terminator},
         types::IrType,
         value::{Immediate, Operand, Value},
     },
     location::{DecodedInstruction, ExecutionState, LocationDescriptor},
+    memory::{AtomicRmwKind, CacheMaintenanceKind},
     memory::{MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryOrdering},
     semantics::{a64::signed_immediate as sign_extend, immediate::decode_a64_logical_immediate},
     state::a64::A64GeneralRegister,
 };
 
-use super::block::{LiftOutcome, conditional_terminator, emit_call, indirect_target};
+use super::block::{LiftOutcome, call_terminator, conditional_terminator, indirect_target};
 
 #[derive(Clone, Copy)]
 enum Register31 {
@@ -384,7 +384,7 @@ mod tests {
     use crate::{
         ir::op::OperationKind,
         location::ExecutionState,
-        memory::{MemoryPermissions, SyntheticMemory},
+        memory::{BarrierOperation, MemoryPermissions, SyntheticMemory},
         profile::GuestCpuProfile,
         translate::block::{BasicBlockLimits, translate_basic_block},
     };
@@ -550,12 +550,18 @@ mod tests {
     }
 
     #[test]
-    fn function_call_and_return_update_lr_and_keep_indirect_target_in_guest_domain() {
+    fn function_call_owns_link_update_and_keeps_indirect_target_in_guest_domain() {
         let call = translate(&[0x9400_0002]);
         assert!(
             matches!(call.terminator, Terminator::Call { return_address, .. } if return_address == GuestVirtualAddress::new(0x1004))
         );
-        assert!(call.operations.iter().any(|operation| matches!(operation.kind, OperationKind::WriteState { register: StateRegister::A64X(register), .. } if register.index() == 30)));
+        assert!(!call.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteState {
+                register: StateRegister::A64X(register),
+                ..
+            } if register.index() == 30
+        )));
 
         let ret = translate(&[0xd65f_03c0]);
         assert!(matches!(
@@ -848,13 +854,15 @@ mod tests {
                 0x1e61_2000, // fcmp d0,d1
                 0x9e62_0000, // scvtf d0,x0
                 0x9e63_0001, // ucvtf d1,x0
+                0x9e79_0020, // fcvtzu x0,d1
+                0x9e78_0062, // fcvtzs x2,d3
                 0x9e66_0002, // fmov x2,d0
                 0x9e67_0040, // fmov d0,x2
                 0x3dc0_0000, // ldr q0,[x0]
                 0xd400_0001,
             ],
         );
-        assert_eq!(block.metadata.guest_instruction_count, 11);
+        assert_eq!(block.metadata.guest_instruction_count, 13);
         assert!(block.operations.iter().any(|operation| matches!(
             operation.kind,
             OperationKind::Helper(ref helper) if helper.helper.as_ref() == "a64.fp-simd.semantic-vector"
@@ -873,5 +881,28 @@ mod tests {
                 ..
             }
         )));
+        for (helper_name, destination) in [
+            ("a64.fp.float-to-unsigned-int", 0),
+            ("a64.fp.float-to-signed-int", 2),
+        ] {
+            let helper = block
+                .operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        OperationKind::Helper(ref helper) if helper.helper.as_ref() == helper_name
+                    )
+                })
+                .unwrap();
+            assert_eq!(helper.results.iter().next().unwrap().ty, IrType::I64);
+            assert!(block.operations.iter().any(|operation| matches!(
+                operation.kind,
+                OperationKind::WriteState {
+                    register: StateRegister::A64X(register),
+                    ..
+                } if register.index() == destination
+            )));
+        }
     }
 }

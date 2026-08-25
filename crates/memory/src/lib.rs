@@ -1,14 +1,17 @@
-//! Device-neutral guest-memory identities and version contracts.
+//! Device-neutral guest-memory identities, backing, and version contracts.
 //!
-//! This crate defines pointer-free values shared by CPU, runtime, and device
-//! code. It deliberately contains no CPU execution, Horizon, console GPU, or
-//! host graphics API behavior.
+//! Stable identities and retained ranges remain pointer-free. The canonical
+//! backing owner additionally exposes a retained, process-local direct-access
+//! lease whose host addresses are derived acceleration facts, never guest
+//! values or a JIT representation. This crate contains no CPU execution,
+//! Horizon, console GPU, or host graphics API behavior.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 mod access;
 mod backing;
+mod invalidation;
 mod range;
 mod visibility;
 
@@ -18,8 +21,13 @@ pub use access::{
 };
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
-    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageError, CanonicalWriteBatch,
-    CanonicalWriteBatchError,
+    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalDirectAccessLease,
+    CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
+};
+pub use invalidation::{
+    MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,
+    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
+    MemoryInvalidationReservation, MemoryInvalidationSource,
 };
 pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalCpuWriteDependency,

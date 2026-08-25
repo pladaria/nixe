@@ -3,11 +3,14 @@ use std::thread;
 use std::time::Duration;
 
 use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment,
-    MemoryMappingPurpose, MemoryOrdering, MemoryPermissions, MemoryValue, ProcessMemory,
-    SYNTHETIC_PAGE_SIZE,
+    AtomicRmwKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
+    MemoryAlignment, MemoryMappingPurpose, MemoryOrdering, MemoryPermissions, MemoryValue,
+    ProcessMemory, SYNTHETIC_PAGE_SIZE,
 };
-use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
+use nixe_memory::{
+    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
+    MemoryInvalidationSource,
+};
 
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 const PRIMARY: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
@@ -105,7 +108,7 @@ fn pending_mapping_mutation_cannot_be_overtaken_by_a_new_execution_lease() {
 }
 
 #[test]
-fn concurrent_alias_access_is_serialized_without_torn_values() {
+fn concurrent_alias_access_remains_coherent_without_torn_values() {
     let memory = shared_memory();
     let start = Arc::new(Barrier::new(3));
     let access = MemoryAccess::normal(MemoryAccessSize::Doubleword);
@@ -243,4 +246,164 @@ fn release_acquire_message_passing_never_observes_stale_data() {
     start.wait();
     producer.join().unwrap();
     consumer.join().unwrap();
+}
+
+#[test]
+fn atomic_rmw_contends_on_physical_identity_from_parallel_host_workers() {
+    let memory = shared_memory();
+    let access = MemoryAccess::new(
+        MemoryAccessSize::Doubleword,
+        MemoryAlignment::Natural,
+        MemoryOrdering::AcquireRelease,
+        MemoryAccessClass::Atomic,
+    );
+    memory
+        .write(SPACE, PRIMARY, access, MemoryValue::U64(0))
+        .unwrap();
+    let start = Arc::new(Barrier::new(5));
+    let mut workers = Vec::new();
+    for worker_index in 0..4 {
+        let memory = Arc::clone(&memory);
+        let start = Arc::clone(&start);
+        workers.push(thread::spawn(move || {
+            let address = if worker_index & 1 == 0 {
+                PRIMARY
+            } else {
+                ALIAS
+            };
+            start.wait();
+            for _ in 0..2_000 {
+                memory
+                    .atomic_read_modify_write(
+                        SPACE,
+                        address,
+                        access,
+                        AtomicRmwKind::Add,
+                        MemoryValue::U64(1),
+                    )
+                    .unwrap();
+            }
+        }));
+    }
+    start.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(
+        memory.read(SPACE, PRIMARY, access).unwrap().value,
+        MemoryValue::U64(8_000)
+    );
+}
+
+#[test]
+fn compare_exchange_and_exclusives_cover_every_supported_scalar_width() {
+    let memory = shared_memory();
+    for (index, (size, initial, replacement)) in [
+        (
+            MemoryAccessSize::Byte,
+            MemoryValue::U8(1),
+            MemoryValue::U8(2),
+        ),
+        (
+            MemoryAccessSize::Halfword,
+            MemoryValue::U16(3),
+            MemoryValue::U16(4),
+        ),
+        (
+            MemoryAccessSize::Word,
+            MemoryValue::U32(5),
+            MemoryValue::U32(6),
+        ),
+        (
+            MemoryAccessSize::Doubleword,
+            MemoryValue::U64(7),
+            MemoryValue::U64(8),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let address = PRIMARY.wrapping_add((index * 16) as u64);
+        let alias = ALIAS.wrapping_add((index * 16) as u64);
+        let exclusive = MemoryAccess::new(
+            size,
+            MemoryAlignment::Natural,
+            MemoryOrdering::AcquireRelease,
+            MemoryAccessClass::Exclusive,
+        );
+        let atomic = MemoryAccess::new(
+            size,
+            MemoryAlignment::Natural,
+            MemoryOrdering::AcquireRelease,
+            MemoryAccessClass::Atomic,
+        );
+        memory.write(SPACE, address, exclusive, initial).unwrap();
+        let (_, reservation) = memory.load_exclusive(SPACE, address, exclusive).unwrap();
+        assert!(
+            memory
+                .store_exclusive(SPACE, alias, exclusive, replacement, reservation)
+                .unwrap()
+                .1
+        );
+        let compared = memory
+            .atomic_compare_exchange(SPACE, address, atomic, replacement, initial)
+            .unwrap();
+        assert_eq!(compared.previous, replacement);
+        assert!(compared.stored);
+        let failed = memory
+            .atomic_compare_exchange(SPACE, alias, atomic, replacement, initial)
+            .unwrap();
+        assert_eq!(failed.previous, initial);
+        assert!(!failed.stored);
+    }
+}
+
+#[test]
+fn only_successful_atomic_writes_publish_executable_invalidation() {
+    let mut memory = ExecutionMemory::new();
+    let page = GuestPhysicalPageId::new(77);
+    assert!(memory.add_ram_page(page));
+    assert!(memory.initialize_ram(page, 0, &1_u32.to_le_bytes()));
+    assert!(memory.map_page(SPACE, PRIMARY, page, MemoryPermissions::READ_WRITE_EXECUTE,));
+    let cursor = memory.invalidation_cursor();
+    let access = MemoryAccess::new(
+        MemoryAccessSize::Word,
+        MemoryAlignment::Natural,
+        MemoryOrdering::AcquireRelease,
+        MemoryAccessClass::Atomic,
+    );
+    let failed = memory
+        .atomic_compare_exchange(
+            SPACE,
+            PRIMARY,
+            access,
+            MemoryValue::U32(2),
+            MemoryValue::U32(3),
+        )
+        .unwrap();
+    assert!(!failed.stored);
+    assert_eq!(memory.invalidation_cursor(), cursor);
+
+    memory
+        .atomic_read_modify_write(
+            SPACE,
+            PRIMARY,
+            access,
+            AtomicRmwKind::Add,
+            MemoryValue::U32(1),
+        )
+        .unwrap();
+    let mut records = Vec::new();
+    memory
+        .read_invalidations_since(cursor, &mut records)
+        .unwrap();
+    assert!(records.iter().any(|record| {
+        matches!(
+            record.kind,
+            MemoryInvalidationKind::ExecutableContent {
+                first,
+                second: None
+            } if first == page
+        )
+    }));
 }

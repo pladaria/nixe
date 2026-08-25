@@ -1125,6 +1125,7 @@ dependencies = [
  "nixe-cpu",
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",
+ "nixe-cpu-engine-jit",
  "nixe-gpu",
  "nixe-gpu-wgpu",
  "nixe-horizon",
@@ -1187,6 +1188,7 @@ dependencies = [
  "libc",
  "nixe-cpu",
  "nixe-cpu-engine",
+ "nixe-cpu-engine-interpreter",
  "nixe-memory",
  "windows-sys 0.61.2",
 ]

@@ -1,7 +1,10 @@
 //! Deterministic memory backend for frontend and runtime tests.
 
 use nixe_memory::{
-    AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
+    GuestVirtualAddress, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
+    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
+    MemoryInvalidationSource,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,13 +20,14 @@ use super::common::{
     virtual_page, writable_executable,
 };
 use super::{
-    CodeDependencies, CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault,
-    DataAccessFaultReason, DataAccessKind, DataReadResult, DataWriteResult, FetchedCode,
-    InstructionMemory, MemoryAccess, MemoryAttributes, MemoryMappingError,
-    MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
-    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
-    SYNTHETIC_PAGE_SIZE, SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo,
-    SyntheticMmio, SyntheticRamPage,
+    AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
+    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
+    DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass,
+    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, MemoryProtectionErrorReason,
+    MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
+    SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo, SyntheticMmio,
+    SyntheticRamPage,
 };
 
 #[derive(Clone, Copy)]
@@ -51,6 +55,7 @@ struct SyntheticMemoryInner {
     next_page_id: u64,
     next_mapping_generation: Option<MappingGeneration>,
     install_failure: Option<(SyntheticInstallStage, usize, Box<str>)>,
+    content_epoch: ContentMutationEpoch,
 }
 
 impl Default for SyntheticMemoryInner {
@@ -63,6 +68,7 @@ impl Default for SyntheticMemoryInner {
             next_page_id: 1,
             next_mapping_generation: Some(MappingGeneration::new(1)),
             install_failure: None,
+            content_epoch: ContentMutationEpoch::INITIAL,
         }
     }
 }
@@ -74,6 +80,7 @@ impl Default for SyntheticMemoryInner {
 #[derive(Default)]
 pub struct SyntheticMemory {
     inner: Mutex<SyntheticMemoryInner>,
+    invalidations: MemoryInvalidationLog,
 }
 
 impl SyntheticMemory {
@@ -91,6 +98,146 @@ impl SyntheticMemory {
         self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn executable_page(
+        inner: &SyntheticMemoryInner,
+        page: GuestPhysicalPageId,
+    ) -> Option<GuestPhysicalPageId> {
+        inner
+            .mappings
+            .values()
+            .any(|mapping| {
+                mapping.physical_page == page
+                    && (mapping.permissions.contains(MemoryPermissions::EXECUTE)
+                        || mapping.purpose.is_code())
+            })
+            .then_some(page)
+    }
+
+    fn atomic_transaction(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        operation: impl FnOnce(MemoryValue) -> (MemoryValue, bool),
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        if access.class != MemoryAccessClass::Atomic || access.alignment != MemoryAlignment::Natural
+        {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::InvalidAtomicAccess,
+            ));
+        }
+        let mut inner = self.lock_inner();
+        resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
+        let resolved = resolve_access(
+            &inner,
+            address_space,
+            address,
+            access,
+            DataAccessKind::Write,
+        )?;
+        if resolved.second.is_some() || resolved.region != MemoryRegionKind::Ram {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::AtomicRegionUnsupported,
+            ));
+        }
+        for kind in [DataAccessKind::Read, DataAccessKind::Write] {
+            if let Some(reason) = inner.data_faults.get(&(address_space, address, kind)) {
+                return Err(DataAccessFault::new(
+                    address_space,
+                    address,
+                    kind,
+                    DataAccessFaultReason::Injected(reason.clone()),
+                ));
+            }
+        }
+        let page = resolved.first.physical_page;
+        let offset = page_offset(address);
+        let byte_count = access.size.bytes();
+        let mut previous_bytes = [0_u8; 16];
+        let PhysicalPage::Ram { bytes, .. } = inner
+            .pages
+            .get(&page)
+            .expect("resolved atomic RAM page exists")
+        else {
+            unreachable!()
+        };
+        if let Some(bytes) = bytes {
+            previous_bytes[..byte_count].copy_from_slice(&bytes[offset..offset + byte_count]);
+        }
+        let previous = MemoryValue::from_le_slice(access.size, &previous_bytes[..byte_count]);
+        let (replacement, stored) = operation(previous);
+        if replacement.size() != access.size {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        if stored {
+            super::contracts::begin_ordered_write(access.ordering);
+            let next_content_epoch = inner.content_epoch.next().map_err(|_| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::ContentGenerationExhausted,
+                )
+            })?;
+            let invalidation = Self::executable_page(&inner, page)
+                .map(|first| {
+                    self.invalidations
+                        .reserve(MemoryInvalidationKind::ExecutableContent {
+                            first,
+                            second: None,
+                        })
+                })
+                .transpose()
+                .map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Write,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?;
+            let PhysicalPage::Ram { bytes, generation } = inner
+                .pages
+                .get_mut(&page)
+                .expect("resolved atomic RAM page exists")
+            else {
+                unreachable!()
+            };
+            let next_generation = generation.next().map_err(|_| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::ContentGenerationExhausted,
+                )
+            })?;
+            let bytes = bytes.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+            replacement.copy_le_bytes(&mut bytes[offset..offset + byte_count]);
+            *generation = next_generation;
+            inner.content_epoch = next_content_epoch;
+            if let Some(invalidation) = invalidation {
+                invalidation.commit();
+            }
+        }
+        super::contracts::complete_ordered_read(access.ordering);
+        Ok(AtomicMemoryResult {
+            previous,
+            stored,
+            region: MemoryRegionKind::Ram,
+        })
+    }
+
     /// Atomically creates, initializes, and publishes ordinary RAM pages.
     ///
     /// Physical pages are owned by this memory object after success. A failed
@@ -100,7 +247,8 @@ impl SyntheticMemory {
         address_space: AddressSpaceId,
         requests: &[SyntheticRamPage<'_>],
     ) -> Result<(), SyntheticInstallError> {
-        let inner = self.inner_mut();
+        let invalidations = &self.invalidations;
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut virtual_pages = Vec::with_capacity(requests.len());
         let mut unique_virtual_pages = BTreeSet::new();
         for (index, request) in requests.iter().enumerate() {
@@ -171,6 +319,34 @@ impl SyntheticMemory {
             )?;
         }
 
+        let mut invalidation_kinds = Vec::new();
+        invalidation_kinds
+            .try_reserve_exact(virtual_pages.len())
+            .map_err(|_| {
+                install_error(
+                    SyntheticInstallStage::Publication,
+                    requests.first().map(|request| request.virtual_address),
+                    "memory invalidation allocation failed",
+                )
+            })?;
+        for virtual_page in &virtual_pages {
+            invalidation_kinds.push(MemoryInvalidationKind::Mapping {
+                address_space,
+                start: page_address(*virtual_page),
+                size: PAGE_SIZE,
+            });
+        }
+        let invalidation = (!invalidation_kinds.is_empty())
+            .then(|| invalidations.reserve_many(&invalidation_kinds))
+            .transpose()
+            .map_err(|reason| {
+                install_error(
+                    SyntheticInstallStage::Publication,
+                    requests.first().map(|request| request.virtual_address),
+                    reason.to_string(),
+                )
+            })?;
+
         let mapping_generation = if pending.is_empty() {
             MappingGeneration::INITIAL
         } else {
@@ -194,6 +370,9 @@ impl SyntheticMemory {
             debug_assert!(previous_mapping.is_none());
         }
         inner.next_page_id = next_page_id;
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
+        }
         Ok(())
     }
 
@@ -235,11 +414,24 @@ impl SyntheticMemory {
         let Some(range) = PageRange::new(start, size).filter(|range| !range.is_empty()) else {
             return false;
         };
-        let inner = self.inner_mut();
+        let invalidations = &self.invalidations;
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
         if !(range.first..range.end).all(|page| inner.mappings.contains_key(&(address_space, page)))
         {
             return false;
         }
+        if (range.first..range.end)
+            .all(|page| inner.mappings[&(address_space, page)].purpose == purpose)
+        {
+            return true;
+        }
+        let Ok(invalidation) = invalidations.reserve(MemoryInvalidationKind::Mapping {
+            address_space,
+            start,
+            size,
+        }) else {
+            return false;
+        };
         let Some(mapping_generation) = take_mapping_generation(&mut inner.next_mapping_generation)
         else {
             return false;
@@ -252,6 +444,7 @@ impl SyntheticMemory {
             mapping.purpose = purpose;
             mapping.mapping_generation = mapping_generation;
         }
+        invalidation.commit();
         true
     }
 
@@ -297,7 +490,8 @@ impl SyntheticMemory {
         if !virtual_address.is_aligned_to(PAGE_SIZE) {
             return false;
         }
-        let inner = self.inner_mut();
+        let invalidations = &self.invalidations;
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
         if !inner.pages.contains_key(&physical_page) {
             return false;
         }
@@ -305,6 +499,13 @@ impl SyntheticMemory {
         if inner.mappings.contains_key(&key) {
             return false;
         }
+        let Ok(invalidation) = invalidations.reserve(MemoryInvalidationKind::Mapping {
+            address_space,
+            start: virtual_address,
+            size: PAGE_SIZE,
+        }) else {
+            return false;
+        };
         let Some(mapping_generation) = take_mapping_generation(&mut inner.next_mapping_generation)
         else {
             return false;
@@ -320,6 +521,7 @@ impl SyntheticMemory {
             },
         );
         debug_assert!(previous.is_none());
+        invalidation.commit();
         true
     }
 
@@ -330,15 +532,36 @@ impl SyntheticMemory {
         offset: usize,
         bytes: &[u8],
     ) -> bool {
+        let invalidations = &self.invalidations;
+        let inner = self.inner.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let Ok(next_epoch) = inner.content_epoch.next() else {
+            return false;
+        };
+        let code_observed = inner.mappings.values().any(|mapping| {
+            mapping.physical_page == page
+                && (mapping.permissions.contains(MemoryPermissions::EXECUTE)
+                    || mapping.purpose.is_code())
+        });
         let Some(PhysicalPage::Ram {
             bytes: contents,
             generation,
-        }) = self.inner_mut().pages.get_mut(&page)
+        }) = inner.pages.get_mut(&page)
         else {
             return false;
         };
         let Some(end) = offset.checked_add(bytes.len()) else {
             return false;
+        };
+        let invalidation = if code_observed {
+            match invalidations.reserve(MemoryInvalidationKind::ExecutableContent {
+                first: page,
+                second: None,
+            }) {
+                Ok(invalidation) => Some(invalidation),
+                Err(_) => return false,
+            }
+        } else {
+            None
         };
         let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
         let Some(destination) = contents.get_mut(offset..end) else {
@@ -349,6 +572,10 @@ impl SyntheticMemory {
         };
         destination.copy_from_slice(bytes);
         *generation = next_generation;
+        inner.content_epoch = next_epoch;
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
+        }
         true
     }
 
@@ -513,6 +740,20 @@ impl SyntheticMemory {
     }
 }
 
+impl MemoryInvalidationSource for SyntheticMemory {
+    fn invalidation_cursor(&self) -> MemoryInvalidationCursor {
+        self.invalidations.cursor()
+    }
+
+    fn read_invalidations_since(
+        &self,
+        after: MemoryInvalidationCursor,
+        output: &mut Vec<MemoryInvalidation>,
+    ) -> Result<MemoryInvalidationCursor, MemoryInvalidationError> {
+        self.invalidations.read_since(after, output)
+    }
+}
+
 fn fail_install_if_requested(
     inner: &SyntheticMemoryInner,
     stage: SyntheticInstallStage,
@@ -529,6 +770,10 @@ fn fail_install_if_requested(
 }
 
 impl InstructionMemory for SyntheticMemory {
+    fn content_mutation_epoch(&self) -> ContentMutationEpoch {
+        self.lock_inner().content_epoch
+    }
+
     fn code_page_span(
         &self,
         address_space: AddressSpaceId,
@@ -635,6 +880,7 @@ impl CpuMemory for SyntheticMemory {
                     DataAccessFaultReason::ValueSizeMismatch,
                 ));
             }
+            super::contracts::complete_ordered_read(access.ordering);
             return Ok(DataReadResult {
                 value,
                 region: MemoryRegionKind::Device,
@@ -683,6 +929,7 @@ impl CpuMemory for SyntheticMemory {
                 }
             }
         }
+        super::contracts::complete_ordered_read(access.ordering);
         Ok(DataReadResult {
             value: MemoryValue::from_le_slice(access.size, &bytes[..byte_count]),
             region: MemoryRegionKind::Ram,
@@ -740,6 +987,7 @@ impl CpuMemory for SyntheticMemory {
             else {
                 unreachable!()
             };
+            super::contracts::begin_ordered_write(access.ordering);
             handler
                 .write(page_offset(address) as u64, access, value)
                 .map_err(|reason| {
@@ -754,9 +1002,41 @@ impl CpuMemory for SyntheticMemory {
                 region: MemoryRegionKind::Device,
             });
         }
+        let next_content_epoch = inner.content_epoch.next().map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ContentGenerationExhausted,
+            )
+        })?;
+        let first_code_page = Self::executable_page(&inner, resolved.first.physical_page);
+        let second_code_page = resolved
+            .second
+            .and_then(|second| Self::executable_page(&inner, second.physical_page))
+            .filter(|second| Some(*second) != first_code_page);
+        let invalidation = first_code_page
+            .or(second_code_page)
+            .map(|first| {
+                self.invalidations
+                    .reserve(MemoryInvalidationKind::ExecutableContent {
+                        first,
+                        second: second_code_page,
+                    })
+            })
+            .transpose()
+            .map_err(|reason| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?;
         let byte_count = access.size.bytes();
         let mut bytes = [0_u8; 16];
         value.copy_le_bytes(&mut bytes[..byte_count]);
+        super::contracts::begin_ordered_write(access.ordering);
         match resolved.second {
             None => {
                 let PhysicalPage::Ram {
@@ -850,9 +1130,130 @@ impl CpuMemory for SyntheticMemory {
                 }
             }
         }
+        inner.content_epoch = next_content_epoch;
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
+        }
         Ok(DataWriteResult {
             region: MemoryRegionKind::Ram,
         })
+    }
+
+    fn atomic_read_modify_write(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: AtomicRmwKind,
+        operand: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        if operand.size() != access.size {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        self.atomic_transaction(address_space, address, access, |previous| {
+            (
+                kind.apply(previous, operand)
+                    .expect("validated atomic operands have one width"),
+                true,
+            )
+        })
+    }
+
+    fn atomic_compare_exchange(
+        &self,
+        address_space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<AtomicMemoryResult, DataAccessFault> {
+        if expected.size() != access.size || replacement.size() != access.size {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        self.atomic_transaction(address_space, address, access, |previous| {
+            if previous == expected {
+                (replacement, true)
+            } else {
+                (previous, false)
+            }
+        })
+    }
+
+    fn maintain_cache(
+        &self,
+        address_space: AddressSpaceId,
+        kind: super::CacheMaintenanceKind,
+        address: Option<GuestVirtualAddress>,
+    ) -> Result<(), DataAccessFault> {
+        if kind == super::CacheMaintenanceKind::InstructionInvalidate && address.is_none() {
+            self.invalidations
+                .reserve(MemoryInvalidationKind::InstructionCache { address_space })
+                .map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        GuestVirtualAddress::MIN,
+                        DataAccessKind::Read,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?
+                .commit();
+            return Ok(());
+        }
+        let address = address.ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                GuestVirtualAddress::MIN,
+                DataAccessKind::Read,
+                DataAccessFaultReason::AddressOverflow,
+            )
+        })?;
+        let inner = self.lock_inner();
+        let mapping = mapping_at(&inner, address_space, address).ok_or_else(|| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::Unmapped,
+            )
+        })?;
+        if !matches!(
+            inner.pages.get(&mapping.physical_page),
+            Some(PhysicalPage::Ram { .. })
+        ) {
+            return Err(DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Read,
+                DataAccessFaultReason::Device("cache maintenance requires RAM".into()),
+            ));
+        }
+        if kind == super::CacheMaintenanceKind::InstructionInvalidate {
+            self.invalidations
+                .reserve(MemoryInvalidationKind::ExecutableContent {
+                    first: mapping.physical_page,
+                    second: None,
+                })
+                .map_err(|reason| {
+                    DataAccessFault::new(
+                        address_space,
+                        address,
+                        DataAccessKind::Read,
+                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                    )
+                })?
+                .commit();
+        }
+        Ok(())
     }
 
     fn load_exclusive(
@@ -891,6 +1292,7 @@ impl CpuMemory for SyntheticMemory {
         if let Some(bytes) = bytes {
             value_bytes[..byte_count].copy_from_slice(&bytes[offset..offset + byte_count]);
         }
+        super::contracts::complete_ordered_read(access.ordering);
         Ok((
             DataReadResult {
                 value: MemoryValue::from_le_slice(access.size, &value_bytes[..byte_count]),
@@ -960,6 +1362,31 @@ impl CpuMemory for SyntheticMemory {
                 false,
             ));
         }
+        let next_content_epoch = inner.content_epoch.next().map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ContentGenerationExhausted,
+            )
+        })?;
+        let invalidation = Self::executable_page(&inner, resolved.first.physical_page)
+            .map(|first| {
+                self.invalidations
+                    .reserve(MemoryInvalidationKind::ExecutableContent {
+                        first,
+                        second: None,
+                    })
+            })
+            .transpose()
+            .map_err(|reason| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?;
         let PhysicalPage::Ram {
             bytes: contents,
             generation,
@@ -981,8 +1408,13 @@ impl CpuMemory for SyntheticMemory {
         let contents = contents.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
         let byte_count = access.size.bytes();
         let offset = page_offset(address);
+        super::contracts::begin_ordered_write(access.ordering);
         value.copy_le_bytes(&mut contents[offset..offset + byte_count]);
         *generation = next_generation;
+        inner.content_epoch = next_content_epoch;
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
+        }
         Ok((
             DataWriteResult {
                 region: MemoryRegionKind::Ram,
@@ -1139,6 +1571,17 @@ impl ProcessMemory for SyntheticMemory {
             )
         })?;
         let mut inner = self.lock_inner();
+        let next_content_epoch = (!bytes.is_empty())
+            .then(|| inner.content_epoch.next())
+            .transpose()
+            .map_err(|_| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::ContentGenerationExhausted,
+                )
+            })?;
         if let Some(((.., fault_address, _), reason)) = inner
             .data_faults
             .iter()
@@ -1205,6 +1648,39 @@ impl ProcessMemory for SyntheticMemory {
                 (SYNTHETIC_PAGE_SIZE - page_offset(current)).min((end - cursor) as usize) as u64;
         }
 
+        let mut invalidation_kinds = Vec::new();
+        invalidation_kinds
+            .try_reserve(next_generations.len())
+            .map_err(|_| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(
+                        "memory invalidation allocation failed".into(),
+                    ),
+                )
+            })?;
+        for page in next_generations.keys().copied() {
+            if let Some(first) = Self::executable_page(&inner, page) {
+                invalidation_kinds.push(MemoryInvalidationKind::ExecutableContent {
+                    first,
+                    second: None,
+                });
+            }
+        }
+        let invalidation = (!invalidation_kinds.is_empty())
+            .then(|| self.invalidations.reserve_many(&invalidation_kinds))
+            .transpose()
+            .map_err(|reason| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
+                )
+            })?;
+
         let mut copied = 0;
         while copied < bytes.len() {
             let current = address
@@ -1233,6 +1709,12 @@ impl ProcessMemory for SyntheticMemory {
                 unreachable!("bulk write RAM page was validated")
             };
             *generation = next;
+        }
+        if let Some(next) = next_content_epoch {
+            inner.content_epoch = next;
+        }
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
         }
         Ok(())
     }
@@ -1289,6 +1771,14 @@ impl ProcessMemory for SyntheticMemory {
         }
 
         if new_end_page < old_end_page {
+            let invalidation = self
+                .invalidations
+                .reserve(MemoryInvalidationKind::Mapping {
+                    address_space,
+                    start,
+                    size: old_size.max(new_size),
+                })
+                .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
             for page in new_end_page..old_end_page {
                 let mapping = inner
                     .mappings
@@ -1302,13 +1792,20 @@ impl ProcessMemory for SyntheticMemory {
                     inner.pages.remove(&mapping.physical_page);
                 }
             }
+            invalidation.commit();
+            return Ok(());
+        }
+        if new_end_page == old_end_page {
             return Ok(());
         }
 
         let additional_pages = new_end_page - old_end_page;
         let capacity = usize::try_from(additional_pages)
             .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
-        let mut pending = Vec::with_capacity(capacity);
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(capacity)
+            .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
         let mut next_page_id = inner.next_page_id;
         for page in old_end_page..new_end_page {
             let physical_page =
@@ -1316,12 +1813,16 @@ impl ProcessMemory for SyntheticMemory {
                     .ok_or_else(|| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
             pending.push((page, physical_page));
         }
-        let mapping_generation = if pending.is_empty() {
-            MappingGeneration::INITIAL
-        } else {
-            take_mapping_generation(&mut inner.next_mapping_generation)
-                .ok_or_else(|| error(start, MemoryMappingErrorReason::GenerationExhausted))?
-        };
+        let invalidation = self
+            .invalidations
+            .reserve(MemoryInvalidationKind::Mapping {
+                address_space,
+                start,
+                size: old_size.max(new_size),
+            })
+            .map_err(|_| error(start, MemoryMappingErrorReason::ResourceExhausted))?;
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(start, MemoryMappingErrorReason::GenerationExhausted))?;
         for (page, physical_page) in pending {
             inner.pages.insert(
                 physical_page,
@@ -1342,6 +1843,7 @@ impl ProcessMemory for SyntheticMemory {
             );
         }
         inner.next_page_id = next_page_id;
+        invalidation.commit();
         Ok(())
     }
 
@@ -1394,6 +1896,14 @@ impl ProcessMemory for SyntheticMemory {
         if !changed {
             return Ok(());
         }
+        let invalidation = self
+            .invalidations
+            .reserve(MemoryInvalidationKind::Mapping {
+                address_space,
+                start,
+                size,
+            })
+            .map_err(|_| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in range.first..range.end {
@@ -1404,6 +1914,7 @@ impl ProcessMemory for SyntheticMemory {
             mapping.permissions = permissions;
             mapping.mapping_generation = mapping_generation;
         }
+        invalidation.commit();
         Ok(())
     }
 
@@ -1445,6 +1956,14 @@ impl ProcessMemory for SyntheticMemory {
         if !changed {
             return Ok(());
         }
+        let invalidation = self
+            .invalidations
+            .reserve(MemoryInvalidationKind::Mapping {
+                address_space,
+                start,
+                size,
+            })
+            .map_err(|_| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in range.first..range.end {
@@ -1456,6 +1975,7 @@ impl ProcessMemory for SyntheticMemory {
                 .expect("attribute mask was validated");
             mapping.mapping_generation = mapping_generation;
         }
+        invalidation.commit();
         Ok(())
     }
 }
@@ -1513,7 +2033,8 @@ mod tests {
 
     use super::*;
     use crate::memory::{
-        ExecutionMemory, MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryOrdering,
+        CacheMaintenanceKind, ExecutionMemory, MemoryAccessClass, MemoryAccessSize,
+        MemoryAlignment, MemoryOrdering,
     };
 
     #[test]
@@ -2543,6 +3064,77 @@ mod tests {
         );
         assert_eq!(synthetic.physical_page_count(), 1);
         assert_eq!(execution.physical_page_count(), 1);
+    }
+
+    #[test]
+    fn writable_alias_mapping_and_cache_operations_publish_semantic_records() {
+        let mut memory = SyntheticMemory::new();
+        assert!(memory.add_ram_page(PAGE_1));
+        assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE,));
+        assert!(memory.map_page(SPACE, ALIAS, PAGE_1, MemoryPermissions::READ_WRITE,));
+        let after_mapping = memory.invalidation_cursor();
+
+        memory
+            .write(
+                SPACE,
+                ALIAS,
+                MemoryAccess::new(
+                    MemoryAccessSize::Word,
+                    MemoryAlignment::Natural,
+                    MemoryOrdering::Relaxed,
+                    MemoryAccessClass::Normal,
+                ),
+                MemoryValue::U32(0xd503_201f),
+            )
+            .unwrap();
+        let mut records = Vec::new();
+        let after_write = memory
+            .read_invalidations_since(after_mapping, &mut records)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].kind,
+            MemoryInvalidationKind::ExecutableContent {
+                first: PAGE_1,
+                second: None,
+            }
+        );
+
+        memory
+            .set_permissions(SPACE, CODE, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        records.clear();
+        let after_permissions = memory
+            .read_invalidations_since(after_write, &mut records)
+            .unwrap();
+        assert!(matches!(
+            records.as_slice(),
+            [MemoryInvalidation {
+                kind: MemoryInvalidationKind::Mapping {
+                    address_space: SPACE,
+                    start: CODE,
+                    size: PAGE_SIZE
+                },
+                ..
+            }]
+        ));
+
+        memory
+            .maintain_cache(SPACE, CacheMaintenanceKind::InstructionInvalidate, None)
+            .unwrap();
+        records.clear();
+        memory
+            .read_invalidations_since(after_permissions, &mut records)
+            .unwrap();
+        assert!(matches!(
+            records.as_slice(),
+            [MemoryInvalidation {
+                kind: MemoryInvalidationKind::InstructionCache {
+                    address_space: SPACE
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]

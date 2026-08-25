@@ -2,6 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nixe_cpu::location::ExecutionState;
 use nixe_cpu::memory::{
@@ -11,7 +12,7 @@ use nixe_cpu::memory::{
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
 use nixe_cpu::state::{ThreadCpuState, a64::A64GeneralRegister, a64::A64Register, a64::A64State};
 use nixe_memory::GuestPhysicalPageId;
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryInvalidationSource};
 
 use crate::{
     CrossVcpuRequest, DomainRequest, EngineDomain, EngineExecutor, EngineExecutorId, EngineExit,
@@ -23,7 +24,9 @@ const CODE: GuestVirtualAddress = GuestVirtualAddress::new(0x1000);
 const DATA: GuestVirtualAddress = GuestVirtualAddress::new(0x2000);
 const CODE_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(1);
 const DATA_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(2);
-pub const CONFORMANCE_FALLBACK_ENCODING: u32 = 0xd420_0000;
+/// A64 ERET, recognized by the frontend but intentionally unavailable to the
+/// user-mode Switch 1 interpreter and baseline JIT.
+pub const CONFORMANCE_FALLBACK_ENCODING: u32 = 0xd69f_03e0;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ConformanceCase {
@@ -32,6 +35,7 @@ pub enum ConformanceCase {
     PreciseException,
     InterpretOneFallback,
     Timer,
+    SchedulingEvents,
     Interrupt,
     Invalidation,
     SelfModifyingCode,
@@ -89,6 +93,7 @@ pub fn run_provider_conformance(
     suite.precise_exception()?;
     suite.interpret_one_fallback()?;
     suite.timer()?;
+    suite.scheduling_events()?;
     suite.interrupt()?;
     suite.invalidation()?;
     suite.self_modifying_code()?;
@@ -137,16 +142,17 @@ impl Suite {
                 domain: id,
                 cpu: self.cpu,
             })
-            .map_err(|error| Self::fail(case, error.to_string()))?;
+            .map_err(|error| Self::fail(case, format!("{error:?}")))?;
         let binding = crate::DomainMemoryBinding {
             address_space: self.cpu.address_space_id(),
             end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
             memory: &self.binding_memory,
-            invalidation_generation: self.binding_memory.mapping_epoch().get(),
+            mapping_epoch: self.binding_memory.mapping_epoch().get(),
+            invalidation_cursor: self.binding_memory.invalidation_cursor(),
         };
         domain
             .bind_memory(binding)
-            .map_err(|error| Self::fail(case, error.to_string()))?;
+            .map_err(|error| Self::fail(case, format!("{error:?}")))?;
         if domain.domain_id() != id {
             return Err(Self::fail(
                 case,
@@ -334,17 +340,36 @@ impl Suite {
     fn timer(&mut self) -> Result<(), ConformanceFailure> {
         let case = ConformanceCase::Timer;
         let (mut domain, mut executor) = self.fresh_executor(case)?;
-        let memory = fixture_memory(&[0xd53b_e020], 0);
+        let memory = fixture_memory(&[0xd53b_e020, 0xd53b_e021, 0xd503_203f], 0);
         let mut state = state_at(CODE);
-        run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
-            .map_err(|error| Self::fail(case, error))?;
+        let timer = AdvancingTimer(AtomicU64::new(123));
+        let report = executor
+            .run_slice(RunRequest {
+                cpu: self.cpu,
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 3,
+                loader_return: None,
+                timer: &timer,
+                events: crate::VcpuEventState::default(),
+            })
+            .map_err(|error| Self::fail(case, error.to_string()))?;
         let ThreadCpuState::A64(state) = state else {
             unreachable!();
         };
-        if state.read_x(A64Register::General(register(0))) != FixedTimer.snapshot().counter {
+        if state.read_x(A64Register::General(register(0))) != 123
+            || state.read_x(A64Register::General(register(1))) != 124
+            || !matches!(
+                report.stop,
+                EngineExit::Scheduled {
+                    request: crate::SchedulerRequest::Yield,
+                    ..
+                }
+            )
+        {
             return Err(Self::fail(
                 case,
-                "architectural timer did not use the supplied timer",
+                "architectural timer was not sampled at each exact register read",
             ));
         }
         drop(executor);
@@ -355,18 +380,66 @@ impl Suite {
         Ok(())
     }
 
+    fn scheduling_events(&mut self) -> Result<(), ConformanceFailure> {
+        let case = ConformanceCase::SchedulingEvents;
+        for (code, expected, retired) in [
+            (vec![0xd503_203f], crate::SchedulerRequest::Yield, 1),
+            (vec![0xd503_205f], crate::SchedulerRequest::WaitForEvent, 1),
+            (
+                vec![0xd503_207f],
+                crate::SchedulerRequest::WaitForInterrupt,
+                1,
+            ),
+            (vec![0xd503_209f], crate::SchedulerRequest::SendEvent, 1),
+            (
+                vec![0xd503_20bf, 0xd503_205f, 0xd503_203f],
+                crate::SchedulerRequest::Yield,
+                3,
+            ),
+        ] {
+            let (mut domain, mut executor) = self.fresh_executor(case)?;
+            let memory = fixture_memory(&code, 0);
+            let mut state = state_at(CODE);
+            let report = run(self.cpu, executor.as_mut(), &memory, &mut state, retired)
+                .map_err(|error| Self::fail(case, error))?;
+            if report.instructions_executed != retired
+                || !matches!(
+                    report.stop,
+                    EngineExit::Scheduled { request, .. } if request == expected
+                )
+            {
+                return Err(Self::fail(
+                    case,
+                    "processor hint did not preserve the typed scheduling/event contract",
+                ));
+            }
+            drop(executor);
+            domain
+                .shutdown()
+                .map_err(|error| Self::fail(case, error.to_string()))?;
+        }
+        self.passed.push(case);
+        Ok(())
+    }
+
     fn interrupt(&mut self) -> Result<(), ConformanceFailure> {
         let case = ConformanceCase::Interrupt;
         let (mut domain, mut executor) = self.fresh_executor(case)?;
-        let Some(control) = executor.control() else {
-            self.skipped.push(case);
-            return Ok(());
-        };
-        control.post_event(0x20);
+        let events = crate::VcpuEventState::default();
+        events.post_interrupts(0x20);
         let memory = fixture_memory(&[0xd503_201f], 0);
         let mut state = state_at(CODE);
-        let report = run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
-            .map_err(|error| Self::fail(case, error))?;
+        let report = executor
+            .run_slice(RunRequest {
+                cpu: self.cpu,
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &FixedTimer,
+                events,
+            })
+            .map_err(|error| Self::fail(case, error.to_string()))?;
         if report.stop != (EngineExit::PendingEvent { mask: 0x20 })
             || report.instructions_executed != 0
         {
@@ -399,14 +472,22 @@ impl Suite {
             .control()
             .ok_or_else(|| Self::fail(case, "invalidation capability has no control path"))?;
         let mut state = state_at(CODE);
-        control.request_invalidation(9);
+        let memory = fixture_memory(&[0xd503_201f], 0);
+        memory
+            .maintain_cache(
+                self.cpu.address_space_id(),
+                nixe_cpu::memory::CacheMaintenanceKind::InstructionInvalidate,
+                None,
+            )
+            .map_err(|error| Self::fail(case, format!("{error:?}")))?;
+        let cursor = memory.invalidation_cursor();
+        control.request_invalidation(cursor.get());
         executor
-            .synchronize_invalidation(9, &state, &fixture_memory(&[0xd503_201f], 0))
+            .synchronize_invalidation(cursor, &state, &memory)
             .map_err(|error| Self::fail(case, error.to_string()))?;
-        if !control.acknowledged_invalidation(9) {
+        if !control.acknowledged_invalidation(cursor.get()) {
             return Err(Self::fail(case, "synchronized epoch was not acknowledged"));
         }
-        let memory = fixture_memory(&[0xd503_201f], 0);
         run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
             .map_err(|error| Self::fail(case, error))?;
         drop(executor);
@@ -434,9 +515,10 @@ impl Suite {
         run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
             .map_err(|error| Self::fail(case, error))?;
         assert!(memory.initialize_ram(CODE_PAGE, 0, &0x9100_0400_u32.to_le_bytes()));
+        let cursor = memory.invalidation_cursor();
         set_instruction_address(&mut state, CODE);
         executor
-            .synchronize_invalidation(10, &state, &memory)
+            .synchronize_invalidation(cursor, &state, &memory)
             .map_err(|error| Self::fail(case, error.to_string()))?;
         run(self.cpu, executor.as_mut(), &memory, &mut state, 1)
             .map_err(|error| Self::fail(case, error))?;
@@ -549,7 +631,24 @@ impl Suite {
     fn teardown(&mut self) -> Result<(), ConformanceFailure> {
         let case = ConformanceCase::Teardown;
         let mut domain = self.domain(case)?;
-        let executor = self.executor(domain.as_mut(), case)?;
+        let mut executor = self.executor(domain.as_mut(), case)?;
+        domain
+            .request_stop()
+            .and_then(|()| domain.request_stop())
+            .map_err(|error| Self::fail(case, error.to_string()))?;
+        let state = state_at(CODE);
+        executor
+            .prepare_shutdown(
+                crate::DomainMemoryBinding {
+                    address_space: self.cpu.address_space_id(),
+                    end_exclusive: GuestVirtualAddress::new(1_u64 << 39),
+                    memory: &self.binding_memory,
+                    mapping_epoch: self.binding_memory.mapping_epoch().get(),
+                    invalidation_cursor: self.binding_memory.invalidation_cursor(),
+                },
+                &state,
+            )
+            .map_err(|error| Self::fail(case, error.to_string()))?;
         drop(executor);
         domain
             .shutdown()
@@ -643,6 +742,17 @@ impl EngineTimer for FixedTimer {
     }
 }
 
+struct AdvancingTimer(AtomicU64);
+
+impl EngineTimer for AdvancingTimer {
+    fn snapshot(&self) -> TimerSnapshot {
+        TimerSnapshot {
+            counter: self.0.fetch_add(1, Ordering::Relaxed),
+            frequency: 19_200_000,
+        }
+    }
+}
+
 fn run(
     cpu: ProcessCpuContext,
     executor: &mut dyn EngineExecutor,
@@ -658,6 +768,7 @@ fn run(
             instruction_budget: budget,
             loader_return: None,
             timer: &FixedTimer,
+            events: crate::VcpuEventState::default(),
         })
         .map_err(|error| error.to_string().into_boxed_str())
 }

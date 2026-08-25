@@ -3,20 +3,21 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalPageId, ContentGeneration, ContentMutationEpoch, CpuVisibilityRequest, CpuWriteEpoch,
     DeviceAccessDeclaration, DeviceVisibilityRequest, GenerationExhausted, GuestPhysicalPageId,
-    MappingGeneration, MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator, VisibilityError,
-    VisibilityState,
+    MappingGeneration, MemoryInvalidationKind, MemoryInvalidationLog, MemoryPermissions,
+    NonCpuDeviceId, VisibilityCoordinator, VisibilityError, VisibilityState,
 };
 
 struct CanonicalBackingStoreInner {
     identity: BackingStoreId,
     content_epoch: AtomicU64,
     cpu_write_epoch: AtomicU64,
+    cpu_writes_active: AtomicU64,
     mutation: Mutex<CanonicalStoreMutationState>,
 }
 
@@ -121,6 +122,15 @@ enum CanonicalContentMutationError {
     ResourceExhausted,
 }
 
+fn page_mutation_error(error: CanonicalContentMutationError) -> CanonicalPageError {
+    match error {
+        CanonicalContentMutationError::GenerationExhausted(error) => {
+            CanonicalPageError::MutationEpochExhausted(error)
+        }
+        CanonicalContentMutationError::ResourceExhausted => CanonicalPageError::ResourceExhausted,
+    }
+}
+
 /// Shared authority for every canonical page in one backing store.
 ///
 /// Per-page content generations remain authoritative for aliases and retained
@@ -139,6 +149,7 @@ impl CanonicalBackingStore {
                 identity: BackingStoreId::allocate()?,
                 content_epoch: AtomicU64::new(ContentMutationEpoch::INITIAL.get()),
                 cpu_write_epoch: AtomicU64::new(CpuWriteEpoch::INITIAL.get()),
+                cpu_writes_active: AtomicU64::new(0),
                 mutation: Mutex::new(CanonicalStoreMutationState::default()),
             }),
         })
@@ -162,8 +173,13 @@ impl CanonicalBackingStore {
         CpuWriteEpoch::new(self.inner.cpu_write_epoch.load(Ordering::Acquire))
     }
 
-    fn begin_content_mutation(
+    pub(crate) fn cpu_writes_active(&self) -> u64 {
+        self.inner.cpu_writes_active.load(Ordering::Acquire)
+    }
+
+    fn begin_mutation(
         &self,
+        content: bool,
         cpu_write: bool,
     ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
         let mut guard = self
@@ -171,33 +187,45 @@ impl CanonicalBackingStore {
             .mutation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next = self
-            .content_epoch()
-            .next()
-            .map_err(CanonicalContentMutationError::GenerationExhausted)?;
-        let next_cpu_write = cpu_write
-            .then(|| self.cpu_write_epoch().next())
-            .transpose()
-            .map_err(CanonicalContentMutationError::GenerationExhausted)?;
+        if content {
+            self.content_epoch()
+                .next()
+                .map_err(CanonicalContentMutationError::GenerationExhausted)?;
+        }
         if cpu_write {
-            guard.cpu_writes.prepare()?;
+            self.inner.cpu_writes_active.fetch_add(1, Ordering::AcqRel);
+        }
+        if cpu_write && let Err(error) = self.cpu_write_epoch().next() {
+            self.inner.cpu_writes_active.fetch_sub(1, Ordering::AcqRel);
+            return Err(CanonicalContentMutationError::GenerationExhausted(error));
+        }
+        if cpu_write && let Err(error) = guard.cpu_writes.prepare() {
+            self.inner.cpu_writes_active.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
         }
         Ok(CanonicalContentMutation {
             store: self,
             guard,
-            next,
-            next_cpu_write,
+            content,
+            cpu_write,
+            cpu_write_records: Vec::new(),
         })
     }
 
     fn begin_cpu_write(
         &self,
     ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
-        self.begin_content_mutation(true)
+        self.begin_mutation(true, true)
+    }
+
+    fn begin_cpu_dirty(
+        &self,
+    ) -> Result<CanonicalContentMutation<'_>, CanonicalContentMutationError> {
+        self.begin_mutation(false, true)
     }
 
     fn begin_device_write(&self) -> Result<CanonicalContentMutation<'_>, GenerationExhausted> {
-        self.begin_content_mutation(false)
+        self.begin_mutation(true, false)
             .map_err(|error| match error {
                 CanonicalContentMutationError::GenerationExhausted(error) => error,
                 CanonicalContentMutationError::ResourceExhausted => {
@@ -236,29 +264,56 @@ impl std::fmt::Debug for CanonicalBackingStore {
 struct CanonicalContentMutation<'a> {
     store: &'a CanonicalBackingStore,
     guard: std::sync::MutexGuard<'a, CanonicalStoreMutationState>,
-    next: ContentMutationEpoch,
-    next_cpu_write: Option<CpuWriteEpoch>,
+    content: bool,
+    cpu_write: bool,
+    cpu_write_records: Vec<(CanonicalPageId, u64, u64)>,
 }
 
 impl CanonicalContentMutation<'_> {
-    fn record_cpu_write(&mut self, page: CanonicalPageId, start: u64, end: u64) {
-        if let Some(epoch) = self.next_cpu_write {
-            self.guard.cpu_writes.record(epoch, page, start, end);
+    fn record_cpu_write(
+        &mut self,
+        page: CanonicalPageId,
+        start: u64,
+        end: u64,
+    ) -> Result<(), CanonicalContentMutationError> {
+        if self.cpu_write && start != end {
+            self.cpu_write_records
+                .try_reserve(1)
+                .map_err(|_| CanonicalContentMutationError::ResourceExhausted)?;
+            self.cpu_write_records.push((page, start, end));
         }
+        Ok(())
     }
 
-    fn commit(self) {
-        self.store
-            .inner
-            .content_epoch
-            .store(self.next.get(), Ordering::Release);
-        if let Some(next) = self.next_cpu_write {
-            self.store
+    fn commit(mut self) {
+        if self.cpu_write {
+            let previous = self
+                .store
                 .inner
                 .cpu_write_epoch
-                .store(next.get(), Ordering::Release);
+                .fetch_add(1, Ordering::Release);
+            let epoch = CpuWriteEpoch::new(previous + 1);
+            for (page, start, end) in self.cpu_write_records.drain(..) {
+                self.guard.cpu_writes.record(epoch, page, start, end);
+            }
         }
-        drop(self.guard);
+        if self.content {
+            self.store
+                .inner
+                .content_epoch
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for CanonicalContentMutation<'_> {
+    fn drop(&mut self) {
+        if self.cpu_write {
+            self.store
+                .inner
+                .cpu_writes_active
+                .fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -275,10 +330,11 @@ enum PageVisibility {
 }
 
 struct CanonicalPageState {
-    bytes: Option<Box<[u8]>>,
-    generation: ContentGeneration,
     visibility: PageVisibility,
     visibility_epoch: u64,
+    validity: Arc<AtomicU64>,
+    direct_write_epoch: Option<u64>,
+    direct_write_generation: Option<ContentGeneration>,
     cpu_writes: CpuWriteJournal,
 }
 
@@ -417,7 +473,114 @@ struct CanonicalPageInner {
     store: CanonicalBackingStore,
     identity: CanonicalPageId,
     size: usize,
+    words: OnceLock<Box<[AtomicU64]>>,
+    generation: AtomicU64,
+    write_sequence: AtomicU64,
+    executable_invalidations: OnceLock<Arc<MemoryInvalidationLog>>,
     state: Mutex<CanonicalPageState>,
+}
+
+struct CanonicalWriter<'a> {
+    page: &'a CanonicalBackingPage,
+    sequence: u64,
+}
+
+impl Drop for CanonicalWriter<'_> {
+    fn drop(&mut self) {
+        self.page
+            .inner
+            .write_sequence
+            .store(self.sequence.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// Retained canonical facts which authorize bounded direct CPU RAM access.
+///
+/// The lease owns the backing lifetime. Its base addresses an array of atomic
+/// little-endian 64-bit words, never a JIT TLB entry. Callers must still apply
+/// their virtual mapping epoch, permissions, access-class, alignment, and
+/// page-boundary checks. This representation is also suitable for deriving a
+/// future NCE mapping without depending on JIT-private state.
+#[derive(Clone)]
+pub struct CanonicalDirectAccessLease {
+    page: CanonicalBackingPage,
+    validity: Arc<AtomicU64>,
+    visibility_epoch: u64,
+    permissions: MemoryPermissions,
+}
+
+impl CanonicalDirectAccessLease {
+    /// Returns the stable physical identity shared by every alias.
+    #[must_use]
+    pub fn page(&self) -> CanonicalPageId {
+        self.page.identity()
+    }
+
+    /// Returns the retained page size in bytes.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.page.size()
+    }
+
+    /// Returns the exact virtual-mapping permissions certified by the owner.
+    #[must_use]
+    pub const fn permissions(&self) -> MemoryPermissions {
+        self.permissions
+    }
+
+    /// Returns the CPU-visible ownership epoch certified by this lease.
+    #[must_use]
+    pub const fn visibility_epoch(&self) -> u64 {
+        self.visibility_epoch
+    }
+
+    /// Returns the stable base of the canonical atomic word array.
+    #[must_use]
+    pub fn host_word_base(&self) -> usize {
+        self.page
+            .inner
+            .words
+            .get()
+            .expect("a direct-access lease retains materialized words")
+            .as_ptr()
+            .addr()
+    }
+
+    /// Returns the stable address of the authoritative content generation.
+    #[must_use]
+    pub fn generation_address(&self) -> usize {
+        std::ptr::from_ref(&self.page.inner.generation).addr()
+    }
+
+    /// Returns the stable address of the store-wide CPU write epoch.
+    #[must_use]
+    pub fn cpu_write_epoch_address(&self) -> usize {
+        std::ptr::from_ref(&self.page.inner.store.inner.cpu_write_epoch).addr()
+    }
+
+    /// Returns the stable address of the store-wide content epoch.
+    #[must_use]
+    pub fn content_epoch_address(&self) -> usize {
+        std::ptr::from_ref(&self.page.inner.store.inner.content_epoch).addr()
+    }
+
+    /// Returns the stable address of the active CPU-writer counter.
+    #[must_use]
+    pub fn cpu_writes_active_address(&self) -> usize {
+        std::ptr::from_ref(&self.page.inner.store.inner.cpu_writes_active).addr()
+    }
+
+    /// Returns the stable address of the canonical write seqlock.
+    #[must_use]
+    pub fn write_sequence_address(&self) -> usize {
+        std::ptr::from_ref(&self.page.inner.write_sequence).addr()
+    }
+
+    /// Returns the stable address of the current direct-access validity epoch.
+    #[must_use]
+    pub fn validity_address(&self) -> usize {
+        std::ptr::from_ref(self.validity.as_ref()).addr()
+    }
 }
 
 /// A retained canonical RAM page.
@@ -465,11 +628,16 @@ impl CanonicalBackingPage {
                 store: store.clone(),
                 identity: CanonicalPageId::new(store.identity(), page),
                 size,
+                words: OnceLock::new(),
+                generation: AtomicU64::new(generation.get()),
+                write_sequence: AtomicU64::new(0),
+                executable_invalidations: OnceLock::new(),
                 state: Mutex::new(CanonicalPageState {
-                    bytes: None,
-                    generation,
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    validity: Arc::new(AtomicU64::new(0)),
+                    direct_write_epoch: None,
+                    direct_write_generation: None,
                     cpu_writes: CpuWriteJournal::default(),
                 }),
             }),
@@ -486,21 +654,26 @@ impl CanonicalBackingPage {
         if bytes.is_empty() {
             return Err(CanonicalPageError::InvalidSize);
         }
-        let mut contents = Vec::new();
-        contents
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-        contents.extend_from_slice(bytes);
+        let words = allocate_words(bytes.len(), Some(bytes))?;
+        let initialized_words = OnceLock::new();
+        initialized_words
+            .set(words)
+            .expect("a new canonical page has no initialized backing");
         Ok(Self {
             inner: Arc::new(CanonicalPageInner {
                 store: store.clone(),
                 identity: CanonicalPageId::new(store.identity(), page),
                 size: bytes.len(),
+                words: initialized_words,
+                generation: AtomicU64::new(generation.get()),
+                write_sequence: AtomicU64::new(0),
+                executable_invalidations: OnceLock::new(),
                 state: Mutex::new(CanonicalPageState {
-                    bytes: Some(contents.into_boxed_slice()),
-                    generation,
                     visibility: PageVisibility::Clean,
                     visibility_epoch: 0,
+                    validity: Arc::new(AtomicU64::new(0)),
+                    direct_write_epoch: None,
+                    direct_write_generation: None,
                     cpu_writes: CpuWriteJournal::default(),
                 }),
             }),
@@ -511,6 +684,24 @@ impl CanonicalBackingPage {
     #[must_use]
     pub fn identity(&self) -> CanonicalPageId {
         self.inner.identity
+    }
+
+    /// Permanently connects device-originated writes on this physical page to
+    /// the process-memory invalidation source which owns executable aliases.
+    /// Repeating the same subscription is idempotent; a page cannot belong to
+    /// two process-memory streams.
+    pub fn observe_executable_content(&self, invalidations: Arc<MemoryInvalidationLog>) -> bool {
+        if let Some(current) = self.inner.executable_invalidations.get() {
+            return Arc::ptr_eq(current, &invalidations);
+        }
+        match self.inner.executable_invalidations.set(invalidations) {
+            Ok(()) => true,
+            Err(candidate) => self
+                .inner
+                .executable_invalidations
+                .get()
+                .is_some_and(|current| Arc::ptr_eq(current, &candidate)),
+        }
     }
 
     pub(crate) fn store(&self) -> &CanonicalBackingStore {
@@ -530,7 +721,62 @@ impl CanonicalBackingPage {
     /// Returns the current byte-content generation.
     #[must_use]
     pub fn content_generation(&self) -> ContentGeneration {
-        self.lock_state().generation
+        ContentGeneration::new(self.inner.generation.load(Ordering::Acquire))
+    }
+
+    /// Acquires retained direct-access facts for a CPU-visible page.
+    ///
+    /// `write` arms direct stores only after the precise first write has made
+    /// the page CPU-newer. The first arm in each visibility epoch publishes a
+    /// conservative whole-page dirty record; later stores advance the content
+    /// generation atomically without repeating a Rust callback.
+    pub fn acquire_direct_access(
+        &self,
+        permissions: MemoryPermissions,
+        write: bool,
+    ) -> Result<Option<CanonicalDirectAccessLease>, CanonicalPageError> {
+        self.ensure_words()?;
+        let mut state = self.lock_state();
+        let eligible = if write {
+            matches!(state.visibility, PageVisibility::CpuNewer)
+                && permissions.contains(MemoryPermissions::WRITE)
+        } else {
+            matches!(
+                state.visibility,
+                PageVisibility::Clean | PageVisibility::CpuNewer
+            ) && permissions.contains(MemoryPermissions::READ)
+        };
+        if !eligible {
+            return Ok(None);
+        }
+        if write && state.direct_write_epoch != Some(state.visibility_epoch) {
+            let generation = self.content_generation();
+            state.cpu_writes.prepare()?;
+            let mut mutation = self
+                .store()
+                .begin_cpu_dirty()
+                .map_err(|error| match error {
+                    CanonicalContentMutationError::GenerationExhausted(error) => {
+                        CanonicalPageError::MutationEpochExhausted(error)
+                    }
+                    CanonicalContentMutationError::ResourceExhausted => {
+                        CanonicalPageError::ResourceExhausted
+                    }
+                })?;
+            state.cpu_writes.record(generation, 0, self.size() as u64);
+            mutation
+                .record_cpu_write(self.identity(), 0, self.size() as u64)
+                .map_err(page_mutation_error)?;
+            mutation.commit();
+            state.direct_write_epoch = Some(state.visibility_epoch);
+            state.direct_write_generation = Some(generation);
+        }
+        Ok(Some(CanonicalDirectAccessLease {
+            page: self.clone(),
+            validity: Arc::clone(&state.validity),
+            visibility_epoch: state.visibility_epoch,
+            permissions,
+        }))
     }
 
     /// Returns the conservative authority state shared by every page alias.
@@ -552,17 +798,12 @@ impl CanonicalBackingPage {
         offset: usize,
         output: &mut [u8],
     ) -> Result<ContentGeneration, CanonicalPageError> {
-        let end = self.checked_end(offset, output.len())?;
+        self.checked_end(offset, output.len())?;
         loop {
             let state = self.lock_state();
             match state.visibility {
                 PageVisibility::Clean | PageVisibility::CpuNewer => {
-                    if let Some(bytes) = &state.bytes {
-                        output.copy_from_slice(&bytes[offset..end]);
-                    } else {
-                        output.fill(0);
-                    }
-                    return Ok(state.generation);
+                    return Ok(self.load_bytes_with_generation(offset, output));
                 }
                 PageVisibility::GpuNewer { .. } => {
                     // Device reconciliation cannot run while the observation
@@ -595,19 +836,18 @@ impl CanonicalBackingPage {
             let mut state = self.lock_state();
             match state.visibility {
                 PageVisibility::Clean | PageVisibility::CpuNewer => {
+                    self.revoke_direct_access(&mut state)
+                        .map_err(CanonicalPageError::Visibility)?;
                     state.cpu_writes.prepare()?;
                     let mut bytes = Vec::new();
                     bytes
                         .try_reserve_exact(self.size())
                         .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-                    if let Some(contents) = &state.bytes {
-                        bytes.extend_from_slice(contents);
-                    } else {
-                        bytes.resize(self.size(), 0);
-                    }
+                    bytes.resize(self.size(), 0);
+                    self.load_bytes(0, &mut bytes);
                     return Ok((
                         bytes.into_boxed_slice(),
-                        state.generation,
+                        self.content_generation(),
                         state.visibility_epoch,
                     ));
                 }
@@ -632,16 +872,10 @@ impl CanonicalBackingPage {
     /// or their content generation.
     pub fn prepare_write(&self) -> Result<(), CanonicalPageError> {
         self.prepare_cpu_access()?;
+        self.ensure_words()?;
         let mut state = self.lock_state();
-        Self::require_cpu_authority(&mut state).map_err(CanonicalPageError::Visibility)?;
-        if state.bytes.is_none() {
-            let mut contents = Vec::new();
-            contents
-                .try_reserve_exact(self.inner.size)
-                .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-            contents.resize(self.inner.size, 0);
-            state.bytes = Some(contents.into_boxed_slice());
-        }
+        self.require_cpu_authority(&mut state)
+            .map_err(CanonicalPageError::Visibility)?;
         state.cpu_writes.prepare()?;
         Ok(())
     }
@@ -667,6 +901,7 @@ impl CanonicalBackingPage {
         next: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
+        self.ensure_words()?;
         if expected.next() != Ok(next) {
             return Err(CanonicalPageError::InvalidGenerationTransition);
         }
@@ -683,33 +918,22 @@ impl CanonicalBackingPage {
             })?;
         let mut state = self.lock_state();
         state.cpu_writes.prepare()?;
-        if state.generation != expected {
-            return Err(CanonicalPageError::StaleGeneration {
-                expected,
-                observed: state.generation,
-            });
-        }
-        Self::require_cpu_authority(&mut state).map_err(CanonicalPageError::Visibility)?;
-        Self::publish_visibility(&mut state, PageVisibility::CpuNewer)
+        self.require_cpu_authority(&mut state)
             .map_err(CanonicalPageError::Visibility)?;
-        if !bytes.is_empty() {
-            if state.bytes.is_none() {
-                let mut contents = Vec::new();
-                contents
-                    .try_reserve_exact(self.inner.size)
-                    .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-                contents.resize(self.inner.size, 0);
-                state.bytes = Some(contents.into_boxed_slice());
-            }
-            state
-                .bytes
-                .as_mut()
-                .expect("materialized canonical page has bytes")[offset..end]
-                .copy_from_slice(bytes);
+        self.publish_visibility(&mut state, PageVisibility::CpuNewer)
+            .map_err(CanonicalPageError::Visibility)?;
+        let writer = self.lock_writer();
+        let observed = self.content_generation();
+        if observed != expected {
+            return Err(CanonicalPageError::StaleGeneration { expected, observed });
         }
-        state.generation = next;
+        mutation
+            .record_cpu_write(self.identity(), offset as u64, end as u64)
+            .map_err(page_mutation_error)?;
+        self.store_bytes_locked(offset, bytes);
+        self.inner.generation.store(next.get(), Ordering::Release);
+        drop(writer);
         state.cpu_writes.record(next, offset as u64, end as u64);
-        mutation.record_cpu_write(self.identity(), offset as u64, end as u64);
         mutation.commit();
         Ok(())
     }
@@ -726,6 +950,7 @@ impl CanonicalBackingPage {
         generation: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
+        self.ensure_words()?;
         let mut mutation = self
             .store()
             .begin_cpu_write()
@@ -739,34 +964,26 @@ impl CanonicalBackingPage {
             })?;
         let mut state = self.lock_state();
         state.cpu_writes.prepare()?;
-        if state.generation != generation {
+        self.require_cpu_authority(&mut state)
+            .map_err(CanonicalPageError::Visibility)?;
+        self.publish_visibility(&mut state, PageVisibility::CpuNewer)
+            .map_err(CanonicalPageError::Visibility)?;
+        let writer = self.lock_writer();
+        let observed = self.content_generation();
+        if observed != generation {
             return Err(CanonicalPageError::StaleGeneration {
                 expected: generation,
-                observed: state.generation,
+                observed,
             });
         }
-        Self::require_cpu_authority(&mut state).map_err(CanonicalPageError::Visibility)?;
-        Self::publish_visibility(&mut state, PageVisibility::CpuNewer)
-            .map_err(CanonicalPageError::Visibility)?;
-        if !bytes.is_empty() {
-            if state.bytes.is_none() {
-                let mut contents = Vec::new();
-                contents
-                    .try_reserve_exact(self.inner.size)
-                    .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-                contents.resize(self.inner.size, 0);
-                state.bytes = Some(contents.into_boxed_slice());
-            }
-            state
-                .bytes
-                .as_mut()
-                .expect("materialized canonical page has bytes")[offset..end]
-                .copy_from_slice(bytes);
-        }
+        mutation
+            .record_cpu_write(self.identity(), offset as u64, end as u64)
+            .map_err(page_mutation_error)?;
+        self.store_bytes_locked(offset, bytes);
+        drop(writer);
         state
             .cpu_writes
             .record(generation, offset as u64, end as u64);
-        mutation.record_cpu_write(self.identity(), offset as u64, end as u64);
         mutation.commit();
         Ok(())
     }
@@ -784,10 +1001,14 @@ impl CanonicalBackingPage {
         if end > self.size() as u64 {
             return Err(CanonicalPageError::InvalidRange);
         }
-        Ok(self
-            .lock_state()
-            .cpu_writes
-            .overlap_since(generation, offset, end))
+        let state = self.lock_state();
+        if state
+            .direct_write_generation
+            .is_some_and(|armed| generation >= armed && self.content_generation() > generation)
+        {
+            return Ok(CanonicalCpuWriteOverlap::Unknown);
+        }
+        Ok(state.cpu_writes.overlap_since(generation, offset, end))
     }
 
     /// Appends CPU-written byte intervals newer than `generation`.
@@ -808,9 +1029,17 @@ impl CanonicalBackingPage {
         if end > self.size() as u64 {
             return Err(CanonicalPageError::InvalidRange);
         }
-        self.lock_state()
-            .cpu_writes
-            .append_ranges_since(generation, offset, end, output);
+        let state = self.lock_state();
+        if state
+            .direct_write_generation
+            .is_some_and(|armed| generation >= armed && self.content_generation() > generation)
+        {
+            output.push(CanonicalCpuWriteRange::new(offset, size));
+        } else {
+            state
+                .cpu_writes
+                .append_ranges_since(generation, offset, end, output);
+        }
         Ok(())
     }
 
@@ -827,22 +1056,20 @@ impl CanonicalBackingPage {
                     device, visible_at, ..
                 } if *device == declaration.device() && *visible_at <= target => return Ok(()),
                 PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
-                    Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+                    self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
                     return Err(VisibilityError::ConflictingAccess);
                 }
                 PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
                 PageVisibility::Clean | PageVisibility::CpuNewer => {}
             }
+            self.revoke_direct_access(&mut state)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(self.inner.size)
                 .map_err(|_| VisibilityError::ResourceExhausted)?;
-            if let Some(contents) = &state.bytes {
-                bytes.extend_from_slice(contents);
-            } else {
-                bytes.resize(self.inner.size, 0);
-            }
-            (bytes, state.generation, state.visibility_epoch)
+            bytes.resize(self.inner.size, 0);
+            self.load_bytes(0, &mut bytes);
+            (bytes, self.content_generation(), state.visibility_epoch)
         };
         let request = DeviceVisibilityRequest {
             page: self.identity(),
@@ -852,15 +1079,15 @@ impl CanonicalBackingPage {
         };
         if let Err(error) = coordinator.make_device_visible(request, &bytes) {
             let mut state = self.lock_state();
-            Self::publish_visibility(&mut state, PageVisibility::Invalid)?;
+            self.publish_visibility(&mut state, PageVisibility::Invalid)?;
             return Err(VisibilityError::Coordinator(error));
         }
         let mut state = self.lock_state();
-        if state.visibility_epoch != epoch || state.generation != generation {
-            Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+        if state.visibility_epoch != epoch || self.content_generation() != generation {
+            self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
             return Err(VisibilityError::ConcurrentTransition);
         }
-        Self::publish_visibility(&mut state, PageVisibility::Clean)
+        self.publish_visibility(&mut state, PageVisibility::Clean)
     }
 
     pub(crate) fn prepare_resident_device_read(
@@ -870,7 +1097,11 @@ impl CanonicalBackingPage {
         let mut state = self.lock_state();
         match state.visibility {
             PageVisibility::Clean => Ok(()),
-            PageVisibility::CpuNewer => Self::publish_visibility(&mut state, PageVisibility::Clean),
+            PageVisibility::CpuNewer => {
+                self.revoke_direct_access(&mut state)?;
+                self.wait_for_direct_writer();
+                self.publish_visibility(&mut state, PageVisibility::Clean)
+            }
             PageVisibility::GpuNewer {
                 device, visible_at, ..
             } if device == declaration.device()
@@ -879,7 +1110,7 @@ impl CanonicalBackingPage {
                 Ok(())
             }
             PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
-                Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+                self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
                 Err(VisibilityError::ConflictingAccess)
             }
             PageVisibility::Invalid => Err(VisibilityError::InvalidState),
@@ -894,11 +1125,25 @@ impl CanonicalBackingPage {
         let Some(visible_at) = declaration.cpu_visible_at() else {
             return Err(VisibilityError::DeclarationDoesNotWrite);
         };
+        let invalidation = self
+            .inner
+            .executable_invalidations
+            .get()
+            .map(|invalidations| {
+                invalidations.reserve(MemoryInvalidationKind::ExecutableContent {
+                    first: self.identity().page(),
+                    second: None,
+                })
+            })
+            .transpose()
+            .map_err(|_| VisibilityError::ResourceExhausted)?;
         let mutation = self
             .store()
             .begin_device_write()
             .map_err(VisibilityError::GenerationExhausted)?;
         let mut state = self.lock_state();
+        self.revoke_direct_access(&mut state)?;
+        self.wait_for_direct_writer();
         match &state.visibility {
             PageVisibility::Clean => {}
             PageVisibility::GpuNewer {
@@ -909,12 +1154,12 @@ impl CanonicalBackingPage {
             PageVisibility::CpuNewer
             | PageVisibility::GpuNewer { .. }
             | PageVisibility::Conflicting => {
-                Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+                self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
                 return Err(VisibilityError::ConflictingAccess);
             }
             PageVisibility::Invalid => return Err(VisibilityError::InvalidState),
         }
-        Self::publish_visibility(
+        self.publish_visibility(
             &mut state,
             PageVisibility::GpuNewer {
                 device: declaration.device(),
@@ -923,11 +1168,17 @@ impl CanonicalBackingPage {
             },
         )?;
         mutation.commit();
+        if let Some(invalidation) = invalidation {
+            invalidation.commit();
+        }
         Ok(())
     }
 
     pub(crate) fn invalidate_visibility(&self) -> Result<(), VisibilityError> {
-        Self::publish_visibility(&mut self.lock_state(), PageVisibility::Invalid)
+        let mut state = self.lock_state();
+        self.revoke_direct_access(&mut state)?;
+        self.wait_for_direct_writer();
+        self.publish_visibility(&mut state, PageVisibility::Invalid)
     }
 
     fn ensure_cpu_visible(&self) -> Result<(), VisibilityError> {
@@ -942,10 +1193,10 @@ impl CanonicalBackingPage {
                     visible_at,
                     coordinator,
                 } => {
-                    let next = match state.generation.next() {
+                    let next = match self.content_generation().next() {
                         Ok(next) => next,
                         Err(error) => {
-                            Self::publish_visibility(&mut state, PageVisibility::Invalid)?;
+                            self.publish_visibility(&mut state, PageVisibility::Invalid)?;
                             return Err(VisibilityError::GenerationExhausted(error));
                         }
                     };
@@ -969,27 +1220,31 @@ impl CanonicalBackingPage {
             Ok(bytes) => bytes,
             Err(error) => {
                 let mut state = self.lock_state();
-                Self::publish_visibility(&mut state, PageVisibility::Invalid)?;
+                self.publish_visibility(&mut state, PageVisibility::Invalid)?;
                 return Err(VisibilityError::Coordinator(error));
             }
         };
         if bytes.len() != self.size() {
             let observed = bytes.len();
             let mut state = self.lock_state();
-            Self::publish_visibility(&mut state, PageVisibility::Invalid)?;
+            self.publish_visibility(&mut state, PageVisibility::Invalid)?;
             return Err(VisibilityError::IncorrectWritebackSize {
                 expected: self.size(),
                 observed,
             });
         }
+        self.ensure_words()
+            .map_err(|_| VisibilityError::ResourceExhausted)?;
         let mut state = self.lock_state();
         if state.visibility_epoch != epoch {
-            Self::publish_visibility(&mut state, PageVisibility::Conflicting)?;
+            self.publish_visibility(&mut state, PageVisibility::Conflicting)?;
             return Err(VisibilityError::ConcurrentTransition);
         }
-        Self::publish_visibility(&mut state, PageVisibility::Clean)?;
-        state.bytes = Some(bytes);
-        state.generation = next_generation;
+        self.publish_visibility(&mut state, PageVisibility::Clean)?;
+        self.store_bytes(0, &bytes);
+        self.inner
+            .generation
+            .store(next_generation.get(), Ordering::Release);
         Ok(())
     }
 
@@ -1008,11 +1263,11 @@ impl CanonicalBackingPage {
         }
     }
 
-    fn require_cpu_authority(state: &mut CanonicalPageState) -> Result<(), VisibilityError> {
+    fn require_cpu_authority(&self, state: &mut CanonicalPageState) -> Result<(), VisibilityError> {
         match state.visibility {
             PageVisibility::Clean | PageVisibility::CpuNewer => Ok(()),
             PageVisibility::GpuNewer { .. } | PageVisibility::Conflicting => {
-                Self::publish_visibility(state, PageVisibility::Conflicting)?;
+                self.publish_visibility(state, PageVisibility::Conflicting)?;
                 Err(VisibilityError::ConflictingAccess)
             }
             PageVisibility::Invalid => Err(VisibilityError::InvalidState),
@@ -1020,16 +1275,45 @@ impl CanonicalBackingPage {
     }
 
     fn publish_visibility(
+        &self,
         state: &mut CanonicalPageState,
         visibility: PageVisibility,
     ) -> Result<(), VisibilityError> {
+        self.finalize_direct_provenance(state);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility = PageVisibility::Invalid;
             return Err(VisibilityError::VisibilityEpochExhausted);
         };
         state.visibility = visibility;
         state.visibility_epoch = next_epoch;
+        state.validity.store(next_epoch, Ordering::Release);
+        state.direct_write_epoch = None;
+        state.direct_write_generation = None;
         Ok(())
+    }
+
+    fn revoke_direct_access(&self, state: &mut CanonicalPageState) -> Result<(), VisibilityError> {
+        self.finalize_direct_provenance(state);
+        let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
+            state.visibility = PageVisibility::Invalid;
+            return Err(VisibilityError::VisibilityEpochExhausted);
+        };
+        state.visibility_epoch = next_epoch;
+        state.validity.store(next_epoch, Ordering::Release);
+        state.direct_write_epoch = None;
+        state.direct_write_generation = None;
+        Ok(())
+    }
+
+    fn finalize_direct_provenance(&self, state: &mut CanonicalPageState) {
+        if state
+            .direct_write_generation
+            .is_some_and(|armed| self.content_generation() > armed)
+        {
+            state
+                .cpu_writes
+                .record(self.content_generation(), 0, self.size() as u64);
+        }
     }
 
     fn checked_end(&self, offset: usize, size: usize) -> Result<usize, CanonicalPageError> {
@@ -1045,6 +1329,147 @@ impl CanonicalBackingPage {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn load_bytes(&self, offset: usize, output: &mut [u8]) {
+        let Some(words) = self.inner.words.get() else {
+            output.fill(0);
+            return;
+        };
+        loop {
+            let before = self.inner.write_sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            for (index, byte) in output.iter_mut().enumerate() {
+                let position = offset + index;
+                let word = words[position / 8].load(Ordering::Acquire);
+                *byte = (word >> ((position % 8) * 8)) as u8;
+            }
+            if self.inner.write_sequence.load(Ordering::Acquire) == before {
+                return;
+            }
+        }
+    }
+
+    fn load_bytes_with_generation(&self, offset: usize, output: &mut [u8]) -> ContentGeneration {
+        let Some(words) = self.inner.words.get() else {
+            output.fill(0);
+            return self.content_generation();
+        };
+        loop {
+            let before = self.inner.write_sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            for (index, byte) in output.iter_mut().enumerate() {
+                let position = offset + index;
+                let word = words[position / 8].load(Ordering::Acquire);
+                *byte = (word >> ((position % 8) * 8)) as u8;
+            }
+            let generation = self.content_generation();
+            if self.inner.write_sequence.load(Ordering::Acquire) == before {
+                return generation;
+            }
+        }
+    }
+
+    fn store_bytes(&self, offset: usize, bytes: &[u8]) {
+        let writer = self.lock_writer();
+        self.store_bytes_locked(offset, bytes);
+        drop(writer);
+    }
+
+    fn lock_writer(&self) -> CanonicalWriter<'_> {
+        let mut sequence = self.inner.write_sequence.load(Ordering::Acquire);
+        loop {
+            if sequence & 1 != 0 {
+                std::hint::spin_loop();
+                sequence = self.inner.write_sequence.load(Ordering::Acquire);
+                continue;
+            }
+            match self.inner.write_sequence.compare_exchange_weak(
+                sequence,
+                sequence.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => sequence = observed,
+            }
+        }
+        CanonicalWriter {
+            page: self,
+            sequence,
+        }
+    }
+
+    fn store_bytes_locked(&self, offset: usize, bytes: &[u8]) {
+        let words = self
+            .inner
+            .words
+            .get()
+            .expect("canonical writes materialize atomic words during preflight");
+        for (index, &byte) in bytes.iter().enumerate() {
+            let position = offset + index;
+            let word = &words[position / 8];
+            let shift = (position % 8) * 8;
+            let mask = !(0xff_u64 << shift);
+            let mut observed = word.load(Ordering::Acquire);
+            loop {
+                let next = (observed & mask) | (u64::from(byte) << shift);
+                match word.compare_exchange_weak(
+                    observed,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                }
+            }
+        }
+    }
+
+    fn wait_for_direct_writer(&self) {
+        while self.inner.write_sequence.load(Ordering::Acquire) & 1 != 0 {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn ensure_words(&self) -> Result<(), CanonicalPageError> {
+        if self.inner.words.get().is_some() {
+            return Ok(());
+        }
+        let words = allocate_words(self.size(), None)?;
+        let _ = self.inner.words.set(words);
+        Ok(())
+    }
+}
+
+fn allocate_words(
+    size: usize,
+    contents: Option<&[u8]>,
+) -> Result<Box<[AtomicU64]>, CanonicalPageError> {
+    let word_count = size.checked_add(7).ok_or(CanonicalPageError::InvalidSize)? / 8;
+    let mut words = Vec::new();
+    words
+        .try_reserve_exact(word_count)
+        .map_err(|_| CanonicalPageError::ResourceExhausted)?;
+    for word_index in 0..word_count {
+        let mut value = 0_u64;
+        if let Some(contents) = contents {
+            for byte_index in 0..8 {
+                let index = word_index * 8 + byte_index;
+                if let Some(&byte) = contents.get(index) {
+                    value |= u64::from(byte) << (byte_index * 8);
+                }
+            }
+        }
+        words.push(AtomicU64::new(value));
+    }
+    Ok(words.into_boxed_slice())
 }
 
 struct PendingCanonicalPageWrite {
@@ -1331,6 +1756,11 @@ impl CanonicalWriteBatch {
                 dirty_ranges: pending.dirty_ranges,
             });
         }
+        for backing in &backings {
+            backing
+                .ensure_words()
+                .map_err(CanonicalWriteBatchError::Page)?;
+        }
 
         let mut stores = backings
             .iter()
@@ -1356,8 +1786,8 @@ impl CanonicalWriteBatch {
             .iter()
             .map(CanonicalBackingPage::lock_state)
             .collect::<Vec<_>>();
-        for (state, write) in states.iter().zip(&writes) {
-            if state.generation != write.expected_generation
+        for ((backing, state), write) in backings.iter().zip(&states).zip(&writes) {
+            if backing.content_generation() != write.expected_generation
                 || state.visibility_epoch != write.expected_visibility_epoch
                 || !matches!(
                     state.visibility,
@@ -1367,22 +1797,43 @@ impl CanonicalWriteBatch {
                 return Err(CanonicalWriteBatchError::ConcurrentMutation);
             }
         }
-        for (state, write) in states.iter_mut().zip(&mut writes) {
-            state.bytes = write.bytes.take();
-            state.generation = write.next_generation;
-            state.visibility = PageVisibility::CpuNewer;
-            state.visibility_epoch = write.next_visibility_epoch;
-            for &(start, end) in &write.dirty_ranges {
-                state.cpu_writes.record(write.next_generation, start, end);
-            }
-        }
         for (backing, write) in backings.iter().zip(&writes) {
             let mutation = mutations
                 .iter_mut()
                 .find(|mutation| mutation.store.identity() == backing.identity().store())
                 .expect("every written backing store has a prepared mutation");
             for &(start, end) in &write.dirty_ranges {
-                mutation.record_cpu_write(backing.identity(), start, end);
+                mutation
+                    .record_cpu_write(backing.identity(), start, end)
+                    .map_err(|error| match error {
+                        CanonicalContentMutationError::GenerationExhausted(error) => {
+                            CanonicalWriteBatchError::GenerationExhausted(error)
+                        }
+                        CanonicalContentMutationError::ResourceExhausted => {
+                            CanonicalWriteBatchError::ResourceExhausted
+                        }
+                    })?;
+            }
+        }
+        for ((backing, state), write) in backings.iter().zip(states.iter_mut()).zip(&mut writes) {
+            let bytes = write
+                .bytes
+                .take()
+                .expect("prepared canonical batch write retains its bytes");
+            backing.store_bytes(0, &bytes);
+            backing
+                .inner
+                .generation
+                .store(write.next_generation.get(), Ordering::Release);
+            state.visibility = PageVisibility::CpuNewer;
+            state.visibility_epoch = write.next_visibility_epoch;
+            state
+                .validity
+                .store(write.next_visibility_epoch, Ordering::Release);
+            state.direct_write_epoch = None;
+            state.direct_write_generation = None;
+            for &(start, end) in &write.dirty_ranges {
+                state.cpu_writes.record(write.next_generation, start, end);
             }
         }
         for mutation in mutations {

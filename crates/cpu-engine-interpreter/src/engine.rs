@@ -149,7 +149,8 @@ impl EngineExecutor for InterpreterExecutor {
         let context = InterpreterContext::new(request.cpu)
             .with_memory(request.memory)
             .with_exclusive_monitor(&self.exclusive_monitor)
-            .with_architectural_timer_provider(request.timer);
+            .with_architectural_timer_provider(request.timer)
+            .with_vcpu_events(&request.events);
         loop {
             if let Some((source, result_code)) =
                 loader_return_observation(request.cpu, request.state, request.loader_return)
@@ -163,19 +164,20 @@ impl EngineExecutor for InterpreterExecutor {
                     request.state,
                 ));
             }
+            let pending_interrupts = request.events.take_pending_interrupts();
+            if pending_interrupts != 0 {
+                return Ok(self.report(
+                    executed,
+                    nixe_cpu_engine::EngineExit::PendingEvent {
+                        mask: pending_interrupts,
+                    },
+                    request.state,
+                ));
+            }
             if let Some(control) = self.control.take_pending() {
                 // The interpreter retains no code cache or TLB. Observing the
                 // request at this instruction boundary completes every effect.
                 self.control.acknowledge(control);
-                if control.event_mask != 0 {
-                    return Ok(self.report(
-                        executed,
-                        nixe_cpu_engine::EngineExit::PendingEvent {
-                            mask: control.event_mask,
-                        },
-                        request.state,
-                    ));
-                }
                 if control.contains(nixe_cpu_engine::CrossVcpuRequest::Preempt) {
                     return Ok(self.report(
                         executed,
@@ -251,8 +253,8 @@ impl EngineExecutor for InterpreterExecutor {
                     kind,
                     syndrome,
                 },
-                InterpreterOutcome::Scheduled { source } => {
-                    nixe_cpu_engine::EngineExit::Scheduled { source }
+                InterpreterOutcome::Scheduled { source, request } => {
+                    nixe_cpu_engine::EngineExit::Scheduled { source, request }
                 }
                 InterpreterOutcome::DataAbort { source, fault } => {
                     nixe_cpu_engine::EngineExit::DataFault { source, fault }
@@ -274,12 +276,12 @@ impl EngineExecutor for InterpreterExecutor {
 
     fn synchronize_invalidation(
         &mut self,
-        epoch: u64,
+        cursor: nixe_memory::MemoryInvalidationCursor,
         _state: &ThreadCpuState,
         _memory: &dyn nixe_cpu::memory::CpuMemory,
     ) -> Result<(), EngineFault> {
         // The interpreter retains no translation cache or TLB.
-        self.control.acknowledge_invalidation(epoch);
+        self.control.acknowledge_invalidation(cursor.get());
         Ok(())
     }
     fn control(&self) -> Option<nixe_cpu_engine::EngineControl> {

@@ -2,7 +2,8 @@
 
 use crate::{
     location::LocationDescriptor,
-    memory::{MemoryAccess, MemoryAccessSize},
+    memory::{AtomicRmwKind, BarrierOperation, MemoryAccess, MemoryAccessSize},
+    semantics::a64::HintOperation,
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
 
@@ -414,46 +415,7 @@ pub enum MemoryOperation {
     },
 }
 
-/// Barrier domain.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BarrierDomain {
-    NonShareable,
-    InnerShareable,
-    OuterShareable,
-    FullSystem,
-}
-
-/// Accesses ordered by a memory barrier.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BarrierAccess {
-    Reads,
-    Writes,
-    ReadsAndWrites,
-}
-
-/// Architectural barrier operation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BarrierOperation {
-    DataMemory {
-        domain: BarrierDomain,
-        access: BarrierAccess,
-    },
-    DataSynchronization {
-        domain: BarrierDomain,
-        access: BarrierAccess,
-    },
-    InstructionSynchronization,
-}
-
-/// Semantic cache-maintenance action.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum CacheMaintenanceKind {
-    InstructionInvalidate,
-    DataInvalidate,
-    DataClean,
-    DataCleanAndInvalidate,
-    InstructionPrefetch,
-}
+use crate::memory::CacheMaintenanceKind;
 
 /// Cache-maintenance operation, optionally applied to a guest address.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -493,20 +455,6 @@ pub enum ExclusiveOperation {
     Clear,
 }
 
-/// Atomic read-modify-write function.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum AtomicRmwKind {
-    Add,
-    Clear,
-    Xor,
-    Set,
-    SignedMaximum,
-    SignedMinimum,
-    UnsignedMaximum,
-    UnsignedMinimum,
-    Swap,
-}
-
 /// Atomic memory operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AtomicOperation {
@@ -520,6 +468,16 @@ pub enum AtomicOperation {
         address: Operand,
         expected: Operand,
         replacement: Operand,
+        descriptor: MemoryDescriptor,
+    },
+    /// Pair compare/exchange keeps architectural register halves explicit.
+    /// `descriptor` is the complete 64- or 128-bit memory transaction.
+    CompareExchangePair {
+        address: Operand,
+        expected_low: Operand,
+        expected_high: Operand,
+        replacement_low: Operand,
+        replacement_high: Operand,
         descriptor: MemoryDescriptor,
     },
 }
@@ -729,6 +687,8 @@ pub enum OperationKind {
     Atomic(AtomicOperation),
     Vector(VectorOperation),
     FloatingPoint(FloatingPointOperation),
+    ProcessorHint(HintOperation),
+    RuntimeRegisterRead(u32),
     Helper(HelperOperation),
 }
 
@@ -750,6 +710,9 @@ impl EffectSet {
     pub const WRITE_FPSR: Self = Self(1 << 9);
     pub const VOLATILE: Self = Self(1 << 10);
     pub const HELPER: Self = Self(1 << 11);
+    pub const SCHEDULER: Self = Self(1 << 12);
+    pub const EVENT: Self = Self(1 << 13);
+    pub const SYSTEM: Self = Self(1 << 14);
 
     /// Returns the union of two effect sets.
     #[must_use]
@@ -907,7 +870,8 @@ impl OperationKind {
             Self::Atomic(operation) => {
                 let descriptor = match operation {
                     AtomicOperation::ReadModifyWrite { descriptor, .. }
-                    | AtomicOperation::CompareExchange { descriptor, .. } => *descriptor,
+                    | AtomicOperation::CompareExchange { descriptor, .. }
+                    | AtomicOperation::CompareExchangePair { descriptor, .. } => *descriptor,
                 };
                 memory_effects(
                     EffectSet::READ_MEMORY
@@ -934,6 +898,19 @@ impl OperationKind {
                 };
                 OperationEffects::new(effects, behavior.exception_mode == FpExceptionMode::Trap)
             }
+            Self::ProcessorHint(operation) => {
+                let effects = match operation {
+                    HintOperation::NoOperation => EffectSet::NONE,
+                    HintOperation::Yield => EffectSet::SCHEDULER,
+                    HintOperation::WaitForEvent | HintOperation::WaitForInterrupt => {
+                        EffectSet::SCHEDULER.union(EffectSet::EVENT)
+                    }
+                    HintOperation::SendEvent => EffectSet::SCHEDULER.union(EffectSet::EVENT),
+                    HintOperation::SendEventLocal => EffectSet::EVENT,
+                };
+                OperationEffects::new(effects, false)
+            }
+            Self::RuntimeRegisterRead(_) => OperationEffects::new(EffectSet::SYSTEM, false),
             Self::Helper(helper) => OperationEffects::new(
                 helper.effects.side_effects.union(EffectSet::HELPER),
                 helper.effects.may_fault,
@@ -959,7 +936,9 @@ mod tests {
 
     use crate::{
         location::ExecutionState,
-        memory::{MemoryAccessClass, MemoryAlignment, MemoryOrdering},
+        memory::{
+            BarrierAccess, BarrierDomain, MemoryAccessClass, MemoryAlignment, MemoryOrdering,
+        },
         profile::CpuProfileId,
     };
 

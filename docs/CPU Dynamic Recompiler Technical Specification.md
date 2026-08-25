@@ -23,7 +23,7 @@ A64 frontend ----+
 A32 frontend ----+-> verified Nixe typed IR regions -> Cranelift -> native code
 T32 frontend ----+                                      |
                                                           v
-                                            bounded cache and dispatcher
+                                      bounded cache and native link tables
 ```
 
 Each frontend fetches, decodes, and lifts its execution state's encodings into
@@ -150,16 +150,23 @@ Profile data must be backed by public documentation, lawful black-box tests, or
 other redistributable research. Unverified fields remain explicit open
 questions.
 
-### 4.1 Recorded Switch 1 Advanced SIMD decision
+### 4.1 Recorded Switch 1 FP/SIMD and crypto decision
 
 The built-in Switch 1 profile enables the architectural `AdvancedSimd` decoder
 feature. This is not inferred from games or host capabilities: Arm documents
 Advanced SIMD/NEON as mandatory for Armv8-A, and NVIDIA's public Tegra X1
-documentation identifies NEON on the Cortex-A57 CPU cores. This decision enables
-classification of the relevant A64 encodings; it does not claim that the current
-interpreter or JIT implements every FP/SIMD operation. The provisional
+documentation identifies NEON on the Cortex-A57 CPU cores. The provisional
 Switch 2 native profile keeps this feature `Unknown` until separately verified
 evidence establishes its guest-visible contract.
+
+The Tegra X1 data sheet describes a CPU-complex cryptographic engine, but does
+not enumerate the guest-visible AES, SHA-1, SHA-256, or CRC32 instruction
+feature fields. Arm defines those as optional, independently discoverable
+extensions. The Switch 1 profile therefore keeps `Aes`, `Sha1`, `Sha256`, and
+`Crc32` as `Unknown`; their decoder rows are unavailable and the required crypto
+subset is empty. A future evidence-backed profile revision must enable the
+exact named features and add their shared semantics together. Neither the host
+ISA nor the separate Tegra security engine may enable them.
 
 ## 5. System architecture
 
@@ -210,7 +217,7 @@ nixe-cpu-engine             engine identities, capabilities, bounded run-slice
                             contract, normalized exits, and state commit
 nixe-cpu-engine-interpreter complete reference-interpreter engine, including
                             semantic dispatch and executor-local state
-nixe-cpu-engine-testkit     dev-only fake JIT/NCE providers and reusable
+nixe-cpu-engine-testkit     dev-only fake NCE provider and reusable
                             engine-boundary acceptance fixtures
 nixe-cpu-engine-jit         established provider and private native ABI owning
                             Cranelift; generated code, dispatch, links, cache
@@ -237,19 +244,18 @@ The runtime has no product-name or engine-family execution branch. A provider
 supplies a process domain, worker executor, memory synchronization, and
 normalized exit/trap behavior; canonical thread state, scheduling, exceptions,
 and Horizon policy stay unchanged. Every provider must pass the reusable
-conformance suite before production registration. The pre-code JIT provider is
-covered by native-ABI, lifecycle, capability, and explicit-fallback tests until
-JIT-016 enables its full provider conformance run. The dev-only fake JIT
-exercises exact
-one-instruction fallback and stale-derived-state invalidation without exposing
-a native-code ABI. The dev-only fake NCE exercises shadow registers, mirrored
-bindings, dirty-memory reconciliation, migration, and teardown without a host
-virtualization API.
+conformance suite before production registration. The Cranelift JIT provider is
+covered by native-ABI, lowering, publication, lifecycle, capability,
+precise-memory, exact FP/SIMD, explicit-boundary, full registry differential,
+and neutral provider-conformance tests. The dev-only fake NCE exercises shadow
+registers, mirrored bindings, dirty-memory reconciliation, migration, and
+teardown without a host virtualization API.
 
-Implementation proceeds as four independent projects: the portable baseline
-JIT, Apple HVF, Linux KVM, and an Android feasibility decision. Platform NCE
-projects must not duplicate architectural semantics or add platform branches
-to runtime, scheduler, or Horizon code.
+The ordered implementation is the portable Cranelift JIT. HVF, KVM, and other
+NCE providers remain future independent engines; the shared contracts preserve
+their feasibility without treating them as parallel implementations of this
+plan. A future NCE must not duplicate architectural semantics or add platform
+branches to runtime, scheduler, or Horizon code.
 
 ## 7. Process, thread, and vCPU state
 
@@ -382,13 +388,13 @@ re-extract fields from `InstructionEncoding`.
 
 The Switch 1 frontend includes predicated A32 integer execution, common T32
 16-bit forms, selected T32 32-bit forms, ordinary and multiple memory transfers,
-initial VFP/NEON, exceptions, calls, A32/T32 interworking, and A32
-acquire/release and exclusive operations. Predication is explicit in IR so a
-false condition cannot perform a memory access, alter exclusive state, or raise
-an instruction exception. Exact typed helpers preserve the implemented VFP
-status/control behavior where direct IR is insufficient. Full FP/SIMD breadth
-and specialization remain owned by `JIT-011`; multicore memory-model completion
-remains owned by `JIT-012`.
+the profile-required FP/NEON subset, exceptions, calls, A32/T32 interworking,
+and A32 acquire/release and exclusive operations. Predication is explicit in IR
+so a false condition cannot perform a memory access, alter exclusive state, or
+raise an instruction exception. Exact typed helpers preserve A64 FPCR/FPSR and
+AArch32 FPSCR behavior where direct IR is insufficient. The completed
+multicore memory model uses the same physical exclusive and ordering contract
+for these predicated AArch32 operations.
 
 Generated conformance tests should enumerate boundary encodings and verify that
 decoder patterns neither overlap unexpectedly nor leave declared instructions
@@ -527,7 +533,8 @@ A region spanning more than one page records the exact ordered dependency set
 in its immutable metadata and reverse invalidation indexes. `translation_mode`
 contains only an explicitly selected frontend mode, never arbitrary vCPU state.
 Direct branch exits retain the destination guest address and destination
-execution state; the dispatcher resolves those to native regions.
+execution state; writable cache-owned link cells resolve those to native
+regions after one miss through the JIT-private resolver.
 
 The region builder may internalize bounded direct successors and both sides of
 a conditional branch. Indirect edges, required observable exits, and edges that
@@ -569,77 +576,103 @@ production lowering for that operation, not a semantic approximation.
 
 Generated regions receive one private `repr(C)` execution frame owned by the
 JIT. It contains imported architectural state, JIT memory-acceleration data,
-control flags, the helper table, and normalized exit storage. Field offsets are
-generated and checked. Canonical `ThreadCpuState` is imported once at slice
-entry and committed once at every exit that can expose state; generated code
-does not cross the Rust ABI at ordinary region boundaries.
+control flags, native-chain state, the helper table, and normalized exit
+storage. Field offsets are generated and checked. Canonical `ThreadCpuState` is
+imported once at slice entry and committed once at every exit that can expose
+state; generated code does not cross the Rust ABI at ordinary region
+boundaries.
 
 The established frame is versioned and sized explicitly, contains independent
 complete A64 and A32/T32 payloads rather than exposing a Rust enum or union,
-and uses checked two-limb vector values at its C boundary. The initial executor
-retains this frame and reusable Cranelift contexts while returning the explicit
-`InterpretOne` exit until Cranelift lowering is implemented;
-it does not contain a second semantic executor.
+and uses checked two-limb vector values at its C boundary. Each executor retains
+this frame and reusable Cranelift contexts. The sole domain cache retains
+lowered immutable regions and writable link tables. A Cranelift-generated
+C-ABI gateway performs the sole transition from Rust to Cranelift's portable
+tail convention; linked regions then tail-call one another without host-stack
+growth. The frame carries current-region metadata and the cumulative budget
+across those calls and is committed only at a normalized engine exit. The
+gateway, native links, and single miss resolver are the sole native execution
+path; no second semantic executor or runtime-visible region handoff exists.
 
 The frame, Cranelift IR, software TLB, native entry convention, spill storage,
 and exit-record layout never appear in `nixe-cpu-engine`, `nixe-runtime`,
 `nixe-memory`, or an NCE crate. Rust panics and unwinding must not cross
-generated code. Entry/exit trampolines catch host-side failures at a safe Rust
-boundary and convert them to a typed engine fault with precise committed state.
+generated code. The sole gateway call is contained at a safe Rust boundary and
+converts host-side failure to a typed engine fault with precise committed state.
 
 ### 11.3 Versioned helper ABI
 
 The helper table is a small, versioned JIT-private ABI generated from typed
-declarations. Its established memory-read, memory-write, atomic, and system
-slots have non-unwinding C signatures and remain null until their implementations
-can be validated with published code. Each helper declares the architectural state and memory effects
-it observes, whether it may fault or schedule, and whether execution may resume
-inside the region. Generated code calls no Horizon, scheduler, runtime, GPU, or
-host graphics API.
+declarations. Its memory-read, memory-write, atomic, exclusive, semantic, and
+system slots have non-unwinding C signatures and are installed only around one
+live native chain. Atomic RMW, CAS, and CASP use the typed atomic slot to reach
+the canonical physical-memory transaction; this is a precise baseline lowering,
+not a second semantic service. Each helper
+declares the architectural state and memory effects it observes, whether it may
+fault or schedule, and whether execution may resume inside the region.
+Generated code calls no Horizon, scheduler, runtime, GPU, or host graphics API.
 
 Helpers provide the precise path for MMIO, cross-page accesses, uncommon
 ordering, exclusives or atomics without an exact native lowering, cache and
 system operations, device-authoritative memory, and normalized exits. A helper
 which can expose guest state receives committed state at the declared boundary.
 Hot recoverable memory helpers may resume at a side entry in the originating
-region after updating the execution frame; architectural exits return through
-the single native exit trampoline.
+region after updating the execution frame; architectural exits return directly
+to the sole gateway boundary.
 
 Helper table indices, signatures, frame offsets, and resume targets are
 validated before publication. Adding a helper does not expand the neutral engine
 contract and does not create a second semantic memory service.
 
-## 12. Code cache and dispatch
+## 12. Code cache, native linking, and resolution
 
 ### 12.1 Lookup
 
-The dispatcher uses a small per-vCPU lookup cache followed by the bounded domain
-code cache. An indirect branch may use a small polymorphic cache containing
-recent guest-target to native-entry pairs.
+The miss resolver uses a 64-slot direct-mapped per-vCPU lookup followed by the
+bounded domain code cache. A local hit compares the complete fixed-size key and
+the entry's atomic live state without acquiring the domain lock. The hot key is
+the address-space identity, complete guest location, translation mode, and root
+physical code mapping; immutable metadata and reverse indexes retain every
+physical and virtual-mapping dependency.
 
-Direct and conditional exits load atomically replaceable link cells from
-writable metadata. Published executable pages are immutable: ordinary linking
-does not patch native instructions or temporarily make them writable. A miss
-returns to one resolver. Links may name only published live entries and become
-unreachable before invalidated storage can be reclaimed.
+Every external direct edge probes one link cell and each computed edge probes a
+four-way polymorphic link site. Hits load an immutable target record with
+acquire ordering, update current-region state in the frame, and tail-call the
+published live entry without returning to Rust. One JIT-private resolver handles
+every direct, conditional, indirect, call, and return miss, keeps the frame
+imported, and publishes an eligible target with release ordering. A full
+polymorphic site remains a miss through this resolver; it does not select a
+second unlinked executor. Exception, fallback, control, fault, and budget exits
+alone cross the neutral engine boundary.
 
 ### 12.2 Ownership
 
 The ownership model is:
 
-- Immutable compiled region metadata after publication, except atomic links and
-  counters.
+- Immutable compiled region metadata after publication, plus one atomic live
+  bit used to detach executor-local lookups during retirement.
 - One domain cache owning translation identity, reverse-dependency indices,
-  link tables, and retirement state.
+  single-flight state, deterministic retirement, every published result,
+  writable link tables, immutable link targets, and incoming-link indexes.
 - Read-mostly access by vCPU threads.
 - The domain coordinates single-flight compilation and owns all published
   results; compilation scheduling does not change cache ownership.
+- One cache-owned cancellation token belongs to each single-flight compile.
+  Domain stop closes admission, wakes every waiter, and cooperatively cancels
+  frontend/lowering work at bounded boundaries. A result racing cancellation
+  is rejected before cache publication; no cancellation type leaves the JIT.
 - The JIT provider supplies one reclaimable process-wide executable-memory
   owner retained by live providers, domains, and executors. A domain cache owns
-  the identity, metadata, links, and lifetime of its published results; the
+  the identity, metadata, and lifetime of its published results; the
   process owner owns only the bounded OS mapping and page-publication mechanism.
-- Reclamation through epochs, never immediate free while another vCPU may
-  execute the region.
+- Link cells point only to immutable cache-owned target payloads. Retirement
+  clears incoming and outgoing cells before the target live bit changes.
+  Cleared payloads and logically retired regions share an epoch queue and are
+  reclaimed only after every executor which could have loaded them is
+  quiescent. Executable pages are never rewritten for normal linking.
+- Logical retirement first detaches links and shared indexes, then marks the
+  entry unavailable. Physical storage returns to the arena after epoch
+  quiescence.
 
 A single global lock around dispatch is not acceptable. A coarse lock during
 rare cache-segment allocation or retirement can be acceptable if measurements
@@ -658,10 +691,11 @@ unreachable sentinel. That publication counts against both bounds and exposes
 no native entry; every later publication accepts only finalized Cranelift
 output.
 
-On non-Apple Unix, pages transition once from read-write to read-execute with
-`mprotect`. Windows reserves an inaccessible arena, commits each segment
-read-write, seals it read-execute with `VirtualProtect`, and calls
-`FlushInstructionCache`. macOS creates one `MAP_JIT` arena and uses
+On non-Apple Unix, newly committed or quiescent recycled pages transition from
+read-write to read-execute with `mprotect`. Windows reserves an inaccessible
+arena, commits or reopens a recycled segment read-write, seals it read-execute
+with `VirtualProtect`, and calls `FlushInstructionCache`. macOS creates one
+`MAP_JIT` arena and uses
 `pthread_jit_write_protect_np` for thread-local write/execute exclusion plus
 `sys_icache_invalidate`; capability probing rejects a missing JIT policy and the
 incompatible JIT write-allowlist entitlement. x86-64 relies on its coherent
@@ -677,11 +711,18 @@ visible or part of an engine-neutral API.
 
 ### 12.4 Cache pressure
 
-Code cache growth is bounded by configured byte and compilation-work budgets.
-Segment retirement first detaches links and lookup entries, then waits until
-every executor has passed the retirement epoch before reclaiming native
-storage. Queued and in-progress compilation is cancellable during pressure or
-domain teardown.
+The live domain cache is bounded to 1024 page-isolated publications, 48 MiB of
+mapped native storage, and 4 million retained IR operations. Misses for one key
+share a condition-variable single flight. Pressure retires the oldest live
+region deterministically, marks it unavailable to lock-free local lookups, and
+removes all hot keys and reverse-index rows before admitting the new result.
+
+Retired page ranges coalesce in the process arena and are reused before its
+high-water mark grows. Reuse is legal only after the owning domain's executor
+epochs drain. An invalidation which races compilation advances the cache
+revision, cancels and wakes affected flights, and rejects the stale result
+rather than publishing it. Domain stop uses the same sole cache ownership with
+a terminal cancellation result; there is no second compilation queue or cache.
 
 Persistent on-disk native code is not an initial feature. It creates validation,
 relocation, host-feature, executable-version, and security problems. Persisting
@@ -720,13 +761,13 @@ pub struct FastTlbEntry {
 
 The real entry also retains a safe canonical-backing lease, access class,
 visibility state, and exact permissions. The host base is valid only for the
-lifetime and epoch certified by that lease. `nixe-memory` may expose a neutral
+lifetime and epoch certified by that lease. `nixe-memory` exposes a neutral
 direct-access lease describing canonical identity, lifetime, permissions, and
 visibility; it never exposes or stores a JIT software-TLB entry.
 
 For normal RAM, translated code performs tag, permission, access-class,
-visibility, width, page-boundary, and epoch checks and then accesses
-`host_page_base + page_offset`. Flags force the slow path for MMIO, watchpoints,
+visibility, width, page-boundary, and epoch checks and then accesses the
+retained canonical atomic-word backing. Flags force the slow path for MMIO, watchpoints,
 GPU-owned pages, executable or observed writes, unusual alignment or ordering,
 and all other special behavior.
 
@@ -752,36 +793,37 @@ effect afterward.
 
 ## 14. Code invalidation and cache maintenance
 
-Canonical memory publishes mapping and executable-content changes through one
-monotonic engine-neutral invalidation source. Records describe the semantic
-change using address-space, virtual mapping, canonical page/range, permissions,
-visibility, and generations. They never contain a JIT region/link identity or
-an NCE framework object.
+Canonical process memory owns one bounded monotonic semantic invalidation
+source. Records describe an affected virtual mapping range, one or two
+canonical physical code pages, or a complete guest instruction-cache
+invalidation; they never contain a JIT region/link identity or an NCE framework
+object. Each engine domain consumes that source through its own acknowledged
+cursor. A future NCE can consume the same facts to reconcile VM mappings or
+inject traps.
 
-Each engine domain consumes the source through an acknowledged cursor. The JIT
-uses reverse dependencies from virtual mappings and physical code pages to
-regions and TLB entries. A future NCE uses the same events to reconcile VM
-mappings or inject traps. Neither mechanism changes the shared record format.
+The invalidation and reclamation order is:
 
-When compiled code becomes invalid:
-
-1. Canonical memory publishes the new mapping or content generation.
+1. Canonical memory completes the mapping or content mutation and publishes its
+   reserved invalidation cursor.
 2. The JIT makes incoming link cells and lookup entries miss.
 3. Dependent regions and TLB entries become unavailable for new entries.
 4. Every executor acknowledges the event after stale state is unreachable.
 5. Native storage is reclaimed only after the retirement epoch has drained.
 
-ARM software normally uses explicit data-cache clean and instruction-cache
-invalidate sequences when publishing code. The memory subsystem should model
-those operations and invalidate at the architecturally visible point. A
-conservative write-watch mode must also exist for debugging, incomplete cache
-modeling, and mappings where code/data aliases make explicit tracking unsafe.
+Arm software normally uses explicit data-cache clean and instruction-cache
+invalidate sequences when publishing code. The shared CPU-memory contract
+models both operations. In addition, every write to a physical page observed
+through an executable or code-purpose alias publishes content invalidation, so
+writable aliases and incomplete guest cache sequences cannot expose stale host
+code. Once a canonical page has been observed as code, publication of a
+device-originated write emits the same physical invalidation before its
+writeback can become CPU-visible.
 
-Writes through any virtual alias must invalidate regions associated with the
-same canonical physical page. Mapping changes also invalidate dependencies on
-the affected virtual view. The dispatcher does not revalidate every dependency
-on every entry; publication, reverse indices, cursors, and retirement make stale
-native code unreachable.
+Writes through any virtual alias invalidate regions associated with the same
+canonical physical page. Mapping changes invalidate dependencies on the
+affected virtual view and only overlapping software-TLB entries. Dispatch polls
+the source cursor in O(1); only a changed cursor walks published records and
+reverse indexes. Lost ring history causes a conservative full eviction.
 
 ## 15. Precise exceptions and host faults
 
@@ -811,8 +853,13 @@ conditions are checked or generated explicitly.
 
 ## 16. Floating point and SIMD
 
-The engine must implement architectural FP behavior, not the host language's
-default floating-point behavior. The implementation accounts for:
+The engine implements architectural FP behavior through one integer-only
+provider in `nixe-cpu`, not through the host language's default floating-point
+behavior. The interpreter invokes that provider directly and the JIT's typed
+slow paths reconstruct a temporary canonical A64 transition from the same
+semantic token. AArch32 VFP binary operations reuse its binary32 primitive and
+map FPSCR control, cumulative status, and enabled exceptions explicitly. The
+provider accounts for:
 
 - FPCR rounding modes.
 - Flush-to-zero behavior.
@@ -823,17 +870,20 @@ default floating-point behavior. The implementation accounts for:
 - Min/max variants with different NaN semantics.
 - Conversion saturation and invalid-result behavior.
 
-Cranelift native FP/vector operations may be used behind explicit host-feature,
-guest-profile, and FPCR guards. All host floating-point transitions are
-explicit and host state is restored before returning to Rust or calling a
-normal helper. Rare or mismatched modes use the exact architectural FP
-provider shared with interpreter helpers. The IR retains 64-bit and 128-bit
-vector semantics rather than exposing x86-64 or AArch64 register widths.
+The baseline currently routes every arithmetic FP operation through that exact
+provider. Cranelift native FP/vector operations may be added only behind
+explicit host-feature, guest-profile, and FPCR guards which prove equivalence;
+there is no unguarded host-FP path. Exact helper completion returns the
+destination and cumulative FPSR/FPSCR together. An enabled FP exception returns
+a precise architectural exit before either is committed, while unrelated FPSR
+bits including QC are preserved. The IR retains 64-bit and 128-bit vector
+semantics rather than exposing x86-64 or AArch64 register widths.
 
 ## 17. Atomics and the memory model
 
 Host memory ordering differs between x86-64 and AArch64 and never defines guest
-semantics. The IR distinguishes:
+semantics. The engine-neutral memory contract, and the IR which consumes it,
+distinguish:
 
 - Plain memory accesses.
 - Acquire and release.
@@ -847,16 +897,42 @@ Cranelift lowering may implement a guest operation with stronger host ordering
 when observable behavior remains correct, but systematic over-serialization is
 a performance bug and may conceal missing guest synchronization in tests.
 
-Exclusive accesses require a semantic monitor. A minimal correct model records
-the physical granule and a generation observed by the load-exclusive. A
-store-exclusive succeeds only when the reservation remains valid and the write
-is atomically committed. Interrupts, context changes, conflicting writes, and
-explicit clear operations update the reservation according to the selected
-profile.
+`MemoryOrdering` carries relaxed, acquire, release, acquire-release, and
+sequentially consistent requirements. `BarrierOperation` carries DMB, DSB, or
+ISB plus shareability domain and read/write scope outside JIT IR. The
+interpreter applies its portable host-fence mapping, the Cranelift provider
+lowers it independently, and a future NCE may map the same descriptor to native
+ordering and traps without importing the JIT helper ABI.
+
+Exclusive accesses require one monitor owned by the active vCPU executor. A
+reservation records canonical physical page, exact byte offset and width, and
+the generation observed by load-exclusive. Store-exclusive succeeds only when
+that identity and generation remain current and the canonical writer commits
+the bytes indivisibly. Writes through any virtual alias and CPU/device
+visibility publication advance the same authority. Explicit clear resets the
+monitor, and scheduler migration clears the old vCPU executor before the guest
+thread may run on another vCPU. Implementing `LDXR`/`STXR` as an isolated host
+`cmpxchg` without that monitor is forbidden.
+
+Atomic RMW, CAS, and CASP linearize at canonical physical backing. Successful
+writes advance page generation, store mutation epochs, CPU-write provenance,
+and executable invalidation once; failed CAS observes the previous value but
+publishes no write. Software-TLB entries retain the same backing and validity
+authority and therefore do not define a separate atomic order. Mapping changes
+still revoke their eligibility through the acknowledged mapping epoch and
+invalidation stream.
+
+The Switch 1 Cortex-A57 profile is Armv8.0-A, while FEAT_LSE begins in
+Armv8.1-A. Switch 1 therefore reports LSE as disabled and uses its complete
+load/store-exclusive instruction subset. The LSE decoder, interpreter, IR, and
+Cranelift lowering remain capability-gated for independently verified future
+profiles; the provisional Switch 2 profile continues to report that capability
+as unknown.
 
 All CPU and relevant device writes participate in the generation/ownership
-mechanism. Implementing `LDXR`/`STXR` as an isolated host `cmpxchg` without a
-guest monitor is insufficient.
+mechanism. Multicore conformance runs contending atomic and exclusive
+transactions on simultaneous host threads and release/acquire message passing,
+so deterministic scheduler serialization cannot make those tests pass.
 
 ## 18. Multicore execution and scheduling
 
@@ -868,17 +944,35 @@ affinity, migration, suspension, and event delivery under the guest scheduler's
 control. Every engine cooperates through the same safepoint and run-slice
 protocol.
 
-A region receives an instruction budget or deadline token. Generated code checks
-for exits at bounded intervals and at backward branches. The check covers:
+A region receives a bounded instruction budget. Generated code checks for
+exits at entry, bounded safepoints, and backward branches. The check covers:
 
 - Timeslice exhaustion.
-- Pending interrupts or kernel events.
-- Debug stop requests.
+- Pending interrupts.
+- Normalized preemption, debug-stop, or process-stop requests.
 - Global TLB or code invalidation requests.
 - Process termination.
 
 Regions poll at bounded safepoints and backward edges. No region-formation or
 linking decision may exceed the provider's declared maximum poll interval.
+
+The runtime owns one persistent event register and pending-interrupt mask per
+emulated physical vCPU. That state crosses thread and process dispatches on the
+same vCPU and is passed to every engine as a cloneable neutral handle; it is not
+stored in the JIT cache, native frame, executor control, or guest thread state.
+`YIELD`, `WFE`, `WFI`, and `SEV` retire through typed normalized scheduling
+requests. `SEVL` sets only the current vCPU event register. The coordinator
+alone registers waits, broadcasts `SEV`, injects per-vCPU interrupts, and makes
+threads ready, closing publication/wait races before the next lease is chosen.
+A future NCE consumes this same contract through injected interrupts or
+virtualization exits without importing the JIT helper ABI.
+
+Runtime timer registers are sampled at the exact guest `MRS`, including inside
+a linked native chain; a slice-entry timer snapshot is not architectural state
+and is not part of the native frame. Profile constants remain shared CPU
+semantics. The coordinator owns one capped adaptive budget policy for both
+deterministic and parallel execution. Exact caller-supplied budgets are retained
+only for replay and deterministic verification, not as a second product policy.
 
 Deterministic execution is a permanent policy, not temporary bring-up code. It
 models every configured vCPU while allowing only one host worker to execute one
@@ -887,6 +981,31 @@ replay. Parallel execution may be enabled only after atomics, invalidation, TLB
 shootdown, shared runtime state, and device visibility have explicit
 concurrency contracts and tests. Deterministic replay records scheduling and
 external events, not host timing.
+
+Process teardown is identical under both policies. Runtime first closes
+dispatch and calls the engine-neutral non-blocking domain stop request. Every
+worker then prepares its exclusively owned primary and semantic-fallback
+executors against the final canonical memory binding: stale mappings and TLB
+entries become unreachable, the final invalidation cursor is acknowledged, and
+the local exclusive monitor is cleared. Runtime verifies acknowledgements,
+drops all executors, and only then performs idempotent domain shutdown and
+releases process memory.
+
+The JIT stop request atomically closes cache admission, cancels queued and
+in-progress single-flight compilation, detaches all links and regions, and
+publishes preemption to every executor control. Executor retirement epochs keep
+detached code and link payloads alive until native entry is impossible; the
+last executor drop triggers another reclamation pass. Translation, Cranelift
+compilation, and executable allocation never run while the cache-state lock is
+held, and executable-publication destruction never nests the arena lock under
+that cache lock. Worker retirement and join have a host-time bound which
+returns a typed failure without releasing the still-owned process resources.
+
+The shared lifecycle contains no JIT representation. A future NCE uses domain
+stop to interrupt virtual CPUs, executor preparation to export canonical state
+and acknowledge mappings, and domain shutdown to reconcile remaining dirty
+state and release its VM. Compilation cancellation remains exclusively JIT
+private.
 
 ## 19. CPU and GPU communication
 
@@ -1017,7 +1136,7 @@ The following should be shared unless testing disproves the abstraction:
 - Typed IR and verifier.
 - Interpreter framework.
 - Cranelift lowering in the one portable JIT provider.
-- JIT-private code cache, W^X allocator, dispatcher, and link machinery.
+- JIT-private code cache, W^X allocator, miss resolver, and link machinery.
 - Software TLB structure and memory slow-path ABI.
 - Exception metadata and host-fault recovery framework.
 - Scheduler safepoint protocol.
@@ -1059,8 +1178,8 @@ IR, and exact helpers.
 The engine families are:
 
 1. Reference interpreter: always available, simple, instrumentable, and exact.
-2. Cranelift JIT: established provider/native ABI and planned primary portable
-   performance engine on supported x86-64 and AArch64 hosts.
+2. Cranelift JIT: production-default portable performance engine on supported
+   x86-64 and AArch64 hosts when its complete capability probe succeeds.
 3. Optional platform NCE engines: selected only when host virtualization and
    the full guest profile, state, memory, trap, and execution-policy contracts
    are supported.
@@ -1071,6 +1190,25 @@ scheduler or Horizon semantics. Engine selection is capability-based; an
 explicitly requested incompatible engine fails before guest execution rather
 than silently selecting another engine. A speculative optimizing tier and its
 deoptimization machinery are outside the current architecture.
+
+Product composition registers the JIT before the interpreter. `auto` probes in
+that deterministic order and selects the first compatible provider; explicit
+`jit` or `interpreter` requests probe only the named provider and fail with its
+rejection details when unavailable. A primary provider which advertises
+`InterpretOne` is paired with the independently registered interpreter as its
+semantic fallback. This policy is expressed entirely through registry order,
+stable engine identity, and capabilities, so future NCE providers require no
+runtime branch. Process construction validates profile semantics; coordinator
+registration validates the actual deterministic or parallel policy for both
+the primary and semantic-fallback providers. The runtime never sees a JIT
+configuration or compiler type.
+
+Configuration may lower the finite per-domain compiled-region and native-byte
+working sets and the maximum number of concurrent compilation flights. These
+values are validated both while loading product configuration and while
+constructing the JIT provider. Compilation admission is a JIT-private,
+teardown-cancellable queue; no compiler flag, IR option, native ABI choice, or
+product identity is configurable through this surface.
 
 Platform NCE feasibility, privilege requirements, lifecycle seams, and current
 availability are versioned in [Native Code Execution Platform
@@ -1086,18 +1224,23 @@ One interpreter step receives an immutable execution context containing
 `ProcessCpuContext` and a narrow `CpuMemory` view. Architectural register state
 remains in `ThreadCpuState`; address-space identity and memory services do not.
 This lets scalar loads/stores return structured data faults without making the
-interpreter depend on the loader or runtime implementation. Scheduler/event and
-cache-maintenance callbacks will be added to this context only when those runtime
-contracts exist. Until then, instructions requiring them remain explicit
-fallbacks rather than approximate no-ops.
+interpreter depend on the loader or runtime implementation. Scheduler/event
+operations use the engine-neutral physical-vCPU contract. Cache maintenance
+already
+uses the engine-neutral callback and invalidation source established by
+JIT-010. Instructions whose required contract is absent remain explicit
+unsupported or future-fallback boundaries rather than approximate no-ops.
 
 The completed frontend covers every A64, A32, and T32 family implemented by the
 reference interpreter for the selected Switch 1 profile, including its current
-FP/SIMD, acquire/release, and exclusive subsets. The registry mechanically
-requires each such family to decode and lift without `InterpretOne`. Scheduler
-events, cache maintenance, broader FP/SIMD, atomics, and the multicore memory
-model remain explicitly tracked semantic work; their absence cannot be hidden
-by a frontend completion claim.
+FP/SIMD, acquire/release, and exclusive subsets. It also covers capability-gated
+A64 LSE RMW, CAS, and CASP through the neutral atomic contract. The registry
+mechanically requires each available family to decode and lift without
+`InterpretOne`. Scheduler hints are structured IR operations and execute
+through typed neutral requests or local vCPU-event actions; named helper
+strings and silent hint fallback are not retained.
+The exact profile-required FP/SIMD subset is established, and optional crypto
+features remain excluded while their profile status is `Unknown`.
 
 ## 23. Fallback policy
 
@@ -1346,7 +1489,7 @@ Decision: accepted.
 Justification: Cranelift supplies maintained x86-64 and AArch64 instruction
 selection, register allocation, ABI handling, verification, and native emission
 with compilation latency suitable for the baseline JIT. Nixe retains the
-emulator-specific dispatcher, state frame, helpers, cache, linking, memory fast
+emulator-specific resolver, state frame, helpers, cache, linking, memory fast
 path, and invalidation that a general compiler cannot own.
 
 ### D3: Keep native-code machinery inside the JIT provider
@@ -1419,10 +1562,19 @@ four-vCPU invariant.
 
 The sole ordered implementation and release plan is
 [`notes/jit.md`](../notes/jit.md). Its
-Cranelift provider, private native ABI, secure executable-memory owner, and
-frontend parity and bounded region formation are established; the remaining
-order starts with Cranelift lowering and ends with complete differential,
-release, and performance gates.
+Cranelift provider, private native ABI, secure executable-memory owner,
+frontend parity, bounded region formation, complete lowering, the sole bounded
+domain cache, cache-owned native links, the canonical-memory software TLB,
+precise invalidation with epoch-safe reclamation, exact shared FP/SIMD
+execution, physical atomics, the shared Arm memory-order contract, and
+JIT-013's scheduler, physical-vCPU event, timer, system, and adaptive-budget
+integration are established. JIT-014's executor ownership, compilation
+cancellation, acknowledged teardown, retirement, and bounded worker shutdown
+and JIT-015's production registry, semantic fallback, explicit selection, and
+bounded JIT resource configuration are also established. JIT-016's complete
+registry differential, structural native-path coverage, and provider
+conformance are established. The remaining order contains only JIT-017's
+release and performance gate.
 This specification defines the architecture those tasks must preserve; it does
 not maintain a parallel set of phases or accept completion through a
 transitional execution path.
@@ -1467,9 +1619,12 @@ alternatives, benchmark/test method, and compatibility impact.
 
 - [Arm: Runtime detection of CPU features on an Armv8-A CPU](https://developer.arm.com/community/arm-community-blogs/b/operating-systems-blog/posts/runtime-detection-of-cpu-features-on-an-armv8-a-cpu)
   — records that Armv8-A makes Advanced SIMD/NEON mandatory for AArch32 and
-  AArch64.
+  AArch64, while AES, SHA, and CRC features require independent runtime
+  discovery.
 - [NVIDIA Tegra X1 Series SoC Technical Reference Manual](https://forums.developer.nvidia.com/uploads/short-url/4pA0RhQeOC4TEwqPuGNml7uV4Nb.pdf)
-  — public SoC documentation identifying NEON on the Cortex-A57 CPU complex.
+  — public SoC documentation identifying NEON and a generic cryptographic
+  engine on the Cortex-A57 CPU complex without enumerating the architectural
+  crypto feature fields.
 - [Dynarmic project overview](https://github.com/azahar-emu/dynarmic) and
   [design documentation](https://github.com/azahar-emu/dynarmic/blob/master/docs/Design.md)
   — focused ARM dynamic recompilation, typed SSA IR, explicit flags, block

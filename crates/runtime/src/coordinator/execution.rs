@@ -1,6 +1,32 @@
 use super::*;
 
 impl RuntimeCoordinator {
+    /// Executes one deterministic slice using the runtime-owned adaptive
+    /// quantum. Exact-budget entry points remain available for replay and
+    /// deterministic tests.
+    pub fn run_next_adaptive(&mut self) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
+        let execution = self.run_next(self.adaptive_budget.current)?;
+        self.adaptive_budget
+            .observe(execution.as_ref().is_some_and(|execution| {
+                matches!(execution.report.stop, ExecutionStop::BudgetExhausted)
+            }));
+        Ok(execution)
+    }
+
+    /// Executes one parallel wave using the runtime-owned adaptive quantum.
+    pub fn run_parallel_wave_adaptive(
+        &mut self,
+    ) -> Result<Vec<CoordinatorExecution>, CoordinatorError> {
+        let executions = self.run_parallel_wave(self.adaptive_budget.current)?;
+        self.adaptive_budget.observe(
+            !executions.is_empty()
+                && executions.iter().all(|execution| {
+                    matches!(execution.report.stop, ExecutionStop::BudgetExhausted)
+                }),
+        );
+        Ok(executions)
+    }
+
     /// Executes at most one deterministic slice and returns its scheduler lease.
     pub fn run_next(
         &mut self,
@@ -113,13 +139,18 @@ impl RuntimeCoordinator {
     ) -> Result<(), CoordinatorError> {
         self.record_dispatch(lease, instruction_budget);
 
+        let events = self
+            .vcpu_events
+            .get(&lease.vcpu)
+            .expect("a scheduler lease references a configured vCPU")
+            .clone();
         let execution = self
             .processes
             .get_mut(&lease.process)
             .ok_or(CoordinatorError::UnknownProcess(lease.process))
             .and_then(|process| {
                 process
-                    .begin_thread_execution(lease.thread, lease.vcpu, instruction_budget)
+                    .begin_thread_execution(lease.thread, lease.vcpu, instruction_budget, events)
                     .map_err(|error| CoordinatorError::Execution {
                         process: lease.process,
                         thread: lease.thread,
@@ -215,9 +246,10 @@ impl RuntimeCoordinator {
                 worker_result.execution,
                 result,
             );
-        let completion = result.as_ref().map_or(Completion::Faulted, |report| {
-            completion_for_stop(&report.stop)
-        });
+        let completion = match &result {
+            Ok(report) => self.completion_for_stop(expected, &report.stop)?,
+            Err(_) => Completion::Faulted,
+        };
         if let Ok(report) = &result {
             self.record_completion(expected, report);
         }
@@ -246,5 +278,66 @@ impl RuntimeCoordinator {
             })
             .map(|_| ())
             .map_err(Into::into)
+    }
+
+    fn completion_for_stop(
+        &mut self,
+        lease: Lease,
+        stop: &ExecutionStop,
+    ) -> Result<Completion, CoordinatorError> {
+        let completion = match stop {
+            ExecutionStop::BudgetExhausted
+            | ExecutionStop::Safepoint
+            | ExecutionStop::PendingEvent { .. } => Completion::Ready,
+            ExecutionStop::LoaderReturn { .. } => Completion::Exited,
+            ExecutionStop::FetchFault { .. } | ExecutionStop::UnsupportedSemantics { .. } => {
+                Completion::Faulted
+            }
+            ExecutionStop::Scheduled { request, .. } => match request {
+                SchedulerRequest::Yield => Completion::Preempted,
+                SchedulerRequest::WaitForEvent => {
+                    let events = self
+                        .vcpu_events
+                        .get(&lease.vcpu)
+                        .expect("a scheduler lease references a configured vCPU");
+                    if events.consume_event() {
+                        Completion::Ready
+                    } else {
+                        self.cpu_waits.insert(
+                            lease.thread,
+                            CpuWait {
+                                vcpu: lease.vcpu,
+                                request: *request,
+                            },
+                        );
+                        Completion::Waiting
+                    }
+                }
+                SchedulerRequest::WaitForInterrupt => {
+                    let events = self
+                        .vcpu_events
+                        .get(&lease.vcpu)
+                        .expect("a scheduler lease references a configured vCPU");
+                    if events.interrupts_pending() {
+                        Completion::Ready
+                    } else {
+                        self.cpu_waits.insert(
+                            lease.thread,
+                            CpuWait {
+                                vcpu: lease.vcpu,
+                                request: *request,
+                            },
+                        );
+                        Completion::Waiting
+                    }
+                }
+                SchedulerRequest::SendEvent => {
+                    self.send_event()?;
+                    Completion::Ready
+                }
+            },
+            _ => Completion::Waiting,
+        };
+        Ok(completion)
     }
 }

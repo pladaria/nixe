@@ -1,7 +1,9 @@
 use super::*;
 use crate::process::tests::{
-    synthetic_process_for_coordinator, synthetic_svc_process_for_coordinator,
+    synthetic_instruction_process_for_coordinator, synthetic_process_for_coordinator,
+    synthetic_svc_process_for_coordinator,
 };
+use nixe_cpu_engine::SchedulerRequest;
 use nixe_scheduler::{PriorityRange, VirtualCpuDescriptor};
 
 fn profile() -> MachineSchedulerProfile {
@@ -51,8 +53,21 @@ fn registration_removal_and_identity_retirement_are_atomic() {
     );
     let process = coordinator.remove_process(id).unwrap();
     assert_eq!(coordinator.process_count(), 0);
-    let replacement = coordinator
+    let error = coordinator
         .register_process(process, registration(&coordinator))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CoordinatorError::Execution {
+            error: ProcessExecutionError::Engine { fault },
+            ..
+        } if fault.kind == nixe_cpu_engine::EngineFaultKind::Unavailable
+    ));
+    let replacement = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(2),
+            registration(&coordinator),
+        )
         .unwrap();
     assert_ne!(replacement, id);
     assert_eq!(coordinator.process_count(), 1);
@@ -117,6 +132,132 @@ fn one_slice_flows_through_a_scheduler_lease() {
             .lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
     );
+}
+
+#[test]
+fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
+    const WFE: u32 = 0xd503_205f;
+    const WFI: u32 = 0xd503_207f;
+    const SEV: u32 = 0xd503_209f;
+    const SEVL: u32 = 0xd503_20bf;
+    const YIELD: u32 = 0xd503_203f;
+
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    let waiter = coordinator
+        .register_process(
+            synthetic_instruction_process_for_coordinator(1, &[WFE]),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let waited = coordinator.run_next(1).unwrap().unwrap();
+    assert!(matches!(
+        waited.report.stop,
+        ExecutionStop::Scheduled {
+            request: SchedulerRequest::WaitForEvent,
+            ..
+        }
+    ));
+    assert_eq!(
+        coordinator
+            .scheduler()
+            .thread(waited.lease.thread)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
+
+    let sender = coordinator
+        .register_process(
+            synthetic_instruction_process_for_coordinator(2, &[SEV]),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let sent = coordinator.run_next(1).unwrap().unwrap();
+    assert_eq!(sent.lease.process, sender);
+    assert!(matches!(
+        sent.report.stop,
+        ExecutionStop::Scheduled {
+            request: SchedulerRequest::SendEvent,
+            ..
+        }
+    ));
+    assert_eq!(
+        coordinator
+            .scheduler()
+            .thread(waited.lease.thread)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+    assert!(coordinator.process(waiter).is_some());
+
+    let mut interrupt_coordinator = RuntimeCoordinator::new(profile());
+    interrupt_coordinator
+        .register_process(
+            synthetic_instruction_process_for_coordinator(3, &[WFI]),
+            registration(&interrupt_coordinator),
+        )
+        .unwrap();
+    let interrupted = interrupt_coordinator.run_next(1).unwrap().unwrap();
+    assert!(matches!(
+        interrupted.report.stop,
+        ExecutionStop::Scheduled {
+            request: SchedulerRequest::WaitForInterrupt,
+            ..
+        }
+    ));
+    interrupt_coordinator
+        .post_vcpu_interrupt(VirtualCpuId::new(7), 0x40)
+        .unwrap();
+    assert_eq!(
+        interrupt_coordinator
+            .scheduler()
+            .thread(interrupted.lease.thread)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+    let pending = interrupt_coordinator.run_next(1).unwrap().unwrap();
+    assert_eq!(
+        pending.report.stop,
+        ExecutionStop::PendingEvent { mask: 0x40 }
+    );
+
+    let mut local = RuntimeCoordinator::new(profile());
+    local
+        .register_process(
+            synthetic_instruction_process_for_coordinator(4, &[SEVL, WFE, YIELD]),
+            registration(&local),
+        )
+        .unwrap();
+    let local_exit = local.run_next(3).unwrap().unwrap();
+    assert_eq!(local_exit.report.instructions_executed, 3);
+    assert!(matches!(
+        local_exit.report.stop,
+        ExecutionStop::Scheduled {
+            request: SchedulerRequest::Yield,
+            ..
+        }
+    ));
+    assert_eq!(
+        local
+            .scheduler()
+            .thread(local_exit.lease.thread)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+}
+
+#[test]
+fn adaptive_execution_budget_grows_only_across_uninterrupted_slices() {
+    let mut budget = AdaptiveExecutionBudget::new(10_000);
+    for expected in [20_000, 40_000, 80_000, 100_000, 100_000] {
+        budget.observe(true);
+        assert_eq!(budget.current, expected);
+    }
+    budget.observe(false);
+    assert_eq!(budget.current, 10_000);
 }
 
 #[test]
@@ -1003,6 +1144,16 @@ fn parallel_observations_replay_through_deterministic_workers() {
 #[test]
 fn coordinator_worker_shutdown_is_idempotent() {
     let mut coordinator = RuntimeCoordinator::new(profile());
+    coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
+        )
+        .unwrap();
     coordinator.shutdown().unwrap();
+    assert_eq!(
+        coordinator.resource_counts(),
+        CoordinatorResourceCounts::default()
+    );
     coordinator.shutdown().unwrap();
 }

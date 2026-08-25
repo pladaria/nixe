@@ -34,7 +34,157 @@ pub(super) fn lift(
         A64MemoryInstruction::LoadExclusive(_) | A64MemoryInstruction::StoreExclusive(_) => {
             lift_exclusive(builder, decoded, fields, instruction)
         }
+        A64MemoryInstruction::AtomicReadModifyWrite(_)
+        | A64MemoryInstruction::CompareAndSwap(_)
+        | A64MemoryInstruction::CompareAndSwapPair(_) => {
+            lift_atomic(builder, decoded, fields, instruction)
+        }
     }
+}
+
+fn atomic_ordering(fields: MemoryOperands) -> MemoryOrdering {
+    match (fields.acquire, fields.release) {
+        (false, false) => MemoryOrdering::Relaxed,
+        (true, false) => MemoryOrdering::Acquire,
+        (false, true) => MemoryOrdering::Release,
+        (true, true) => MemoryOrdering::AcquireRelease,
+    }
+}
+
+fn lift_atomic(
+    builder: &mut IrBuilder,
+    decoded: &DecodedInstruction<DecodedOpcode>,
+    fields: MemoryOperands,
+    instruction: A64MemoryInstruction,
+) -> Result<LiftOutcome, BuildError> {
+    let source = decoded.location;
+    let address = base_address(builder, source, fields.rn)?;
+    let ordering = atomic_ordering(fields);
+    match instruction {
+        A64MemoryInstruction::AtomicReadModifyWrite(_) => {
+            let kind = match fields.atomic_opcode {
+                0 => AtomicRmwKind::Add,
+                1 => AtomicRmwKind::Clear,
+                2 => AtomicRmwKind::Xor,
+                3 => AtomicRmwKind::Set,
+                4 => AtomicRmwKind::SignedMaximum,
+                5 => AtomicRmwKind::SignedMinimum,
+                6 => AtomicRmwKind::UnsignedMaximum,
+                7 => AtomicRmwKind::UnsignedMinimum,
+                8 => AtomicRmwKind::Swap,
+                _ => return Ok(unsupported(decoded)),
+            };
+            let size = memory_size(fields.size);
+            let descriptor = aligned_descriptor(size, ordering, MemoryAccessClass::Atomic);
+            let value = read_store_value(builder, source, fields.rm, descriptor)?;
+            let previous = emit_one(
+                builder,
+                source,
+                descriptor.value_type(),
+                OperationKind::Atomic(AtomicOperation::ReadModifyWrite {
+                    kind,
+                    address,
+                    value,
+                    descriptor,
+                }),
+            )?;
+            write_gpr(
+                builder,
+                source,
+                fields.rt,
+                previous.into(),
+                Register31::Zero,
+            )?;
+        }
+        A64MemoryInstruction::CompareAndSwap(_) => {
+            let size = memory_size(fields.size);
+            let descriptor = aligned_descriptor(size, ordering, MemoryAccessClass::Atomic);
+            let expected = read_store_value(builder, source, fields.rm, descriptor)?;
+            let replacement = read_store_value(builder, source, fields.rt, descriptor)?;
+            let previous = emit_one(
+                builder,
+                source,
+                descriptor.value_type(),
+                OperationKind::Atomic(AtomicOperation::CompareExchange {
+                    address,
+                    expected,
+                    replacement,
+                    descriptor,
+                }),
+            )?;
+            write_gpr(
+                builder,
+                source,
+                fields.rm,
+                previous.into(),
+                Register31::Zero,
+            )?;
+        }
+        A64MemoryInstruction::CompareAndSwapPair(_) => {
+            if fields.size > 1 || fields.rm & 1 != 0 || fields.rt & 1 != 0 {
+                return Ok(unsupported(decoded));
+            }
+            let (element_type, access_size) = if fields.size == 0 {
+                (IrType::I32, MemoryAccessSize::Doubleword)
+            } else {
+                (IrType::I64, MemoryAccessSize::Quadword)
+            };
+            let expected_low =
+                read_gpr(builder, source, fields.rm, element_type, Register31::Zero)?;
+            let expected_high = read_gpr(
+                builder,
+                source,
+                fields.rm + 1,
+                element_type,
+                Register31::Zero,
+            )?;
+            let replacement_low =
+                read_gpr(builder, source, fields.rt, element_type, Register31::Zero)?;
+            let replacement_high = read_gpr(
+                builder,
+                source,
+                fields.rt + 1,
+                element_type,
+                Register31::Zero,
+            )?;
+            let descriptor = aligned_descriptor(access_size, ordering, MemoryAccessClass::Atomic);
+            let previous = builder.emit(
+                source,
+                &[element_type, element_type],
+                OperationKind::Atomic(AtomicOperation::CompareExchangePair {
+                    address,
+                    expected_low,
+                    expected_high,
+                    replacement_low,
+                    replacement_high,
+                    descriptor,
+                }),
+            )?;
+            let mut previous = previous.iter();
+            write_gpr(
+                builder,
+                source,
+                fields.rm,
+                previous
+                    .next()
+                    .expect("atomic pair has a low result")
+                    .into(),
+                Register31::Zero,
+            )?;
+            write_gpr(
+                builder,
+                source,
+                fields.rm + 1,
+                previous
+                    .next()
+                    .expect("atomic pair has a high result")
+                    .into(),
+                Register31::Zero,
+            )?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(LiftOutcome::Continue)
 }
 
 pub(super) fn descriptor(

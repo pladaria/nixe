@@ -50,6 +50,7 @@ fn engine_domain_matches_direct_single_step_state_counts_and_stops() {
                 instruction_budget: 1,
                 loader_return: None,
                 timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
             })
             .unwrap();
         assert_eq!(adapted, direct);

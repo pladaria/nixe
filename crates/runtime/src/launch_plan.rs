@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use nixe_cpu::location::ExecutionState;
 use nixe_loader_content::{ApplicationVersion, RomFsArchive};
 use nixe_loader_executable::{EffectiveNpdmPolicy, Npdm, NroImage, NsoImage};
 use nixe_loader_storage::StorageRef;
@@ -298,6 +299,17 @@ impl LaunchPlan {
 
     pub const fn kind(&self) -> &LaunchKind {
         &self.kind
+    }
+    /// Returns the architectural execution state selected by immutable launch
+    /// metadata before an engine provider is chosen.
+    pub fn initial_execution_state(&self) -> ExecutionState {
+        match &self.kind {
+            LaunchKind::Packaged(identity) if identity.npdm().flags().is_64_bit_instruction() => {
+                ExecutionState::A64
+            }
+            LaunchKind::Packaged(_) => ExecutionState::A32,
+            LaunchKind::Homebrew(_) => ExecutionState::A64,
+        }
     }
     pub fn packaged_identity(&self) -> Option<&PackagedIdentity> {
         match &self.kind {

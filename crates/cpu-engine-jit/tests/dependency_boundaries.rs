@@ -4,6 +4,10 @@ use std::{fs, path::Path};
 fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let production_dependencies = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("the manifest has a production dependency section");
 
     for required in [
         "cranelift-codegen = { version = \"=0.134.3\"",
@@ -28,8 +32,8 @@ fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
         "nixe-gpu.workspace",
     ] {
         assert!(
-            !manifest.contains(forbidden),
-            "forbidden dependency: {forbidden}"
+            !production_dependencies.contains(forbidden),
+            "forbidden production dependency: {forbidden}"
         );
     }
     for forbidden in ["cranelift-jit", "cranelift-module", "dynasm", "iced-x86"] {
