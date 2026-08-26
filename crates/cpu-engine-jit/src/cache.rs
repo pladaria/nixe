@@ -802,7 +802,7 @@ impl Drop for NativeEpochGuard {
 
 impl DomainCodeCache {
     pub(crate) fn new(configuration: JitConfiguration) -> Self {
-        let performance_enabled = configuration.performance_report().is_some();
+        let performance_enabled = configuration.performance_report_directory().is_some();
         Self {
             limits: CacheLimits::from_configuration(&configuration),
             state: Mutex::new(CacheState::new(performance_enabled)),
@@ -1896,7 +1896,7 @@ mod tests {
     #[test]
     fn light_region_promotes_once_and_optimized_publication_replaces_it() {
         let cache = DomainCodeCache::new(
-            JitConfiguration::default().with_performance_report(Some("unused.toml".into())),
+            JitConfiguration::default().with_performance_report_directory(Some("unused".into())),
         );
         let region_key = key(0x1000, 1, 1);
         let (light_pending_region, promotion) = light_pending(region_key);
@@ -2217,7 +2217,7 @@ mod tests {
     #[test]
     fn invalidation_cancels_compilation_as_retryable_stale_work() {
         let configuration = JitConfiguration::default()
-            .with_performance_report(Some("unused-performance-report.toml".into()));
+            .with_performance_report_directory(Some("unused-performance-report".into()));
         let cache = Arc::new(DomainCodeCache::new(configuration));
         let region_key = key(0x1000, 1, 1);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -2266,7 +2266,7 @@ mod tests {
     #[test]
     fn irrelevant_invalidation_uses_constant_time_fast_path() {
         let configuration = JitConfiguration::default()
-            .with_performance_report(Some("unused-performance-report.toml".into()));
+            .with_performance_report_directory(Some("unused-performance-report".into()));
         let cache = DomainCodeCache::new(configuration);
         let region_key = key(0x1000, 1, 1);
         let region = cache
@@ -2396,7 +2396,7 @@ mod tests {
     fn performance_snapshot_separates_hits_rebuilds_evictions_and_invalidations() {
         let configuration = JitConfiguration::new(2, 1024 * 1024, 1)
             .unwrap()
-            .with_performance_report(Some("unused-performance-report.toml".into()));
+            .with_performance_report_directory(Some("unused-performance-report".into()));
         let cache = DomainCodeCache::new(configuration);
         let first = key(0x1000, 1, 1);
         let second = key(0x2000, 2, 1);

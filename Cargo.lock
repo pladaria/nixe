@@ -1183,6 +1183,7 @@ name = "nixe-cpu-engine-jit"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "chrono",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-native",
