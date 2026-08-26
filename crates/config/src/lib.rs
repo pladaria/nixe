@@ -250,6 +250,8 @@ pub struct CpuJitConfig {
     pub max_concurrent_compilations: usize,
     /// Optional directory for guest-code and neutral-IR compilation dumps.
     pub dump_directory: Option<PathBuf>,
+    /// Optional aggregate JIT performance report written at coordinated shutdown.
+    pub performance_report: Option<PathBuf>,
 }
 
 impl Default for CpuJitConfig {
@@ -259,6 +261,7 @@ impl Default for CpuJitConfig {
             max_cache_bytes: DEFAULT_JIT_CACHE_MIB * 1024 * 1024,
             max_concurrent_compilations: DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS,
             dump_directory: None,
+            performance_report: None,
         }
     }
 }
@@ -423,6 +426,8 @@ struct RawCpuJitConfig {
     max_concurrent_compilations: usize,
     #[serde(default)]
     dump_directory: Option<String>,
+    #[serde(default)]
+    performance_report: Option<String>,
 }
 
 impl Default for RawCpuJitConfig {
@@ -432,12 +437,13 @@ impl Default for RawCpuJitConfig {
             cache_mib: default_jit_cache_mib(),
             max_concurrent_compilations: default_jit_max_concurrent_compilations(),
             dump_directory: None,
+            performance_report: None,
         }
     }
 }
 
-const DEFAULT_JIT_MAX_CACHED_REGIONS: usize = 1_024;
-const DEFAULT_JIT_CACHE_MIB: usize = 48;
+const DEFAULT_JIT_MAX_CACHED_REGIONS: usize = 32_768;
+const DEFAULT_JIT_CACHE_MIB: usize = 512;
 const DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS: usize = 4;
 const MAX_JIT_MAX_CACHED_REGIONS: usize = DEFAULT_JIT_MAX_CACHED_REGIONS;
 const MAX_JIT_CACHE_MIB: usize = DEFAULT_JIT_CACHE_MIB;
@@ -647,6 +653,12 @@ fn cpu_configuration(
                 .filter(|directory| !directory.trim().is_empty())
                 .map(PathBuf::from)
                 .map(|directory| resolve_path(base_directory, directory)),
+            performance_report: raw
+                .jit
+                .performance_report
+                .filter(|report| !report.trim().is_empty())
+                .map(PathBuf::from)
+                .map(|report| resolve_path(base_directory, report)),
         },
     })
 }
@@ -959,6 +971,7 @@ mod tests {
                 cache_mib = 16
                 max_concurrent_compilations = 2
                 dump_directory = "./diagnostics/jit"
+                performance_report = "./diagnostics/jit-performance.toml"
             "#,
         );
         let jit = NixeConfig::load(&jit_file.path).unwrap().cpu;
@@ -970,6 +983,13 @@ mod tests {
                 max_cache_bytes: 16 * 1024 * 1024,
                 max_concurrent_compilations: 2,
                 dump_directory: Some(jit_file.path.parent().unwrap().join("./diagnostics/jit")),
+                performance_report: Some(
+                    jit_file
+                        .path
+                        .parent()
+                        .unwrap()
+                        .join("./diagnostics/jit-performance.toml"),
+                ),
             }
         );
 
@@ -984,6 +1004,7 @@ mod tests {
                 initial_operation_mode = "handheld"
                 [cpu.jit]
                 dump_directory = ""
+                performance_report = ""
             "#,
         );
         assert_eq!(
@@ -992,6 +1013,14 @@ mod tests {
                 .cpu
                 .jit
                 .dump_directory,
+            None
+        );
+        assert_eq!(
+            NixeConfig::load(&empty_dump.path)
+                .unwrap()
+                .cpu
+                .jit
+                .performance_report,
             None
         );
 

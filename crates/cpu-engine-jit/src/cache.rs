@@ -20,8 +20,9 @@ use crate::abi::{EXECUTION_STATE_A32, EXECUTION_STATE_A64, EXECUTION_STATE_T32, 
 use crate::compiler::{CompiledRegion, CompilerError};
 use crate::configuration::JitConfiguration;
 use crate::links::{INDIRECT_LINK_WAYS, LinkKind, LinkTable, NativeLinkTarget};
+use crate::performance::CachePerformanceSnapshot;
 
-const DEFAULT_MAX_LIVE_IR_OPERATIONS: u64 = 4 * 1024 * 1024;
+const DEFAULT_MAX_LIVE_IR_OPERATIONS: u64 = 32 * 1024 * 1024;
 const LOCAL_LOOKUP_SLOTS: usize = 64;
 const QUIESCENT_EPOCH: u64 = 0;
 const COMPILATION_ACTIVE: u8 = 0;
@@ -174,6 +175,36 @@ impl PendingRegion {
             ir_operations: u64::from(region.metadata.ir_operation_count),
         })
     }
+
+    pub(crate) fn dependencies_are_current(
+        &self,
+        memory: &dyn CpuMemory,
+        address_space: AddressSpaceId,
+    ) -> Result<bool, FrontendError> {
+        for expected in &self.identity.mapping_dependencies {
+            let observed = match expected.location.execution_state {
+                ExecutionState::A64 | ExecutionState::A32 => {
+                    memory
+                        .fetch32(address_space, expected.location.pc)
+                        .map_err(FrontendError::InstructionFetch)?
+                        .dependencies
+                }
+                ExecutionState::T32 => {
+                    memory
+                        .fetch16(address_space, expected.location.pc)
+                        .map_err(FrontendError::InstructionFetch)?
+                        .dependencies
+                }
+            };
+            if !observed
+                .iter()
+                .any(|dependency| dependency == expected.dependency)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 pub(crate) struct CachedRegion {
@@ -214,6 +245,11 @@ pub(crate) enum CacheError {
     Internal(Box<str>),
     Stale,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InvalidationEffect {
+    pub(crate) retired_regions: u64,
 }
 
 impl From<FrontendError> for CacheError {
@@ -328,6 +364,11 @@ pub(crate) enum CompilationCancellationReason {
 }
 
 impl CompilationCancellation<'_> {
+    pub(crate) fn active() -> Self {
+        static ACTIVE: AtomicU8 = AtomicU8::new(COMPILATION_ACTIVE);
+        Self { state: &ACTIVE }
+    }
+
     #[must_use]
     pub(crate) fn reason(self) -> Option<CompilationCancellationReason> {
         match self.state.load(Ordering::Acquire) {
@@ -361,12 +402,83 @@ struct CacheState {
     invalidation_revision: u64,
     invalidation_cursor: MemoryInvalidationCursor,
     active_compilations: usize,
+    compiling_slots: usize,
     active_links: HashMap<LinkRef, ActiveLink>,
     incoming_links: HashMap<RegionId, BTreeSet<LinkRef>>,
     link_targets: HashMap<usize, Arc<NativeLinkTarget>>,
     retirement_epoch: u64,
     executors: Vec<Weak<AtomicU64>>,
     retired: VecDeque<RetiredBatch>,
+    performance: Option<CachePerformanceState>,
+}
+
+struct CachePerformanceState {
+    snapshot: CachePerformanceSnapshot,
+    builds_by_key: HashMap<RegionKey, u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct InvalidationRecordCounts {
+    executable_content: u64,
+    mapping: u64,
+    instruction_cache: u64,
+}
+
+impl CachePerformanceState {
+    fn new() -> Self {
+        Self {
+            snapshot: CachePerformanceSnapshot::default(),
+            builds_by_key: HashMap::new(),
+        }
+    }
+
+    fn record_build(&mut self, key: RegionKey) {
+        self.snapshot.global_builds = self.snapshot.global_builds.saturating_add(1);
+        let builds = self.builds_by_key.entry(key).or_default();
+        if *builds == 0 {
+            self.snapshot.unique_region_keys = self.snapshot.unique_region_keys.saturating_add(1);
+        } else {
+            self.snapshot.repeat_builds = self.snapshot.repeat_builds.saturating_add(1);
+            if *builds == 1 {
+                self.snapshot.recompiled_region_keys =
+                    self.snapshot.recompiled_region_keys.saturating_add(1);
+            }
+        }
+        *builds = builds.saturating_add(1);
+    }
+
+    fn record_invalidation(
+        &mut self,
+        records: InvalidationRecordCounts,
+        history_lost: bool,
+        retired_regions: u64,
+        links_unlinked: u64,
+        fast_irrelevant: bool,
+    ) {
+        let snapshot = &mut self.snapshot;
+        snapshot.invalidation_batches = snapshot.invalidation_batches.saturating_add(1);
+        snapshot.invalidation_executable_content = snapshot
+            .invalidation_executable_content
+            .saturating_add(records.executable_content);
+        snapshot.invalidation_mapping = snapshot
+            .invalidation_mapping
+            .saturating_add(records.mapping);
+        snapshot.invalidation_instruction_cache = snapshot
+            .invalidation_instruction_cache
+            .saturating_add(records.instruction_cache);
+        snapshot.invalidation_history_lost = snapshot
+            .invalidation_history_lost
+            .saturating_add(u64::from(history_lost));
+        snapshot.regions_retired_invalidation = snapshot
+            .regions_retired_invalidation
+            .saturating_add(retired_regions);
+        snapshot.links_unlinked_invalidation = snapshot
+            .links_unlinked_invalidation
+            .saturating_add(links_unlinked);
+        snapshot.fast_irrelevant_invalidations = snapshot
+            .fast_irrelevant_invalidations
+            .saturating_add(u64::from(fast_irrelevant));
+    }
 }
 
 struct RetiredBatch {
@@ -400,7 +512,7 @@ struct ActiveLink {
 }
 
 impl CacheState {
-    fn new() -> Self {
+    fn new(performance_enabled: bool) -> Self {
         Self {
             accepting_compilation: true,
             slots: HashMap::new(),
@@ -414,12 +526,14 @@ impl CacheState {
             invalidation_revision: 0,
             invalidation_cursor: MemoryInvalidationCursor::INITIAL,
             active_compilations: 0,
+            compiling_slots: 0,
             active_links: HashMap::new(),
             incoming_links: HashMap::new(),
             link_targets: HashMap::new(),
             retirement_epoch: 1,
             executors: Vec::new(),
             retired: VecDeque::new(),
+            performance: performance_enabled.then(CachePerformanceState::new),
         }
     }
 
@@ -534,6 +648,7 @@ impl CacheState {
             self.retire(id, retirement_epoch);
         }
         self.slots.clear();
+        self.compiling_slots = 0;
         self.retirement_order.clear();
         self.physical_index.clear();
         self.mapping_index.clear();
@@ -592,9 +707,10 @@ impl Drop for NativeEpochGuard {
 
 impl DomainCodeCache {
     pub(crate) fn new(configuration: JitConfiguration) -> Self {
+        let performance_enabled = configuration.performance_report().is_some();
         Self {
             limits: CacheLimits::from_configuration(&configuration),
-            state: Mutex::new(CacheState::new()),
+            state: Mutex::new(CacheState::new(performance_enabled)),
             compilation_ready: Condvar::new(),
         }
     }
@@ -681,23 +797,31 @@ impl DomainCodeCache {
         records: &[MemoryInvalidation],
         through: MemoryInvalidationCursor,
         history_lost: bool,
-    ) -> Result<(), CacheError> {
-        let flights = {
+    ) -> Result<InvalidationEffect, CacheError> {
+        let (flights, effect) = {
             let mut state = lock(&self.state);
             if state.invalidation_cursor >= through {
-                return Ok(());
+                return Ok(InvalidationEffect::default());
             }
-            let next_revision = state.invalidation_revision.checked_add(1).ok_or_else(|| {
-                CacheError::Capacity("domain cache invalidation identities are exhausted".into())
-            })?;
-            let flights: Vec<_> = state
-                .slots
-                .values()
-                .filter_map(|slot| match slot {
-                    CacheSlot::Compiling(flight) => Some(Arc::clone(flight)),
-                    CacheSlot::Ready(_) => None,
-                })
-                .collect();
+            let mut record_counts = InvalidationRecordCounts::default();
+            for record in records
+                .iter()
+                .filter(|record| record.cursor > state.invalidation_cursor)
+            {
+                match record.kind {
+                    MemoryInvalidationKind::ExecutableContent { .. } => {
+                        record_counts.executable_content =
+                            record_counts.executable_content.saturating_add(1);
+                    }
+                    MemoryInvalidationKind::Mapping { .. } => {
+                        record_counts.mapping = record_counts.mapping.saturating_add(1);
+                    }
+                    MemoryInvalidationKind::InstructionCache { .. } => {
+                        record_counts.instruction_cache =
+                            record_counts.instruction_cache.saturating_add(1);
+                    }
+                }
+            }
             let mut affected = BTreeSet::new();
             if history_lost {
                 affected.extend(state.regions.keys().copied());
@@ -745,23 +869,59 @@ impl DomainCodeCache {
                     }
                 }
             }
+            if affected.is_empty() && state.compiling_slots == 0 {
+                if let Some(performance) = &mut state.performance {
+                    performance.record_invalidation(record_counts, history_lost, 0, 0, true);
+                }
+                state.invalidation_cursor = through;
+                return Ok(InvalidationEffect::default());
+            }
+            let next_revision = state.invalidation_revision.checked_add(1).ok_or_else(|| {
+                CacheError::Capacity("domain cache invalidation identities are exhausted".into())
+            })?;
+            let flights: Vec<_> = state
+                .slots
+                .values()
+                .filter_map(|slot| match slot {
+                    CacheSlot::Compiling(flight) => Some(Arc::clone(flight)),
+                    CacheSlot::Ready(_) => None,
+                })
+                .collect();
             let retirement_epoch = state.next_retirement_epoch()?;
+            let retired_count = affected.len() as u64;
+            let links_before = state.active_links.len();
             for id in affected {
                 state.retire(id, retirement_epoch);
+            }
+            let links_unlinked = links_before.saturating_sub(state.active_links.len()) as u64;
+            if let Some(performance) = &mut state.performance {
+                performance.record_invalidation(
+                    record_counts,
+                    history_lost,
+                    retired_count,
+                    links_unlinked,
+                    false,
+                );
             }
             state
                 .slots
                 .retain(|_, slot| matches!(slot, CacheSlot::Ready(_)));
+            state.compiling_slots = 0;
             state.invalidation_revision = next_revision;
             state.invalidation_cursor = through;
-            flights
+            (
+                flights,
+                InvalidationEffect {
+                    retired_regions: retired_count,
+                },
+            )
         };
         for flight in flights {
             flight.cancel(CacheError::Stale);
         }
         self.compilation_ready.notify_all();
         self.reclaim_retired();
-        Ok(())
+        Ok(effect)
     }
 
     pub(crate) fn begin_shutdown(&self) -> Result<(), CacheError> {
@@ -782,6 +942,35 @@ impl DomainCodeCache {
         state.executors.len()
     }
 
+    pub(crate) fn performance_snapshot(&self) -> Option<CachePerformanceSnapshot> {
+        lock(&self.state)
+            .performance
+            .as_ref()
+            .map(|performance| performance.snapshot.clone())
+    }
+
+    /// Returns an already-published translation without starting or waiting on
+    /// compilation. The cold tier uses this to keep executing while another
+    /// vCPU may be compiling the same region.
+    pub(crate) fn lookup_ready(&self, key: RegionKey) -> Option<Arc<CachedRegion>> {
+        let mut state = lock(&self.state);
+        let region = match state.slots.get(&key) {
+            Some(CacheSlot::Ready(id)) => state
+                .regions
+                .get(id)
+                .filter(|region| region.is_live())
+                .cloned(),
+            Some(CacheSlot::Compiling(_)) | None => None,
+        };
+        if region.is_some()
+            && let Some(performance) = &mut state.performance
+        {
+            performance.snapshot.global_ready_hits =
+                performance.snapshot.global_ready_hits.saturating_add(1);
+        }
+        region
+    }
+
     pub(crate) fn resolve(
         &self,
         key: RegionKey,
@@ -798,7 +987,7 @@ impl DomainCodeCache {
             if !state.accepting_compilation {
                 return Err(CacheError::Cancelled);
             }
-            match state.slots.get(&key) {
+            let resolution = match state.slots.get(&key) {
                 Some(CacheSlot::Ready(id)) => state
                     .regions
                     .get(id)
@@ -811,6 +1000,7 @@ impl DomainCodeCache {
                         state
                             .slots
                             .insert(key, CacheSlot::Compiling(Arc::clone(&flight)));
+                        state.compiling_slots += 1;
                         Resolution::Build(flight)
                     }),
                 Some(CacheSlot::Compiling(flight)) => Resolution::Wait(Arc::clone(flight)),
@@ -819,9 +1009,24 @@ impl DomainCodeCache {
                     state
                         .slots
                         .insert(key, CacheSlot::Compiling(Arc::clone(&flight)));
+                    state.compiling_slots += 1;
                     Resolution::Build(flight)
                 }
+            };
+            if let Some(performance) = &mut state.performance {
+                match &resolution {
+                    Resolution::Ready(_) => {
+                        performance.snapshot.global_ready_hits =
+                            performance.snapshot.global_ready_hits.saturating_add(1);
+                    }
+                    Resolution::Wait(_) => {
+                        performance.snapshot.global_waits =
+                            performance.snapshot.global_waits.saturating_add(1);
+                    }
+                    Resolution::Build(_) => performance.record_build(key),
+                }
             }
+            resolution
         };
 
         match resolution {
@@ -838,16 +1043,31 @@ impl DomainCodeCache {
                 })) {
                     Ok(result) => result,
                     Err(_) => Err(CacheError::Internal(
-                        "panic was contained during JIT compilation".into(),
+                        format!("panic was contained during JIT compilation for {key:?}")
+                            .into_boxed_str(),
                     )),
                 };
                 if result.is_err() {
                     let mut state = lock(&self.state);
+                    if let Some(performance) = &mut state.performance {
+                        match &result {
+                            Err(CacheError::Stale) => {
+                                performance.snapshot.build_stale =
+                                    performance.snapshot.build_stale.saturating_add(1);
+                            }
+                            Err(_) => {
+                                performance.snapshot.build_failures =
+                                    performance.snapshot.build_failures.saturating_add(1);
+                            }
+                            Ok(_) => unreachable!(),
+                        }
+                    }
                     if matches!(
                         state.slots.get(&key),
                         Some(CacheSlot::Compiling(current)) if Arc::ptr_eq(current, &flight)
                     ) {
                         state.slots.remove(&key);
+                        state.compiling_slots = state.compiling_slots.saturating_sub(1);
                     }
                 }
                 flight.complete(result.clone());
@@ -998,9 +1218,12 @@ impl DomainCodeCache {
                 Some(CacheSlot::Compiling(current)) if Arc::ptr_eq(current, flight)
             )
         {
+            if let Some(performance) = &mut state.performance {
+                performance.snapshot.publish_stale =
+                    performance.snapshot.publish_stale.saturating_add(1);
+            }
             return Err(CacheError::Stale);
         }
-
         while state.regions.len() == self.limits.max_live_segments
             || state
                 .live_mapped_bytes
@@ -1017,7 +1240,19 @@ impl DomainCodeCache {
                 ));
             };
             let retirement_epoch = state.next_retirement_epoch()?;
+            let links_before = state.active_links.len();
             state.retire(oldest, retirement_epoch);
+            let links_unlinked = links_before.saturating_sub(state.active_links.len()) as u64;
+            if let Some(performance) = &mut state.performance {
+                performance.snapshot.regions_evicted_capacity = performance
+                    .snapshot
+                    .regions_evicted_capacity
+                    .saturating_add(1);
+                performance.snapshot.links_unlinked_capacity = performance
+                    .snapshot
+                    .links_unlinked_capacity
+                    .saturating_add(links_unlinked);
+            }
         }
 
         let id = state.next_region_id;
@@ -1053,6 +1288,10 @@ impl DomainCodeCache {
                 .or_default()
                 .insert(id);
         }
+        state.compiling_slots = state
+            .compiling_slots
+            .checked_sub(1)
+            .ok_or_else(|| CacheError::Internal("compiling-slot accounting underflow".into()))?;
         for entry_key in &region.identity.keys {
             match state.slots.get(entry_key) {
                 Some(CacheSlot::Compiling(current)) if !Arc::ptr_eq(current, flight) => {}
@@ -1069,6 +1308,21 @@ impl DomainCodeCache {
         state.live_ir_operations += region.ir_operations;
         state.retirement_order.push_back(id);
         state.regions.insert(id, Arc::clone(&region));
+        let live_regions = state.regions.len() as u64;
+        let live_mapped_bytes = state.live_mapped_bytes as u64;
+        let cache_slots = state.slots.len() as u64;
+        if let Some(performance) = &mut state.performance {
+            performance.snapshot.regions_published =
+                performance.snapshot.regions_published.saturating_add(1);
+            performance.snapshot.peak_live_regions =
+                performance.snapshot.peak_live_regions.max(live_regions);
+            performance.snapshot.peak_live_mapped_bytes = performance
+                .snapshot
+                .peak_live_mapped_bytes
+                .max(live_mapped_bytes);
+            performance.snapshot.peak_cache_slots =
+                performance.snapshot.peak_cache_slots.max(cache_slots);
+        }
         Ok(region)
     }
 }
@@ -1226,6 +1480,7 @@ mod tests {
                     sources: Box::new([]),
                     side_exits: Box::new([]),
                     semantic_calls: Box::new([]),
+                    native_named_operations: 0,
                     link_sites,
                 },
                 4096,
@@ -1494,7 +1749,9 @@ mod tests {
 
     #[test]
     fn invalidation_cancels_compilation_as_retryable_stale_work() {
-        let cache = Arc::new(DomainCodeCache::new(JitConfiguration::default()));
+        let configuration = JitConfiguration::default()
+            .with_performance_report(Some("unused-performance-report.toml".into()));
+        let cache = Arc::new(DomainCodeCache::new(configuration));
         let region_key = key(0x1000, 1, 1);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -1528,6 +1785,50 @@ mod tests {
                 .resolve(region_key, |_| Ok(pending(region_key, None)))
                 .is_ok()
         );
+        let snapshot = cache.performance_snapshot().unwrap();
+        assert_eq!(snapshot.global_builds, 2);
+        assert_eq!(snapshot.build_stale, 1);
+        assert_eq!(snapshot.regions_published, 1);
+        assert_eq!(snapshot.unique_region_keys, 1);
+        assert_eq!(snapshot.recompiled_region_keys, 1);
+        assert_eq!(snapshot.repeat_builds, 1);
+        assert_eq!(snapshot.invalidation_batches, 1);
+        assert_eq!(snapshot.invalidation_executable_content, 1);
+    }
+
+    #[test]
+    fn irrelevant_invalidation_uses_constant_time_fast_path() {
+        let configuration = JitConfiguration::default()
+            .with_performance_report(Some("unused-performance-report.toml".into()));
+        let cache = DomainCodeCache::new(configuration);
+        let region_key = key(0x1000, 1, 1);
+        let region = cache
+            .resolve(region_key, |_| Ok(pending(region_key, None)))
+            .unwrap();
+        let revision_before = lock(&cache.state).invalidation_revision;
+
+        let effect = cache
+            .apply_invalidations(
+                &[MemoryInvalidation {
+                    cursor: MemoryInvalidationCursor::new(1),
+                    kind: MemoryInvalidationKind::ExecutableContent {
+                        first: GuestPhysicalPageId::new(999),
+                        second: None,
+                    },
+                }],
+                MemoryInvalidationCursor::new(1),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(effect, InvalidationEffect::default());
+        assert!(region.is_live());
+        let state = lock(&cache.state);
+        assert_eq!(state.invalidation_revision, revision_before);
+        assert_eq!(state.compiling_slots, 0);
+        drop(state);
+        let snapshot = cache.performance_snapshot().unwrap();
+        assert_eq!(snapshot.fast_irrelevant_invalidations, 1);
     }
 
     #[test]
@@ -1537,7 +1838,7 @@ mod tests {
         assert!(matches!(
             cache.resolve(region_key, |_| panic!("injected compilation panic")),
             Err(CacheError::Internal(detail))
-                if detail.as_ref() == "panic was contained during JIT compilation"
+                if detail.contains("panic was contained during JIT compilation for RegionKey")
         ));
         assert!(
             cache
@@ -1581,6 +1882,51 @@ mod tests {
                 .contains_key(&GuestPhysicalPageId::new(11))
         );
         assert_eq!(state.mapping_index.len(), 2);
+    }
+
+    #[test]
+    fn performance_snapshot_separates_hits_rebuilds_evictions_and_invalidations() {
+        let configuration = JitConfiguration::new(2, 1024 * 1024, 1)
+            .unwrap()
+            .with_performance_report(Some("unused-performance-report.toml".into()));
+        let cache = DomainCodeCache::new(configuration);
+        let first = key(0x1000, 1, 1);
+        let second = key(0x2000, 2, 1);
+        let third = key(0x3000, 3, 1);
+
+        cache.resolve(first, |_| Ok(pending(first, None))).unwrap();
+        cache.resolve(first, |_| unreachable!()).unwrap();
+        cache
+            .resolve(second, |_| Ok(pending(second, None)))
+            .unwrap();
+        cache.resolve(third, |_| Ok(pending(third, None))).unwrap();
+        cache.resolve(first, |_| Ok(pending(first, None))).unwrap();
+        cache
+            .apply_invalidations(
+                &[MemoryInvalidation {
+                    cursor: MemoryInvalidationCursor::new(1),
+                    kind: MemoryInvalidationKind::ExecutableContent {
+                        first: GuestPhysicalPageId::new(3),
+                        second: None,
+                    },
+                }],
+                MemoryInvalidationCursor::new(1),
+                false,
+            )
+            .unwrap();
+
+        let snapshot = cache.performance_snapshot().unwrap();
+        assert_eq!(snapshot.global_ready_hits, 1);
+        assert_eq!(snapshot.global_builds, 4);
+        assert_eq!(snapshot.regions_published, 4);
+        assert_eq!(snapshot.unique_region_keys, 3);
+        assert_eq!(snapshot.recompiled_region_keys, 1);
+        assert_eq!(snapshot.repeat_builds, 1);
+        assert_eq!(snapshot.regions_evicted_capacity, 2);
+        assert_eq!(snapshot.invalidation_batches, 1);
+        assert_eq!(snapshot.invalidation_executable_content, 1);
+        assert_eq!(snapshot.regions_retired_invalidation, 1);
+        assert_eq!(snapshot.peak_live_regions, 2);
     }
 
     #[test]

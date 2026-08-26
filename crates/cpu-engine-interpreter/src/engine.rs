@@ -194,16 +194,17 @@ impl EngineExecutor for InterpreterExecutor {
                     request.state,
                 ));
             }
-            let encoding = match fetch_current(request.memory, request.cpu, request.state) {
-                Ok(encoding) => encoding,
-                Err(fault) => {
-                    return Ok(self.report(
-                        executed,
-                        nixe_cpu_engine::EngineExit::FetchFault { fault },
-                        request.state,
-                    ));
-                }
-            };
+            let encoding =
+                match fetch_current_instruction(request.memory, request.cpu, request.state) {
+                    Ok(encoding) => encoding,
+                    Err(fault) => {
+                        return Ok(self.report(
+                            executed,
+                            nixe_cpu_engine::EngineExit::FetchFault { fault },
+                            request.state,
+                        ));
+                    }
+                };
             let outcome = match execute_one_with_context(context, request.state, encoding) {
                 Ok(outcome) => outcome,
                 Err(InterpreterError::UnsupportedInstruction {
@@ -323,7 +324,7 @@ fn loader_return_observation(
     })
 }
 
-fn fetch_current(
+pub fn fetch_current_instruction(
     memory: &dyn InstructionMemory,
     cpu: ProcessCpuContext,
     state: &ThreadCpuState,

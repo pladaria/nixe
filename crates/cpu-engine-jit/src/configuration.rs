@@ -4,9 +4,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Default maximum number of compiled regions retained by one JIT domain.
-pub const DEFAULT_MAX_CACHED_REGIONS: usize = 1_024;
+pub const DEFAULT_MAX_CACHED_REGIONS: usize = 32_768;
 /// Default maximum native bytes retained by one JIT domain.
-pub const DEFAULT_MAX_CACHE_BYTES: usize = 48 * 1024 * 1024;
+pub const DEFAULT_MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// Default maximum number of simultaneous compilations in one JIT domain.
 pub const DEFAULT_MAX_CONCURRENT_COMPILATIONS: usize = 4;
 
@@ -25,6 +25,7 @@ pub struct JitConfiguration {
     max_cache_bytes: usize,
     max_concurrent_compilations: usize,
     dump_directory: Option<PathBuf>,
+    performance_report: Option<PathBuf>,
 }
 
 impl JitConfiguration {
@@ -58,6 +59,7 @@ impl JitConfiguration {
             max_cache_bytes,
             max_concurrent_compilations,
             dump_directory: None,
+            performance_report: None,
         })
     }
 
@@ -65,6 +67,13 @@ impl JitConfiguration {
     #[must_use]
     pub fn with_dump_directory(mut self, dump_directory: Option<PathBuf>) -> Self {
         self.dump_directory = dump_directory.filter(|path| !path.as_os_str().is_empty());
+        self
+    }
+
+    /// Enables one aggregate low-overhead performance report per application run.
+    #[must_use]
+    pub fn with_performance_report(mut self, performance_report: Option<PathBuf>) -> Self {
+        self.performance_report = performance_report.filter(|path| !path.as_os_str().is_empty());
         self
     }
 
@@ -87,6 +96,11 @@ impl JitConfiguration {
     pub fn dump_directory(&self) -> Option<&Path> {
         self.dump_directory.as_deref()
     }
+
+    #[must_use]
+    pub fn performance_report(&self) -> Option<&Path> {
+        self.performance_report.as_deref()
+    }
 }
 
 impl Default for JitConfiguration {
@@ -96,6 +110,7 @@ impl Default for JitConfiguration {
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             max_concurrent_compilations: DEFAULT_MAX_CONCURRENT_COMPILATIONS,
             dump_directory: None,
+            performance_report: None,
         }
     }
 }
@@ -174,6 +189,12 @@ mod tests {
             JitConfiguration::default()
                 .with_dump_directory(Some(PathBuf::new()))
                 .dump_directory(),
+            None
+        );
+        assert_eq!(
+            JitConfiguration::default()
+                .with_performance_report(Some(PathBuf::new()))
+                .performance_report(),
             None
         );
     }

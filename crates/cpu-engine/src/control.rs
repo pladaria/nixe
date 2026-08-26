@@ -1,7 +1,7 @@
 //! Lock-free cross-vCPU control publication and acknowledgement.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const CONTROL_PREEMPT: u32 = 1 << 0;
 const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;
@@ -36,7 +36,7 @@ impl ControlSnapshot {
 
 #[derive(Default)]
 struct EngineControlState {
-    pending: AtomicBool,
+    pending: AtomicU32,
     requests: AtomicU32,
     invalidation_epoch: AtomicU64,
     acknowledged_invalidation_epoch: AtomicU64,
@@ -78,7 +78,7 @@ impl EngineControl {
         self.state
             .requests
             .fetch_or(request.bit(), Ordering::Release);
-        self.state.pending.store(true, Ordering::Release);
+        self.state.pending.store(1, Ordering::Release);
     }
 
     pub fn request_invalidation(&self, epoch: u64) {
@@ -90,8 +90,8 @@ impl EngineControl {
 
     #[must_use]
     pub fn take_pending(&self) -> Option<ControlSnapshot> {
-        if !self.state.pending.load(Ordering::Acquire)
-            || !self.state.pending.swap(false, Ordering::AcqRel)
+        if self.state.pending.load(Ordering::Acquire) == 0
+            || self.state.pending.swap(0, Ordering::AcqRel) == 0
         {
             return None;
         }
@@ -104,6 +104,13 @@ impl EngineControl {
             requests,
             invalidation_epoch,
         })
+    }
+
+    /// Stable address of the native-poll pending word. The address remains
+    /// valid while this control or any clone is alive.
+    #[must_use]
+    pub fn pending_word_address(&self) -> usize {
+        std::ptr::from_ref(&self.state.pending).addr()
     }
 
     /// Confirms that invalidated resources represented by `snapshot` cannot be

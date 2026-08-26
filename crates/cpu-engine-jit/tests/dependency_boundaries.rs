@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 #[test]
-fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
+fn jit_owns_cranelift_and_cold_interpretation_without_importing_runtime() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let production_dependencies = manifest
@@ -15,6 +15,7 @@ fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
         "cranelift-native = \"=0.134.3\"",
         "nixe-cpu.workspace = true",
         "nixe-cpu-engine.workspace = true",
+        "nixe-cpu-engine-interpreter.workspace = true",
         "nixe-memory.workspace = true",
         "libc = \"0.2\"",
         "windows-sys = { version = \"0.61\"",
@@ -25,7 +26,6 @@ fn jit_owns_cranelift_without_importing_runtime_or_other_engines() {
         );
     }
     for forbidden in [
-        "nixe-cpu-engine-interpreter.workspace",
         "nixe-runtime.workspace",
         "nixe-horizon.workspace",
         "nixe-scheduler.workspace",

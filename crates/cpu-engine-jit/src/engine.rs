@@ -1,12 +1,17 @@
 //! Engine provider, process domain, and executor-local native state.
 
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use nixe_cpu::coverage::CoverageId;
 use nixe_cpu::error::FrontendError;
+use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
@@ -18,6 +23,10 @@ use nixe_cpu_engine::{
     EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind,
     EngineId, EngineKind, EngineProvider, ExecutionReport, RunRequest, SchedulerRequest,
 };
+use nixe_cpu_engine_interpreter::{
+    InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
+    fetch_current_instruction,
+};
 use nixe_memory::GuestVirtualAddress;
 
 use crate::abi::{
@@ -27,22 +36,69 @@ use crate::abi::{
     SCHEDULE_SEND_EVENT, SCHEDULE_WAIT_FOR_EVENT, SCHEDULE_WAIT_FOR_INTERRUPT, SCHEDULE_YIELD,
 };
 use crate::cache::{
-    CacheError, DomainCodeCache, ExecutorEpoch, LocalLookupCache, PendingRegion, RegionKey,
-    TranslationMode, root_code_mapping,
+    CacheError, DomainCodeCache, ExecutorEpoch, LocalLookupCache, RegionKey, TranslationMode,
+    root_code_mapping,
 };
-use crate::compiler::{CompiledRegionMetadata, CompilerContext, SideExit, compile_gateway};
+use crate::compilation_pool::{
+    CompilationPool, CompilationPoolHandle, CompilationTask, host_compilation_workers,
+};
+use crate::compiler::{CompiledRegionMetadata, SideExit, compile_gateway};
 use crate::configuration::JitConfiguration;
 use crate::diagnostics::JitDiagnostics;
 use crate::executable_memory::{
     ExecutableMemoryError, PublishedCode, SharedExecutableMemory, process_executable_memory,
 };
 use crate::helpers::{HELPER_TABLE, NativeContext};
+use crate::performance::{DomainPerformance, ExecutorPerformance, JitPerformanceReport};
 use crate::tlb::SoftwareTlb;
 
 pub const JIT_ENGINE_ID: EngineId = EngineId::new(2);
 
 const CONTROL_PREEMPT: u32 = 1 << 0;
 const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;
+const HOTNESS_SLOTS: usize = 16 * 1024;
+const HOTNESS_PROMOTION_VISITS: u8 = 3;
+
+struct HotnessTable {
+    slots: Box<[Option<(RegionKey, u8)>]>,
+}
+
+impl HotnessTable {
+    fn new() -> Self {
+        Self {
+            slots: vec![None; HOTNESS_SLOTS].into_boxed_slice(),
+        }
+    }
+
+    fn should_compile(&mut self, key: RegionKey) -> bool {
+        let index = self.index(key);
+        match &mut self.slots[index] {
+            Some((stored, visits)) if *stored == key => {
+                *visits = visits.saturating_add(1);
+                *visits >= HOTNESS_PROMOTION_VISITS
+            }
+            slot => {
+                *slot = Some((key, 1));
+                false
+            }
+        }
+    }
+
+    fn promote(&mut self, key: RegionKey) {
+        let index = self.index(key);
+        self.slots[index] = Some((key, HOTNESS_PROMOTION_VISITS));
+    }
+
+    fn index(&self, key: RegionKey) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % self.slots.len()
+    }
+
+    fn clear(&mut self) {
+        self.slots.fill(None);
+    }
+}
 
 enum HostSupport {
     Available(OwnedTargetIsa),
@@ -56,6 +112,7 @@ enum HostSupport {
 pub struct JitProvider {
     host: OnceLock<HostSupport>,
     executable_memory: OnceLock<Result<SharedExecutableMemory, ExecutableMemoryError>>,
+    performance_report: OnceLock<Result<Arc<JitPerformanceReport>, Box<str>>>,
     configuration: JitConfiguration,
 }
 
@@ -71,6 +128,7 @@ impl JitProvider {
         Self {
             host: OnceLock::new(),
             executable_memory: OnceLock::new(),
+            performance_report: OnceLock::new(),
             configuration,
         }
     }
@@ -80,6 +138,7 @@ impl JitProvider {
         let provider = Self {
             host: OnceLock::new(),
             executable_memory: OnceLock::new(),
+            performance_report: OnceLock::new(),
             configuration: JitConfiguration::default(),
         };
         assert!(
@@ -96,6 +155,19 @@ impl JitProvider {
 
     fn host(&self) -> &HostSupport {
         self.host.get_or_init(probe_host)
+    }
+
+    fn configured_performance_report(&self) -> Result<Option<Arc<JitPerformanceReport>>, Box<str>> {
+        let Some(path) = self.configuration.performance_report() else {
+            return Ok(None);
+        };
+        match self
+            .performance_report
+            .get_or_init(|| JitPerformanceReport::new(path).map(Arc::new))
+        {
+            Ok(report) => Ok(Some(Arc::clone(report))),
+            Err(detail) => Err(detail.clone()),
+        }
     }
 
     fn availability_rejections(
@@ -196,6 +268,18 @@ impl EngineProvider for JitProvider {
 
     fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
         let (isa, executable_memory) = self.available_resources(request.cpu)?;
+        let performance = self
+            .configured_performance_report()
+            .map(|report| {
+                report.map(|report| Arc::new(DomainPerformance::new(report, request.domain)))
+            })
+            .map_err(|detail| domain_fault(request.cpu, EngineFaultKind::Unavailable, detail))?;
+        if let Some(performance) = &performance {
+            log::info!(
+                "JIT performance report enabled: path={}",
+                performance.report_path().display()
+            );
+        }
         let diagnostics = self
             .configuration
             .dump_directory()
@@ -223,15 +307,26 @@ impl EngineProvider for JitProvider {
                     format!("JIT native gateway failed: {}", error.detail()),
                 )
             })?;
+        let compilation_workers = host_compilation_workers();
+        let compilation_pool = CompilationPool::new(
+            compilation_workers,
+            Arc::clone(&isa),
+            executable_memory.clone(),
+            diagnostics.clone(),
+            request.cpu.profile(),
+        )
+        .map_err(|detail| domain_fault(request.cpu, EngineFaultKind::Unavailable, detail))?;
+        log::info!("JIT asynchronous compilation pool enabled: workers={compilation_workers}");
         Ok(Box::new(JitDomain {
             id: request.domain,
             cpu: request.cpu,
-            isa,
             executable_memory: Some(executable_memory),
             gateway: Some(gateway),
             gateway_code: Some(gateway_code),
             code_cache: Some(Arc::new(DomainCodeCache::new(self.configuration.clone()))),
+            compilation_pool: Some(compilation_pool),
             diagnostics,
+            performance,
             controls: Vec::new(),
             binding: None,
             stopping: false,
@@ -250,14 +345,15 @@ struct BoundMemory {
 struct JitDomain {
     id: EngineDomainId,
     cpu: ProcessCpuContext,
-    isa: OwnedTargetIsa,
     // The provider owns the process-wide arena; each live domain retains the
     // owner so code can never outlive its OS mapping.
     executable_memory: Option<SharedExecutableMemory>,
     gateway: Option<NativeGateway>,
     gateway_code: Option<PublishedCode>,
     code_cache: Option<Arc<DomainCodeCache>>,
+    compilation_pool: Option<CompilationPool>,
     diagnostics: Option<Arc<JitDiagnostics>>,
+    performance: Option<Arc<DomainPerformance>>,
     controls: Vec<EngineControl>,
     binding: Option<BoundMemory>,
     stopping: bool,
@@ -311,8 +407,12 @@ impl EngineDomain for JitDomain {
             cpu: self.cpu,
             address_space_end: binding.end_exclusive,
             frame: ExecutionFrame::default(),
-            compiler: CompilerContext::new(Arc::clone(&self.isa)),
-            executable_memory: self
+            compilation_pool: self
+                .compilation_pool
+                .as_ref()
+                .expect("live domain retains its compilation pool")
+                .handle(),
+            _executable_memory: self
                 .executable_memory
                 .as_ref()
                 .expect("live domain retains executable memory")
@@ -326,11 +426,16 @@ impl EngineDomain for JitDomain {
                 .expect("live domain retains its native gateway publication")
                 .clone(),
             code_cache,
-            diagnostics: self.diagnostics.clone(),
+            performance_domain: self.performance.clone(),
+            performance: self
+                .performance
+                .as_ref()
+                .map(|_| ExecutorPerformance::default()),
             executor_epoch,
             local_lookup: LocalLookupCache::new(),
+            hotness: HotnessTable::new(),
             control,
-            exclusive_monitor: ExclusiveMonitorState::default(),
+            exclusive_monitor: RefCell::new(ExclusiveMonitorState::default()),
             tlb: SoftwareTlb::new(),
             mapping_epoch: binding.mapping_epoch,
             invalidation_cursor: binding.invalidation_cursor,
@@ -364,6 +469,9 @@ impl EngineDomain for JitDomain {
         if self.stopping || self.shutdown {
             return Ok(());
         }
+        if let Some(pool) = &self.compilation_pool {
+            pool.begin_shutdown();
+        }
         if let Some(cache) = &self.code_cache {
             cache.begin_shutdown().map_err(|error| {
                 domain_fault(
@@ -393,12 +501,36 @@ impl EngineDomain for JitDomain {
                 "JIT domain shutdown requires every executor to be prepared and dropped",
             ));
         }
+        if let Some(pool) = &mut self.compilation_pool {
+            pool.shutdown();
+        }
+        let compilation_pool_performance = self
+            .compilation_pool
+            .as_ref()
+            .map(CompilationPool::snapshot);
         self.shutdown = true;
+        if let Some(performance) = self.performance.take() {
+            let cache_performance = self
+                .code_cache
+                .as_ref()
+                .and_then(|cache| cache.performance_snapshot());
+            match performance.write(
+                cache_performance.as_ref(),
+                compilation_pool_performance.as_ref(),
+            ) {
+                Ok(()) => log::info!(
+                    "JIT performance report written: path={}",
+                    performance.report_path().display()
+                ),
+                Err(detail) => log::error!("JIT performance report failed: {detail}"),
+            }
+        }
         self.binding = None;
         self.executable_memory = None;
         self.gateway = None;
         self.gateway_code = None;
         self.code_cache = None;
+        self.compilation_pool = None;
         self.diagnostics = None;
         self.controls.clear();
         Ok(())
@@ -410,18 +542,20 @@ struct JitExecutor {
     cpu: ProcessCpuContext,
     address_space_end: GuestVirtualAddress,
     frame: ExecutionFrame,
-    compiler: CompilerContext,
+    compilation_pool: CompilationPoolHandle,
     // Native execution retains the process arena for the executor's complete
     // lifetime; runtime drops every executor before releasing its domain.
-    executable_memory: SharedExecutableMemory,
+    _executable_memory: SharedExecutableMemory,
     gateway: NativeGateway,
     _gateway_code: PublishedCode,
     code_cache: Arc<DomainCodeCache>,
-    diagnostics: Option<Arc<JitDiagnostics>>,
+    performance_domain: Option<Arc<DomainPerformance>>,
+    performance: Option<ExecutorPerformance>,
     executor_epoch: ExecutorEpoch,
     local_lookup: LocalLookupCache,
+    hotness: HotnessTable,
     control: EngineControl,
-    exclusive_monitor: ExclusiveMonitorState,
+    exclusive_monitor: RefCell<ExclusiveMonitorState>,
     tlb: SoftwareTlb,
     mapping_epoch: u64,
     invalidation_cursor: nixe_memory::MemoryInvalidationCursor,
@@ -437,6 +571,9 @@ impl EngineExecutor for JitExecutor {
     }
 
     fn run_slice(&mut self, request: RunRequest<'_>) -> Result<ExecutionReport, EngineFault> {
+        if let Some(performance) = &mut self.performance {
+            performance.run_slices = performance.run_slices.saturating_add(1);
+        }
         if request.cpu != self.cpu {
             return Err(fault(
                 EngineFaultKind::InvalidRequest,
@@ -465,8 +602,10 @@ impl EngineExecutor for JitExecutor {
         self.frame.control.loader_return_valid = u32::from(request.loader_return.is_some());
         self.frame.control.loader_return =
             request.loader_return.map_or(0, GuestVirtualAddress::get);
+        self.frame.control.control_pending_address = self.control.pending_word_address();
+        self.frame.control.interrupt_pending_address = request.events.pending_interrupts_address();
 
-        let pending = self.control.take_pending();
+        let mut pending = self.control.take_pending();
         self.frame.control.event_mask = request.events.take_pending_interrupts();
         if let Some(snapshot) = pending {
             self.frame.control.request_flags =
@@ -485,6 +624,7 @@ impl EngineExecutor for JitExecutor {
                 data_fault: Option<nixe_cpu::memory::DataAccessFault>,
                 pending: Option<nixe_cpu_engine::ControlSnapshot>,
             },
+            Interpreted(nixe_cpu_engine::EngineExit),
             Frontend(FrontendError),
             Fault(EngineFaultKind, Box<str>),
             Panicked,
@@ -495,12 +635,38 @@ impl EngineExecutor for JitExecutor {
         let mut pending_link = None;
         let dispatch = {
             loop {
+                if let Some(snapshot) = self.control.take_pending() {
+                    self.frame.control.request_flags |=
+                        (u32::from(snapshot.contains(CrossVcpuRequest::Preempt)) * CONTROL_PREEMPT)
+                            | (u32::from(snapshot.contains(CrossVcpuRequest::CodeInvalidation))
+                                * CONTROL_CODE_INVALIDATION);
+                    self.frame.control.invalidation_epoch = self
+                        .frame
+                        .control
+                        .invalidation_epoch
+                        .max(snapshot.invalidation_epoch);
+                    pending = Some(match pending {
+                        Some(previous) => nixe_cpu_engine::ControlSnapshot {
+                            requests: previous.requests | snapshot.requests,
+                            invalidation_epoch: previous
+                                .invalidation_epoch
+                                .max(snapshot.invalidation_epoch),
+                        },
+                        None => snapshot,
+                    });
+                }
                 if let Err(error) = self.consume_invalidations(
                     request.memory,
                     request.memory.invalidation_cursor(),
                     request.state,
                 ) {
                     break DispatchResult::Fault(error.kind, error.message);
+                }
+                if pending.is_some_and(|snapshot| {
+                    snapshot.contains(CrossVcpuRequest::CodeInvalidation)
+                        && snapshot.invalidation_epoch <= self.invalidation_cursor.get()
+                }) {
+                    self.frame.control.request_flags &= !CONTROL_CODE_INVALIDATION;
                 }
                 self.frame.control.instruction_budget = request
                     .instruction_budget
@@ -538,84 +704,110 @@ impl EngineExecutor for JitExecutor {
                     root,
                 );
                 let cached = if let Some(region) = self.local_lookup.lookup(key) {
-                    Ok(region)
+                    if let Some(performance) = &mut self.performance {
+                        performance.local_cache_hits =
+                            performance.local_cache_hits.saturating_add(1);
+                    }
+                    Ok(Some(region))
                 } else {
-                    let cache = Arc::clone(&self.code_cache);
-                    let diagnostics = self.diagnostics.clone();
-                    let profile = request.cpu.profile();
-                    let compile_cursor = request.memory.invalidation_cursor();
-                    let result = cache.resolve(key, |cancellation| {
-                        cancellation.check()?;
-                        let region = translate_region(
-                            translation_mode.config(),
-                            &request.cpu.profile(),
-                            request.cpu.address_space_id(),
-                            location,
-                            request.memory,
-                        )?;
-                        if trace_jit {
-                            log::trace!(
-                                "JIT region compilation started: executor={:?} start=[{}] blocks={} entries={} exits={} guest_instructions={} guest_bytes={} ir_operations={} code_dependencies={}",
-                                self.id,
-                                region.metadata.start,
-                                region.blocks.len(),
-                                region.metadata.entries.len(),
-                                region.metadata.exits.len(),
-                                region.metadata.guest_instruction_count,
-                                region.metadata.guest_byte_count,
-                                region.metadata.ir_operation_count,
-                                region.metadata.code_dependencies.len(),
+                    if let Some(performance) = &mut self.performance {
+                        performance.local_cache_misses =
+                            performance.local_cache_misses.saturating_add(1);
+                    }
+                    if let Some(region) = self.code_cache.lookup_ready(key) {
+                        self.local_lookup.insert(key, Arc::clone(&region));
+                        Ok(Some(region))
+                    } else if let Some(completed) = self.compilation_pool.take_completed(key) {
+                        match completed.result {
+                            Ok(pending) => {
+                                match pending.dependencies_are_current(
+                                    request.memory,
+                                    request.cpu.address_space_id(),
+                                ) {
+                                    Ok(true) => {
+                                        if let Some(performance) = &mut self.performance {
+                                            performance.cache_miss_resolution_calls = performance
+                                                .cache_miss_resolution_calls
+                                                .saturating_add(1);
+                                        }
+                                        let started =
+                                            self.performance.as_ref().map(|_| Instant::now());
+                                        let result =
+                                            self.code_cache.resolve(key, |_| Ok(pending)).map(Some);
+                                        if let (Some(performance), Some(started)) =
+                                            (&mut self.performance, started)
+                                        {
+                                            ExecutorPerformance::add_duration(
+                                                &mut performance.cache_miss_resolution_ns,
+                                                started.elapsed(),
+                                            );
+                                        }
+                                        if let Ok(Some(region)) = &result {
+                                            self.local_lookup.insert(key, Arc::clone(region));
+                                        }
+                                        result
+                                    }
+                                    Ok(false) => Err(CacheError::Stale),
+                                    Err(error) => Err(CacheError::Frontend(error)),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        if !self.compilation_pool.contains(key) && self.hotness.should_compile(key)
+                        {
+                            let frontend_started =
+                                self.performance.as_ref().map(|_| Instant::now());
+                            let translated = translate_region(
+                                translation_mode.config(),
+                                &request.cpu.profile(),
+                                request.cpu.address_space_id(),
+                                location,
+                                request.memory,
                             );
-                        }
-                        cancellation.check()?;
-                        if request.memory.invalidation_cursor() != compile_cursor {
-                            return Err(CacheError::Stale);
-                        }
-                        let compiled = self.compiler.compile(
-                            &region,
-                            &self.executable_memory,
-                            cancellation,
-                        )?;
-                        if trace_jit {
-                            log::trace!(
-                                "JIT region compilation completed: executor={:?} start=[{}] native_entry={:#x} native_bytes={} sources={} side_exits={} link_sites={}",
-                                self.id,
-                                compiled.metadata.start,
-                                compiled.entry_address(),
-                                compiled.mapped_len(),
-                                compiled.metadata.sources.len(),
-                                compiled.metadata.side_exits.len(),
-                                compiled.metadata.link_sites.len(),
-                            );
-                        }
-                        cancellation.check()?;
-                        if request.memory.invalidation_cursor() != compile_cursor {
-                            return Err(CacheError::Stale);
-                        }
-                        if let Some(diagnostics) = &diagnostics {
-                            let dump = diagnostics
-                                .dump_region(&profile, &region, &compiled)
-                                .map_err(CacheError::Internal)?;
-                            if trace_jit {
-                                log::trace!(
-                                    "JIT region compilation dumped: executor={:?} start=[{}] directory={}",
-                                    self.id,
-                                    region.metadata.start,
-                                    dump.display()
+                            if let (Some(performance), Some(started)) =
+                                (&mut self.performance, frontend_started)
+                            {
+                                ExecutorPerformance::add_duration(
+                                    &mut performance.frontend_ns,
+                                    started.elapsed(),
                                 );
                             }
+                            match translated {
+                                Ok(region) => {
+                                    if trace_jit {
+                                        log::trace!(
+                                            "JIT region queued for asynchronous compilation: executor={:?} start=[{}] guest_instructions={} ir_operations={}",
+                                            self.id,
+                                            region.metadata.start,
+                                            region.metadata.guest_instruction_count,
+                                            region.metadata.ir_operation_count,
+                                        );
+                                    }
+                                    let enqueued = self.compilation_pool.enqueue(CompilationTask {
+                                        key,
+                                        address_space: request.cpu.address_space_id(),
+                                        mode: translation_mode,
+                                        region,
+                                    });
+                                    if enqueued && let Some(performance) = &mut self.performance {
+                                        performance.hot_promotions =
+                                            performance.hot_promotions.saturating_add(1);
+                                        performance.compilation_attempts =
+                                            performance.compilation_attempts.saturating_add(1);
+                                    }
+                                    #[cfg(test)]
+                                    if enqueued && self.compilation_pool.wait_for_completion(key) {
+                                        continue;
+                                    }
+                                    Ok(None)
+                                }
+                                Err(error) => Err(CacheError::Frontend(error)),
+                            }
+                        } else {
+                            Ok(None)
                         }
-                        PendingRegion::new(
-                            request.cpu.address_space_id(),
-                            translation_mode,
-                            &region,
-                            compiled,
-                        )
-                    });
-                    if let Ok(region) = &result {
-                        self.local_lookup.insert(key, Arc::clone(region));
                     }
-                    result
                 };
                 let cached = match cached {
                     Ok(cached) => cached,
@@ -641,11 +833,67 @@ impl EngineExecutor for JitExecutor {
                     }
                 };
 
+                let Some(cached) = cached else {
+                    if let Some(performance) = &mut self.performance {
+                        performance.cold_interpreter_steps =
+                            performance.cold_interpreter_steps.saturating_add(1);
+                    }
+                    pending_link = None;
+                    self.commit_or_fault(request.state, instructions_executed)?;
+                    let encoding =
+                        match fetch_current_instruction(request.memory, request.cpu, request.state)
+                        {
+                            Ok(encoding) => encoding,
+                            Err(fault) => {
+                                break DispatchResult::Interpreted(
+                                    nixe_cpu_engine::EngineExit::FetchFault { fault },
+                                );
+                            }
+                        };
+                    let context = InterpreterContext::new(request.cpu)
+                        .with_memory(request.memory)
+                        .with_exclusive_monitor(&self.exclusive_monitor)
+                        .with_architectural_timer_provider(request.timer)
+                        .with_vcpu_events(&request.events);
+                    let outcome = match execute_one_with_context(context, request.state, encoding) {
+                        Ok(outcome) => outcome,
+                        Err(InterpreterError::UnsupportedInstruction { .. }) => {
+                            self.hotness.promote(key);
+                            continue;
+                        }
+                        Err(error) => {
+                            break DispatchResult::Fault(
+                                EngineFaultKind::Internal,
+                                error.to_string().into_boxed_str(),
+                            );
+                        }
+                    };
+                    instructions_executed = instructions_executed.saturating_add(1);
+                    self.frame.import_state(request.state);
+                    match normalize_interpreter_outcome(outcome) {
+                        None => continue,
+                        Some(stop) => break DispatchResult::Interpreted(stop),
+                    }
+                };
+
                 if let Some((source, site, linked_location)) = pending_link.take() {
                     debug_assert_eq!(linked_location, location);
+                    if let Some(performance) = &mut self.performance {
+                        performance.link_attempts = performance.link_attempts.saturating_add(1);
+                    }
                     match self.code_cache.link(source, site, location, &cached) {
-                        Ok(()) => {}
-                        Err(CacheError::Stale) => continue,
+                        Ok(()) => {
+                            if let Some(performance) = &mut self.performance {
+                                performance.link_successes =
+                                    performance.link_successes.saturating_add(1);
+                            }
+                        }
+                        Err(CacheError::Stale) => {
+                            if let Some(performance) = &mut self.performance {
+                                performance.link_stale = performance.link_stale.saturating_add(1);
+                            }
+                            continue;
+                        }
                         Err(error) => {
                             break DispatchResult::Fault(
                                 EngineFaultKind::Internal,
@@ -669,13 +917,15 @@ impl EngineExecutor for JitExecutor {
                 let compiled = cached.compiled();
                 let mut native_context = NativeContext::new(
                     request.memory,
-                    &mut self.exclusive_monitor,
+                    self.exclusive_monitor.get_mut(),
                     &mut self.tlb,
                     &self.control,
                     request.cpu,
                     request.timer,
                     &request.events,
-                );
+                )
+                .with_invalidations(&self.code_cache, &mut self.invalidation_cursor)
+                .with_performance(self.performance.as_mut());
                 cached.install_dispatch(&mut self.frame);
                 self.frame.install_host_context(
                     &HELPER_TABLE,
@@ -693,12 +943,17 @@ impl EngineExecutor for JitExecutor {
                         compiled.mapped_len(),
                     );
                 }
+                if let Some(performance) = native_context.performance.as_deref_mut() {
+                    performance.native_entries = performance.native_entries.saturating_add(1);
+                }
+                let native_started = native_context.performance.as_ref().map(|_| Instant::now());
                 let native_exit = contain_rust_boundary(|| {
                     // SAFETY: the live cached region and imported frame remain
                     // valid for this complete non-unwinding native call.
                     unsafe { compiled.execute(self.gateway, &raw mut self.frame) };
                     self.frame.exit
                 });
+                let native_elapsed = native_started.map(|started| started.elapsed());
                 if trace_jit {
                     match &native_exit {
                         Ok(exit) => log::trace!(
@@ -725,6 +980,13 @@ impl EngineExecutor for JitExecutor {
                 let data_fault = native_context.data_fault.take();
                 let native_pending = native_context.control_snapshot.take();
                 drop(native_context);
+                if let (Some(performance), Some(elapsed)) = (&mut self.performance, native_elapsed)
+                {
+                    ExecutorPerformance::add_duration(&mut performance.native_ns, elapsed);
+                    if let Ok(exit) = &native_exit {
+                        performance.record_native_exit(exit.kind, exit.instructions_executed);
+                    }
+                }
                 let mut native_exit = match native_exit {
                     Ok(exit) => exit,
                     Err(()) => break DispatchResult::Panicked,
@@ -769,6 +1031,11 @@ impl EngineExecutor for JitExecutor {
             }
         };
 
+        if let Some(performance) = &mut self.performance {
+            performance.instructions_reported = performance
+                .instructions_reported
+                .saturating_add(instructions_executed);
+        }
         self.commit_or_fault(request.state, instructions_executed)?;
         self.acknowledge_snapshot(pending);
         match dispatch {
@@ -791,6 +1058,11 @@ impl EngineExecutor for JitExecutor {
                     context: request.state.register_context(),
                 })
             }
+            DispatchResult::Interpreted(stop) => Ok(ExecutionReport {
+                instructions_executed,
+                stop,
+                context: request.state.register_context(),
+            }),
             DispatchResult::Frontend(error) => Ok(ExecutionReport {
                 instructions_executed,
                 stop: normalize_frontend_error(error, instructions_executed, request.state)?,
@@ -860,8 +1132,9 @@ impl EngineExecutor for JitExecutor {
             ));
         }
         self.local_lookup.clear();
+        self.hotness.clear();
         self.tlb.clear();
-        self.exclusive_monitor.clear();
+        self.exclusive_monitor.get_mut().clear();
         self.invalidation_cursor = binding.invalidation_cursor;
         self.mapping_epoch = binding.mapping_epoch;
         self.frame.memory.mapping_epoch = binding.mapping_epoch;
@@ -872,7 +1145,17 @@ impl EngineExecutor for JitExecutor {
     }
 
     fn clear_local_exclusive_reservation(&mut self) {
-        self.exclusive_monitor.clear();
+        self.exclusive_monitor.get_mut().clear();
+    }
+}
+
+impl Drop for JitExecutor {
+    fn drop(&mut self) {
+        if let (Some(domain), Some(performance)) =
+            (&self.performance_domain, self.performance.take())
+        {
+            domain.record_executor(self.id, performance);
+        }
     }
 }
 
@@ -922,7 +1205,17 @@ impl JitExecutor {
                     ));
                 }
             };
-        self.code_cache
+        if let Some(performance) = &mut self.performance {
+            performance.invalidation_batches = performance.invalidation_batches.saturating_add(1);
+            performance.invalidation_records = performance
+                .invalidation_records
+                .saturating_add(records.len() as u64);
+            performance.invalidation_history_lost = performance
+                .invalidation_history_lost
+                .saturating_add(u64::from(history_lost));
+        }
+        let _effect = self
+            .code_cache
             .apply_invalidations(&records, through, history_lost)
             .map_err(|error| {
                 fault(
@@ -1023,6 +1316,42 @@ impl JitExecutor {
                 state,
             )
         })
+    }
+}
+
+fn normalize_interpreter_outcome(
+    outcome: InterpreterOutcome,
+) -> Option<nixe_cpu_engine::EngineExit> {
+    match outcome {
+        InterpreterOutcome::Resume(_) => None,
+        InterpreterOutcome::Exception {
+            source,
+            kind: ExceptionKind::SupervisorCall,
+            syndrome: Some(syndrome),
+        } if let Ok(immediate) = u32::try_from(syndrome) => {
+            Some(nixe_cpu_engine::EngineExit::SupervisorCall { source, immediate })
+        }
+        InterpreterOutcome::Exception {
+            source,
+            kind,
+            syndrome,
+        } => Some(nixe_cpu_engine::EngineExit::ArchitecturalException {
+            source,
+            kind,
+            syndrome,
+        }),
+        InterpreterOutcome::Scheduled { source, request } => {
+            Some(nixe_cpu_engine::EngineExit::Scheduled { source, request })
+        }
+        InterpreterOutcome::DataAbort { source, fault } => {
+            Some(nixe_cpu_engine::EngineExit::DataFault { source, fault })
+        }
+        InterpreterOutcome::ProfileDisabled(error) => {
+            Some(nixe_cpu_engine::EngineExit::ProfileDisabled { error })
+        }
+        InterpreterOutcome::Unallocated(error) => {
+            Some(nixe_cpu_engine::EngineExit::UnallocatedEncoding { error })
+        }
     }
 }
 
@@ -1391,6 +1720,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use nixe_cpu::memory::{
         CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
@@ -1517,7 +1847,7 @@ mod tests {
                 cpu: cpu(),
                 memory: &memory,
                 state: &mut state,
-                instruction_budget: 1,
+                instruction_budget: 3,
                 loader_return: None,
                 timer: &FixedTimer,
                 events: nixe_cpu_engine::VcpuEventState::default(),
@@ -1525,7 +1855,7 @@ mod tests {
             .unwrap();
 
         let session = only_directory(dump.path());
-        let region = only_directory(&session);
+        let region = wait_for_only_directory(&session);
         assert!(region.join("complete").is_file());
         assert!(region.join("metadata.txt").is_file());
         assert!(region.join("guest.asm").is_file());
@@ -1546,6 +1876,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_performance_report_is_written_at_domain_shutdown() {
+        let dump = TemporaryDumpDirectory::new();
+        let report_path = dump.path().join("jit-performance.toml");
+        let compilation_dump = dump.path().join("jit");
+        let configuration = JitConfiguration::default()
+            .with_performance_report(Some(report_path.clone()))
+            .with_dump_directory(Some(compilation_dump.clone()));
+        let provider = JitProvider::with_configuration(configuration);
+        let binding_memory = ExecutionMemory::new();
+        let mut domain = provider
+            .create_domain(DomainRequest {
+                domain: EngineDomainId::new(9),
+                cpu: cpu(),
+            })
+            .unwrap();
+
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(80);
+        assert!(memory.add_ram_page(code_page));
+        assert!(memory.initialize_ram(code_page, 0, &0x1400_0000_u32.to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let binding = DomainMemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(1 << 39),
+            memory: &binding_memory,
+            mapping_epoch: 3,
+            invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+        };
+        domain.bind_memory(binding).unwrap();
+        drop(domain.create_executor(EngineExecutorId::new(11)).unwrap());
+        let mut executor = domain.create_executor(EngineExecutorId::new(11)).unwrap();
+        let mut a64 = A64State::default();
+        a64.set_pc(0x1000);
+        let mut state = ThreadCpuState::A64(Box::new(a64));
+        executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 3,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
+
+        let session = only_directory(&compilation_dump);
+        let _region = wait_for_only_directory(&session);
+        for _ in 0..16 {
+            executor
+                .run_slice(RunRequest {
+                    cpu: cpu(),
+                    memory: &memory,
+                    state: &mut state,
+                    instruction_budget: 1,
+                    loader_return: None,
+                    timer: &FixedTimer,
+                    events: nixe_cpu_engine::VcpuEventState::default(),
+                })
+                .unwrap();
+            std::thread::yield_now();
+        }
+
+        domain.request_stop().unwrap();
+        executor.prepare_shutdown(binding, &state).unwrap();
+        drop(executor);
+        domain.shutdown().unwrap();
+
+        let report = fs::read_to_string(report_path).unwrap();
+        toml::from_str::<toml::Value>(&report).unwrap();
+        assert!(report.contains("nixe_jit_performance_version=6"));
+        assert!(report.contains("[domain.9]"));
+        assert!(report.contains("[domain.9.executor.11]"));
+        assert!(report.contains("codegen_completed=1"));
+        assert!(report.contains("regions_published=1"));
+        assert!(report.contains("unique_region_keys=1"));
+        assert!(report.contains("repeat_builds=0"));
+        assert!(report.contains("native_entries="));
+        assert!(report.contains("native_instructions="));
+        assert!(report.contains("cold_interpreter_steps="));
+        assert!(report.contains("compiled_native_named_operations="));
+        assert!(report.contains("compiled_semantic_helper_callsites="));
+        assert!(report.contains("helper_system_polls=0"));
+        assert!(report.contains("compilation_pool_workers="));
+    }
+
     fn only_directory(parent: &Path) -> PathBuf {
         let entries: Vec<_> = fs::read_dir(parent)
             .unwrap()
@@ -1554,6 +1976,22 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         entries.into_iter().next().unwrap()
+    }
+
+    fn wait_for_only_directory(parent: &Path) -> PathBuf {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let entries: Vec<_> = fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .collect();
+            if entries.len() == 1 && entries[0].join("complete").is_file() {
+                return entries.into_iter().next().unwrap();
+            }
+            assert!(Instant::now() < deadline, "asynchronous JIT dump timed out");
+            std::thread::yield_now();
+        }
     }
 
     fn executor_for_execution_memory(
@@ -3331,10 +3769,17 @@ mod tests {
             })
         };
 
-        assert_eq!(
-            run(executor.as_mut(), &memory, &mut state, 2).unwrap().stop,
-            nixe_cpu_engine::EngineExit::BudgetExhausted
-        );
+        // Three visits promote 0x1000 and execute the third ADD natively.
+        for _ in 0..3 {
+            let ThreadCpuState::A64(a64) = &mut state else {
+                unreachable!()
+            };
+            a64.set_pc(0x1000);
+            assert_eq!(
+                run(executor.as_mut(), &memory, &mut state, 1).unwrap().stop,
+                nixe_cpu_engine::EngineExit::BudgetExhausted
+            );
+        }
         // Replace ADD #1 with ADD #2 after the first native region is cached.
         assert!(memory.initialize_ram(code_page, 0, &0x9100_0800_u32.to_le_bytes()));
         let ThreadCpuState::A64(a64) = &mut state else {
@@ -3348,7 +3793,66 @@ mod tests {
         let ThreadCpuState::A64(a64) = state else {
             unreachable!()
         };
-        assert_eq!(a64.read_x(x0), 3);
+        assert_eq!(a64.read_x(x0), 5);
+    }
+
+    #[test]
+    fn unrelated_executable_writes_do_not_force_native_safepoints() {
+        let (_domain, mut executor) = bound_executor();
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(91);
+        let observed_data_page = GuestPhysicalPageId::new(92);
+        assert!(memory.add_ram_page(code_page));
+        assert!(memory.add_ram_page(observed_data_page));
+        // STR X1,[X0]; B 0x1000.
+        assert!(memory.initialize_ram(code_page, 0, &0xf900_0001_u32.to_le_bytes()));
+        assert!(memory.initialize_ram(code_page, 4, &0x17ff_ffff_u32.to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x8000),
+            observed_data_page,
+            MemoryPermissions::READ_WRITE,
+        ));
+        // The executable alias makes writes publish executable-content
+        // invalidations, but no compiled region depends on this physical page.
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x9000),
+            observed_data_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let mut a64 = A64State::default();
+        a64.set_pc(0x1000);
+        a64.write_x(
+            A64Register::General(A64GeneralRegister::new(0).unwrap()),
+            0x8000,
+        );
+        a64.write_x(
+            A64Register::General(A64GeneralRegister::new(1).unwrap()),
+            0x1234_5678_9abc_def0,
+        );
+        let mut state = ThreadCpuState::A64(Box::new(a64));
+
+        let report = executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 20,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
+
+        assert_eq!(report.instructions_executed, 20);
+        assert_eq!(report.stop, nixe_cpu_engine::EngineExit::BudgetExhausted);
     }
 
     #[test]
