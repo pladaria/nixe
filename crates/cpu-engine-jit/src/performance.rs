@@ -7,16 +7,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nixe_cpu::ir::region::IrRegion;
 use nixe_cpu_engine::{EngineDomainId, EngineExecutorId};
 
 use crate::abi::{
     EXIT_ARCHITECTURAL, EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERNAL,
-    EXIT_INTERPRET_ONE, EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT,
-    EXIT_SCHEDULED, EXIT_UNSUPPORTED,
+    EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT, EXIT_SCHEDULED,
+    EXIT_UNSUPPORTED,
 };
 use crate::compilation_pool::CompilationPoolSnapshot;
+use crate::compiler::{CompilationMetrics, CompiledRegion};
+use crate::{cache::LinkOutcome, links::LinkKind};
 
-const REPORT_VERSION: u32 = 7;
+const REPORT_VERSION: u32 = 10;
 const EXIT_KIND_COUNT: usize = EXIT_INTERNAL as usize + 1;
 
 pub(crate) struct JitPerformanceReport {
@@ -43,8 +46,9 @@ impl JitPerformanceReport {
             .unwrap_or_default()
             .as_millis();
         let header = format!(
-            "nixe_jit_performance_version={REPORT_VERSION}\nprocess_id={}\nstarted_unix_ms={started_unix_ms}\nhost_debug_assertions={}\ncranelift_opt_level=\"none\"\ncranelift_opt_level_source=\"default\"\ncranelift_pass_timing=true\ncold_tier=\"interpreter\"\nhot_promotion_visits=3\nasynchronous_compilation=true\ncompilation_workers_policy=\"max(1,host_logical_cores/2)\"\nnative_poll_fast_path=true\n",
+            "nixe_jit_performance_version={REPORT_VERSION}\nprocess_id={}\nstarted_unix_ms={started_unix_ms}\nhost_debug_assertions={}\nlight_tier=\"cranelift-none-single-pass-synchronous\"\nlight_cranelift_verifier={}\noptimized_tier=\"cranelift-speed-backtracking-asynchronous\"\noptimized_cranelift_verifier=true\nhot_promotion_entries=100\npromotion_queue=\"lifo-deduplicated-direct-publication\"\ncompilation_workers_policy=\"max(1,host_logical_cores/2)\"\ncranelift_pass_timing=true\nnative_poll_fast_path=true\nlink_pic_policy=\"four-way-round-robin-replacement\"\nguest_invalidation_prefilter=true\ninstruction_boundary=\"entry-hoisted-control-ssa-budget-shared-exit\"\n",
             std::process::id(),
+            cfg!(debug_assertions),
             cfg!(debug_assertions),
         );
         fs::write(path, header).map_err(|error| {
@@ -81,9 +85,7 @@ impl JitPerformanceReport {
             total.merge(counters);
         }
         if let Some(pool) = compilation_pool {
-            total.codegen_completed = total
-                .codegen_completed
-                .saturating_add(pool.completed.saturating_sub(pool.failed));
+            total.codegen_completed = total.codegen_completed.saturating_add(pool.published);
             total.worker_compilation_ns = total
                 .worker_compilation_ns
                 .saturating_add(pool.worker_total_ns);
@@ -275,7 +277,6 @@ pub(crate) struct ExecutorPerformance {
     pub(crate) local_cache_misses: u64,
     pub(crate) cache_miss_resolution_calls: u64,
     pub(crate) cache_miss_resolution_ns: u64,
-    pub(crate) cold_interpreter_steps: u64,
     pub(crate) hot_promotions: u64,
     pub(crate) compilation_attempts: u64,
     pub(crate) codegen_completed: u64,
@@ -310,14 +311,18 @@ pub(crate) struct ExecutorPerformance {
     pub(crate) native_entries: u64,
     pub(crate) native_ns: u64,
     pub(crate) native_instructions: u64,
-    pub(crate) link_attempts: u64,
-    pub(crate) link_successes: u64,
+    pub(crate) link_direct_published: u64,
+    pub(crate) link_direct_already_present: u64,
+    pub(crate) link_direct_pic_full: u64,
+    pub(crate) link_indirect_published: u64,
+    pub(crate) link_indirect_already_present: u64,
+    pub(crate) link_indirect_pic_full: u64,
     pub(crate) link_stale: u64,
     pub(crate) invalidation_batches: u64,
     pub(crate) invalidation_records: u64,
     pub(crate) invalidation_history_lost: u64,
-    pub(crate) filtered_invalidation_polls: u64,
-    pub(crate) relevant_invalidation_polls: u64,
+    pub(crate) invalidation_checks_filtered: u64,
+    pub(crate) invalidation_checks_relevant: u64,
     pub(crate) helper_memory_reads: u64,
     pub(crate) helper_memory_writes: u64,
     pub(crate) helper_atomics: u64,
@@ -333,11 +338,80 @@ impl ExecutorPerformance {
         *target = target.saturating_add(duration_ns(elapsed));
     }
 
+    pub(crate) fn record_light_compilation(
+        &mut self,
+        region: &IrRegion,
+        compiled: &CompiledRegion,
+        metrics: CompilationMetrics,
+    ) {
+        self.codegen_completed = self.codegen_completed.saturating_add(1);
+        macro_rules! add {
+            ($field:ident, $value:expr) => {
+                self.$field = self.$field.saturating_add($value)
+            };
+        }
+        add!(nixe_ir_verify_ns, metrics.nixe_ir_verify_ns);
+        add!(state_validation_ns, metrics.state_validation_ns);
+        add!(lowering_ns, metrics.lowering_ns);
+        add!(cranelift_compile_ns, metrics.cranelift_compile_ns);
+        add!(cranelift_verifier_ns, metrics.cranelift_verifier_ns);
+        add!(cranelift_optimize_ns, metrics.cranelift_optimize_ns);
+        add!(cranelift_vcode_lower_ns, metrics.cranelift_vcode_lower_ns);
+        add!(cranelift_regalloc_ns, metrics.cranelift_regalloc_ns);
+        add!(cranelift_emit_ns, metrics.cranelift_emit_ns);
+        add!(cranelift_other_ns, metrics.cranelift_other_ns);
+        add!(publication_total_ns, metrics.publication.total_ns);
+        add!(publication_lock_wait_ns, metrics.publication.lock_wait_ns);
+        add!(publication_allocation_ns, metrics.publication.allocation_ns);
+        add!(publication_zero_copy_ns, metrics.publication.zero_copy_ns);
+        add!(publication_protection_ns, metrics.publication.protection_ns);
+        add!(
+            publication_instruction_cache_ns,
+            metrics.publication.instruction_cache_ns
+        );
+        add!(
+            compiled_guest_instructions,
+            u64::from(region.metadata.guest_instruction_count)
+        );
+        add!(
+            compiled_ir_operations,
+            u64::from(region.metadata.ir_operation_count)
+        );
+        add!(compiled_clif_instructions, metrics.clif_instructions);
+        add!(compiled_clif_blocks, metrics.clif_blocks);
+        add!(compiled_native_code_bytes, metrics.native_code_bytes);
+        add!(compiled_native_mapped_bytes, metrics.native_mapped_bytes);
+        add!(
+            compiled_native_named_operations,
+            compiled.metadata.native_named_operations
+        );
+        add!(
+            compiled_semantic_helper_callsites,
+            compiled.metadata.semantic_calls.len() as u64
+        );
+    }
+
     pub(crate) fn record_native_exit(&mut self, kind: u32, instructions: u64) {
         self.native_instructions = self.native_instructions.saturating_add(instructions);
         if let Some(count) = self.exit_kinds.get_mut(kind as usize) {
             *count = count.saturating_add(1);
         }
+    }
+
+    pub(crate) fn record_link(&mut self, kind: LinkKind, outcome: LinkOutcome) {
+        let counter = match (kind, outcome) {
+            (LinkKind::Direct, LinkOutcome::Published) => &mut self.link_direct_published,
+            (LinkKind::Direct, LinkOutcome::AlreadyPresent) => {
+                &mut self.link_direct_already_present
+            }
+            (LinkKind::Direct, LinkOutcome::PicFull) => &mut self.link_direct_pic_full,
+            (LinkKind::Indirect, LinkOutcome::Published) => &mut self.link_indirect_published,
+            (LinkKind::Indirect, LinkOutcome::AlreadyPresent) => {
+                &mut self.link_indirect_already_present
+            }
+            (LinkKind::Indirect, LinkOutcome::PicFull) => &mut self.link_indirect_pic_full,
+        };
+        *counter = counter.saturating_add(1);
     }
 
     fn merge(&mut self, other: &Self) {
@@ -353,7 +427,6 @@ impl ExecutorPerformance {
             local_cache_misses,
             cache_miss_resolution_calls,
             cache_miss_resolution_ns,
-            cold_interpreter_steps,
             hot_promotions,
             compilation_attempts,
             codegen_completed,
@@ -388,14 +461,18 @@ impl ExecutorPerformance {
             native_entries,
             native_ns,
             native_instructions,
-            link_attempts,
-            link_successes,
+            link_direct_published,
+            link_direct_already_present,
+            link_direct_pic_full,
+            link_indirect_published,
+            link_indirect_already_present,
+            link_indirect_pic_full,
             link_stale,
             invalidation_batches,
             invalidation_records,
             invalidation_history_lost,
-            filtered_invalidation_polls,
-            relevant_invalidation_polls,
+            invalidation_checks_filtered,
+            invalidation_checks_relevant,
             helper_memory_reads,
             helper_memory_writes,
             helper_atomics,
@@ -428,7 +505,6 @@ fn render_counters(output: &mut String, counters: &ExecutorPerformance) {
         "cache_miss_resolution_ns",
         counters.cache_miss_resolution_ns
     );
-    field!("cold_interpreter_steps", counters.cold_interpreter_steps);
     field!("hot_promotions", counters.hot_promotions);
     field!("compilation_attempts", counters.compilation_attempts);
     field!("codegen_completed", counters.codegen_completed);
@@ -505,8 +581,18 @@ fn render_counters(output: &mut String, counters: &ExecutorPerformance) {
         counters.native_instructions as f64 * 1_000_000_000.0 / counters.native_ns as f64
     };
     writeln!(output, "native_ips={native_ips:.3}").unwrap();
-    field!("link_attempts", counters.link_attempts);
-    field!("link_successes", counters.link_successes);
+    field!("link_direct_published", counters.link_direct_published);
+    field!(
+        "link_direct_already_present",
+        counters.link_direct_already_present
+    );
+    field!("link_direct_pic_full", counters.link_direct_pic_full);
+    field!("link_indirect_published", counters.link_indirect_published);
+    field!(
+        "link_indirect_already_present",
+        counters.link_indirect_already_present
+    );
+    field!("link_indirect_pic_full", counters.link_indirect_pic_full);
     field!("link_stale", counters.link_stale);
     field!("invalidation_batches", counters.invalidation_batches);
     field!("invalidation_records", counters.invalidation_records);
@@ -515,12 +601,12 @@ fn render_counters(output: &mut String, counters: &ExecutorPerformance) {
         counters.invalidation_history_lost
     );
     field!(
-        "filtered_invalidation_polls",
-        counters.filtered_invalidation_polls
+        "invalidation_checks_filtered",
+        counters.invalidation_checks_filtered
     );
     field!(
-        "relevant_invalidation_polls",
-        counters.relevant_invalidation_polls
+        "invalidation_checks_relevant",
+        counters.invalidation_checks_relevant
     );
     field!("helper_memory_reads", counters.helper_memory_reads);
     field!("helper_memory_writes", counters.helper_memory_writes);
@@ -531,7 +617,6 @@ fn render_counters(output: &mut String, counters: &ExecutorPerformance) {
     field!("helper_system_other", counters.helper_system_other);
     for (kind, name) in [
         (EXIT_NONE, "none"),
-        (EXIT_INTERPRET_ONE, "interpret_one"),
         (EXIT_BUDGET_EXHAUSTED, "budget_exhausted"),
         (EXIT_SAFEPOINT, "safepoint"),
         (EXIT_PENDING_EVENT, "pending_event"),
@@ -560,8 +645,9 @@ fn render_compilation_pool_counters(output: &mut String, counters: &CompilationP
     field!("queued_discarded", counters.queued_discarded);
     field!("started", counters.started);
     field!("completed", counters.completed);
+    field!("published", counters.published);
+    field!("stale", counters.stale);
     field!("failed", counters.failed);
-    field!("completed_discarded", counters.completed_discarded);
     field!("peak_queued", counters.peak_queued);
     field!("peak_running", counters.peak_running);
     field!("worker_total_ns", counters.worker_total_ns);
@@ -637,6 +723,7 @@ pub(crate) struct CachePerformanceSnapshot {
     pub(crate) build_stale: u64,
     pub(crate) build_failures: u64,
     pub(crate) regions_published: u64,
+    pub(crate) tier_upgrades: u64,
     pub(crate) publish_stale: u64,
     pub(crate) unique_region_keys: u64,
     pub(crate) recompiled_region_keys: u64,
@@ -668,6 +755,7 @@ fn render_cache_counters(output: &mut String, counters: &CachePerformanceSnapsho
     field!("cache_build_stale", counters.build_stale);
     field!("cache_build_failures", counters.build_failures);
     field!("regions_published", counters.regions_published);
+    field!("tier_upgrades", counters.tier_upgrades);
     field!("publish_stale", counters.publish_stale);
     field!("unique_region_keys", counters.unique_region_keys);
     field!("recompiled_region_keys", counters.recompiled_region_keys);

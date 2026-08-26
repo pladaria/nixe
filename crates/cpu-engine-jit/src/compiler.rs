@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::mem::{offset_of, size_of};
 use std::rc::Rc;
@@ -42,7 +42,9 @@ use nixe_cpu::{
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::CacheMaintenanceKind,
     semantics::{
-        a64::HintOperation, a64_fp_simd::semantic_instruction, immediate::decode_a64_bit_masks,
+        a64::HintOperation,
+        a64_fp_simd::{SemanticInput, semantic_inputs, semantic_instruction},
+        immediate::decode_a64_bit_masks,
     },
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
@@ -54,16 +56,19 @@ use nixe_memory::{
 use crate::{
     abi::{
         EXECUTION_STATE_A32, EXECUTION_STATE_A64, EXECUTION_STATE_T32, EXIT_ARCHITECTURAL,
-        EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERNAL, EXIT_INTERPRET_ONE,
-        EXIT_LOADER_RETURN, EXIT_PENDING_EVENT, EXIT_SAFEPOINT, EXIT_SCHEDULED, EXIT_UNSUPPORTED,
-        FRAME_OFFSETS, HELPER_OFFSETS, NativeEntryAddress, NativeGateway, SCHEDULE_SEND_EVENT,
+        EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERNAL, EXIT_LOADER_RETURN,
+        EXIT_PENDING_EVENT, EXIT_SAFEPOINT, EXIT_SCHEDULED, EXIT_UNSUPPORTED, FRAME_OFFSETS,
+        HELPER_OFFSETS, NativeEntryAddress, NativeGateway, SCHEDULE_SEND_EVENT,
         SCHEDULE_WAIT_FOR_EVENT, SCHEDULE_WAIT_FOR_INTERRUPT, SCHEDULE_YIELD,
         SYSTEM_CACHE_DATA_CLEAN, SYSTEM_CACHE_DATA_CLEAN_INVALIDATE, SYSTEM_CACHE_DATA_INVALIDATE,
-        SYSTEM_CACHE_INSTRUCTION_INVALIDATE, SYSTEM_CACHE_INSTRUCTION_PREFETCH, SYSTEM_POLL,
-        SYSTEM_READ_RUNTIME_REGISTER, SYSTEM_SEND_EVENT_LOCAL, SYSTEM_WAIT_FOR_EVENT,
-        SYSTEM_WAIT_FOR_INTERRUPT,
+        SYSTEM_CACHE_INSTRUCTION_INVALIDATE, SYSTEM_CACHE_INSTRUCTION_PREFETCH,
+        SYSTEM_HOTNESS_PROMOTION, SYSTEM_POLL, SYSTEM_READ_RUNTIME_REGISTER,
+        SYSTEM_SEND_EVENT_LOCAL, SYSTEM_WAIT_FOR_EVENT, SYSTEM_WAIT_FOR_INTERRUPT,
     },
-    cache::{CompilationCancellation, CompilationCancellationReason},
+    cache::{
+        CompilationCancellation, CompilationCancellationReason, HOT_PROMOTION_ENTRIES,
+        PROMOTION_COUNTING, PROMOTION_ENTRIES_OFFSET, PROMOTION_STATE_OFFSET,
+    },
     executable_memory::{
         ExecutableMemoryError, PublicationMetrics, PublishedCode, SharedExecutableMemory,
         publish_code,
@@ -90,6 +95,7 @@ pub(crate) enum SideExit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SemanticCall {
     pub(crate) helper: Box<str>,
+    pub(crate) argument_count: u8,
     pub(crate) result_types: Box<[IrType]>,
 }
 
@@ -180,14 +186,38 @@ struct StateSlot {
     variable: Variable,
     ty: ir::Type,
     offset: i32,
+    dirty: bool,
+}
+
+#[derive(Default)]
+struct StateAccessPlan {
+    accessed: HashSet<StateRegister>,
+    dirty: HashSet<StateRegister>,
+}
+
+impl StateAccessPlan {
+    fn read(&mut self, register: StateRegister) {
+        self.accessed.insert(register);
+    }
+
+    fn write(&mut self, register: StateRegister) {
+        self.accessed.insert(register);
+        self.dirty.insert(register);
+    }
 }
 
 struct LoweringState {
     frame: ir::Value,
     retired: Variable,
+    remaining_budget: Variable,
+    carried_retired: ir::Value,
+    loader_return: Option<ir::Value>,
+    control_pending_address: Option<ir::Value>,
+    interrupt_pending_address: Option<ir::Value>,
     execution_state: Variable,
     state: Vec<StateSlot>,
     blocks: Vec<ir::Block>,
+    boundary_exit: ir::Block,
     exit: ir::Block,
     sources: Vec<LocationDescriptor>,
     source_indices: HashMap<LocationDescriptor, u32>,
@@ -363,7 +393,7 @@ pub(crate) struct CompilerContext {
     isa: OwnedTargetIsa,
     context: Context,
     builder: FunctionBuilderContext,
-    timing: Option<CraneliftTimingCollector>,
+    collect_performance: bool,
 }
 
 impl CompilerContext {
@@ -380,7 +410,7 @@ impl CompilerContext {
             isa,
             context: Context::new(),
             builder: FunctionBuilderContext::new(),
-            timing: collect_performance.then(CraneliftTimingCollector::install),
+            collect_performance,
         }
     }
 
@@ -389,16 +419,20 @@ impl CompilerContext {
         region: &IrRegion,
         executable_memory: &SharedExecutableMemory,
         cancellation: CompilationCancellation<'_>,
+        promotion_address: Option<usize>,
         metrics: &mut CompilationMetrics,
     ) -> Result<CompiledRegion, CompilerError> {
         check_cancellation(cancellation)?;
-        let started = self.timing.as_ref().map(|_| Instant::now());
+        let timing = self
+            .collect_performance
+            .then(CraneliftTimingCollector::install);
+        let started = timing.as_ref().map(|_| Instant::now());
         verify_region(region)
             .map_err(|error| CompilerError::new(format!("Nixe IR verification failed: {error}")))?;
         if let Some(started) = started {
             metrics.nixe_ir_verify_ns = duration_ns(started.elapsed());
         }
-        let started = self.timing.as_ref().map(|_| Instant::now());
+        let started = timing.as_ref().map(|_| Instant::now());
         validate_region_state(region)?;
         if let Some(started) = started {
             metrics.state_validation_ns = duration_ns(started.elapsed());
@@ -413,7 +447,7 @@ impl CompilerContext {
             .params
             .push(AbiParam::new(self.isa.pointer_type()));
 
-        let started = self.timing.as_ref().map(|_| Instant::now());
+        let started = timing.as_ref().map(|_| Instant::now());
         let builder = FunctionBuilder::new(&mut self.context.func, &mut self.builder);
         let metadata = lower_region(
             builder,
@@ -421,14 +455,15 @@ impl CompilerContext {
             self.isa.frontend_config(),
             self.isa.default_call_conv(),
             cancellation,
+            promotion_address,
         )?;
         if let Some(started) = started {
             metrics.lowering_ns = duration_ns(started.elapsed());
         }
         metrics.clif_instructions = self.context.func.dfg.num_insts() as u64;
         metrics.clif_blocks = self.context.func.dfg.num_blocks() as u64;
-        let pass_before = self.timing.as_ref().map(CraneliftTimingCollector::snapshot);
-        let cranelift_started = self.timing.as_ref().map(|_| Instant::now());
+        let pass_before = timing.as_ref().map(CraneliftTimingCollector::snapshot);
+        let cranelift_started = timing.as_ref().map(|_| Instant::now());
         #[cfg(debug_assertions)]
         cranelift_codegen::verifier::verify_function(&self.context.func, self.isa.as_ref())
             .map_err(|errors| {
@@ -447,7 +482,7 @@ impl CompilerContext {
         if let Some(started) = cranelift_started {
             metrics.cranelift_compile_ns = duration_ns(started.elapsed());
         }
-        if let (Some(timing), Some(before)) = (&self.timing, pass_before) {
+        if let (Some(timing), Some(before)) = (&timing, pass_before) {
             let passes = timing.metrics_since(before);
             metrics.cranelift_verifier_ns = passes.verifier_ns;
             metrics.cranelift_optimize_ns = passes.optimize_ns;
@@ -567,8 +602,15 @@ fn lower_region(
     frontend_config: TargetFrontendConfig,
     helper_call_conv: CallConv,
     cancellation: CompilationCancellation<'_>,
+    promotion_address: Option<usize>,
 ) -> Result<CompiledRegionMetadata, CompilerError> {
-    let metadata = lower_region_body(&mut builder, region, helper_call_conv, cancellation)?;
+    let metadata = lower_region_body(
+        &mut builder,
+        region,
+        helper_call_conv,
+        cancellation,
+        promotion_address,
+    )?;
     builder.finalize(frontend_config);
     Ok(metadata)
 }
@@ -578,6 +620,7 @@ fn lower_region_body(
     region: &IrRegion,
     helper_call_conv: CallConv,
     cancellation: CompilationCancellation<'_>,
+    promotion_address: Option<usize>,
 ) -> Result<CompiledRegionMetadata, CompilerError> {
     check_cancellation(cancellation)?;
     let entry = builder.create_block();
@@ -588,6 +631,7 @@ fn lower_region_body(
         .map(|_| builder.create_block())
         .collect();
     let invalid_entry = builder.create_block();
+    let boundary_exit = create_boundary_exit_block(builder);
     let exit = create_exit_block(builder);
     builder.switch_to_block(entry);
     builder.seal_block(entry);
@@ -595,16 +639,70 @@ fn lower_region_body(
     let retired = builder.declare_var(types::I64);
     let zero = builder.ins().iconst(types::I64, 0);
     builder.def_var(retired, zero);
+    let carried_retired = load(builder, types::I64, frame, FRAME_OFFSETS.dispatch_retired)?;
+    let instruction_budget = load(
+        builder,
+        types::I64,
+        frame,
+        FRAME_OFFSETS.control_instruction_budget,
+    )?;
+    let remaining_budget = builder.declare_var(types::I64);
+    let remaining = builder.ins().isub(instruction_budget, carried_retired);
+    builder.def_var(remaining_budget, remaining);
+    let loader_return = if region.metadata.start.execution_state == ExecutionState::A64 {
+        Some(load(
+            builder,
+            types::I64,
+            frame,
+            FRAME_OFFSETS.control_loader_return,
+        )?)
+    } else {
+        None
+    };
+    let polls_control = !region.metadata.safepoints.is_empty();
+    let pointer_type = builder.func.dfg.value_type(frame);
+    let control_pending_address = polls_control
+        .then(|| {
+            load(
+                builder,
+                pointer_type,
+                frame,
+                FRAME_OFFSETS.control_pending_address,
+            )
+        })
+        .transpose()?;
+    let interrupt_pending_address = polls_control
+        .then(|| {
+            load(
+                builder,
+                pointer_type,
+                frame,
+                FRAME_OFFSETS.interrupt_pending_address,
+            )
+        })
+        .transpose()?;
     let execution_state = builder.declare_var(types::I32);
     let imported_state = load(builder, types::I32, frame, FRAME_OFFSETS.execution_state)?;
     builder.def_var(execution_state, imported_state);
-    let state = declare_state(builder, region.metadata.start.execution_state, frame)?;
+    let state_plan = state_access_plan(region);
+    let state = declare_state(
+        builder,
+        region.metadata.start.execution_state,
+        frame,
+        &state_plan,
+    )?;
     let mut lowering = LoweringState {
         frame,
         retired,
+        remaining_budget,
+        carried_retired,
+        loader_return,
+        control_pending_address,
+        interrupt_pending_address,
         execution_state,
         state,
         blocks,
+        boundary_exit,
         exit,
         sources: Vec::new(),
         source_indices: HashMap::new(),
@@ -615,6 +713,9 @@ fn lower_region_body(
         helper_call_conv,
     };
 
+    if let Some(promotion_address) = promotion_address {
+        emit_hotness_counter(builder, &lowering, promotion_address)?;
+    }
     emit_entry_dispatch(builder, region, &lowering, invalid_entry)?;
     builder.switch_to_block(invalid_entry);
     emit_exit(
@@ -639,6 +740,7 @@ fn lower_region_body(
             cancellation,
         )?;
     }
+    lower_boundary_exit_block(builder, &lowering);
     lower_exit_block(builder, &lowering)?;
     builder.seal_all_blocks();
     let metadata = CompiledRegionMetadata {
@@ -650,6 +752,14 @@ fn lower_region_body(
         link_sites: lowering.link_sites.into_boxed_slice(),
     };
     Ok(metadata)
+}
+
+fn create_boundary_exit_block(builder: &mut FunctionBuilder<'_>) -> ir::Block {
+    let block = builder.create_block();
+    for ty in [types::I32, types::I64, types::I64] {
+        builder.append_block_param(block, ty);
+    }
+    block
 }
 
 fn create_exit_block(builder: &mut FunctionBuilder<'_>) -> ir::Block {
@@ -665,6 +775,61 @@ fn create_exit_block(builder: &mut FunctionBuilder<'_>) -> ir::Block {
         builder.append_block_param(block, ty);
     }
     block
+}
+
+fn emit_hotness_counter(
+    builder: &mut FunctionBuilder<'_>,
+    lowering: &LoweringState,
+    promotion_address: usize,
+) -> Result<(), CompilerError> {
+    let flags = trusted_mem_flags(builder);
+    let cell = builder.ins().iconst(types::I64, promotion_address as i64);
+    let state_address = builder
+        .ins()
+        .iadd_imm_s(cell, PROMOTION_STATE_OFFSET as i64);
+    let state = builder.ins().atomic_load(types::I32, flags, state_address);
+    let counting = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, state, i64::from(PROMOTION_COUNTING));
+    let increment = builder.create_block();
+    let resume = builder.create_block();
+    builder.ins().brif(counting, increment, &[], resume, &[]);
+
+    builder.switch_to_block(increment);
+    let entries_address = builder
+        .ins()
+        .iadd_imm_s(cell, PROMOTION_ENTRIES_OFFSET as i64);
+    let one = builder.ins().iconst(types::I32, 1);
+    let previous =
+        builder
+            .ins()
+            .atomic_rmw(types::I32, flags, AtomicRmwOp::Add, entries_address, one);
+    let reached =
+        builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, previous, i64::from(HOT_PROMOTION_ENTRIES - 1));
+    let promote = builder.create_block();
+    builder.ins().brif(reached, promote, &[], resume, &[]);
+
+    builder.switch_to_block(promote);
+    let argument = builder.ins().iconst(types::I64, promotion_address as i64);
+    let status = call_system_helper(builder, lowering, SYSTEM_HOTNESS_PROMOTION, argument)?;
+    let failed = builder.ins().icmp_imm_s(IntCC::NotEqual, status, 0);
+    let failure = builder.create_block();
+    builder.ins().brif(failed, failure, &[], resume, &[]);
+    builder.switch_to_block(failure);
+    emit_exit(
+        builder,
+        lowering,
+        EXIT_INTERNAL,
+        0,
+        0,
+        SYSTEM_HOTNESS_PROMOTION as u64,
+        promotion_address as u64,
+    );
+
+    builder.switch_to_block(resume);
+    Ok(())
 }
 
 fn emit_entry_dispatch(
@@ -780,69 +945,47 @@ fn emit_instruction_boundary(
     lowering: &LoweringState,
     source: LocationDescriptor,
 ) -> Result<(), CompilerError> {
-    if source.execution_state == ExecutionState::A64 {
-        let valid = load(
-            builder,
-            types::I32,
-            lowering.frame,
-            FRAME_OFFSETS.control_loader_return_valid,
-        )?;
-        let valid = builder.ins().icmp_imm_s(IntCC::NotEqual, valid, 0);
-        let loader_return = load(
-            builder,
-            types::I64,
-            lowering.frame,
-            FRAME_OFFSETS.control_loader_return,
-        )?;
+    let remaining = builder.use_var(lowering.remaining_budget);
+    let available = builder.ins().icmp_imm_s(IntCC::NotEqual, remaining, 0);
+    let source_pc = builder.ins().iconst(types::I64, source.pc.get() as i64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let (can_execute, kind, payload) = if let Some(loader_return) = lowering.loader_return {
         let matches = builder
             .ins()
             .icmp_imm_s(IntCC::Equal, loader_return, source.pc.get() as i64);
-        let stop = builder.ins().band(valid, matches);
-        let loader = builder.create_block();
-        let execute = builder.create_block();
-        builder.ins().brif(stop, loader, &[], execute, &[]);
-        builder.switch_to_block(loader);
+        let continue_loader = builder.ins().icmp_imm_s(IntCC::Equal, matches, 0);
+        let execute = builder.ins().band(available, continue_loader);
+        let loader_kind = builder
+            .ins()
+            .iconst(types::I32, i64::from(EXIT_LOADER_RETURN));
+        let budget_kind = builder
+            .ins()
+            .iconst(types::I32, i64::from(EXIT_BUDGET_EXHAUSTED));
+        let kind = builder.ins().select(matches, loader_kind, budget_kind);
         let result_code = state_value_for(
             builder,
             lowering,
             StateRegister::A64X(A64GeneralRegister::new(0).unwrap()),
         )?;
-        emit_exit_with_payload(
-            builder,
-            lowering,
-            EXIT_LOADER_RETURN,
-            source.pc.get(),
-            result_code,
-        );
-        builder.switch_to_block(execute);
-    }
-    let retired = builder.use_var(lowering.retired);
-    let carried = load(
-        builder,
-        types::I64,
-        lowering.frame,
-        FRAME_OFFSETS.dispatch_retired,
-    )?;
-    let retired = builder.ins().iadd(carried, retired);
-    let budget = load(
-        builder,
-        types::I64,
-        lowering.frame,
-        FRAME_OFFSETS.control_instruction_budget,
-    )?;
-    let available = builder.ins().icmp(IntCC::UnsignedLessThan, retired, budget);
+        let payload = builder.ins().select(matches, result_code, zero);
+        (execute, kind, payload)
+    } else {
+        let kind = builder
+            .ins()
+            .iconst(types::I32, i64::from(EXIT_BUDGET_EXHAUSTED));
+        (available, kind, zero)
+    };
     let execute = builder.create_block();
-    let exhausted = builder.create_block();
-    builder.ins().brif(available, execute, &[], exhausted, &[]);
-    builder.switch_to_block(exhausted);
-    emit_exit(
-        builder,
-        lowering,
-        EXIT_BUDGET_EXHAUSTED,
-        0,
-        source.pc.get(),
-        0,
-        0,
+    builder.ins().brif(
+        can_execute,
+        execute,
+        &[],
+        lowering.boundary_exit,
+        &[
+            BlockArg::from(kind),
+            BlockArg::from(source_pc),
+            BlockArg::from(payload),
+        ],
     );
     builder.switch_to_block(execute);
     Ok(())
@@ -853,23 +996,16 @@ fn emit_control_poll(
     lowering: &LoweringState,
     source: LocationDescriptor,
 ) -> Result<(), CompilerError> {
-    let pointer_type = builder.func.dfg.value_type(lowering.frame);
     let flags = trusted_mem_flags(builder);
-    let control_pending_address = load(
-        builder,
-        pointer_type,
-        lowering.frame,
-        FRAME_OFFSETS.control_pending_address,
-    )?;
+    let control_pending_address = lowering.control_pending_address.ok_or_else(|| {
+        CompilerError::new("control poll emitted without an entry control address")
+    })?;
     let control_pending = builder
         .ins()
         .atomic_load(types::I32, flags, control_pending_address);
-    let interrupt_pending_address = load(
-        builder,
-        pointer_type,
-        lowering.frame,
-        FRAME_OFFSETS.interrupt_pending_address,
-    )?;
+    let interrupt_pending_address = lowering.interrupt_pending_address.ok_or_else(|| {
+        CompilerError::new("control poll emitted without an entry interrupt address")
+    })?;
     let interrupt_pending = builder
         .ins()
         .atomic_load(types::I32, flags, interrupt_pending_address);
@@ -966,12 +1102,18 @@ fn increment_retired(builder: &mut FunctionBuilder<'_>, lowering: &LoweringState
     let retired = builder.use_var(lowering.retired);
     let retired = builder.ins().iadd_imm_s(retired, 1);
     builder.def_var(lowering.retired, retired);
+    let remaining = builder.use_var(lowering.remaining_budget);
+    let remaining = builder.ins().iadd_imm_s(remaining, -1);
+    builder.def_var(lowering.remaining_budget, remaining);
 }
 
 fn decrement_retired(builder: &mut FunctionBuilder<'_>, lowering: &LoweringState) {
     let retired = builder.use_var(lowering.retired);
     let retired = builder.ins().iadd_imm_s(retired, -1);
     builder.def_var(lowering.retired, retired);
+    let remaining = builder.use_var(lowering.remaining_budget);
+    let remaining = builder.ins().iadd_imm_s(remaining, 1);
+    builder.def_var(lowering.remaining_budget, remaining);
 }
 
 fn set_current_location(
@@ -1584,12 +1726,6 @@ fn lower_named_helper(
             helper.helper
         )));
     }
-    let index = u32::try_from(lowering.semantic_calls.len())
-        .map_err(|_| CompilerError::new("semantic helper metadata index overflow"))?;
-    lowering.semantic_calls.push(SemanticCall {
-        helper: helper.helper.clone(),
-        result_types: result_types.to_vec().into_boxed_slice(),
-    });
     if helper.arguments.len() > crate::abi::MAX_HELPER_ARGUMENTS
         || result_types.len() > crate::abi::MAX_HELPER_RESULTS
     {
@@ -1597,6 +1733,14 @@ fn lower_named_helper(
             "semantic helper exceeds native scratch ABI",
         ));
     }
+    let index = u32::try_from(lowering.semantic_calls.len())
+        .map_err(|_| CompilerError::new("semantic helper metadata index overflow"))?;
+    lowering.semantic_calls.push(SemanticCall {
+        helper: helper.helper.clone(),
+        argument_count: u8::try_from(helper.arguments.len())
+            .expect("native scratch ABI count fits in u8"),
+        result_types: result_types.to_vec().into_boxed_slice(),
+    });
     for (argument_index, argument) in helper.arguments.iter().enumerate() {
         let value = operand(builder, values, *argument)?;
         store_scratch(
@@ -2036,8 +2180,9 @@ fn lower_native_a64_semantic_vector(
     helper: &nixe_cpu::ir::op::HelperOperation,
     values: &BTreeMap<ValueId, ir::Value>,
 ) -> Result<Option<Vec<ir::Value>>, CompilerError> {
-    let token = helper_immediate(helper, 8)?;
+    let token = helper_immediate(helper, 0)?;
     let instruction = semantic_instruction(token);
+    let inputs = semantic_inputs(instruction);
     let supported = matches!(
         instruction,
         A64FpSimdInstruction::DuplicateGeneral(_)
@@ -2065,6 +2210,7 @@ fn lower_native_a64_semantic_vector(
             | A64FpSimdInstruction::VectorShiftRightImmediate(_)
             | A64FpSimdInstruction::ScalarShiftLeftImmediate(_)
             | A64FpSimdInstruction::VectorShiftLeftImmediate(_)
+            | A64FpSimdInstruction::ShiftLeftLong(_)
             | A64FpSimdInstruction::CountBits(_)
             | A64FpSimdInstruction::AddAcrossVector(_)
     );
@@ -2076,12 +2222,31 @@ fn lower_native_a64_semantic_vector(
         .iter()
         .map(|argument| operand(builder, values, *argument))
         .collect::<Result<Vec<_>, _>>()?;
+    if arguments.len() != inputs.argument_count() {
+        return Err(CompilerError::new(
+            "semantic-vector arguments do not match the compact input signature",
+        ));
+    }
+    let semantic_argument = |input: SemanticInput| -> Result<ir::Value, CompilerError> {
+        let index = inputs.argument_index(input).ok_or_else(|| {
+            CompilerError::new(format!("semantic-vector input {input:?} is unavailable"))
+        })?;
+        arguments
+            .get(index)
+            .copied()
+            .ok_or_else(|| CompilerError::new("semantic-vector argument index is out of range"))
+    };
     let fields = instruction.operands();
     let result = match instruction {
         A64FpSimdInstruction::DuplicateGeneral(_) => {
             let lane_bits = 8_u32 << fields.immediate_5.trailing_zeros();
             let lane = integer_lane_type(lane_bits)?;
-            let source = cast_integer(builder, arguments[4], lane, false);
+            let source = cast_integer(
+                builder,
+                semantic_argument(SemanticInput::RnGeneral)?,
+                lane,
+                false,
+            );
             let vector_ty = lane
                 .by(128 / lane_bits)
                 .ok_or_else(|| CompilerError::new("invalid DUP general vector shape"))?;
@@ -2096,7 +2261,11 @@ fn lower_native_a64_semantic_vector(
             let vector_ty = lane
                 .by(128 / lane_bits)
                 .ok_or_else(|| CompilerError::new("invalid DUP element vector shape"))?;
-            let source = vector_bitcast(builder, arguments[0], vector_ty);
+            let source = vector_bitcast(
+                builder,
+                semantic_argument(SemanticInput::RnVector)?,
+                vector_ty,
+            );
             let element = builder.ins().extractlane(source, lane_index);
             let result = builder.ins().splat(vector_ty, element);
             opaque_vector_128(builder, result, fields.vector_128)?
@@ -2111,9 +2280,13 @@ fn lower_native_a64_semantic_vector(
             let value = vector_constant(builder, replicated);
             let result = if fields.cmode <= 11 && fields.cmode & 1 != 0 {
                 if fields.operation_bit {
-                    builder.ins().band(arguments[3], value)
+                    builder
+                        .ins()
+                        .band(semantic_argument(SemanticInput::RdVector)?, value)
                 } else {
-                    builder.ins().bor(arguments[3], value)
+                    builder
+                        .ins()
+                        .bor(semantic_argument(SemanticInput::RdVector)?, value)
                 }
             } else {
                 value
@@ -2130,8 +2303,16 @@ fn lower_native_a64_semantic_vector(
             let vector_ty = lane
                 .by(128 / lane_bits)
                 .ok_or_else(|| CompilerError::new("invalid INS element vector shape"))?;
-            let source = vector_bitcast(builder, arguments[0], vector_ty);
-            let previous = vector_bitcast(builder, arguments[3], vector_ty);
+            let source = vector_bitcast(
+                builder,
+                semantic_argument(SemanticInput::RnVector)?,
+                vector_ty,
+            );
+            let previous = vector_bitcast(
+                builder,
+                semantic_argument(SemanticInput::RdVector)?,
+                vector_ty,
+            );
             let element = builder.ins().extractlane(source, source_lane);
             let result = builder
                 .ins()
@@ -2146,45 +2327,106 @@ fn lower_native_a64_semantic_vector(
             let vector_ty = lane
                 .by(128 / lane_bits)
                 .ok_or_else(|| CompilerError::new("invalid INS general vector shape"))?;
-            let previous = vector_bitcast(builder, arguments[3], vector_ty);
-            let element = cast_integer(builder, arguments[4], lane, false);
+            let previous = vector_bitcast(
+                builder,
+                semantic_argument(SemanticInput::RdVector)?,
+                vector_ty,
+            );
+            let element = cast_integer(
+                builder,
+                semantic_argument(SemanticInput::RnGeneral)?,
+                lane,
+                false,
+            );
             let result = builder
                 .ins()
                 .insertlane(previous, element, destination_lane);
             vector_bitcast(builder, result, types::I8X16)
         }
-        A64FpSimdInstruction::Extract(_) => {
-            lower_native_a64_vector_extract(builder, arguments[0], arguments[1], fields)?
-        }
-        A64FpSimdInstruction::PermuteTwoSource(_) => {
-            lower_native_a64_permute(builder, arguments[0], arguments[1], fields)?
-        }
+        A64FpSimdInstruction::Extract(_) => lower_native_a64_vector_extract(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            semantic_argument(SemanticInput::RmVector)?,
+            fields,
+        )?,
+        A64FpSimdInstruction::PermuteTwoSource(_) => lower_native_a64_permute(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            semantic_argument(SemanticInput::RmVector)?,
+            fields,
+        )?,
         A64FpSimdInstruction::IntegerCompare(_) => {
-            lower_native_a64_integer_compare(builder, arguments[0], arguments[1], fields)?
+            let rhs = if inputs.contains(SemanticInput::RmVector) {
+                semantic_argument(SemanticInput::RmVector)?
+            } else {
+                vector_constant(builder, 0)
+            };
+            lower_native_a64_integer_compare(
+                builder,
+                semantic_argument(SemanticInput::RnVector)?,
+                rhs,
+                fields,
+            )?
         }
-        A64FpSimdInstruction::IntegerPairwise(_) => {
-            lower_native_a64_integer_pairwise(builder, arguments[0], arguments[1], fields)?
-        }
-        A64FpSimdInstruction::IntegerMinMax(_) => {
-            lower_native_a64_integer_min_max(builder, arguments[0], arguments[1], fields)?
-        }
+        A64FpSimdInstruction::IntegerPairwise(_) => lower_native_a64_integer_pairwise(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            semantic_argument(SemanticInput::RmVector)?,
+            fields,
+        )?,
+        A64FpSimdInstruction::IntegerMinMax(_) => lower_native_a64_integer_min_max(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            semantic_argument(SemanticInput::RmVector)?,
+            fields,
+        )?,
         A64FpSimdInstruction::ExtractNarrow(_) => {
-            lower_native_a64_extract_narrow(builder, arguments[0], arguments[3], fields, false)?
+            let previous = if inputs.contains(SemanticInput::RdVector) {
+                semantic_argument(SemanticInput::RdVector)?
+            } else {
+                vector_constant(builder, 0)
+            };
+            lower_native_a64_extract_narrow(
+                builder,
+                semantic_argument(SemanticInput::RnVector)?,
+                previous,
+                fields,
+                false,
+            )?
         }
         A64FpSimdInstruction::ShiftRightNarrow(_) => {
-            lower_native_a64_extract_narrow(builder, arguments[0], arguments[3], fields, true)?
+            let previous = if inputs.contains(SemanticInput::RdVector) {
+                semantic_argument(SemanticInput::RdVector)?
+            } else {
+                vector_constant(builder, 0)
+            };
+            lower_native_a64_extract_narrow(
+                builder,
+                semantic_argument(SemanticInput::RnVector)?,
+                previous,
+                fields,
+                true,
+            )?
         }
         A64FpSimdInstruction::ScalarShiftRightImmediate(_)
         | A64FpSimdInstruction::VectorShiftRightImmediate(_)
         | A64FpSimdInstruction::ScalarShiftLeftImmediate(_)
-        | A64FpSimdInstruction::VectorShiftLeftImmediate(_) => {
-            lower_native_a64_immediate_shift(builder, arguments[0], fields, instruction)?
-        }
+        | A64FpSimdInstruction::VectorShiftLeftImmediate(_) => lower_native_a64_immediate_shift(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            fields,
+            instruction,
+        )?,
+        A64FpSimdInstruction::ShiftLeftLong(_) => lower_native_a64_shift_left_long(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            fields,
+        )?,
         A64FpSimdInstruction::VectorSignedShiftRegister(_)
         | A64FpSimdInstruction::VectorUnsignedShiftRegister(_) => lower_native_a64_register_shift(
             builder,
-            arguments[0],
-            arguments[1],
+            semantic_argument(SemanticInput::RnVector)?,
+            semantic_argument(SemanticInput::RmVector)?,
             fields,
             matches!(
                 instruction,
@@ -2199,7 +2441,9 @@ fn lower_native_a64_semantic_vector(
                 _ => return Err(CompilerError::new("invalid scalar sign width")),
             };
             let active = vector_mask(builder, width);
-            let source = builder.ins().band(arguments[0], active);
+            let source = builder
+                .ins()
+                .band(semantic_argument(SemanticInput::RnVector)?, active);
             let sign = vector_constant(builder, 1_u128 << (width - 1));
             if matches!(instruction, A64FpSimdInstruction::ScalarNegate(_)) {
                 builder.ins().bxor(source, sign)
@@ -2219,7 +2463,9 @@ fn lower_native_a64_semantic_vector(
             }
             let sign = vector_constant(builder, sign_mask);
             let active = vector_mask(builder, vector_bits);
-            let source = builder.ins().band(arguments[0], active);
+            let source = builder
+                .ins()
+                .band(semantic_argument(SemanticInput::RnVector)?, active);
             if matches!(instruction, A64FpSimdInstruction::VectorFloatNegate(_)) {
                 builder.ins().bxor(source, sign)
             } else {
@@ -2259,25 +2505,37 @@ fn lower_native_a64_semantic_vector(
         A64FpSimdInstruction::ScalarFloatConditionalSelect(_) => {
             let condition = evaluate_condition(
                 builder,
-                arguments[5],
+                semantic_argument(SemanticInput::Nzcv)?,
                 Condition::from_encoding(fields.condition),
                 true,
             );
-            let selected = builder.ins().select(condition, arguments[0], arguments[1]);
+            let selected = builder.ins().select(
+                condition,
+                semantic_argument(SemanticInput::RnVector)?,
+                semantic_argument(SemanticInput::RmVector)?,
+            );
             let active = vector_mask(builder, if fields.opc == 0 { 32 } else { 64 });
             builder.ins().band(selected, active)
         }
         A64FpSimdInstruction::CountBits(_) => {
-            let counted = builder.ins().popcnt(arguments[0]);
+            let counted = builder
+                .ins()
+                .popcnt(semantic_argument(SemanticInput::RnVector)?);
             let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
             builder.ins().band(counted, active)
         }
-        A64FpSimdInstruction::AddAcrossVector(_) => {
-            lower_native_a64_add_across(builder, arguments[0], fields)?
-        }
+        A64FpSimdInstruction::AddAcrossVector(_) => lower_native_a64_add_across(
+            builder,
+            semantic_argument(SemanticInput::RnVector)?,
+            fields,
+        )?,
         _ => unreachable!("native semantic-vector classification is exhaustive"),
     };
-    Ok(Some(vec![result, arguments[7]]))
+    let mut results = vec![result];
+    if inputs.contains(SemanticInput::Fpsr) {
+        results.push(semantic_argument(SemanticInput::Fpsr)?);
+    }
+    Ok(Some(results))
 }
 
 fn integer_lane_type(bits: u32) -> Result<ir::Type, CompilerError> {
@@ -2788,6 +3046,49 @@ fn lower_native_a64_immediate_shift(
             builder.ins().ishl_imm_u(value, i64::from(shift))
         };
         result = builder.ins().insertlane(result, shifted, index as u8);
+    }
+    Ok(vector_bitcast(builder, result, types::I8X16))
+}
+
+fn lower_native_a64_shift_left_long(
+    builder: &mut FunctionBuilder<'_>,
+    source: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let bits = fields.helper_token.helper_abi_value();
+    let immediate = (bits >> 16) & 0x7f;
+    let immediate_high = immediate >> 3;
+    let source_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+    let destination_bits = source_bits * 2;
+    let shift = immediate - source_bits;
+    let lane_count = 64 / source_bits;
+    let source_lane = integer_lane_type(source_bits)?;
+    let destination_lane = integer_lane_type(destination_bits)?;
+    let source_vector = source_lane
+        .by(128 / source_bits)
+        .ok_or_else(|| CompilerError::new("invalid SSHLL/USHLL source vector shape"))?;
+    let destination_vector = destination_lane
+        .by(128 / destination_bits)
+        .ok_or_else(|| CompilerError::new("invalid SSHLL/USHLL destination vector shape"))?;
+    let source = vector_bitcast(builder, source, source_vector);
+    let zero = builder.ins().iconst(destination_lane, 0);
+    let mut result = builder.ins().splat(destination_vector, zero);
+    let first_source_lane = if fields.vector_128 { lane_count } else { 0 };
+    for lane in 0..lane_count {
+        let value = builder
+            .ins()
+            .extractlane(source, (first_source_lane + lane) as u8);
+        let value = if fields.operation_bit {
+            builder.ins().uextend(destination_lane, value)
+        } else {
+            builder.ins().sextend(destination_lane, value)
+        };
+        let value = if shift == 0 {
+            value
+        } else {
+            builder.ins().ishl_imm_u(value, i64::from(shift))
+        };
+        result = builder.ins().insertlane(result, value, lane as u8);
     }
     Ok(vector_bitcast(builder, result, types::I8X16))
 }
@@ -4716,21 +5017,12 @@ fn lower_terminator(
         }
         Terminator::InterpretOne {
             source,
-            encoding: _,
-            coverage_id: _,
-        } => {
-            decrement_retired(builder, lowering);
-            emit_exit(
-                builder,
-                lowering,
-                EXIT_INTERPRET_ONE,
-                0,
-                source.pc.get(),
-                0,
-                0,
-            );
-            Ok(())
-        }
+            encoding,
+            coverage_id,
+        } => Err(CompilerError::new(format!(
+            "JIT frontend requested forbidden interpreter fallback: pc={:#018x} encoding={encoding:?} coverage_id={coverage_id}",
+            source.pc.get()
+        ))),
         Terminator::UnsupportedInstruction {
             source,
             encoding,
@@ -5066,13 +5358,7 @@ fn emit_link_tail_call(
 ) -> Result<(), CompilerError> {
     let pointer_type = builder.func.dfg.value_type(lowering.frame);
     let local = builder.use_var(lowering.retired);
-    let carried = load(
-        builder,
-        types::I64,
-        lowering.frame,
-        FRAME_OFFSETS.dispatch_retired,
-    )?;
-    let retired = builder.ins().iadd(carried, local);
+    let retired = builder.ins().iadd(lowering.carried_retired, local);
     store(
         builder,
         retired,
@@ -5193,19 +5479,20 @@ fn emit_exit_dynamic(
     builder.ins().jump(lowering.exit, &arguments);
 }
 
-fn emit_exit_with_payload(
-    builder: &mut FunctionBuilder<'_>,
-    lowering: &LoweringState,
-    kind: u32,
-    source_pc: u64,
-    payload0: ir::Value,
-) {
-    let kind = builder.ins().iconst(types::I32, i64::from(kind));
-    let detail = builder.ins().iconst(types::I32, 0);
-    let source_pc = builder.ins().iconst(types::I64, source_pc as i64);
-    let zero = builder.ins().iconst(types::I64, 0);
+fn lower_boundary_exit_block(builder: &mut FunctionBuilder<'_>, lowering: &LoweringState) {
+    builder.switch_to_block(lowering.boundary_exit);
+    let params = builder.block_params(lowering.boundary_exit).to_vec();
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    let zero_i64 = builder.ins().iconst(types::I64, 0);
     let retired = builder.use_var(lowering.retired);
-    let arguments = [kind, detail, source_pc, payload0, zero, retired].map(BlockArg::from);
+    let arguments = [
+        BlockArg::from(params[0]),
+        BlockArg::from(zero_i32),
+        BlockArg::from(params[1]),
+        BlockArg::from(params[2]),
+        BlockArg::from(zero_i64),
+        BlockArg::from(retired),
+    ];
     builder.ins().jump(lowering.exit, &arguments);
 }
 
@@ -5225,13 +5512,7 @@ fn lower_exit_block(
     ]) {
         store(builder, value, lowering.frame, offset(destination)?);
     }
-    let carried = load(
-        builder,
-        types::I64,
-        lowering.frame,
-        FRAME_OFFSETS.dispatch_retired,
-    )?;
-    let retired = builder.ins().iadd(carried, params[5]);
+    let retired = builder.ins().iadd(lowering.carried_retired, params[5]);
     store(
         builder,
         retired,
@@ -5246,7 +5527,7 @@ fn store_architectural_state(
     builder: &mut FunctionBuilder<'_>,
     lowering: &LoweringState,
 ) -> Result<(), CompilerError> {
-    for slot in &lowering.state {
+    for slot in lowering.state.iter().filter(|slot| slot.dirty) {
         let value = builder.use_var(slot.variable);
         store(builder, value, lowering.frame, slot.offset);
     }
@@ -5264,8 +5545,12 @@ fn declare_state(
     builder: &mut FunctionBuilder<'_>,
     execution_state: ExecutionState,
     frame: ir::Value,
+    plan: &StateAccessPlan,
 ) -> Result<Vec<StateSlot>, CompilerError> {
-    let registers = state_registers(execution_state);
+    let registers: Vec<_> = state_registers(execution_state)
+        .into_iter()
+        .filter(|register| plan.accessed.contains(register))
+        .collect();
     let mut slots = Vec::with_capacity(registers.len());
     for register in registers {
         let ty = cranelift_type(register.ty());
@@ -5279,9 +5564,53 @@ fn declare_state(
             variable,
             ty,
             offset: register_offset,
+            dirty: plan.dirty.contains(&register),
         });
     }
     Ok(slots)
+}
+
+fn state_access_plan(region: &IrRegion) -> StateAccessPlan {
+    let mut plan = StateAccessPlan::default();
+    match region.metadata.start.execution_state {
+        ExecutionState::A64 => {
+            // Entry dispatch and every precise exit require the current PC.
+            plan.write(StateRegister::A64Pc);
+            // The loader-return boundary can observe X0 before any guest
+            // instruction in each published entry.
+            plan.read(StateRegister::A64X(
+                A64GeneralRegister::new(0).expect("A64 X0 exists"),
+            ));
+        }
+        ExecutionState::A32 | ExecutionState::T32 => {
+            plan.write(StateRegister::A32Pc);
+            // External AArch32 targets synchronize the T bit through CPSR.
+            plan.write(StateRegister::A32Cpsr);
+        }
+    }
+    for block in &region.blocks {
+        for operation in &block.operations {
+            match &operation.kind {
+                OperationKind::ReadState(register) => plan.read(*register),
+                OperationKind::WriteState { register, .. } => plan.write(*register),
+                _ => {}
+            }
+        }
+        if matches!(
+            &block.terminator,
+            Terminator::Call { .. } | Terminator::ConditionalCall { .. }
+        ) {
+            match region.metadata.start.execution_state {
+                ExecutionState::A64 => plan.write(StateRegister::A64X(
+                    A64GeneralRegister::new(30).expect("A64 link register exists"),
+                )),
+                ExecutionState::A32 | ExecutionState::T32 => plan.write(StateRegister::A32R(
+                    A32GeneralRegister::new(14).expect("AArch32 link register exists"),
+                )),
+            }
+        }
+    }
+    plan
 }
 
 fn state_registers(execution_state: ExecutionState) -> Vec<StateRegister> {
@@ -5500,4 +5829,83 @@ fn offset(value: usize) -> Result<i32, CompilerError> {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use nixe_cpu::{
+        ir::{
+            block::{BlockMetadata, IrBlock},
+            op::{IrOperation, OperationResults, RegisterIndex},
+            region::RegionMetadata,
+        },
+        profile::CpuProfileId,
+    };
+
+    use super::*;
+
+    #[test]
+    fn state_plan_declares_only_accessed_fields_and_commits_only_writes() {
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            CpuProfileId::new(1),
+        );
+        let x1 = StateRegister::A64X(A64GeneralRegister::new(1).unwrap());
+        let x2 = StateRegister::A64X(A64GeneralRegister::new(2).unwrap());
+        let v31 = StateRegister::A64V(RegisterIndex::new(31).unwrap());
+        let block = IrBlock::new(
+            BlockMetadata::new(location, 4, 1, Vec::new()),
+            vec![
+                IrOperation::new(
+                    location,
+                    OperationResults::NONE,
+                    OperationKind::ReadState(x1),
+                ),
+                IrOperation::new(
+                    location,
+                    OperationResults::NONE,
+                    OperationKind::WriteState {
+                        register: x2,
+                        value: Immediate::I64(7).into(),
+                    },
+                ),
+                IrOperation::new(
+                    location,
+                    OperationResults::NONE,
+                    OperationKind::WriteState {
+                        register: v31,
+                        value: Immediate::V128(9).into(),
+                    },
+                ),
+            ],
+            Terminator::Call {
+                target: ControlTarget::Direct {
+                    pc: GuestVirtualAddress::new(0x2000),
+                    execution_state: ExecutionState::A64,
+                },
+                return_address: GuestVirtualAddress::new(0x1004),
+            },
+        );
+        let region = IrRegion::new(
+            RegionMetadata {
+                start: location,
+                guest_byte_count: 4,
+                guest_instruction_count: 1,
+                ir_operation_count: 3,
+                entries: Box::new([]),
+                exits: Box::new([]),
+                code_dependencies: Box::new([]),
+                safepoints: Box::new([]),
+            },
+            vec![block],
+        );
+
+        let plan = state_access_plan(&region);
+        let pc = StateRegister::A64Pc;
+        let x0 = StateRegister::A64X(A64GeneralRegister::new(0).unwrap());
+        let x30 = StateRegister::A64X(A64GeneralRegister::new(30).unwrap());
+        assert_eq!(plan.accessed, HashSet::from([pc, x0, x1, x2, x30, v31]));
+        assert_eq!(plan.dirty, HashSet::from([pc, x2, x30, v31]));
+    }
 }

@@ -604,6 +604,22 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD,
     )
     .fixture32(0x4f3f_556a),
+    // Arm A64 SSHLL/SSHLL2 and USHLL/USHLL2 widen signed or unsigned lanes
+    // from one 64-bit half of the source before applying an immediate shift.
+    // SXTL/SXTL2 and UXTL/UXTL2 are the zero-shift aliases.
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHLL--SSHLL2--Signed-Shift-Left-Long--immediate--
+    // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SXTL--SXTL2--Signed-extend-long--an-alias-of-SSHLL--SSHLL2-
+    pattern(
+        "simd-shift-left-long",
+        0x9f80_fc00,
+        0x0f00_a400,
+        0x0000_00a0,
+        210,
+        &[],
+        SIMD,
+    )
+    .lowered()
+    .fixture32(0x0f20_a7fe),
     // Arm A64 SSHL/USHL use the signed low byte of each shift-count lane to
     // select a left (non-negative) or right (negative) shift independently.
     // The data interpretation only differs for right shifts. Arm ARM DDI 0602
@@ -1409,6 +1425,7 @@ instructions!(
     VectorShiftRightImmediate,
     ScalarShiftLeftImmediate,
     VectorShiftLeftImmediate,
+    ShiftLeftLong,
     VectorSignedShiftRegister,
     VectorUnsignedShiftRegister,
     CountBits,
@@ -1569,6 +1586,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0092 => Instruction::VectorShiftRightImmediate(operands),
         0x0000_0099 => Instruction::ScalarShiftLeftImmediate(operands),
         0x0000_009a => Instruction::VectorShiftLeftImmediate(operands),
+        0x0000_00a0 => Instruction::ShiftLeftLong(operands),
         0x0000_0095 => Instruction::VectorSignedShiftRegister(operands),
         0x0000_0096 => Instruction::VectorUnsignedShiftRegister(operands),
         0x0000_0093 => Instruction::CountBits(operands),

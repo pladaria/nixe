@@ -945,4 +945,48 @@ mod tests {
             )));
         }
     }
+
+    #[test]
+    fn semantic_vector_helpers_use_the_minimal_typed_signature() {
+        use crate::profile::{CapabilityStatus, InstructionFeature};
+
+        let profile = GuestCpuProfile::switch_1()
+            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled);
+        let block = translate_with_profile(
+            profile,
+            &[
+                0x4e01_0c20, // dup v0.16b,w1
+                0xd400_0001, // svc #0
+            ],
+        );
+        let helper = block
+            .operations
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                OperationKind::Helper(helper)
+                    if helper.helper.as_ref() == "a64.fp-simd.semantic-vector" =>
+                {
+                    Some((helper, operation.results))
+                }
+                _ => None,
+            })
+            .expect("DUP general uses the semantic-vector operation");
+        assert_eq!(helper.0.arguments.len(), 2, "token plus the source GPR");
+        assert!(matches!(
+            helper.0.arguments[0],
+            Operand::Immediate(Immediate::I64(_))
+        ));
+        assert_eq!(helper.1.iter().count(), 1);
+        assert!(block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::ReadState(StateRegister::A64X(register)) if register.index() == 1
+        )));
+        assert!(!block.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::ReadState(StateRegister::A64V(_))
+                | OperationKind::ReadState(StateRegister::A64Fpcr)
+                | OperationKind::ReadState(StateRegister::A64Fpsr)
+                | OperationKind::ReadState(StateRegister::A64Nzcv)
+        )));
+    }
 }

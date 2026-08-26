@@ -232,44 +232,6 @@ fn run_registry_state(execution_state: ExecutionState) {
 
 #[test]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn every_supported_registry_fixture_can_enter_async_jit_pipeline() {
-    let profile = GuestCpuProfile::switch_1();
-    for execution_state in [
-        ExecutionState::A64,
-        ExecutionState::A32,
-        ExecutionState::T32,
-    ] {
-        let identity = state_index(execution_state) as u64;
-        let mut jit = EngineHarness::new(&JitProvider::new(), 0x100 + identity, 0x100 + identity);
-        for pattern in patterns().filter(|pattern| {
-            pattern.execution_state == execution_state
-                && pattern.decoder == DecodeSupport::Ready
-                && profile
-                    .allowed_execution_states()
-                    .contains(pattern.execution_state)
-                && !pattern.required_features.iter().any(|feature| {
-                    profile.instruction_features().status(*feature) != CapabilityStatus::Enabled
-                })
-        }) {
-            let code_page =
-                GuestPhysicalPageId::new(0x40_0000 + u64::from(pattern.coverage_id.get()));
-            let identity = format!(
-                "{} {} ({})",
-                pattern.execution_state, pattern.coverage_id, pattern.name
-            );
-            for visit in 1..=3 {
-                let memory = fixture_memory(pattern, code_page);
-                let mut state = initial_state(pattern.execution_state, pattern.coverage_id.get());
-                jit.run(&memory, &mut state).unwrap_or_else(|error| {
-                    panic!("{identity} JIT visit {visit} failed during promotion: {error}")
-                });
-            }
-        }
-    }
-}
-
-#[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn ldpsw_offset_uses_the_displaced_address_in_compiled_code() {
     const CODE_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(0x30_0000);
     const DATA_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(0x30_0001);

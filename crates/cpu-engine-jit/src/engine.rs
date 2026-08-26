@@ -1,8 +1,6 @@
 //! Engine provider, process domain, and executor-local native state.
 
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -11,7 +9,6 @@ use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use nixe_cpu::coverage::CoverageId;
 use nixe_cpu::error::FrontendError;
-use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::exclusive::ExclusiveMonitorState;
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
 use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
@@ -23,26 +20,22 @@ use nixe_cpu_engine::{
     EngineDomain, EngineDomainId, EngineExecutor, EngineExecutorId, EngineFault, EngineFaultKind,
     EngineId, EngineKind, EngineProvider, ExecutionReport, RunRequest, SchedulerRequest,
 };
-use nixe_cpu_engine_interpreter::{
-    InterpreterContext, InterpreterError, InterpreterOutcome, execute_one_with_context,
-    fetch_current_instruction,
-};
 use nixe_memory::GuestVirtualAddress;
 
 use crate::abi::{
     EXIT_ARCHITECTURAL, EXIT_BUDGET_EXHAUSTED, EXIT_DATA_FAULT, EXIT_DISPATCH, EXIT_INTERNAL,
-    EXIT_INTERPRET_ONE, EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT,
-    EXIT_SCHEDULED, EXIT_UNSUPPORTED, ExecutionFrame, FrameError, NativeExit, NativeGateway,
+    EXIT_LOADER_RETURN, EXIT_NONE, EXIT_PENDING_EVENT, EXIT_SAFEPOINT, EXIT_SCHEDULED,
+    EXIT_UNSUPPORTED, ExecutionFrame, FrameError, NO_LOADER_RETURN, NativeExit, NativeGateway,
     SCHEDULE_SEND_EVENT, SCHEDULE_WAIT_FOR_EVENT, SCHEDULE_WAIT_FOR_INTERRUPT, SCHEDULE_YIELD,
 };
 use crate::cache::{
-    CacheError, DomainCodeCache, ExecutorEpoch, LocalLookupCache, RegionKey, TranslationMode,
-    root_code_mapping,
+    CacheError, CodeTier, DomainCodeCache, ExecutorEpoch, LocalLookupCache, PendingRegion,
+    PromotionCell, RegionKey, TranslationMode, root_code_mapping,
 };
-use crate::compilation_pool::{
-    CompilationPool, CompilationPoolHandle, CompilationTask, host_compilation_workers,
+use crate::compilation_pool::{CompilationPool, CompilationPoolHandle, host_compilation_workers};
+use crate::compiler::{
+    CompilationMetrics, CompiledRegionMetadata, CompilerContext, SideExit, compile_gateway,
 };
-use crate::compiler::{CompiledRegionMetadata, SideExit, compile_gateway};
 use crate::configuration::JitConfiguration;
 use crate::diagnostics::JitDiagnostics;
 use crate::executable_memory::{
@@ -55,52 +48,12 @@ pub const JIT_ENGINE_ID: EngineId = EngineId::new(2);
 
 const CONTROL_PREEMPT: u32 = 1 << 0;
 const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;
-const HOTNESS_SLOTS: usize = 16 * 1024;
-const HOTNESS_PROMOTION_VISITS: u8 = 3;
-
-struct HotnessTable {
-    slots: Box<[Option<(RegionKey, u8)>]>,
-}
-
-impl HotnessTable {
-    fn new() -> Self {
-        Self {
-            slots: vec![None; HOTNESS_SLOTS].into_boxed_slice(),
-        }
-    }
-
-    fn should_compile(&mut self, key: RegionKey) -> bool {
-        let index = self.index(key);
-        match &mut self.slots[index] {
-            Some((stored, visits)) if *stored == key => {
-                *visits = visits.saturating_add(1);
-                *visits >= HOTNESS_PROMOTION_VISITS
-            }
-            slot => {
-                *slot = Some((key, 1));
-                false
-            }
-        }
-    }
-
-    fn promote(&mut self, key: RegionKey) {
-        let index = self.index(key);
-        self.slots[index] = Some((key, HOTNESS_PROMOTION_VISITS));
-    }
-
-    fn index(&self, key: RegionKey) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        hasher.finish() as usize % self.slots.len()
-    }
-
-    fn clear(&mut self) {
-        self.slots.fill(None);
-    }
-}
 
 enum HostSupport {
-    Available(OwnedTargetIsa),
+    Available {
+        light: OwnedTargetIsa,
+        optimized: OwnedTargetIsa,
+    },
     Unavailable {
         reason: CapabilityRejectionReason,
         detail: Box<str>,
@@ -212,7 +165,7 @@ impl JitProvider {
     fn available_resources(
         &self,
         cpu: ProcessCpuContext,
-    ) -> Result<(OwnedTargetIsa, SharedExecutableMemory), EngineFault> {
+    ) -> Result<(OwnedTargetIsa, OwnedTargetIsa, SharedExecutableMemory), EngineFault> {
         let rejections = self.availability_rejections(cpu.profile(), EngineCapabilities::default());
         if !rejections.is_empty() {
             return Err(fault(
@@ -232,8 +185,10 @@ impl JitProvider {
                 ),
             ));
         }
-        let isa = match self.host() {
-            HostSupport::Available(isa) => Arc::clone(isa),
+        let (light, optimized) = match self.host() {
+            HostSupport::Available { light, optimized } => {
+                (Arc::clone(light), Arc::clone(optimized))
+            }
             HostSupport::Unavailable { .. } => unreachable!("rejections handled host failure"),
         };
         let executable_memory = self
@@ -241,7 +196,7 @@ impl JitProvider {
             .as_ref()
             .expect("rejections handled executable-memory failure")
             .clone();
-        Ok((isa, executable_memory))
+        Ok((light, optimized, executable_memory))
     }
 }
 
@@ -266,7 +221,8 @@ impl EngineProvider for JitProvider {
     }
 
     fn create_domain(&self, request: DomainRequest) -> Result<Box<dyn EngineDomain>, EngineFault> {
-        let (isa, executable_memory) = self.available_resources(request.cpu)?;
+        let (light_isa, optimized_isa, executable_memory) =
+            self.available_resources(request.cpu)?;
         let performance = self
             .configured_performance_report()
             .map(|report| {
@@ -299,18 +255,20 @@ impl EngineProvider for JitProvider {
             );
         }
         let (gateway, gateway_code) =
-            compile_gateway(&isa, &executable_memory).map_err(|error| {
+            compile_gateway(&light_isa, &executable_memory).map_err(|error| {
                 domain_fault(
                     request.cpu,
                     EngineFaultKind::Internal,
                     format!("JIT native gateway failed: {}", error.detail()),
                 )
             })?;
+        let code_cache = Arc::new(DomainCodeCache::new(self.configuration.clone()));
         let compilation_workers = host_compilation_workers();
         let compilation_pool = CompilationPool::new(
             compilation_workers,
-            Arc::clone(&isa),
+            optimized_isa,
             executable_memory.clone(),
+            Arc::clone(&code_cache),
             diagnostics.clone(),
             request.cpu.profile(),
             performance.is_some(),
@@ -320,10 +278,11 @@ impl EngineProvider for JitProvider {
         Ok(Box::new(JitDomain {
             id: request.domain,
             cpu: request.cpu,
+            light_isa,
             executable_memory: Some(executable_memory),
             gateway: Some(gateway),
             gateway_code: Some(gateway_code),
-            code_cache: Some(Arc::new(DomainCodeCache::new(self.configuration.clone()))),
+            code_cache: Some(code_cache),
             compilation_pool: Some(compilation_pool),
             diagnostics,
             performance,
@@ -345,6 +304,7 @@ struct BoundMemory {
 struct JitDomain {
     id: EngineDomainId,
     cpu: ProcessCpuContext,
+    light_isa: OwnedTargetIsa,
     // The provider owns the process-wide arena; each live domain retains the
     // owner so code can never outlive its OS mapping.
     executable_memory: Option<SharedExecutableMemory>,
@@ -407,6 +367,10 @@ impl EngineDomain for JitDomain {
             cpu: self.cpu,
             address_space_end: binding.end_exclusive,
             frame: ExecutionFrame::default(),
+            light_compiler: CompilerContext::new(
+                Arc::clone(&self.light_isa),
+                self.performance.is_some(),
+            ),
             compilation_pool: self
                 .compilation_pool
                 .as_ref()
@@ -426,6 +390,7 @@ impl EngineDomain for JitDomain {
                 .expect("live domain retains its native gateway publication")
                 .clone(),
             code_cache,
+            diagnostics: self.diagnostics.clone(),
             performance_domain: self.performance.clone(),
             performance: self
                 .performance
@@ -433,7 +398,6 @@ impl EngineDomain for JitDomain {
                 .map(|_| ExecutorPerformance::default()),
             executor_epoch,
             local_lookup: LocalLookupCache::new(),
-            hotness: HotnessTable::new(),
             control,
             exclusive_monitor: RefCell::new(ExclusiveMonitorState::default()),
             mapping_epoch: binding.mapping_epoch,
@@ -541,6 +505,7 @@ struct JitExecutor {
     cpu: ProcessCpuContext,
     address_space_end: GuestVirtualAddress,
     frame: ExecutionFrame,
+    light_compiler: CompilerContext,
     compilation_pool: CompilationPoolHandle,
     // Native execution retains the process arena for the executor's complete
     // lifetime; runtime drops every executor before releasing its domain.
@@ -548,11 +513,11 @@ struct JitExecutor {
     gateway: NativeGateway,
     _gateway_code: PublishedCode,
     code_cache: Arc<DomainCodeCache>,
+    diagnostics: Option<Arc<JitDiagnostics>>,
     performance_domain: Option<Arc<DomainPerformance>>,
     performance: Option<ExecutorPerformance>,
     executor_epoch: ExecutorEpoch,
     local_lookup: LocalLookupCache,
-    hotness: HotnessTable,
     control: EngineControl,
     exclusive_monitor: RefCell<ExclusiveMonitorState>,
     mapping_epoch: u64,
@@ -602,9 +567,9 @@ impl EngineExecutor for JitExecutor {
         };
         self.frame.control.instruction_budget = request.instruction_budget;
         self.frame.control.invalidation_epoch = self.invalidation_cursor.get();
-        self.frame.control.loader_return_valid = u32::from(request.loader_return.is_some());
-        self.frame.control.loader_return =
-            request.loader_return.map_or(0, GuestVirtualAddress::get);
+        self.frame.control.loader_return = request
+            .loader_return
+            .map_or(NO_LOADER_RETURN, GuestVirtualAddress::get);
         self.frame.control.control_pending_address = self.control.pending_word_address();
         self.frame.control.interrupt_pending_address = request.events.pending_interrupts_address();
 
@@ -627,7 +592,6 @@ impl EngineExecutor for JitExecutor {
                 data_fault: Option<nixe_cpu::memory::DataAccessFault>,
                 pending: Option<nixe_cpu_engine::ControlSnapshot>,
             },
-            Interpreted(nixe_cpu_engine::EngineExit),
             Frontend(FrontendError),
             Fault(EngineFaultKind, Box<str>),
             Panicked,
@@ -638,6 +602,16 @@ impl EngineExecutor for JitExecutor {
         let mut pending_link = None;
         let dispatch = {
             loop {
+                if let Some(error) = self.code_cache.background_failure() {
+                    break DispatchResult::Fault(
+                        EngineFaultKind::Internal,
+                        format!(
+                            "asynchronous optimized JIT compilation failed: {}",
+                            cache_error_detail(error)
+                        )
+                        .into_boxed_str(),
+                    );
+                }
                 if let Some(snapshot) = self.control.take_pending() {
                     self.frame.control.request_flags |=
                         (u32::from(snapshot.contains(CrossVcpuRequest::Preempt)) * CONTROL_PREEMPT)
@@ -711,7 +685,7 @@ impl EngineExecutor for JitExecutor {
                         performance.local_cache_hits =
                             performance.local_cache_hits.saturating_add(1);
                     }
-                    Ok(Some(region))
+                    Ok(region)
                 } else {
                     if let Some(performance) = &mut self.performance {
                         performance.local_cache_misses =
@@ -719,97 +693,82 @@ impl EngineExecutor for JitExecutor {
                     }
                     if let Some(region) = self.code_cache.lookup_ready(key) {
                         self.local_lookup.insert(key, Arc::clone(&region));
-                        Ok(Some(region))
-                    } else if let Some(completed) = self.compilation_pool.take_completed(key) {
-                        match completed.result {
-                            Ok(pending) => {
-                                match pending.dependencies_are_current(
-                                    request.memory,
-                                    request.cpu.address_space_id(),
-                                ) {
-                                    Ok(true) => {
-                                        if let Some(performance) = &mut self.performance {
-                                            performance.cache_miss_resolution_calls = performance
-                                                .cache_miss_resolution_calls
-                                                .saturating_add(1);
-                                        }
-                                        let started =
-                                            self.performance.as_ref().map(|_| Instant::now());
-                                        let result =
-                                            self.code_cache.resolve(key, |_| Ok(pending)).map(Some);
-                                        if let (Some(performance), Some(started)) =
-                                            (&mut self.performance, started)
-                                        {
-                                            ExecutorPerformance::add_duration(
-                                                &mut performance.cache_miss_resolution_ns,
-                                                started.elapsed(),
-                                            );
-                                        }
-                                        if let Ok(Some(region)) = &result {
-                                            self.local_lookup.insert(key, Arc::clone(region));
-                                        }
-                                        result
-                                    }
-                                    Ok(false) => Err(CacheError::Stale),
-                                    Err(error) => Err(CacheError::Frontend(error)),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
+                        Ok(region)
                     } else {
-                        if !self.compilation_pool.contains(key) && self.hotness.should_compile(key)
-                        {
-                            let frontend_started =
-                                self.performance.as_ref().map(|_| Instant::now());
-                            let translated = translate_region(
+                        if let Some(performance) = &mut self.performance {
+                            performance.cache_miss_resolution_calls =
+                                performance.cache_miss_resolution_calls.saturating_add(1);
+                        }
+                        let resolution_started = self.performance.as_ref().map(|_| Instant::now());
+                        let code_cache = Arc::clone(&self.code_cache);
+                        let executable_memory = self._executable_memory.clone();
+                        let diagnostics = self.diagnostics.clone();
+                        let profile = request.cpu.profile();
+                        let address_space = request.cpu.address_space_id();
+                        let memory = request.memory;
+                        let collect_performance = self.performance.is_some();
+                        let compiler = &mut self.light_compiler;
+                        let performance = &mut self.performance;
+                        let result = code_cache.resolve(key, |cancellation| {
+                            if let Some(performance) = performance.as_mut() {
+                                performance.compilation_attempts =
+                                    performance.compilation_attempts.saturating_add(1);
+                            }
+                            let frontend_started = collect_performance.then(Instant::now);
+                            let region = translate_region(
                                 translation_mode.config(),
-                                &request.cpu.profile(),
-                                request.cpu.address_space_id(),
+                                &profile,
+                                address_space,
                                 location,
-                                request.memory,
-                            );
+                                memory,
+                            )?;
                             if let (Some(performance), Some(started)) =
-                                (&mut self.performance, frontend_started)
+                                (performance.as_mut(), frontend_started)
                             {
                                 ExecutorPerformance::add_duration(
                                     &mut performance.frontend_ns,
                                     started.elapsed(),
                                 );
                             }
-                            match translated {
-                                Ok(region) => {
-                                    if trace_jit {
-                                        log::trace!(
-                                            "JIT region queued for asynchronous compilation: executor={:?} start=[{}] guest_instructions={} ir_operations={}",
-                                            self.id,
-                                            region.metadata.start,
-                                            region.metadata.guest_instruction_count,
-                                            region.metadata.ir_operation_count,
-                                        );
-                                    }
-                                    let enqueued = self.compilation_pool.enqueue(CompilationTask {
-                                        key,
-                                        address_space: request.cpu.address_space_id(),
-                                        mode: translation_mode,
-                                        region,
-                                    });
-                                    if enqueued && let Some(performance) = &mut self.performance {
-                                        performance.hot_promotions =
-                                            performance.hot_promotions.saturating_add(1);
-                                        performance.compilation_attempts =
-                                            performance.compilation_attempts.saturating_add(1);
-                                    }
-                                    #[cfg(test)]
-                                    if enqueued && self.compilation_pool.wait_for_completion(key) {
-                                        continue;
-                                    }
-                                    Ok(None)
-                                }
-                                Err(error) => Err(CacheError::Frontend(error)),
+                            let region = Arc::new(region);
+                            let promotion = Arc::new(PromotionCell::new());
+                            let mut metrics = CompilationMetrics::default();
+                            let compiled = compiler.compile(
+                                &region,
+                                &executable_memory,
+                                cancellation,
+                                Some(Arc::as_ptr(&promotion).addr()),
+                                &mut metrics,
+                            )?;
+                            if let Some(diagnostics) = &diagnostics {
+                                diagnostics
+                                    .dump_region(&profile, &region, &compiled)
+                                    .map_err(CacheError::Internal)?;
                             }
-                        } else {
-                            Ok(None)
+                            if let Some(performance) = performance.as_mut() {
+                                performance.record_light_compilation(&region, &compiled, metrics);
+                            }
+                            PendingRegion::new(
+                                address_space,
+                                translation_mode,
+                                region,
+                                compiled,
+                                CodeTier::Light,
+                                Some(promotion),
+                            )
+                        });
+                        if let (Some(performance), Some(started)) =
+                            (&mut self.performance, resolution_started)
+                        {
+                            ExecutorPerformance::add_duration(
+                                &mut performance.cache_miss_resolution_ns,
+                                started.elapsed(),
+                            );
                         }
+                        if let Ok(region) = &result {
+                            self.local_lookup.insert(key, Arc::clone(region));
+                        }
+                        result
                     }
                 };
                 let cached = match cached {
@@ -836,59 +795,12 @@ impl EngineExecutor for JitExecutor {
                     }
                 };
 
-                let Some(cached) = cached else {
-                    if let Some(performance) = &mut self.performance {
-                        performance.cold_interpreter_steps =
-                            performance.cold_interpreter_steps.saturating_add(1);
-                    }
-                    pending_link = None;
-                    self.commit_or_fault(request.state, instructions_executed)?;
-                    let encoding =
-                        match fetch_current_instruction(request.memory, request.cpu, request.state)
-                        {
-                            Ok(encoding) => encoding,
-                            Err(fault) => {
-                                break DispatchResult::Interpreted(
-                                    nixe_cpu_engine::EngineExit::FetchFault { fault },
-                                );
-                            }
-                        };
-                    let context = InterpreterContext::new(request.cpu)
-                        .with_memory(request.memory)
-                        .with_exclusive_monitor(&self.exclusive_monitor)
-                        .with_architectural_timer_provider(request.timer)
-                        .with_vcpu_events(&request.events);
-                    let outcome = match execute_one_with_context(context, request.state, encoding) {
-                        Ok(outcome) => outcome,
-                        Err(InterpreterError::UnsupportedInstruction { .. }) => {
-                            self.hotness.promote(key);
-                            continue;
-                        }
-                        Err(error) => {
-                            break DispatchResult::Fault(
-                                EngineFaultKind::Internal,
-                                error.to_string().into_boxed_str(),
-                            );
-                        }
-                    };
-                    instructions_executed = instructions_executed.saturating_add(1);
-                    self.frame.import_state(request.state);
-                    match normalize_interpreter_outcome(outcome) {
-                        None => continue,
-                        Some(stop) => break DispatchResult::Interpreted(stop),
-                    }
-                };
-
                 if let Some((source, site, linked_location)) = pending_link.take() {
                     debug_assert_eq!(linked_location, location);
-                    if let Some(performance) = &mut self.performance {
-                        performance.link_attempts = performance.link_attempts.saturating_add(1);
-                    }
                     match self.code_cache.link(source, site, location, &cached) {
-                        Ok(()) => {
+                        Ok((kind, outcome)) => {
                             if let Some(performance) = &mut self.performance {
-                                performance.link_successes =
-                                    performance.link_successes.saturating_add(1);
+                                performance.record_link(kind, outcome);
                             }
                         }
                         Err(CacheError::Stale) => {
@@ -927,6 +839,7 @@ impl EngineExecutor for JitExecutor {
                     &request.events,
                 )
                 .with_invalidations(&self.code_cache, &mut self.invalidation_cursor)
+                .with_compilation_pool(&self.compilation_pool)
                 .with_performance(self.performance.as_mut());
                 cached.install_dispatch(&mut self.frame);
                 self.frame.install_host_context(
@@ -1078,11 +991,6 @@ impl EngineExecutor for JitExecutor {
                     context: request.state.register_context(),
                 })
             }
-            DispatchResult::Interpreted(stop) => Ok(ExecutionReport {
-                instructions_executed,
-                stop,
-                context: request.state.register_context(),
-            }),
             DispatchResult::Frontend(error) => Ok(ExecutionReport {
                 instructions_executed,
                 stop: normalize_frontend_error(error, instructions_executed, request.state)?,
@@ -1150,7 +1058,6 @@ impl EngineExecutor for JitExecutor {
             ));
         }
         self.local_lookup.clear();
-        self.hotness.clear();
         self.exclusive_monitor.get_mut().clear();
         self.invalidation_cursor = binding.invalidation_cursor;
         self.mapping_epoch = binding.mapping_epoch;
@@ -1179,7 +1086,6 @@ impl Drop for JitExecutor {
 const fn native_exit_kind_name(kind: u32) -> &'static str {
     match kind {
         EXIT_NONE => "none",
-        EXIT_INTERPRET_ONE => "interpret-one",
         EXIT_BUDGET_EXHAUSTED => "budget-exhausted",
         EXIT_SAFEPOINT => "safepoint",
         EXIT_PENDING_EVENT => "pending-event",
@@ -1203,6 +1109,9 @@ impl JitExecutor {
     ) -> Result<(), EngineFault> {
         if requested <= self.invalidation_cursor {
             self.control.acknowledge_invalidation(requested.get());
+            if self.frame.control.invalidation_epoch <= self.invalidation_cursor.get() {
+                self.frame.control.request_flags &= !CONTROL_CODE_INVALIDATION;
+            }
             return Ok(());
         }
         let mut records = Vec::new();
@@ -1248,6 +1157,7 @@ impl JitExecutor {
         self.invalidation_cursor = through;
         self.frame.control.invalidation_epoch = through.get();
         self.control.acknowledge_invalidation(through.get());
+        self.frame.control.request_flags &= !CONTROL_CODE_INVALIDATION;
         Ok(())
     }
 
@@ -1293,8 +1203,7 @@ impl JitExecutor {
                 ..NativeExit::default()
             });
         }
-        if self.frame.control.loader_return_valid != 0
-            && source_pc == self.frame.control.loader_return
+        if source_pc == self.frame.control.loader_return
             && let Some(result_code) = self.frame.a64_result_code()
         {
             return Some(NativeExit {
@@ -1333,42 +1242,6 @@ impl JitExecutor {
     }
 }
 
-fn normalize_interpreter_outcome(
-    outcome: InterpreterOutcome,
-) -> Option<nixe_cpu_engine::EngineExit> {
-    match outcome {
-        InterpreterOutcome::Resume(_) => None,
-        InterpreterOutcome::Exception {
-            source,
-            kind: ExceptionKind::SupervisorCall,
-            syndrome: Some(syndrome),
-        } if let Ok(immediate) = u32::try_from(syndrome) => {
-            Some(nixe_cpu_engine::EngineExit::SupervisorCall { source, immediate })
-        }
-        InterpreterOutcome::Exception {
-            source,
-            kind,
-            syndrome,
-        } => Some(nixe_cpu_engine::EngineExit::ArchitecturalException {
-            source,
-            kind,
-            syndrome,
-        }),
-        InterpreterOutcome::Scheduled { source, request } => {
-            Some(nixe_cpu_engine::EngineExit::Scheduled { source, request })
-        }
-        InterpreterOutcome::DataAbort { source, fault } => {
-            Some(nixe_cpu_engine::EngineExit::DataFault { source, fault })
-        }
-        InterpreterOutcome::ProfileDisabled(error) => {
-            Some(nixe_cpu_engine::EngineExit::ProfileDisabled { error })
-        }
-        InterpreterOutcome::Unallocated(error) => {
-            Some(nixe_cpu_engine::EngineExit::UnallocatedEncoding { error })
-        }
-    }
-}
-
 fn normalize_exit(
     exit: NativeExit,
     metadata: Option<&CompiledRegionMetadata>,
@@ -1383,7 +1256,6 @@ fn normalize_exit(
         cpu.profile().id(),
     );
     match exit.kind {
-        EXIT_INTERPRET_ONE => Ok(nixe_cpu_engine::EngineExit::InterpretOne { source }),
         EXIT_DISPATCH => Err(fault(
             EngineFaultKind::Internal,
             exit.instructions_executed,
@@ -1439,12 +1311,20 @@ fn normalize_exit(
                     coverage_id,
                     disassembly,
                     ..
-                } => Ok(nixe_cpu_engine::EngineExit::UnsupportedSemantics {
-                    source: compact_source(metadata, *source, state, exit.instructions_executed)?,
-                    encoding: *encoding,
-                    disassembly: disassembly.clone(),
-                    coverage_id: CoverageId::new(*coverage_id),
-                }),
+                } => {
+                    let source =
+                        compact_source(metadata, *source, state, exit.instructions_executed)?;
+                    Err(fault(
+                        EngineFaultKind::Internal,
+                        exit.instructions_executed,
+                        format!(
+                            "JIT does not support guest instruction: source={source} \
+                             encoding={encoding:?} coverage_id={} disassembly={disassembly}",
+                            CoverageId::new(*coverage_id)
+                        ),
+                        state,
+                    ))
+                }
                 _ => Err(fault(
                     EngineFaultKind::Internal,
                     exit.instructions_executed,
@@ -1566,9 +1446,12 @@ fn normalize_frontend_error(
         FrontendError::Unallocated(error) => {
             Ok(nixe_cpu_engine::EngineExit::UnallocatedEncoding { error })
         }
-        FrontendError::Decode(error) => Ok(nixe_cpu_engine::EngineExit::InterpretOne {
-            source: error.instruction.location,
-        }),
+        FrontendError::Decode(error) => Err(fault(
+            EngineFaultKind::Internal,
+            instructions_executed,
+            format!("JIT cannot decode guest instruction: {error}"),
+            state,
+        )),
         FrontendError::InvalidIr(error) => Err(fault(
             EngineFaultKind::Internal,
             instructions_executed,
@@ -1611,7 +1494,7 @@ const fn capabilities() -> EngineCapabilities {
         a64: true,
         a32: true,
         t32: true,
-        interpret_one_fallback: true,
+        interpret_one_fallback: false,
         concurrent_executors: true,
         // Entry polls and explicit backward-edge polls bound a default region
         // to at most this many instructions before returning to the runtime.
@@ -1636,29 +1519,50 @@ fn probe_host() -> HostSupport {
             .into_boxed_str(),
         };
     }
-    let builder = match cranelift_native::builder() {
-        Ok(builder) => builder,
-        Err(detail) => {
-            return HostSupport::Unavailable {
-                reason: CapabilityRejectionReason::HostUnavailable,
-                detail: format!("Cranelift rejected the native host ISA: {detail}")
-                    .into_boxed_str(),
-            };
-        }
+    let build = |opt_level: &str,
+                 regalloc_algorithm: &str,
+                 enable_verifier: bool|
+     -> Result<OwnedTargetIsa, Box<str>> {
+        let builder = cranelift_native::builder().map_err(|detail| {
+            format!("Cranelift rejected the native host ISA: {detail}").into_boxed_str()
+        })?;
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|error| {
+                format!("Cranelift tail-call configuration failed: {error}").into_boxed_str()
+            })?;
+        flag_builder.set("opt_level", opt_level).map_err(|error| {
+            format!("Cranelift optimization configuration failed: {error}").into_boxed_str()
+        })?;
+        flag_builder
+            .set("regalloc_algorithm", regalloc_algorithm)
+            .map_err(|error| {
+                format!("Cranelift register-allocation configuration failed: {error}")
+                    .into_boxed_str()
+            })?;
+        flag_builder
+            .set(
+                "enable_verifier",
+                if enable_verifier { "true" } else { "false" },
+            )
+            .map_err(|error| {
+                format!("Cranelift verifier configuration failed: {error}").into_boxed_str()
+            })?;
+        builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|error| {
+                format!("Cranelift native ISA configuration failed: {error}").into_boxed_str()
+            })
     };
-    let mut flag_builder = settings::builder();
-    if let Err(error) = flag_builder.set("preserve_frame_pointers", "true") {
-        return HostSupport::Unavailable {
+    match (
+        build("none", "single_pass", cfg!(debug_assertions)),
+        build("speed", "backtracking", true),
+    ) {
+        (Ok(light), Ok(optimized)) => HostSupport::Available { light, optimized },
+        (Err(detail), _) | (_, Err(detail)) => HostSupport::Unavailable {
             reason: CapabilityRejectionReason::HostUnavailable,
-            detail: format!("Cranelift tail-call configuration failed: {error}").into_boxed_str(),
-        };
-    }
-    let flags = settings::Flags::new(flag_builder);
-    match builder.finish(flags) {
-        Ok(isa) => HostSupport::Available(isa),
-        Err(error) => HostSupport::Unavailable {
-            reason: CapabilityRejectionReason::HostUnavailable,
-            detail: format!("Cranelift native ISA configuration failed: {error}").into_boxed_str(),
+            detail,
         },
     }
 }
@@ -1754,6 +1658,23 @@ mod tests {
 
     const SPACE: AddressSpaceId = AddressSpaceId::new(7);
     static NEXT_DUMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn host_isa_uses_fast_release_baseline_and_checked_optimized_profiles() {
+        let HostSupport::Available { light, optimized } = probe_host() else {
+            panic!("the JIT test host must support native Cranelift code generation");
+        };
+        assert_eq!(
+            light.flags().regalloc_algorithm(),
+            settings::RegallocAlgorithm::SinglePass
+        );
+        assert_eq!(light.flags().enable_verifier(), cfg!(debug_assertions));
+        assert_eq!(
+            optimized.flags().regalloc_algorithm(),
+            settings::RegallocAlgorithm::Backtracking
+        );
+        assert!(optimized.flags().enable_verifier());
+    }
 
     struct TemporaryDumpDirectory {
         path: PathBuf,
@@ -1966,7 +1887,7 @@ mod tests {
 
         let report = fs::read_to_string(report_path).unwrap();
         toml::from_str::<toml::Value>(&report).unwrap();
-        assert!(report.contains("nixe_jit_performance_version=7"));
+        assert!(report.contains("nixe_jit_performance_version=10"));
         assert!(report.contains("[domain.9]"));
         assert!(report.contains("[domain.9.executor.11]"));
         assert!(report.contains("codegen_completed=1"));
@@ -1975,15 +1896,92 @@ mod tests {
         assert!(report.contains("repeat_builds=0"));
         assert!(report.contains("native_entries="));
         assert!(report.contains("native_instructions="));
-        assert!(report.contains("cold_interpreter_steps="));
+        assert!(report.contains("light_tier=\"cranelift-none-single-pass-synchronous\""));
+        assert!(report.contains(&format!(
+            "light_cranelift_verifier={}",
+            cfg!(debug_assertions)
+        )));
+        assert!(report.contains("optimized_tier=\"cranelift-speed-backtracking-asynchronous\""));
+        assert!(report.contains("optimized_cranelift_verifier=true"));
         assert!(report.contains("compiled_native_named_operations="));
         assert!(report.contains("compiled_semantic_helper_callsites="));
         assert!(report.contains("cranelift_regalloc_ns="));
         assert!(report.contains("publication_lock_wait_ns="));
         assert!(report.contains("compiled_native_code_bytes="));
         assert!(report.contains("compiled_native_mapped_bytes="));
+        assert!(report.contains("link_direct_published="));
+        assert!(report.contains("link_indirect_pic_full="));
+        assert!(report.contains("invalidation_checks_filtered="));
         assert!(report.contains("helper_system_polls=0"));
         assert!(report.contains("compilation_pool_workers="));
+    }
+
+    #[test]
+    fn native_hotness_counter_promotes_and_publishes_optimized_code_directly() {
+        let dump = TemporaryDumpDirectory::new();
+        let configuration =
+            JitConfiguration::default().with_dump_directory(Some(dump.path().to_path_buf()));
+        let (_domain, mut executor) = bound_executor_with_configuration(configuration);
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(95);
+        assert!(memory.add_ram_page(code_page));
+        assert!(memory.initialize_ram(code_page, 0, &0x1400_0000_u32.to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let mut state = ThreadCpuState::A64(Box::new({
+            let mut state = A64State::default();
+            state.set_pc(0x1000);
+            state
+        }));
+
+        for _ in 0..=crate::cache::HOT_PROMOTION_ENTRIES {
+            let report = executor
+                .run_slice(RunRequest {
+                    cpu: cpu(),
+                    memory: &memory,
+                    state: &mut state,
+                    instruction_budget: 1,
+                    loader_return: None,
+                    timer: &FixedTimer,
+                    events: nixe_cpu_engine::VcpuEventState::default(),
+                })
+                .unwrap();
+            assert_eq!(report.stop, nixe_cpu_engine::EngineExit::BudgetExhausted);
+        }
+
+        let session = only_directory(dump.path());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let completed = fs::read_dir(&session)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.join("complete").is_file())
+                .count();
+            if completed == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "optimized JIT publication did not complete"
+            );
+            std::thread::yield_now();
+        }
+
+        executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 1,
+                loader_return: None,
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
     }
 
     fn only_directory(parent: &Path) -> PathBuf {
@@ -3239,6 +3237,56 @@ mod tests {
         assert_eq!(state.pc(), 0x1000);
     }
 
+    #[test]
+    fn hoisted_loader_control_still_exits_at_the_exact_instruction_boundary() {
+        let (_domain, mut executor) = bound_executor();
+        let mut memory = SyntheticMemory::new();
+        let code_page = GuestPhysicalPageId::new(93);
+        assert!(memory.add_ram_page(code_page));
+        // ADD X0,X0,#1; ADD X0,X0,#1; B .
+        assert!(memory.initialize_ram(code_page, 0, &0x9100_0400_u32.to_le_bytes()));
+        assert!(memory.initialize_ram(code_page, 4, &0x9100_0400_u32.to_le_bytes()));
+        assert!(memory.initialize_ram(code_page, 8, &0x1400_0000_u32.to_le_bytes()));
+        assert!(memory.map_page(
+            SPACE,
+            GuestVirtualAddress::new(0x1000),
+            code_page,
+            MemoryPermissions::READ_EXECUTE,
+        ));
+        let mut a64 = A64State::default();
+        a64.set_pc(0x1000);
+        let mut state = ThreadCpuState::A64(Box::new(a64));
+
+        let report = executor
+            .run_slice(RunRequest {
+                cpu: cpu(),
+                memory: &memory,
+                state: &mut state,
+                instruction_budget: 10,
+                loader_return: Some(GuestVirtualAddress::new(0x1004)),
+                timer: &FixedTimer,
+                events: nixe_cpu_engine::VcpuEventState::default(),
+            })
+            .unwrap();
+
+        assert_eq!(report.instructions_executed, 1);
+        assert!(matches!(
+            report.stop,
+            nixe_cpu_engine::EngineExit::LoaderReturn {
+                source,
+                result_code: 1
+            } if source.pc == GuestVirtualAddress::new(0x1004)
+        ));
+        let ThreadCpuState::A64(state) = state else {
+            unreachable!()
+        };
+        assert_eq!(state.pc(), 0x1004);
+        assert_eq!(
+            state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
+            1
+        );
+    }
+
     struct PreemptingMmio {
         control: EngineControl,
     }
@@ -3682,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_and_interpreter_fallback_leave_only_through_normalized_exits() {
+    fn exception_is_normalized_and_interpreter_fallback_is_a_fatal_jit_error() {
         let (_domain, mut executor) = bound_executor();
         let mut a64_memory = SyntheticMemory::new();
         let a64_page = GuestPhysicalPageId::new(89);
@@ -3719,8 +3767,9 @@ mod tests {
         let mut t32_memory = SyntheticMemory::new();
         let t32_page = GuestPhysicalPageId::new(90);
         assert!(t32_memory.add_ram_page(t32_page));
-        // YIELD is intentionally delegated to the exact one-instruction
-        // interpreter boundary by the current T32 frontend.
+        // YIELD is intentionally left as an interpreter-only frontend
+        // terminator. JIT mode must reject that boundary instead of switching
+        // execution engines.
         assert!(t32_memory.initialize_ram(t32_page, 0, &0xbf10_u16.to_le_bytes()));
         assert!(t32_memory.map_page(
             SPACE,
@@ -3731,7 +3780,7 @@ mod tests {
         let mut t32 = A32State::t32();
         t32.set_instruction_address(0x1000).unwrap();
         let mut t32 = ThreadCpuState::A32(Box::new(t32));
-        let report = executor
+        let error = executor
             .run_slice(RunRequest {
                 cpu: cpu(),
                 memory: &t32_memory,
@@ -3741,14 +3790,11 @@ mod tests {
                 timer: &FixedTimer,
                 events: nixe_cpu_engine::VcpuEventState::default(),
             })
-            .unwrap();
-        assert_eq!(report.instructions_executed, 0);
-        assert!(matches!(
-            report.stop,
-            nixe_cpu_engine::EngineExit::InterpretOne { source }
-                if source.pc == GuestVirtualAddress::new(0x1000)
-                    && source.execution_state == ExecutionState::T32
-        ));
+            .unwrap_err();
+        assert_eq!(error.kind, EngineFaultKind::Internal);
+        assert_eq!(error.instructions_executed, 0);
+        assert!(error.message.contains("forbidden interpreter fallback"));
+        assert!(error.message.contains("pc=0x0000000000001000"));
     }
 
     #[test]
@@ -3816,7 +3862,27 @@ mod tests {
 
     #[test]
     fn unrelated_executable_writes_do_not_force_native_safepoints() {
-        let (_domain, mut executor) = bound_executor();
+        let dump = TemporaryDumpDirectory::new();
+        let report_path = dump.path().join("jit-performance.toml");
+        let provider = JitProvider::with_configuration(
+            JitConfiguration::default().with_performance_report(Some(report_path.clone())),
+        );
+        let binding_memory = ExecutionMemory::new();
+        let mut domain = provider
+            .create_domain(DomainRequest {
+                domain: EngineDomainId::new(9),
+                cpu: cpu(),
+            })
+            .unwrap();
+        let binding = DomainMemoryBinding {
+            address_space: SPACE,
+            end_exclusive: GuestVirtualAddress::new(1 << 39),
+            memory: &binding_memory,
+            mapping_epoch: 3,
+            invalidation_cursor: nixe_memory::MemoryInvalidationCursor::INITIAL,
+        };
+        domain.bind_memory(binding).unwrap();
+        let mut executor = domain.create_executor(EngineExecutorId::new(11)).unwrap();
         let mut memory = SyntheticMemory::new();
         let code_page = GuestPhysicalPageId::new(91);
         let observed_data_page = GuestPhysicalPageId::new(92);
@@ -3871,6 +3937,14 @@ mod tests {
 
         assert_eq!(report.instructions_executed, 20);
         assert_eq!(report.stop, nixe_cpu_engine::EngineExit::BudgetExhausted);
+
+        domain.request_stop().unwrap();
+        executor.prepare_shutdown(binding, &state).unwrap();
+        drop(executor);
+        domain.shutdown().unwrap();
+        let performance = fs::read_to_string(report_path).unwrap();
+        assert!(performance.contains("helper_system_polls=0"));
+        assert!(performance.contains("invalidation_checks_filtered=10"));
     }
 
     #[test]

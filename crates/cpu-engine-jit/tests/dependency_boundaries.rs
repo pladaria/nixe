@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 #[test]
-fn jit_owns_cranelift_and_cold_interpretation_without_importing_runtime() {
+fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let production_dependencies = manifest
@@ -15,7 +15,6 @@ fn jit_owns_cranelift_and_cold_interpretation_without_importing_runtime() {
         "cranelift-native = \"=0.134.3\"",
         "nixe-cpu.workspace = true",
         "nixe-cpu-engine.workspace = true",
-        "nixe-cpu-engine-interpreter.workspace = true",
         "nixe-memory.workspace = true",
         "libc = \"0.2\"",
         "windows-sys = { version = \"0.61\"",
@@ -26,6 +25,7 @@ fn jit_owns_cranelift_and_cold_interpretation_without_importing_runtime() {
         );
     }
     for forbidden in [
+        "nixe-cpu-engine-interpreter.workspace",
         "nixe-runtime.workspace",
         "nixe-horizon.workspace",
         "nixe-scheduler.workspace",
@@ -36,6 +36,10 @@ fn jit_owns_cranelift_and_cold_interpretation_without_importing_runtime() {
             "forbidden production dependency: {forbidden}"
         );
     }
+    assert!(
+        manifest.contains("[dev-dependencies]\nnixe-cpu-engine-interpreter.workspace = true"),
+        "the reference interpreter must remain test-only"
+    );
     for forbidden in ["cranelift-jit", "cranelift-module", "dynasm", "iced-x86"] {
         assert!(
             !manifest.contains(forbidden),

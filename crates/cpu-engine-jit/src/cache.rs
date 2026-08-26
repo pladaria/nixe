@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use nixe_cpu::error::{FrontendError, FrontendInternalError};
@@ -30,6 +30,111 @@ const COMPILATION_STALE: u8 = 1;
 const COMPILATION_STOPPED: u8 = 2;
 
 type RegionId = u64;
+
+// Ryujinx likewise gives LCQ code a native entry counter and requests an HCQ
+// replacement after the counter reaches its threshold:
+// https://git.axenov.dev/Museum/ryujinx/src/commit/b5cf8b8af9a8316a32322c8a7dc6d1798490e241/ARMeilleure/Translation/Translator.cs
+pub(crate) const HOT_PROMOTION_ENTRIES: u32 = 100;
+pub(crate) const PROMOTION_COUNTING: u32 = 0;
+const PROMOTION_QUEUED: u32 = 1;
+const PROMOTION_COMPILING: u32 = 2;
+const PROMOTION_OPTIMIZED: u32 = 3;
+const PROMOTION_STALE: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodeTier {
+    Light,
+    Optimized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkOutcome {
+    Published,
+    AlreadyPresent,
+    /// The PIC was full and a bounded round-robin replacement was published.
+    PicFull,
+}
+
+/// Stable state addressed directly by light-tier native code.
+#[repr(C, align(8))]
+pub(crate) struct PromotionCell {
+    pub(crate) entries: AtomicU32,
+    pub(crate) state: AtomicU32,
+    region_id: AtomicU64,
+    cancellation: AtomicU8,
+}
+
+impl PromotionCell {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: AtomicU32::new(0),
+            state: AtomicU32::new(PROMOTION_COUNTING),
+            region_id: AtomicU64::new(0),
+            cancellation: AtomicU8::new(COMPILATION_ACTIVE),
+        }
+    }
+
+    pub(crate) fn install_region(&self, region_id: RegionId) {
+        self.region_id.store(region_id, Ordering::Release);
+    }
+
+    fn queue(&self) -> bool {
+        self.state
+            .compare_exchange(
+                PROMOTION_COUNTING,
+                PROMOTION_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn begin_compilation(&self) -> bool {
+        self.state
+            .compare_exchange(
+                PROMOTION_QUEUED,
+                PROMOTION_COMPILING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn rearm(&self) {
+        if self
+            .state
+            .compare_exchange(
+                PROMOTION_QUEUED,
+                PROMOTION_COUNTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.entries
+                .store(HOT_PROMOTION_ENTRIES - 1, Ordering::Release);
+        }
+    }
+
+    fn mark_optimized(&self) {
+        self.state.store(PROMOTION_OPTIMIZED, Ordering::Release);
+    }
+
+    pub(crate) fn mark_stale(&self) {
+        self.cancellation
+            .store(COMPILATION_STALE, Ordering::Release);
+        self.state.store(PROMOTION_STALE, Ordering::Release);
+    }
+
+    pub(crate) fn cancellation(&self) -> CompilationCancellation<'_> {
+        CompilationCancellation {
+            state: &self.cancellation,
+        }
+    }
+}
+
+pub(crate) const PROMOTION_ENTRIES_OFFSET: usize = core::mem::offset_of!(PromotionCell, entries);
+pub(crate) const PROMOTION_STATE_OFFSET: usize = core::mem::offset_of!(PromotionCell, state);
 
 /// Frontend policy which affects generated semantics and therefore cache identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -120,14 +225,19 @@ pub(crate) struct PendingRegion {
     compiled: CompiledRegion,
     identity: RegionIdentity,
     ir_operations: u64,
+    tier: CodeTier,
+    source_ir: Option<Arc<IrRegion>>,
+    promotion: Option<Arc<PromotionCell>>,
 }
 
 impl PendingRegion {
     pub(crate) fn new(
         address_space: AddressSpaceId,
         translation_mode: TranslationMode,
-        region: &IrRegion,
+        region: Arc<IrRegion>,
         compiled: CompiledRegion,
+        tier: CodeTier,
+        promotion: Option<Arc<PromotionCell>>,
     ) -> Result<Self, CacheError> {
         let mut keys = Vec::with_capacity(region.metadata.entries.len());
         for entry in &region.metadata.entries {
@@ -173,37 +283,10 @@ impl PendingRegion {
                 mapping_dependencies: mapping_dependencies.into_boxed_slice(),
             },
             ir_operations: u64::from(region.metadata.ir_operation_count),
+            tier,
+            source_ir: (tier == CodeTier::Light).then_some(region),
+            promotion,
         })
-    }
-
-    pub(crate) fn dependencies_are_current(
-        &self,
-        memory: &dyn CpuMemory,
-        address_space: AddressSpaceId,
-    ) -> Result<bool, FrontendError> {
-        for expected in &self.identity.mapping_dependencies {
-            let observed = match expected.location.execution_state {
-                ExecutionState::A64 | ExecutionState::A32 => {
-                    memory
-                        .fetch32(address_space, expected.location.pc)
-                        .map_err(FrontendError::InstructionFetch)?
-                        .dependencies
-                }
-                ExecutionState::T32 => {
-                    memory
-                        .fetch16(address_space, expected.location.pc)
-                        .map_err(FrontendError::InstructionFetch)?
-                        .dependencies
-                }
-            };
-            if !observed
-                .iter()
-                .any(|dependency| dependency == expected.dependency)
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 }
 
@@ -214,6 +297,9 @@ pub(crate) struct CachedRegion {
     identity: RegionIdentity,
     ir_operations: u64,
     links: LinkTable,
+    tier: CodeTier,
+    source_ir: Option<Arc<IrRegion>>,
+    promotion: Option<Arc<PromotionCell>>,
 }
 
 impl CachedRegion {
@@ -235,6 +321,15 @@ impl CachedRegion {
         frame.dispatch.region_id = self.id;
         frame.dispatch.retired = 0;
     }
+}
+
+pub(crate) struct PromotionRequest {
+    pub(crate) key: RegionKey,
+    pub(crate) baseline_id: RegionId,
+    pub(crate) address_space: AddressSpaceId,
+    pub(crate) mode: TranslationMode,
+    pub(crate) region: Arc<IrRegion>,
+    pub(crate) promotion: Arc<PromotionCell>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,11 +459,6 @@ pub(crate) enum CompilationCancellationReason {
 }
 
 impl CompilationCancellation<'_> {
-    pub(crate) fn active() -> Self {
-        static ACTIVE: AtomicU8 = AtomicU8::new(COMPILATION_ACTIVE);
-        Self { state: &ACTIVE }
-    }
-
     #[must_use]
     pub(crate) fn reason(self) -> Option<CompilationCancellationReason> {
         match self.state.load(Ordering::Acquire) {
@@ -409,6 +499,7 @@ struct CacheState {
     retirement_epoch: u64,
     executors: Vec<Weak<AtomicU64>>,
     retired: VecDeque<RetiredBatch>,
+    background_failure: Option<CacheError>,
     performance: Option<CachePerformanceState>,
 }
 
@@ -533,6 +624,7 @@ impl CacheState {
             retirement_epoch: 1,
             executors: Vec::new(),
             retired: VecDeque::new(),
+            background_failure: None,
             performance: performance_enabled.then(CachePerformanceState::new),
         }
     }
@@ -557,6 +649,9 @@ impl CacheState {
         let Some(region) = self.regions.get(&id).cloned() else {
             return;
         };
+        if let Some(promotion) = &region.promotion {
+            promotion.mark_stale();
+        }
         self.unlink_region(id, epoch);
         region.live.store(false, Ordering::Release);
         self.regions.remove(&id);
@@ -924,6 +1019,44 @@ impl DomainCodeCache {
         Ok(effect)
     }
 
+    /// Advances the cache cursor only when executable-content records cannot
+    /// affect live code and no unpublished compilation can still depend on
+    /// them. This is used inside guest write helpers before they request a
+    /// native poll, avoiding a second Rust transition for irrelevant writes.
+    pub(crate) fn consume_irrelevant_invalidations(
+        &self,
+        records: &[MemoryInvalidation],
+        through: MemoryInvalidationCursor,
+    ) -> Result<bool, CacheError> {
+        let mut state = lock(&self.state);
+        if state.invalidation_cursor >= through {
+            return Ok(true);
+        }
+        if state.compiling_slots != 0 {
+            return Ok(false);
+        }
+        let mut counts = InvalidationRecordCounts::default();
+        for record in records
+            .iter()
+            .filter(|record| record.cursor > state.invalidation_cursor)
+        {
+            let MemoryInvalidationKind::ExecutableContent { first, second } = record.kind else {
+                return Ok(false);
+            };
+            counts.executable_content = counts.executable_content.saturating_add(1);
+            if state.physical_index.contains_key(&first)
+                || second.is_some_and(|page| state.physical_index.contains_key(&page))
+            {
+                return Ok(false);
+            }
+        }
+        if let Some(performance) = &mut state.performance {
+            performance.record_invalidation(counts, false, 0, 0, true);
+        }
+        state.invalidation_cursor = through;
+        Ok(true)
+    }
+
     pub(crate) fn begin_shutdown(&self) -> Result<(), CacheError> {
         let flights = lock(&self.state).begin_shutdown()?;
         for flight in flights {
@@ -949,8 +1082,19 @@ impl DomainCodeCache {
             .map(|performance| performance.snapshot.clone())
     }
 
+    pub(crate) fn record_background_failure(&self, error: CacheError) {
+        let mut state = lock(&self.state);
+        if state.background_failure.is_none() {
+            state.background_failure = Some(error);
+        }
+    }
+
+    pub(crate) fn background_failure(&self) -> Option<CacheError> {
+        lock(&self.state).background_failure.clone()
+    }
+
     /// Returns an already-published translation without starting or waiting on
-    /// compilation. The cold tier uses this to keep executing while another
+    /// compilation. The light tier uses this to keep executing while another
     /// vCPU may be compiling the same region.
     pub(crate) fn lookup_ready(&self, key: RegionKey) -> Option<Arc<CachedRegion>> {
         let mut state = lock(&self.state);
@@ -969,6 +1113,139 @@ impl DomainCodeCache {
                 performance.snapshot.global_ready_hits.saturating_add(1);
         }
         region
+    }
+
+    pub(crate) fn request_promotion(
+        &self,
+        address: usize,
+    ) -> Result<Option<PromotionRequest>, CacheError> {
+        let promotion_ptr = std::ptr::with_exposed_provenance::<PromotionCell>(address);
+        let region_id = unsafe { promotion_ptr.as_ref() }
+            .ok_or_else(|| CacheError::Internal("native promotion cell is null".into()))?
+            .region_id
+            .load(Ordering::Acquire);
+        let state = lock(&self.state);
+        let Some(region) = state
+            .regions
+            .get(&region_id)
+            .filter(|region| region.is_live())
+        else {
+            return Ok(None);
+        };
+        let Some(promotion) = &region.promotion else {
+            return Ok(None);
+        };
+        if Arc::as_ptr(promotion).addr() != address || region.tier != CodeTier::Light {
+            return Err(CacheError::Internal(
+                "native promotion cell does not belong to its published light-tier region".into(),
+            ));
+        }
+        if !promotion.queue() {
+            return Ok(None);
+        }
+        let region_ir = region.source_ir.as_ref().ok_or_else(|| {
+            CacheError::Internal("light-tier region retained no source IR for promotion".into())
+        })?;
+        let key = region.identity.keys.first().copied().ok_or_else(|| {
+            CacheError::Internal("published region has no guest entry identity".into())
+        })?;
+        Ok(Some(PromotionRequest {
+            key,
+            baseline_id: region.id,
+            address_space: key.address_space,
+            mode: key.translation_mode,
+            region: Arc::clone(region_ir),
+            promotion: Arc::clone(promotion),
+        }))
+    }
+
+    pub(crate) fn publish_upgrade(
+        &self,
+        request: &PromotionRequest,
+        pending: PendingRegion,
+    ) -> Result<Arc<CachedRegion>, CacheError> {
+        if pending.tier != CodeTier::Optimized
+            || pending.promotion.is_some()
+            || pending.source_ir.is_some()
+        {
+            return Err(CacheError::Internal(
+                "optimized publication contains light-tier state".into(),
+            ));
+        }
+        if !pending.identity.keys.contains(&request.key) {
+            return Err(CacheError::Internal(
+                "optimized region does not own its requested entry key".into(),
+            ));
+        }
+        if pending.compiled.mapped_len() > self.limits.max_live_mapped_bytes
+            || pending.ir_operations > self.limits.max_live_ir_operations
+        {
+            return Err(CacheError::Capacity(
+                "one optimized region exceeds the domain cache bounds".into(),
+            ));
+        }
+
+        let mut state = lock(&self.state);
+        if !state.accepting_compilation {
+            return Err(CacheError::Cancelled);
+        }
+        let baseline = state
+            .regions
+            .get(&request.baseline_id)
+            .filter(|region| region.is_live())
+            .cloned()
+            .ok_or(CacheError::Stale)?;
+        if baseline.tier != CodeTier::Light
+            || baseline
+                .promotion
+                .as_ref()
+                .is_none_or(|cell| !Arc::ptr_eq(cell, &request.promotion))
+            || request.promotion.state.load(Ordering::Acquire) != PROMOTION_COMPILING
+        {
+            return Err(CacheError::Stale);
+        }
+        let id = state.next_region_id;
+        state.next_region_id = state
+            .next_region_id
+            .checked_add(1)
+            .ok_or_else(|| CacheError::Capacity("domain region identities are exhausted".into()))?;
+        let retirement_epoch = state.next_retirement_epoch()?;
+        state.retire(request.baseline_id, retirement_epoch);
+        while state.regions.len() == self.limits.max_live_segments
+            || state
+                .live_mapped_bytes
+                .checked_add(pending.compiled.mapped_len())
+                .is_none_or(|bytes| bytes > self.limits.max_live_mapped_bytes)
+            || state
+                .live_ir_operations
+                .checked_add(pending.ir_operations)
+                .is_none_or(|work| work > self.limits.max_live_ir_operations)
+        {
+            let Some(oldest) = state.retirement_order.pop_front() else {
+                return Err(CacheError::Capacity(
+                    "domain cache pressure cannot retire an eligible region".into(),
+                ));
+            };
+            state.retire(oldest, retirement_epoch);
+            if let Some(performance) = &mut state.performance {
+                performance.snapshot.regions_evicted_capacity = performance
+                    .snapshot
+                    .regions_evicted_capacity
+                    .saturating_add(1);
+            }
+        }
+
+        let region = install_pending_region(&mut state, id, pending);
+        request.promotion.mark_optimized();
+        if let Some(performance) = &mut state.performance {
+            performance.snapshot.regions_published =
+                performance.snapshot.regions_published.saturating_add(1);
+            performance.snapshot.tier_upgrades =
+                performance.snapshot.tier_upgrades.saturating_add(1);
+        }
+        drop(state);
+        self.reclaim_retired();
+        Ok(region)
     }
 
     pub(crate) fn resolve(
@@ -1083,7 +1360,7 @@ impl DomainCodeCache {
         site_index: u32,
         location: LocationDescriptor,
         target: &Arc<CachedRegion>,
-    ) -> Result<(), CacheError> {
+    ) -> Result<(LinkKind, LinkOutcome), CacheError> {
         let mut state = lock(&self.state);
         let source = state
             .regions
@@ -1128,16 +1405,31 @@ impl DomainCodeCache {
                 way: way as u8,
             };
             match state.active_links.get(&link) {
-                Some(active) if active.location == location => return Ok(()),
+                Some(active) if active.location == location => {
+                    return Ok((metadata.kind, LinkOutcome::AlreadyPresent));
+                }
                 Some(_) => {}
                 None if empty.is_none() => empty = Some(link),
                 None => {}
             }
         }
-        let Some(link) = empty else {
-            // A full PIC remains a miss and returns to this same resolver. It
-            // never acquires a parallel unlinked execution path.
-            return Ok(());
+        let (link, replaced, outcome) = if let Some(link) = empty {
+            (link, None, LinkOutcome::Published)
+        } else {
+            let site = source
+                .links
+                .site(site_index as usize)
+                .ok_or_else(|| CacheError::Internal("link table has no requested site".into()))?;
+            let link = LinkRef {
+                source: source_id,
+                site: site_index,
+                way: u8::try_from(site.replacement_way(ways))
+                    .map_err(|_| CacheError::Internal("link way exceeds u8".into()))?,
+            };
+            let active = state.active_links.get(&link).copied().ok_or_else(|| {
+                CacheError::Internal("full native PIC has an untracked cell".into())
+            })?;
+            (link, Some(active), LinkOutcome::PicFull)
         };
         let payload = Arc::new(NativeLinkTarget {
             guest_pc: location.pc.get(),
@@ -1156,7 +1448,29 @@ impl DomainCodeCache {
             .ok_or_else(|| {
                 CacheError::Internal("link table does not own its metadata site".into())
             })?;
-        if !cell.publish(target_address) {
+        if let Some(replaced) = replaced {
+            let retirement_epoch = state.next_retirement_epoch()?;
+            let expected = std::ptr::with_exposed_provenance_mut(replaced.target_address);
+            if !cell.replace(expected, target_address) {
+                return Err(CacheError::Internal(
+                    "domain link cell changed outside the code-cache lock".into(),
+                ));
+            }
+            if let Some(incoming) = state.incoming_links.get_mut(&replaced.target) {
+                incoming.remove(&link);
+                if incoming.is_empty() {
+                    state.incoming_links.remove(&replaced.target);
+                }
+            }
+            let retired = state
+                .link_targets
+                .remove(&replaced.target_address)
+                .expect("every active link owns a retained native payload");
+            state
+                .retired_batch(retirement_epoch)
+                .link_targets
+                .push(retired);
+        } else if !cell.publish(target_address) {
             return Err(CacheError::Internal(
                 "domain link cell changed outside the code-cache lock".into(),
             ));
@@ -1175,7 +1489,11 @@ impl DomainCodeCache {
             .entry(target.id)
             .or_default()
             .insert(link);
-        Ok(())
+        drop(state);
+        if outcome == LinkOutcome::PicFull {
+            self.reclaim_retired();
+        }
+        Ok((metadata.kind, outcome))
     }
 
     pub(crate) fn region_for_exit(&self, id: u64) -> Option<Arc<CachedRegion>> {
@@ -1268,7 +1586,14 @@ impl DomainCodeCache {
             identity: pending.identity,
             ir_operations: pending.ir_operations,
             links: LinkTable::new(link_site_count),
+            tier: pending.tier,
+            source_ir: pending.source_ir,
+            promotion: pending.promotion,
         });
+
+        if let Some(promotion) = &region.promotion {
+            promotion.install_region(id);
+        }
 
         for dependency in &region.identity.code_dependencies {
             state
@@ -1325,6 +1650,55 @@ impl DomainCodeCache {
         }
         Ok(region)
     }
+}
+
+fn install_pending_region(
+    state: &mut CacheState,
+    id: RegionId,
+    pending: PendingRegion,
+) -> Arc<CachedRegion> {
+    let link_site_count = pending.compiled.metadata.link_sites.len();
+    let region = Arc::new(CachedRegion {
+        id,
+        live: AtomicBool::new(true),
+        compiled: pending.compiled,
+        identity: pending.identity,
+        ir_operations: pending.ir_operations,
+        links: LinkTable::new(link_site_count),
+        tier: pending.tier,
+        source_ir: pending.source_ir,
+        promotion: pending.promotion,
+    });
+    if let Some(promotion) = &region.promotion {
+        promotion.install_region(id);
+    }
+    for dependency in &region.identity.code_dependencies {
+        state
+            .physical_index
+            .entry(dependency.page)
+            .or_default()
+            .insert(id);
+    }
+    let address_space = region.identity.keys[0].address_space;
+    for dependency in &region.identity.mapping_dependencies {
+        state
+            .mapping_index
+            .entry(MappingIndexKey {
+                address_space,
+                location: dependency.location.pc,
+                generation: dependency.dependency.mapping_generation,
+            })
+            .or_default()
+            .insert(id);
+    }
+    for key in &region.identity.keys {
+        state.slots.insert(*key, CacheSlot::Ready(id));
+    }
+    state.live_mapped_bytes += region.compiled.mapped_len();
+    state.live_ir_operations += region.ir_operations;
+    state.retirement_order.push_back(id);
+    state.regions.insert(id, Arc::clone(&region));
+    region
 }
 
 struct LocalEntry {
@@ -1418,6 +1792,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use nixe_cpu::ir::region::RegionMetadata;
     use nixe_cpu::profile::GuestCpuProfile;
     use nixe_memory::{ContentGeneration, MappingGeneration};
 
@@ -1491,7 +1866,64 @@ mod tests {
                 mapping_dependencies,
             },
             ir_operations: 1,
+            tier: CodeTier::Optimized,
+            source_ir: None,
+            promotion: None,
         }
+    }
+
+    fn light_pending(key: RegionKey) -> (PendingRegion, Arc<PromotionCell>) {
+        let promotion = Arc::new(PromotionCell::new());
+        let mut pending = pending(key, None);
+        pending.tier = CodeTier::Light;
+        pending.source_ir = Some(Arc::new(IrRegion::new(
+            RegionMetadata {
+                start: key.location,
+                guest_byte_count: 4,
+                guest_instruction_count: 1,
+                ir_operation_count: 1,
+                entries: Box::new([]),
+                exits: Box::new([]),
+                code_dependencies: Box::new([key.root_code_mapping]),
+                safepoints: Box::new([]),
+            },
+            Vec::new(),
+        )));
+        pending.promotion = Some(Arc::clone(&promotion));
+        (pending, promotion)
+    }
+
+    #[test]
+    fn light_region_promotes_once_and_optimized_publication_replaces_it() {
+        let cache = DomainCodeCache::new(
+            JitConfiguration::default().with_performance_report(Some("unused.toml".into())),
+        );
+        let region_key = key(0x1000, 1, 1);
+        let (light_pending_region, promotion) = light_pending(region_key);
+        let light = cache
+            .resolve(region_key, |_| Ok(light_pending_region))
+            .unwrap();
+        let request = cache
+            .request_promotion(Arc::as_ptr(&promotion).addr())
+            .unwrap()
+            .expect("the first threshold crossing queues the light region");
+        assert!(
+            cache
+                .request_promotion(Arc::as_ptr(&promotion).addr())
+                .unwrap()
+                .is_none(),
+            "one light version can own only one promotion"
+        );
+        assert!(request.promotion.begin_compilation());
+        let optimized = cache
+            .publish_upgrade(&request, pending(region_key, None))
+            .unwrap();
+        assert!(!light.is_live());
+        assert!(optimized.is_live());
+        assert_eq!(optimized.tier, CodeTier::Optimized);
+        assert_eq!(cache.lookup_ready(region_key).unwrap().id(), optimized.id());
+        let snapshot = cache.performance_snapshot().unwrap();
+        assert_eq!(snapshot.tier_upgrades, 1);
     }
 
     #[test]
@@ -1522,7 +1954,14 @@ mod tests {
         let first = cache
             .resolve(target_key, |_| Ok(pending(target_key, None)))
             .unwrap();
-        cache.link(source.id, 0, target_location, &first).unwrap();
+        assert_eq!(
+            cache.link(source.id, 0, target_location, &first).unwrap(),
+            (LinkKind::Direct, LinkOutcome::Published)
+        );
+        assert_eq!(
+            cache.link(source.id, 0, target_location, &first).unwrap(),
+            (LinkKind::Direct, LinkOutcome::AlreadyPresent)
+        );
         let first_address = lock(&cache.state)
             .active_links
             .values()
@@ -1563,10 +2002,11 @@ mod tests {
     }
 
     #[test]
-    fn indirect_link_sites_are_bounded_polymorphic_caches() {
+    fn full_indirect_link_sites_replace_a_bounded_way() {
         use crate::links::{INDIRECT_LINK_WAYS, LinkKind, LinkSiteMetadata};
 
-        let cache = DomainCodeCache::new(JitConfiguration::default());
+        let cache = Arc::new(DomainCodeCache::new(JitConfiguration::default()));
+        let executor = cache.register_executor();
         let source_key = key(0x3000, 3, 1);
         let source = cache
             .resolve(source_key, |_| {
@@ -1580,18 +2020,45 @@ mod tests {
                 ))
             })
             .unwrap();
+        let mut last_location = None;
+        let mut native_guard = None;
         for index in 0..=INDIRECT_LINK_WAYS {
+            if index == INDIRECT_LINK_WAYS {
+                native_guard = Some(cache.begin_native(&source, &executor).unwrap());
+            }
             let target_key = key(0x4000 + index as u64 * 4, 10 + index as u64, 1);
             let target = cache
                 .resolve(target_key, |_| Ok(pending(target_key, None)))
                 .unwrap();
-            cache
+            let outcome = cache
                 .link(source.id, 0, target_key.location, &target)
                 .unwrap();
+            assert_eq!(
+                outcome,
+                (
+                    LinkKind::Indirect,
+                    if index < INDIRECT_LINK_WAYS {
+                        LinkOutcome::Published
+                    } else {
+                        LinkOutcome::PicFull
+                    }
+                )
+            );
+            last_location = Some(target_key.location);
         }
         let state = lock(&cache.state);
         assert_eq!(state.active_links.len(), INDIRECT_LINK_WAYS);
         assert_eq!(state.link_targets.len(), INDIRECT_LINK_WAYS);
+        assert_eq!(state.retired.len(), 1);
+        assert!(
+            state
+                .active_links
+                .values()
+                .any(|active| Some(active.location) == last_location)
+        );
+        drop(state);
+        drop(native_guard);
+        assert!(lock(&cache.state).retired.is_empty());
     }
 
     #[test]
@@ -1829,6 +2296,47 @@ mod tests {
         drop(state);
         let snapshot = cache.performance_snapshot().unwrap();
         assert_eq!(snapshot.fast_irrelevant_invalidations, 1);
+    }
+
+    #[test]
+    fn guest_write_prefilter_advances_only_irrelevant_executable_content() {
+        let cache = DomainCodeCache::new(JitConfiguration::default());
+        let region_key = key(0x1000, 1, 1);
+        let region = cache
+            .resolve(region_key, |_| Ok(pending(region_key, None)))
+            .unwrap();
+        let irrelevant = MemoryInvalidation {
+            cursor: MemoryInvalidationCursor::new(1),
+            kind: MemoryInvalidationKind::ExecutableContent {
+                first: GuestPhysicalPageId::new(999),
+                second: None,
+            },
+        };
+        assert!(
+            cache
+                .consume_irrelevant_invalidations(&[irrelevant], MemoryInvalidationCursor::new(1))
+                .unwrap()
+        );
+        assert_eq!(
+            lock(&cache.state).invalidation_cursor,
+            MemoryInvalidationCursor::new(1)
+        );
+
+        let relevant = MemoryInvalidation {
+            cursor: MemoryInvalidationCursor::new(2),
+            kind: MemoryInvalidationKind::ExecutableContent {
+                first: GuestPhysicalPageId::new(1),
+                second: None,
+            },
+        };
+        assert!(
+            !cache
+                .consume_irrelevant_invalidations(&[relevant], MemoryInvalidationCursor::new(2))
+                .unwrap()
+        );
+        let state = lock(&cache.state);
+        assert_eq!(state.invalidation_cursor, MemoryInvalidationCursor::new(1));
+        assert!(region.is_live());
     }
 
     #[test]

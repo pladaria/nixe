@@ -7,6 +7,7 @@ use crate::{
     },
     ir::builder::{BuildError, IrBuilder},
     location::DecodedInstruction,
+    semantics::a64_fp_simd::{SemanticInput, semantic_inputs},
 };
 
 use super::LiftOutcome;
@@ -55,6 +56,7 @@ pub(super) fn lift(
         | FpSimdInstruction::VectorShiftRightImmediate(_)
         | FpSimdInstruction::ScalarShiftLeftImmediate(_)
         | FpSimdInstruction::VectorShiftLeftImmediate(_)
+        | FpSimdInstruction::ShiftLeftLong(_)
         | FpSimdInstruction::CountBits(_)
         | FpSimdInstruction::AddAcrossVector(_) => {
             lift_semantic_vector_helper(builder, decoded, fields, instruction)
@@ -258,61 +260,60 @@ fn lift_semantic_vector_helper(
     fields: FpSimdOperands,
     instruction: FpSimdInstruction,
 ) -> Result<LiftOutcome, BuildError> {
-    let fp = matches!(
-        instruction,
-        FpSimdInstruction::VectorSignedIntToFloat(_)
-            | FpSimdInstruction::VectorUnsignedIntToFloat(_)
-            | FpSimdInstruction::ScalarVectorSignedIntToFloat(_)
-            | FpSimdInstruction::ScalarVectorUnsignedIntToFloat(_)
-            | FpSimdInstruction::VectorFloatDivide(_)
-            | FpSimdInstruction::VectorFloatImmediate(_)
-            | FpSimdInstruction::VectorFloatAbsolute(_)
-            | FpSimdInstruction::VectorFloatNegate(_)
-            | FpSimdInstruction::ScalarFloatImmediate(_)
-            | FpSimdInstruction::ScalarFloatConvert(_)
-            | FpSimdInstruction::ScalarFloatDivide(_)
-            | FpSimdInstruction::ScalarFloatRound(_)
-            | FpSimdInstruction::ScalarFloatAdd(_)
-            | FpSimdInstruction::ScalarFloatMultiply(_)
-            | FpSimdInstruction::ScalarFloatFusedMultiplyAdd(_)
-            | FpSimdInstruction::ScalarFloatSquareRoot(_)
-            | FpSimdInstruction::ScalarFloatConditionalSelect(_)
-    );
+    let inputs = semantic_inputs(instruction);
+    let fp = inputs.contains(SemanticInput::Fpsr);
     let source = decoded.location;
-    let fpcr = emit_one(
-        builder,
-        source,
-        IrType::I32,
-        OperationKind::ReadState(StateRegister::A64Fpcr),
-    )?;
-    let fpsr = emit_one(
-        builder,
-        source,
-        IrType::I32,
-        OperationKind::ReadState(StateRegister::A64Fpsr),
-    )?;
-    let rn = vector_read(builder, source, fields.rn)?;
-    let rm = vector_read(builder, source, fields.rm)?;
-    let ra = vector_read(builder, source, fields.ra)?;
-    let rd = vector_read(builder, source, fields.rd)?;
-    let general_rn = read_gpr(builder, source, fields.rn, IrType::I64, Register31::Zero)?;
-    let flags = read_flags(builder, source)?;
+    let mut arguments = vec![Immediate::I64(fields.helper_token.semantic_abi_value()).into()];
+    for input in [
+        SemanticInput::RnVector,
+        SemanticInput::RmVector,
+        SemanticInput::RaVector,
+        SemanticInput::RdVector,
+        SemanticInput::RnGeneral,
+        SemanticInput::Nzcv,
+        SemanticInput::Fpcr,
+        SemanticInput::Fpsr,
+    ] {
+        if !inputs.contains(input) {
+            continue;
+        }
+        arguments.push(match input {
+            SemanticInput::RnVector => vector_read(builder, source, fields.rn)?,
+            SemanticInput::RmVector => vector_read(builder, source, fields.rm)?,
+            SemanticInput::RaVector => vector_read(builder, source, fields.ra)?,
+            SemanticInput::RdVector => vector_read(builder, source, fields.rd)?,
+            SemanticInput::RnGeneral => {
+                read_gpr(builder, source, fields.rn, IrType::I64, Register31::Zero)?
+            }
+            SemanticInput::Nzcv => read_flags(builder, source)?,
+            SemanticInput::Fpcr => emit_one(
+                builder,
+                source,
+                IrType::I32,
+                OperationKind::ReadState(StateRegister::A64Fpcr),
+            )?
+            .into(),
+            SemanticInput::Fpsr => emit_one(
+                builder,
+                source,
+                IrType::I32,
+                OperationKind::ReadState(StateRegister::A64Fpsr),
+            )?
+            .into(),
+        });
+    }
+    debug_assert_eq!(arguments.len(), inputs.argument_count());
+    let result_types: &[IrType] = if fp {
+        &[IrType::V128, IrType::I32]
+    } else {
+        &[IrType::V128]
+    };
     let results = helper(
         builder,
         source,
         "a64.fp-simd.semantic-vector",
-        vec![
-            rn,
-            rm,
-            ra,
-            rd,
-            general_rn,
-            flags,
-            fpcr.into(),
-            fpsr.into(),
-            Immediate::I64(fields.helper_token.semantic_abi_value()).into(),
-        ],
-        &[IrType::V128, IrType::I32],
+        arguments,
+        result_types,
         OperationEffects::new(
             if fp {
                 EffectSet::HELPER
