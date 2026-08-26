@@ -264,10 +264,10 @@ mod tests {
             IrOperation::new(
                 location(0x1000),
                 OperationResults::one(flags),
-                OperationKind::Flags(FlagOperation::FromArithmetic {
-                    result: sum.into(),
-                    carry: Immediate::I1(false).into(),
-                    overflow: Immediate::I1(false).into(),
+                OperationKind::Flags(FlagOperation::Add {
+                    lhs: Immediate::I64(1).into(),
+                    rhs: Immediate::I64(2).into(),
+                    result: Some(sum.into()),
                 }),
             ),
             IrOperation::new(

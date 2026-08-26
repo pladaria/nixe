@@ -145,17 +145,6 @@ pub enum IntegerPredicate {
     SignedLessThanOrEqual,
 }
 
-/// Architectural flag outputs requested from one arithmetic operation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ArithmeticFlagOutput {
-    /// Produce only the arithmetic result.
-    None,
-    /// Also produce the unsigned carry/no-borrow bit.
-    Carry,
-    /// Also produce carry/no-borrow and signed overflow.
-    CarryAndOverflow,
-}
-
 /// Explicit scalar integer operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScalarOperation {
@@ -165,26 +154,17 @@ pub enum ScalarOperation {
         lhs: Operand,
         rhs: Operand,
     },
-    /// Add with an incoming carry, producing result, carry, and signed overflow.
-    AddWithCarry {
+    /// Wrapping addition with an incoming one-bit carry.
+    AddCarry {
         lhs: Operand,
         rhs: Operand,
         carry_in: Operand,
-        flags: ArithmeticFlagOutput,
     },
-    /// Derives unsigned overflow from two operands and a result.
-    UnsignedOverflow {
-        operation: IntegerBinaryKind,
+    /// Wrapping subtraction with Arm's incoming carry/no-borrow bit.
+    SubtractCarry {
         lhs: Operand,
         rhs: Operand,
-        result: Operand,
-    },
-    /// Derives signed overflow from two operands and a result.
-    SignedOverflow {
-        operation: IntegerBinaryKind,
-        lhs: Operand,
-        rhs: Operand,
-        result: Operand,
+        carry_in: Operand,
     },
     /// Typed comparison producing I1.
     Compare {
@@ -216,6 +196,22 @@ pub enum ScalarOperation {
     Truncate { value: Operand, to: IrType },
     /// Width-preserving reinterpretation between integer, FP, vector, or address domains.
     Bitcast { value: Operand, to: IrType },
+}
+
+/// Architectural lazy-flag bank.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FlagState {
+    /// A64 NZCV state.
+    A64Nzcv,
+}
+
+/// One independently queryable architectural condition flag.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FlagBit {
+    Negative,
+    Zero,
+    Carry,
+    Overflow,
 }
 
 /// Architectural width used when guest-address arithmetic wraps.
@@ -300,16 +296,48 @@ impl Condition {
 /// Lazy flag creation, consumption, and architectural materialization.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FlagOperation {
-    /// Forms lazy NZCV from an arithmetic result and explicit carry/overflow bits.
-    FromArithmetic {
-        result: Operand,
-        carry: Operand,
-        overflow: Operand,
+    /// Defers flags for wrapping addition. A flags-only comparison omits `result`.
+    Add {
+        lhs: Operand,
+        rhs: Operand,
+        result: Option<Operand>,
     },
-    /// Forms lazy NZCV for a logical result with an explicit carry bit.
-    FromLogical { result: Operand, carry: Operand },
+    /// Defers flags for addition with carry.
+    AddCarry {
+        lhs: Operand,
+        rhs: Operand,
+        carry_in: Operand,
+        result: Option<Operand>,
+    },
+    /// Defers flags for wrapping subtraction. A flags-only comparison omits `result`.
+    Subtract {
+        lhs: Operand,
+        rhs: Operand,
+        result: Option<Operand>,
+    },
+    /// Defers flags for subtraction with Arm's incoming carry/no-borrow bit.
+    SubtractCarry {
+        lhs: Operand,
+        rhs: Operand,
+        carry_in: Operand,
+        result: Option<Operand>,
+    },
+    /// Defers A64 ANDS/TST flags. C and V are architecturally zero.
+    LogicalAnd {
+        lhs: Operand,
+        rhs: Operand,
+        result: Option<Operand>,
+    },
     /// Converts packed architectural NZCV/CPSR bits into lazy flags.
     FromPacked { value: Operand },
+    /// Selects one lazy flag producer without materializing either input.
+    Select {
+        condition: Operand,
+        when_true: Operand,
+        when_false: Operand,
+    },
+    /// Evaluates one flag bit into I1 without packing the remaining flags.
+    EvaluateBit { flags: Operand, bit: FlagBit },
     /// Evaluates one architectural condition into I1.
     Evaluate {
         flags: Operand,
@@ -679,6 +707,11 @@ pub enum OperationKind {
         register: StateRegister,
         value: Operand,
     },
+    ReadFlags(FlagState),
+    WriteFlags {
+        state: FlagState,
+        flags: Operand,
+    },
     Flags(FlagOperation),
     Memory(MemoryOperation),
     Barrier(BarrierOperation),
@@ -836,8 +869,12 @@ impl OperationKind {
                 };
                 OperationEffects::new(effects, false)
             }
-            Self::ReadState(_) => OperationEffects::new(EffectSet::READ_STATE, false),
-            Self::WriteState { .. } => OperationEffects::new(EffectSet::WRITE_STATE, false),
+            Self::ReadState(_) | Self::ReadFlags(_) => {
+                OperationEffects::new(EffectSet::READ_STATE, false)
+            }
+            Self::WriteState { .. } | Self::WriteFlags { .. } => {
+                OperationEffects::new(EffectSet::WRITE_STATE, false)
+            }
             Self::Memory(
                 MemoryOperation::Load { descriptor, .. }
                 | MemoryOperation::GuardedLoad { descriptor, .. },
@@ -1012,24 +1049,19 @@ mod tests {
     }
 
     #[test]
-    fn add_with_carry_can_define_result_carry_and_overflow() {
-        let results = OperationResults::three(
-            Value::new(ValueId::new(0), IrType::I64),
-            Value::new(ValueId::new(1), IrType::I1),
-            Value::new(ValueId::new(2), IrType::I1),
-        );
+    fn add_carry_defines_only_the_scalar_result() {
+        let results = OperationResults::one(Value::new(ValueId::new(0), IrType::I64));
         let operation = IrOperation::new(
             location(),
             results,
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
+            OperationKind::Scalar(ScalarOperation::AddCarry {
                 lhs: Immediate::I64(1).into(),
                 rhs: Immediate::I64(2).into(),
                 carry_in: Immediate::I1(false).into(),
-                flags: ArithmeticFlagOutput::CarryAndOverflow,
             }),
         );
 
-        assert_eq!(operation.results.iter().count(), 3);
+        assert_eq!(operation.results.iter().count(), 1);
         assert_eq!(operation.effects, OperationEffects::default());
     }
 

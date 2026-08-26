@@ -14,8 +14,8 @@ use wgpu::{
     PipelineCompilationOptions, PipelineLayoutDescriptor, PresentMode, PrimitiveState, Queue,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
     Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StoreOp, Surface, SurfaceConfiguration, TextureSampleType, TextureViewDescriptor,
-    TextureViewDimension, VertexState,
+    ShaderStages, StoreOp, Surface, SurfaceConfiguration, TextureFormat, TextureSampleType,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -193,6 +193,22 @@ impl Presenter {
         let mut surface_configuration = surface
             .get_default_config(adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(WindowError::unsupported_surface)?;
+        // Guest presentation images currently carry display-ready UNORM bytes.
+        // Prefer a UNORM surface so WGPU does not apply an implicit sRGB encode
+        // and brighten the image during the final presentation pass.
+        if let Some(format) = surface
+            .get_capabilities(adapter)
+            .formats
+            .into_iter()
+            .find(|format| {
+                matches!(
+                    format,
+                    TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
+                )
+            })
+        {
+            surface_configuration.format = format;
+        }
         surface_configuration.present_mode = PresentMode::Fifo;
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

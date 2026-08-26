@@ -17,11 +17,11 @@ use crate::{
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
-            AddressOperation, ArithmeticFlagOutput, AtomicOperation, ByteOrder,
-            CacheMaintenanceOperation, Condition, EffectSet, ExclusiveOperation, FlagOperation,
-            GuestAddressWidth, HelperOperation, IntegerBinaryKind, IntegerPredicate,
-            MemoryDescriptor, MemoryOperation, MemoryPrivilege, OperationEffects, OperationKind,
-            ScalarOperation, ShiftKind, StateRegister, Volatility,
+            AddressOperation, AtomicOperation, ByteOrder, CacheMaintenanceOperation, Condition,
+            EffectSet, ExclusiveOperation, FlagBit, FlagOperation, FlagState, GuestAddressWidth,
+            HelperOperation, IntegerBinaryKind, IntegerPredicate, MemoryDescriptor,
+            MemoryOperation, MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation,
+            ShiftKind, StateRegister, Volatility,
         },
         terminator::{ControlTarget, Terminator},
         types::IrType,
@@ -263,19 +263,11 @@ fn binary(
 }
 
 fn read_flags(builder: &mut IrBuilder, source: LocationDescriptor) -> Result<Operand, BuildError> {
-    let packed = emit_one(
-        builder,
-        source,
-        IrType::I32,
-        OperationKind::ReadState(StateRegister::A64Nzcv),
-    )?;
     Ok(emit_one(
         builder,
         source,
         IrType::Flags,
-        OperationKind::Flags(FlagOperation::FromPacked {
-            value: packed.into(),
-        }),
+        OperationKind::ReadFlags(FlagState::A64Nzcv),
     )?
     .into())
 }
@@ -300,56 +292,29 @@ fn write_flags(
     source: LocationDescriptor,
     flags: Operand,
 ) -> Result<(), BuildError> {
-    let packed = emit_one(
-        builder,
-        source,
-        IrType::I32,
-        OperationKind::Flags(FlagOperation::Materialize { flags }),
-    )?;
     builder.emit(
         source,
         &[],
-        OperationKind::WriteState {
-            register: StateRegister::A64Nzcv,
-            value: packed.into(),
+        OperationKind::WriteFlags {
+            state: FlagState::A64Nzcv,
+            flags,
         },
     )?;
     Ok(())
 }
 
-fn arithmetic_flags(
-    builder: &mut IrBuilder,
-    source: LocationDescriptor,
-    result: Operand,
-    carry: Operand,
-    overflow: Operand,
-) -> Result<(), BuildError> {
-    let flags = emit_one(
-        builder,
-        source,
-        IrType::Flags,
-        OperationKind::Flags(FlagOperation::FromArithmetic {
-            result,
-            carry,
-            overflow,
-        }),
-    )?;
-    write_flags(builder, source, flags.into())
-}
-
 fn logical_flags(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
-    result: Operand,
+    lhs: Operand,
+    rhs: Operand,
+    result: Option<Operand>,
 ) -> Result<(), BuildError> {
     let flags = emit_one(
         builder,
         source,
         IrType::Flags,
-        OperationKind::Flags(FlagOperation::FromLogical {
-            result,
-            carry: Immediate::I1(false).into(),
-        }),
+        OperationKind::Flags(FlagOperation::LogicalAnd { lhs, rhs, result }),
     )?;
     write_flags(builder, source, flags.into())
 }
@@ -471,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_requests_only_live_flags_and_materializes_them_before_exit() {
+    fn arithmetic_emits_exact_scalar_and_deferred_flag_operations() {
         // add x0,x0,#1; svc #0
         let without_flags = translate(&[0x9100_0400, 0xd400_0001]);
         let add = without_flags
@@ -480,25 +445,27 @@ mod tests {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    OperationKind::Scalar(ScalarOperation::AddWithCarry { .. })
+                    OperationKind::Scalar(ScalarOperation::Binary {
+                        kind: IntegerBinaryKind::Add,
+                        ..
+                    })
                 )
             })
             .unwrap();
         assert_eq!(add.results.iter().count(), 1);
         assert!(matches!(
             add.kind,
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
-                flags: ArithmeticFlagOutput::None,
+            OperationKind::Scalar(ScalarOperation::Binary {
+                kind: IntegerBinaryKind::Add,
                 ..
             })
         ));
-        assert!(!without_flags.operations.iter().any(|operation| matches!(
-            operation.kind,
-            OperationKind::WriteState {
-                register: StateRegister::A64Nzcv,
-                ..
-            }
-        )));
+        assert!(
+            !without_flags
+                .operations
+                .iter()
+                .any(|operation| matches!(operation.kind, OperationKind::WriteFlags { .. }))
+        );
 
         // subs x0,x0,#1; svc #0
         let with_flags = translate(&[0xf100_0400, 0xd400_0001]);
@@ -508,23 +475,32 @@ mod tests {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    OperationKind::Scalar(ScalarOperation::AddWithCarry { .. })
+                    OperationKind::Scalar(ScalarOperation::Binary {
+                        kind: IntegerBinaryKind::Subtract,
+                        ..
+                    })
                 )
             })
             .unwrap();
-        assert_eq!(subtract.results.iter().count(), 3);
+        assert_eq!(subtract.results.iter().count(), 1);
         assert!(matches!(
             subtract.kind,
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
-                carry_in: Operand::Immediate(Immediate::I1(true)),
-                flags: ArithmeticFlagOutput::CarryAndOverflow,
+            OperationKind::Scalar(ScalarOperation::Binary {
+                kind: IntegerBinaryKind::Subtract,
                 ..
             })
         ));
         assert!(with_flags.operations.iter().any(|operation| matches!(
             operation.kind,
-            OperationKind::WriteState {
-                register: StateRegister::A64Nzcv,
+            OperationKind::Flags(FlagOperation::Subtract {
+                result: Some(_),
+                ..
+            })
+        )));
+        assert!(with_flags.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::WriteFlags {
+                state: FlagState::A64Nzcv,
                 ..
             }
         )));
@@ -538,8 +514,8 @@ mod tests {
         let fallback = translate(&[0xf100_0400, 0xd503_20df]);
         assert!(fallback.operations.iter().any(|operation| matches!(
             operation.kind,
-            OperationKind::WriteState {
-                register: StateRegister::A64Nzcv,
+            OperationKind::WriteFlags {
+                state: FlagState::A64Nzcv,
                 ..
             }
         )));
@@ -547,6 +523,51 @@ mod tests {
             fallback.terminator,
             Terminator::UnsupportedInstruction { .. }
         ));
+
+        // cmp x0,#1 and tst x0,x1 are flags-only aliases: neither creates a
+        // numerical result that will be discarded through XZR.
+        let compare = translate(&[0xf100_041f, 0xd400_0001]);
+        assert!(compare.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::Subtract { result: None, .. })
+        )));
+        assert!(!compare.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::Binary {
+                kind: IntegerBinaryKind::Subtract,
+                ..
+            })
+        )));
+
+        let test = translate(&[0xea01_001f, 0xd400_0001]);
+        assert!(test.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::LogicalAnd { result: None, .. })
+        )));
+        assert!(!test.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::Binary {
+                kind: IntegerBinaryKind::And,
+                ..
+            })
+        )));
+
+        let carry_compare = translate(&[0xba01_001f, 0xd400_0001]);
+        assert!(carry_compare.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::EvaluateBit {
+                bit: FlagBit::Carry,
+                ..
+            })
+        )));
+        assert!(carry_compare.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Flags(FlagOperation::AddCarry { result: None, .. })
+        )));
+        assert!(!carry_compare.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::AddCarry { .. })
+        )));
     }
 
     #[test]
@@ -916,8 +937,8 @@ mod tests {
         )));
         assert!(block.operations.iter().any(|operation| matches!(
             operation.kind,
-            OperationKind::WriteState {
-                register: StateRegister::A64Nzcv,
+            OperationKind::WriteFlags {
+                state: FlagState::A64Nzcv,
                 ..
             }
         )));
@@ -987,6 +1008,7 @@ mod tests {
                 | OperationKind::ReadState(StateRegister::A64Fpcr)
                 | OperationKind::ReadState(StateRegister::A64Fpsr)
                 | OperationKind::ReadState(StateRegister::A64Nzcv)
+                | OperationKind::ReadFlags(FlagState::A64Nzcv)
         )));
     }
 }
