@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use nixe_cpu_engine::CapabilityRejectionReason;
 
@@ -20,6 +21,27 @@ const DEFAULT_MAX_SEGMENTS: usize = 65_536;
 const PUBLICATION_PROBE_BYTES: &[u8] = &[0];
 
 pub(crate) type SharedExecutableMemory = Arc<Mutex<ExecutableMemory>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PublicationMetrics {
+    pub(crate) total_ns: u64,
+    pub(crate) lock_wait_ns: u64,
+    pub(crate) allocation_ns: u64,
+    pub(crate) zero_copy_ns: u64,
+    pub(crate) protection_ns: u64,
+    pub(crate) instruction_cache_ns: u64,
+}
+
+impl PublicationMetrics {
+    fn add_platform(&mut self, other: Self) {
+        self.allocation_ns = self.allocation_ns.saturating_add(other.allocation_ns);
+        self.zero_copy_ns = self.zero_copy_ns.saturating_add(other.zero_copy_ns);
+        self.protection_ns = self.protection_ns.saturating_add(other.protection_ns);
+        self.instruction_cache_ns = self
+            .instruction_cache_ns
+            .saturating_add(other.instruction_cache_ns);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ErrorKind {
@@ -287,7 +309,7 @@ impl ExecutableMemory {
         // path used for real code while capability probing. This internal
         // publication is charged to both bounds, but its address remains
         // unreachable and immutable for the arena lifetime.
-        let (probe_address, probe_len, _, _) = memory.publish_raw(PUBLICATION_PROBE_BYTES, 1)?;
+        let (probe_address, probe_len, _, _, _) = memory.publish_raw(PUBLICATION_PROBE_BYTES, 1)?;
         let _probe_address = probe_address;
         debug_assert_eq!(probe_len, PUBLICATION_PROBE_BYTES.len());
         Ok(memory)
@@ -297,10 +319,12 @@ impl ExecutableMemory {
         &mut self,
         code: &[u8],
         alignment: usize,
-    ) -> Result<(NonNull<u8>, usize, usize, usize), ExecutableMemoryError> {
+    ) -> Result<(NonNull<u8>, usize, usize, usize, PublicationMetrics), ExecutableMemoryError> {
+        let allocation_started = Instant::now();
         let plan = self.state.plan(code.len(), alignment)?;
-        let address = match self.arena.publish(plan, code) {
-            Ok(address) => address,
+        let allocation_ns = duration_ns(allocation_started.elapsed());
+        let (address, mut metrics) = match self.arena.publish(plan, code) {
+            Ok(publication) => publication,
             Err(error) => {
                 // A platform transition can fail after touching the reserved
                 // page. Never allow that page to be reused or mutated.
@@ -309,7 +333,8 @@ impl ExecutableMemory {
             }
         };
         self.state.commit(plan);
-        Ok((address, code.len(), plan.offset, plan.mapped_len))
+        metrics.allocation_ns = metrics.allocation_ns.saturating_add(allocation_ns);
+        Ok((address, code.len(), plan.offset, plan.mapped_len, metrics))
     }
 
     #[cfg(test)]
@@ -324,29 +349,45 @@ pub(crate) fn publish_code(
     owner: &SharedExecutableMemory,
     code: &[u8],
     alignment: usize,
-) -> Result<PublishedCode, ExecutableMemoryError> {
-    let (address, code_len, offset, mapped_len) = owner
-        .lock()
-        .map_err(|_| {
-            ExecutableMemoryError::new(
-                ErrorKind::HostUnavailable,
-                "executable-memory owner lock was poisoned",
-            )
-        })?
-        .publish_raw(code, alignment)?;
+) -> Result<(PublishedCode, PublicationMetrics), ExecutableMemoryError> {
+    let total_started = Instant::now();
+    let lock_started = Instant::now();
+    let mut guard = owner.lock().map_err(|_| {
+        ExecutableMemoryError::new(
+            ErrorKind::HostUnavailable,
+            "executable-memory owner lock was poisoned",
+        )
+    })?;
+    let lock_wait_ns = duration_ns(lock_started.elapsed());
+    let (address, code_len, offset, mapped_len, platform_metrics) =
+        guard.publish_raw(code, alignment)?;
+    drop(guard);
+    let mut metrics = PublicationMetrics {
+        lock_wait_ns,
+        total_ns: duration_ns(total_started.elapsed()),
+        ..PublicationMetrics::default()
+    };
+    metrics.add_platform(platform_metrics);
     #[cfg(not(test))]
     let _ = code_len;
-    Ok(PublishedCode {
-        address: address.as_ptr().addr(),
-        #[cfg(test)]
-        len: code_len,
-        mapped_len,
-        _allocation: Arc::new(PublishedAllocation {
-            owner: Arc::downgrade(owner),
-            offset,
+    Ok((
+        PublishedCode {
+            address: address.as_ptr().addr(),
+            #[cfg(test)]
+            len: code_len,
             mapped_len,
-        }),
-    })
+            _allocation: Arc::new(PublishedAllocation {
+                owner: Arc::downgrade(owner),
+                offset,
+                mapped_len,
+            }),
+        },
+        metrics,
+    ))
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Returns one shared owner per process while allowing it to be reclaimed when
@@ -390,8 +431,11 @@ const fn align_up(value: usize, alignment: usize) -> Option<usize> {
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod platform {
     use std::ptr::NonNull;
+    use std::time::Instant;
 
-    use super::{ErrorKind, ExecutableMemoryError, PublicationPlan};
+    use super::{
+        ErrorKind, ExecutableMemoryError, PublicationMetrics, PublicationPlan, duration_ns,
+    };
 
     pub(super) struct Arena {
         base: NonNull<u8>,
@@ -445,9 +489,11 @@ mod platform {
             &mut self,
             plan: PublicationPlan,
             code: &[u8],
-        ) -> Result<NonNull<u8>, ExecutableMemoryError> {
+        ) -> Result<(NonNull<u8>, PublicationMetrics), ExecutableMemoryError> {
             // SAFETY: AllocationState confines the range to this mapping.
             let destination = unsafe { self.base.as_ptr().add(plan.offset) };
+            let mut metrics = PublicationMetrics::default();
+            let protection_started = Instant::now();
             if plan.reused
                 && unsafe {
                     libc::mprotect(
@@ -461,12 +507,16 @@ mod platform {
                     "could not reopen retired JIT pages for reuse",
                 ));
             }
+            metrics.protection_ns = duration_ns(protection_started.elapsed());
+            let zero_copy_started = Instant::now();
             unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
+            metrics.zero_copy_ns = duration_ns(zero_copy_started.elapsed());
             // Linux/Unix write-to-execute transition contract:
             // https://man7.org/linux/man-pages/man2/mprotect.2.html
             // SAFETY: destination and mapped_len are page-aligned and wholly
             // contained in the live mapping.
+            let protection_started = Instant::now();
             if unsafe {
                 libc::mprotect(
                     destination.cast(),
@@ -477,11 +527,16 @@ mod platform {
             {
                 return Err(last_os_error("could not seal JIT code read-execute"));
             }
+            metrics.protection_ns = metrics
+                .protection_ns
+                .saturating_add(duration_ns(protection_started.elapsed()));
             // SAFETY: the range was initialized above and has just been made
             // executable. No address escapes until synchronization completes.
+            let instruction_cache_started = Instant::now();
             unsafe { synchronize_instruction_cache(destination, plan.code_len) };
+            metrics.instruction_cache_ns = duration_ns(instruction_cache_started.elapsed());
             // SAFETY: mmap returned a non-null base and the offset is in range.
-            Ok(unsafe { NonNull::new_unchecked(destination) })
+            Ok((unsafe { NonNull::new_unchecked(destination) }, metrics))
         }
     }
 
@@ -549,8 +604,11 @@ mod platform {
 mod platform {
     use std::ffi::{CStr, c_char, c_void};
     use std::ptr::NonNull;
+    use std::time::Instant;
 
-    use super::{ErrorKind, ExecutableMemoryError, PublicationPlan};
+    use super::{
+        ErrorKind, ExecutableMemoryError, PublicationMetrics, PublicationPlan, duration_ns,
+    };
 
     type WriteProtect = unsafe extern "C" fn(i32);
 
@@ -619,21 +677,32 @@ mod platform {
             &mut self,
             plan: PublicationPlan,
             code: &[u8],
-        ) -> Result<NonNull<u8>, ExecutableMemoryError> {
+        ) -> Result<(NonNull<u8>, PublicationMetrics), ExecutableMemoryError> {
             let destination = unsafe { self.base.as_ptr().add(plan.offset) };
+            let mut metrics = PublicationMetrics::default();
             // SAFETY: temporarily disables execute and enables write access on
             // this thread only. The pointer is not published during this span.
+            let protection_started = Instant::now();
             unsafe { (self.write_protect)(0) };
+            metrics.protection_ns = duration_ns(protection_started.elapsed());
+            let zero_copy_started = Instant::now();
             unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
+            metrics.zero_copy_ns = duration_ns(zero_copy_started.elapsed());
             // SAFETY: restores execute-only publication before the address can
             // leave this owner.
+            let protection_started = Instant::now();
             unsafe { (self.write_protect)(1) };
+            metrics.protection_ns = metrics
+                .protection_ns
+                .saturating_add(duration_ns(protection_started.elapsed()));
             // Apple's documented instruction-cache API:
             // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/sys_cache_control.3.html
             // SAFETY: the range is initialized and not yet published.
+            let instruction_cache_started = Instant::now();
             unsafe { sys_icache_invalidate(destination.cast(), plan.code_len) };
-            Ok(unsafe { NonNull::new_unchecked(destination) })
+            metrics.instruction_cache_ns = duration_ns(instruction_cache_started.elapsed());
+            Ok((unsafe { NonNull::new_unchecked(destination) }, metrics))
         }
     }
 
@@ -732,6 +801,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::ptr::NonNull;
+    use std::time::Instant;
 
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{
@@ -741,7 +811,9 @@ mod platform {
     use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use super::{ErrorKind, ExecutableMemoryError, PublicationPlan};
+    use super::{
+        ErrorKind, ExecutableMemoryError, PublicationMetrics, PublicationPlan, duration_ns,
+    };
 
     pub(super) struct Arena {
         base: NonNull<u8>,
@@ -776,11 +848,13 @@ mod platform {
             &mut self,
             plan: PublicationPlan,
             code: &[u8],
-        ) -> Result<NonNull<u8>, ExecutableMemoryError> {
+        ) -> Result<(NonNull<u8>, PublicationMetrics), ExecutableMemoryError> {
             let destination = unsafe { self.base.as_ptr().add(plan.offset) };
+            let mut metrics = PublicationMetrics::default();
             // Windows requires writable allocation followed by VirtualProtect,
             // then an explicit FlushInstructionCache before execution:
             // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
+            let allocation_started = Instant::now();
             if plan.reused {
                 let mut previous = PAGE_NOACCESS;
                 if unsafe {
@@ -809,10 +883,14 @@ mod platform {
                     return Err(last_os_error("could not commit writable JIT pages"));
                 }
             }
+            metrics.allocation_ns = duration_ns(allocation_started.elapsed());
+            let zero_copy_started = Instant::now();
             unsafe { std::ptr::write_bytes(destination, 0, plan.mapped_len) };
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), destination, plan.code_len) };
+            metrics.zero_copy_ns = duration_ns(zero_copy_started.elapsed());
             let mut previous = PAGE_NOACCESS;
             // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-flushinstructioncache
+            let protection_started = Instant::now();
             if unsafe {
                 VirtualProtect(
                     destination.cast(),
@@ -824,13 +902,16 @@ mod platform {
             {
                 return Err(last_os_error("could not seal JIT code read-execute"));
             }
+            metrics.protection_ns = duration_ns(protection_started.elapsed());
+            let instruction_cache_started = Instant::now();
             if unsafe {
                 FlushInstructionCache(GetCurrentProcess(), destination.cast(), plan.code_len)
             } == 0
             {
                 return Err(last_os_error("could not synchronize the instruction cache"));
             }
-            Ok(unsafe { NonNull::new_unchecked(destination) })
+            metrics.instruction_cache_ns = duration_ns(instruction_cache_started.elapsed());
+            Ok((unsafe { NonNull::new_unchecked(destination) }, metrics))
         }
     }
 
@@ -854,7 +935,7 @@ mod platform {
 mod platform {
     use std::ptr::NonNull;
 
-    use super::{ErrorKind, ExecutableMemoryError, PublicationPlan};
+    use super::{ErrorKind, ExecutableMemoryError, PublicationMetrics, PublicationPlan};
 
     pub(super) struct Arena;
 
@@ -874,7 +955,7 @@ mod platform {
             &mut self,
             _plan: PublicationPlan,
             _code: &[u8],
-        ) -> Result<NonNull<u8>, ExecutableMemoryError> {
+        ) -> Result<(NonNull<u8>, PublicationMetrics), ExecutableMemoryError> {
             unreachable!("unsupported platforms cannot construct an arena")
         }
     }
@@ -1004,8 +1085,8 @@ mod tests {
             0xc0, 0x03, 0x5f, 0xd6, // ret
         ];
 
-        let first = publish_code(&owner, code_bytes, 16).unwrap();
-        let second = publish_code(&owner, PUBLICATION_PROBE_BYTES, 16).unwrap();
+        let (first, _) = publish_code(&owner, code_bytes, 16).unwrap();
+        let (second, _) = publish_code(&owner, PUBLICATION_PROBE_BYTES, 16).unwrap();
         let locked = owner.lock().unwrap();
         assert_eq!(unsafe { locked.bytes(&first) }, code_bytes);
         assert!(second.address.abs_diff(first.address) >= locked.state.page_size);

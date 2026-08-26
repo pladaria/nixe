@@ -807,20 +807,19 @@ pub enum CacheMaintenanceKind {
 
 /// Engine-facing semantic memory contract shared by every CPU provider.
 pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
-    /// Derives a retained canonical RAM lease for engine-private acceleration.
-    ///
-    /// The default is intentionally unavailable for diagnostic or device-only
-    /// memory implementations. Production memory may return a lease only when
-    /// the complete physical page is CPU-visible, ordinarily cacheable, and
-    /// unobserved by executable mappings. Engines remain responsible for their
-    /// own mapping-epoch, page-boundary, access-class, and ordering checks.
-    fn direct_access(
+    /// Returns the Linux fastmem arena used by generated native code.
+    fn fastmem_view(&self, _address_space: AddressSpaceId) -> Option<nixe_memory::FastmemView> {
+        None
+    }
+
+    /// Arms one ordinary CPU-visible RAM page in the native fastmem arena.
+    fn arm_fastmem_page(
         &self,
         _address_space: AddressSpaceId,
         _page: GuestVirtualAddress,
         _kind: DataAccessKind,
-    ) -> Option<nixe_memory::CanonicalDirectAccessLease> {
-        None
+    ) -> bool {
+        false
     }
 
     /// Performs one complete architectural read.

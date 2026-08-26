@@ -127,17 +127,15 @@ struct A32Frame {
     reserved: u32,
 }
 
-/// Opaque handles and epochs used by future inline memory acceleration. The
-/// canonical backing lease and concrete software-TLB entries remain owned by
-/// Rust executor state and are never represented as guest-visible pointers.
+/// Linux fastmem addresses and the mapping epoch visible to native code.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub(crate) struct MemoryAcceleration {
     pub(crate) address_space: u64,
     pub(crate) mapping_epoch: u64,
-    pub(crate) tlb_base: usize,
-    pub(crate) tlb_entry_count: u32,
-    pub(crate) tlb_index_mask: u32,
+    pub(crate) fastmem_base: usize,
+    pub(crate) fastmem_entries: usize,
+    pub(crate) fastmem_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -463,9 +461,9 @@ pub(crate) struct FrameOffsets {
     pub(crate) a32_tpidruro: usize,
     pub(crate) memory_address_space: usize,
     pub(crate) memory_mapping_epoch: usize,
-    pub(crate) memory_tlb_base: usize,
-    pub(crate) memory_tlb_entry_count: usize,
-    pub(crate) memory_tlb_index_mask: usize,
+    pub(crate) memory_fastmem_base: usize,
+    pub(crate) memory_fastmem_entries: usize,
+    pub(crate) memory_fastmem_size: usize,
     pub(crate) control_instruction_budget: usize,
     pub(crate) control_loader_return: usize,
     pub(crate) control_invalidation_epoch: usize,
@@ -512,11 +510,12 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
         + offset_of!(MemoryAcceleration, address_space),
     memory_mapping_epoch: offset_of!(ExecutionFrame, memory)
         + offset_of!(MemoryAcceleration, mapping_epoch),
-    memory_tlb_base: offset_of!(ExecutionFrame, memory) + offset_of!(MemoryAcceleration, tlb_base),
-    memory_tlb_entry_count: offset_of!(ExecutionFrame, memory)
-        + offset_of!(MemoryAcceleration, tlb_entry_count),
-    memory_tlb_index_mask: offset_of!(ExecutionFrame, memory)
-        + offset_of!(MemoryAcceleration, tlb_index_mask),
+    memory_fastmem_base: offset_of!(ExecutionFrame, memory)
+        + offset_of!(MemoryAcceleration, fastmem_base),
+    memory_fastmem_entries: offset_of!(ExecutionFrame, memory)
+        + offset_of!(MemoryAcceleration, fastmem_entries),
+    memory_fastmem_size: offset_of!(ExecutionFrame, memory)
+        + offset_of!(MemoryAcceleration, fastmem_size),
     control_instruction_budget: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, instruction_budget),
     control_loader_return: offset_of!(ExecutionFrame, control)
@@ -573,9 +572,9 @@ impl FrameOffsets {
             self.a32_tpidruro,
             self.memory_address_space,
             self.memory_mapping_epoch,
-            self.memory_tlb_base,
-            self.memory_tlb_entry_count,
-            self.memory_tlb_index_mask,
+            self.memory_fastmem_base,
+            self.memory_fastmem_entries,
+            self.memory_fastmem_size,
             self.control_instruction_budget,
             self.control_loader_return,
             self.control_invalidation_epoch,
