@@ -1,18 +1,17 @@
 //! Domain-owned asynchronous Cranelift compilation workers.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cranelift_codegen::isa::OwnedTargetIsa;
-use nixe_cpu::ir::region::IrRegion;
 use nixe_cpu::profile::GuestCpuProfile;
-use nixe_memory::AddressSpaceId;
 
 use crate::cache::{
-    CacheError, CompilationCancellation, PendingRegion, RegionKey, TranslationMode,
+    CacheError, CodeTier, DomainCodeCache, PendingRegion, PromotionCell, PromotionRequest,
+    RegionKey,
 };
 use crate::compiler::{CompilationMetrics, CompilerContext};
 use crate::diagnostics::JitDiagnostics;
@@ -25,17 +24,6 @@ pub(crate) fn host_compilation_workers() -> usize {
         .map(|parallelism| parallelism.get() / 2)
         .unwrap_or(1)
         .max(1)
-}
-
-pub(crate) struct CompilationTask {
-    pub(crate) key: RegionKey,
-    pub(crate) address_space: AddressSpaceId,
-    pub(crate) mode: TranslationMode,
-    pub(crate) region: IrRegion,
-}
-
-pub(crate) struct CompletedCompilation {
-    pub(crate) result: Result<PendingRegion, CacheError>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,8 +47,9 @@ pub(crate) struct CompilationPoolSnapshot {
     pub(crate) queued_discarded: u64,
     pub(crate) started: u64,
     pub(crate) completed: u64,
+    pub(crate) published: u64,
+    pub(crate) stale: u64,
     pub(crate) failed: u64,
-    pub(crate) completed_discarded: u64,
     pub(crate) peak_queued: u64,
     pub(crate) peak_running: u64,
     pub(crate) worker_total_ns: u64,
@@ -94,10 +83,8 @@ pub(crate) struct CompilationPoolSnapshot {
 
 struct PoolState {
     stopping: bool,
-    queue: VecDeque<CompilationTask>,
-    known: HashSet<RegionKey>,
-    completed: HashMap<RegionKey, CompletedCompilation>,
-    completion_order: VecDeque<RegionKey>,
+    queue: VecDeque<PromotionRequest>,
+    known: HashMap<RegionKey, Arc<PromotionCell>>,
     running: usize,
     snapshot: CompilationPoolSnapshot,
 }
@@ -106,7 +93,6 @@ struct SharedPool {
     state: Mutex<PoolState>,
     ready: Condvar,
     queue_capacity: usize,
-    completed_capacity: usize,
 }
 
 struct WorkerEnvironment {
@@ -115,6 +101,7 @@ struct WorkerEnvironment {
     diagnostics: Option<Arc<JitDiagnostics>>,
     profile: GuestCpuProfile,
     collect_performance: bool,
+    code_cache: Arc<DomainCodeCache>,
 }
 
 #[derive(Clone)]
@@ -123,12 +110,12 @@ pub(crate) struct CompilationPoolHandle {
 }
 
 impl CompilationPoolHandle {
-    pub(crate) fn enqueue(&self, task: CompilationTask) -> bool {
+    pub(crate) fn enqueue(&self, task: PromotionRequest) -> bool {
         let mut state = lock(&self.shared.state);
         if state.stopping {
             return false;
         }
-        if !state.known.insert(task.key) {
+        if state.known.contains_key(&task.key) {
             state.snapshot.duplicate_requests = state.snapshot.duplicate_requests.saturating_add(1);
             return false;
         }
@@ -136,8 +123,13 @@ impl CompilationPoolHandle {
             && let Some(discarded) = state.queue.pop_front()
         {
             state.known.remove(&discarded.key);
+            discarded.promotion.rearm();
             state.snapshot.queued_discarded = state.snapshot.queued_discarded.saturating_add(1);
         }
+        state.known.insert(task.key, Arc::clone(&task.promotion));
+        // Ryujinx's rejit queue is deliberately a deduplicated stack so that
+        // recently hot code is optimized before older, potentially cold work:
+        // https://www.git.axenov.dev/Museum/ryujinx/src/commit/a23d8cb92f3f1bb8dc144f4d9fb3fddee749feae/src/ARMeilleure/Translation/TranslatorQueue.cs
         state.queue.push_back(task);
         state.snapshot.enqueued = state.snapshot.enqueued.saturating_add(1);
         state.snapshot.peak_queued = state.snapshot.peak_queued.max(state.queue.len() as u64);
@@ -145,46 +137,8 @@ impl CompilationPoolHandle {
         true
     }
 
-    pub(crate) fn contains(&self, key: RegionKey) -> bool {
-        lock(&self.shared.state).known.contains(&key)
-    }
-
-    pub(crate) fn take_completed(&self, key: RegionKey) -> Option<CompletedCompilation> {
-        let mut state = lock(&self.shared.state);
-        let completed = state.completed.remove(&key)?;
-        state.known.remove(&key);
-        if let Some(index) = state
-            .completion_order
-            .iter()
-            .position(|candidate| *candidate == key)
-        {
-            state.completion_order.remove(index);
-        }
-        Some(completed)
-    }
-
     pub(crate) fn snapshot(&self) -> CompilationPoolSnapshot {
         lock(&self.shared.state).snapshot
-    }
-
-    #[cfg(test)]
-    pub(crate) fn wait_for_completion(&self, key: RegionKey) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = lock(&self.shared.state);
-            if state.completed.contains_key(&key) {
-                return true;
-            }
-            if state.stopping || !state.known.contains(&key) {
-                return false;
-            }
-            drop(state);
-            assert!(
-                Instant::now() < deadline,
-                "asynchronous JIT compilation timed out in test"
-            );
-            thread::yield_now();
-        }
     }
 }
 
@@ -198,6 +152,7 @@ impl CompilationPool {
         worker_count: usize,
         isa: OwnedTargetIsa,
         executable_memory: SharedExecutableMemory,
+        code_cache: Arc<DomainCodeCache>,
         diagnostics: Option<Arc<JitDiagnostics>>,
         profile: GuestCpuProfile,
         collect_performance: bool,
@@ -208,9 +163,7 @@ impl CompilationPool {
             state: Mutex::new(PoolState {
                 stopping: false,
                 queue: VecDeque::new(),
-                known: HashSet::new(),
-                completed: HashMap::new(),
-                completion_order: VecDeque::new(),
+                known: HashMap::new(),
                 running: 0,
                 snapshot: CompilationPoolSnapshot {
                     workers: worker_count as u64,
@@ -220,7 +173,6 @@ impl CompilationPool {
             }),
             ready: Condvar::new(),
             queue_capacity,
-            completed_capacity: queue_capacity,
         });
         let environment = Arc::new(WorkerEnvironment {
             isa,
@@ -228,6 +180,7 @@ impl CompilationPool {
             diagnostics,
             profile,
             collect_performance,
+            code_cache,
         });
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
@@ -291,13 +244,13 @@ fn stop_shared(shared: &SharedPool) {
         .snapshot
         .queued_discarded
         .saturating_add(state.queue.len() as u64);
-    state.snapshot.completed_discarded = state
-        .snapshot
-        .completed_discarded
-        .saturating_add(state.completed.len() as u64);
+    for task in &state.queue {
+        task.promotion.mark_stale();
+    }
+    for promotion in state.known.values() {
+        promotion.mark_stale();
+    }
     state.queue.clear();
-    state.completed.clear();
-    state.completion_order.clear();
     state.known.clear();
     shared.ready.notify_all();
 }
@@ -319,12 +272,19 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             if state.stopping {
                 return;
             }
-            let task = state.queue.pop_front().expect("a ready worker owns a task");
+            let task = state.queue.pop_back().expect("a ready worker owns a task");
             state.running += 1;
             state.snapshot.started = state.snapshot.started.saturating_add(1);
             state.snapshot.peak_running = state.snapshot.peak_running.max(state.running as u64);
             task
         };
+
+        if !task.promotion.begin_compilation() {
+            let mut state = lock(&shared.state);
+            state.running = state.running.saturating_sub(1);
+            state.known.remove(&task.key);
+            continue;
+        }
 
         let started = environment.collect_performance.then(Instant::now);
         let guest_instructions = u64::from(task.region.metadata.guest_instruction_count);
@@ -338,7 +298,8 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             let compiled = compiler.compile(
                 &task.region,
                 &environment.executable_memory,
-                CompilationCancellation::active(),
+                task.promotion.cancellation(),
+                None,
                 &mut metrics.compilation,
             )?;
             if let Some(diagnostics) = &environment.diagnostics {
@@ -353,12 +314,18 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             metrics.native_named_operations = compiled.metadata.native_named_operations;
             metrics.semantic_helper_callsites = compiled.metadata.semantic_calls.len() as u64;
             let pending_started = environment.collect_performance.then(Instant::now);
-            let pending =
-                PendingRegion::new(task.address_space, task.mode, &task.region, compiled)?;
+            let pending = PendingRegion::new(
+                task.address_space,
+                task.mode,
+                Arc::clone(&task.region),
+                compiled,
+                CodeTier::Optimized,
+                None,
+            )?;
             if let Some(started) = pending_started {
                 metrics.pending_region_ns = duration_ns(started.elapsed());
             }
-            Ok::<_, CacheError>(pending)
+            environment.code_cache.publish_upgrade(&task, pending)
         }))
         .unwrap_or_else(|_| {
             Err(CacheError::Internal(
@@ -372,8 +339,18 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
         if let Some(started) = started {
             metrics.worker_total_ns = duration_ns(started.elapsed());
         }
+        let hard_failure = match &result {
+            Err(CacheError::Stale | CacheError::Cancelled) => None,
+            Err(error) => Some(error.clone()),
+            Ok(_) => None,
+        };
+        if let Some(error) = hard_failure {
+            task.promotion.mark_stale();
+            environment.code_cache.record_background_failure(error);
+        }
         let mut state = lock(&shared.state);
         state.running = state.running.saturating_sub(1);
+        state.known.remove(&task.key);
         state.snapshot.completed = state.snapshot.completed.saturating_add(1);
         macro_rules! add_metric {
             ($field:ident, $value:expr) => {
@@ -461,27 +438,17 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             .snapshot
             .compiled_semantic_helper_callsites
             .saturating_add(metrics.semantic_helper_callsites);
-        if result.is_err() {
-            state.snapshot.failed = state.snapshot.failed.saturating_add(1);
+        match result {
+            Ok(_) => {
+                state.snapshot.published = state.snapshot.published.saturating_add(1);
+            }
+            Err(CacheError::Stale | CacheError::Cancelled) => {
+                state.snapshot.stale = state.snapshot.stale.saturating_add(1);
+            }
+            Err(_) => {
+                state.snapshot.failed = state.snapshot.failed.saturating_add(1);
+            }
         }
-        if state.stopping {
-            state.known.remove(&task.key);
-            state.snapshot.completed_discarded =
-                state.snapshot.completed_discarded.saturating_add(1);
-            continue;
-        }
-        if state.completed.len() == shared.completed_capacity
-            && let Some(discarded) = state.completion_order.pop_front()
-        {
-            state.completed.remove(&discarded);
-            state.known.remove(&discarded);
-            state.snapshot.completed_discarded =
-                state.snapshot.completed_discarded.saturating_add(1);
-        }
-        state
-            .completed
-            .insert(task.key, CompletedCompilation { result });
-        state.completion_order.push_back(task.key);
     }
 }
 
@@ -495,7 +462,54 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use nixe_cpu::ir::region::{IrRegion, RegionMetadata};
+    use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+    use nixe_memory::{
+        AddressSpaceId, ContentGeneration, GuestPhysicalPageId, GuestVirtualAddress,
+        MappingGeneration,
+    };
+
     use super::*;
+    use crate::cache::TranslationMode;
+
+    fn request(pc: u64) -> PromotionRequest {
+        let address_space = AddressSpaceId::new(7);
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(pc),
+            ExecutionState::A64,
+            GuestCpuProfile::SWITCH_1_ID,
+        );
+        let dependency = nixe_cpu::memory::CodePageDependency {
+            page: GuestPhysicalPageId::new(pc >> 12),
+            generation: ContentGeneration::new(1),
+            mapping_generation: MappingGeneration::new(1),
+        };
+        PromotionRequest {
+            key: RegionKey::new(
+                address_space,
+                location,
+                TranslationMode::Baseline,
+                dependency,
+            ),
+            baseline_id: pc,
+            address_space,
+            mode: TranslationMode::Baseline,
+            region: Arc::new(IrRegion::new(
+                RegionMetadata {
+                    start: location,
+                    guest_byte_count: 4,
+                    guest_instruction_count: 1,
+                    ir_operation_count: 1,
+                    entries: Box::new([]),
+                    exits: Box::new([]),
+                    code_dependencies: Box::new([dependency]),
+                    safepoints: Box::new([]),
+                },
+                Vec::new(),
+            )),
+            promotion: Arc::new(PromotionCell::new()),
+        }
+    }
 
     #[test]
     fn worker_count_is_half_the_host_parallelism_with_one_as_the_floor() {
@@ -503,5 +517,39 @@ mod tests {
             .map(|parallelism| parallelism.get())
             .unwrap_or(1);
         assert_eq!(host_compilation_workers(), (host / 2).max(1));
+    }
+
+    #[test]
+    fn bounded_queue_discards_the_oldest_request_and_deduplicates_keys() {
+        let shared = Arc::new(SharedPool {
+            state: Mutex::new(PoolState {
+                stopping: false,
+                queue: VecDeque::new(),
+                known: HashMap::new(),
+                running: 0,
+                snapshot: CompilationPoolSnapshot::default(),
+            }),
+            ready: Condvar::new(),
+            queue_capacity: 2,
+        });
+        let handle = CompilationPoolHandle {
+            shared: Arc::clone(&shared),
+        };
+        let oldest = request(0x1000);
+        let middle = request(0x2000);
+        let newest = request(0x3000);
+        let newest_key = newest.key;
+        let middle_key = middle.key;
+
+        assert!(handle.enqueue(oldest));
+        assert!(handle.enqueue(middle));
+        assert!(handle.enqueue(newest));
+        assert!(!handle.enqueue(request(0x3000)));
+
+        let mut state = lock(&shared.state);
+        assert_eq!(state.queue.pop_back().unwrap().key, newest_key);
+        assert_eq!(state.queue.pop_back().unwrap().key, middle_key);
+        assert_eq!(state.snapshot.queued_discarded, 1);
+        assert_eq!(state.snapshot.duplicate_requests, 1);
     }
 }

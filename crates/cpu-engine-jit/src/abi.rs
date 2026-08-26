@@ -10,24 +10,24 @@ use nixe_cpu::state::a64::{
 };
 use nixe_cpu::state::{A32State, A64State, ThreadCpuState};
 
-pub(crate) const NATIVE_ABI_VERSION: u32 = 4;
+pub(crate) const NATIVE_ABI_VERSION: u32 = 6;
+pub(crate) const NO_LOADER_RETURN: u64 = u64::MAX;
 
 pub(crate) const EXECUTION_STATE_A64: u32 = 0;
 pub(crate) const EXECUTION_STATE_A32: u32 = 1;
 pub(crate) const EXECUTION_STATE_T32: u32 = 2;
 
 pub(crate) const EXIT_NONE: u32 = 0;
-pub(crate) const EXIT_INTERPRET_ONE: u32 = 1;
-pub(crate) const EXIT_BUDGET_EXHAUSTED: u32 = 2;
-pub(crate) const EXIT_SAFEPOINT: u32 = 3;
-pub(crate) const EXIT_PENDING_EVENT: u32 = 4;
-pub(crate) const EXIT_LOADER_RETURN: u32 = 5;
-pub(crate) const EXIT_DISPATCH: u32 = 6;
-pub(crate) const EXIT_ARCHITECTURAL: u32 = 7;
-pub(crate) const EXIT_UNSUPPORTED: u32 = 8;
-pub(crate) const EXIT_DATA_FAULT: u32 = 9;
-pub(crate) const EXIT_SCHEDULED: u32 = 10;
-pub(crate) const EXIT_INTERNAL: u32 = 11;
+pub(crate) const EXIT_BUDGET_EXHAUSTED: u32 = 1;
+pub(crate) const EXIT_SAFEPOINT: u32 = 2;
+pub(crate) const EXIT_PENDING_EVENT: u32 = 3;
+pub(crate) const EXIT_LOADER_RETURN: u32 = 4;
+pub(crate) const EXIT_DISPATCH: u32 = 5;
+pub(crate) const EXIT_ARCHITECTURAL: u32 = 6;
+pub(crate) const EXIT_UNSUPPORTED: u32 = 7;
+pub(crate) const EXIT_DATA_FAULT: u32 = 8;
+pub(crate) const EXIT_SCHEDULED: u32 = 9;
+pub(crate) const EXIT_INTERNAL: u32 = 10;
 
 pub(crate) const SCHEDULE_YIELD: u32 = 1;
 pub(crate) const SCHEDULE_WAIT_FOR_EVENT: u32 = 2;
@@ -44,6 +44,7 @@ pub(crate) const SYSTEM_READ_RUNTIME_REGISTER: u32 = 6;
 pub(crate) const SYSTEM_WAIT_FOR_EVENT: u32 = 7;
 pub(crate) const SYSTEM_WAIT_FOR_INTERRUPT: u32 = 8;
 pub(crate) const SYSTEM_SEND_EVENT_LOCAL: u32 = 9;
+pub(crate) const SYSTEM_HOTNESS_PROMOTION: u32 = 10;
 
 pub(crate) const MAX_HELPER_ARGUMENTS: usize = 16;
 pub(crate) const MAX_HELPER_RESULTS: usize = 4;
@@ -138,7 +139,7 @@ pub(crate) struct MemoryAcceleration {
     pub(crate) fastmem_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub(crate) struct NativeControl {
     pub(crate) instruction_budget: u64,
@@ -148,8 +149,20 @@ pub(crate) struct NativeControl {
     pub(crate) interrupt_pending_address: usize,
     pub(crate) request_flags: u32,
     pub(crate) event_mask: u32,
-    pub(crate) loader_return_valid: u32,
-    pub(crate) reserved: u32,
+}
+
+impl Default for NativeControl {
+    fn default() -> Self {
+        Self {
+            instruction_budget: 0,
+            loader_return: NO_LOADER_RETURN,
+            invalidation_epoch: 0,
+            control_pending_address: 0,
+            interrupt_pending_address: 0,
+            request_flags: 0,
+            event_mask: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -471,7 +484,6 @@ pub(crate) struct FrameOffsets {
     pub(crate) interrupt_pending_address: usize,
     pub(crate) control_request_flags: usize,
     pub(crate) control_event_mask: usize,
-    pub(crate) control_loader_return_valid: usize,
     pub(crate) dispatch_link_table: usize,
     pub(crate) dispatch_metadata: usize,
     pub(crate) dispatch_region_id: usize,
@@ -529,8 +541,6 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
     control_request_flags: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, request_flags),
     control_event_mask: offset_of!(ExecutionFrame, control) + offset_of!(NativeControl, event_mask),
-    control_loader_return_valid: offset_of!(ExecutionFrame, control)
-        + offset_of!(NativeControl, loader_return_valid),
     dispatch_link_table: offset_of!(ExecutionFrame, dispatch)
         + offset_of!(NativeDispatch, link_table),
     dispatch_metadata: offset_of!(ExecutionFrame, dispatch) + offset_of!(NativeDispatch, metadata),
@@ -551,7 +561,7 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
 };
 
 impl FrameOffsets {
-    pub(crate) const fn all(self) -> [usize; 44] {
+    pub(crate) const fn all(self) -> [usize; 43] {
         [
             self.execution_state,
             self.a64_x,
@@ -582,7 +592,6 @@ impl FrameOffsets {
             self.interrupt_pending_address,
             self.control_request_flags,
             self.control_event_mask,
-            self.control_loader_return_valid,
             self.dispatch_link_table,
             self.dispatch_metadata,
             self.dispatch_region_id,

@@ -1,6 +1,7 @@
 //! Exact Rust slow paths reached through the private native ABI.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use nixe_cpu::{
     exclusive::ExclusiveMonitorState,
@@ -13,8 +14,8 @@ use nixe_cpu::{
     semantics::{
         a64::RuntimeRegisterRead,
         a64_fp_simd::{
-            A64FpSimdError, Binary32Operation, binary32, execute_semantic_token, fp_status_bits,
-            fp_status_traps, semantic_instruction,
+            A64FpSimdError, Binary32Operation, SemanticInput, binary32, execute_semantic_token,
+            fp_status_bits, fp_status_traps, semantic_inputs, semantic_instruction,
         },
         arithmetic::{add_with_carry, subtract_with_carry},
         bits::{BitWidth, rotate_right, sign_extend},
@@ -34,11 +35,12 @@ use nixe_memory::{
 use crate::abi::{
     AbiU128, ExecutionFrame, HelperTable, NATIVE_ABI_VERSION, SYSTEM_CACHE_DATA_CLEAN,
     SYSTEM_CACHE_DATA_CLEAN_INVALIDATE, SYSTEM_CACHE_DATA_INVALIDATE,
-    SYSTEM_CACHE_INSTRUCTION_INVALIDATE, SYSTEM_CACHE_INSTRUCTION_PREFETCH, SYSTEM_POLL,
-    SYSTEM_READ_RUNTIME_REGISTER, SYSTEM_SEND_EVENT_LOCAL, SYSTEM_WAIT_FOR_EVENT,
-    SYSTEM_WAIT_FOR_INTERRUPT,
+    SYSTEM_CACHE_INSTRUCTION_INVALIDATE, SYSTEM_CACHE_INSTRUCTION_PREFETCH,
+    SYSTEM_HOTNESS_PROMOTION, SYSTEM_POLL, SYSTEM_READ_RUNTIME_REGISTER, SYSTEM_SEND_EVENT_LOCAL,
+    SYSTEM_WAIT_FOR_EVENT, SYSTEM_WAIT_FOR_INTERRUPT,
 };
 use crate::cache::DomainCodeCache;
+use crate::compilation_pool::CompilationPoolHandle;
 use crate::performance::ExecutorPerformance;
 
 pub(crate) struct NativeContext<'a> {
@@ -47,6 +49,7 @@ pub(crate) struct NativeContext<'a> {
     pub(crate) data_fault: Option<DataAccessFault>,
     pub(crate) control: &'a EngineControl,
     pub(crate) code_cache: Option<&'a DomainCodeCache>,
+    pub(crate) compilation_pool: Option<&'a CompilationPoolHandle>,
     pub(crate) invalidation_cursor: Option<&'a mut MemoryInvalidationCursor>,
     pub(crate) control_snapshot: Option<ControlSnapshot>,
     pub(crate) cpu: ProcessCpuContext,
@@ -70,6 +73,7 @@ impl<'a> NativeContext<'a> {
             data_fault: None,
             control,
             code_cache: None,
+            compilation_pool: None,
             invalidation_cursor: None,
             control_snapshot: None,
             cpu,
@@ -94,6 +98,14 @@ impl<'a> NativeContext<'a> {
     ) -> Self {
         self.code_cache = Some(code_cache);
         self.invalidation_cursor = Some(invalidation_cursor);
+        self
+    }
+
+    pub(crate) fn with_compilation_pool(
+        mut self,
+        compilation_pool: &'a CompilationPoolHandle,
+    ) -> Self {
+        self.compilation_pool = Some(compilation_pool);
         self
     }
 }
@@ -188,7 +200,7 @@ unsafe extern "C" fn memory_write(
             }
         };
         if result.is_ok() {
-            mark_guest_invalidation(frame, context, invalidation_before);
+            mark_guest_invalidation(frame, context, invalidation_before)?;
         }
         result
     })
@@ -196,14 +208,15 @@ unsafe extern "C" fn memory_write(
 
 fn mark_guest_invalidation(
     frame: &mut ExecutionFrame,
-    context: &NativeContext<'_>,
+    context: &mut NativeContext<'_>,
     before: MemoryInvalidationCursor,
-) {
+) -> Result<(), ()> {
     let after = context.memory.invalidation_cursor();
-    if after > before {
+    if after > before && consume_irrelevant_code_invalidations(frame, context)? {
         frame.control.request_flags |= 1 << 1;
         frame.control.invalidation_epoch = frame.control.invalidation_epoch.max(after.get());
     }
+    Ok(())
 }
 
 unsafe extern "C" fn atomic(
@@ -258,7 +271,7 @@ unsafe extern "C" fn atomic(
         match transaction {
             Ok(transaction) => {
                 unsafe { result.write(memory_bits(transaction.previous).into()) };
-                mark_guest_invalidation(frame, context, invalidation_before);
+                mark_guest_invalidation(frame, context, invalidation_before)?;
                 Ok(())
             }
             Err(fault) => {
@@ -326,7 +339,7 @@ unsafe extern "C" fn exclusive(
                 ) {
                     Ok((_, stored)) => {
                         unsafe { result.write(u128::from(!stored).into()) };
-                        mark_guest_invalidation(frame, context, invalidation_before);
+                        mark_guest_invalidation(frame, context, invalidation_before)?;
                         Ok(())
                     }
                     Err(fault) => {
@@ -356,6 +369,11 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
         }
         .ok_or(())?;
         let call = metadata.semantic_calls.get(operation as usize).ok_or(())?;
+        let arguments = frame
+            .scratch
+            .arguments
+            .get(..usize::from(call.argument_count))
+            .ok_or(())?;
         if matches!(
             call.helper.as_ref(),
             "a64.simd.pair-memory"
@@ -366,11 +384,11 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
             let invalidation_before = context.memory.invalidation_cursor();
             let result = execute_complex_memory(
                 call.helper.as_ref(),
-                &frame.scratch.arguments,
+                arguments,
                 context.memory,
                 address_space,
             );
-            mark_guest_invalidation(frame, context, invalidation_before);
+            mark_guest_invalidation(frame, context, invalidation_before)?;
             match result {
                 Ok(results) if results.len() == call.result_types.len() => {
                     frame.scratch.results[..results.len()].copy_from_slice(&results);
@@ -384,7 +402,7 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
             }
         }
         if is_a64_fp_simd_helper(call.helper.as_ref()) {
-            match execute_a64_fp_simd_helper(call.helper.as_ref(), &frame.scratch.arguments) {
+            match execute_a64_fp_simd_helper(call.helper.as_ref(), arguments) {
                 Ok(results) if results.len() == call.result_types.len() => {
                     frame.scratch.results[..results.len()].copy_from_slice(&results);
                     return Ok(0);
@@ -394,7 +412,7 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
             }
         }
         if call.helper.as_ref() == "aarch32.vfp.binary32-vector" {
-            match execute_aarch32_binary32(&frame.scratch.arguments) {
+            match execute_aarch32_binary32(arguments) {
                 Ok(results) if results.len() == call.result_types.len() => {
                     frame.scratch.results[..results.len()].copy_from_slice(&results);
                     return Ok(0);
@@ -403,7 +421,6 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
                 Ok(_) | Err(A64FpSimdError::Unsupported) => return Err(()),
             }
         }
-        let arguments = &frame.scratch.arguments;
         let results = execute_semantic(call.helper.as_ref(), arguments, &call.result_types)?;
         if results.len() != call.result_types.len() {
             return Err(());
@@ -446,7 +463,7 @@ fn execute_a64_fp_simd_helper(
         "a64.fp.scalar-move" | "a64.fp.move-to-general" | "a64.simd.unsigned-move-to-general" => 1,
         "a64.fp.move-from-general" => 2,
         "a64.simd.bitwise" | "a64.simd.integer-add-sub" => 3,
-        "a64.fp-simd.semantic-vector" => 8,
+        "a64.fp-simd.semantic-vector" => 0,
         "a64.fp.semantic-conditional-compare" => 5,
         "a64.fp.scalar-arithmetic" | "a64.fp.scalar-compare" => 4,
         "a64.fp.float-to-signed-int"
@@ -474,14 +491,41 @@ fn execute_a64_fp_simd_helper(
             install_vector(&mut state, fields.rd, argument(1));
         }
         "a64.fp-simd.semantic-vector" => {
-            install_vector(&mut state, fields.rn, argument(0));
-            install_vector(&mut state, fields.rm, argument(1));
-            install_vector(&mut state, fields.ra, argument(2));
-            install_vector(&mut state, fields.rd, argument(3));
-            write_general(&mut state, fields.rn, argument(4) as u64);
-            state.set_nzcv(Nzcv::from_bits(argument(5) as u32));
-            state.set_fpcr(argument(6) as u32);
-            state.set_fpsr(argument(7) as u32);
+            let inputs = semantic_inputs(instruction);
+            let input = |input: SemanticInput| -> Result<u128, A64FpSimdError> {
+                inputs
+                    .argument_index(input)
+                    .map(argument)
+                    .ok_or(A64FpSimdError::Unsupported)
+            };
+            if inputs.contains(SemanticInput::RnVector) {
+                install_vector(&mut state, fields.rn, input(SemanticInput::RnVector)?);
+            }
+            if inputs.contains(SemanticInput::RmVector) {
+                install_vector(&mut state, fields.rm, input(SemanticInput::RmVector)?);
+            }
+            if inputs.contains(SemanticInput::RaVector) {
+                install_vector(&mut state, fields.ra, input(SemanticInput::RaVector)?);
+            }
+            if inputs.contains(SemanticInput::RdVector) {
+                install_vector(&mut state, fields.rd, input(SemanticInput::RdVector)?);
+            }
+            if inputs.contains(SemanticInput::RnGeneral) {
+                write_general(
+                    &mut state,
+                    fields.rn,
+                    input(SemanticInput::RnGeneral)? as u64,
+                );
+            }
+            if inputs.contains(SemanticInput::Nzcv) {
+                state.set_nzcv(Nzcv::from_bits(input(SemanticInput::Nzcv)? as u32));
+            }
+            if inputs.contains(SemanticInput::Fpcr) {
+                state.set_fpcr(input(SemanticInput::Fpcr)? as u32);
+            }
+            if inputs.contains(SemanticInput::Fpsr) {
+                state.set_fpsr(input(SemanticInput::Fpsr)? as u32);
+            }
         }
         "a64.fp.semantic-conditional-compare" => {
             install_vector(&mut state, fields.rn, argument(0));
@@ -535,7 +579,7 @@ fn execute_a64_fp_simd_helper(
             .vector(fields.rd)
             .expect("normalized FP/SIMD destination register"),
     };
-    if matches!(
+    let single_result = matches!(
         name,
         "a64.simd.bitwise"
             | "a64.simd.integer-add-sub"
@@ -543,7 +587,9 @@ fn execute_a64_fp_simd_helper(
             | "a64.fp.scalar-move"
             | "a64.fp.move-to-general"
             | "a64.fp.move-from-general"
-    ) {
+    ) || (name == "a64.fp-simd.semantic-vector"
+        && !semantic_inputs(instruction).contains(SemanticInput::Fpsr));
+    if single_result {
         Ok(vec![first.into()])
     } else {
         Ok(vec![first.into(), u128::from(state.fpsr()).into()])
@@ -800,33 +846,37 @@ fn consume_irrelevant_code_invalidations(
             MemoryInvalidationKind::ExecutableContent { .. }
         )
     }) {
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.invalidation_checks_relevant =
+                performance.invalidation_checks_relevant.saturating_add(1);
+        }
         return Ok(true);
     }
-    let effect = context
+    let irrelevant = context
         .code_cache
         .ok_or(())?
-        .apply_invalidations(&records, through, false)
+        .consume_irrelevant_invalidations(&records, through)
         .map_err(|_| ())?;
+    if !irrelevant {
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.invalidation_checks_relevant =
+                performance.invalidation_checks_relevant.saturating_add(1);
+        }
+        return Ok(true);
+    }
     *invalidation_cursor = through;
     frame.control.invalidation_epoch = through.get();
     context.control.acknowledge_invalidation(through.get());
-    if effect.retired_regions == 0 {
-        frame.control.request_flags &= !(1 << 1);
-    }
+    frame.control.request_flags &= !(1 << 1);
     if let Some(performance) = context.performance.as_deref_mut() {
         performance.invalidation_batches = performance.invalidation_batches.saturating_add(1);
         performance.invalidation_records = performance
             .invalidation_records
             .saturating_add(records.len() as u64);
-        if effect.retired_regions == 0 {
-            performance.filtered_invalidation_polls =
-                performance.filtered_invalidation_polls.saturating_add(1);
-        } else {
-            performance.relevant_invalidation_polls =
-                performance.relevant_invalidation_polls.saturating_add(1);
-        }
+        performance.invalidation_checks_filtered =
+            performance.invalidation_checks_filtered.saturating_add(1);
     }
-    Ok(effect.retired_regions != 0)
+    Ok(false)
 }
 
 unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument: u64) -> u32 {
@@ -877,11 +927,28 @@ unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument
                 }
             };
             if result.is_ok() {
-                mark_guest_invalidation(frame, context, invalidation_before);
+                mark_guest_invalidation(frame, context, invalidation_before)?;
             }
             return result;
         }
         match operation {
+            SYSTEM_HOTNESS_PROMOTION => {
+                let request = context
+                    .code_cache
+                    .ok_or(())?
+                    .request_promotion(argument as usize)
+                    .map_err(|_| ())?;
+                if let Some(request) = request {
+                    let promotion = Arc::clone(&request.promotion);
+                    let queued = context.compilation_pool.ok_or(())?.enqueue(request);
+                    if !queued {
+                        promotion.rearm();
+                    } else if let Some(performance) = context.performance.as_deref_mut() {
+                        performance.hot_promotions = performance.hot_promotions.saturating_add(1);
+                    }
+                }
+                return Ok(false);
+            }
             SYSTEM_READ_RUNTIME_REGISTER => {
                 let read = nixe_cpu::semantics::a64::runtime_register_read(
                     context.cpu.profile(),

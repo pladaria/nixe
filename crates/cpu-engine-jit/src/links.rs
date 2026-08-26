@@ -2,7 +2,7 @@
 
 use core::mem::{offset_of, size_of};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use nixe_cpu::location::LocationDescriptor;
 
@@ -69,22 +69,39 @@ impl LinkCell {
             Ordering::Acquire,
         );
     }
+
+    pub(crate) fn replace(
+        &self,
+        expected: *mut NativeLinkTarget,
+        replacement: *mut NativeLinkTarget,
+    ) -> bool {
+        self.target
+            .compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 #[repr(C)]
 pub(crate) struct LinkSite {
     cells: [LinkCell; INDIRECT_LINK_WAYS],
+    replacement_cursor: AtomicU8,
 }
 
 impl LinkSite {
     fn empty() -> Self {
         Self {
             cells: std::array::from_fn(|_| LinkCell::empty()),
+            replacement_cursor: AtomicU8::new(0),
         }
     }
 
     pub(crate) fn cell(&self, way: usize) -> Option<&LinkCell> {
         self.cells.get(way)
+    }
+
+    pub(crate) fn replacement_way(&self, ways: usize) -> usize {
+        debug_assert!(ways > 0 && ways <= INDIRECT_LINK_WAYS);
+        usize::from(self.replacement_cursor.fetch_add(1, Ordering::Relaxed)) % ways
     }
 }
 

@@ -182,6 +182,14 @@ pub fn validate_a64(id: CoverageId, bits: u32) -> AllocationStatus {
         0x0000_0099 | 0x0000_009a => {
             validate_a64_simd_shift_left_immediate(id == 0x0000_0099, bits)
         }
+        0x0000_00a0 => {
+            let immediate_high = (bits >> 19) & 0xf;
+            if immediate_high == 0 {
+                AllocationStatus::Unallocated("SIMD long shift has no element-size bit")
+            } else {
+                AllocationStatus::Allocated
+            }
+        }
         0x0000_009c | 0x0000_009d => validate_a64_simd_float_vector(bits),
         0x0000_009e | 0x0000_009f => {
             let scale = ((bits >> 10) & 0x3f) as u8;
