@@ -6,6 +6,7 @@
 
 mod abi;
 mod cache;
+mod compilation_pool;
 mod compiler;
 mod configuration;
 mod diagnostics;
@@ -13,6 +14,7 @@ mod engine;
 mod executable_memory;
 mod helpers;
 mod links;
+mod performance;
 mod tlb;
 
 pub use configuration::{

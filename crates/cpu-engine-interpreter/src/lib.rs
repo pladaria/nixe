@@ -9,6 +9,7 @@ mod interpreter;
 
 pub use engine::{
     INTERPRETER_ENGINE_ID, InterpreterDomain, InterpreterExecutor, InterpreterProvider,
+    fetch_current_instruction,
 };
 pub use interpreter::{
     InterpreterContext, InterpreterError, InterpreterOutcome, InterpreterPolicy, execute_fallback,

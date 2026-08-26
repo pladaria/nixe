@@ -14,6 +14,10 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use nixe_cpu::{
+    decode::a64::fp_simd::{
+        BitwiseOperation, Instruction as A64FpSimdInstruction, IntegerComparison,
+        PairwiseOperation, PermuteOperation,
+    },
     exception::ExceptionKind,
     ir::{
         block::{BlockId, IrBlock},
@@ -31,7 +35,9 @@ use nixe_cpu::{
     },
     location::{ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::CacheMaintenanceKind,
-    semantics::a64::HintOperation,
+    semantics::{
+        a64::HintOperation, a64_fp_simd::semantic_instruction, immediate::decode_a64_bit_masks,
+    },
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
 use nixe_memory::GuestVirtualAddress;
@@ -88,6 +94,7 @@ pub(crate) struct CompiledRegionMetadata {
     pub(crate) sources: Box<[LocationDescriptor]>,
     pub(crate) side_exits: Box<[SideExit]>,
     pub(crate) semantic_calls: Box<[SemanticCall]>,
+    pub(crate) native_named_operations: u64,
     pub(crate) link_sites: Box<[LinkSiteMetadata]>,
 }
 
@@ -190,6 +197,7 @@ struct LoweringState {
     source_indices: HashMap<LocationDescriptor, u32>,
     side_exits: Vec<SideExit>,
     semantic_calls: Vec<SemanticCall>,
+    native_named_operations: u64,
     link_sites: Vec<LinkSiteMetadata>,
     helper_call_conv: CallConv,
 }
@@ -411,6 +419,7 @@ fn lower_region_body(
         source_indices: HashMap::new(),
         side_exits: Vec::new(),
         semantic_calls: Vec::new(),
+        native_named_operations: 0,
         link_sites: Vec::new(),
         helper_call_conv,
     };
@@ -446,6 +455,7 @@ fn lower_region_body(
         sources: lowering.sources.into_boxed_slice(),
         side_exits: lowering.side_exits.into_boxed_slice(),
         semantic_calls: lowering.semantic_calls.into_boxed_slice(),
+        native_named_operations: lowering.native_named_operations,
         link_sites: lowering.link_sites.into_boxed_slice(),
     };
     Ok(metadata)
@@ -652,12 +662,52 @@ fn emit_control_poll(
     lowering: &LoweringState,
     source: LocationDescriptor,
 ) -> Result<(), CompilerError> {
+    let pointer_type = builder.func.dfg.value_type(lowering.frame);
+    let flags = trusted_mem_flags(builder);
+    let control_pending_address = load(
+        builder,
+        pointer_type,
+        lowering.frame,
+        FRAME_OFFSETS.control_pending_address,
+    )?;
+    let control_pending = builder
+        .ins()
+        .atomic_load(types::I32, flags, control_pending_address);
+    let interrupt_pending_address = load(
+        builder,
+        pointer_type,
+        lowering.frame,
+        FRAME_OFFSETS.interrupt_pending_address,
+    )?;
+    let interrupt_pending = builder
+        .ins()
+        .atomic_load(types::I32, flags, interrupt_pending_address);
+    let local_requests = load(
+        builder,
+        types::I32,
+        lowering.frame,
+        FRAME_OFFSETS.control_request_flags,
+    )?;
+    let local_events = load(
+        builder,
+        types::I32,
+        lowering.frame,
+        FRAME_OFFSETS.control_event_mask,
+    )?;
+    let shared_pending = builder.ins().bor(control_pending, interrupt_pending);
+    let local_pending = builder.ins().bor(local_requests, local_events);
+    let pending = builder.ins().bor(shared_pending, local_pending);
+    let needs_slow_path = builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
+    let slow = builder.create_block();
+    let resume = builder.create_block();
+    builder.ins().brif(needs_slow_path, slow, &[], resume, &[]);
+
+    builder.switch_to_block(slow);
     let argument = builder.ins().iconst(types::I64, 0);
     let status = call_system_helper(builder, lowering, SYSTEM_POLL, argument)?;
     let pending = builder.ins().icmp_imm_s(IntCC::Equal, status, 1);
     let handle_pending = builder.create_block();
     let classify_error = builder.create_block();
-    let resume = builder.create_block();
     builder
         .ins()
         .brif(pending, handle_pending, &[], classify_error, &[]);
@@ -1333,6 +1383,16 @@ fn lower_named_helper(
     result_types: &[IrType],
     values: &BTreeMap<ValueId, ir::Value>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
+    if let Some(results) = lower_native_named_helper(builder, helper, result_types, values)? {
+        lowering.native_named_operations = lowering.native_named_operations.saturating_add(1);
+        return Ok(results);
+    }
+    if !approved_semantic_slow_path(helper.helper.as_ref()) {
+        return Err(CompilerError::new(format!(
+            "named operation {} has no native lowering and is not an approved semantic slow path",
+            helper.helper
+        )));
+    }
     let index = u32::try_from(lowering.semantic_calls.len())
         .map_err(|_| CompilerError::new("semantic helper metadata index overflow"))?;
     lowering.semantic_calls.push(SemanticCall {
@@ -1381,6 +1441,1665 @@ fn lower_named_helper(
             )
         })
         .collect()
+}
+
+fn approved_semantic_slow_path(name: &str) -> bool {
+    matches!(
+        name,
+        "a64.simd.pair-memory"
+            | "a64.simd.multiple-structure-memory"
+            | "a64.simd.single-structure-memory"
+            | "a64.fp-simd.semantic-vector"
+            | "a64.fp.float-to-signed-int"
+            | "a64.fp.float-to-unsigned-int"
+            | "a64.fp.scalar-arithmetic"
+            | "a64.fp.scalar-compare"
+            | "a64.fp.semantic-conditional-compare"
+            | "a64.fp.signed-int-to-float"
+            | "a64.fp.unsigned-int-to-float"
+            | "aarch32.vfp.binary32-vector"
+    )
+}
+
+fn lower_native_named_helper(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    values: &BTreeMap<ValueId, ir::Value>,
+) -> Result<Option<Vec<ir::Value>>, CompilerError> {
+    if helper.helper.as_ref() == "a64.fp-simd.semantic-vector"
+        && let Some(results) = lower_native_a64_semantic_vector(builder, helper, values)?
+    {
+        return Ok(Some(results));
+    }
+    let native = matches!(
+        helper.helper.as_ref(),
+        "a64.extend-register"
+            | "a64.load-store-register-offset"
+            | "a64.sbfm"
+            | "a64.bfm"
+            | "a64.ubfm"
+            | "a64.smaddl"
+            | "a64.smsubl"
+            | "a64.umaddl"
+            | "a64.umsubl"
+            | "a64.smulh"
+            | "a64.umulh"
+            | "a64.extr"
+            | "a64.rev16"
+            | "a64.rev32"
+            | "a64.rev"
+            | "a64.cls"
+            | "a64.simd.zero-extend-load"
+            | "a64.simd.low-bits"
+            | "a64.simd.bitwise"
+            | "a64.simd.integer-add-sub"
+            | "a64.simd.unsigned-move-to-general"
+            | "a64.fp.scalar-move"
+            | "a64.fp.move-to-general"
+            | "a64.fp.move-from-general"
+            | "aarch32.vector.pack"
+            | "aarch32.vector.unpack"
+            | "aarch32.neon.bitwise"
+            | "aarch32.shift"
+            | "aarch32.data-processing"
+            | "aarch32.multiply"
+    );
+    if !native {
+        return Ok(None);
+    }
+    let arguments = helper
+        .arguments
+        .iter()
+        .map(|argument| operand(builder, values, *argument))
+        .collect::<Result<Vec<_>, _>>()?;
+    let results = match helper.helper.as_ref() {
+        "a64.extend-register" | "a64.load-store-register-offset" => {
+            lower_native_extend(builder, helper, result_types, &arguments)?
+        }
+        "a64.sbfm" | "a64.bfm" | "a64.ubfm" => {
+            lower_native_bitfield(builder, helper, result_types, &arguments)?
+        }
+        "a64.smaddl" | "a64.smsubl" | "a64.umaddl" | "a64.umsubl" => {
+            lower_native_widening_multiply(builder, helper.helper.as_ref(), &arguments)?
+        }
+        "a64.smulh" => vec![builder.ins().smulhi(arguments[0], arguments[1])],
+        "a64.umulh" => vec![builder.ins().umulhi(arguments[0], arguments[1])],
+        "a64.extr" => lower_native_extract(builder, helper, result_types, &arguments)?,
+        "a64.rev16" | "a64.rev32" | "a64.rev" | "a64.cls" => {
+            lower_native_one_source(builder, helper.helper.as_ref(), &arguments)?
+        }
+        "a64.simd.zero-extend-load" => {
+            vec![vector_from_low_integer(builder, arguments[0])]
+        }
+        "a64.simd.low-bits" => {
+            vec![low_integer_from_vector(
+                builder,
+                arguments[0],
+                cranelift_type(single_result_type(result_types)?),
+            )]
+        }
+        "a64.simd.bitwise" => lower_native_a64_simd_bitwise(builder, helper, &arguments)?,
+        "a64.simd.integer-add-sub" => lower_native_a64_simd_add_sub(builder, helper, &arguments)?,
+        "a64.simd.unsigned-move-to-general" => {
+            lower_native_a64_unsigned_move(builder, helper, result_types, &arguments)?
+        }
+        "a64.fp.scalar-move" => lower_native_a64_scalar_move(builder, helper, &arguments)?,
+        "a64.fp.move-to-general" => {
+            lower_native_a64_move_to_general(builder, helper, result_types, &arguments)?
+        }
+        "a64.fp.move-from-general" => {
+            lower_native_a64_move_from_general(builder, helper, &arguments)?
+        }
+        "aarch32.vector.pack" => {
+            vec![vector_from_halves(builder, arguments[0], arguments[1])]
+        }
+        "aarch32.vector.unpack" => {
+            let (low, high) = vector_halves(builder, arguments[0]);
+            vec![low, high]
+        }
+        "aarch32.neon.bitwise" => lower_native_aarch32_neon_bitwise(builder, helper, &arguments)?,
+        "aarch32.shift" => lower_native_aarch32_shift(builder, helper, &arguments)?,
+        "aarch32.data-processing" => {
+            lower_native_aarch32_data_processing(builder, helper, &arguments)?
+        }
+        "aarch32.multiply" => lower_native_aarch32_multiply(builder, helper, &arguments)?,
+        _ => unreachable!("native semantic helper classification is exhaustive"),
+    };
+    if results.len() != result_types.len() {
+        return Err(CompilerError::new(format!(
+            "native helper lowering for {} produced {} results, expected {}",
+            helper.helper,
+            results.len(),
+            result_types.len()
+        )));
+    }
+    Ok(Some(results))
+}
+
+fn single_result_type(result_types: &[IrType]) -> Result<IrType, CompilerError> {
+    match result_types {
+        [result] => Ok(*result),
+        _ => Err(CompilerError::new("native helper requires one result")),
+    }
+}
+
+fn helper_immediate(
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    index: usize,
+) -> Result<u64, CompilerError> {
+    let value = helper.arguments.get(index).copied().ok_or_else(|| {
+        CompilerError::new(format!("{} is missing argument {index}", helper.helper))
+    })?;
+    match value {
+        Operand::Immediate(Immediate::I1(value)) => Ok(u64::from(value)),
+        Operand::Immediate(Immediate::I8(value)) => Ok(u64::from(value)),
+        Operand::Immediate(Immediate::I16(value)) => Ok(u64::from(value)),
+        Operand::Immediate(Immediate::I32(value)) => Ok(u64::from(value)),
+        Operand::Immediate(Immediate::I64(value)) => Ok(value),
+        _ => Err(CompilerError::new(format!(
+            "{} argument {index} must be an integer immediate",
+            helper.helper
+        ))),
+    }
+}
+
+fn integer_constant(builder: &mut FunctionBuilder<'_>, ty: ir::Type, value: u64) -> ir::Value {
+    builder.ins().iconst(ty, value as i64)
+}
+
+fn cast_integer(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    to: ir::Type,
+    signed: bool,
+) -> ir::Value {
+    let from = builder.func.dfg.value_type(value);
+    match from.bits().cmp(&to.bits()) {
+        std::cmp::Ordering::Less if signed => builder.ins().sextend(to, value),
+        std::cmp::Ordering::Less => builder.ins().uextend(to, value),
+        std::cmp::Ordering::Greater => builder.ins().ireduce(to, value),
+        std::cmp::Ordering::Equal => value,
+    }
+}
+
+fn lower_native_extend(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let option = helper_immediate(helper, 1)? as u8;
+    let shift = helper_immediate(helper, 2)? as u32;
+    let source_bits = match option & 3 {
+        0 => 8,
+        1 => 16,
+        2 => 32,
+        3 => 64,
+        _ => unreachable!(),
+    };
+    let source_ty = match source_bits {
+        8 => types::I8,
+        16 => types::I16,
+        32 => types::I32,
+        64 => types::I64,
+        _ => unreachable!(),
+    };
+    let result_ty = cranelift_type(single_result_type(result_types)?);
+    let narrowed = cast_integer(builder, arguments[0], source_ty, false);
+    let extended = cast_integer(builder, narrowed, result_ty, option & 4 != 0);
+    let result = if shift == 0 {
+        extended
+    } else {
+        let amount = integer_constant(builder, result_ty, u64::from(shift));
+        builder.ins().ishl(extended, amount)
+    };
+    Ok(vec![result])
+}
+
+fn lower_native_bitfield(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let result_ty = cranelift_type(single_result_type(result_types)?);
+    let width = result_ty.bits() as u8;
+    let imm_r = helper_immediate(helper, 2)? as u8;
+    let imm_s = helper_immediate(helper, 3)? as u8;
+    let masks = decode_a64_bit_masks(width == 64, imm_r, imm_s, width, false)
+        .map_err(|error| CompilerError::new(format!("invalid native bitfield masks: {error}")))?;
+    let rotate = integer_constant(builder, result_ty, u64::from(imm_r));
+    let rotated = builder.ins().rotr(arguments[1], rotate);
+    let write = integer_constant(builder, result_ty, masks.write_mask);
+    let rotated_write = builder.ins().band(rotated, write);
+    let bottom = if helper.helper.as_ref() == "a64.bfm" {
+        let inverse_write = integer_constant(builder, result_ty, !masks.write_mask);
+        let preserved = builder.ins().band(arguments[0], inverse_write);
+        builder.ins().bor(preserved, rotated_write)
+    } else {
+        rotated_write
+    };
+    let test = integer_constant(builder, result_ty, masks.test_mask);
+    let bottom_test = builder.ins().band(bottom, test);
+    let result = match helper.helper.as_ref() {
+        "a64.ubfm" => bottom_test,
+        "a64.bfm" => {
+            let inverse_test = integer_constant(builder, result_ty, !masks.test_mask);
+            let preserved = builder.ins().band(arguments[0], inverse_test);
+            builder.ins().bor(preserved, bottom_test)
+        }
+        "a64.sbfm" => {
+            let sign_shift = integer_constant(builder, result_ty, u64::from(imm_s));
+            let sign = builder.ins().ushr(arguments[1], sign_shift);
+            let sign = builder.ins().band_imm_u(sign, 1);
+            let sign = builder.ins().ineg(sign);
+            let inverse_test = integer_constant(builder, result_ty, !masks.test_mask);
+            let top = builder.ins().band(sign, inverse_test);
+            builder.ins().bor(top, bottom_test)
+        }
+        _ => unreachable!(),
+    };
+    Ok(vec![result])
+}
+
+fn lower_native_widening_multiply(
+    builder: &mut FunctionBuilder<'_>,
+    name: &str,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let signed = matches!(name, "a64.smaddl" | "a64.smsubl");
+    let lhs = cast_integer(builder, arguments[0], types::I64, signed);
+    let rhs = cast_integer(builder, arguments[1], types::I64, signed);
+    let product = builder.ins().imul(lhs, rhs);
+    let result = match name {
+        "a64.smaddl" | "a64.umaddl" => builder.ins().iadd(product, arguments[2]),
+        "a64.smsubl" | "a64.umsubl" => builder.ins().isub(arguments[2], product),
+        _ => return Err(CompilerError::new("unknown widening multiply helper")),
+    };
+    Ok(vec![result])
+}
+
+fn lower_native_extract(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let shift = helper_immediate(helper, 2)? as u32;
+    if shift == 0 {
+        return Ok(vec![arguments[1]]);
+    }
+    let ty = cranelift_type(single_result_type(result_types)?);
+    let bits = ty.bits();
+    let right_amount = integer_constant(builder, ty, u64::from(shift));
+    let left_amount = integer_constant(builder, ty, u64::from(bits - shift));
+    let low = builder.ins().ushr(arguments[1], right_amount);
+    let high = builder.ins().ishl(arguments[0], left_amount);
+    Ok(vec![builder.ins().bor(low, high)])
+}
+
+fn lower_native_one_source(
+    builder: &mut FunctionBuilder<'_>,
+    name: &str,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let value = arguments[0];
+    let ty = builder.func.dfg.value_type(value);
+    let result = match name {
+        "a64.rev" => builder.ins().bswap(value),
+        "a64.rev16" => {
+            let low_mask = if ty == types::I64 {
+                0x00ff_00ff_00ff_00ff
+            } else {
+                0x00ff_00ff
+            };
+            let mask = integer_constant(builder, ty, low_mask);
+            let low = builder.ins().band(value, mask);
+            let low = builder.ins().ishl_imm_u(low, 8);
+            let high = builder.ins().ushr_imm_u(value, 8);
+            let mask = integer_constant(builder, ty, low_mask);
+            let high = builder.ins().band(high, mask);
+            builder.ins().bor(low, high)
+        }
+        "a64.rev32" if ty == types::I32 => builder.ins().bswap(value),
+        "a64.rev32" => {
+            let swapped = builder.ins().bswap(value);
+            builder.ins().rotl_imm_u(swapped, 32)
+        }
+        "a64.cls" => {
+            let sign = builder.ins().sshr_imm_u(value, i64::from(ty.bits() - 1));
+            let changed = builder.ins().bxor(value, sign);
+            let leading = builder.ins().clz(changed);
+            builder.ins().iadd_imm_s(leading, -1)
+        }
+        _ => return Err(CompilerError::new("unknown one-source native helper")),
+    };
+    Ok(vec![result])
+}
+
+fn vector_halves(builder: &mut FunctionBuilder<'_>, vector: ir::Value) -> (ir::Value, ir::Value) {
+    let flags = bitcast_flags(builder);
+    let integer = builder.ins().bitcast(types::I128, flags, vector);
+    builder.ins().isplit(integer)
+}
+
+fn vector_from_halves(
+    builder: &mut FunctionBuilder<'_>,
+    low: ir::Value,
+    high: ir::Value,
+) -> ir::Value {
+    let low = cast_integer(builder, low, types::I64, false);
+    let high = cast_integer(builder, high, types::I64, false);
+    let integer = builder.ins().iconcat(low, high);
+    let flags = bitcast_flags(builder);
+    builder.ins().bitcast(types::I8X16, flags, integer)
+}
+
+fn vector_from_low_integer(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
+    let ty = builder.func.dfg.value_type(value);
+    let integer = if ty == types::I128 {
+        value
+    } else {
+        builder.ins().uextend(types::I128, value)
+    };
+    let flags = bitcast_flags(builder);
+    builder.ins().bitcast(types::I8X16, flags, integer)
+}
+
+fn low_integer_from_vector(
+    builder: &mut FunctionBuilder<'_>,
+    vector: ir::Value,
+    result_ty: ir::Type,
+) -> ir::Value {
+    let flags = bitcast_flags(builder);
+    let integer = builder.ins().bitcast(types::I128, flags, vector);
+    if result_ty == types::I128 {
+        integer
+    } else {
+        builder.ins().ireduce(result_ty, integer)
+    }
+}
+
+fn vector_mask(builder: &mut FunctionBuilder<'_>, bits: u32) -> ir::Value {
+    let mask = match bits {
+        0 => 0,
+        1..=127 => (1_u128 << bits) - 1,
+        128 => u128::MAX,
+        _ => unreachable!("vector mask width is bounded"),
+    };
+    let integer = integer_128(builder, mask);
+    let flags = bitcast_flags(builder);
+    builder.ins().bitcast(types::I8X16, flags, integer)
+}
+
+fn semantic_fields(
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    token_index: usize,
+) -> Result<nixe_cpu::decode::a64::fp_simd::Operands, CompilerError> {
+    Ok(semantic_instruction(helper_immediate(helper, token_index)?).operands())
+}
+
+fn lower_native_a64_semantic_vector(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    values: &BTreeMap<ValueId, ir::Value>,
+) -> Result<Option<Vec<ir::Value>>, CompilerError> {
+    let token = helper_immediate(helper, 8)?;
+    let instruction = semantic_instruction(token);
+    let supported = matches!(
+        instruction,
+        A64FpSimdInstruction::DuplicateGeneral(_)
+            | A64FpSimdInstruction::DuplicateElement(_)
+            | A64FpSimdInstruction::ModifiedImmediate(_)
+            | A64FpSimdInstruction::InsertElement(_)
+            | A64FpSimdInstruction::InsertGeneral(_)
+            | A64FpSimdInstruction::PermuteTwoSource(_)
+            | A64FpSimdInstruction::Extract(_)
+            | A64FpSimdInstruction::ExtractNarrow(_)
+            | A64FpSimdInstruction::IntegerCompare(_)
+            | A64FpSimdInstruction::IntegerPairwise(_)
+            | A64FpSimdInstruction::IntegerMinMax(_)
+            | A64FpSimdInstruction::VectorSignedShiftRegister(_)
+            | A64FpSimdInstruction::VectorUnsignedShiftRegister(_)
+            | A64FpSimdInstruction::ScalarAbsolute(_)
+            | A64FpSimdInstruction::ScalarNegate(_)
+            | A64FpSimdInstruction::ScalarFloatImmediate(_)
+            | A64FpSimdInstruction::ScalarFloatConditionalSelect(_)
+            | A64FpSimdInstruction::VectorFloatImmediate(_)
+            | A64FpSimdInstruction::VectorFloatAbsolute(_)
+            | A64FpSimdInstruction::VectorFloatNegate(_)
+            | A64FpSimdInstruction::ShiftRightNarrow(_)
+            | A64FpSimdInstruction::ScalarShiftRightImmediate(_)
+            | A64FpSimdInstruction::VectorShiftRightImmediate(_)
+            | A64FpSimdInstruction::ScalarShiftLeftImmediate(_)
+            | A64FpSimdInstruction::VectorShiftLeftImmediate(_)
+            | A64FpSimdInstruction::CountBits(_)
+            | A64FpSimdInstruction::AddAcrossVector(_)
+    );
+    if !supported {
+        return Ok(None);
+    }
+    let arguments = helper
+        .arguments
+        .iter()
+        .map(|argument| operand(builder, values, *argument))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = instruction.operands();
+    let result = match instruction {
+        A64FpSimdInstruction::DuplicateGeneral(_) => {
+            let lane_bits = 8_u32 << fields.immediate_5.trailing_zeros();
+            let lane = integer_lane_type(lane_bits)?;
+            let source = cast_integer(builder, arguments[4], lane, false);
+            let vector_ty = lane
+                .by(128 / lane_bits)
+                .ok_or_else(|| CompilerError::new("invalid DUP general vector shape"))?;
+            let result = builder.ins().splat(vector_ty, source);
+            opaque_vector_128(builder, result, fields.vector_128)?
+        }
+        A64FpSimdInstruction::DuplicateElement(_) => {
+            let size_shift = fields.immediate_5.trailing_zeros();
+            let lane_bits = 8_u32 << size_shift;
+            let lane_index = fields.immediate_5 >> (size_shift + 1);
+            let lane = integer_lane_type(lane_bits)?;
+            let vector_ty = lane
+                .by(128 / lane_bits)
+                .ok_or_else(|| CompilerError::new("invalid DUP element vector shape"))?;
+            let source = vector_bitcast(builder, arguments[0], vector_ty);
+            let element = builder.ins().extractlane(source, lane_index);
+            let result = builder.ins().splat(vector_ty, element);
+            opaque_vector_128(builder, result, fields.vector_128)?
+        }
+        A64FpSimdInstruction::ModifiedImmediate(_) => {
+            let immediate = expand_a64_modified_immediate(
+                fields.cmode,
+                fields.immediate_8,
+                fields.operation_bit,
+            )?;
+            let replicated = u128::from(immediate) | (u128::from(immediate) << 64);
+            let value = vector_constant(builder, replicated);
+            let result = if fields.cmode <= 11 && fields.cmode & 1 != 0 {
+                if fields.operation_bit {
+                    builder.ins().band(arguments[3], value)
+                } else {
+                    builder.ins().bor(arguments[3], value)
+                }
+            } else {
+                value
+            };
+            let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
+            builder.ins().band(result, active)
+        }
+        A64FpSimdInstruction::InsertElement(_) => {
+            let size_shift = fields.immediate_5.trailing_zeros();
+            let lane_bits = 8_u32 << size_shift;
+            let destination_lane = fields.immediate_5 >> (size_shift + 1);
+            let source_lane = fields.immediate_4 >> size_shift;
+            let lane = integer_lane_type(lane_bits)?;
+            let vector_ty = lane
+                .by(128 / lane_bits)
+                .ok_or_else(|| CompilerError::new("invalid INS element vector shape"))?;
+            let source = vector_bitcast(builder, arguments[0], vector_ty);
+            let previous = vector_bitcast(builder, arguments[3], vector_ty);
+            let element = builder.ins().extractlane(source, source_lane);
+            let result = builder
+                .ins()
+                .insertlane(previous, element, destination_lane);
+            vector_bitcast(builder, result, types::I8X16)
+        }
+        A64FpSimdInstruction::InsertGeneral(_) => {
+            let size_shift = fields.immediate_5.trailing_zeros();
+            let lane_bits = 8_u32 << size_shift;
+            let destination_lane = fields.immediate_5 >> (size_shift + 1);
+            let lane = integer_lane_type(lane_bits)?;
+            let vector_ty = lane
+                .by(128 / lane_bits)
+                .ok_or_else(|| CompilerError::new("invalid INS general vector shape"))?;
+            let previous = vector_bitcast(builder, arguments[3], vector_ty);
+            let element = cast_integer(builder, arguments[4], lane, false);
+            let result = builder
+                .ins()
+                .insertlane(previous, element, destination_lane);
+            vector_bitcast(builder, result, types::I8X16)
+        }
+        A64FpSimdInstruction::Extract(_) => {
+            lower_native_a64_vector_extract(builder, arguments[0], arguments[1], fields)?
+        }
+        A64FpSimdInstruction::PermuteTwoSource(_) => {
+            lower_native_a64_permute(builder, arguments[0], arguments[1], fields)?
+        }
+        A64FpSimdInstruction::IntegerCompare(_) => {
+            lower_native_a64_integer_compare(builder, arguments[0], arguments[1], fields)?
+        }
+        A64FpSimdInstruction::IntegerPairwise(_) => {
+            lower_native_a64_integer_pairwise(builder, arguments[0], arguments[1], fields)?
+        }
+        A64FpSimdInstruction::IntegerMinMax(_) => {
+            lower_native_a64_integer_min_max(builder, arguments[0], arguments[1], fields)?
+        }
+        A64FpSimdInstruction::ExtractNarrow(_) => {
+            lower_native_a64_extract_narrow(builder, arguments[0], arguments[3], fields, false)?
+        }
+        A64FpSimdInstruction::ShiftRightNarrow(_) => {
+            lower_native_a64_extract_narrow(builder, arguments[0], arguments[3], fields, true)?
+        }
+        A64FpSimdInstruction::ScalarShiftRightImmediate(_)
+        | A64FpSimdInstruction::VectorShiftRightImmediate(_)
+        | A64FpSimdInstruction::ScalarShiftLeftImmediate(_)
+        | A64FpSimdInstruction::VectorShiftLeftImmediate(_) => {
+            lower_native_a64_immediate_shift(builder, arguments[0], fields, instruction)?
+        }
+        A64FpSimdInstruction::VectorSignedShiftRegister(_)
+        | A64FpSimdInstruction::VectorUnsignedShiftRegister(_) => lower_native_a64_register_shift(
+            builder,
+            arguments[0],
+            arguments[1],
+            fields,
+            matches!(
+                instruction,
+                A64FpSimdInstruction::VectorSignedShiftRegister(_)
+            ),
+        )?,
+        A64FpSimdInstruction::ScalarAbsolute(_) | A64FpSimdInstruction::ScalarNegate(_) => {
+            let width = match fields.opc {
+                0 => 32,
+                1 => 64,
+                3 => 16,
+                _ => return Err(CompilerError::new("invalid scalar sign width")),
+            };
+            let active = vector_mask(builder, width);
+            let source = builder.ins().band(arguments[0], active);
+            let sign = vector_constant(builder, 1_u128 << (width - 1));
+            if matches!(instruction, A64FpSimdInstruction::ScalarNegate(_)) {
+                builder.ins().bxor(source, sign)
+            } else {
+                let ones = vector_mask(builder, 128);
+                let not_sign = builder.ins().bxor(sign, ones);
+                builder.ins().band(source, not_sign)
+            }
+        }
+        A64FpSimdInstruction::VectorFloatAbsolute(_)
+        | A64FpSimdInstruction::VectorFloatNegate(_) => {
+            let lane_bits = if fields.opc & 1 == 0 { 32 } else { 64 };
+            let vector_bits = if fields.vector_128 { 128 } else { 64 };
+            let mut sign_mask = 0_u128;
+            for offset in (0..vector_bits).step_by(lane_bits as usize) {
+                sign_mask |= 1_u128 << (offset + lane_bits - 1);
+            }
+            let sign = vector_constant(builder, sign_mask);
+            let active = vector_mask(builder, vector_bits);
+            let source = builder.ins().band(arguments[0], active);
+            if matches!(instruction, A64FpSimdInstruction::VectorFloatNegate(_)) {
+                builder.ins().bxor(source, sign)
+            } else {
+                let ones = vector_mask(builder, 128);
+                let not_sign = builder.ins().bxor(sign, ones);
+                builder.ins().band(source, not_sign)
+            }
+        }
+        A64FpSimdInstruction::ScalarFloatImmediate(_) => {
+            let (exponent_bits, fraction_bits) = match fields.opc {
+                0 => (8, 23),
+                1 => (11, 52),
+                3 => (5, 10),
+                _ => return Err(CompilerError::new("invalid scalar FP immediate width")),
+            };
+            let immediate =
+                expand_vfp_immediate(fields.fp_immediate_8, exponent_bits, fraction_bits);
+            let immediate = integer_constant(builder, types::I64, immediate);
+            vector_from_low_integer(builder, immediate)
+        }
+        A64FpSimdInstruction::VectorFloatImmediate(_) => {
+            let (lane, lane_bits) = if fields.operation_bit {
+                (expand_vfp_immediate(fields.immediate_8, 11, 52), 64)
+            } else {
+                (expand_vfp_immediate(fields.immediate_8, 8, 23), 32)
+            };
+            let value = if lane_bits == 64 {
+                u128::from(lane) | (u128::from(lane) << 64)
+            } else {
+                let lane = u128::from(lane as u32);
+                lane | (lane << 32) | (lane << 64) | (lane << 96)
+            };
+            let value = vector_constant(builder, value);
+            let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
+            builder.ins().band(value, active)
+        }
+        A64FpSimdInstruction::ScalarFloatConditionalSelect(_) => {
+            let condition = evaluate_condition(
+                builder,
+                arguments[5],
+                Condition::from_encoding(fields.condition),
+                true,
+            );
+            let selected = builder.ins().select(condition, arguments[0], arguments[1]);
+            let active = vector_mask(builder, if fields.opc == 0 { 32 } else { 64 });
+            builder.ins().band(selected, active)
+        }
+        A64FpSimdInstruction::CountBits(_) => {
+            let counted = builder.ins().popcnt(arguments[0]);
+            let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
+            builder.ins().band(counted, active)
+        }
+        A64FpSimdInstruction::AddAcrossVector(_) => {
+            lower_native_a64_add_across(builder, arguments[0], fields)?
+        }
+        _ => unreachable!("native semantic-vector classification is exhaustive"),
+    };
+    Ok(Some(vec![result, arguments[7]]))
+}
+
+fn integer_lane_type(bits: u32) -> Result<ir::Type, CompilerError> {
+    match bits {
+        8 => Ok(types::I8),
+        16 => Ok(types::I16),
+        32 => Ok(types::I32),
+        64 => Ok(types::I64),
+        _ => Err(CompilerError::new("invalid integer vector lane width")),
+    }
+}
+
+fn vector_bitcast(builder: &mut FunctionBuilder<'_>, value: ir::Value, to: ir::Type) -> ir::Value {
+    if builder.func.dfg.value_type(value) == to {
+        value
+    } else {
+        let flags = bitcast_flags(builder);
+        builder.ins().bitcast(to, flags, value)
+    }
+}
+
+fn opaque_vector_128(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    full_width: bool,
+) -> Result<ir::Value, CompilerError> {
+    let result = vector_bitcast(builder, value, types::I8X16);
+    if full_width {
+        Ok(result)
+    } else {
+        let active = vector_mask(builder, 64);
+        Ok(builder.ins().band(result, active))
+    }
+}
+
+fn vector_constant(builder: &mut FunctionBuilder<'_>, value: u128) -> ir::Value {
+    let integer = integer_128(builder, value);
+    vector_bitcast(builder, integer, types::I8X16)
+}
+
+fn expand_a64_modified_immediate(
+    cmode: u8,
+    immediate: u8,
+    operation_bit: bool,
+) -> Result<u64, CompilerError> {
+    let immediate = u64::from(immediate);
+    let value = match cmode {
+        0..=7 => {
+            let lane = immediate << ((cmode >> 1) * 8);
+            lane | (lane << 32)
+        }
+        8..=11 => {
+            let lane = immediate << (((cmode >> 1) & 1) * 8);
+            lane | (lane << 16) | (lane << 32) | (lane << 48)
+        }
+        12 => {
+            let lane = (immediate << 8) | 0xff;
+            lane | (lane << 32)
+        }
+        13 => {
+            let lane = (immediate << 16) | 0xffff;
+            lane | (lane << 32)
+        }
+        14 if !operation_bit => immediate * 0x0101_0101_0101_0101,
+        14 => {
+            let mut result = 0_u64;
+            for bit in 0..8 {
+                if immediate & (1 << bit) != 0 {
+                    result |= 0xff << (bit * 8);
+                }
+            }
+            result
+        }
+        _ => return Err(CompilerError::new("invalid SIMD modified immediate")),
+    };
+    Ok(if operation_bit && cmode != 14 {
+        !value
+    } else {
+        value
+    })
+}
+
+fn expand_vfp_immediate(immediate: u8, exponent_bits: u32, fraction_bits: u32) -> u64 {
+    let sign = u64::from(immediate >> 7);
+    let exponent_control = u64::from((immediate >> 6) & 1);
+    let exponent_tail = u64::from((immediate >> 4) & 3);
+    let fraction_head = u64::from(immediate & 0xf);
+    let sign_shift = exponent_bits + fraction_bits;
+    let repeated_count = exponent_bits - 3;
+    let repeated = if exponent_control == 0 {
+        0
+    } else {
+        (1_u64 << repeated_count) - 1
+    };
+    (sign << sign_shift)
+        | ((exponent_control ^ 1) << (sign_shift - 1))
+        | (repeated << (fraction_bits + 2))
+        | (exponent_tail << fraction_bits)
+        | (fraction_head << (fraction_bits - 4))
+}
+
+fn lower_native_a64_vector_extract(
+    builder: &mut FunctionBuilder<'_>,
+    first: ir::Value,
+    second: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let offset_bits = u32::from(fields.immediate_4) * 8;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    if offset_bits == 0 {
+        let active = vector_mask(builder, vector_bits);
+        return Ok(builder.ins().band(first, active));
+    }
+    if vector_bits == 64 {
+        let (first, _) = vector_halves(builder, first);
+        let (second, _) = vector_halves(builder, second);
+        let low = builder.ins().ushr_imm_u(first, i64::from(offset_bits));
+        let high = builder
+            .ins()
+            .ishl_imm_u(second, i64::from(64 - offset_bits));
+        let result = builder.ins().bor(low, high);
+        return Ok(vector_from_low_integer(builder, result));
+    }
+    let (first_low, first_high) = vector_halves(builder, first);
+    let (second_low, second_high) = vector_halves(builder, second);
+    let (result_low, result_high) = match offset_bits {
+        1..=63 => (
+            merge_shifted_halves(builder, first_low, first_high, offset_bits),
+            merge_shifted_halves(builder, first_high, second_low, offset_bits),
+        ),
+        64 => (first_high, second_low),
+        65..=127 => {
+            let amount = offset_bits - 64;
+            (
+                merge_shifted_halves(builder, first_high, second_low, amount),
+                merge_shifted_halves(builder, second_low, second_high, amount),
+            )
+        }
+        _ => return Err(CompilerError::new("invalid 128-bit EXT offset")),
+    };
+    Ok(vector_from_halves(builder, result_low, result_high))
+}
+
+fn merge_shifted_halves(
+    builder: &mut FunctionBuilder<'_>,
+    low: ir::Value,
+    high: ir::Value,
+    amount: u32,
+) -> ir::Value {
+    debug_assert!((1..64).contains(&amount));
+    let low = builder.ins().ushr_imm_u(low, i64::from(amount));
+    let high = builder.ins().ishl_imm_u(high, i64::from(64 - amount));
+    builder.ins().bor(low, high)
+}
+
+fn lower_native_a64_add_across(
+    builder: &mut FunctionBuilder<'_>,
+    source: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let bits = fields.helper_token.helper_abi_value();
+    let lane_bits = 8_u32 << ((bits >> 22) & 3);
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let lane = integer_lane_type(lane_bits)?;
+    let vector_ty = lane
+        .by(128 / lane_bits)
+        .ok_or_else(|| CompilerError::new("invalid ADDV vector shape"))?;
+    let source = vector_bitcast(builder, source, vector_ty);
+    let mut result = builder.ins().iconst(lane, 0);
+    for index in 0..lane_count {
+        let value = builder.ins().extractlane(source, index as u8);
+        result = builder.ins().iadd(result, value);
+    }
+    Ok(vector_from_low_integer(builder, result))
+}
+
+fn zero_lane_vector(
+    builder: &mut FunctionBuilder<'_>,
+    lane_bits: u32,
+) -> Result<(ir::Type, ir::Value), CompilerError> {
+    let lane = integer_lane_type(lane_bits)?;
+    let vector_ty = lane
+        .by(128 / lane_bits)
+        .ok_or_else(|| CompilerError::new("invalid native vector shape"))?;
+    let zero = builder.ins().iconst(lane, 0);
+    Ok((vector_ty, builder.ins().splat(vector_ty, zero)))
+}
+
+fn finish_lane_vector(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    full_width: bool,
+) -> ir::Value {
+    let value = vector_bitcast(builder, value, types::I8X16);
+    if full_width {
+        value
+    } else {
+        let active = vector_mask(builder, 64);
+        builder.ins().band(value, active)
+    }
+}
+
+fn lower_native_a64_permute(
+    builder: &mut FunctionBuilder<'_>,
+    first: ir::Value,
+    second: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let half = lane_count / 2;
+    let (vector_ty, mut result) = zero_lane_vector(builder, lane_bits)?;
+    let first = vector_bitcast(builder, first, vector_ty);
+    let second = vector_bitcast(builder, second, vector_ty);
+    let operation = fields
+        .permute_operation
+        .ok_or_else(|| CompilerError::new("SIMD permutation token has no operation"))?;
+    for destination_lane in 0..lane_count {
+        let (source, source_lane) = match operation {
+            PermuteOperation::UnzipPrimary | PermuteOperation::UnzipSecondary => {
+                let odd = u32::from(matches!(operation, PermuteOperation::UnzipSecondary));
+                if destination_lane < half {
+                    (first, destination_lane * 2 + odd)
+                } else {
+                    (second, (destination_lane - half) * 2 + odd)
+                }
+            }
+            PermuteOperation::TransposePrimary | PermuteOperation::TransposeSecondary => {
+                let odd = u32::from(matches!(operation, PermuteOperation::TransposeSecondary));
+                let source = if destination_lane & 1 == 0 {
+                    first
+                } else {
+                    second
+                };
+                (source, (destination_lane / 2) * 2 + odd)
+            }
+            PermuteOperation::ZipPrimary | PermuteOperation::ZipSecondary => {
+                let upper = u32::from(matches!(operation, PermuteOperation::ZipSecondary));
+                let source = if destination_lane & 1 == 0 {
+                    first
+                } else {
+                    second
+                };
+                (source, destination_lane / 2 + upper * half)
+            }
+        };
+        let lane = builder.ins().extractlane(source, source_lane as u8);
+        result = builder
+            .ins()
+            .insertlane(result, lane, destination_lane as u8);
+    }
+    Ok(finish_lane_vector(builder, result, fields.vector_128))
+}
+
+fn lower_native_a64_integer_compare(
+    builder: &mut FunctionBuilder<'_>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let lane = integer_lane_type(lane_bits)?;
+    let (vector_ty, mut result) = zero_lane_vector(builder, lane_bits)?;
+    let lhs = vector_bitcast(builder, lhs, vector_ty);
+    let rhs = vector_bitcast(builder, rhs, vector_ty);
+    let zero = builder.ins().iconst(lane, 0);
+    let ones = builder.ins().iconst(lane, -1);
+    let comparison = fields
+        .integer_comparison
+        .ok_or_else(|| CompilerError::new("SIMD comparison token has no predicate"))?;
+    for index in 0..lane_count {
+        let lhs_lane = builder.ins().extractlane(lhs, index as u8);
+        let rhs_lane = if fields.compare_with_zero {
+            zero
+        } else {
+            builder.ins().extractlane(rhs, index as u8)
+        };
+        let condition = match comparison {
+            IntegerComparison::SignedGreaterThan => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThan, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::UnsignedGreaterThan => {
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::SignedGreaterThanOrEqual => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::UnsignedGreaterThanOrEqual => {
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::SignedLessThan => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::SignedLessThanOrEqual => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, lhs_lane, rhs_lane)
+            }
+            IntegerComparison::NonzeroBitTest => {
+                let bits = builder.ins().band(lhs_lane, rhs_lane);
+                builder.ins().icmp_imm_s(IntCC::NotEqual, bits, 0)
+            }
+            IntegerComparison::Equal => builder.ins().icmp(IntCC::Equal, lhs_lane, rhs_lane),
+        };
+        let lane_value = builder.ins().select(condition, ones, zero);
+        result = builder.ins().insertlane(result, lane_value, index as u8);
+    }
+    Ok(finish_lane_vector(builder, result, fields.vector_128))
+}
+
+fn select_pairwise_lane(
+    builder: &mut FunctionBuilder<'_>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    operation: PairwiseOperation,
+) -> Result<ir::Value, CompilerError> {
+    Ok(match operation {
+        PairwiseOperation::Add => builder.ins().iadd(lhs, rhs),
+        PairwiseOperation::SignedMaximum => {
+            let condition = builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs);
+            builder.ins().select(condition, lhs, rhs)
+        }
+        PairwiseOperation::SignedMinimum => {
+            let condition = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs);
+            builder.ins().select(condition, lhs, rhs)
+        }
+        PairwiseOperation::UnsignedMaximum => {
+            let condition = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs, rhs);
+            builder.ins().select(condition, lhs, rhs)
+        }
+        PairwiseOperation::UnsignedMinimum => {
+            let condition = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, lhs, rhs);
+            builder.ins().select(condition, lhs, rhs)
+        }
+    })
+}
+
+fn lower_native_a64_integer_pairwise(
+    builder: &mut FunctionBuilder<'_>,
+    first: ir::Value,
+    second: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lanes_per_source = vector_bits / lane_bits;
+    let (vector_ty, mut result) = zero_lane_vector(builder, lane_bits)?;
+    let first = vector_bitcast(builder, first, vector_ty);
+    let second = vector_bitcast(builder, second, vector_ty);
+    let operation = fields
+        .pairwise_operation
+        .ok_or_else(|| CompilerError::new("SIMD pairwise token has no operation"))?;
+    for (source_index, source) in [first, second].into_iter().enumerate() {
+        for pair in 0..(lanes_per_source / 2) {
+            let lhs = builder.ins().extractlane(source, (pair * 2) as u8);
+            let rhs = builder.ins().extractlane(source, (pair * 2 + 1) as u8);
+            let reduced = select_pairwise_lane(builder, lhs, rhs, operation)?;
+            let destination = source_index as u32 * (lanes_per_source / 2) + pair;
+            result = builder.ins().insertlane(result, reduced, destination as u8);
+        }
+    }
+    Ok(finish_lane_vector(builder, result, fields.vector_128))
+}
+
+fn lower_native_a64_integer_min_max(
+    builder: &mut FunctionBuilder<'_>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+) -> Result<ir::Value, CompilerError> {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let (vector_ty, mut result) = zero_lane_vector(builder, lane_bits)?;
+    let lhs = vector_bitcast(builder, lhs, vector_ty);
+    let rhs = vector_bitcast(builder, rhs, vector_ty);
+    let operation = fields
+        .pairwise_operation
+        .ok_or_else(|| CompilerError::new("SIMD min/max token has no operation"))?;
+    if operation == PairwiseOperation::Add {
+        return Err(CompilerError::new(
+            "SIMD min/max token contains pairwise add",
+        ));
+    }
+    for index in 0..lane_count {
+        let lhs_lane = builder.ins().extractlane(lhs, index as u8);
+        let rhs_lane = builder.ins().extractlane(rhs, index as u8);
+        let selected = select_pairwise_lane(builder, lhs_lane, rhs_lane, operation)?;
+        result = builder.ins().insertlane(result, selected, index as u8);
+    }
+    Ok(finish_lane_vector(builder, result, fields.vector_128))
+}
+
+fn lower_native_a64_extract_narrow(
+    builder: &mut FunctionBuilder<'_>,
+    source: ir::Value,
+    previous: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    shift_right: bool,
+) -> Result<ir::Value, CompilerError> {
+    let (destination_lane_bits, shift) = if shift_right {
+        let bits = fields.helper_token.helper_abi_value();
+        let immediate_high = (bits >> 19) & 0xf;
+        let immediate_low = (bits >> 16) & 7;
+        let destination_lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+        let source_lane_bits = destination_lane_bits * 2;
+        let immediate = (immediate_high << 3) | immediate_low;
+        (destination_lane_bits, source_lane_bits - immediate)
+    } else {
+        (8_u32 << fields.opc, 0)
+    };
+    let source_lane_bits = destination_lane_bits * 2;
+    let lane_count = 128 / source_lane_bits;
+    let source_lane = integer_lane_type(source_lane_bits)?;
+    let source_ty = source_lane
+        .by(lane_count)
+        .ok_or_else(|| CompilerError::new("invalid narrowing source shape"))?;
+    let source = vector_bitcast(builder, source, source_ty);
+    let destination_lane = integer_lane_type(destination_lane_bits)?;
+    let destination_ty = destination_lane
+        .by(128 / destination_lane_bits)
+        .ok_or_else(|| CompilerError::new("invalid narrowing destination shape"))?;
+    let mut result = if fields.vector_128 {
+        vector_bitcast(builder, previous, destination_ty)
+    } else {
+        let zero = builder.ins().iconst(destination_lane, 0);
+        builder.ins().splat(destination_ty, zero)
+    };
+    let first_destination = if fields.vector_128 { lane_count } else { 0 };
+    for index in 0..lane_count {
+        let value = builder.ins().extractlane(source, index as u8);
+        let value = if shift == 0 {
+            value
+        } else {
+            builder.ins().ushr_imm_u(value, i64::from(shift))
+        };
+        let value = builder.ins().ireduce(destination_lane, value);
+        result = builder
+            .ins()
+            .insertlane(result, value, (first_destination + index) as u8);
+    }
+    Ok(vector_bitcast(builder, result, types::I8X16))
+}
+
+fn lower_native_a64_immediate_shift(
+    builder: &mut FunctionBuilder<'_>,
+    source: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    instruction: A64FpSimdInstruction,
+) -> Result<ir::Value, CompilerError> {
+    let bits = fields.helper_token.helper_abi_value();
+    let immediate = (bits >> 16) & 0x7f;
+    let immediate_high = immediate >> 3;
+    let lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
+    let right = matches!(
+        instruction,
+        A64FpSimdInstruction::ScalarShiftRightImmediate(_)
+            | A64FpSimdInstruction::VectorShiftRightImmediate(_)
+    );
+    let scalar = matches!(
+        instruction,
+        A64FpSimdInstruction::ScalarShiftRightImmediate(_)
+            | A64FpSimdInstruction::ScalarShiftLeftImmediate(_)
+    );
+    let shift = if right {
+        2 * lane_bits - immediate
+    } else {
+        immediate - lane_bits
+    };
+    let active_bits = if scalar || !fields.vector_128 {
+        64
+    } else {
+        128
+    };
+    let lane_count = active_bits / lane_bits;
+    let lane = integer_lane_type(lane_bits)?;
+    let vector_ty = lane
+        .by(128 / lane_bits)
+        .ok_or_else(|| CompilerError::new("invalid immediate-shift vector shape"))?;
+    let source = vector_bitcast(builder, source, vector_ty);
+    let zero = builder.ins().iconst(lane, 0);
+    let mut result = builder.ins().splat(vector_ty, zero);
+    for index in 0..lane_count {
+        let value = builder.ins().extractlane(source, index as u8);
+        let shifted = if right && !fields.operation_bit {
+            builder.ins().sshr_imm_u(value, i64::from(shift))
+        } else if right {
+            builder.ins().ushr_imm_u(value, i64::from(shift))
+        } else {
+            builder.ins().ishl_imm_u(value, i64::from(shift))
+        };
+        result = builder.ins().insertlane(result, shifted, index as u8);
+    }
+    Ok(vector_bitcast(builder, result, types::I8X16))
+}
+
+fn lower_native_a64_register_shift(
+    builder: &mut FunctionBuilder<'_>,
+    values: ir::Value,
+    shifts: ir::Value,
+    fields: nixe_cpu::decode::a64::fp_simd::Operands,
+    signed: bool,
+) -> Result<ir::Value, CompilerError> {
+    let lane_bits = 8_u32 << fields.opc;
+    let vector_bits = if fields.vector_128 { 128 } else { 64 };
+    let lane_count = vector_bits / lane_bits;
+    let lane = integer_lane_type(lane_bits)?;
+    let vector_ty = lane
+        .by(128 / lane_bits)
+        .ok_or_else(|| CompilerError::new("invalid register-shift vector shape"))?;
+    let values = vector_bitcast(builder, values, vector_ty);
+    let shifts = vector_bitcast(builder, shifts, vector_ty);
+    let zero = builder.ins().iconst(lane, 0);
+    let mut result = builder.ins().splat(vector_ty, zero);
+    for index in 0..lane_count {
+        let value = builder.ins().extractlane(values, index as u8);
+        let distance = builder.ins().extractlane(shifts, index as u8);
+        let distance = cast_integer(builder, distance, types::I8, false);
+        let distance = builder.ins().sextend(types::I32, distance);
+        let nonnegative = builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, distance, 0);
+        let negative_distance = builder.ins().ineg(distance);
+        let magnitude = builder
+            .ins()
+            .select(nonnegative, distance, negative_distance);
+        let out_of_range = builder.ins().icmp_imm_u(
+            IntCC::UnsignedGreaterThanOrEqual,
+            magnitude,
+            lane_bits as i64,
+        );
+        let lane_amount = cast_integer(builder, magnitude, lane, false);
+        let left = builder.ins().ishl(value, lane_amount);
+        let right = if signed {
+            builder.ins().sshr(value, lane_amount)
+        } else {
+            builder.ins().ushr(value, lane_amount)
+        };
+        let right_fill = if signed {
+            builder.ins().sshr_imm_u(value, i64::from(lane_bits - 1))
+        } else {
+            zero
+        };
+        let right = builder.ins().select(out_of_range, right_fill, right);
+        let left = builder.ins().select(out_of_range, zero, left);
+        let shifted = builder.ins().select(nonnegative, left, right);
+        result = builder.ins().insertlane(result, shifted, index as u8);
+    }
+    Ok(finish_lane_vector(builder, result, fields.vector_128))
+}
+
+fn lower_native_a64_simd_bitwise(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 3)?;
+    let first = arguments[0];
+    let second = arguments[1];
+    let destination = arguments[2];
+    let ones = vector_mask(builder, 128);
+    let not_second = builder.ins().bxor(second, ones);
+    let not_destination = builder.ins().bxor(destination, ones);
+    let result = match fields
+        .bitwise_operation
+        .ok_or_else(|| CompilerError::new("SIMD bitwise token has no operation"))?
+    {
+        BitwiseOperation::And => builder.ins().band(first, second),
+        BitwiseOperation::BitClear => builder.ins().band(first, not_second),
+        BitwiseOperation::Or => builder.ins().bor(first, second),
+        BitwiseOperation::OrNot => builder.ins().bor(first, not_second),
+        BitwiseOperation::ExclusiveOr => builder.ins().bxor(first, second),
+        BitwiseOperation::Select => {
+            let selected_first = builder.ins().band(destination, first);
+            let selected_second = builder.ins().band(not_destination, second);
+            builder.ins().bor(selected_first, selected_second)
+        }
+        BitwiseOperation::InsertIfTrue => {
+            let preserved = builder.ins().band(destination, not_second);
+            let inserted = builder.ins().band(first, second);
+            builder.ins().bor(preserved, inserted)
+        }
+        BitwiseOperation::InsertIfFalse => {
+            let preserved = builder.ins().band(destination, second);
+            let inserted = builder.ins().band(first, not_second);
+            builder.ins().bor(preserved, inserted)
+        }
+    };
+    let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
+    Ok(vec![builder.ins().band(result, active)])
+}
+
+fn lower_native_a64_simd_add_sub(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 3)?;
+    let lane = match fields.opc {
+        0 => types::I8,
+        1 => types::I16,
+        2 => types::I32,
+        3 => types::I64,
+        _ => return Err(CompilerError::new("invalid SIMD integer lane width")),
+    };
+    let vector_ty = lane
+        .by(128 / lane.bits())
+        .ok_or_else(|| CompilerError::new("unsupported SIMD integer arrangement"))?;
+    let flags = bitcast_flags(builder);
+    let lhs = builder.ins().bitcast(vector_ty, flags, arguments[0]);
+    let flags = bitcast_flags(builder);
+    let rhs = builder.ins().bitcast(vector_ty, flags, arguments[1]);
+    let result = if fields.subtract {
+        builder.ins().isub(lhs, rhs)
+    } else {
+        builder.ins().iadd(lhs, rhs)
+    };
+    let flags = bitcast_flags(builder);
+    let result = builder.ins().bitcast(types::I8X16, flags, result);
+    let active = vector_mask(builder, if fields.vector_128 { 128 } else { 64 });
+    Ok(vec![builder.ins().band(result, active)])
+}
+
+fn lower_native_a64_unsigned_move(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 1)?;
+    let size_shift = fields.immediate_5.trailing_zeros();
+    let lane_bits = 8_u32 << size_shift;
+    let lane = u32::from(fields.immediate_5) >> (size_shift + 1);
+    let shift = lane * lane_bits;
+    let (low, high) = vector_halves(builder, arguments[0]);
+    let half = if shift < 64 { low } else { high };
+    let shifted = builder.ins().ushr_imm_u(half, i64::from(shift % 64));
+    let result_ty = cranelift_type(single_result_type(result_types)?);
+    let result = cast_integer(builder, shifted, result_ty, false);
+    let mask = if lane_bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << lane_bits) - 1
+    };
+    let mask = integer_constant(builder, result_ty, mask);
+    Ok(vec![builder.ins().band(result, mask)])
+}
+
+fn lower_native_a64_scalar_move(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 1)?;
+    let width = match fields.opc {
+        0 => 32,
+        1 => 64,
+        3 => 16,
+        _ => return Err(CompilerError::new("invalid scalar move width")),
+    };
+    let mask = vector_mask(builder, width);
+    Ok(vec![builder.ins().band(arguments[0], mask)])
+}
+
+fn lower_native_a64_move_to_general(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    result_types: &[IrType],
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 1)?;
+    let (low, high) = vector_halves(builder, arguments[0]);
+    let (value, source_bits) = match (fields.size & 2 != 0, fields.opc) {
+        (false, 0) => (low, 32),
+        (false, 3) => (low, 16),
+        (true, 1) => (low, 64),
+        (true, 2) => (high, 64),
+        _ => return Err(CompilerError::new("invalid move-to-general encoding")),
+    };
+    let result_ty = cranelift_type(single_result_type(result_types)?);
+    let value = cast_integer(builder, value, result_ty, false);
+    let mask = if source_bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << source_bits) - 1
+    };
+    let mask = integer_constant(builder, result_ty, mask);
+    Ok(vec![builder.ins().band(value, mask)])
+}
+
+fn lower_native_a64_move_from_general(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let fields = semantic_fields(helper, 2)?;
+    let value = cast_integer(builder, arguments[0], types::I64, false);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let result = match (fields.size & 2 != 0, fields.opc) {
+        (false, 0) => {
+            let masked = builder.ins().band_imm_u(value, i64::from(u32::MAX));
+            vector_from_halves(builder, masked, zero)
+        }
+        (false, 3) => {
+            let masked = builder.ins().band_imm_u(value, i64::from(u16::MAX));
+            vector_from_halves(builder, masked, zero)
+        }
+        (true, 1) => vector_from_halves(builder, value, zero),
+        (true, 2) => {
+            let (previous_low, _) = vector_halves(builder, arguments[1]);
+            vector_from_halves(builder, previous_low, value)
+        }
+        _ => return Err(CompilerError::new("invalid move-from-general encoding")),
+    };
+    Ok(vec![result])
+}
+
+fn lower_native_aarch32_neon_bitwise(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let operation = helper_immediate(helper, 2)? as u32;
+    let ones = match builder.func.dfg.value_type(arguments[0]).bits() {
+        64 => {
+            let bits = integer_constant(builder, types::I64, u64::MAX);
+            let flags = bitcast_flags(builder);
+            builder.ins().bitcast(types::I8X8, flags, bits)
+        }
+        128 => vector_mask(builder, 128),
+        _ => return Err(CompilerError::new("invalid AArch32 NEON vector width")),
+    };
+    let not_rhs = builder.ins().bxor(arguments[1], ones);
+    let result = match operation {
+        0 => arguments[1],
+        1 => builder.ins().band(arguments[0], arguments[1]),
+        2 => builder.ins().band(arguments[0], not_rhs),
+        3 => builder.ins().bor(arguments[0], arguments[1]),
+        4 => builder.ins().bxor(arguments[0], arguments[1]),
+        _ => return Err(CompilerError::new("invalid AArch32 NEON bitwise operation")),
+    };
+    Ok(vec![result])
+}
+
+fn lower_native_aarch32_shift(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let value = arguments[0];
+    let amount = arguments[1];
+    let kind = helper_immediate(helper, 3)? as u8;
+    let (shifted, _) = lower_aarch32_shift_with_carry(builder, value, amount, arguments[2], kind)?;
+    Ok(vec![shifted])
+}
+
+fn lower_aarch32_shift_with_carry(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    amount: ir::Value,
+    cpsr: ir::Value,
+    kind: u8,
+) -> Result<(ir::Value, ir::Value), CompilerError> {
+    let zero_value = builder.ins().iconst(types::I32, 0);
+    let amount_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, amount, 0);
+    let amount_at_least_width =
+        builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, amount, 32);
+    let amount_at_most_width = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, amount, 32);
+    let carry_in_bits = builder.ins().ushr_imm_u(cpsr, 29);
+    let carry_in_bits = builder.ins().band_imm_u(carry_in_bits, 1);
+    let carry_in = builder.ins().icmp_imm_s(IntCC::NotEqual, carry_in_bits, 0);
+    let (shifted, carry) = match kind {
+        0 => {
+            let candidate = builder.ins().ishl(value, amount);
+            let bounded = builder
+                .ins()
+                .select(amount_at_least_width, zero_value, candidate);
+            let result = builder.ins().select(amount_is_zero, value, bounded);
+            let width = builder.ins().iconst(types::I32, 32);
+            let carry_shift = builder.ins().isub(width, amount);
+            let bit = builder.ins().ushr(value, carry_shift);
+            let bit = builder.ins().band_imm_u(bit, 1);
+            let bit = builder.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+            let within = builder.ins().band(amount_at_most_width, bit);
+            let carry = builder.ins().select(amount_is_zero, carry_in, within);
+            (result, carry)
+        }
+        1 => {
+            let candidate = builder.ins().ushr(value, amount);
+            let bounded = builder
+                .ins()
+                .select(amount_at_least_width, zero_value, candidate);
+            let result = builder.ins().select(amount_is_zero, value, bounded);
+            let carry_shift = builder.ins().iadd_imm_s(amount, -1);
+            let bit = builder.ins().ushr(value, carry_shift);
+            let bit = builder.ins().band_imm_u(bit, 1);
+            let bit = builder.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+            let within = builder.ins().band(amount_at_most_width, bit);
+            let carry = builder.ins().select(amount_is_zero, carry_in, within);
+            (result, carry)
+        }
+        2 => {
+            let candidate = builder.ins().sshr(value, amount);
+            let sign = builder.ins().sshr_imm_u(value, 31);
+            let bounded = builder.ins().select(amount_at_least_width, sign, candidate);
+            let result = builder.ins().select(amount_is_zero, value, bounded);
+            let carry_shift = builder.ins().iadd_imm_s(amount, -1);
+            let bit = builder.ins().ushr(value, carry_shift);
+            let bit = builder.ins().band_imm_u(bit, 1);
+            let bit = builder.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+            let sign_bit = builder.ins().icmp_imm_s(IntCC::SignedLessThan, value, 0);
+            let bounded_carry = builder.ins().select(amount_at_least_width, sign_bit, bit);
+            let carry = builder
+                .ins()
+                .select(amount_is_zero, carry_in, bounded_carry);
+            (result, carry)
+        }
+        3 => {
+            let candidate = builder.ins().rotr(value, amount);
+            let result = builder.ins().select(amount_is_zero, value, candidate);
+            let bit = builder.ins().icmp_imm_s(IntCC::SignedLessThan, result, 0);
+            let carry = builder.ins().select(amount_is_zero, carry_in, bit);
+            (result, carry)
+        }
+        4 => {
+            let carry = builder.ins().ishl_imm_u(carry_in_bits, 31);
+            let shifted = builder.ins().ushr_imm_u(value, 1);
+            let result = builder.ins().bor(carry, shifted);
+            let carry = builder.ins().band_imm_u(value, 1);
+            let carry = builder.ins().icmp_imm_s(IntCC::NotEqual, carry, 0);
+            (result, carry)
+        }
+        _ => return Err(CompilerError::new("invalid AArch32 shift operation")),
+    };
+    Ok((shifted, carry))
+}
+
+fn native_add_with_carry(
+    builder: &mut FunctionBuilder<'_>,
+    lhs: ir::Value,
+    rhs: ir::Value,
+    carry: ir::Value,
+) -> (ir::Value, ir::Value, ir::Value) {
+    let carry_value = builder.ins().uextend(types::I32, carry);
+    let (partial, carry0) = builder.ins().uadd_overflow(lhs, rhs);
+    let (result, carry1) = builder.ins().uadd_overflow(partial, carry_value);
+    let carry_out = builder.ins().bor(carry0, carry1);
+    let (signed_partial, overflow0) = builder.ins().sadd_overflow(lhs, rhs);
+    let (_, overflow1) = builder.ins().sadd_overflow(signed_partial, carry_value);
+    let overflow = builder.ins().bor(overflow0, overflow1);
+    (result, carry_out, overflow)
+}
+
+fn lower_native_aarch32_data_processing(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let operation = helper_immediate(helper, 6)? as u8;
+    let rotation = helper_immediate(helper, 11)? as u8;
+    let carry_in_bits = builder.ins().ushr_imm_u(arguments[5], 29);
+    let carry_in_bits = builder.ins().band_imm_u(carry_in_bits, 1);
+    let carry_in = builder.ins().icmp_imm_s(IntCC::NotEqual, carry_in_bits, 0);
+    let (operand, shifter_carry) = if rotation != 0 {
+        let carry = builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedLessThan, arguments[3], 0);
+        (arguments[3], carry)
+    } else {
+        lower_aarch32_shift_with_carry(
+            builder,
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            helper_immediate(helper, 9)? as u8,
+        )?
+    };
+    let all_ones = builder.ins().iconst(types::I32, -1);
+    let not_operand = builder.ins().bxor(operand, all_ones);
+    let carry_true = builder.ins().iconst(types::I8, 1);
+    let carry_false = builder.ins().iconst(types::I8, 0);
+    let mut arithmetic = None;
+    let result = match operation {
+        0 | 8 => builder.ins().band(arguments[2], operand),
+        1 | 9 => builder.ins().bxor(arguments[2], operand),
+        2 | 10 => {
+            let value = native_add_with_carry(builder, arguments[2], not_operand, carry_true);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        3 => {
+            let not_lhs = builder.ins().bxor(arguments[2], all_ones);
+            let value = native_add_with_carry(builder, operand, not_lhs, carry_true);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        4 | 11 => {
+            let value = native_add_with_carry(builder, arguments[2], operand, carry_false);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        5 => {
+            let value = native_add_with_carry(builder, arguments[2], operand, carry_in);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        6 => {
+            let value = native_add_with_carry(builder, arguments[2], not_operand, carry_in);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        7 => {
+            let not_lhs = builder.ins().bxor(arguments[2], all_ones);
+            let value = native_add_with_carry(builder, operand, not_lhs, carry_in);
+            arithmetic = Some((value.1, value.2));
+            value.0
+        }
+        12 => builder.ins().bor(arguments[2], operand),
+        13 => operand,
+        14 => builder.ins().band(arguments[2], not_operand),
+        15 => not_operand,
+        _ => return Err(CompilerError::new("invalid AArch32 data operation")),
+    };
+
+    let set_flags = helper_immediate(helper, 7)? != 0;
+    let updated_cpsr = if set_flags {
+        let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, result, 0);
+        let zero = builder.ins().icmp_imm_s(IntCC::Equal, result, 0);
+        let (carry, overflow) = arithmetic.unwrap_or_else(|| {
+            let overflow_bits = builder.ins().ushr_imm_u(arguments[5], 28);
+            let overflow_bits = builder.ins().band_imm_u(overflow_bits, 1);
+            let overflow = builder.ins().icmp_imm_s(IntCC::NotEqual, overflow_bits, 0);
+            (shifter_carry, overflow)
+        });
+        let negative = builder.ins().uextend(types::I32, negative);
+        let zero = builder.ins().uextend(types::I32, zero);
+        let carry = builder.ins().uextend(types::I32, carry);
+        let overflow = builder.ins().uextend(types::I32, overflow);
+        let negative = builder.ins().ishl_imm_u(negative, 31);
+        let zero = builder.ins().ishl_imm_u(zero, 30);
+        let carry = builder.ins().ishl_imm_u(carry, 29);
+        let overflow = builder.ins().ishl_imm_u(overflow, 28);
+        let nz = builder.ins().bor(negative, zero);
+        let cv = builder.ins().bor(carry, overflow);
+        let flags = builder.ins().bor(nz, cv);
+        let preserved = builder
+            .ins()
+            .band_imm_u(arguments[5], i64::from(0x0fff_ffff_u32));
+        let updated = builder.ins().bor(preserved, flags);
+        let update = builder.ins().icmp_imm_s(IntCC::Equal, arguments[8], 0);
+        builder.ins().select(update, updated, arguments[5])
+    } else {
+        arguments[5]
+    };
+    let selected_result = builder.ins().select(arguments[0], result, arguments[1]);
+    let selected_cpsr = builder
+        .ins()
+        .select(arguments[0], updated_cpsr, arguments[5]);
+    Ok(vec![selected_result, selected_cpsr])
+}
+
+fn lower_native_aarch32_multiply(
+    builder: &mut FunctionBuilder<'_>,
+    helper: &nixe_cpu::ir::op::HelperOperation,
+    arguments: &[ir::Value],
+) -> Result<Vec<ir::Value>, CompilerError> {
+    let product = builder.ins().imul(arguments[2], arguments[3]);
+    let computed = builder.ins().iadd(product, arguments[4]);
+    let selected = builder.ins().select(arguments[0], computed, arguments[1]);
+    let set_flags = helper_immediate(helper, 6)? != 0;
+    let updated_cpsr = if set_flags {
+        let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, computed, 0);
+        let zero = builder.ins().icmp_imm_s(IntCC::Equal, computed, 0);
+        let negative = builder.ins().uextend(types::I32, negative);
+        let zero = builder.ins().uextend(types::I32, zero);
+        let negative = builder.ins().ishl_imm_u(negative, 31);
+        let zero = builder.ins().ishl_imm_u(zero, 30);
+        let flags = builder.ins().bor(negative, zero);
+        let preserved = builder
+            .ins()
+            .band_imm_u(arguments[5], i64::from(!0xc000_0000_u32));
+        let updated = builder.ins().bor(preserved, flags);
+        let not_suppressed = builder.ins().icmp_imm_s(IntCC::Equal, arguments[7], 0);
+        builder.ins().select(not_suppressed, updated, arguments[5])
+    } else {
+        arguments[5]
+    };
+    let cpsr = builder
+        .ins()
+        .select(arguments[0], updated_cpsr, arguments[5]);
+    Ok(vec![selected, cpsr])
 }
 
 fn semantic_helper_can_trap_fp(name: &str) -> bool {

@@ -98,7 +98,9 @@ effects, then lowers that IR exclusively through Cranelift. Cranelift does not
 own emulator dispatch, cache lifetime, link tables, invalidation, memory
 authority, or architectural-state commitment; those facilities remain
 JIT-private Nixe integration code around the compiler. LLVM and a second
-optimizing tier are outside the production plan.
+optimizing compiler tier are outside the production plan. The baseline engine
+does use the reference interpreter as a cold execution tier so one-shot code
+does not pay Cranelift compilation cost.
 
 ## 4. Verified facts, profiles, and assumptions
 
@@ -238,7 +240,9 @@ CPU, engine-protocol, and scheduler code must not depend on Horizon, the runtime
 Cranelift, a graphics API, or a platform NCE implementation. A concrete engine
 must not call Horizon directly. Product composition owns concrete providers;
 `nixe-runtime` accepts the neutral provider protocol and does not depend on the
-reference interpreter or concrete JIT in production.
+reference interpreter or concrete JIT in production. The JIT may consume the
+reference interpreter's context-free single-step API for cold execution; this
+dependency does not expose runtime or scheduler ownership to either engine.
 
 The runtime has no product-name or engine-family execution branch. A provider
 supplies a process domain, worker executor, memory synchronization, and
@@ -561,16 +565,19 @@ before native code is published.
 
 Guest and host capabilities are independent. `GuestCpuProfile` decides whether
 an instruction is legal; the JIT's capability probe and guarded lowering decide
-whether Cranelift may use a native operation with identical semantics. Otherwise
-lowering invokes an exact typed helper. Cranelift owns host instruction
+how Cranelift implements the same semantics. Pure integer, flag, bitfield,
+permutation, lane, narrowing, shift, and bit-preserving FP/SIMD operations must
+be emitted as native Cranelift IR; a generic semantic helper is not an allowed
+fallback for them. Cranelift owns host instruction
 selection, register allocation, calling-convention details, and emission for
 supported x86-64 and AArch64 hosts.
 
 Particularly sensitive operations include saturation and narrowing, FP NaNs and
 status, vector shifts and table lookups, exclusives and atomics, cache
-maintenance, and cross-page accesses. A native operation is selected only when
-its behavior matches the selected guest profile; otherwise the helper is the
-production lowering for that operation, not a semantic approximation.
+maintenance, and cross-page accesses. Exact typed slow paths remain permitted
+only when execution needs canonical memory, MMIO, shared host state, scheduling,
+or FP behavior which cannot yet be proven equivalent to host operations. They
+are not a substitute for ordinary native lowering.
 
 ### 11.2 Private native execution frame
 
@@ -585,7 +592,8 @@ boundaries.
 The established frame is versioned and sized explicitly, contains independent
 complete A64 and A32/T32 payloads rather than exposing a Rust enum or union,
 and uses checked two-limb vector values at its C boundary. Each executor retains
-this frame and reusable Cranelift contexts. The sole domain cache retains
+this frame, while domain compilation workers retain independent reusable
+Cranelift contexts. The sole domain cache retains
 lowered immutable regions and writable link tables. A Cranelift-generated
 C-ABI gateway performs the sole transition from Rust to Cranelift's portable
 tail convention; linked regions then tail-call one another without host-stack
@@ -593,6 +601,14 @@ growth. The frame carries current-region metadata and the cumulative budget
 across those calls and is committed only at a normalized engine exit. The
 gateway, native links, and single miss resolver are the sole native execution
 path; no second semantic executor or runtime-visible region handoff exists.
+
+Cranelift code generation runs in a bounded domain-owned worker pool sized to
+`max(1, host logical cores / 2)`. Promotion captures verified Nixe IR on the
+vCPU, then interpretation continues while workers compile. Completed code is
+adopted only at a dispatch boundary after every captured code dependency is
+revalidated. Queued work is bounded and older candidates may be discarded;
+running obsolete work is never forcefully terminated and its result is simply
+discarded after completion.
 
 The frame, Cranelift IR, software TLB, native entry convention, spill storage,
 and exit-record layout never appear in `nixe-cpu-engine`, `nixe-runtime`,
@@ -603,9 +619,14 @@ converts host-side failure to a typed engine fault with precise committed state.
 ### 11.3 Versioned helper ABI
 
 The helper table is a small, versioned JIT-private ABI generated from typed
-declarations. Its memory-read, memory-write, atomic, exclusive, semantic, and
+declarations. Its memory-read, memory-write, atomic, exclusive, exact-FP, and
 system slots have non-unwinding C signatures and are installed only around one
-live native chain. Atomic RMW, CAS, and CASP use the typed atomic slot to reach
+live native chain. The generic named-helper IR is consumed natively for every
+pure operation and therefore creates no runtime call or semantic metadata.
+Lowering rejects any named operation which is neither translated natively nor
+listed explicitly as an exact semantic slow path; an unclassified operation may
+not silently expand the helper ABI.
+Atomic RMW, CAS, and CASP use the typed atomic slot to reach
 the canonical physical-memory transaction; this is a precise baseline lowering,
 not a second semantic service. Each helper
 declares the architectural state and memory effects it observes, whether it may
@@ -634,6 +655,14 @@ the entry's atomic live state without acquiring the domain lock. The hot key is
 the address-space identity, complete guest location, translation mode, and root
 physical code mapping; immutable metadata and reverse indexes retain every
 physical and virtual-mapping dependency.
+
+An absent key first executes through a bounded 16K-entry direct-mapped cold
+frequency table. The first two visits use the reference interpreter's exact
+single-step API inside the same `run_slice`; the third visit promotes the key to
+baseline compilation. An instruction unsupported by the interpreter is
+promoted immediately so the compiled frontend preserves the normal
+`InterpretOne` contract. An already-published global-cache entry bypasses the
+cold tier.
 
 Every external direct edge probes one link cell and each computed edge probes a
 four-way polymorphic link site. Hits load an immutable target record with
@@ -680,8 +709,8 @@ support it.
 
 ### 12.3 Executable memory
 
-The JIT executable-memory owner enforces write xor execute in a 64 MiB arena
-with at most 4096 page-isolated publications. Checked accounting rejects an
+The JIT executable-memory owner enforces write xor execute in a 1 GiB virtual
+arena with at most 65536 page-isolated publications. Checked accounting rejects an
 invalid alignment, arithmetic overflow, byte exhaustion, or segment exhaustion
 before publication. A failed platform transition poisons the owner so a
 partially transitioned page can never be reused.
@@ -711,8 +740,8 @@ visible or part of an engine-neutral API.
 
 ### 12.4 Cache pressure
 
-The live domain cache is bounded to 1024 page-isolated publications, 48 MiB of
-mapped native storage, and 4 million retained IR operations. Misses for one key
+The live domain cache is bounded to 32768 page-isolated publications, 512 MiB of
+mapped native storage, and 32 million retained IR operations. Misses for one key
 share a condition-variable single flight. Pressure retires the oldest live
 region deterministically, marks it unavailable to lock-free local lookups, and
 removes all hot keys and reverse-index rows before admitting the new result.
@@ -822,8 +851,13 @@ writeback can become CPU-visible.
 Writes through any virtual alias invalidate regions associated with the same
 canonical physical page. Mapping changes invalidate dependencies on the
 affected virtual view and only overlapping software-TLB entries. Dispatch polls
-the source cursor in O(1); only a changed cursor walks published records and
-reverse indexes. Lost ring history causes a conservative full eviction.
+shared control and interrupt words directly from generated code. External
+invalidation publication raises the shared control word; guest writes to pages
+observed as code raise a frame-local invalidation flag in the precise memory
+helper. Only a raised word crosses the helper ABI and reads the source cursor.
+An invalidation with no reverse-index match and no compilation flight advances
+the cache cursor in O(1), without scanning cache slots or changing the
+compilation revision. Lost ring history causes a conservative full eviction.
 
 ## 15. Precise exceptions and host faults
 
@@ -955,11 +989,16 @@ exits at entry, bounded safepoints, and backward branches. The check covers:
 
 Regions poll at bounded safepoints and backward edges. No region-formation or
 linking decision may exceed the provider's declared maximum poll interval.
+The common native poll is two atomic word loads plus frame-local flag loads and
+a predicted branch. It calls the Rust slow path only for a published control
+request, pending interrupt, or guest-generated local invalidation.
 
 The runtime owns one persistent event register and pending-interrupt mask per
 emulated physical vCPU. That state crosses thread and process dispatches on the
 same vCPU and is passed to every engine as a cloneable neutral handle; it is not
-stored in the JIT cache, native frame, executor control, or guest thread state.
+stored in the JIT cache, executor control, or guest thread state. A native frame
+borrows only the stable address of its pending-interrupt word for the bounded
+duration of `run_slice`.
 `YIELD`, `WFE`, `WFI`, and `SEV` retire through typed normalized scheduling
 requests. `SEVL` sets only the current vCPU event register. The coordinator
 alone registers waits, broadcasts `SEV`, injects per-vCPU interrupts, and makes
@@ -1188,8 +1227,10 @@ The interpreter is mandatory. JIT and NCE implementations use the same
 run-slice and state-commit boundary and may be unavailable without changing
 scheduler or Horizon semantics. Engine selection is capability-based; an
 explicitly requested incompatible engine fails before guest execution rather
-than silently selecting another engine. A speculative optimizing tier and its
-deoptimization machinery are outside the current architecture.
+than silently selecting another engine. The JIT interprets cold locations and
+promotes repeatedly visited locations to baseline Cranelift code. A speculative
+optimizing compiler tier and its deoptimization machinery remain outside the
+current architecture.
 
 Product composition registers the JIT before the interpreter. `auto` probes in
 that deterministic order and selects the first compatible provider; explicit

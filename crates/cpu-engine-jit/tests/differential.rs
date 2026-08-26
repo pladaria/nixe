@@ -76,6 +76,15 @@ impl EngineHarness {
         memory: &SyntheticMemory,
         state: &mut ThreadCpuState,
     ) -> Result<nixe_cpu_engine::ExecutionReport, nixe_cpu_engine::EngineFault> {
+        self.run_with_budget(memory, state, 1)
+    }
+
+    fn run_with_budget(
+        &mut self,
+        memory: &SyntheticMemory,
+        state: &mut ThreadCpuState,
+        instruction_budget: u64,
+    ) -> Result<nixe_cpu_engine::ExecutionReport, nixe_cpu_engine::EngineFault> {
         self.executor
             .as_mut()
             .expect("the harness executor is live")
@@ -83,7 +92,7 @@ impl EngineHarness {
                 cpu: cpu(),
                 memory,
                 state,
-                instruction_budget: 1,
+                instruction_budget,
                 loader_return: None,
                 timer: &FixedTimer,
                 events: nixe_cpu_engine::VcpuEventState::default(),
@@ -96,6 +105,33 @@ impl Drop for EngineHarness {
         drop(self.executor.take());
         self.domain.shutdown().unwrap();
     }
+}
+
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn full_width_simd_extract_compiles_without_i128_shift_immediates() {
+    const CODE_PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(0x30_0010);
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(CODE_PAGE));
+    assert!(memory.initialize_ram(CODE_PAGE, 0, &0x6e1f_43ff_u32.to_le_bytes()));
+    assert!(memory.initialize_ram(CODE_PAGE, 4, &0x17ff_ffff_u32.to_le_bytes()));
+    assert!(memory.map_page(SPACE, CODE, CODE_PAGE, MemoryPermissions::READ_EXECUTE));
+
+    let mut initial = A64State::default();
+    initial.set_pc(CODE.get());
+    assert!(initial.set_vector(31, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef));
+    let mut interpreter_state = ThreadCpuState::A64(Box::new(initial.clone()));
+    let mut jit_state = ThreadCpuState::A64(Box::new(initial));
+    let mut interpreter = EngineHarness::new(&InterpreterProvider, 0x50, 0x50);
+    let mut jit = EngineHarness::new(&JitProvider::new(), 0x51, 0x51);
+
+    let interpreter_report = interpreter
+        .run_with_budget(&memory, &mut interpreter_state, 12)
+        .unwrap();
+    let jit_report = jit.run_with_budget(&memory, &mut jit_state, 12).unwrap();
+
+    assert_eq!(jit_report, interpreter_report);
+    assert_eq!(jit_state, interpreter_state);
 }
 
 #[test]
@@ -192,6 +228,44 @@ fn run_registry_state(execution_state: ExecutionState) {
     }
 
     assert_ne!(executed, 0, "{execution_state} registry was not exercised");
+}
+
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn every_supported_registry_fixture_can_enter_async_jit_pipeline() {
+    let profile = GuestCpuProfile::switch_1();
+    for execution_state in [
+        ExecutionState::A64,
+        ExecutionState::A32,
+        ExecutionState::T32,
+    ] {
+        let identity = state_index(execution_state) as u64;
+        let mut jit = EngineHarness::new(&JitProvider::new(), 0x100 + identity, 0x100 + identity);
+        for pattern in patterns().filter(|pattern| {
+            pattern.execution_state == execution_state
+                && pattern.decoder == DecodeSupport::Ready
+                && profile
+                    .allowed_execution_states()
+                    .contains(pattern.execution_state)
+                && !pattern.required_features.iter().any(|feature| {
+                    profile.instruction_features().status(*feature) != CapabilityStatus::Enabled
+                })
+        }) {
+            let code_page =
+                GuestPhysicalPageId::new(0x40_0000 + u64::from(pattern.coverage_id.get()));
+            let identity = format!(
+                "{} {} ({})",
+                pattern.execution_state, pattern.coverage_id, pattern.name
+            );
+            for visit in 1..=3 {
+                let memory = fixture_memory(pattern, code_page);
+                let mut state = initial_state(pattern.execution_state, pattern.coverage_id.get());
+                jit.run(&memory, &mut state).unwrap_or_else(|error| {
+                    panic!("{identity} JIT visit {visit} failed during promotion: {error}")
+                });
+            }
+        }
+    }
 }
 
 #[test]

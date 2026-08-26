@@ -115,6 +115,13 @@ impl VcpuEventState {
     pub fn take_pending_interrupts(&self) -> u32 {
         self.state.pending_interrupts.swap(0, Ordering::AcqRel)
     }
+
+    /// Stable address of the interrupt word used by native engine polls. The
+    /// address remains valid while this event state or any clone is alive.
+    #[must_use]
+    pub fn pending_interrupts_address(&self) -> usize {
+        std::ptr::from_ref(&self.state.pending_interrupts).addr()
+    }
 }
 
 /// Scheduler-visible action requested by one retired architectural hint.

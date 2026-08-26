@@ -1191,6 +1191,7 @@ dependencies = [
  "nixe-cpu-engine",
  "nixe-cpu-engine-interpreter",
  "nixe-memory",
+ "toml",
  "windows-sys 0.61.2",
 ]
 

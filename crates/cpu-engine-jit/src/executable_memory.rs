@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use nixe_cpu_engine::CapabilityRejectionReason;
 
-const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_MAX_SEGMENTS: usize = 4096;
+const DEFAULT_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MAX_SEGMENTS: usize = 65_536;
 
 // The capability probe publishes but never enters this unreachable byte. All
 // executable guest regions published through the other path come from

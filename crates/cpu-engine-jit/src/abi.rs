@@ -10,7 +10,7 @@ use nixe_cpu::state::a64::{
 };
 use nixe_cpu::state::{A32State, A64State, ThreadCpuState};
 
-pub(crate) const NATIVE_ABI_VERSION: u32 = 3;
+pub(crate) const NATIVE_ABI_VERSION: u32 = 4;
 
 pub(crate) const EXECUTION_STATE_A64: u32 = 0;
 pub(crate) const EXECUTION_STATE_A32: u32 = 1;
@@ -146,6 +146,8 @@ pub(crate) struct NativeControl {
     pub(crate) instruction_budget: u64,
     pub(crate) loader_return: u64,
     pub(crate) invalidation_epoch: u64,
+    pub(crate) control_pending_address: usize,
+    pub(crate) interrupt_pending_address: usize,
     pub(crate) request_flags: u32,
     pub(crate) event_mask: u32,
     pub(crate) loader_return_valid: u32,
@@ -467,6 +469,8 @@ pub(crate) struct FrameOffsets {
     pub(crate) control_instruction_budget: usize,
     pub(crate) control_loader_return: usize,
     pub(crate) control_invalidation_epoch: usize,
+    pub(crate) control_pending_address: usize,
+    pub(crate) interrupt_pending_address: usize,
     pub(crate) control_request_flags: usize,
     pub(crate) control_event_mask: usize,
     pub(crate) control_loader_return_valid: usize,
@@ -519,6 +523,10 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
         + offset_of!(NativeControl, loader_return),
     control_invalidation_epoch: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, invalidation_epoch),
+    control_pending_address: offset_of!(ExecutionFrame, control)
+        + offset_of!(NativeControl, control_pending_address),
+    interrupt_pending_address: offset_of!(ExecutionFrame, control)
+        + offset_of!(NativeControl, interrupt_pending_address),
     control_request_flags: offset_of!(ExecutionFrame, control)
         + offset_of!(NativeControl, request_flags),
     control_event_mask: offset_of!(ExecutionFrame, control) + offset_of!(NativeControl, event_mask),
@@ -544,7 +552,7 @@ pub(crate) const FRAME_OFFSETS: FrameOffsets = FrameOffsets {
 };
 
 impl FrameOffsets {
-    pub(crate) const fn all(self) -> [usize; 42] {
+    pub(crate) const fn all(self) -> [usize; 44] {
         [
             self.execution_state,
             self.a64_x,
@@ -571,6 +579,8 @@ impl FrameOffsets {
             self.control_instruction_budget,
             self.control_loader_return,
             self.control_invalidation_epoch,
+            self.control_pending_address,
+            self.interrupt_pending_address,
             self.control_request_flags,
             self.control_event_mask,
             self.control_loader_return_valid,

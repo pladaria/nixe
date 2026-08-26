@@ -26,7 +26,10 @@ use nixe_cpu::{
 use nixe_cpu_engine::{
     ControlSnapshot, CrossVcpuRequest, EngineControl, EngineTimer, VcpuEventState,
 };
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::{
+    AddressSpaceId, GuestVirtualAddress, MemoryInvalidationCursor, MemoryInvalidationError,
+    MemoryInvalidationKind,
+};
 
 use crate::abi::{
     AbiU128, ExecutionFrame, HelperTable, NATIVE_ABI_VERSION, SYSTEM_CACHE_DATA_CLEAN,
@@ -35,6 +38,8 @@ use crate::abi::{
     SYSTEM_READ_RUNTIME_REGISTER, SYSTEM_SEND_EVENT_LOCAL, SYSTEM_WAIT_FOR_EVENT,
     SYSTEM_WAIT_FOR_INTERRUPT,
 };
+use crate::cache::DomainCodeCache;
+use crate::performance::ExecutorPerformance;
 use crate::tlb::SoftwareTlb;
 
 pub(crate) struct NativeContext<'a> {
@@ -43,10 +48,13 @@ pub(crate) struct NativeContext<'a> {
     pub(crate) tlb: &'a mut SoftwareTlb,
     pub(crate) data_fault: Option<DataAccessFault>,
     pub(crate) control: &'a EngineControl,
+    pub(crate) code_cache: Option<&'a DomainCodeCache>,
+    pub(crate) invalidation_cursor: Option<&'a mut MemoryInvalidationCursor>,
     pub(crate) control_snapshot: Option<ControlSnapshot>,
     pub(crate) cpu: ProcessCpuContext,
     pub(crate) timer: &'a dyn EngineTimer,
     pub(crate) events: &'a VcpuEventState,
+    pub(crate) performance: Option<&'a mut ExecutorPerformance>,
 }
 
 impl<'a> NativeContext<'a> {
@@ -65,11 +73,32 @@ impl<'a> NativeContext<'a> {
             tlb,
             data_fault: None,
             control,
+            code_cache: None,
+            invalidation_cursor: None,
             control_snapshot: None,
             cpu,
             timer,
             events,
+            performance: None,
         }
+    }
+
+    pub(crate) fn with_performance(
+        mut self,
+        performance: Option<&'a mut ExecutorPerformance>,
+    ) -> Self {
+        self.performance = performance;
+        self
+    }
+
+    pub(crate) fn with_invalidations(
+        mut self,
+        code_cache: &'a DomainCodeCache,
+        invalidation_cursor: &'a mut MemoryInvalidationCursor,
+    ) -> Self {
+        self.code_cache = Some(code_cache);
+        self.invalidation_cursor = Some(invalidation_cursor);
+        self
     }
 }
 
@@ -92,6 +121,9 @@ unsafe extern "C" fn memory_read(
 ) -> u32 {
     contain(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.helper_memory_reads = performance.helper_memory_reads.saturating_add(1);
+        }
         let access = decode_access(descriptor)?;
         let address_space = AddressSpaceId::new(frame.memory.address_space);
         match context
@@ -128,11 +160,15 @@ unsafe extern "C" fn memory_write(
 ) -> u32 {
     contain(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.helper_memory_writes = performance.helper_memory_writes.saturating_add(1);
+        }
         let access = decode_access(descriptor)?;
         let value = unsafe { value.read() };
         let value = memory_value(access.size, value.into());
         let address_space = AddressSpaceId::new(frame.memory.address_space);
-        match context.memory.write(
+        let invalidation_before = context.memory.invalidation_cursor();
+        let result = match context.memory.write(
             address_space,
             GuestVirtualAddress::new(address),
             access,
@@ -154,8 +190,24 @@ unsafe extern "C" fn memory_write(
                 context.data_fault = Some(fault);
                 Err(())
             }
+        };
+        if result.is_ok() {
+            mark_guest_invalidation(frame, context, invalidation_before);
         }
+        result
     })
+}
+
+fn mark_guest_invalidation(
+    frame: &mut ExecutionFrame,
+    context: &NativeContext<'_>,
+    before: MemoryInvalidationCursor,
+) {
+    let after = context.memory.invalidation_cursor();
+    if after > before {
+        frame.control.request_flags |= 1 << 1;
+        frame.control.invalidation_epoch = frame.control.invalidation_epoch.max(after.get());
+    }
 }
 
 unsafe extern "C" fn atomic(
@@ -167,11 +219,15 @@ unsafe extern "C" fn atomic(
 ) -> u32 {
     contain(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.helper_atomics = performance.helper_atomics.saturating_add(1);
+        }
         let operation = (descriptor >> 32) as u8;
         let access = decode_access(descriptor & 0xffff_ffff)?;
         let address_space = AddressSpaceId::new(frame.memory.address_space);
         let address = GuestVirtualAddress::new(address);
         let first = memory_value(access.size, unsafe { u128::from(operand.read()) });
+        let invalidation_before = context.memory.invalidation_cursor();
         let transaction = match operation {
             0..=8 => {
                 let kind = match operation {
@@ -206,6 +262,7 @@ unsafe extern "C" fn atomic(
         match transaction {
             Ok(transaction) => {
                 unsafe { result.write(memory_bits(transaction.previous).into()) };
+                mark_guest_invalidation(frame, context, invalidation_before);
                 Ok(())
             }
             Err(fault) => {
@@ -233,6 +290,9 @@ unsafe extern "C" fn exclusive(
 ) -> u32 {
     contain(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.helper_exclusives = performance.helper_exclusives.saturating_add(1);
+        }
         let operation = (descriptor >> 32) as u8;
         let access = decode_access(descriptor & 0xffff_ffff)?;
         let address_space = AddressSpaceId::new(frame.memory.address_space);
@@ -259,6 +319,7 @@ unsafe extern "C" fn exclusive(
                 };
                 context.exclusive.clear();
                 let bits: u128 = unsafe { value.read() }.into();
+                let invalidation_before = context.memory.invalidation_cursor();
                 match context.memory.store_exclusive(
                     address_space,
                     address,
@@ -268,6 +329,7 @@ unsafe extern "C" fn exclusive(
                 ) {
                     Ok((_, stored)) => {
                         unsafe { result.write(u128::from(!stored).into()) };
+                        mark_guest_invalidation(frame, context, invalidation_before);
                         Ok(())
                     }
                     Err(fault) => {
@@ -289,6 +351,9 @@ unsafe extern "C" fn exclusive(
 unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32 {
     match catch_unwind(AssertUnwindSafe(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            performance.helper_semantics = performance.helper_semantics.saturating_add(1);
+        }
         let metadata = unsafe {
             (frame.dispatch.metadata as *const crate::compiler::CompiledRegionMetadata).as_ref()
         }
@@ -301,12 +366,15 @@ unsafe extern "C" fn semantic(frame: *mut ExecutionFrame, operation: u32) -> u32
                 | "a64.simd.single-structure-memory"
         ) {
             let address_space = AddressSpaceId::new(frame.memory.address_space);
-            match execute_complex_memory(
+            let invalidation_before = context.memory.invalidation_cursor();
+            let result = execute_complex_memory(
                 call.helper.as_ref(),
                 &frame.scratch.arguments,
                 context.memory,
                 address_space,
-            ) {
+            );
+            mark_guest_invalidation(frame, context, invalidation_before);
+            match result {
                 Ok(results) if results.len() == call.result_types.len() => {
                     frame.scratch.results[..results.len()].copy_from_slice(&results);
                     return Ok(0);
@@ -708,9 +776,73 @@ fn vector_access(size: MemoryAccessSize) -> MemoryAccess {
     )
 }
 
+/// Consumes executable-content notifications which cannot affect any live
+/// translation. Mapping and instruction-cache changes still require a native
+/// exit because they can invalidate the active acceleration state.
+fn consume_irrelevant_code_invalidations(
+    frame: &mut ExecutionFrame,
+    context: &mut NativeContext<'_>,
+) -> Result<bool, ()> {
+    let latest = context.memory.invalidation_cursor();
+    let invalidation_cursor = context.invalidation_cursor.as_deref_mut().ok_or(())?;
+    if latest <= *invalidation_cursor {
+        return Ok(false);
+    }
+    let mut records = Vec::new();
+    let through = match context
+        .memory
+        .read_invalidations_since(*invalidation_cursor, &mut records)
+    {
+        Ok(through) => through,
+        Err(MemoryInvalidationError::HistoryLost { .. }) => return Ok(true),
+        Err(_) => return Err(()),
+    };
+    if records.iter().any(|record| {
+        !matches!(
+            record.kind,
+            MemoryInvalidationKind::ExecutableContent { .. }
+        )
+    }) {
+        return Ok(true);
+    }
+    let effect = context
+        .code_cache
+        .ok_or(())?
+        .apply_invalidations(&records, through, false)
+        .map_err(|_| ())?;
+    context.tlb.apply_invalidations(&records);
+    *invalidation_cursor = through;
+    frame.control.invalidation_epoch = through.get();
+    context.control.acknowledge_invalidation(through.get());
+    if effect.retired_regions == 0 {
+        frame.control.request_flags &= !(1 << 1);
+    }
+    if let Some(performance) = context.performance.as_deref_mut() {
+        performance.invalidation_batches = performance.invalidation_batches.saturating_add(1);
+        performance.invalidation_records = performance
+            .invalidation_records
+            .saturating_add(records.len() as u64);
+        if effect.retired_regions == 0 {
+            performance.filtered_invalidation_polls =
+                performance.filtered_invalidation_polls.saturating_add(1);
+        } else {
+            performance.relevant_invalidation_polls =
+                performance.relevant_invalidation_polls.saturating_add(1);
+        }
+    }
+    Ok(effect.retired_regions != 0)
+}
+
 unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument: u64) -> u32 {
     match catch_unwind(AssertUnwindSafe(|| {
         let (frame, context) = unsafe { context(frame)? };
+        if let Some(performance) = context.performance.as_deref_mut() {
+            if operation == SYSTEM_POLL {
+                performance.helper_system_polls = performance.helper_system_polls.saturating_add(1);
+            } else {
+                performance.helper_system_other = performance.helper_system_other.saturating_add(1);
+            }
+        }
         if matches!(
             operation & 0xff,
             SYSTEM_CACHE_INSTRUCTION_INVALIDATE
@@ -736,7 +868,8 @@ unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument
                 _ => unreachable!(),
             };
             let address = (operation & (1 << 8) != 0).then_some(GuestVirtualAddress::new(argument));
-            return match context.memory.maintain_cache(
+            let invalidation_before = context.memory.invalidation_cursor();
+            let result = match context.memory.maintain_cache(
                 AddressSpaceId::new(frame.memory.address_space),
                 kind,
                 address,
@@ -747,6 +880,10 @@ unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument
                     Err(())
                 }
             };
+            if result.is_ok() {
+                mark_guest_invalidation(frame, context, invalidation_before);
+            }
+            return result;
         }
         match operation {
             SYSTEM_READ_RUNTIME_REGISTER => {
@@ -772,8 +909,8 @@ unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument
             SYSTEM_POLL => {}
             _ => return Err(()),
         }
-        let memory_cursor = context.memory.invalidation_cursor();
-        if memory_cursor.get() > frame.control.invalidation_epoch {
+        if consume_irrelevant_code_invalidations(frame, context)? {
+            let memory_cursor = context.memory.invalidation_cursor();
             frame.control.request_flags = 1 << 1;
             frame.control.invalidation_epoch = memory_cursor.get();
             return Ok(true);
@@ -786,6 +923,14 @@ unsafe extern "C" fn system(frame: *mut ExecutionFrame, operation: u32, argument
         let Some(snapshot) = context.control.take_pending() else {
             return Ok(false);
         };
+        if !snapshot.contains(CrossVcpuRequest::Preempt)
+            && snapshot.contains(CrossVcpuRequest::CodeInvalidation)
+            && snapshot.invalidation_epoch
+                <= context.invalidation_cursor.as_deref().ok_or(())?.get()
+        {
+            context.control.acknowledge(snapshot);
+            return Ok(false);
+        }
         frame.control.request_flags = u32::from(snapshot.contains(CrossVcpuRequest::Preempt))
             | (u32::from(snapshot.contains(CrossVcpuRequest::CodeInvalidation)) << 1);
         frame.control.invalidation_epoch = snapshot.invalidation_epoch;
@@ -848,11 +993,17 @@ fn execute_semantic(
                 decode_a64_bit_masks(width == 64, imm_r, imm_s, width, false).map_err(|_| ())?;
             let width = BitWidth::new(width).map_err(|_| ())?;
             let source = width.truncate(argument(1));
-            let bottom =
-                rotate_right(source, width, u32::from(imm_r)) & u128::from(masks.write_mask);
+            let destination = width.truncate(argument(0));
+            let write = u128::from(masks.write_mask);
+            let rotated = rotate_right(source, width, u32::from(imm_r));
+            let bottom = if name == "a64.bfm" {
+                (destination & !write) | (rotated & write)
+            } else {
+                rotated & write
+            };
             let test = u128::from(masks.test_mask);
             let value = match name {
-                "a64.bfm" => (argument(0) & !test) | (bottom & test),
+                "a64.bfm" => (destination & !test) | (bottom & test),
                 "a64.ubfm" => bottom & test,
                 "a64.sbfm" => {
                     let sign = (source >> imm_s) & 1;
@@ -1236,6 +1387,19 @@ mod tests {
         arguments[3] = 63_u128.into();
         let result = execute_semantic("a64.ubfm", &arguments, &[IrType::I64]).unwrap();
         assert_eq!(u128::from(result[0]), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn a64_bfm_helper_preserves_destination_bits_outside_write_mask() {
+        let mut arguments = [AbiU128::default(); crate::abi::MAX_HELPER_ARGUMENTS];
+        arguments[0] = 3_u128.into();
+        arguments[1] = 0xc0b0_4705_u128.into();
+        arguments[2] = 32_u128.into();
+        arguments[3] = 31_u128.into();
+
+        let result = execute_semantic("a64.bfm", &arguments, &[IrType::I64]).unwrap();
+
+        assert_eq!(u128::from(result[0]), 0xc0b0_4705_0000_0003);
     }
 
     #[test]
