@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 cranelift-codegen = { version = "=0.134.3", default-features = false, features = ["host-arch", "std", "timing"] }
 cranelift-frontend = "=0.134.3"
 cranelift-native = "=0.134.3"

@@ -59,8 +59,8 @@ max_concurrent_compilations = 4
 # Optional compilation diagnostics. Missing or empty disables all JIT dumps;
 # relative paths are resolved from the directory containing this file.
 # dump_directory = "./dump/jit"
-# Aggregate low-overhead JIT counters written during coordinated shutdown.
-performance_report = "./dump/jit-performance.toml"
+# Directory receiving timestamped low-overhead JIT reports at coordinated shutdown.
+performance_report_directory = "./dump/jit-perf/"
 
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by

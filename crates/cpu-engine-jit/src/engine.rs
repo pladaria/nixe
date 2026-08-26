@@ -110,12 +110,12 @@ impl JitProvider {
     }
 
     fn configured_performance_report(&self) -> Result<Option<Arc<JitPerformanceReport>>, Box<str>> {
-        let Some(path) = self.configuration.performance_report() else {
+        let Some(directory) = self.configuration.performance_report_directory() else {
             return Ok(None);
         };
         match self
             .performance_report
-            .get_or_init(|| JitPerformanceReport::new(path).map(Arc::new))
+            .get_or_init(|| JitPerformanceReport::new(directory).map(Arc::new))
         {
             Ok(report) => Ok(Some(Arc::clone(report))),
             Err(detail) => Err(detail.clone()),
@@ -1812,12 +1812,12 @@ mod tests {
     }
 
     #[test]
-    fn configured_performance_report_is_written_at_domain_shutdown() {
+    fn configured_timestamped_performance_report_is_written_at_domain_shutdown() {
         let dump = TemporaryDumpDirectory::new();
-        let report_path = dump.path().join("jit-performance.toml");
+        let report_directory = dump.path().join("performance");
         let compilation_dump = dump.path().join("jit");
         let configuration = JitConfiguration::default()
-            .with_performance_report(Some(report_path.clone()))
+            .with_performance_report_directory(Some(report_directory.clone()))
             .with_dump_directory(Some(compilation_dump.clone()));
         let provider = JitProvider::with_configuration(configuration);
         let binding_memory = ExecutionMemory::new();
@@ -1885,6 +1885,10 @@ mod tests {
         drop(executor);
         domain.shutdown().unwrap();
 
+        let report_path = only_file(&report_directory);
+        let report_name = report_path.file_name().unwrap().to_str().unwrap();
+        assert!(report_name.starts_with("jit-performance-"));
+        assert!(report_name.ends_with(".toml"));
         let report = fs::read_to_string(report_path).unwrap();
         toml::from_str::<toml::Value>(&report).unwrap();
         assert!(report.contains("nixe_jit_performance_version=10"));
@@ -1989,6 +1993,16 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        entries.into_iter().next().unwrap()
+    }
+
+    fn only_file(parent: &Path) -> PathBuf {
+        let entries: Vec<_> = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
             .collect();
         assert_eq!(entries.len(), 1);
         entries.into_iter().next().unwrap()
@@ -3863,9 +3877,10 @@ mod tests {
     #[test]
     fn unrelated_executable_writes_do_not_force_native_safepoints() {
         let dump = TemporaryDumpDirectory::new();
-        let report_path = dump.path().join("jit-performance.toml");
+        let report_directory = dump.path().join("performance");
         let provider = JitProvider::with_configuration(
-            JitConfiguration::default().with_performance_report(Some(report_path.clone())),
+            JitConfiguration::default()
+                .with_performance_report_directory(Some(report_directory.clone())),
         );
         let binding_memory = ExecutionMemory::new();
         let mut domain = provider
@@ -3942,7 +3957,7 @@ mod tests {
         executor.prepare_shutdown(binding, &state).unwrap();
         drop(executor);
         domain.shutdown().unwrap();
-        let performance = fs::read_to_string(report_path).unwrap();
+        let performance = fs::read_to_string(only_file(&report_directory)).unwrap();
         assert!(performance.contains("helper_system_polls=0"));
         assert!(performance.contains("invalidation_checks_filtered=10"));
     }

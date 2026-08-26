@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use nixe_cpu::ir::region::IrRegion;
 use nixe_cpu_engine::{EngineDomainId, EngineExecutorId};
 
@@ -28,38 +29,45 @@ pub(crate) struct JitPerformanceReport {
 }
 
 impl JitPerformanceReport {
-    pub(crate) fn new(path: &Path) -> Result<Self, Box<str>> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "cannot create JIT performance report directory {}: {error}",
-                    parent.display()
-                )
-                .into_boxed_str()
-            })?;
-        }
-        let started_unix_ms = SystemTime::now()
+    pub(crate) fn new(directory: &Path) -> Result<Self, Box<str>> {
+        fs::create_dir_all(directory).map_err(|error| {
+            format!(
+                "cannot create JIT performance report directory {}: {error}",
+                directory.display()
+            )
+            .into_boxed_str()
+        })?;
+        let started = SystemTime::now();
+        let started_unix_ms = started
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
+        let timestamp: DateTime<Utc> = started.into();
+        let path = directory.join(format!(
+            "jit-performance-{}-{}.toml",
+            timestamp.format("%Y%m%dT%H%M%S%.3fZ"),
+            std::process::id()
+        ));
         let header = format!(
             "nixe_jit_performance_version={REPORT_VERSION}\nprocess_id={}\nstarted_unix_ms={started_unix_ms}\nhost_debug_assertions={}\nlight_tier=\"cranelift-none-single-pass-synchronous\"\nlight_cranelift_verifier={}\noptimized_tier=\"cranelift-speed-backtracking-asynchronous\"\noptimized_cranelift_verifier=true\nhot_promotion_entries=100\npromotion_queue=\"lifo-deduplicated-direct-publication\"\ncompilation_workers_policy=\"max(1,host_logical_cores/2)\"\ncranelift_pass_timing=true\nnative_poll_fast_path=true\nlink_pic_policy=\"four-way-round-robin-replacement\"\nguest_invalidation_prefilter=true\ninstruction_boundary=\"entry-hoisted-control-ssa-budget-shared-exit\"\n",
             std::process::id(),
             cfg!(debug_assertions),
             cfg!(debug_assertions),
         );
-        fs::write(path, header).map_err(|error| {
-            format!(
-                "cannot initialize JIT performance report {}: {error}",
-                path.display()
-            )
-            .into_boxed_str()
-        })?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut report| report.write_all(header.as_bytes()))
+            .map_err(|error| {
+                format!(
+                    "cannot initialize JIT performance report {}: {error}",
+                    path.display()
+                )
+                .into_boxed_str()
+            })?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
             write_lock: Mutex::new(()),
         })
     }

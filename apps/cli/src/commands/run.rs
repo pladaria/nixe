@@ -332,7 +332,7 @@ fn select_cpu_engines(
     )
     .map_err(|error| format!("invalid JIT resource configuration: {error}"))?
     .with_dump_directory(configuration.jit.dump_directory.clone())
-    .with_performance_report(configuration.jit.performance_report.clone());
+    .with_performance_report_directory(configuration.jit.performance_report_directory.clone());
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
     let jit: Arc<dyn EngineProvider> = Arc::new(JitProvider::with_configuration(jit_configuration));
     let registry = EngineRegistry::new([Arc::clone(&jit), Arc::clone(&interpreter)]);
@@ -403,7 +403,7 @@ mod engine_selection_tests {
                 max_cache_bytes: 8 * 1024 * 1024,
                 max_concurrent_compilations: 2,
                 dump_directory: Some("jit-diagnostics".into()),
-                performance_report: Some("jit-performance.toml".into()),
+                performance_report_directory: Some("jit-performance".into()),
             },
         };
 

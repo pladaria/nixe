@@ -25,7 +25,7 @@ pub struct JitConfiguration {
     max_cache_bytes: usize,
     max_concurrent_compilations: usize,
     dump_directory: Option<PathBuf>,
-    performance_report: Option<PathBuf>,
+    performance_report_directory: Option<PathBuf>,
 }
 
 impl JitConfiguration {
@@ -59,7 +59,7 @@ impl JitConfiguration {
             max_cache_bytes,
             max_concurrent_compilations,
             dump_directory: None,
-            performance_report: None,
+            performance_report_directory: None,
         })
     }
 
@@ -72,8 +72,12 @@ impl JitConfiguration {
 
     /// Enables one aggregate low-overhead performance report per application run.
     #[must_use]
-    pub fn with_performance_report(mut self, performance_report: Option<PathBuf>) -> Self {
-        self.performance_report = performance_report.filter(|path| !path.as_os_str().is_empty());
+    pub fn with_performance_report_directory(
+        mut self,
+        performance_report_directory: Option<PathBuf>,
+    ) -> Self {
+        self.performance_report_directory =
+            performance_report_directory.filter(|path| !path.as_os_str().is_empty());
         self
     }
 
@@ -98,8 +102,8 @@ impl JitConfiguration {
     }
 
     #[must_use]
-    pub fn performance_report(&self) -> Option<&Path> {
-        self.performance_report.as_deref()
+    pub fn performance_report_directory(&self) -> Option<&Path> {
+        self.performance_report_directory.as_deref()
     }
 }
 
@@ -110,7 +114,7 @@ impl Default for JitConfiguration {
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             max_concurrent_compilations: DEFAULT_MAX_CONCURRENT_COMPILATIONS,
             dump_directory: None,
-            performance_report: None,
+            performance_report_directory: None,
         }
     }
 }
@@ -193,8 +197,8 @@ mod tests {
         );
         assert_eq!(
             JitConfiguration::default()
-                .with_performance_report(Some(PathBuf::new()))
-                .performance_report(),
+                .with_performance_report_directory(Some(PathBuf::new()))
+                .performance_report_directory(),
             None
         );
     }
