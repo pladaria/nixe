@@ -28,9 +28,9 @@ use nixe_cpu::{
     ir::{
         block::{BlockId, IrBlock},
         op::{
-            AddressOperation, ArithmeticFlagOutput, AtomicOperation, Condition, ExclusiveOperation,
-            FlagOperation, GuestAddressWidth, IntegerBinaryKind, IntegerPredicate, IrOperation,
-            MemoryOperation, OperationKind, ScalarOperation, ShiftKind, StateRegister,
+            AddressOperation, AtomicOperation, Condition, ExclusiveOperation, FlagBit,
+            FlagOperation, FlagState, GuestAddressWidth, IntegerBinaryKind, IntegerPredicate,
+            IrOperation, MemoryOperation, OperationKind, ScalarOperation, ShiftKind, StateRegister,
             VectorOperation,
         },
         region::{IrRegion, RegionSafepointKind},
@@ -189,6 +189,51 @@ struct StateSlot {
     dirty: bool,
 }
 
+#[derive(Clone)]
+enum DeferredFlags {
+    CanonicalPacked(ir::Value),
+    Packed(ir::Value),
+    Add {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        result: Option<ir::Value>,
+    },
+    AddCarry {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        carry: ir::Value,
+        result: Option<ir::Value>,
+    },
+    Subtract {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        result: Option<ir::Value>,
+    },
+    SubtractCarry {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        carry: ir::Value,
+        result: Option<ir::Value>,
+    },
+    LogicalAnd {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        result: Option<ir::Value>,
+    },
+    Select {
+        condition: ir::Value,
+        when_true: Box<DeferredFlags>,
+        when_false: Box<DeferredFlags>,
+    },
+}
+
+#[derive(Clone)]
+enum LoweredValue {
+    Native(ir::Value),
+    GuestAddress(ir::Value),
+    DeferredFlags(DeferredFlags),
+}
+
 #[derive(Default)]
 struct StateAccessPlan {
     accessed: HashSet<StateRegister>,
@@ -216,6 +261,8 @@ struct LoweringState {
     interrupt_pending_address: Option<ir::Value>,
     execution_state: Variable,
     state: Vec<StateSlot>,
+    current_flags: Option<DeferredFlags>,
+    flags_live_in: Vec<bool>,
     blocks: Vec<ir::Block>,
     boundary_exit: ir::Block,
     exit: ir::Block,
@@ -685,6 +732,7 @@ fn lower_region_body(
     let imported_state = load(builder, types::I32, frame, FRAME_OFFSETS.execution_state)?;
     builder.def_var(execution_state, imported_state);
     let state_plan = state_access_plan(region);
+    let flags_live_in = flag_liveness(region);
     let state = declare_state(
         builder,
         region.metadata.start.execution_state,
@@ -701,6 +749,8 @@ fn lower_region_body(
         interrupt_pending_address,
         execution_state,
         state,
+        current_flags: None,
+        flags_live_in,
         blocks,
         boundary_exit,
         exit,
@@ -712,6 +762,7 @@ fn lower_region_body(
         link_sites: Vec::new(),
         helper_call_conv,
     };
+    reset_current_flags(builder, &mut lowering)?;
 
     if let Some(promotion_address) = promotion_address {
         emit_hotness_counter(builder, &lowering, promotion_address)?;
@@ -731,6 +782,7 @@ fn lower_region_body(
     for (index, block) in region.blocks.iter().enumerate() {
         check_cancellation(cancellation)?;
         builder.switch_to_block(lowering.blocks[index]);
+        reset_current_flags(builder, &mut lowering)?;
         lower_block(
             builder,
             region,
@@ -855,6 +907,7 @@ fn emit_entry_dispatch(
     let pc = state_value_for(builder, lowering, pc_register)?;
     for (index, entry) in region.metadata.entries.iter().enumerate() {
         let target = lowering.blocks[entry.block.index() as usize];
+        let enter = builder.create_block();
         let matches = builder
             .ins()
             .icmp_imm_s(IntCC::Equal, pc, entry.location.pc.get() as i64);
@@ -863,7 +916,10 @@ fn emit_entry_dispatch(
         } else {
             builder.create_block()
         };
-        builder.ins().brif(matches, target, &[], next, &[]);
+        builder.ins().brif(matches, enter, &[], next, &[]);
+        builder.switch_to_block(enter);
+        emit_block_entry_preamble(builder, region, entry.block, lowering)?;
+        builder.ins().jump(target, &[]);
         if next != invalid_entry {
             builder.switch_to_block(next);
         }
@@ -881,22 +937,13 @@ fn lower_block(
 ) -> Result<(), CompilerError> {
     let mut values = BTreeMap::new();
     let mut operation_index = 0;
-    if region
-        .metadata
-        .safepoints
-        .iter()
-        .any(|safepoint| safepoint.block == id && safepoint.kind == RegionSafepointKind::Entry)
-    {
-        // Internal edges can reach any published entry, so an entry poll must
-        // export that entry rather than the last instruction in its predecessor.
-        set_current_location(builder, lowering, block.metadata.start)?;
-        emit_control_poll(builder, lowering, block.metadata.start)?;
-    }
-    for source in &block.metadata.sources {
+    for (source_index, source) in block.metadata.sources.iter().enumerate() {
         check_cancellation(cancellation)?;
         set_source_location(builder, lowering, source.location)?;
-        set_current_location(builder, lowering, source.location)?;
-        emit_instruction_boundary(builder, lowering, source.location)?;
+        if source_index != 0 {
+            set_current_location(builder, lowering, source.location)?;
+            emit_instruction_boundary(builder, lowering, source.location)?;
+        }
         while let Some(operation) = block.operations.get(operation_index) {
             if operation.source != source.location {
                 break;
@@ -913,6 +960,29 @@ fn lower_block(
         )));
     }
     lower_terminator(builder, region, id, block, lowering, &values)
+}
+
+fn emit_block_entry_preamble(
+    builder: &mut FunctionBuilder<'_>,
+    region: &IrRegion,
+    block: BlockId,
+    lowering: &LoweringState,
+) -> Result<(), CompilerError> {
+    let block_data = &region.blocks[block.index() as usize];
+    let location = block_data.metadata.start;
+    set_current_location(builder, lowering, location)?;
+    if region
+        .metadata
+        .safepoints
+        .iter()
+        .any(|safepoint| safepoint.block == block && safepoint.kind == RegionSafepointKind::Entry)
+    {
+        emit_control_poll(builder, lowering, location)?;
+    }
+    if let Some(source) = block_data.metadata.sources.first() {
+        emit_instruction_boundary(builder, lowering, source.location)?;
+    }
+    Ok(())
 }
 
 fn check_cancellation(cancellation: CompilationCancellation<'_>) -> Result<(), CompilerError> {
@@ -976,17 +1046,36 @@ fn emit_instruction_boundary(
         (available, kind, zero)
     };
     let execute = builder.create_block();
-    builder.ins().brif(
-        can_execute,
-        execute,
-        &[],
-        lowering.boundary_exit,
-        &[
+    let deferred_exit = lowering
+        .current_flags
+        .as_ref()
+        .filter(|flags| !matches!(flags, DeferredFlags::CanonicalPacked(_)))
+        .map(|_| builder.create_block());
+    let exit = deferred_exit.unwrap_or(lowering.boundary_exit);
+    let exit_arguments = if deferred_exit.is_some() {
+        Vec::new()
+    } else {
+        vec![
             BlockArg::from(kind),
             BlockArg::from(source_pc),
             BlockArg::from(payload),
-        ],
-    );
+        ]
+    };
+    builder
+        .ins()
+        .brif(can_execute, execute, &[], exit, &exit_arguments);
+    if let Some(deferred_exit) = deferred_exit {
+        builder.switch_to_block(deferred_exit);
+        commit_current_flags(builder, lowering);
+        builder.ins().jump(
+            lowering.boundary_exit,
+            &[
+                BlockArg::from(kind),
+                BlockArg::from(source_pc),
+                BlockArg::from(payload),
+            ],
+        );
+    }
     builder.switch_to_block(execute);
     Ok(())
 }
@@ -1147,32 +1236,52 @@ fn lower_operation(
     builder: &mut FunctionBuilder<'_>,
     lowering: &mut LoweringState,
     operation: &IrOperation,
-    values: &mut BTreeMap<ValueId, ir::Value>,
+    values: &mut BTreeMap<ValueId, LoweredValue>,
 ) -> Result<(), CompilerError> {
     let source = operation.source;
     let results = match &operation.kind {
-        OperationKind::Constant(value) => vec![immediate(builder, *value)],
-        OperationKind::Scalar(operation) => lower_scalar(builder, *operation, values)?,
-        OperationKind::Address(operation) => vec![lower_address(builder, *operation, values)?],
+        OperationKind::Constant(value) => vec![lowered_immediate(builder, *value)],
+        OperationKind::Scalar(operation) => {
+            native_values(lower_scalar(builder, *operation, values)?)
+        }
+        OperationKind::Address(operation) => vec![LoweredValue::GuestAddress(lower_address(
+            builder, *operation, values,
+        )?)],
         OperationKind::ReadState(register) => {
-            vec![state_value_for(builder, lowering, *register)?]
+            vec![LoweredValue::Native(state_value_for(
+                builder, lowering, *register,
+            )?)]
         }
         OperationKind::WriteState { register, value } => {
             let value = operand(builder, values, *value)?;
             define_state(builder, lowering, *register, value)?;
             Vec::new()
         }
+        OperationKind::ReadFlags(FlagState::A64Nzcv) => vec![LoweredValue::DeferredFlags(
+            lowering.current_flags.clone().ok_or_else(|| {
+                CompilerError::new("A64 flags are unavailable in this lowered region")
+            })?,
+        )],
+        OperationKind::WriteFlags {
+            state: FlagState::A64Nzcv,
+            flags,
+        } => {
+            lowering.current_flags = Some(flags_operand(values, *flags)?);
+            Vec::new()
+        }
         OperationKind::Flags(operation) => vec![lower_flags(builder, *operation, values)?],
-        OperationKind::Vector(operation) => lower_vector(builder, *operation, values)?,
+        OperationKind::Vector(operation) => {
+            native_values(lower_vector(builder, *operation, values)?)
+        }
         OperationKind::Memory(operation) => {
-            lower_memory(builder, lowering, *operation, source, values)?
+            native_values(lower_memory(builder, lowering, *operation, source, values)?)
         }
         OperationKind::Barrier(_) => {
             builder.ins().fence();
             Vec::new()
         }
         OperationKind::ProcessorHint(operation) => {
-            lower_processor_hint(builder, lowering, *operation, source)?
+            native_values(lower_processor_hint(builder, lowering, *operation, source)?)
         }
         OperationKind::RuntimeRegisterRead(key) => {
             let key = builder.ins().iconst(types::I64, i64::from(*key));
@@ -1184,12 +1293,12 @@ fn lower_operation(
             builder.switch_to_block(failure);
             emit_exit(builder, lowering, EXIT_INTERNAL, 0, source.pc.get(), 0, 0);
             builder.switch_to_block(complete);
-            vec![load(
+            native_values(vec![load(
                 builder,
                 types::I64,
                 lowering.frame,
                 FRAME_OFFSETS.scratch_results,
-            )?]
+            )?])
         }
         OperationKind::CacheMaintenance(operation) => {
             let address = operation
@@ -1232,24 +1341,23 @@ fn lower_operation(
             builder.switch_to_block(unreachable);
             Vec::new()
         }
-        OperationKind::Exclusive(operation) => {
-            lower_exclusive(builder, lowering, *operation, source, values)?
-        }
+        OperationKind::Exclusive(operation) => native_values(lower_exclusive(
+            builder, lowering, *operation, source, values,
+        )?),
         OperationKind::Atomic(operation) => {
-            lower_atomic(builder, lowering, *operation, source, values)?
+            native_values(lower_atomic(builder, lowering, *operation, source, values)?)
         }
-        OperationKind::Helper(helper) => lower_named_helper(
-            builder,
-            lowering,
-            helper,
-            source,
-            &operation
+        OperationKind::Helper(helper) => {
+            let result_types = operation
                 .results
                 .iter()
                 .map(|value| value.ty)
-                .collect::<Vec<_>>(),
-            values,
-        )?,
+                .collect::<Vec<_>>();
+            wrap_typed_values(
+                lower_named_helper(builder, lowering, helper, source, &result_types, values)?,
+                &result_types,
+            )
+        }
         OperationKind::FloatingPoint(_) => {
             return Err(CompilerError::new(format!(
                 "exact helper lowering is not connected for {:?}",
@@ -1274,7 +1382,7 @@ fn lower_atomic(
     lowering: &LoweringState,
     operation: AtomicOperation,
     source: LocationDescriptor,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     if let AtomicOperation::CompareExchangePair {
         address,
@@ -1418,7 +1526,7 @@ fn lower_atomic(
 fn lower_scalar(
     builder: &mut FunctionBuilder<'_>,
     operation: ScalarOperation,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     Ok(match operation {
         ScalarOperation::Binary { kind, lhs, rhs } => {
@@ -1426,69 +1534,25 @@ fn lower_scalar(
             let rhs = operand(builder, values, rhs)?;
             vec![lower_binary(builder, kind, lhs, rhs)]
         }
-        ScalarOperation::AddWithCarry {
-            lhs,
-            rhs,
-            carry_in,
-            flags,
-        } => {
+        ScalarOperation::AddCarry { lhs, rhs, carry_in } => {
             let lhs = operand(builder, values, lhs)?;
             let rhs = operand(builder, values, rhs)?;
             let carry = operand(builder, values, carry_in)?;
             let ty = builder.func.dfg.value_type(lhs);
             let carry = builder.ins().uextend(ty, carry);
-            let (partial, carry0) = builder.ins().uadd_overflow(lhs, rhs);
-            let (result, carry1) = builder.ins().uadd_overflow(partial, carry);
-            let carry_out = builder.ins().bor(carry0, carry1);
-            let (signed_partial, overflow0) = builder.ins().sadd_overflow(lhs, rhs);
-            let (_, overflow1) = builder.ins().sadd_overflow(signed_partial, carry);
-            let overflow = builder.ins().bor(overflow0, overflow1);
-            let mut results = vec![result];
-            if flags != ArithmeticFlagOutput::None {
-                results.push(carry_out);
-            }
-            if flags == ArithmeticFlagOutput::CarryAndOverflow {
-                results.push(overflow);
-            }
-            results
+            let partial = builder.ins().iadd(lhs, rhs);
+            vec![builder.ins().iadd(partial, carry)]
         }
-        ScalarOperation::UnsignedOverflow {
-            operation,
-            lhs,
-            rhs,
-            result,
-        } => {
+        ScalarOperation::SubtractCarry { lhs, rhs, carry_in } => {
             let lhs = operand(builder, values, lhs)?;
             let rhs = operand(builder, values, rhs)?;
-            let result = operand(builder, values, result)?;
-            let overflow = match operation {
-                IntegerBinaryKind::Add => builder.ins().icmp(IntCC::UnsignedLessThan, result, lhs),
-                IntegerBinaryKind::Subtract => {
-                    builder
-                        .ins()
-                        .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs, rhs)
-                }
-                _ => return Err(CompilerError::new("invalid unsigned-overflow operation")),
-            };
-            vec![overflow]
-        }
-        ScalarOperation::SignedOverflow {
-            operation,
-            lhs,
-            rhs,
-            result,
-        } => {
-            let lhs = operand(builder, values, lhs)?;
-            let rhs = operand(builder, values, rhs)?;
-            let result = operand(builder, values, result)?;
-            let lhs_result = builder.ins().bxor(lhs, result);
-            let other = match operation {
-                IntegerBinaryKind::Add => builder.ins().bxor(rhs, result),
-                IntegerBinaryKind::Subtract => builder.ins().bxor(lhs, rhs),
-                _ => return Err(CompilerError::new("invalid signed-overflow operation")),
-            };
-            let combined = builder.ins().band(lhs_result, other);
-            vec![builder.ins().icmp_imm_s(IntCC::SignedLessThan, combined, 0)]
+            let carry = operand(builder, values, carry_in)?;
+            let ty = builder.func.dfg.value_type(lhs);
+            let carry = builder.ins().uextend(ty, carry);
+            let one = builder.ins().iconst(ty, 1);
+            let borrow = builder.ins().isub(one, carry);
+            let partial = builder.ins().isub(lhs, rhs);
+            vec![builder.ins().isub(partial, borrow)]
         }
         ScalarOperation::Compare {
             predicate,
@@ -1551,7 +1615,7 @@ fn lower_memory(
     lowering: &LoweringState,
     operation: MemoryOperation,
     source: LocationDescriptor,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     match operation {
         MemoryOperation::Load {
@@ -1714,7 +1778,7 @@ fn lower_named_helper(
     helper: &nixe_cpu::ir::op::HelperOperation,
     source: LocationDescriptor,
     result_types: &[IrType],
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     if let Some(results) = lower_native_named_helper(builder, helper, result_types, values)? {
         lowering.native_named_operations = lowering.native_named_operations.saturating_add(1);
@@ -1742,7 +1806,7 @@ fn lower_named_helper(
         result_types: result_types.to_vec().into_boxed_slice(),
     });
     for (argument_index, argument) in helper.arguments.iter().enumerate() {
-        let value = operand(builder, values, *argument)?;
+        let value = materialized_operand(builder, values, *argument)?;
         store_scratch(
             builder,
             lowering.frame,
@@ -1800,7 +1864,7 @@ fn lower_native_named_helper(
     builder: &mut FunctionBuilder<'_>,
     helper: &nixe_cpu::ir::op::HelperOperation,
     result_types: &[IrType],
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Option<Vec<ir::Value>>, CompilerError> {
     if helper.helper.as_ref() == "a64.fp-simd.semantic-vector"
         && let Some(results) = lower_native_a64_semantic_vector(builder, helper, values)?
@@ -1846,7 +1910,7 @@ fn lower_native_named_helper(
     let arguments = helper
         .arguments
         .iter()
-        .map(|argument| operand(builder, values, *argument))
+        .map(|argument| materialized_operand(builder, values, *argument))
         .collect::<Result<Vec<_>, _>>()?;
     let results = match helper.helper.as_ref() {
         "a64.extend-register" | "a64.load-store-register-offset" => {
@@ -2178,7 +2242,7 @@ fn semantic_fields(
 fn lower_native_a64_semantic_vector(
     builder: &mut FunctionBuilder<'_>,
     helper: &nixe_cpu::ir::op::HelperOperation,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Option<Vec<ir::Value>>, CompilerError> {
     let token = helper_immediate(helper, 0)?;
     let instruction = semantic_instruction(token);
@@ -2220,7 +2284,7 @@ fn lower_native_a64_semantic_vector(
     let arguments = helper
         .arguments
         .iter()
-        .map(|argument| operand(builder, values, *argument))
+        .map(|argument| materialized_operand(builder, values, *argument))
         .collect::<Result<Vec<_>, _>>()?;
     if arguments.len() != inputs.argument_count() {
         return Err(CompilerError::new(
@@ -3815,7 +3879,7 @@ fn lower_exclusive(
     lowering: &LoweringState,
     operation: ExclusiveOperation,
     source: LocationDescriptor,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     match operation {
         ExclusiveOperation::Load {
@@ -4627,7 +4691,7 @@ fn lower_shift(
 fn lower_address(
     builder: &mut FunctionBuilder<'_>,
     operation: AddressOperation,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<ir::Value, CompilerError> {
     Ok(match operation {
         AddressOperation::FromInteger { value, width } => {
@@ -4686,55 +4750,383 @@ fn lower_address(
 fn lower_flags(
     builder: &mut FunctionBuilder<'_>,
     operation: FlagOperation,
-    values: &BTreeMap<ValueId, ir::Value>,
-) -> Result<ir::Value, CompilerError> {
+    values: &BTreeMap<ValueId, LoweredValue>,
+) -> Result<LoweredValue, CompilerError> {
     Ok(match operation {
-        FlagOperation::FromArithmetic {
-            result,
-            carry,
-            overflow,
-        } => {
-            let result = operand(builder, values, result)?;
-            let carry = operand(builder, values, carry)?;
-            let overflow = operand(builder, values, overflow)?;
-            flags_from_result(builder, result, carry, overflow)
+        FlagOperation::Add { lhs, rhs, result } => {
+            LoweredValue::DeferredFlags(DeferredFlags::Add {
+                lhs: operand(builder, values, lhs)?,
+                rhs: operand(builder, values, rhs)?,
+                result: result
+                    .map(|value| operand(builder, values, value))
+                    .transpose()?,
+            })
         }
-        FlagOperation::FromLogical { result, carry } => {
-            let result = operand(builder, values, result)?;
-            let carry = operand(builder, values, carry)?;
-            let overflow = builder.ins().iconst(types::I8, 0);
-            flags_from_result(builder, result, carry, overflow)
+        FlagOperation::AddCarry {
+            lhs,
+            rhs,
+            carry_in,
+            result,
+        } => LoweredValue::DeferredFlags(DeferredFlags::AddCarry {
+            lhs: operand(builder, values, lhs)?,
+            rhs: operand(builder, values, rhs)?,
+            carry: operand(builder, values, carry_in)?,
+            result: result
+                .map(|value| operand(builder, values, value))
+                .transpose()?,
+        }),
+        FlagOperation::Subtract { lhs, rhs, result } => {
+            LoweredValue::DeferredFlags(DeferredFlags::Subtract {
+                lhs: operand(builder, values, lhs)?,
+                rhs: operand(builder, values, rhs)?,
+                result: result
+                    .map(|value| operand(builder, values, value))
+                    .transpose()?,
+            })
+        }
+        FlagOperation::SubtractCarry {
+            lhs,
+            rhs,
+            carry_in,
+            result,
+        } => LoweredValue::DeferredFlags(DeferredFlags::SubtractCarry {
+            lhs: operand(builder, values, lhs)?,
+            rhs: operand(builder, values, rhs)?,
+            carry: operand(builder, values, carry_in)?,
+            result: result
+                .map(|value| operand(builder, values, value))
+                .transpose()?,
+        }),
+        FlagOperation::LogicalAnd { lhs, rhs, result } => {
+            LoweredValue::DeferredFlags(DeferredFlags::LogicalAnd {
+                lhs: operand(builder, values, lhs)?,
+                rhs: operand(builder, values, rhs)?,
+                result: result
+                    .map(|value| operand(builder, values, value))
+                    .transpose()?,
+            })
         }
         FlagOperation::FromPacked { value } => {
             let value = operand(builder, values, value)?;
-            builder.ins().band_imm_s(value, 0xf000_0000_u32 as i64)
+            LoweredValue::DeferredFlags(DeferredFlags::Packed(value))
+        }
+        FlagOperation::Select {
+            condition,
+            when_true,
+            when_false,
+        } => LoweredValue::DeferredFlags(DeferredFlags::Select {
+            condition: operand(builder, values, condition)?,
+            when_true: Box::new(flags_operand(values, when_true)?),
+            when_false: Box::new(flags_operand(values, when_false)?),
+        }),
+        FlagOperation::EvaluateBit { flags, bit } => {
+            let flags = flags_operand(values, flags)?;
+            let bit = match bit {
+                FlagBit::Negative => ArchitecturalFlag::Negative,
+                FlagBit::Zero => ArchitecturalFlag::Zero,
+                FlagBit::Carry => ArchitecturalFlag::Carry,
+                FlagBit::Overflow => ArchitecturalFlag::Overflow,
+            };
+            LoweredValue::Native(query_deferred_flag(builder, &flags, bit))
         }
         FlagOperation::Evaluate { flags, condition } => {
-            let flags = operand(builder, values, flags)?;
-            evaluate_condition(builder, flags, condition, true)
+            let flags = flags_operand(values, flags)?;
+            LoweredValue::Native(evaluate_deferred_condition(
+                builder, &flags, condition, true,
+            ))
         }
         FlagOperation::EvaluateEncoded {
             flags,
             condition,
             nv_is_unconditional,
         } => {
-            let flags = operand(builder, values, flags)?;
+            let flags = flags_operand(values, flags)?;
             let condition = operand(builder, values, condition)?;
-            evaluate_encoded_condition(builder, flags, condition, nv_is_unconditional)
+            LoweredValue::Native(evaluate_deferred_encoded_condition(
+                builder,
+                &flags,
+                condition,
+                nv_is_unconditional,
+            ))
         }
-        FlagOperation::Materialize { flags } => operand(builder, values, flags)?,
+        FlagOperation::Materialize { flags } => LoweredValue::Native(materialize_deferred_flags(
+            builder,
+            &flags_operand(values, flags)?,
+        )),
     })
 }
 
-fn flags_from_result(
+#[derive(Clone, Copy)]
+enum ArchitecturalFlag {
+    Negative,
+    Zero,
+    Carry,
+    Overflow,
+}
+
+fn deferred_result(builder: &mut FunctionBuilder<'_>, flags: &DeferredFlags) -> ir::Value {
+    match flags {
+        DeferredFlags::Add { lhs, rhs, result } => {
+            result.unwrap_or_else(|| builder.ins().iadd(*lhs, *rhs))
+        }
+        DeferredFlags::AddCarry {
+            lhs,
+            rhs,
+            carry,
+            result,
+        } => result.unwrap_or_else(|| {
+            let ty = builder.func.dfg.value_type(*lhs);
+            let carry = builder.ins().uextend(ty, *carry);
+            let partial = builder.ins().iadd(*lhs, *rhs);
+            builder.ins().iadd(partial, carry)
+        }),
+        DeferredFlags::Subtract { lhs, rhs, result } => {
+            result.unwrap_or_else(|| builder.ins().isub(*lhs, *rhs))
+        }
+        DeferredFlags::SubtractCarry {
+            lhs,
+            rhs,
+            carry,
+            result,
+        } => result.unwrap_or_else(|| {
+            let ty = builder.func.dfg.value_type(*lhs);
+            let carry = builder.ins().uextend(ty, *carry);
+            let one = builder.ins().iconst(ty, 1);
+            let borrow = builder.ins().isub(one, carry);
+            let partial = builder.ins().isub(*lhs, *rhs);
+            builder.ins().isub(partial, borrow)
+        }),
+        DeferredFlags::LogicalAnd { lhs, rhs, result } => {
+            result.unwrap_or_else(|| builder.ins().band(*lhs, *rhs))
+        }
+        DeferredFlags::CanonicalPacked(_)
+        | DeferredFlags::Packed(_)
+        | DeferredFlags::Select { .. } => {
+            unreachable!("packed and selected flags do not have one arithmetic result")
+        }
+    }
+}
+
+fn query_deferred_flag(
     builder: &mut FunctionBuilder<'_>,
-    result: ir::Value,
-    carry: ir::Value,
-    overflow: ir::Value,
+    flags: &DeferredFlags,
+    flag: ArchitecturalFlag,
 ) -> ir::Value {
-    let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, result, 0);
-    let zero = builder.ins().icmp_imm_s(IntCC::Equal, result, 0);
+    if let DeferredFlags::CanonicalPacked(packed) | DeferredFlags::Packed(packed) = flags {
+        let shift = match flag {
+            ArchitecturalFlag::Negative => 31,
+            ArchitecturalFlag::Zero => 30,
+            ArchitecturalFlag::Carry => 29,
+            ArchitecturalFlag::Overflow => 28,
+        };
+        let bit = builder.ins().ushr_imm_s(*packed, shift);
+        let bit = builder.ins().band_imm_s(bit, 1);
+        return builder.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+    }
+    if let DeferredFlags::Select {
+        condition,
+        when_true,
+        when_false,
+    } = flags
+    {
+        let when_true = query_deferred_flag(builder, when_true, flag);
+        let when_false = query_deferred_flag(builder, when_false, flag);
+        return builder.ins().select(*condition, when_true, when_false);
+    }
+    if matches!(flag, ArchitecturalFlag::Negative | ArchitecturalFlag::Zero) {
+        let result = deferred_result(builder, flags);
+        return builder.ins().icmp_imm_s(
+            if matches!(flag, ArchitecturalFlag::Negative) {
+                IntCC::SignedLessThan
+            } else {
+                IntCC::Equal
+            },
+            result,
+            0,
+        );
+    }
+    match (flags, flag) {
+        (DeferredFlags::Add { lhs, result, .. }, ArchitecturalFlag::Carry) => {
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            builder.ins().icmp(IntCC::UnsignedLessThan, result, *lhs)
+        }
+        (
+            DeferredFlags::AddCarry {
+                lhs, carry, result, ..
+            },
+            ArchitecturalFlag::Carry,
+        ) => {
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            let wrapped = builder.ins().icmp(IntCC::UnsignedLessThan, result, *lhs);
+            let equal = builder.ins().icmp(IntCC::Equal, result, *lhs);
+            let equal_with_carry = builder.ins().band(equal, *carry);
+            builder.ins().bor(wrapped, equal_with_carry)
+        }
+        (DeferredFlags::Subtract { lhs, rhs, .. }, ArchitecturalFlag::Carry) => {
+            builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, *lhs, *rhs)
+        }
+        (
+            DeferredFlags::SubtractCarry {
+                lhs, rhs, carry, ..
+            },
+            ArchitecturalFlag::Carry,
+        ) => {
+            let greater = builder.ins().icmp(IntCC::UnsignedGreaterThan, *lhs, *rhs);
+            let equal = builder.ins().icmp(IntCC::Equal, *lhs, *rhs);
+            let equal_with_carry = builder.ins().band(equal, *carry);
+            builder.ins().bor(greater, equal_with_carry)
+        }
+        (
+            DeferredFlags::LogicalAnd { .. },
+            ArchitecturalFlag::Carry | ArchitecturalFlag::Overflow,
+        ) => builder.ins().iconst(types::I8, 0),
+        (DeferredFlags::Add { lhs, rhs, result }, ArchitecturalFlag::Overflow) => {
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            let same_sign = builder.ins().bxor(*lhs, *rhs);
+            let changed_sign = builder.ins().bxor(*lhs, result);
+            let not_same_sign = builder.ins().bnot(same_sign);
+            let overflow = builder.ins().band(not_same_sign, changed_sign);
+            builder.ins().icmp_imm_s(IntCC::SignedLessThan, overflow, 0)
+        }
+        (
+            DeferredFlags::AddCarry {
+                lhs, rhs, result, ..
+            },
+            ArchitecturalFlag::Overflow,
+        ) => {
+            let same_sign = builder.ins().bxor(*lhs, *rhs);
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            let changed_sign = builder.ins().bxor(*lhs, result);
+            let not_same_sign = builder.ins().bnot(same_sign);
+            let overflow = builder.ins().band(not_same_sign, changed_sign);
+            builder.ins().icmp_imm_s(IntCC::SignedLessThan, overflow, 0)
+        }
+        (DeferredFlags::Subtract { lhs, rhs, result }, ArchitecturalFlag::Overflow) => {
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            let different_sign = builder.ins().bxor(*lhs, *rhs);
+            let changed_sign = builder.ins().bxor(*lhs, result);
+            let overflow = builder.ins().band(different_sign, changed_sign);
+            builder.ins().icmp_imm_s(IntCC::SignedLessThan, overflow, 0)
+        }
+        (
+            DeferredFlags::SubtractCarry {
+                lhs, rhs, result, ..
+            },
+            ArchitecturalFlag::Overflow,
+        ) => {
+            let different_sign = builder.ins().bxor(*lhs, *rhs);
+            let result = result.unwrap_or_else(|| deferred_result(builder, flags));
+            let changed_sign = builder.ins().bxor(*lhs, result);
+            let overflow = builder.ins().band(different_sign, changed_sign);
+            builder.ins().icmp_imm_s(IntCC::SignedLessThan, overflow, 0)
+        }
+        _ => unreachable!("packed and selected flags were handled above"),
+    }
+}
+
+fn materialize_deferred_flags(
+    builder: &mut FunctionBuilder<'_>,
+    flags: &DeferredFlags,
+) -> ir::Value {
+    let negative = query_deferred_flag(builder, flags, ArchitecturalFlag::Negative);
+    let zero = query_deferred_flag(builder, flags, ArchitecturalFlag::Zero);
+    let carry = query_deferred_flag(builder, flags, ArchitecturalFlag::Carry);
+    let overflow = query_deferred_flag(builder, flags, ArchitecturalFlag::Overflow);
     pack_flags(builder, negative, zero, carry, overflow)
+}
+
+fn evaluate_deferred_condition(
+    builder: &mut FunctionBuilder<'_>,
+    flags: &DeferredFlags,
+    condition: Condition,
+    nv_is_unconditional: bool,
+) -> ir::Value {
+    let query = |builder: &mut FunctionBuilder<'_>, flag| query_deferred_flag(builder, flags, flag);
+    let invert = |builder: &mut FunctionBuilder<'_>, value| {
+        let one = builder.ins().iconst(types::I8, 1);
+        builder.ins().bxor(value, one)
+    };
+    match condition {
+        Condition::Eq => query(builder, ArchitecturalFlag::Zero),
+        Condition::Ne => {
+            let value = query(builder, ArchitecturalFlag::Zero);
+            invert(builder, value)
+        }
+        Condition::Cs => query(builder, ArchitecturalFlag::Carry),
+        Condition::Cc => {
+            let value = query(builder, ArchitecturalFlag::Carry);
+            invert(builder, value)
+        }
+        Condition::Mi => query(builder, ArchitecturalFlag::Negative),
+        Condition::Pl => {
+            let value = query(builder, ArchitecturalFlag::Negative);
+            invert(builder, value)
+        }
+        Condition::Vs => query(builder, ArchitecturalFlag::Overflow),
+        Condition::Vc => {
+            let value = query(builder, ArchitecturalFlag::Overflow);
+            invert(builder, value)
+        }
+        Condition::Hi => {
+            let carry = query(builder, ArchitecturalFlag::Carry);
+            let zero = query(builder, ArchitecturalFlag::Zero);
+            let not_zero = invert(builder, zero);
+            builder.ins().band(carry, not_zero)
+        }
+        Condition::Ls => {
+            let carry = query(builder, ArchitecturalFlag::Carry);
+            let not_carry = invert(builder, carry);
+            let zero = query(builder, ArchitecturalFlag::Zero);
+            builder.ins().bor(not_carry, zero)
+        }
+        Condition::Ge | Condition::Lt | Condition::Gt | Condition::Le => {
+            let negative = query(builder, ArchitecturalFlag::Negative);
+            let overflow = query(builder, ArchitecturalFlag::Overflow);
+            let equal = builder.ins().icmp(IntCC::Equal, negative, overflow);
+            match condition {
+                Condition::Ge => equal,
+                Condition::Lt => invert(builder, equal),
+                Condition::Gt => {
+                    let zero = query(builder, ArchitecturalFlag::Zero);
+                    let not_zero = invert(builder, zero);
+                    builder.ins().band(not_zero, equal)
+                }
+                Condition::Le => {
+                    let zero = query(builder, ArchitecturalFlag::Zero);
+                    let different = invert(builder, equal);
+                    builder.ins().bor(zero, different)
+                }
+                _ => unreachable!(),
+            }
+        }
+        Condition::Al => builder.ins().iconst(types::I8, 1),
+        Condition::Nv if nv_is_unconditional => builder.ins().iconst(types::I8, 1),
+        Condition::Nv => builder.ins().iconst(types::I8, 0),
+    }
+}
+
+fn evaluate_deferred_encoded_condition(
+    builder: &mut FunctionBuilder<'_>,
+    flags: &DeferredFlags,
+    condition: ir::Value,
+    nv_is_unconditional: bool,
+) -> ir::Value {
+    let mut result = builder.ins().iconst(types::I8, 0);
+    for encoding in 0..16_u8 {
+        let matches = builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, condition, i64::from(encoding));
+        let candidate = evaluate_deferred_condition(
+            builder,
+            flags,
+            Condition::from_encoding(encoding),
+            nv_is_unconditional,
+        );
+        result = builder.ins().select(matches, candidate, result);
+    }
+    result
 }
 
 fn pack_flags(
@@ -4824,32 +5216,10 @@ fn bool_to_i32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value
     builder.ins().uextend(types::I32, value)
 }
 
-fn evaluate_encoded_condition(
-    builder: &mut FunctionBuilder<'_>,
-    flags: ir::Value,
-    condition: ir::Value,
-    nv_is_unconditional: bool,
-) -> ir::Value {
-    let mut result = builder.ins().iconst(types::I8, 0);
-    for encoding in 0..16_u8 {
-        let matches = builder
-            .ins()
-            .icmp_imm_s(IntCC::Equal, condition, i64::from(encoding));
-        let candidate = evaluate_condition(
-            builder,
-            flags,
-            Condition::from_encoding(encoding),
-            nv_is_unconditional,
-        );
-        result = builder.ins().select(matches, candidate, result);
-    }
-    result
-}
-
 fn lower_vector(
     builder: &mut FunctionBuilder<'_>,
     operation: VectorOperation,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<Vec<ir::Value>, CompilerError> {
     match operation {
         VectorOperation::Arithmetic {
@@ -4898,7 +5268,7 @@ fn lower_terminator(
     from: BlockId,
     block: &IrBlock,
     lowering: &mut LoweringState,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
 ) -> Result<(), CompilerError> {
     match &block.terminator {
         Terminator::Direct { target }
@@ -5070,7 +5440,7 @@ fn lower_target(
     region: &IrRegion,
     from: BlockId,
     lowering: &mut LoweringState,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
     target: ControlTarget,
     return_address: Option<GuestVirtualAddress>,
 ) -> Result<(), CompilerError> {
@@ -5078,14 +5448,18 @@ fn lower_target(
         if let Some(return_address) = return_address {
             install_call_link(builder, region, lowering, return_address)?;
         }
+        let target_location = region.blocks[block.index() as usize].metadata.start;
         if region.metadata.safepoints.iter().any(|safepoint| {
             safepoint.kind == RegionSafepointKind::BackwardEdge
                 && safepoint.block == from
                 && safepoint.target == Some(block)
         }) {
-            let target_location = region.blocks[block.index() as usize].metadata.start;
             set_current_location(builder, lowering, target_location)?;
             emit_control_poll(builder, lowering, target_location)?;
+        }
+        emit_block_entry_preamble(builder, region, block, lowering)?;
+        if lowering.flags_live_in[block.index() as usize] {
+            commit_current_flags(builder, lowering);
         }
         builder
             .ins()
@@ -5288,6 +5662,7 @@ fn emit_link(
     let site = u32::try_from(lowering.link_sites.len())
         .map_err(|_| CompilerError::new("link-site metadata index overflow"))?;
     lowering.link_sites.push(metadata);
+    commit_current_flags(builder, lowering);
     store_architectural_state(builder, lowering)?;
 
     let pointer_type = builder.func.dfg.value_type(lowering.frame);
@@ -5445,6 +5820,18 @@ fn compact_source_index(
         .ok_or_else(|| CompilerError::new("side exit source is absent from compact metadata"))
 }
 
+fn commit_current_flags(builder: &mut FunctionBuilder<'_>, lowering: &LoweringState) {
+    let Some(flags) = &lowering.current_flags else {
+        return;
+    };
+    let value = match flags {
+        DeferredFlags::CanonicalPacked(value) | DeferredFlags::Packed(value) => *value,
+        _ => materialize_deferred_flags(builder, flags),
+    };
+    define_state(builder, lowering, StateRegister::A64Nzcv, value)
+        .expect("flag state access planning includes every A64 lazy-flag definition");
+}
+
 fn emit_exit(
     builder: &mut FunctionBuilder<'_>,
     lowering: &LoweringState,
@@ -5454,6 +5841,7 @@ fn emit_exit(
     payload0: u64,
     payload1: u64,
 ) {
+    commit_current_flags(builder, lowering);
     let kind = builder.ins().iconst(types::I32, kind as i64);
     let detail = builder.ins().iconst(types::I32, detail as i64);
     let source_pc = builder.ins().iconst(types::I64, source_pc as i64);
@@ -5471,6 +5859,7 @@ fn emit_exit_dynamic(
     detail: ir::Value,
     source_pc: u64,
 ) {
+    commit_current_flags(builder, lowering);
     let kind = builder.ins().iconst(types::I32, i64::from(kind));
     let source_pc = builder.ins().iconst(types::I64, source_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
@@ -5593,6 +5982,11 @@ fn state_access_plan(region: &IrRegion) -> StateAccessPlan {
             match &operation.kind {
                 OperationKind::ReadState(register) => plan.read(*register),
                 OperationKind::WriteState { register, .. } => plan.write(*register),
+                OperationKind::ReadFlags(FlagState::A64Nzcv) => plan.read(StateRegister::A64Nzcv),
+                OperationKind::WriteFlags {
+                    state: FlagState::A64Nzcv,
+                    ..
+                } => plan.write(StateRegister::A64Nzcv),
                 _ => {}
             }
         }
@@ -5611,6 +6005,135 @@ fn state_access_plan(region: &IrRegion) -> StateAccessPlan {
         }
     }
     plan
+}
+
+fn reset_current_flags(
+    builder: &mut FunctionBuilder<'_>,
+    lowering: &mut LoweringState,
+) -> Result<(), CompilerError> {
+    lowering.current_flags = if lowering
+        .state
+        .iter()
+        .any(|slot| slot.register == StateRegister::A64Nzcv)
+    {
+        Some(DeferredFlags::CanonicalPacked(state_value_for(
+            builder,
+            lowering,
+            StateRegister::A64Nzcv,
+        )?))
+    } else {
+        None
+    };
+    Ok(())
+}
+
+fn flag_liveness(region: &IrRegion) -> Vec<bool> {
+    let count = region.blocks.len();
+    let mut uses_before_definition = vec![false; count];
+    let mut defines = vec![false; count];
+    for (index, block) in region.blocks.iter().enumerate() {
+        let mut defined = false;
+        for operation in &block.operations {
+            match operation.kind {
+                OperationKind::ReadFlags(FlagState::A64Nzcv)
+                | OperationKind::ReadState(StateRegister::A64Nzcv) => {
+                    uses_before_definition[index] |= !defined;
+                }
+                OperationKind::WriteFlags {
+                    state: FlagState::A64Nzcv,
+                    ..
+                }
+                | OperationKind::WriteState {
+                    register: StateRegister::A64Nzcv,
+                    ..
+                } => {
+                    defined = true;
+                    defines[index] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let successors = region
+        .blocks
+        .iter()
+        .map(|block| internal_successors(&block.terminator))
+        .collect::<Vec<_>>();
+    let mut live_in = vec![false; count];
+    loop {
+        let mut changed = false;
+        for index in (0..count).rev() {
+            let live_out = terminator_observes_flags(&region.blocks[index].terminator)
+                || successors[index]
+                    .iter()
+                    .any(|successor| live_in[successor.index() as usize]);
+            let carries_to_internal_boundary = !defines[index] && !successors[index].is_empty();
+            let next = uses_before_definition[index]
+                || (live_out && !defines[index])
+                || carries_to_internal_boundary;
+            changed |= next != live_in[index];
+            live_in[index] = next;
+        }
+        if !changed {
+            return live_in;
+        }
+    }
+}
+
+fn terminator_observes_flags(terminator: &Terminator) -> bool {
+    let external = |target: &ControlTarget| !matches!(target, ControlTarget::Internal { .. });
+    match terminator {
+        Terminator::Direct { target }
+        | Terminator::Indirect { target }
+        | Terminator::Return { target }
+        | Terminator::Call { target, .. } => external(target),
+        Terminator::Conditional {
+            taken, fallthrough, ..
+        }
+        | Terminator::ConditionalCall {
+            target: taken,
+            fallthrough,
+            ..
+        } => external(taken) || external(fallthrough),
+        Terminator::ConditionalException { .. }
+        | Terminator::Exception { .. }
+        | Terminator::InterpretOne { .. }
+        | Terminator::UnsupportedInstruction { .. }
+        | Terminator::Stop { .. } => true,
+    }
+}
+
+fn internal_successors(terminator: &Terminator) -> Vec<BlockId> {
+    let mut result = Vec::new();
+    let mut push = |target: &ControlTarget| {
+        if let ControlTarget::Internal { block } = target {
+            result.push(*block);
+        }
+    };
+    match terminator {
+        Terminator::Direct { target }
+        | Terminator::Indirect { target }
+        | Terminator::Return { target }
+        | Terminator::Call { target, .. } => push(target),
+        Terminator::Conditional {
+            taken, fallthrough, ..
+        }
+        | Terminator::ConditionalCall {
+            target: taken,
+            fallthrough,
+            ..
+        } => {
+            push(taken);
+            push(fallthrough);
+        }
+        Terminator::ConditionalException { fallthrough, .. } => push(fallthrough),
+        Terminator::Exception { .. }
+        | Terminator::InterpretOne { .. }
+        | Terminator::UnsupportedInstruction { .. }
+        | Terminator::Stop { .. } => {}
+    }
+    result
 }
 
 fn state_registers(execution_state: ExecutionState) -> Vec<StateRegister> {
@@ -5711,14 +6234,85 @@ fn define_state(
 
 fn operand(
     builder: &mut FunctionBuilder<'_>,
-    values: &BTreeMap<ValueId, ir::Value>,
+    values: &BTreeMap<ValueId, LoweredValue>,
     operand: Operand,
 ) -> Result<ir::Value, CompilerError> {
     match operand {
         Operand::Immediate(value) => Ok(immediate(builder, value)),
-        Operand::Value(value) => values.get(&value.id).copied().ok_or_else(|| {
-            CompilerError::new(format!("undefined lowered value %{}", value.id.index()))
-        }),
+        Operand::Value(value) => match values.get(&value.id) {
+            Some(LoweredValue::Native(value) | LoweredValue::GuestAddress(value)) => Ok(*value),
+            Some(LoweredValue::DeferredFlags(_)) => Err(CompilerError::new(format!(
+                "deferred flags %{} require an explicit flag operation or materialization",
+                value.id.index()
+            ))),
+            None => Err(CompilerError::new(format!(
+                "undefined lowered value %{}",
+                value.id.index()
+            ))),
+        },
+    }
+}
+
+fn flags_operand(
+    values: &BTreeMap<ValueId, LoweredValue>,
+    operand: Operand,
+) -> Result<DeferredFlags, CompilerError> {
+    match operand {
+        Operand::Value(value) => match values.get(&value.id) {
+            Some(LoweredValue::DeferredFlags(flags)) => Ok(flags.clone()),
+            Some(_) => Err(CompilerError::new(format!(
+                "value %{} is not a deferred flag value",
+                value.id.index()
+            ))),
+            None => Err(CompilerError::new(format!(
+                "undefined lowered flag value %{}",
+                value.id.index()
+            ))),
+        },
+        Operand::Immediate(_) => Err(CompilerError::new(
+            "flags cannot be represented by an untyped immediate operand",
+        )),
+    }
+}
+
+fn materialized_operand(
+    builder: &mut FunctionBuilder<'_>,
+    values: &BTreeMap<ValueId, LoweredValue>,
+    value_operand: Operand,
+) -> Result<ir::Value, CompilerError> {
+    match value_operand {
+        Operand::Value(value) => match values.get(&value.id) {
+            Some(LoweredValue::DeferredFlags(flags)) => {
+                Ok(materialize_deferred_flags(builder, flags))
+            }
+            _ => operand(builder, values, value_operand),
+        },
+        Operand::Immediate(_) => operand(builder, values, value_operand),
+    }
+}
+
+fn native_values(values: Vec<ir::Value>) -> Vec<LoweredValue> {
+    values.into_iter().map(LoweredValue::Native).collect()
+}
+
+fn wrap_typed_values(values: Vec<ir::Value>, types: &[IrType]) -> Vec<LoweredValue> {
+    values
+        .into_iter()
+        .zip(types)
+        .map(|(value, ty)| match ty {
+            IrType::Flags => LoweredValue::DeferredFlags(DeferredFlags::Packed(value)),
+            IrType::Address => LoweredValue::GuestAddress(value),
+            _ => LoweredValue::Native(value),
+        })
+        .collect()
+}
+
+fn lowered_immediate(builder: &mut FunctionBuilder<'_>, value: Immediate) -> LoweredValue {
+    let lowered = immediate(builder, value);
+    if value.ty() == IrType::Address {
+        LoweredValue::GuestAddress(lowered)
+    } else {
+        LoweredValue::Native(lowered)
     }
 }
 
@@ -5838,6 +6432,7 @@ mod tests {
             block::{BlockMetadata, IrBlock},
             op::{IrOperation, OperationResults, RegisterIndex},
             region::RegionMetadata,
+            value::Value,
         },
         profile::CpuProfileId,
     };
@@ -5907,5 +6502,144 @@ mod tests {
         let x30 = StateRegister::A64X(A64GeneralRegister::new(30).unwrap());
         assert_eq!(plan.accessed, HashSet::from([pc, x0, x1, x2, x30, v31]));
         assert_eq!(plan.dirty, HashSet::from([pc, x2, x30, v31]));
+    }
+
+    #[test]
+    fn lazy_flag_shapes_emit_only_demanded_clif() {
+        let add = clif_opcodes(|builder| {
+            let lhs = builder.ins().iconst(types::I64, 1);
+            let rhs = builder.ins().iconst(types::I64, 2);
+            let _ = lower_binary(builder, IntegerBinaryKind::Add, lhs, rhs);
+        });
+        assert_eq!(opcode_count(&add, ir::Opcode::Iadd), 1);
+
+        let adds_eq = clif_opcodes(|builder| {
+            let lhs = builder.ins().iconst(types::I64, 1);
+            let rhs = builder.ins().iconst(types::I64, 2);
+            let result = lower_binary(builder, IntegerBinaryKind::Add, lhs, rhs);
+            let flags = DeferredFlags::Add {
+                lhs,
+                rhs,
+                result: Some(result),
+            };
+            let _ = evaluate_deferred_condition(builder, &flags, Condition::Eq, true);
+        });
+        assert_eq!(opcode_count(&adds_eq, ir::Opcode::Iadd), 1);
+        assert_eq!(opcode_count(&adds_eq, ir::Opcode::Icmp), 1);
+        assert_eq!(opcode_count(&adds_eq, ir::Opcode::Band), 0);
+        assert_eq!(opcode_count(&adds_eq, ir::Opcode::Bxor), 0);
+
+        let cmp_cs = clif_opcodes(|builder| {
+            let lhs = builder.ins().iconst(types::I64, 1);
+            let rhs = builder.ins().iconst(types::I64, 2);
+            let flags = DeferredFlags::Subtract {
+                lhs,
+                rhs,
+                result: None,
+            };
+            let _ = evaluate_deferred_condition(builder, &flags, Condition::Cs, true);
+        });
+        assert_eq!(opcode_count(&cmp_cs, ir::Opcode::Icmp), 1);
+        assert_eq!(opcode_count(&cmp_cs, ir::Opcode::Isub), 0);
+
+        let dead_flags = clif_opcodes(|builder| {
+            let lhs = builder.ins().iconst(types::I64, 1);
+            let rhs = builder.ins().iconst(types::I64, 2);
+            let _dead = DeferredFlags::Subtract {
+                lhs,
+                rhs,
+                result: None,
+            };
+        });
+        assert_eq!(opcode_count(&dead_flags, ir::Opcode::Icmp), 0);
+        assert_eq!(opcode_count(&dead_flags, ir::Opcode::Isub), 0);
+    }
+
+    #[test]
+    fn flag_liveness_kills_overwritten_values_and_preserves_pass_through_loops() {
+        let location = LocationDescriptor::new(
+            GuestVirtualAddress::new(0x1000),
+            ExecutionState::A64,
+            CpuProfileId::new(1),
+        );
+        let flags = Value::new(ValueId::new(0), IrType::Flags);
+        let write = || {
+            IrOperation::new(
+                location,
+                OperationResults::NONE,
+                OperationKind::WriteFlags {
+                    state: FlagState::A64Nzcv,
+                    flags: flags.into(),
+                },
+            )
+        };
+        let internal = |block| Terminator::Direct {
+            target: ControlTarget::Internal {
+                block: BlockId::new(block),
+            },
+        };
+        let region = |second_operations: Vec<IrOperation>| {
+            IrRegion::new(
+                RegionMetadata {
+                    start: location,
+                    guest_byte_count: 8,
+                    guest_instruction_count: 2,
+                    ir_operation_count: 1 + second_operations.len() as u32,
+                    entries: Box::new([]),
+                    exits: Box::new([]),
+                    code_dependencies: Box::new([]),
+                    safepoints: Box::new([]),
+                },
+                vec![
+                    IrBlock::new(
+                        BlockMetadata::new(location, 4, 1, Vec::new()),
+                        vec![write()],
+                        internal(1),
+                    ),
+                    IrBlock::new(
+                        BlockMetadata::new(location, 4, 1, Vec::new()),
+                        second_operations,
+                        internal(1),
+                    ),
+                ],
+            )
+        };
+
+        assert_eq!(flag_liveness(&region(vec![write()])), vec![false, false]);
+        assert_eq!(flag_liveness(&region(Vec::new())), vec![false, true]);
+        let read = IrOperation::new(
+            location,
+            OperationResults::one(flags),
+            OperationKind::ReadFlags(FlagState::A64Nzcv),
+        );
+        assert_eq!(flag_liveness(&region(vec![read])), vec![false, true]);
+    }
+
+    fn clif_opcodes(build: impl FnOnce(&mut FunctionBuilder<'_>)) -> Vec<ir::Opcode> {
+        let isa = cranelift_native::builder()
+            .expect("test host is supported by the JIT")
+            .finish(cranelift_codegen::settings::Flags::new(
+                cranelift_codegen::settings::builder(),
+            ))
+            .expect("test ISA settings are valid");
+        let mut function = ir::Function::new();
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut function, &mut context);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+        build(&mut builder);
+        builder.ins().return_(&[]);
+        builder.finalize(isa.frontend_config());
+        function
+            .layout
+            .blocks()
+            .flat_map(|block| function.layout.block_insts(block))
+            .map(|instruction| function.dfg.insts[instruction].opcode())
+            .collect()
+    }
+
+    fn opcode_count(opcodes: &[ir::Opcode], expected: ir::Opcode) -> usize {
+        opcodes.iter().filter(|opcode| **opcode == expected).count()
     }
 }

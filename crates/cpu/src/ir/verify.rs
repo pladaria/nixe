@@ -355,6 +355,23 @@ fn verify_operation_types(index: usize, operation: &IrOperation) -> Result<(), V
             expect_type(index, *value, register.ty(), "state write value")?;
             expect_results(index, &results, &[])
         }
+        OperationKind::ReadFlags(state) => {
+            if operation.source.execution_state != ExecutionState::A64
+                || !matches!(state, crate::ir::op::FlagState::A64Nzcv)
+            {
+                return Err(error("A64 NZCV flags require A64 execution state"));
+            }
+            expect_results(index, &results, &[IrType::Flags])
+        }
+        OperationKind::WriteFlags { state, flags } => {
+            if operation.source.execution_state != ExecutionState::A64
+                || !matches!(state, crate::ir::op::FlagState::A64Nzcv)
+            {
+                return Err(error("A64 NZCV flags require A64 execution state"));
+            }
+            expect_type(index, *flags, IrType::Flags, "flag-state write value")?;
+            expect_results(index, &results, &[])
+        }
         OperationKind::Scalar(scalar) => verify_scalar(index, scalar, &results),
         OperationKind::Address(address) => verify_address(index, address, &results),
         OperationKind::Flags(flags) => verify_flags(index, flags, &results),
@@ -440,33 +457,11 @@ fn verify_scalar(
             let ty = same_integer(index, lhs, rhs, "binary operands")?;
             expect_results(index, results, &[ty])
         }
-        ScalarOperation::AddWithCarry {
-            lhs,
-            rhs,
-            carry_in,
-            flags,
-        } => {
-            let ty = same_integer(index, lhs, rhs, "add-with-carry operands")?;
+        ScalarOperation::AddCarry { lhs, rhs, carry_in }
+        | ScalarOperation::SubtractCarry { lhs, rhs, carry_in } => {
+            let ty = same_integer(index, lhs, rhs, "carry arithmetic operands")?;
             expect_type(index, carry_in, IrType::I1, "carry input")?;
-            match flags {
-                crate::ir::op::ArithmeticFlagOutput::None => expect_results(index, results, &[ty]),
-                crate::ir::op::ArithmeticFlagOutput::Carry => {
-                    expect_results(index, results, &[ty, IrType::I1])
-                }
-                crate::ir::op::ArithmeticFlagOutput::CarryAndOverflow => {
-                    expect_results(index, results, &[ty, IrType::I1, IrType::I1])
-                }
-            }
-        }
-        ScalarOperation::UnsignedOverflow {
-            lhs, rhs, result, ..
-        }
-        | ScalarOperation::SignedOverflow {
-            lhs, rhs, result, ..
-        } => {
-            let ty = same_integer(index, lhs, rhs, "overflow operands")?;
-            expect_type(index, result, ty, "overflow arithmetic result")?;
-            expect_results(index, results, &[IrType::I1])
+            expect_results(index, results, &[ty])
         }
         ScalarOperation::Compare { lhs, rhs, .. } => {
             same_integer(index, lhs, rhs, "comparison operands")?;
@@ -533,24 +528,51 @@ fn verify_flags(
     results: &[Value],
 ) -> Result<(), VerificationError> {
     match *operation {
-        FlagOperation::FromArithmetic {
-            result,
-            carry,
-            overflow,
-        } => {
-            require_integer(index, result, "flag arithmetic result")?;
-            expect_type(index, carry, IrType::I1, "carry flag")?;
-            expect_type(index, overflow, IrType::I1, "overflow flag")?;
+        FlagOperation::Add { lhs, rhs, result }
+        | FlagOperation::Subtract { lhs, rhs, result }
+        | FlagOperation::LogicalAnd { lhs, rhs, result } => {
+            let ty = same_integer(index, lhs, rhs, "lazy flag operands")?;
+            if let Some(result) = result {
+                expect_type(index, result, ty, "lazy flag result")?;
+            }
             expect_results(index, results, &[IrType::Flags])
         }
-        FlagOperation::FromLogical { result, carry } => {
-            require_integer(index, result, "flag logical result")?;
-            expect_type(index, carry, IrType::I1, "carry flag")?;
+        FlagOperation::AddCarry {
+            lhs,
+            rhs,
+            carry_in,
+            result,
+        }
+        | FlagOperation::SubtractCarry {
+            lhs,
+            rhs,
+            carry_in,
+            result,
+        } => {
+            let ty = same_integer(index, lhs, rhs, "lazy carry flag operands")?;
+            expect_type(index, carry_in, IrType::I1, "lazy carry input")?;
+            if let Some(result) = result {
+                expect_type(index, result, ty, "lazy carry flag result")?;
+            }
             expect_results(index, results, &[IrType::Flags])
         }
         FlagOperation::FromPacked { value } => {
             expect_type(index, value, IrType::I32, "packed flags")?;
             expect_results(index, results, &[IrType::Flags])
+        }
+        FlagOperation::Select {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            expect_type(index, condition, IrType::I1, "flag select condition")?;
+            expect_type(index, when_true, IrType::Flags, "flag select true value")?;
+            expect_type(index, when_false, IrType::Flags, "flag select false value")?;
+            expect_results(index, results, &[IrType::Flags])
+        }
+        FlagOperation::EvaluateBit { flags, .. } => {
+            expect_type(index, flags, IrType::Flags, "queried flags")?;
+            expect_results(index, results, &[IrType::I1])
         }
         FlagOperation::Evaluate { flags, .. } => {
             expect_type(index, flags, IrType::Flags, "condition flags")?;
@@ -1123,22 +1145,21 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
     match kind {
         OperationKind::Constant(_)
         | OperationKind::ReadState(_)
+        | OperationKind::ReadFlags(_)
         | OperationKind::Barrier(_)
         | OperationKind::ProcessorHint(_)
         | OperationKind::RuntimeRegisterRead(_) => {}
         OperationKind::WriteState { value, .. } => operands.push(*value),
+        OperationKind::WriteFlags { flags, .. } => operands.push(*flags),
         OperationKind::Scalar(operation) => match *operation {
             ScalarOperation::Binary { lhs, rhs, .. }
             | ScalarOperation::Compare { lhs, rhs, .. } => operands.extend([lhs, rhs]),
-            ScalarOperation::AddWithCarry {
+            ScalarOperation::AddCarry {
+                lhs, rhs, carry_in, ..
+            }
+            | ScalarOperation::SubtractCarry {
                 lhs, rhs, carry_in, ..
             } => operands.extend([lhs, rhs, carry_in]),
-            ScalarOperation::UnsignedOverflow {
-                lhs, rhs, result, ..
-            }
-            | ScalarOperation::SignedOverflow {
-                lhs, rhs, result, ..
-            } => operands.extend([lhs, rhs, result]),
             ScalarOperation::Select {
                 condition,
                 when_true,
@@ -1158,16 +1179,36 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
             AddressOperation::ToInteger { address, .. } => operands.push(address),
         },
         OperationKind::Flags(operation) => match *operation {
-            FlagOperation::FromArithmetic {
-                result,
-                carry,
-                overflow,
-            } => operands.extend([result, carry, overflow]),
-            FlagOperation::FromLogical { result, carry } => operands.extend([result, carry]),
-            FlagOperation::FromPacked { value } => operands.push(value),
-            FlagOperation::Evaluate { flags, .. } | FlagOperation::Materialize { flags } => {
-                operands.push(flags)
+            FlagOperation::Add { lhs, rhs, result }
+            | FlagOperation::Subtract { lhs, rhs, result }
+            | FlagOperation::LogicalAnd { lhs, rhs, result } => {
+                operands.extend([lhs, rhs]);
+                operands.extend(result);
             }
+            FlagOperation::AddCarry {
+                lhs,
+                rhs,
+                carry_in,
+                result,
+            }
+            | FlagOperation::SubtractCarry {
+                lhs,
+                rhs,
+                carry_in,
+                result,
+            } => {
+                operands.extend([lhs, rhs, carry_in]);
+                operands.extend(result);
+            }
+            FlagOperation::FromPacked { value } => operands.push(value),
+            FlagOperation::Select {
+                condition,
+                when_true,
+                when_false,
+            } => operands.extend([condition, when_true, when_false]),
+            FlagOperation::EvaluateBit { flags, .. }
+            | FlagOperation::Evaluate { flags, .. }
+            | FlagOperation::Materialize { flags } => operands.push(flags),
             FlagOperation::EvaluateEncoded {
                 flags, condition, ..
             } => operands.extend([flags, condition]),

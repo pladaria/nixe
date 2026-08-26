@@ -287,6 +287,67 @@ fn ldpsw_offset_uses_the_displaced_address_in_compiled_code() {
     );
 }
 
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn a64_lazy_arithmetic_flags_match_reference_edge_cases() {
+    // ADDS/SUBS/ADCS/SBCS in W and X forms, including zero, unsigned
+    // carry/borrow, signed overflow, and both incoming carry values.
+    let cases = [
+        (0x2b01_0002, 0_u64, 0_u64, false),
+        (0x2b01_0002, u32::MAX as u64, 1, false),
+        (0x2b01_0002, i32::MAX as u64, 1, false),
+        (0x6b01_0002, 0, 1, false),
+        (0x6b01_0002, i32::MIN as u32 as u64, 1, false),
+        (0xab01_0002, 0, 0, false),
+        (0xab01_0002, u64::MAX, 1, false),
+        (0xab01_0002, i64::MAX as u64, 1, false),
+        (0xeb01_0002, 0, 1, false),
+        (0xeb01_0002, i64::MIN as u64, 1, false),
+        (0x3a01_0002, u32::MAX as u64, 0, false),
+        (0x3a01_0002, u32::MAX as u64, 0, true),
+        (0x7a01_0002, 0, 0, false),
+        (0x7a01_0002, 0, 0, true),
+        (0xba01_0002, u64::MAX, 0, false),
+        (0xba01_0002, u64::MAX, 0, true),
+        (0xfa01_0002, 0, 0, false),
+        (0xfa01_0002, 0, 0, true),
+    ];
+    let mut interpreter = EngineHarness::new(&InterpreterProvider, 0x60, 0x60);
+    let mut jit = EngineHarness::new(&JitProvider::new(), 0x61, 0x61);
+
+    for (index, (encoding, lhs, rhs, carry)) in cases.into_iter().enumerate() {
+        let code_page = GuestPhysicalPageId::new(0x31_0000 + index as u64);
+        let memory = raw_a64_memory(encoding, code_page);
+        let mut initial = A64State::default();
+        initial.set_pc(CODE.get());
+        initial.write_x(
+            A64Register::General(A64GeneralRegister::new(0).unwrap()),
+            lhs,
+        );
+        initial.write_x(
+            A64Register::General(A64GeneralRegister::new(1).unwrap()),
+            rhs,
+        );
+        initial.set_nzcv(Nzcv::from_bits(if carry { Nzcv::C } else { 0 }));
+        let mut interpreter_state = ThreadCpuState::A64(Box::new(initial.clone()));
+        let mut jit_state = ThreadCpuState::A64(Box::new(initial));
+
+        let interpreter_report = interpreter.run(&memory, &mut interpreter_state).unwrap();
+        let jit_report = jit.run(&memory, &mut jit_state).unwrap();
+        assert_eq!(jit_report, interpreter_report, "encoding {encoding:#010x}");
+        assert_eq!(jit_state, interpreter_state, "encoding {encoding:#010x}");
+    }
+}
+
+fn raw_a64_memory(encoding: u32, code_page: GuestPhysicalPageId) -> SyntheticMemory {
+    let mut memory = SyntheticMemory::new();
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &0x1400_0000_u32.to_le_bytes()));
+    assert!(memory.map_page(SPACE, CODE, code_page, MemoryPermissions::READ_EXECUTE));
+    memory
+}
+
 fn patterns() -> impl Iterator<Item = &'static InstructionPattern> {
     decode::a64::patterns()
         .iter()

@@ -65,12 +65,22 @@ fn lift_mrs(
     fields: SystemOperands,
 ) -> Result<LiftOutcome, BuildError> {
     let value = if let Some(register) = system_register(fields.system_key) {
-        let value = emit_one(
-            builder,
-            decoded.location,
-            register.ty(),
-            OperationKind::ReadState(register),
-        )?;
+        let value = if register == StateRegister::A64Nzcv {
+            let flags = read_flags(builder, decoded.location)?;
+            emit_one(
+                builder,
+                decoded.location,
+                IrType::I32,
+                OperationKind::Flags(FlagOperation::Materialize { flags }),
+            )?
+        } else {
+            emit_one(
+                builder,
+                decoded.location,
+                register.ty(),
+                OperationKind::ReadState(register),
+            )?
+        };
         if register.ty() == IrType::I32 {
             scalar(
                 builder,
@@ -146,11 +156,21 @@ fn lift_msr(
             Immediate::I32(0xf000_0000).into(),
         )?;
     }
-    builder.emit(
-        decoded.location,
-        &[],
-        OperationKind::WriteState { register, value },
-    )?;
+    if register == StateRegister::A64Nzcv {
+        let flags = emit_one(
+            builder,
+            decoded.location,
+            IrType::Flags,
+            OperationKind::Flags(FlagOperation::FromPacked { value }),
+        )?;
+        write_flags(builder, decoded.location, flags.into())?;
+    } else {
+        builder.emit(
+            decoded.location,
+            &[],
+            OperationKind::WriteState { register, value },
+        )?;
+    }
     Ok(LiftOutcome::Continue)
 }
 

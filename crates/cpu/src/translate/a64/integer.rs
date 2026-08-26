@@ -112,7 +112,6 @@ fn lift_move_wide(
 }
 
 struct AddSubSpec {
-    width: IrType,
     subtract: bool,
     set_flags: bool,
     destination: u8,
@@ -126,54 +125,70 @@ fn emit_add_sub(
     rhs: Operand,
     spec: AddSubSpec,
 ) -> Result<(), BuildError> {
-    let rhs = if spec.subtract {
-        binary(
-            builder,
-            source,
-            IntegerBinaryKind::Xor,
-            rhs,
-            immediate_for(spec.width, u64::MAX).into(),
-        )?
-    } else {
-        rhs
-    };
-    let result_types: &[IrType] = if spec.set_flags {
-        &[spec.width, IrType::I1, IrType::I1]
-    } else {
-        &[spec.width]
-    };
-    let results: Vec<_> = builder
-        .emit(
-            source,
-            result_types,
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
+    if spec.set_flags
+        && spec.destination == 31
+        && matches!(spec.destination_register31, Register31::Zero)
+    {
+        let operation = if spec.subtract {
+            FlagOperation::Subtract {
                 lhs,
                 rhs,
-                carry_in: Immediate::I1(spec.subtract).into(),
-                flags: if spec.set_flags {
-                    ArithmeticFlagOutput::CarryAndOverflow
-                } else {
-                    ArithmeticFlagOutput::None
-                },
-            }),
-        )?
-        .iter()
-        .collect();
+                result: None,
+            }
+        } else {
+            FlagOperation::Add {
+                lhs,
+                rhs,
+                result: None,
+            }
+        };
+        let flags = emit_one(
+            builder,
+            source,
+            IrType::Flags,
+            OperationKind::Flags(operation),
+        )?;
+        return write_flags(builder, source, flags.into());
+    }
+    let result = binary(
+        builder,
+        source,
+        if spec.subtract {
+            IntegerBinaryKind::Subtract
+        } else {
+            IntegerBinaryKind::Add
+        },
+        lhs,
+        rhs,
+    )?;
     write_gpr(
         builder,
         source,
         spec.destination,
-        results[0].into(),
+        result,
         spec.destination_register31,
     )?;
     if spec.set_flags {
-        arithmetic_flags(
+        let operation = if spec.subtract {
+            FlagOperation::Subtract {
+                lhs,
+                rhs,
+                result: Some(result),
+            }
+        } else {
+            FlagOperation::Add {
+                lhs,
+                rhs,
+                result: Some(result),
+            }
+        };
+        let flags = emit_one(
             builder,
             source,
-            results[0].into(),
-            results[1].into(),
-            results[2].into(),
+            IrType::Flags,
+            OperationKind::Flags(operation),
         )?;
+        write_flags(builder, source, flags.into())?;
     }
     Ok(())
 }
@@ -200,7 +215,6 @@ fn lift_add_sub_immediate(
         lhs,
         rhs,
         AddSubSpec {
-            width,
             subtract: fields.subtract,
             set_flags,
             destination: fields.rd,
@@ -276,7 +290,6 @@ fn lift_add_sub_shifted(
         lhs,
         rhs,
         AddSubSpec {
-            width,
             subtract: fields.subtract,
             set_flags: fields.set_flags,
             destination: fields.rd,
@@ -330,7 +343,6 @@ fn lift_add_sub_extended(
         lhs,
         result.into(),
         AddSubSpec {
-            width,
             subtract: fields.subtract,
             set_flags,
             destination: fields.rd,
@@ -345,7 +357,17 @@ fn lift_add_sub_extended(
 }
 
 fn carry_in(builder: &mut IrBuilder, source: LocationDescriptor) -> Result<Operand, BuildError> {
-    evaluate_condition(builder, source, Condition::Cs)
+    let flags = read_flags(builder, source)?;
+    Ok(emit_one(
+        builder,
+        source,
+        IrType::I1,
+        OperationKind::Flags(FlagOperation::EvaluateBit {
+            flags,
+            bit: FlagBit::Carry,
+        }),
+    )?
+    .into())
 }
 
 fn lift_add_sub_carry(
@@ -361,61 +383,83 @@ fn lift_add_sub_carry(
         width,
         Register31::Zero,
     )?;
-    let mut rhs = read_gpr(
+    let rhs = read_gpr(
         builder,
         decoded.location,
         fields.rm,
         width,
         Register31::Zero,
     )?;
-    let subtract = fields.subtract;
-    if subtract {
-        rhs = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Xor,
-            rhs,
-            immediate_for(width, u64::MAX).into(),
-        )?;
-    }
     let carry = carry_in(builder, decoded.location)?;
-    let result_types: &[IrType] = if fields.set_flags {
-        &[width, IrType::I1, IrType::I1]
-    } else {
-        &[width]
-    };
-    let values: Vec<_> = builder
-        .emit(
-            decoded.location,
-            result_types,
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
+    if fields.set_flags && fields.rd == 31 {
+        let flag_operation = if fields.subtract {
+            FlagOperation::SubtractCarry {
                 lhs,
                 rhs,
                 carry_in: carry,
-                flags: if fields.set_flags {
-                    ArithmeticFlagOutput::CarryAndOverflow
-                } else {
-                    ArithmeticFlagOutput::None
-                },
-            }),
-        )?
-        .iter()
-        .collect();
+                result: None,
+            }
+        } else {
+            FlagOperation::AddCarry {
+                lhs,
+                rhs,
+                carry_in: carry,
+                result: None,
+            }
+        };
+        let flags = emit_one(
+            builder,
+            decoded.location,
+            IrType::Flags,
+            OperationKind::Flags(flag_operation),
+        )?;
+        write_flags(builder, decoded.location, flags.into())?;
+        return Ok(LiftOutcome::Continue);
+    }
+    let scalar_operation = if fields.subtract {
+        ScalarOperation::SubtractCarry {
+            lhs,
+            rhs,
+            carry_in: carry,
+        }
+    } else {
+        ScalarOperation::AddCarry {
+            lhs,
+            rhs,
+            carry_in: carry,
+        }
+    };
+    let result = scalar(builder, decoded.location, width, scalar_operation)?;
     write_gpr(
         builder,
         decoded.location,
         fields.rd,
-        values[0].into(),
+        result,
         Register31::Zero,
     )?;
     if fields.set_flags {
-        arithmetic_flags(
+        let flag_operation = if fields.subtract {
+            FlagOperation::SubtractCarry {
+                lhs,
+                rhs,
+                carry_in: carry,
+                result: Some(result),
+            }
+        } else {
+            FlagOperation::AddCarry {
+                lhs,
+                rhs,
+                carry_in: carry,
+                result: Some(result),
+            }
+        };
+        let flags = emit_one(
             builder,
             decoded.location,
-            values[0].into(),
-            values[1].into(),
-            values[2].into(),
+            IrType::Flags,
+            OperationKind::Flags(flag_operation),
         )?;
+        write_flags(builder, decoded.location, flags.into())?;
     }
     Ok(LiftOutcome::Continue)
 }
@@ -464,13 +508,12 @@ fn lift_logical_immediate(
         Register31::Zero,
     )?;
     let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
-    let result = logical_result(
-        builder,
-        decoded.location,
-        opc,
-        lhs,
-        immediate_for(width, immediate).into(),
-    )?;
+    let rhs = immediate_for(width, immediate).into();
+    if opc == 3 && fields.rd == 31 {
+        logical_flags(builder, decoded.location, lhs, rhs, None)?;
+        return Ok(LiftOutcome::Continue);
+    }
+    let result = logical_result(builder, decoded.location, opc, lhs, rhs)?;
     write_gpr(
         builder,
         decoded.location,
@@ -479,7 +522,7 @@ fn lift_logical_immediate(
         Register31::Zero,
     )?;
     if opc == 3 {
-        logical_flags(builder, decoded.location, result)?;
+        logical_flags(builder, decoded.location, lhs, rhs, Some(result))?;
     }
     Ok(LiftOutcome::Continue)
 }
@@ -511,6 +554,10 @@ fn lift_logical_shifted(
         Register31::Zero,
     )?;
     let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
+    if opc == 3 && fields.rd == 31 {
+        logical_flags(builder, decoded.location, lhs, rhs, None)?;
+        return Ok(LiftOutcome::Continue);
+    }
     let result = logical_result(builder, decoded.location, opc, lhs, rhs)?;
     write_gpr(
         builder,
@@ -520,7 +567,7 @@ fn lift_logical_shifted(
         Register31::Zero,
     )?;
     if opc == 3 {
-        logical_flags(builder, decoded.location, result)?;
+        logical_flags(builder, decoded.location, lhs, rhs, Some(result))?;
     }
     Ok(LiftOutcome::Continue)
 }
@@ -701,42 +748,28 @@ fn lift_two_source(
 fn proposed_compare_flags(
     builder: &mut IrBuilder,
     source: LocationDescriptor,
-    width: IrType,
     lhs: Operand,
-    mut rhs: Operand,
+    rhs: Operand,
     subtract: bool,
 ) -> Result<Operand, BuildError> {
-    if subtract {
-        rhs = binary(
-            builder,
-            source,
-            IntegerBinaryKind::Xor,
+    let operation = if subtract {
+        FlagOperation::Subtract {
+            lhs,
             rhs,
-            immediate_for(width, u64::MAX).into(),
-        )?;
-    }
-    let values: Vec<_> = builder
-        .emit(
-            source,
-            &[width, IrType::I1, IrType::I1],
-            OperationKind::Scalar(ScalarOperation::AddWithCarry {
-                lhs,
-                rhs,
-                carry_in: Immediate::I1(subtract).into(),
-                flags: ArithmeticFlagOutput::CarryAndOverflow,
-            }),
-        )?
-        .iter()
-        .collect();
+            result: None,
+        }
+    } else {
+        FlagOperation::Add {
+            lhs,
+            rhs,
+            result: None,
+        }
+    };
     Ok(emit_one(
         builder,
         source,
         IrType::Flags,
-        OperationKind::Flags(FlagOperation::FromArithmetic {
-            result: values[0].into(),
-            carry: values[1].into(),
-            overflow: values[2].into(),
-        }),
+        OperationKind::Flags(operation),
     )?
     .into())
 }
@@ -765,8 +798,7 @@ fn lift_conditional_compare(
             Register31::Zero,
         )?
     };
-    let proposed =
-        proposed_compare_flags(builder, decoded.location, width, lhs, rhs, fields.subtract)?;
+    let proposed = proposed_compare_flags(builder, decoded.location, lhs, rhs, fields.subtract)?;
     let fallback = emit_one(
         builder,
         decoded.location,
@@ -780,17 +812,17 @@ fn lift_conditional_compare(
         decoded.location,
         Condition::from_encoding(fields.condition),
     )?;
-    let selected = scalar(
+    let selected = emit_one(
         builder,
         decoded.location,
         IrType::Flags,
-        ScalarOperation::Select {
+        OperationKind::Flags(FlagOperation::Select {
             condition: cond,
             when_true: proposed,
             when_false: fallback.into(),
-        },
+        }),
     )?;
-    write_flags(builder, decoded.location, selected)?;
+    write_flags(builder, decoded.location, selected.into())?;
     Ok(LiftOutcome::Continue)
 }
 

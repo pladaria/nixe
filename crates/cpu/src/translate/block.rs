@@ -455,6 +455,8 @@ mod tests {
             OperationKind::Address(_) => "address",
             OperationKind::ReadState(_) => "read-state",
             OperationKind::WriteState { .. } => "write-state",
+            OperationKind::ReadFlags(_) => "read-flags",
+            OperationKind::WriteFlags { .. } => "write-flags",
             OperationKind::Flags(_) => "flags",
             OperationKind::Memory(_) => "memory",
             OperationKind::Barrier(_) => "barrier",
