@@ -6,11 +6,15 @@
 //! values or a JIT representation. This crate contains no CPU execution,
 //! Horizon, console GPU, or host graphics API behavior.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("nixe-memory requires Linux host-mapped backing support");
+
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 mod access;
 mod backing;
+mod host_mapped;
 mod invalidation;
 mod range;
 mod visibility;
@@ -21,8 +25,12 @@ pub use access::{
 };
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
-    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalDirectAccessLease,
-    CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
+    CanonicalCpuWriteOverlap, CanonicalCpuWriteRange, CanonicalPageError, CanonicalWriteBatch,
+    CanonicalWriteBatchError, FastmemPageLease,
+};
+pub use host_mapped::{
+    FASTMEM_ADDRESS_SPACE_BITS, FASTMEM_PAGE_BITS, FASTMEM_PAGE_SIZE, FASTMEM_READ, FASTMEM_SIZE,
+    FASTMEM_WRITE, FastmemArena, FastmemEntry, FastmemView, HostMappedBacking, HostMappedError,
 };
 pub use invalidation::{
     MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,

@@ -50,7 +50,6 @@ use crate::executable_memory::{
 };
 use crate::helpers::{HELPER_TABLE, NativeContext};
 use crate::performance::{DomainPerformance, ExecutorPerformance, JitPerformanceReport};
-use crate::tlb::SoftwareTlb;
 
 pub const JIT_ENGINE_ID: EngineId = EngineId::new(2);
 
@@ -314,6 +313,7 @@ impl EngineProvider for JitProvider {
             executable_memory.clone(),
             diagnostics.clone(),
             request.cpu.profile(),
+            performance.is_some(),
         )
         .map_err(|detail| domain_fault(request.cpu, EngineFaultKind::Unavailable, detail))?;
         log::info!("JIT asynchronous compilation pool enabled: workers={compilation_workers}");
@@ -436,7 +436,6 @@ impl EngineDomain for JitDomain {
             hotness: HotnessTable::new(),
             control,
             exclusive_monitor: RefCell::new(ExclusiveMonitorState::default()),
-            tlb: SoftwareTlb::new(),
             mapping_epoch: binding.mapping_epoch,
             invalidation_cursor: binding.invalidation_cursor,
         }))
@@ -556,7 +555,6 @@ struct JitExecutor {
     hotness: HotnessTable,
     control: EngineControl,
     exclusive_monitor: RefCell<ExclusiveMonitorState>,
-    tlb: SoftwareTlb,
     mapping_epoch: u64,
     invalidation_cursor: nixe_memory::MemoryInvalidationCursor,
 }
@@ -594,9 +592,14 @@ impl EngineExecutor for JitExecutor {
         let trace_jit = log::log_enabled!(log::Level::Trace);
 
         self.frame.import_state(request.state);
-        self.frame.memory = self
-            .tlb
-            .acceleration(request.cpu.address_space_id(), self.mapping_epoch);
+        let fastmem = request.memory.fastmem_view(request.cpu.address_space_id());
+        self.frame.memory = crate::abi::MemoryAcceleration {
+            address_space: request.cpu.address_space_id().get(),
+            mapping_epoch: self.mapping_epoch,
+            fastmem_base: fastmem.map_or(0, |view| view.base),
+            fastmem_entries: fastmem.map_or(0, |view| view.entries),
+            fastmem_size: fastmem.map_or(0, |view| view.address_space_size),
+        };
         self.frame.control.instruction_budget = request.instruction_budget;
         self.frame.control.invalidation_epoch = self.invalidation_cursor.get();
         self.frame.control.loader_return_valid = u32::from(request.loader_return.is_some());
@@ -918,7 +921,6 @@ impl EngineExecutor for JitExecutor {
                 let mut native_context = NativeContext::new(
                     request.memory,
                     self.exclusive_monitor.get_mut(),
-                    &mut self.tlb,
                     &self.control,
                     request.cpu,
                     request.timer,
@@ -947,10 +949,21 @@ impl EngineExecutor for JitExecutor {
                     performance.native_entries = performance.native_entries.saturating_add(1);
                 }
                 let native_started = native_context.performance.as_ref().map(|_| Instant::now());
+                let mut fastmem_fault = None;
                 let native_exit = contain_rust_boundary(|| {
                     // SAFETY: the live cached region and imported frame remain
-                    // valid for this complete non-unwinding native call.
-                    unsafe { compiled.execute(self.gateway, &raw mut self.frame) };
+                    // valid for this complete non-unwinding native call. The
+                    // Linux boundary converts arena SIGSEGV/SIGBUS faults into
+                    // an explicit result before control returns to Rust.
+                    fastmem_fault = unsafe {
+                        crate::fastmem_fault::execute(
+                            self.gateway,
+                            &raw mut self.frame,
+                            compiled.entry_address(),
+                            self.frame.memory.fastmem_base,
+                            self.frame.memory.fastmem_size,
+                        )
+                    };
                     self.frame.exit
                 });
                 let native_elapsed = native_started.map(|started| started.elapsed());
@@ -986,6 +999,13 @@ impl EngineExecutor for JitExecutor {
                     if let Ok(exit) = &native_exit {
                         performance.record_native_exit(exit.kind, exit.instructions_executed);
                     }
+                }
+                if let Some(address) = fastmem_fault {
+                    break DispatchResult::Fault(
+                        EngineFaultKind::Internal,
+                        format!("native fastmem fault at host address {address:#018x}")
+                            .into_boxed_str(),
+                    );
                 }
                 let mut native_exit = match native_exit {
                     Ok(exit) => exit,
@@ -1106,8 +1126,6 @@ impl EngineExecutor for JitExecutor {
         let mapping_changed = self.mapping_epoch != binding.mapping_epoch;
         self.synchronize_invalidation(binding.invalidation_cursor, state, binding.memory)?;
         if mapping_changed {
-            self.tlb
-                .advance_mapping_epoch(binding.address_space, binding.mapping_epoch);
             self.mapping_epoch = binding.mapping_epoch;
             self.frame.memory.mapping_epoch = self.mapping_epoch;
         }
@@ -1133,7 +1151,6 @@ impl EngineExecutor for JitExecutor {
         }
         self.local_lookup.clear();
         self.hotness.clear();
-        self.tlb.clear();
         self.exclusive_monitor.get_mut().clear();
         self.invalidation_cursor = binding.invalidation_cursor;
         self.mapping_epoch = binding.mapping_epoch;
@@ -1227,9 +1244,6 @@ impl JitExecutor {
             })?;
         if history_lost {
             self.local_lookup.clear();
-            self.tlb.clear();
-        } else {
-            self.tlb.apply_invalidations(&records);
         }
         self.invalidation_cursor = through;
         self.frame.control.invalidation_epoch = through.get();
@@ -1952,7 +1966,7 @@ mod tests {
 
         let report = fs::read_to_string(report_path).unwrap();
         toml::from_str::<toml::Value>(&report).unwrap();
-        assert!(report.contains("nixe_jit_performance_version=6"));
+        assert!(report.contains("nixe_jit_performance_version=7"));
         assert!(report.contains("[domain.9]"));
         assert!(report.contains("[domain.9.executor.11]"));
         assert!(report.contains("codegen_completed=1"));
@@ -1964,6 +1978,10 @@ mod tests {
         assert!(report.contains("cold_interpreter_steps="));
         assert!(report.contains("compiled_native_named_operations="));
         assert!(report.contains("compiled_semantic_helper_callsites="));
+        assert!(report.contains("cranelift_regalloc_ns="));
+        assert!(report.contains("publication_lock_wait_ns="));
+        assert!(report.contains("compiled_native_code_bytes="));
+        assert!(report.contains("compiled_native_mapped_bytes="));
         assert!(report.contains("helper_system_polls=0"));
         assert!(report.contains("compilation_pool_workers="));
     }
@@ -2583,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_execution_memory_uses_the_canonical_tlb_fast_path() {
+    fn ordinary_execution_memory_uses_the_host_mapped_fastmem_path() {
         let mut memory = ExecutionMemory::new();
         let mut code = [0_u8; nixe_cpu::memory::SYNTHETIC_PAGE_SIZE];
         let instructions = [
@@ -2685,7 +2703,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_aliases_share_one_backing_through_native_tlb_entries() {
+    fn canonical_aliases_share_one_backing_through_fastmem_mappings() {
         let mut memory = ExecutionMemory::new();
         let mut code = [0_u8; nixe_cpu::memory::SYNTHETIC_PAGE_SIZE];
         for (index, instruction) in [

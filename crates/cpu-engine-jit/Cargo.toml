@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cranelift-codegen = { version = "=0.134.3", default-features = false, features = ["host-arch", "std"] }
+cranelift-codegen = { version = "=0.134.3", default-features = false, features = ["host-arch", "std", "timing"] }
 cranelift-frontend = "=0.134.3"
 cranelift-native = "=0.134.3"
 log.workspace = true
@@ -28,3 +28,6 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 toml.workspace = true
+
+[build-dependencies]
+cc = "1"

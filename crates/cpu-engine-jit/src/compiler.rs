@@ -1,7 +1,12 @@
 //! Verified Nixe IR to Cranelift lowering and native publication.
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::mem::{offset_of, size_of};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use cranelift_codegen::{
     Context,
@@ -11,6 +16,7 @@ use cranelift_codegen::{
         UserFuncName, condcodes::IntCC, types,
     },
     isa::{CallConv, OwnedTargetIsa, TargetFrontendConfig},
+    timing::{self, NUM_PASSES, Pass, Profiler},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use nixe_cpu::{
@@ -40,7 +46,10 @@ use nixe_cpu::{
     },
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
-use nixe_memory::GuestVirtualAddress;
+use nixe_memory::{
+    FASTMEM_PAGE_BITS, FASTMEM_PAGE_SIZE, FASTMEM_READ, FASTMEM_WRITE, FastmemEntry,
+    GuestVirtualAddress,
+};
 
 use crate::{
     abi::{
@@ -56,14 +65,11 @@ use crate::{
     },
     cache::{CompilationCancellation, CompilationCancellationReason},
     executable_memory::{
-        ExecutableMemoryError, PublishedCode, SharedExecutableMemory, publish_code,
+        ExecutableMemoryError, PublicationMetrics, PublishedCode, SharedExecutableMemory,
+        publish_code,
     },
     helpers::encode_access,
     links::{LINK_OFFSETS, LinkKind, LinkSiteMetadata},
-    tlb::{
-        FLAG_CPU_VISIBLE, FLAG_ORDINARY, FLAG_READ, FLAG_WRITE, FLAG_WRITE_ARMED, PAGE_BITS,
-        PAGE_SIZE, TLB_ENTRY_SIZE, TLB_OFFSETS,
-    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,16 +112,6 @@ pub(crate) struct CompiledRegion {
 }
 
 impl CompiledRegion {
-    pub(crate) unsafe fn execute(
-        &self,
-        gateway: NativeGateway,
-        frame: *mut crate::abi::ExecutionFrame,
-    ) {
-        // SAFETY: publication produced a tail-convention entry and the
-        // Cranelift-generated C gateway owns the only ABI transition to it.
-        unsafe { gateway(frame, self.entry) }
-    }
-
     pub(crate) const fn entry_address(&self) -> NativeEntryAddress {
         self.entry
     }
@@ -202,15 +198,176 @@ struct LoweringState {
     helper_call_conv: CallConv,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompilationMetrics {
+    pub(crate) nixe_ir_verify_ns: u64,
+    pub(crate) state_validation_ns: u64,
+    pub(crate) lowering_ns: u64,
+    pub(crate) cranelift_compile_ns: u64,
+    pub(crate) cranelift_verifier_ns: u64,
+    pub(crate) cranelift_optimize_ns: u64,
+    pub(crate) cranelift_vcode_lower_ns: u64,
+    pub(crate) cranelift_regalloc_ns: u64,
+    pub(crate) cranelift_emit_ns: u64,
+    pub(crate) cranelift_other_ns: u64,
+    pub(crate) publication: PublicationMetrics,
+    pub(crate) clif_instructions: u64,
+    pub(crate) clif_blocks: u64,
+    pub(crate) native_code_bytes: u64,
+    pub(crate) native_mapped_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CraneliftPassMetrics {
+    verifier_ns: u64,
+    optimize_ns: u64,
+    vcode_lower_ns: u64,
+    regalloc_ns: u64,
+    emit_ns: u64,
+    other_ns: u64,
+}
+
+struct ActiveCraneliftPass {
+    pass: Pass,
+    started: Instant,
+    child_ns: u64,
+}
+
+struct CraneliftTimingState {
+    self_ns: [u64; NUM_PASSES],
+    active: Vec<ActiveCraneliftPass>,
+}
+
+struct CraneliftTimingProfiler {
+    state: Rc<RefCell<CraneliftTimingState>>,
+}
+
+impl Profiler for CraneliftTimingProfiler {
+    fn start_pass(&self, pass: Pass) -> Box<dyn Any> {
+        self.state.borrow_mut().active.push(ActiveCraneliftPass {
+            pass,
+            started: Instant::now(),
+            child_ns: 0,
+        });
+        Box::new(CraneliftTimingToken {
+            pass,
+            state: Rc::clone(&self.state),
+        })
+    }
+}
+
+struct CraneliftTimingToken {
+    pass: Pass,
+    state: Rc<RefCell<CraneliftTimingState>>,
+}
+
+impl Drop for CraneliftTimingToken {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        let active = state
+            .active
+            .pop()
+            .expect("Cranelift timing passes are properly nested");
+        debug_assert_eq!(active.pass, self.pass);
+        let elapsed_ns = duration_ns(active.started.elapsed());
+        let self_ns = elapsed_ns.saturating_sub(active.child_ns);
+        let index = self.pass as usize;
+        if let Some(total) = state.self_ns.get_mut(index) {
+            *total = total.saturating_add(self_ns);
+        }
+        if let Some(parent) = state.active.last_mut() {
+            parent.child_ns = parent.child_ns.saturating_add(elapsed_ns);
+        }
+    }
+}
+
+struct CraneliftTimingCollector {
+    state: Rc<RefCell<CraneliftTimingState>>,
+    previous: Option<Box<dyn Profiler>>,
+}
+
+impl CraneliftTimingCollector {
+    fn install() -> Self {
+        let state = Rc::new(RefCell::new(CraneliftTimingState {
+            self_ns: [0; NUM_PASSES],
+            active: Vec::new(),
+        }));
+        let previous = timing::set_thread_profiler(Box::new(CraneliftTimingProfiler {
+            state: Rc::clone(&state),
+        }));
+        Self {
+            state,
+            previous: Some(previous),
+        }
+    }
+
+    fn snapshot(&self) -> [u64; NUM_PASSES] {
+        let state = self.state.borrow();
+        debug_assert!(state.active.is_empty());
+        state.self_ns
+    }
+
+    fn metrics_since(&self, before: [u64; NUM_PASSES]) -> CraneliftPassMetrics {
+        let after = self.snapshot();
+        let elapsed = |pass: Pass| after[pass as usize].saturating_sub(before[pass as usize]);
+        let verifier_ns = elapsed(Pass::verifier);
+        let optimize_ns = [
+            Pass::flowgraph,
+            Pass::domtree,
+            Pass::loop_analysis,
+            Pass::preopt,
+            Pass::egraph,
+            Pass::gvn,
+            Pass::licm,
+            Pass::unreachable_code,
+            Pass::remove_constant_phis,
+            Pass::canonicalize_nans,
+        ]
+        .into_iter()
+        .fold(0_u64, |total, pass| total.saturating_add(elapsed(pass)));
+        let vcode_lower_ns = elapsed(Pass::vcode_lower);
+        let regalloc_ns = elapsed(Pass::regalloc).saturating_add(elapsed(Pass::regalloc_checker));
+        let emit_ns = elapsed(Pass::vcode_emit).saturating_add(elapsed(Pass::vcode_emit_finish));
+        let categorized = verifier_ns
+            .saturating_add(optimize_ns)
+            .saturating_add(vcode_lower_ns)
+            .saturating_add(regalloc_ns)
+            .saturating_add(emit_ns);
+        let all_passes = after
+            .iter()
+            .zip(before)
+            .fold(0_u64, |total, (after, before)| {
+                total.saturating_add(after.saturating_sub(before))
+            });
+        CraneliftPassMetrics {
+            verifier_ns,
+            optimize_ns,
+            vcode_lower_ns,
+            regalloc_ns,
+            emit_ns,
+            other_ns: all_passes.saturating_sub(categorized),
+        }
+    }
+}
+
+impl Drop for CraneliftTimingCollector {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            let _ = timing::set_thread_profiler(previous);
+        }
+    }
+}
+
 /// Executor-local Cranelift state reused across bounded compilations.
 pub(crate) struct CompilerContext {
     isa: OwnedTargetIsa,
     context: Context,
     builder: FunctionBuilderContext,
+    timing: Option<CraneliftTimingCollector>,
 }
 
 impl CompilerContext {
-    pub(crate) fn new(isa: OwnedTargetIsa) -> Self {
+    pub(crate) fn new(isa: OwnedTargetIsa, collect_performance: bool) -> Self {
         debug_assert!(
             FRAME_OFFSETS
                 .all()
@@ -223,6 +380,7 @@ impl CompilerContext {
             isa,
             context: Context::new(),
             builder: FunctionBuilderContext::new(),
+            timing: collect_performance.then(CraneliftTimingCollector::install),
         }
     }
 
@@ -231,11 +389,20 @@ impl CompilerContext {
         region: &IrRegion,
         executable_memory: &SharedExecutableMemory,
         cancellation: CompilationCancellation<'_>,
+        metrics: &mut CompilationMetrics,
     ) -> Result<CompiledRegion, CompilerError> {
         check_cancellation(cancellation)?;
+        let started = self.timing.as_ref().map(|_| Instant::now());
         verify_region(region)
             .map_err(|error| CompilerError::new(format!("Nixe IR verification failed: {error}")))?;
+        if let Some(started) = started {
+            metrics.nixe_ir_verify_ns = duration_ns(started.elapsed());
+        }
+        let started = self.timing.as_ref().map(|_| Instant::now());
         validate_region_state(region)?;
+        if let Some(started) = started {
+            metrics.state_validation_ns = duration_ns(started.elapsed());
+        }
         check_cancellation(cancellation)?;
         self.context.clear();
         self.context.func.name = UserFuncName::user(0, 0);
@@ -246,6 +413,7 @@ impl CompilerContext {
             .params
             .push(AbiParam::new(self.isa.pointer_type()));
 
+        let started = self.timing.as_ref().map(|_| Instant::now());
         let builder = FunctionBuilder::new(&mut self.context.func, &mut self.builder);
         let metadata = lower_region(
             builder,
@@ -254,6 +422,13 @@ impl CompilerContext {
             self.isa.default_call_conv(),
             cancellation,
         )?;
+        if let Some(started) = started {
+            metrics.lowering_ns = duration_ns(started.elapsed());
+        }
+        metrics.clif_instructions = self.context.func.dfg.num_insts() as u64;
+        metrics.clif_blocks = self.context.func.dfg.num_blocks() as u64;
+        let pass_before = self.timing.as_ref().map(CraneliftTimingCollector::snapshot);
+        let cranelift_started = self.timing.as_ref().map(|_| Instant::now());
         #[cfg(debug_assertions)]
         cranelift_codegen::verifier::verify_function(&self.context.func, self.isa.as_ref())
             .map_err(|errors| {
@@ -263,12 +438,25 @@ impl CompilerContext {
             })?;
         check_cancellation(cancellation)?;
         let mut control_plane = ControlPlane::default();
-        let compiled = self
+        let compiled_result = self
             .context
             .compile(self.isa.as_ref(), &mut control_plane)
             .map_err(|error| {
                 CompilerError::new(format!("Cranelift compilation failed: {error:?}"))
-            })?;
+            });
+        if let Some(started) = cranelift_started {
+            metrics.cranelift_compile_ns = duration_ns(started.elapsed());
+        }
+        if let (Some(timing), Some(before)) = (&self.timing, pass_before) {
+            let passes = timing.metrics_since(before);
+            metrics.cranelift_verifier_ns = passes.verifier_ns;
+            metrics.cranelift_optimize_ns = passes.optimize_ns;
+            metrics.cranelift_vcode_lower_ns = passes.vcode_lower_ns;
+            metrics.cranelift_regalloc_ns = passes.regalloc_ns;
+            metrics.cranelift_emit_ns = passes.emit_ns;
+            metrics.cranelift_other_ns = passes.other_ns;
+        }
+        let compiled = compiled_result?;
         check_cancellation(cancellation)?;
         if !compiled.buffer.relocs().is_empty() {
             return Err(CompilerError::new(
@@ -276,9 +464,12 @@ impl CompilerContext {
             ));
         }
         let code = compiled.code_buffer();
+        metrics.native_code_bytes = code.len() as u64;
         let alignment = self.isa.function_alignment().preferred as usize;
         check_cancellation(cancellation)?;
-        let published = publish_code(executable_memory, code, alignment)?;
+        let (published, publication) = publish_code(executable_memory, code, alignment)?;
+        metrics.publication = publication;
+        metrics.native_mapped_bytes = published.mapped_len as u64;
         let address: *mut u8 = std::ptr::with_exposed_provenance_mut(published.address);
         let entry = address.addr();
         Ok(CompiledRegion {
@@ -341,7 +532,7 @@ pub(crate) fn compile_gateway(
             "native gateway unexpectedly requires relocations",
         ));
     }
-    let published = publish_code(
+    let (published, _) = publish_code(
         executable_memory,
         compiled.code_buffer(),
         isa.function_alignment().preferred as usize,
@@ -3247,33 +3438,36 @@ fn memory_read(
     let merged = builder.create_block();
     builder.append_block_param(merged, ty);
 
-    let tlb_base = load(
+    let entries = load(
         builder,
         types::I64,
         lowering.frame,
-        FRAME_OFFSETS.memory_tlb_base,
+        FRAME_OFFSETS.memory_fastmem_entries,
     )?;
-    let available = builder.ins().icmp_imm_s(IntCC::NotEqual, tlb_base, 0);
+    let arena_size = load(
+        builder,
+        types::I64,
+        lowering.frame,
+        FRAME_OFFSETS.memory_fastmem_size,
+    )?;
+    let has_entries = builder.ins().icmp_imm_s(IntCC::NotEqual, entries, 0);
+    let in_arena = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, address, arena_size);
+    let available = builder.ins().band(has_entries, in_arena);
     builder.ins().brif(available, lookup, &[], slow, &[]);
 
     builder.switch_to_block(lookup);
-    let entry = tlb_entry(builder, lowering, address, tlb_base)?;
-    let valid = tlb_entry_matches(
-        builder,
-        lowering,
-        address,
-        entry,
-        FLAG_READ | FLAG_ORDINARY | FLAG_CPU_VISIBLE,
-        access.size,
-    )?;
+    let entry = fastmem_entry(builder, address, entries);
+    let valid = fastmem_entry_matches(builder, address, entry, FASTMEM_READ, access.size)?;
     builder.ins().brif(valid, hit, &[], slow, &[]);
 
     builder.switch_to_block(hit);
-    let visible = direct_visibility_matches(builder, entry)?;
+    let (validity_address, visibility_epoch, visible) = direct_visibility_control(builder, entry)?;
     builder.ins().brif(visible, visible_hit, &[], slow, &[]);
     builder.switch_to_block(visible_hit);
-    let value = direct_load(builder, address, entry, access.size)?;
-    let still_valid = direct_visibility_matches(builder, entry)?;
+    let value = direct_load(builder, lowering, address, access.size)?;
+    let still_valid = current_visibility_matches(builder, validity_address, visibility_epoch);
     builder
         .ins()
         .brif(still_valid, hit_complete, &[], slow, &[]);
@@ -3495,29 +3689,32 @@ fn memory_write(
     let hit = builder.create_block();
     let slow = builder.create_block();
     let merged = builder.create_block();
-    let tlb_base = load(
+    let entries = load(
         builder,
         types::I64,
         lowering.frame,
-        FRAME_OFFSETS.memory_tlb_base,
+        FRAME_OFFSETS.memory_fastmem_entries,
     )?;
-    let available = builder.ins().icmp_imm_s(IntCC::NotEqual, tlb_base, 0);
+    let arena_size = load(
+        builder,
+        types::I64,
+        lowering.frame,
+        FRAME_OFFSETS.memory_fastmem_size,
+    )?;
+    let has_entries = builder.ins().icmp_imm_s(IntCC::NotEqual, entries, 0);
+    let in_arena = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, address, arena_size);
+    let available = builder.ins().band(has_entries, in_arena);
     builder.ins().brif(available, lookup, &[], slow, &[]);
 
     builder.switch_to_block(lookup);
-    let entry = tlb_entry(builder, lowering, address, tlb_base)?;
-    let valid = tlb_entry_matches(
-        builder,
-        lowering,
-        address,
-        entry,
-        FLAG_WRITE | FLAG_WRITE_ARMED | FLAG_ORDINARY | FLAG_CPU_VISIBLE,
-        access.size,
-    )?;
+    let entry = fastmem_entry(builder, address, entries);
+    let valid = fastmem_entry_matches(builder, address, entry, FASTMEM_WRITE, access.size)?;
     builder.ins().brif(valid, hit, &[], slow, &[]);
 
     builder.switch_to_block(hit);
-    direct_store(builder, address, entry, value, access.size, slow)?;
+    direct_store(builder, lowering, address, entry, value, access.size, slow)?;
     builder.ins().jump(merged, &[]);
 
     builder.switch_to_block(slow);
@@ -3567,73 +3764,64 @@ fn memory_integer_type(size: nixe_cpu::memory::MemoryAccessSize) -> ir::Type {
     }
 }
 
-fn tlb_entry(
+fn fastmem_entry(
     builder: &mut FunctionBuilder<'_>,
-    lowering: &LoweringState,
     address: ir::Value,
-    tlb_base: ir::Value,
-) -> Result<ir::Value, CompilerError> {
-    let guest_page = builder.ins().ushr_imm_u(address, i64::from(PAGE_BITS));
-    let mask = load(
-        builder,
-        types::I32,
-        lowering.frame,
-        FRAME_OFFSETS.memory_tlb_index_mask,
-    )?;
-    let mask = builder.ins().uextend(types::I64, mask);
-    let index = builder.ins().band(guest_page, mask);
-    let byte_offset = builder.ins().imul_imm_u(index, TLB_ENTRY_SIZE as i64);
-    Ok(builder.ins().iadd(tlb_base, byte_offset))
+    entries: ir::Value,
+) -> ir::Value {
+    let guest_page = builder
+        .ins()
+        .ushr_imm_u(address, i64::from(FASTMEM_PAGE_BITS));
+    let byte_offset = builder
+        .ins()
+        .imul_imm_u(guest_page, size_of::<FastmemEntry>() as i64);
+    builder.ins().iadd(entries, byte_offset)
 }
 
-fn tlb_entry_matches(
+fn atomic_entry_load(
     builder: &mut FunctionBuilder<'_>,
-    lowering: &LoweringState,
+    ty: ir::Type,
+    flags: MemFlagsData,
+    entry: ir::Value,
+    field_offset: usize,
+) -> Result<ir::Value, CompilerError> {
+    let pointer = builder
+        .ins()
+        .iadd_imm_s(entry, i64::from(offset(field_offset)?));
+    Ok(builder.ins().atomic_load(ty, flags, pointer))
+}
+
+fn fastmem_entry_matches(
+    builder: &mut FunctionBuilder<'_>,
     address: ir::Value,
     entry: ir::Value,
     required_flags: u32,
     size: nixe_cpu::memory::MemoryAccessSize,
 ) -> Result<ir::Value, CompilerError> {
     let flags = trusted_mem_flags(builder);
-    let guest_page = builder.ins().ushr_imm_u(address, i64::from(PAGE_BITS));
-    let cached_page = builder
-        .ins()
-        .load(types::I64, flags, entry, offset(TLB_OFFSETS.guest_page)?);
-    let mut valid = builder.ins().icmp(IntCC::Equal, guest_page, cached_page);
-    for (frame_offset, entry_offset) in [
-        (
-            FRAME_OFFSETS.memory_address_space,
-            TLB_OFFSETS.address_space,
-        ),
-        (
-            FRAME_OFFSETS.memory_mapping_epoch,
-            TLB_OFFSETS.mapping_epoch,
-        ),
-    ] {
-        let expected = load(builder, types::I64, lowering.frame, frame_offset)?;
-        let observed = builder
-            .ins()
-            .load(types::I64, flags, entry, offset(entry_offset)?);
-        let equal = builder.ins().icmp(IntCC::Equal, expected, observed);
-        valid = builder.ins().band(valid, equal);
-    }
-    let observed_flags = builder
-        .ins()
-        .load(types::I32, flags, entry, offset(TLB_OFFSETS.flags)?);
+    let observed_flags = atomic_entry_load(
+        builder,
+        types::I32,
+        flags,
+        entry,
+        offset_of!(FastmemEntry, flags),
+    )?;
     let masked = builder
         .ins()
         .band_imm_u(observed_flags, i64::from(required_flags));
     let allowed = builder
         .ins()
         .icmp_imm_s(IntCC::Equal, masked, i64::from(required_flags));
-    valid = builder.ins().band(valid, allowed);
+    let mut valid = allowed;
 
     let bytes = size.bytes() as u64;
-    let page_offset = builder.ins().band_imm_u(address, (PAGE_SIZE - 1) as i64);
+    let page_offset = builder
+        .ins()
+        .band_imm_u(address, (FASTMEM_PAGE_SIZE - 1) as i64);
     let within_page = builder.ins().icmp_imm_u(
         IntCC::UnsignedLessThanOrEqual,
         page_offset,
-        (PAGE_SIZE - bytes) as i64,
+        (FASTMEM_PAGE_SIZE as u64 - bytes) as i64,
     );
     let alignment = builder.ins().band_imm_u(address, (bytes - 1) as i64);
     let aligned = builder.ins().icmp_imm_s(IntCC::Equal, alignment, 0);
@@ -3641,56 +3829,65 @@ fn tlb_entry_matches(
     Ok(builder.ins().band(valid, aligned))
 }
 
-fn direct_visibility_matches(
+fn direct_visibility_control(
     builder: &mut FunctionBuilder<'_>,
     entry: ir::Value,
-) -> Result<ir::Value, CompilerError> {
+) -> Result<(ir::Value, ir::Value, ir::Value), CompilerError> {
     let flags = trusted_mem_flags(builder);
-    let validity_address = builder.ins().load(
+    let validity_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.validity_address)?,
-    );
+        offset_of!(FastmemEntry, validity_address),
+    )?;
+    let expected_visibility = atomic_entry_load(
+        builder,
+        types::I64,
+        flags,
+        entry,
+        offset_of!(FastmemEntry, visibility_epoch),
+    )?;
+    let visible = current_visibility_matches(builder, validity_address, expected_visibility);
+    Ok((validity_address, expected_visibility, visible))
+}
+
+fn current_visibility_matches(
+    builder: &mut FunctionBuilder<'_>,
+    validity_address: ir::Value,
+    expected_visibility: ir::Value,
+) -> ir::Value {
+    let flags = trusted_mem_flags(builder);
     let current_visibility = builder
         .ins()
         .atomic_load(types::I64, flags, validity_address);
-    let expected_visibility = builder.ins().load(
-        types::I64,
-        flags,
-        entry,
-        offset(TLB_OFFSETS.visibility_epoch)?,
-    );
-    let visible = builder
+    builder
         .ins()
-        .icmp(IntCC::Equal, current_visibility, expected_visibility);
-    Ok(visible)
+        .icmp(IntCC::Equal, current_visibility, expected_visibility)
 }
 
 fn direct_word_pointer(
     builder: &mut FunctionBuilder<'_>,
+    lowering: &LoweringState,
     address: ir::Value,
-    entry: ir::Value,
 ) -> Result<ir::Value, CompilerError> {
-    let flags = trusted_mem_flags(builder);
-    let base = builder.ins().load(
+    let base = load(
+        builder,
         types::I64,
-        flags,
-        entry,
-        offset(TLB_OFFSETS.host_word_base)?,
-    );
-    let page_offset = builder.ins().band_imm_u(address, (PAGE_SIZE - 1) as i64);
-    let word_offset = builder.ins().band_imm_s(page_offset, !7_i64);
-    Ok(builder.ins().iadd(base, word_offset))
+        lowering.frame,
+        FRAME_OFFSETS.memory_fastmem_base,
+    )?;
+    let word_address = builder.ins().band_imm_s(address, !7_i64);
+    Ok(builder.ins().iadd(base, word_address))
 }
 
 fn direct_load(
     builder: &mut FunctionBuilder<'_>,
+    lowering: &LoweringState,
     address: ir::Value,
-    entry: ir::Value,
     size: nixe_cpu::memory::MemoryAccessSize,
 ) -> Result<ir::Value, CompilerError> {
-    let pointer = direct_word_pointer(builder, address, entry)?;
+    let pointer = direct_word_pointer(builder, lowering, address)?;
     let flags = trusted_mem_flags(builder);
     let low = builder.ins().atomic_load(types::I64, flags, pointer);
     if size == nixe_cpu::memory::MemoryAccessSize::Quadword {
@@ -3711,50 +3908,55 @@ fn direct_load(
 
 fn direct_store(
     builder: &mut FunctionBuilder<'_>,
+    lowering: &LoweringState,
     address: ir::Value,
     entry: ir::Value,
     value: ir::Value,
     size: nixe_cpu::memory::MemoryAccessSize,
     slow: ir::Block,
 ) -> Result<(), CompilerError> {
-    let pointer = direct_word_pointer(builder, address, entry)?;
+    let pointer = direct_word_pointer(builder, lowering, address)?;
     let flags = trusted_mem_flags(builder);
-    let sequence_address = builder.ins().load(
+    let sequence_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.write_sequence_address)?,
-    );
+        offset_of!(FastmemEntry, write_sequence_address),
+    )?;
     let sequence = acquire_write_sequence(builder, sequence_address);
-    let mut permitted = direct_visibility_matches(builder, entry)?;
-    let generation_address = builder.ins().load(
+    let (_, _, mut permitted) = direct_visibility_control(builder, entry)?;
+    let generation_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.generation_address)?,
-    );
+        offset_of!(FastmemEntry, generation_address),
+    )?;
     let generation = builder
         .ins()
         .atomic_load(types::I64, flags, generation_address);
     let has_generation = builder.ins().icmp_imm_s(IntCC::NotEqual, generation, -1);
     permitted = builder.ins().band(permitted, has_generation);
-    let content_epoch_address = builder.ins().load(
+    let content_epoch_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.content_epoch_address)?,
-    );
+        offset_of!(FastmemEntry, content_epoch_address),
+    )?;
     let content_epoch = builder
         .ins()
         .atomic_load(types::I64, flags, content_epoch_address);
     let has_content_epoch = builder.ins().icmp_imm_s(IntCC::NotEqual, content_epoch, -1);
     permitted = builder.ins().band(permitted, has_content_epoch);
-    let cpu_write_epoch_address = builder.ins().load(
+    let cpu_write_epoch_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.cpu_write_epoch_address)?,
-    );
+        offset_of!(FastmemEntry, cpu_write_epoch_address),
+    )?;
     let cpu_write_epoch = builder
         .ins()
         .atomic_load(types::I64, flags, cpu_write_epoch_address);
@@ -3762,12 +3964,13 @@ fn direct_store(
         .ins()
         .icmp_imm_s(IntCC::NotEqual, cpu_write_epoch, -1);
     permitted = builder.ins().band(permitted, has_cpu_write_epoch);
-    let cpu_writes_active_address = builder.ins().load(
+    let cpu_writes_active_address = atomic_entry_load(
+        builder,
         types::I64,
         flags,
         entry,
-        offset(TLB_OFFSETS.cpu_writes_active_address)?,
-    );
+        offset_of!(FastmemEntry, cpu_writes_active_address),
+    )?;
     let store = builder.create_block();
     let revoked = builder.create_block();
     builder.ins().brif(permitted, store, &[], revoked, &[]);
@@ -5293,4 +5496,8 @@ fn trusted_mem_flags(_builder: &mut FunctionBuilder<'_>) -> MemFlagsData {
 
 fn offset(value: usize) -> Result<i32, CompilerError> {
     i32::try_from(value).map_err(|_| CompilerError::new("native frame offset exceeds i32"))
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }

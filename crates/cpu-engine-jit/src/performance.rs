@@ -16,7 +16,7 @@ use crate::abi::{
 };
 use crate::compilation_pool::CompilationPoolSnapshot;
 
-const REPORT_VERSION: u32 = 6;
+const REPORT_VERSION: u32 = 7;
 const EXIT_KIND_COUNT: usize = EXIT_INTERNAL as usize + 1;
 
 pub(crate) struct JitPerformanceReport {
@@ -43,7 +43,7 @@ impl JitPerformanceReport {
             .unwrap_or_default()
             .as_millis();
         let header = format!(
-            "nixe_jit_performance_version={REPORT_VERSION}\nprocess_id={}\nstarted_unix_ms={started_unix_ms}\nhost_debug_assertions={}\ncranelift_opt_level=\"none\"\ncranelift_opt_level_source=\"default\"\ncold_tier=\"interpreter\"\nhot_promotion_visits=3\nasynchronous_compilation=true\ncompilation_workers_policy=\"max(1,host_logical_cores/2)\"\nnative_poll_fast_path=true\n",
+            "nixe_jit_performance_version={REPORT_VERSION}\nprocess_id={}\nstarted_unix_ms={started_unix_ms}\nhost_debug_assertions={}\ncranelift_opt_level=\"none\"\ncranelift_opt_level_source=\"default\"\ncranelift_pass_timing=true\ncold_tier=\"interpreter\"\nhot_promotion_visits=3\nasynchronous_compilation=true\ncompilation_workers_policy=\"max(1,host_logical_cores/2)\"\nnative_poll_fast_path=true\n",
             std::process::id(),
             cfg!(debug_assertions),
         );
@@ -84,16 +84,77 @@ impl JitPerformanceReport {
             total.codegen_completed = total
                 .codegen_completed
                 .saturating_add(pool.completed.saturating_sub(pool.failed));
-            total.codegen_ns = total.codegen_ns.saturating_add(pool.codegen_ns);
+            total.worker_compilation_ns = total
+                .worker_compilation_ns
+                .saturating_add(pool.worker_total_ns);
+            total.nixe_ir_verify_ns = total
+                .nixe_ir_verify_ns
+                .saturating_add(pool.nixe_ir_verify_ns);
+            total.state_validation_ns = total
+                .state_validation_ns
+                .saturating_add(pool.state_validation_ns);
+            total.lowering_ns = total.lowering_ns.saturating_add(pool.lowering_ns);
+            total.cranelift_compile_ns = total
+                .cranelift_compile_ns
+                .saturating_add(pool.cranelift_compile_ns);
+            total.cranelift_verifier_ns = total
+                .cranelift_verifier_ns
+                .saturating_add(pool.cranelift_verifier_ns);
+            total.cranelift_optimize_ns = total
+                .cranelift_optimize_ns
+                .saturating_add(pool.cranelift_optimize_ns);
+            total.cranelift_vcode_lower_ns = total
+                .cranelift_vcode_lower_ns
+                .saturating_add(pool.cranelift_vcode_lower_ns);
+            total.cranelift_regalloc_ns = total
+                .cranelift_regalloc_ns
+                .saturating_add(pool.cranelift_regalloc_ns);
+            total.cranelift_emit_ns = total
+                .cranelift_emit_ns
+                .saturating_add(pool.cranelift_emit_ns);
+            total.cranelift_other_ns = total
+                .cranelift_other_ns
+                .saturating_add(pool.cranelift_other_ns);
+            total.publication_total_ns = total
+                .publication_total_ns
+                .saturating_add(pool.publication_total_ns);
+            total.publication_lock_wait_ns = total
+                .publication_lock_wait_ns
+                .saturating_add(pool.publication_lock_wait_ns);
+            total.publication_allocation_ns = total
+                .publication_allocation_ns
+                .saturating_add(pool.publication_allocation_ns);
+            total.publication_zero_copy_ns = total
+                .publication_zero_copy_ns
+                .saturating_add(pool.publication_zero_copy_ns);
+            total.publication_protection_ns = total
+                .publication_protection_ns
+                .saturating_add(pool.publication_protection_ns);
+            total.publication_instruction_cache_ns = total
+                .publication_instruction_cache_ns
+                .saturating_add(pool.publication_instruction_cache_ns);
+            total.diagnostics_ns = total.diagnostics_ns.saturating_add(pool.diagnostics_ns);
+            total.pending_region_ns = total
+                .pending_region_ns
+                .saturating_add(pool.pending_region_ns);
             total.compiled_guest_instructions = total
                 .compiled_guest_instructions
                 .saturating_add(pool.compiled_guest_instructions);
             total.compiled_ir_operations = total
                 .compiled_ir_operations
                 .saturating_add(pool.compiled_ir_operations);
-            total.compiled_native_bytes = total
-                .compiled_native_bytes
-                .saturating_add(pool.compiled_native_bytes);
+            total.compiled_clif_instructions = total
+                .compiled_clif_instructions
+                .saturating_add(pool.compiled_clif_instructions);
+            total.compiled_clif_blocks = total
+                .compiled_clif_blocks
+                .saturating_add(pool.compiled_clif_blocks);
+            total.compiled_native_code_bytes = total
+                .compiled_native_code_bytes
+                .saturating_add(pool.compiled_native_code_bytes);
+            total.compiled_native_mapped_bytes = total
+                .compiled_native_mapped_bytes
+                .saturating_add(pool.compiled_native_mapped_bytes);
             total.compiled_native_named_operations = total
                 .compiled_native_named_operations
                 .saturating_add(pool.compiled_native_named_operations);
@@ -219,10 +280,31 @@ pub(crate) struct ExecutorPerformance {
     pub(crate) compilation_attempts: u64,
     pub(crate) codegen_completed: u64,
     pub(crate) frontend_ns: u64,
-    pub(crate) codegen_ns: u64,
+    pub(crate) worker_compilation_ns: u64,
+    pub(crate) nixe_ir_verify_ns: u64,
+    pub(crate) state_validation_ns: u64,
+    pub(crate) lowering_ns: u64,
+    pub(crate) cranelift_compile_ns: u64,
+    pub(crate) cranelift_verifier_ns: u64,
+    pub(crate) cranelift_optimize_ns: u64,
+    pub(crate) cranelift_vcode_lower_ns: u64,
+    pub(crate) cranelift_regalloc_ns: u64,
+    pub(crate) cranelift_emit_ns: u64,
+    pub(crate) cranelift_other_ns: u64,
+    pub(crate) publication_total_ns: u64,
+    pub(crate) publication_lock_wait_ns: u64,
+    pub(crate) publication_allocation_ns: u64,
+    pub(crate) publication_zero_copy_ns: u64,
+    pub(crate) publication_protection_ns: u64,
+    pub(crate) publication_instruction_cache_ns: u64,
+    pub(crate) diagnostics_ns: u64,
+    pub(crate) pending_region_ns: u64,
     pub(crate) compiled_guest_instructions: u64,
     pub(crate) compiled_ir_operations: u64,
-    pub(crate) compiled_native_bytes: u64,
+    pub(crate) compiled_clif_instructions: u64,
+    pub(crate) compiled_clif_blocks: u64,
+    pub(crate) compiled_native_code_bytes: u64,
+    pub(crate) compiled_native_mapped_bytes: u64,
     pub(crate) compiled_native_named_operations: u64,
     pub(crate) compiled_semantic_helper_callsites: u64,
     pub(crate) native_entries: u64,
@@ -276,10 +358,31 @@ impl ExecutorPerformance {
             compilation_attempts,
             codegen_completed,
             frontend_ns,
-            codegen_ns,
+            worker_compilation_ns,
+            nixe_ir_verify_ns,
+            state_validation_ns,
+            lowering_ns,
+            cranelift_compile_ns,
+            cranelift_verifier_ns,
+            cranelift_optimize_ns,
+            cranelift_vcode_lower_ns,
+            cranelift_regalloc_ns,
+            cranelift_emit_ns,
+            cranelift_other_ns,
+            publication_total_ns,
+            publication_lock_wait_ns,
+            publication_allocation_ns,
+            publication_zero_copy_ns,
+            publication_protection_ns,
+            publication_instruction_cache_ns,
+            diagnostics_ns,
+            pending_region_ns,
             compiled_guest_instructions,
             compiled_ir_operations,
-            compiled_native_bytes,
+            compiled_clif_instructions,
+            compiled_clif_blocks,
+            compiled_native_code_bytes,
+            compiled_native_mapped_bytes,
             compiled_native_named_operations,
             compiled_semantic_helper_callsites,
             native_entries,
@@ -330,13 +433,61 @@ fn render_counters(output: &mut String, counters: &ExecutorPerformance) {
     field!("compilation_attempts", counters.compilation_attempts);
     field!("codegen_completed", counters.codegen_completed);
     field!("frontend_ns", counters.frontend_ns);
-    field!("codegen_ns", counters.codegen_ns);
+    field!("worker_compilation_ns", counters.worker_compilation_ns);
+    field!("nixe_ir_verify_ns", counters.nixe_ir_verify_ns);
+    field!("state_validation_ns", counters.state_validation_ns);
+    field!("lowering_ns", counters.lowering_ns);
+    field!("cranelift_compile_ns", counters.cranelift_compile_ns);
+    field!("cranelift_verifier_ns", counters.cranelift_verifier_ns);
+    field!("cranelift_optimize_ns", counters.cranelift_optimize_ns);
+    field!(
+        "cranelift_vcode_lower_ns",
+        counters.cranelift_vcode_lower_ns
+    );
+    field!("cranelift_regalloc_ns", counters.cranelift_regalloc_ns);
+    field!("cranelift_emit_ns", counters.cranelift_emit_ns);
+    field!("cranelift_other_ns", counters.cranelift_other_ns);
+    field!("publication_total_ns", counters.publication_total_ns);
+    field!(
+        "publication_lock_wait_ns",
+        counters.publication_lock_wait_ns
+    );
+    field!(
+        "publication_allocation_ns",
+        counters.publication_allocation_ns
+    );
+    field!(
+        "publication_zero_copy_ns",
+        counters.publication_zero_copy_ns
+    );
+    field!(
+        "publication_protection_ns",
+        counters.publication_protection_ns
+    );
+    field!(
+        "publication_instruction_cache_ns",
+        counters.publication_instruction_cache_ns
+    );
+    field!("diagnostics_ns", counters.diagnostics_ns);
+    field!("pending_region_ns", counters.pending_region_ns);
     field!(
         "compiled_guest_instructions",
         counters.compiled_guest_instructions
     );
     field!("compiled_ir_operations", counters.compiled_ir_operations);
-    field!("compiled_native_bytes", counters.compiled_native_bytes);
+    field!(
+        "compiled_clif_instructions",
+        counters.compiled_clif_instructions
+    );
+    field!("compiled_clif_blocks", counters.compiled_clif_blocks);
+    field!(
+        "compiled_native_code_bytes",
+        counters.compiled_native_code_bytes
+    );
+    field!(
+        "compiled_native_mapped_bytes",
+        counters.compiled_native_mapped_bytes
+    );
     field!(
         "compiled_native_named_operations",
         counters.compiled_native_named_operations
@@ -413,13 +564,61 @@ fn render_compilation_pool_counters(output: &mut String, counters: &CompilationP
     field!("completed_discarded", counters.completed_discarded);
     field!("peak_queued", counters.peak_queued);
     field!("peak_running", counters.peak_running);
-    field!("codegen_ns", counters.codegen_ns);
+    field!("worker_total_ns", counters.worker_total_ns);
+    field!("nixe_ir_verify_ns", counters.nixe_ir_verify_ns);
+    field!("state_validation_ns", counters.state_validation_ns);
+    field!("lowering_ns", counters.lowering_ns);
+    field!("cranelift_compile_ns", counters.cranelift_compile_ns);
+    field!("cranelift_verifier_ns", counters.cranelift_verifier_ns);
+    field!("cranelift_optimize_ns", counters.cranelift_optimize_ns);
+    field!(
+        "cranelift_vcode_lower_ns",
+        counters.cranelift_vcode_lower_ns
+    );
+    field!("cranelift_regalloc_ns", counters.cranelift_regalloc_ns);
+    field!("cranelift_emit_ns", counters.cranelift_emit_ns);
+    field!("cranelift_other_ns", counters.cranelift_other_ns);
+    field!("publication_total_ns", counters.publication_total_ns);
+    field!(
+        "publication_lock_wait_ns",
+        counters.publication_lock_wait_ns
+    );
+    field!(
+        "publication_allocation_ns",
+        counters.publication_allocation_ns
+    );
+    field!(
+        "publication_zero_copy_ns",
+        counters.publication_zero_copy_ns
+    );
+    field!(
+        "publication_protection_ns",
+        counters.publication_protection_ns
+    );
+    field!(
+        "publication_instruction_cache_ns",
+        counters.publication_instruction_cache_ns
+    );
+    field!("diagnostics_ns", counters.diagnostics_ns);
+    field!("pending_region_ns", counters.pending_region_ns);
     field!(
         "compiled_guest_instructions",
         counters.compiled_guest_instructions
     );
     field!("compiled_ir_operations", counters.compiled_ir_operations);
-    field!("compiled_native_bytes", counters.compiled_native_bytes);
+    field!(
+        "compiled_clif_instructions",
+        counters.compiled_clif_instructions
+    );
+    field!("compiled_clif_blocks", counters.compiled_clif_blocks);
+    field!(
+        "compiled_native_code_bytes",
+        counters.compiled_native_code_bytes
+    );
+    field!(
+        "compiled_native_mapped_bytes",
+        counters.compiled_native_mapped_bytes
+    );
     field!(
         "compiled_native_named_operations",
         counters.compiled_native_named_operations

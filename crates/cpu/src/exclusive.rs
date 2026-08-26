@@ -1,6 +1,6 @@
 //! Engine-neutral exclusive-reservation value types.
 //!
-//! Dispatch budgets, pending events, safepoints, software TLBs, and mutable
+//! Dispatch budgets, pending events, safepoints, memory acceleration, and mutable
 //! local-monitor storage belong to concrete engine executors. This module keeps
 //! only values referenced by the common CPU memory contract.
 

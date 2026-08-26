@@ -1182,6 +1182,7 @@ dependencies = [
 name = "nixe-cpu-engine-jit"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-native",
@@ -1319,6 +1320,9 @@ dependencies = [
 [[package]]
 name = "nixe-memory"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "nixe-runtime"

@@ -14,9 +14,10 @@ use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
     CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
-    ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId, GuestVirtualAddress,
-    MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError,
-    MemoryInvalidationKind, MemoryInvalidationLog, MemoryInvalidationSource,
+    ContentGeneration, ContentMutationEpoch, FastmemArena, FastmemView, GuestPhysicalPageId,
+    GuestVirtualAddress, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
+    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
+    MemoryInvalidationSource,
 };
 
 use crate::{
@@ -158,11 +159,42 @@ struct ExecutionMemoryInner {
     physical_slots: Vec<Option<ExecutionPhysicalSlot>>,
     free_physical_slots: Vec<usize>,
     slots_by_id: BTreeMap<GuestPhysicalPageId, usize>,
+    fastmem: BTreeMap<AddressSpaceId, FastmemArena>,
     next_page_id: u64,
     next_mapping_generation: Option<MappingGeneration>,
 }
 
 impl ExecutionMemoryInner {
+    fn fastmem_mut(&mut self, address_space: AddressSpaceId) -> Option<&mut FastmemArena> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.fastmem.entry(address_space)
+        {
+            let arena = FastmemArena::new().ok()?;
+            entry.insert(arena);
+        }
+        self.fastmem.get_mut(&address_space)
+    }
+
+    fn invalidate_fastmem_page(&mut self, address_space: AddressSpaceId, virtual_page: u64) {
+        if let Some(arena) = self.fastmem.get_mut(&address_space) {
+            arena
+                .unmap_page(page_address(virtual_page).get())
+                .expect("a published fastmem mapping can be revoked");
+        }
+    }
+
+    fn invalidate_fastmem_physical_slot(&mut self, physical_slot: usize) {
+        let aliases: Vec<_> = self
+            .mappings
+            .mappings()
+            .filter_map(|(address_space, virtual_page, mapping)| {
+                (mapping.physical_slot == physical_slot).then_some((address_space, virtual_page))
+            })
+            .collect();
+        for (address_space, virtual_page) in aliases {
+            self.invalidate_fastmem_page(address_space, virtual_page);
+        }
+    }
+
     fn page(&self, slot: usize) -> Option<&ExecutionPhysicalPage> {
         Some(&self.physical_slots.get(slot)?.as_ref()?.page)
     }
@@ -222,6 +254,9 @@ impl ExecutionMemoryInner {
         mapping: ExecutionMapping,
     ) {
         assert!(self.mappings.get(address_space, virtual_page).is_none());
+        if mapping.observes_executable_content() {
+            self.invalidate_fastmem_physical_slot(mapping.physical_slot);
+        }
         let previous = self.mappings.insert(address_space, virtual_page, mapping);
         debug_assert!(previous.is_none());
         self.register_mapping(mapping);
@@ -232,6 +267,7 @@ impl ExecutionMemoryInner {
         address_space: AddressSpaceId,
         virtual_page: u64,
     ) -> Option<ExecutionMapping> {
+        self.invalidate_fastmem_page(address_space, virtual_page);
         let mapping = self.mappings.remove(address_space, virtual_page)?;
         self.unregister_mapping(mapping);
         Some(mapping)
@@ -244,6 +280,7 @@ impl ExecutionMemoryInner {
         purpose: MemoryMappingPurpose,
         mapping_generation: MappingGeneration,
     ) {
+        self.invalidate_fastmem_page(address_space, virtual_page);
         let (physical_slot, was_executable_content, is_executable_content) = {
             let mapping = self
                 .mappings
@@ -263,6 +300,9 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
+        if !was_executable_content && is_executable_content {
+            self.invalidate_fastmem_physical_slot(physical_slot);
+        }
     }
 
     fn set_mapping_permissions(
@@ -272,6 +312,7 @@ impl ExecutionMemoryInner {
         permissions: MemoryPermissions,
         mapping_generation: MappingGeneration,
     ) {
+        self.invalidate_fastmem_page(address_space, virtual_page);
         let (physical_slot, was_executable_content, is_executable_content) = {
             let mapping = self
                 .mappings
@@ -291,6 +332,9 @@ impl ExecutionMemoryInner {
             was_executable_content,
             is_executable_content,
         );
+        if !was_executable_content && is_executable_content {
+            self.invalidate_fastmem_physical_slot(physical_slot);
+        }
     }
 
     fn executable_content_page(&self, physical_slot: usize) -> Option<GuestPhysicalPageId> {
@@ -1551,31 +1595,58 @@ fn bulk_translation_fault(
 }
 
 impl CpuMemory for ExecutionMemory {
-    fn direct_access(
+    fn fastmem_view(&self, address_space: AddressSpaceId) -> Option<FastmemView> {
+        self.lock_inner()
+            .fastmem_mut(address_space)
+            .map(|arena| arena.view())
+    }
+
+    fn arm_fastmem_page(
         &self,
         address_space: AddressSpaceId,
         page: GuestVirtualAddress,
         kind: DataAccessKind,
-    ) -> Option<nixe_memory::CanonicalDirectAccessLease> {
+    ) -> bool {
         if page_offset(page) != 0 {
-            return None;
+            return false;
         }
-        let inner = self.lock_inner();
-        let mapping = inner.mapping_at(address_space, page)?;
+        let mut inner = self.lock_inner();
+        let Some(mapping) = inner.mapping_at(address_space, page) else {
+            return false;
+        };
         if mapping.attributes.contains(MemoryAttributes::UNCACHED)
             || inner
                 .executable_content_page(mapping.physical_slot)
                 .is_some()
         {
-            return None;
+            return false;
         }
-        let ExecutionPhysicalPage::Ram(backing) = inner.page(mapping.physical_slot)? else {
-            return None;
+        let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot) else {
+            return false;
         };
-        backing
-            .acquire_direct_access(mapping.permissions, matches!(kind, DataAccessKind::Write))
-            .ok()
-            .flatten()
+        let backing = backing.clone();
+        let Ok(Some(lease)) =
+            backing.acquire_fastmem(mapping.permissions, matches!(kind, DataAccessKind::Write))
+        else {
+            return false;
+        };
+        let Some(arena) = inner.fastmem_mut(address_space) else {
+            return false;
+        };
+        if arena
+            .map_page(page.get(), lease.host_mapped_backing())
+            .is_err()
+        {
+            return false;
+        }
+        arena
+            .arm_page(
+                page.get(),
+                mapping.permissions,
+                &lease,
+                matches!(kind, DataAccessKind::Write),
+            )
+            .is_ok()
     }
 
     fn read(
@@ -2695,6 +2766,7 @@ impl ProcessMemory for ExecutionMemory {
         let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
             .ok_or_else(|| error(start, MemoryProtectionErrorReason::GenerationExhausted))?;
         for page in range.first..range.end {
+            inner.invalidate_fastmem_page(address_space, page);
             let mapping = inner
                 .mappings
                 .get_mut(address_space, page)
@@ -2713,12 +2785,13 @@ impl ProcessMemory for ExecutionMemory {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::memory::MemoryAccessSize;
     use nixe_memory::{
         CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
-        DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
-        VisibilityState,
+        DeviceVisibilityRequest, FASTMEM_READ, FASTMEM_WRITE, FastmemEntry, NonCpuDeviceId,
+        VisibilityCoordinator, VisibilityCoordinatorError, VisibilityState,
     };
 
     struct DeviceWriteback {
@@ -3162,12 +3235,26 @@ mod tests {
             physical_page,
             MemoryPermissions::READ_WRITE,
         ));
+        memory
+            .write(space, writable, access, MemoryValue::U8(0x10))
+            .unwrap();
+        assert!(memory.arm_fastmem_page(space, writable, DataAccessKind::Write));
+        let fastmem = memory.fastmem_view(space).unwrap();
+        let writable_entry = unsafe {
+            &*((fastmem.entries as *const FastmemEntry)
+                .add((writable.get() as usize) >> nixe_memory::FASTMEM_PAGE_BITS))
+        };
+        assert_eq!(
+            writable_entry.flags.load(Ordering::Acquire),
+            FASTMEM_READ | FASTMEM_WRITE
+        );
         assert!(memory.map_page(
             space,
             executable_alias,
             physical_page,
             MemoryPermissions::READ_EXECUTE,
         ));
+        assert_eq!(writable_entry.flags.load(Ordering::Acquire), 0);
 
         let physical_slot = memory.inner_mut().slots_by_id[&physical_page];
         {

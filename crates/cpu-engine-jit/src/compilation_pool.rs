@@ -14,7 +14,7 @@ use nixe_memory::AddressSpaceId;
 use crate::cache::{
     CacheError, CompilationCancellation, PendingRegion, RegionKey, TranslationMode,
 };
-use crate::compiler::CompilerContext;
+use crate::compiler::{CompilationMetrics, CompilerContext};
 use crate::diagnostics::JitDiagnostics;
 use crate::executable_memory::SharedExecutableMemory;
 
@@ -40,12 +40,14 @@ pub(crate) struct CompletedCompilation {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CompletedMetrics {
-    pub(crate) codegen_ns: u64,
+    pub(crate) worker_total_ns: u64,
+    pub(crate) diagnostics_ns: u64,
+    pub(crate) pending_region_ns: u64,
     pub(crate) guest_instructions: u64,
     pub(crate) ir_operations: u64,
-    pub(crate) native_bytes: u64,
     pub(crate) native_named_operations: u64,
     pub(crate) semantic_helper_callsites: u64,
+    pub(crate) compilation: CompilationMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,10 +63,31 @@ pub(crate) struct CompilationPoolSnapshot {
     pub(crate) completed_discarded: u64,
     pub(crate) peak_queued: u64,
     pub(crate) peak_running: u64,
-    pub(crate) codegen_ns: u64,
+    pub(crate) worker_total_ns: u64,
+    pub(crate) nixe_ir_verify_ns: u64,
+    pub(crate) state_validation_ns: u64,
+    pub(crate) lowering_ns: u64,
+    pub(crate) cranelift_compile_ns: u64,
+    pub(crate) cranelift_verifier_ns: u64,
+    pub(crate) cranelift_optimize_ns: u64,
+    pub(crate) cranelift_vcode_lower_ns: u64,
+    pub(crate) cranelift_regalloc_ns: u64,
+    pub(crate) cranelift_emit_ns: u64,
+    pub(crate) cranelift_other_ns: u64,
+    pub(crate) publication_total_ns: u64,
+    pub(crate) publication_lock_wait_ns: u64,
+    pub(crate) publication_allocation_ns: u64,
+    pub(crate) publication_zero_copy_ns: u64,
+    pub(crate) publication_protection_ns: u64,
+    pub(crate) publication_instruction_cache_ns: u64,
+    pub(crate) diagnostics_ns: u64,
+    pub(crate) pending_region_ns: u64,
     pub(crate) compiled_guest_instructions: u64,
     pub(crate) compiled_ir_operations: u64,
-    pub(crate) compiled_native_bytes: u64,
+    pub(crate) compiled_clif_instructions: u64,
+    pub(crate) compiled_clif_blocks: u64,
+    pub(crate) compiled_native_code_bytes: u64,
+    pub(crate) compiled_native_mapped_bytes: u64,
     pub(crate) compiled_native_named_operations: u64,
     pub(crate) compiled_semantic_helper_callsites: u64,
 }
@@ -91,6 +114,7 @@ struct WorkerEnvironment {
     executable_memory: SharedExecutableMemory,
     diagnostics: Option<Arc<JitDiagnostics>>,
     profile: GuestCpuProfile,
+    collect_performance: bool,
 }
 
 #[derive(Clone)]
@@ -176,6 +200,7 @@ impl CompilationPool {
         executable_memory: SharedExecutableMemory,
         diagnostics: Option<Arc<JitDiagnostics>>,
         profile: GuestCpuProfile,
+        collect_performance: bool,
     ) -> Result<Self, Box<str>> {
         let worker_count = worker_count.max(1);
         let queue_capacity = worker_count.saturating_mul(TASKS_PER_WORKER).max(1);
@@ -202,6 +227,7 @@ impl CompilationPool {
             executable_memory,
             diagnostics,
             profile,
+            collect_performance,
         });
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
@@ -277,7 +303,10 @@ fn stop_shared(shared: &SharedPool) {
 }
 
 fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
-    let mut compiler = CompilerContext::new(Arc::clone(&environment.isa));
+    let mut compiler = CompilerContext::new(
+        Arc::clone(&environment.isa),
+        environment.collect_performance,
+    );
     loop {
         let task = {
             let mut state = lock(&shared.state);
@@ -297,31 +326,39 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             task
         };
 
-        let started = Instant::now();
+        let started = environment.collect_performance.then(Instant::now);
         let guest_instructions = u64::from(task.region.metadata.guest_instruction_count);
         let ir_operations = u64::from(task.region.metadata.ir_operation_count);
+        let mut metrics = CompletedMetrics {
+            guest_instructions,
+            ir_operations,
+            ..CompletedMetrics::default()
+        };
         let result = catch_unwind(AssertUnwindSafe(|| {
             let compiled = compiler.compile(
                 &task.region,
                 &environment.executable_memory,
                 CompilationCancellation::active(),
+                &mut metrics.compilation,
             )?;
             if let Some(diagnostics) = &environment.diagnostics {
+                let diagnostics_started = environment.collect_performance.then(Instant::now);
                 diagnostics
                     .dump_region(&environment.profile, &task.region, &compiled)
                     .map_err(CacheError::Internal)?;
+                if let Some(started) = diagnostics_started {
+                    metrics.diagnostics_ns = duration_ns(started.elapsed());
+                }
             }
-            let metrics = CompletedMetrics {
-                codegen_ns: duration_ns(started.elapsed()),
-                guest_instructions,
-                ir_operations,
-                native_bytes: compiled.mapped_len() as u64,
-                native_named_operations: compiled.metadata.native_named_operations,
-                semantic_helper_callsites: compiled.metadata.semantic_calls.len() as u64,
-            };
+            metrics.native_named_operations = compiled.metadata.native_named_operations;
+            metrics.semantic_helper_callsites = compiled.metadata.semantic_calls.len() as u64;
+            let pending_started = environment.collect_performance.then(Instant::now);
             let pending =
                 PendingRegion::new(task.address_space, task.mode, &task.region, compiled)?;
-            Ok::<_, CacheError>((pending, metrics))
+            if let Some(started) = pending_started {
+                metrics.pending_region_ns = duration_ns(started.elapsed());
+            }
+            Ok::<_, CacheError>(pending)
         }))
         .unwrap_or_else(|_| {
             Err(CacheError::Internal(
@@ -332,23 +369,69 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
                 .into_boxed_str(),
             ))
         });
-
-        let (result, metrics) = match result {
-            Ok((pending, metrics)) => (Ok(pending), metrics),
-            Err(error) => (
-                Err(error),
-                CompletedMetrics {
-                    codegen_ns: duration_ns(started.elapsed()),
-                    guest_instructions,
-                    ir_operations,
-                    ..CompletedMetrics::default()
-                },
-            ),
-        };
+        if let Some(started) = started {
+            metrics.worker_total_ns = duration_ns(started.elapsed());
+        }
         let mut state = lock(&shared.state);
         state.running = state.running.saturating_sub(1);
         state.snapshot.completed = state.snapshot.completed.saturating_add(1);
-        state.snapshot.codegen_ns = state.snapshot.codegen_ns.saturating_add(metrics.codegen_ns);
+        macro_rules! add_metric {
+            ($field:ident, $value:expr) => {
+                state.snapshot.$field = state.snapshot.$field.saturating_add($value);
+            };
+        }
+        add_metric!(worker_total_ns, metrics.worker_total_ns);
+        add_metric!(nixe_ir_verify_ns, metrics.compilation.nixe_ir_verify_ns);
+        add_metric!(state_validation_ns, metrics.compilation.state_validation_ns);
+        add_metric!(lowering_ns, metrics.compilation.lowering_ns);
+        add_metric!(
+            cranelift_compile_ns,
+            metrics.compilation.cranelift_compile_ns
+        );
+        add_metric!(
+            cranelift_verifier_ns,
+            metrics.compilation.cranelift_verifier_ns
+        );
+        add_metric!(
+            cranelift_optimize_ns,
+            metrics.compilation.cranelift_optimize_ns
+        );
+        add_metric!(
+            cranelift_vcode_lower_ns,
+            metrics.compilation.cranelift_vcode_lower_ns
+        );
+        add_metric!(
+            cranelift_regalloc_ns,
+            metrics.compilation.cranelift_regalloc_ns
+        );
+        add_metric!(cranelift_emit_ns, metrics.compilation.cranelift_emit_ns);
+        add_metric!(cranelift_other_ns, metrics.compilation.cranelift_other_ns);
+        add_metric!(
+            publication_total_ns,
+            metrics.compilation.publication.total_ns
+        );
+        add_metric!(
+            publication_lock_wait_ns,
+            metrics.compilation.publication.lock_wait_ns
+        );
+        add_metric!(
+            publication_allocation_ns,
+            metrics.compilation.publication.allocation_ns
+        );
+        add_metric!(
+            publication_zero_copy_ns,
+            metrics.compilation.publication.zero_copy_ns
+        );
+        add_metric!(
+            publication_protection_ns,
+            metrics.compilation.publication.protection_ns
+        );
+        add_metric!(
+            publication_instruction_cache_ns,
+            metrics.compilation.publication.instruction_cache_ns
+        );
+        add_metric!(diagnostics_ns, metrics.diagnostics_ns);
+        add_metric!(pending_region_ns, metrics.pending_region_ns);
         state.snapshot.compiled_guest_instructions = state
             .snapshot
             .compiled_guest_instructions
@@ -357,10 +440,19 @@ fn worker_loop(shared: Arc<SharedPool>, environment: Arc<WorkerEnvironment>) {
             .snapshot
             .compiled_ir_operations
             .saturating_add(metrics.ir_operations);
-        state.snapshot.compiled_native_bytes = state
-            .snapshot
-            .compiled_native_bytes
-            .saturating_add(metrics.native_bytes);
+        add_metric!(
+            compiled_clif_instructions,
+            metrics.compilation.clif_instructions
+        );
+        add_metric!(compiled_clif_blocks, metrics.compilation.clif_blocks);
+        add_metric!(
+            compiled_native_code_bytes,
+            metrics.compilation.native_code_bytes
+        );
+        add_metric!(
+            compiled_native_mapped_bytes,
+            metrics.compilation.native_mapped_bytes
+        );
         state.snapshot.compiled_native_named_operations = state
             .snapshot
             .compiled_native_named_operations

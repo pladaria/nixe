@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::host_mapped::{HostMappedBacking, HostMappedStore};
 use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalPageId, ContentGeneration, ContentMutationEpoch, CpuVisibilityRequest, CpuWriteEpoch,
@@ -18,6 +19,7 @@ struct CanonicalBackingStoreInner {
     content_epoch: AtomicU64,
     cpu_write_epoch: AtomicU64,
     cpu_writes_active: AtomicU64,
+    host: OnceLock<HostMappedStore>,
     mutation: Mutex<CanonicalStoreMutationState>,
 }
 
@@ -150,6 +152,7 @@ impl CanonicalBackingStore {
                 content_epoch: AtomicU64::new(ContentMutationEpoch::INITIAL.get()),
                 cpu_write_epoch: AtomicU64::new(CpuWriteEpoch::INITIAL.get()),
                 cpu_writes_active: AtomicU64::new(0),
+                host: OnceLock::new(),
                 mutation: Mutex::new(CanonicalStoreMutationState::default()),
             }),
         })
@@ -175,6 +178,19 @@ impl CanonicalBackingStore {
 
     pub(crate) fn cpu_writes_active(&self) -> u64 {
         self.inner.cpu_writes_active.load(Ordering::Acquire)
+    }
+
+    fn host(&self) -> Result<&HostMappedStore, CanonicalPageError> {
+        if let Some(host) = self.inner.host.get() {
+            return Ok(host);
+        }
+        let host = HostMappedStore::new().map_err(|_| CanonicalPageError::ResourceExhausted)?;
+        let _ = self.inner.host.set(host);
+        Ok(self
+            .inner
+            .host
+            .get()
+            .expect("the host-mapped store was initialized"))
     }
 
     fn begin_mutation(
@@ -473,7 +489,7 @@ struct CanonicalPageInner {
     store: CanonicalBackingStore,
     identity: CanonicalPageId,
     size: usize,
-    words: OnceLock<Box<[AtomicU64]>>,
+    backing: OnceLock<HostMappedBacking>,
     generation: AtomicU64,
     write_sequence: AtomicU64,
     executable_invalidations: OnceLock<Arc<MemoryInvalidationLog>>,
@@ -496,54 +512,31 @@ impl Drop for CanonicalWriter<'_> {
 
 /// Retained canonical facts which authorize bounded direct CPU RAM access.
 ///
-/// The lease owns the backing lifetime. Its base addresses an array of atomic
-/// little-endian 64-bit words, never a JIT TLB entry. Callers must still apply
+/// The lease owns the host-mapped backing lifetime. Callers must still apply
 /// their virtual mapping epoch, permissions, access-class, alignment, and
-/// page-boundary checks. This representation is also suitable for deriving a
-/// future NCE mapping without depending on JIT-private state.
+/// page-boundary checks.
 #[derive(Clone)]
-pub struct CanonicalDirectAccessLease {
+pub struct FastmemPageLease {
     page: CanonicalBackingPage,
     validity: Arc<AtomicU64>,
     visibility_epoch: u64,
-    permissions: MemoryPermissions,
 }
 
-impl CanonicalDirectAccessLease {
-    /// Returns the stable physical identity shared by every alias.
-    #[must_use]
-    pub fn page(&self) -> CanonicalPageId {
-        self.page.identity()
-    }
-
-    /// Returns the retained page size in bytes.
-    #[must_use]
-    pub fn size(&self) -> usize {
-        self.page.size()
-    }
-
-    /// Returns the exact virtual-mapping permissions certified by the owner.
-    #[must_use]
-    pub const fn permissions(&self) -> MemoryPermissions {
-        self.permissions
-    }
-
+impl FastmemPageLease {
     /// Returns the CPU-visible ownership epoch certified by this lease.
     #[must_use]
     pub const fn visibility_epoch(&self) -> u64 {
         self.visibility_epoch
     }
 
-    /// Returns the stable base of the canonical atomic word array.
+    /// Returns the retained host-mapped object used to create fastmem aliases.
     #[must_use]
-    pub fn host_word_base(&self) -> usize {
+    pub fn host_mapped_backing(&self) -> &HostMappedBacking {
         self.page
             .inner
-            .words
+            .backing
             .get()
-            .expect("a direct-access lease retains materialized words")
-            .as_ptr()
-            .addr()
+            .expect("a fastmem lease retains materialized backing")
     }
 
     /// Returns the stable address of the authoritative content generation.
@@ -628,7 +621,7 @@ impl CanonicalBackingPage {
                 store: store.clone(),
                 identity: CanonicalPageId::new(store.identity(), page),
                 size,
-                words: OnceLock::new(),
+                backing: OnceLock::new(),
                 generation: AtomicU64::new(generation.get()),
                 write_sequence: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
@@ -654,17 +647,17 @@ impl CanonicalBackingPage {
         if bytes.is_empty() {
             return Err(CanonicalPageError::InvalidSize);
         }
-        let words = allocate_words(bytes.len(), Some(bytes))?;
-        let initialized_words = OnceLock::new();
-        initialized_words
-            .set(words)
+        let backing = allocate_backing(store, bytes.len(), Some(bytes))?;
+        let initialized_backing = OnceLock::new();
+        initialized_backing
+            .set(backing)
             .expect("a new canonical page has no initialized backing");
         Ok(Self {
             inner: Arc::new(CanonicalPageInner {
                 store: store.clone(),
                 identity: CanonicalPageId::new(store.identity(), page),
                 size: bytes.len(),
-                words: initialized_words,
+                backing: initialized_backing,
                 generation: AtomicU64::new(generation.get()),
                 write_sequence: AtomicU64::new(0),
                 executable_invalidations: OnceLock::new(),
@@ -730,12 +723,12 @@ impl CanonicalBackingPage {
     /// the page CPU-newer. The first arm in each visibility epoch publishes a
     /// conservative whole-page dirty record; later stores advance the content
     /// generation atomically without repeating a Rust callback.
-    pub fn acquire_direct_access(
+    pub fn acquire_fastmem(
         &self,
         permissions: MemoryPermissions,
         write: bool,
-    ) -> Result<Option<CanonicalDirectAccessLease>, CanonicalPageError> {
-        self.ensure_words()?;
+    ) -> Result<Option<FastmemPageLease>, CanonicalPageError> {
+        self.ensure_backing()?;
         let mut state = self.lock_state();
         let eligible = if write {
             matches!(state.visibility, PageVisibility::CpuNewer)
@@ -771,11 +764,10 @@ impl CanonicalBackingPage {
             state.direct_write_epoch = Some(state.visibility_epoch);
             state.direct_write_generation = Some(generation);
         }
-        Ok(Some(CanonicalDirectAccessLease {
+        Ok(Some(FastmemPageLease {
             page: self.clone(),
             validity: Arc::clone(&state.validity),
             visibility_epoch: state.visibility_epoch,
-            permissions,
         }))
     }
 
@@ -872,7 +864,7 @@ impl CanonicalBackingPage {
     /// or their content generation.
     pub fn prepare_write(&self) -> Result<(), CanonicalPageError> {
         self.prepare_cpu_access()?;
-        self.ensure_words()?;
+        self.ensure_backing()?;
         let mut state = self.lock_state();
         self.require_cpu_authority(&mut state)
             .map_err(CanonicalPageError::Visibility)?;
@@ -901,7 +893,7 @@ impl CanonicalBackingPage {
         next: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
-        self.ensure_words()?;
+        self.ensure_backing()?;
         if expected.next() != Ok(next) {
             return Err(CanonicalPageError::InvalidGenerationTransition);
         }
@@ -950,7 +942,7 @@ impl CanonicalBackingPage {
         generation: ContentGeneration,
     ) -> Result<(), CanonicalPageError> {
         let end = self.checked_end(offset, bytes.len())?;
-        self.ensure_words()?;
+        self.ensure_backing()?;
         let mut mutation = self
             .store()
             .begin_cpu_write()
@@ -1233,7 +1225,7 @@ impl CanonicalBackingPage {
                 observed,
             });
         }
-        self.ensure_words()
+        self.ensure_backing()
             .map_err(|_| VisibilityError::ResourceExhausted)?;
         let mut state = self.lock_state();
         if state.visibility_epoch != epoch {
@@ -1331,7 +1323,7 @@ impl CanonicalBackingPage {
     }
 
     fn load_bytes(&self, offset: usize, output: &mut [u8]) {
-        let Some(words) = self.inner.words.get() else {
+        let Some(backing) = self.inner.backing.get() else {
             output.fill(0);
             return;
         };
@@ -1343,7 +1335,9 @@ impl CanonicalBackingPage {
             }
             for (index, byte) in output.iter_mut().enumerate() {
                 let position = offset + index;
-                let word = words[position / 8].load(Ordering::Acquire);
+                let word_address = backing.base() + (position & !7);
+                let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) }
+                    .load(Ordering::Acquire);
                 *byte = (word >> ((position % 8) * 8)) as u8;
             }
             if self.inner.write_sequence.load(Ordering::Acquire) == before {
@@ -1353,7 +1347,7 @@ impl CanonicalBackingPage {
     }
 
     fn load_bytes_with_generation(&self, offset: usize, output: &mut [u8]) -> ContentGeneration {
-        let Some(words) = self.inner.words.get() else {
+        let Some(backing) = self.inner.backing.get() else {
             output.fill(0);
             return self.content_generation();
         };
@@ -1365,7 +1359,9 @@ impl CanonicalBackingPage {
             }
             for (index, byte) in output.iter_mut().enumerate() {
                 let position = offset + index;
-                let word = words[position / 8].load(Ordering::Acquire);
+                let word_address = backing.base() + (position & !7);
+                let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) }
+                    .load(Ordering::Acquire);
                 *byte = (word >> ((position % 8) * 8)) as u8;
             }
             let generation = self.content_generation();
@@ -1406,14 +1402,15 @@ impl CanonicalBackingPage {
     }
 
     fn store_bytes_locked(&self, offset: usize, bytes: &[u8]) {
-        let words = self
+        let backing = self
             .inner
-            .words
+            .backing
             .get()
-            .expect("canonical writes materialize atomic words during preflight");
+            .expect("canonical writes materialize host backing during preflight");
         for (index, &byte) in bytes.iter().enumerate() {
             let position = offset + index;
-            let word = &words[position / 8];
+            let word_address = backing.base() + (position & !7);
+            let word = unsafe { AtomicU64::from_ptr(word_address as *mut u64) };
             let shift = (position % 8) * 8;
             let mask = !(0xff_u64 << shift);
             let mut observed = word.load(Ordering::Acquire);
@@ -1438,38 +1435,25 @@ impl CanonicalBackingPage {
         }
     }
 
-    fn ensure_words(&self) -> Result<(), CanonicalPageError> {
-        if self.inner.words.get().is_some() {
+    fn ensure_backing(&self) -> Result<(), CanonicalPageError> {
+        if self.inner.backing.get().is_some() {
             return Ok(());
         }
-        let words = allocate_words(self.size(), None)?;
-        let _ = self.inner.words.set(words);
+        let backing = allocate_backing(self.store(), self.size(), None)?;
+        let _ = self.inner.backing.set(backing);
         Ok(())
     }
 }
 
-fn allocate_words(
+fn allocate_backing(
+    store: &CanonicalBackingStore,
     size: usize,
     contents: Option<&[u8]>,
-) -> Result<Box<[AtomicU64]>, CanonicalPageError> {
-    let word_count = size.checked_add(7).ok_or(CanonicalPageError::InvalidSize)? / 8;
-    let mut words = Vec::new();
-    words
-        .try_reserve_exact(word_count)
-        .map_err(|_| CanonicalPageError::ResourceExhausted)?;
-    for word_index in 0..word_count {
-        let mut value = 0_u64;
-        if let Some(contents) = contents {
-            for byte_index in 0..8 {
-                let index = word_index * 8 + byte_index;
-                if let Some(&byte) = contents.get(index) {
-                    value |= u64::from(byte) << (byte_index * 8);
-                }
-            }
-        }
-        words.push(AtomicU64::new(value));
-    }
-    Ok(words.into_boxed_slice())
+) -> Result<HostMappedBacking, CanonicalPageError> {
+    store
+        .host()?
+        .allocate(size, contents)
+        .map_err(|_| CanonicalPageError::ResourceExhausted)
 }
 
 struct PendingCanonicalPageWrite {
@@ -1758,7 +1742,7 @@ impl CanonicalWriteBatch {
         }
         for backing in &backings {
             backing
-                .ensure_words()
+                .ensure_backing()
                 .map_err(CanonicalWriteBatchError::Page)?;
         }
 

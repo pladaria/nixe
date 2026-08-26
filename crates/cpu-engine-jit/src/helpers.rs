@@ -40,12 +40,10 @@ use crate::abi::{
 };
 use crate::cache::DomainCodeCache;
 use crate::performance::ExecutorPerformance;
-use crate::tlb::SoftwareTlb;
 
 pub(crate) struct NativeContext<'a> {
     pub(crate) memory: &'a dyn CpuMemory,
     pub(crate) exclusive: &'a mut ExclusiveMonitorState,
-    pub(crate) tlb: &'a mut SoftwareTlb,
     pub(crate) data_fault: Option<DataAccessFault>,
     pub(crate) control: &'a EngineControl,
     pub(crate) code_cache: Option<&'a DomainCodeCache>,
@@ -61,7 +59,6 @@ impl<'a> NativeContext<'a> {
     pub(crate) fn new(
         memory: &'a dyn CpuMemory,
         exclusive: &'a mut ExclusiveMonitorState,
-        tlb: &'a mut SoftwareTlb,
         control: &'a EngineControl,
         cpu: ProcessCpuContext,
         timer: &'a dyn EngineTimer,
@@ -70,7 +67,6 @@ impl<'a> NativeContext<'a> {
         Self {
             memory,
             exclusive,
-            tlb,
             data_fault: None,
             control,
             code_cache: None,
@@ -132,11 +128,11 @@ unsafe extern "C" fn memory_read(
         {
             Ok(read) => {
                 if fast_access_candidate(address, access) {
-                    context.tlb.install(
-                        context.memory,
+                    let _ = context.memory.arm_fastmem_page(
                         address_space,
-                        frame.memory.mapping_epoch,
-                        GuestVirtualAddress::new(address),
+                        GuestVirtualAddress::new(
+                            address & !(nixe_memory::FASTMEM_PAGE_SIZE as u64 - 1),
+                        ),
                         nixe_cpu::memory::DataAccessKind::Read,
                     );
                 }
@@ -176,11 +172,11 @@ unsafe extern "C" fn memory_write(
         ) {
             Ok(_) => {
                 if fast_access_candidate(address, access) {
-                    context.tlb.install(
-                        context.memory,
+                    let _ = context.memory.arm_fastmem_page(
                         address_space,
-                        frame.memory.mapping_epoch,
-                        GuestVirtualAddress::new(address),
+                        GuestVirtualAddress::new(
+                            address & !(nixe_memory::FASTMEM_PAGE_SIZE as u64 - 1),
+                        ),
                         nixe_cpu::memory::DataAccessKind::Write,
                     );
                 }
@@ -278,7 +274,8 @@ fn fast_access_candidate(address: u64, access: MemoryAccess) -> bool {
     access.class == MemoryAccessClass::Normal
         && access.ordering == MemoryOrdering::Relaxed
         && address & (size - 1) == 0
-        && (address & (crate::tlb::PAGE_SIZE - 1)) <= crate::tlb::PAGE_SIZE - size
+        && (address & (nixe_memory::FASTMEM_PAGE_SIZE as u64 - 1))
+            <= nixe_memory::FASTMEM_PAGE_SIZE as u64 - size
 }
 
 unsafe extern "C" fn exclusive(
@@ -810,7 +807,6 @@ fn consume_irrelevant_code_invalidations(
         .ok_or(())?
         .apply_invalidations(&records, through, false)
         .map_err(|_| ())?;
-    context.tlb.apply_invalidations(&records);
     *invalidation_cursor = through;
     frame.control.invalidation_epoch = through.get();
     context.control.acknowledge_invalidation(through.get());
