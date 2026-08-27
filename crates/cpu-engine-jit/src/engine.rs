@@ -113,10 +113,10 @@ impl JitProvider {
         let Some(directory) = self.configuration.performance_report_directory() else {
             return Ok(None);
         };
-        match self
-            .performance_report
-            .get_or_init(|| JitPerformanceReport::new(directory).map(Arc::new))
-        {
+        match self.performance_report.get_or_init(|| {
+            JitPerformanceReport::new(directory, self.configuration.performance_report_title())
+                .map(Arc::new)
+        }) {
             Ok(report) => Ok(Some(Arc::clone(report))),
             Err(detail) => Err(detail.clone()),
         }
@@ -1818,6 +1818,7 @@ mod tests {
         let compilation_dump = dump.path().join("jit");
         let configuration = JitConfiguration::default()
             .with_performance_report_directory(Some(report_directory.clone()))
+            .with_performance_report_title("Performance Test")
             .with_dump_directory(Some(compilation_dump.clone()));
         let provider = JitProvider::with_configuration(configuration);
         let binding_memory = ExecutionMemory::new();
@@ -1887,7 +1888,7 @@ mod tests {
 
         let report_path = only_file(&report_directory);
         let report_name = report_path.file_name().unwrap().to_str().unwrap();
-        assert!(report_name.starts_with("jit-performance-"));
+        assert!(report_name.starts_with("performance-test-"));
         assert!(report_name.ends_with(".toml"));
         let report = fs::read_to_string(report_path).unwrap();
         toml::from_str::<toml::Value>(&report).unwrap();

@@ -18,8 +18,7 @@ use nixe_cpu::{
             fp_status_bits, fp_status_traps, semantic_inputs, semantic_instruction,
         },
         arithmetic::{add_with_carry, subtract_with_carry},
-        bits::{BitWidth, rotate_right, sign_extend},
-        immediate::decode_a64_bit_masks,
+        bits::{BitWidth, sign_extend},
         shifts::{A32ShiftKind, a32_shift_with_carry},
     },
     state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv},
@@ -1026,7 +1025,7 @@ fn execute_semantic(
     let result = match name {
         // Arm ARM DDI 0602, Add/subtract (extended register):
         // https://developer.arm.com/documentation/ddi0602/latest/A64-Instructions/ADD--extended-register-
-        "a64.extend-register" | "a64.load-store-register-offset" => {
+        "a64.load-store-register-offset" => {
             let width = result_width()?;
             let option = argument(1) as u8;
             let shift = argument(2) as u32;
@@ -1045,127 +1044,6 @@ fn execute_semantic(
                 sign_extend(argument(0), source_width, destination_width).map_err(|_| ())?
             };
             vec![destination_width.truncate(value << shift)]
-        }
-        // Arm ARM DDI 0602, SBFM/BFM/UBFM and DecodeBitMasks:
-        // https://developer.arm.com/documentation/ddi0602/latest/A64-Instructions/SBFM
-        "a64.sbfm" | "a64.bfm" | "a64.ubfm" => {
-            let width = result_width()?;
-            let imm_r = argument(2) as u8;
-            let imm_s = argument(3) as u8;
-            let masks =
-                decode_a64_bit_masks(width == 64, imm_r, imm_s, width, false).map_err(|_| ())?;
-            let width = BitWidth::new(width).map_err(|_| ())?;
-            let source = width.truncate(argument(1));
-            let destination = width.truncate(argument(0));
-            let write = u128::from(masks.write_mask);
-            let rotated = rotate_right(source, width, u32::from(imm_r));
-            let bottom = if name == "a64.bfm" {
-                (destination & !write) | (rotated & write)
-            } else {
-                rotated & write
-            };
-            let test = u128::from(masks.test_mask);
-            let value = match name {
-                "a64.bfm" => (destination & !test) | (bottom & test),
-                "a64.ubfm" => bottom & test,
-                "a64.sbfm" => {
-                    let sign = (source >> imm_s) & 1;
-                    let top = if sign == 0 { 0 } else { width.mask() };
-                    (top & !test) | (bottom & test)
-                }
-                _ => unreachable!(),
-            };
-            vec![width.truncate(value)]
-        }
-        // Arm ARM DDI 0602, signed/unsigned widening and high-half multiply:
-        // https://developer.arm.com/documentation/ddi0602/latest/A64-Instructions/SMADDL
-        "a64.smaddl" => {
-            let product = i64::from(argument(0) as u32 as i32)
-                .wrapping_mul(i64::from(argument(1) as u32 as i32));
-            vec![product.wrapping_add(argument(2) as i64) as u64 as u128]
-        }
-        "a64.smsubl" => {
-            let product = i64::from(argument(0) as u32 as i32)
-                .wrapping_mul(i64::from(argument(1) as u32 as i32));
-            vec![(argument(2) as i64).wrapping_sub(product) as u64 as u128]
-        }
-        "a64.umaddl" => vec![
-            (argument(0) as u32 as u64)
-                .wrapping_mul(argument(1) as u32 as u64)
-                .wrapping_add(argument(2) as u64) as u128,
-        ],
-        "a64.umsubl" => vec![
-            (argument(2) as u64)
-                .wrapping_sub((argument(0) as u32 as u64).wrapping_mul(argument(1) as u32 as u64))
-                as u128,
-        ],
-        "a64.smulh" => vec![
-            (((argument(0) as u64 as i64) as i128)
-                .wrapping_mul((argument(1) as u64 as i64) as i128)
-                >> 64) as u64 as u128,
-        ],
-        "a64.umulh" => vec![argument(0).wrapping_mul(argument(1)) >> 64],
-        // Arm ARM DDI 0602, extract and data-processing (one source):
-        // https://developer.arm.com/documentation/ddi0602/latest/A64-Instructions/EXTR
-        "a64.extr" => {
-            let bits = u32::from(result_width()?);
-            let shift = argument(2) as u32;
-            let mask = if bits == 64 {
-                u64::MAX
-            } else {
-                u32::MAX as u64
-            };
-            let first = argument(0) as u64 & mask;
-            let second = argument(1) as u64 & mask;
-            let value = if shift == 0 {
-                second
-            } else {
-                (second >> shift) | (first << (bits - shift))
-            } & mask;
-            vec![u128::from(value)]
-        }
-        "a64.rev16" | "a64.rev32" | "a64.rev" | "a64.cls" => {
-            let value = argument(0);
-            let bits = u32::from(result_width()?);
-            let value = value as u64;
-            let result = match name {
-                "a64.rev16" => {
-                    let mut result = 0_u64;
-                    for offset in (0..bits).step_by(16) {
-                        result |= (((value >> offset) as u16).swap_bytes() as u64) << offset;
-                    }
-                    result
-                }
-                "a64.rev32" => {
-                    let low = (value as u32).swap_bytes() as u64;
-                    if bits == 64 {
-                        low | (((value >> 32) as u32).swap_bytes() as u64) << 32
-                    } else {
-                        low
-                    }
-                }
-                "a64.rev" => {
-                    if bits == 64 {
-                        value.swap_bytes()
-                    } else {
-                        (value as u32).swap_bytes() as u64
-                    }
-                }
-                "a64.cls" => {
-                    let shifted = if bits == 64 {
-                        value << 1
-                    } else {
-                        (value as u32).wrapping_shl(1) as u64
-                    };
-                    if value >> (bits - 1) == 0 {
-                        shifted.leading_zeros() as u64 - (64 - bits) as u64
-                    } else {
-                        (!shifted).leading_zeros() as u64 - (64 - bits) as u64
-                    }
-                }
-                _ => unreachable!(),
-            };
-            vec![u128::from(result)]
         }
         "a64.simd.zero-extend-load" => vec![argument(0)],
         "a64.simd.low-bits" => vec![argument(0)],
@@ -1439,30 +1317,6 @@ mod tests {
             MemoryAccessClass::Exclusive,
         );
         assert_eq!(decode_access(encode_access(access)), Ok(access));
-    }
-
-    #[test]
-    fn a64_bitfield_helper_uses_the_declared_result_width() {
-        let mut arguments = [AbiU128::default(); crate::abi::MAX_HELPER_ARGUMENTS];
-        arguments[0] = 0_u128.into();
-        arguments[1] = 0x0123_4567_89ab_cdef_u128.into();
-        arguments[2] = 0_u128.into();
-        arguments[3] = 63_u128.into();
-        let result = execute_semantic("a64.ubfm", &arguments, &[IrType::I64]).unwrap();
-        assert_eq!(u128::from(result[0]), 0x0123_4567_89ab_cdef);
-    }
-
-    #[test]
-    fn a64_bfm_helper_preserves_destination_bits_outside_write_mask() {
-        let mut arguments = [AbiU128::default(); crate::abi::MAX_HELPER_ARGUMENTS];
-        arguments[0] = 3_u128.into();
-        arguments[1] = 0xc0b0_4705_u128.into();
-        arguments[2] = 32_u128.into();
-        arguments[3] = 31_u128.into();
-
-        let result = execute_semantic("a64.bfm", &arguments, &[IrType::I64]).unwrap();
-
-        assert_eq!(u128::from(result[0]), 0xc0b0_4705_0000_0003);
     }
 
     #[test]

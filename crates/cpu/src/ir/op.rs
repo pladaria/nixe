@@ -101,16 +101,35 @@ pub enum IntegerBinaryKind {
     Subtract,
     /// Low-half multiplication.
     Multiply,
-    /// Unsigned division.
-    UnsignedDivide,
-    /// Signed division.
-    SignedDivide,
     /// Bitwise AND.
     And,
     /// Bitwise OR.
     Or,
     /// Bitwise exclusive OR.
     Xor,
+}
+
+/// Signedness policy for integer operations whose data flow is otherwise identical.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IntegerSignedness {
+    Unsigned,
+    Signed,
+}
+
+/// Transformation applied to the false operand of an A64 conditional select.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SelectTransform {
+    Increment,
+    Invert,
+    Negate,
+}
+
+/// Container size within which bytes are reversed independently.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ByteReverseWidth {
+    Bits16,
+    Bits32,
+    Full,
 }
 
 /// Shift or rotate operation.
@@ -166,6 +185,12 @@ pub enum ScalarOperation {
         rhs: Operand,
         carry_in: Operand,
     },
+    /// Arm integer division, including architectural zero and signed-overflow results.
+    Divide {
+        signedness: IntegerSignedness,
+        lhs: Operand,
+        rhs: Operand,
+    },
     /// Typed comparison producing I1.
     Compare {
         predicate: IntegerPredicate,
@@ -178,14 +203,96 @@ pub enum ScalarOperation {
         when_true: Operand,
         when_false: Operand,
     },
+    /// Selects a value after applying one exact transformation to the false operand.
+    SelectTransformed {
+        condition: Operand,
+        when_true: Operand,
+        when_false: Operand,
+        transform: SelectTransform,
+    },
     /// Shift or rotate by an explicitly typed amount.
     Shift {
         kind: ShiftKind,
         value: Operand,
         amount: Operand,
     },
+    /// Shift or rotate by a compile-time amount known to be in range.
+    ShiftImmediate {
+        kind: ShiftKind,
+        value: Operand,
+        amount: u8,
+    },
+    /// Shift or rotate using the low log2(width) bits of the amount.
+    ShiftMasked {
+        kind: ShiftKind,
+        value: Operand,
+        amount: Operand,
+    },
+    /// Tests one statically selected bit and produces an I1 predicate.
+    TestBit {
+        value: Operand,
+        bit: u8,
+        nonzero: bool,
+    },
+    /// Low-half multiply followed by an add or subtract from the addend.
+    MultiplyAdd {
+        lhs: Operand,
+        rhs: Operand,
+        addend: Operand,
+        subtract_product: bool,
+    },
+    /// I32 multiply widened to I64 before adding to or subtracting from an I64 addend.
+    WideningMultiplyAdd {
+        signedness: IntegerSignedness,
+        lhs: Operand,
+        rhs: Operand,
+        addend: Operand,
+        subtract_product: bool,
+    },
+    /// High 64 bits of a signed or unsigned 64x64 multiplication.
+    MultiplyHigh {
+        signedness: IntegerSignedness,
+        lhs: Operand,
+        rhs: Operand,
+    },
+    /// Extracts a contiguous bitfield and optionally sign-extends it to the result width.
+    ExtractBits {
+        value: Operand,
+        lsb: u8,
+        width: u8,
+        signed: bool,
+    },
+    /// Inserts a contiguous source field while preserving bits outside the destination field.
+    InsertBits {
+        destination: Operand,
+        source: Operand,
+        source_lsb: u8,
+        destination_lsb: u8,
+        width: u8,
+    },
+    /// Inserts low source bits and sign-fills above the inserted field.
+    SignedInsertBits {
+        source: Operand,
+        destination_lsb: u8,
+        width: u8,
+    },
+    /// Extracts from the concatenation of two same-width integers.
+    ExtractConcat {
+        high: Operand,
+        low: Operand,
+        lsb: u8,
+    },
+    /// Reverses bytes independently within fixed-size containers.
+    ReverseBytes {
+        value: Operand,
+        container: ByteReverseWidth,
+    },
+    /// Bitwise complement.
+    Not { value: Operand },
     /// Counts leading zero bits.
     CountLeadingZeros { value: Operand },
+    /// Counts leading bits equal to the sign bit, excluding the sign bit itself.
+    CountLeadingSignBits { value: Operand },
     /// Reverses all bits.
     ReverseBits { value: Operand },
     /// Zero extension into a wider integer type.

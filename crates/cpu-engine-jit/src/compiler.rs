@@ -28,10 +28,10 @@ use nixe_cpu::{
     ir::{
         block::{BlockId, IrBlock},
         op::{
-            AddressOperation, AtomicOperation, Condition, ExclusiveOperation, FlagBit,
-            FlagOperation, FlagState, GuestAddressWidth, IntegerBinaryKind, IntegerPredicate,
-            IrOperation, MemoryOperation, OperationKind, ScalarOperation, ShiftKind, StateRegister,
-            VectorOperation,
+            AddressOperation, AtomicOperation, ByteReverseWidth, Condition, ExclusiveOperation,
+            FlagBit, FlagOperation, FlagState, GuestAddressWidth, IntegerBinaryKind,
+            IntegerPredicate, IntegerSignedness, IrOperation, MemoryOperation, OperationKind,
+            ScalarOperation, SelectTransform, ShiftKind, StateRegister, VectorOperation,
         },
         region::{IrRegion, RegionSafepointKind},
         terminator::{ControlTarget, StopReason, Terminator},
@@ -44,7 +44,6 @@ use nixe_cpu::{
     semantics::{
         a64::HintOperation,
         a64_fp_simd::{SemanticInput, semantic_inputs, semantic_instruction},
-        immediate::decode_a64_bit_masks,
     },
     state::{a32::A32GeneralRegister, a64::A64GeneralRegister},
 };
@@ -1554,6 +1553,20 @@ fn lower_scalar(
             let partial = builder.ins().isub(lhs, rhs);
             vec![builder.ins().isub(partial, borrow)]
         }
+        ScalarOperation::Divide {
+            signedness,
+            lhs,
+            rhs,
+        } => {
+            let lhs = operand(builder, values, lhs)?;
+            let rhs = operand(builder, values, rhs)?;
+            vec![safe_divide(
+                builder,
+                lhs,
+                rhs,
+                signedness == IntegerSignedness::Signed,
+            )]
+        }
         ScalarOperation::Compare {
             predicate,
             lhs,
@@ -1573,6 +1586,22 @@ fn lower_scalar(
             let when_false = operand(builder, values, when_false)?;
             vec![builder.ins().select(condition, when_true, when_false)]
         }
+        ScalarOperation::SelectTransformed {
+            condition,
+            when_true,
+            when_false,
+            transform,
+        } => {
+            let condition = operand(builder, values, condition)?;
+            let when_true = operand(builder, values, when_true)?;
+            let when_false = operand(builder, values, when_false)?;
+            let when_false = match transform {
+                SelectTransform::Increment => builder.ins().iadd_imm_s(when_false, 1),
+                SelectTransform::Invert => builder.ins().bnot(when_false),
+                SelectTransform::Negate => builder.ins().ineg(when_false),
+            };
+            vec![builder.ins().select(condition, when_true, when_false)]
+        }
         ScalarOperation::Shift {
             kind,
             value,
@@ -1582,9 +1611,157 @@ fn lower_scalar(
             let amount = operand(builder, values, amount)?;
             vec![lower_shift(builder, kind, value, amount)]
         }
+        ScalarOperation::ShiftImmediate {
+            kind,
+            value,
+            amount,
+        } => {
+            let value = operand(builder, values, value)?;
+            vec![lower_shift_immediate(builder, kind, value, amount)]
+        }
+        ScalarOperation::ShiftMasked {
+            kind,
+            value,
+            amount,
+        } => {
+            let value = operand(builder, values, value)?;
+            let amount = operand(builder, values, amount)?;
+            vec![lower_masked_shift(builder, kind, value, amount)]
+        }
+        ScalarOperation::TestBit {
+            value,
+            bit,
+            nonzero,
+        } => {
+            let value = operand(builder, values, value)?;
+            let tested = builder.ins().band_imm_u(value, (1_u64 << bit) as i64);
+            vec![builder.ins().icmp_imm_s(
+                if nonzero {
+                    IntCC::NotEqual
+                } else {
+                    IntCC::Equal
+                },
+                tested,
+                0,
+            )]
+        }
+        ScalarOperation::MultiplyAdd {
+            lhs,
+            rhs,
+            addend,
+            subtract_product,
+        } => {
+            let lhs = operand(builder, values, lhs)?;
+            let rhs = operand(builder, values, rhs)?;
+            let addend = operand(builder, values, addend)?;
+            let product = builder.ins().imul(lhs, rhs);
+            vec![if subtract_product {
+                builder.ins().isub(addend, product)
+            } else {
+                builder.ins().iadd(addend, product)
+            }]
+        }
+        ScalarOperation::WideningMultiplyAdd {
+            signedness,
+            lhs,
+            rhs,
+            addend,
+            subtract_product,
+        } => {
+            let signed = signedness == IntegerSignedness::Signed;
+            let lhs = operand(builder, values, lhs)?;
+            let rhs = operand(builder, values, rhs)?;
+            let lhs = cast_integer(builder, lhs, types::I64, signed);
+            let rhs = cast_integer(builder, rhs, types::I64, signed);
+            let addend = operand(builder, values, addend)?;
+            let product = builder.ins().imul(lhs, rhs);
+            vec![if subtract_product {
+                builder.ins().isub(addend, product)
+            } else {
+                builder.ins().iadd(addend, product)
+            }]
+        }
+        ScalarOperation::MultiplyHigh {
+            signedness,
+            lhs,
+            rhs,
+        } => {
+            let lhs = operand(builder, values, lhs)?;
+            let rhs = operand(builder, values, rhs)?;
+            vec![if signedness == IntegerSignedness::Signed {
+                builder.ins().smulhi(lhs, rhs)
+            } else {
+                builder.ins().umulhi(lhs, rhs)
+            }]
+        }
+        ScalarOperation::ExtractBits {
+            value,
+            lsb,
+            width,
+            signed,
+        } => {
+            let value = operand(builder, values, value)?;
+            vec![lower_extract_bits(builder, value, lsb, width, signed)]
+        }
+        ScalarOperation::InsertBits {
+            destination,
+            source,
+            source_lsb,
+            destination_lsb,
+            width,
+        } => {
+            let destination = if integer_immediate_is_zero(destination) {
+                None
+            } else {
+                Some(operand(builder, values, destination)?)
+            };
+            let source = operand(builder, values, source)?;
+            vec![lower_insert_bits(
+                builder,
+                destination,
+                source,
+                source_lsb,
+                destination_lsb,
+                width,
+            )]
+        }
+        ScalarOperation::SignedInsertBits {
+            source,
+            destination_lsb,
+            width,
+        } => {
+            let source = operand(builder, values, source)?;
+            vec![lower_signed_insert_bits(
+                builder,
+                source,
+                destination_lsb,
+                width,
+            )]
+        }
+        ScalarOperation::ExtractConcat { high, low, lsb } => {
+            let high = operand(builder, values, high)?;
+            let low = operand(builder, values, low)?;
+            vec![lower_extract_concat(builder, high, low, lsb)]
+        }
+        ScalarOperation::ReverseBytes { value, container } => {
+            let value = operand(builder, values, value)?;
+            vec![lower_reverse_bytes(builder, value, container)]
+        }
+        ScalarOperation::Not { value } => {
+            let value = operand(builder, values, value)?;
+            vec![builder.ins().bnot(value)]
+        }
         ScalarOperation::CountLeadingZeros { value } => {
             let value = operand(builder, values, value)?;
             vec![builder.ins().clz(value)]
+        }
+        ScalarOperation::CountLeadingSignBits { value } => {
+            let value = operand(builder, values, value)?;
+            let ty = builder.func.dfg.value_type(value);
+            let sign = builder.ins().sshr_imm_u(value, i64::from(ty.bits() - 1));
+            let changed = builder.ins().bxor(value, sign);
+            let leading = builder.ins().clz(changed);
+            vec![builder.ins().iadd_imm_s(leading, -1)]
         }
         ScalarOperation::ReverseBits { value } => {
             let value = operand(builder, values, value)?;
@@ -1873,22 +2050,7 @@ fn lower_native_named_helper(
     }
     let native = matches!(
         helper.helper.as_ref(),
-        "a64.extend-register"
-            | "a64.load-store-register-offset"
-            | "a64.sbfm"
-            | "a64.bfm"
-            | "a64.ubfm"
-            | "a64.smaddl"
-            | "a64.smsubl"
-            | "a64.umaddl"
-            | "a64.umsubl"
-            | "a64.smulh"
-            | "a64.umulh"
-            | "a64.extr"
-            | "a64.rev16"
-            | "a64.rev32"
-            | "a64.rev"
-            | "a64.cls"
+        "a64.load-store-register-offset"
             | "a64.simd.zero-extend-load"
             | "a64.simd.low-bits"
             | "a64.simd.bitwise"
@@ -1913,20 +2075,8 @@ fn lower_native_named_helper(
         .map(|argument| materialized_operand(builder, values, *argument))
         .collect::<Result<Vec<_>, _>>()?;
     let results = match helper.helper.as_ref() {
-        "a64.extend-register" | "a64.load-store-register-offset" => {
+        "a64.load-store-register-offset" => {
             lower_native_extend(builder, helper, result_types, &arguments)?
-        }
-        "a64.sbfm" | "a64.bfm" | "a64.ubfm" => {
-            lower_native_bitfield(builder, helper, result_types, &arguments)?
-        }
-        "a64.smaddl" | "a64.smsubl" | "a64.umaddl" | "a64.umsubl" => {
-            lower_native_widening_multiply(builder, helper.helper.as_ref(), &arguments)?
-        }
-        "a64.smulh" => vec![builder.ins().smulhi(arguments[0], arguments[1])],
-        "a64.umulh" => vec![builder.ins().umulhi(arguments[0], arguments[1])],
-        "a64.extr" => lower_native_extract(builder, helper, result_types, &arguments)?,
-        "a64.rev16" | "a64.rev32" | "a64.rev" | "a64.cls" => {
-            lower_native_one_source(builder, helper.helper.as_ref(), &arguments)?
         }
         "a64.simd.zero-extend-load" => {
             vec![vector_from_low_integer(builder, arguments[0])]
@@ -2052,127 +2202,6 @@ fn lower_native_extend(
     } else {
         let amount = integer_constant(builder, result_ty, u64::from(shift));
         builder.ins().ishl(extended, amount)
-    };
-    Ok(vec![result])
-}
-
-fn lower_native_bitfield(
-    builder: &mut FunctionBuilder<'_>,
-    helper: &nixe_cpu::ir::op::HelperOperation,
-    result_types: &[IrType],
-    arguments: &[ir::Value],
-) -> Result<Vec<ir::Value>, CompilerError> {
-    let result_ty = cranelift_type(single_result_type(result_types)?);
-    let width = result_ty.bits() as u8;
-    let imm_r = helper_immediate(helper, 2)? as u8;
-    let imm_s = helper_immediate(helper, 3)? as u8;
-    let masks = decode_a64_bit_masks(width == 64, imm_r, imm_s, width, false)
-        .map_err(|error| CompilerError::new(format!("invalid native bitfield masks: {error}")))?;
-    let rotate = integer_constant(builder, result_ty, u64::from(imm_r));
-    let rotated = builder.ins().rotr(arguments[1], rotate);
-    let write = integer_constant(builder, result_ty, masks.write_mask);
-    let rotated_write = builder.ins().band(rotated, write);
-    let bottom = if helper.helper.as_ref() == "a64.bfm" {
-        let inverse_write = integer_constant(builder, result_ty, !masks.write_mask);
-        let preserved = builder.ins().band(arguments[0], inverse_write);
-        builder.ins().bor(preserved, rotated_write)
-    } else {
-        rotated_write
-    };
-    let test = integer_constant(builder, result_ty, masks.test_mask);
-    let bottom_test = builder.ins().band(bottom, test);
-    let result = match helper.helper.as_ref() {
-        "a64.ubfm" => bottom_test,
-        "a64.bfm" => {
-            let inverse_test = integer_constant(builder, result_ty, !masks.test_mask);
-            let preserved = builder.ins().band(arguments[0], inverse_test);
-            builder.ins().bor(preserved, bottom_test)
-        }
-        "a64.sbfm" => {
-            let sign_shift = integer_constant(builder, result_ty, u64::from(imm_s));
-            let sign = builder.ins().ushr(arguments[1], sign_shift);
-            let sign = builder.ins().band_imm_u(sign, 1);
-            let sign = builder.ins().ineg(sign);
-            let inverse_test = integer_constant(builder, result_ty, !masks.test_mask);
-            let top = builder.ins().band(sign, inverse_test);
-            builder.ins().bor(top, bottom_test)
-        }
-        _ => unreachable!(),
-    };
-    Ok(vec![result])
-}
-
-fn lower_native_widening_multiply(
-    builder: &mut FunctionBuilder<'_>,
-    name: &str,
-    arguments: &[ir::Value],
-) -> Result<Vec<ir::Value>, CompilerError> {
-    let signed = matches!(name, "a64.smaddl" | "a64.smsubl");
-    let lhs = cast_integer(builder, arguments[0], types::I64, signed);
-    let rhs = cast_integer(builder, arguments[1], types::I64, signed);
-    let product = builder.ins().imul(lhs, rhs);
-    let result = match name {
-        "a64.smaddl" | "a64.umaddl" => builder.ins().iadd(product, arguments[2]),
-        "a64.smsubl" | "a64.umsubl" => builder.ins().isub(arguments[2], product),
-        _ => return Err(CompilerError::new("unknown widening multiply helper")),
-    };
-    Ok(vec![result])
-}
-
-fn lower_native_extract(
-    builder: &mut FunctionBuilder<'_>,
-    helper: &nixe_cpu::ir::op::HelperOperation,
-    result_types: &[IrType],
-    arguments: &[ir::Value],
-) -> Result<Vec<ir::Value>, CompilerError> {
-    let shift = helper_immediate(helper, 2)? as u32;
-    if shift == 0 {
-        return Ok(vec![arguments[1]]);
-    }
-    let ty = cranelift_type(single_result_type(result_types)?);
-    let bits = ty.bits();
-    let right_amount = integer_constant(builder, ty, u64::from(shift));
-    let left_amount = integer_constant(builder, ty, u64::from(bits - shift));
-    let low = builder.ins().ushr(arguments[1], right_amount);
-    let high = builder.ins().ishl(arguments[0], left_amount);
-    Ok(vec![builder.ins().bor(low, high)])
-}
-
-fn lower_native_one_source(
-    builder: &mut FunctionBuilder<'_>,
-    name: &str,
-    arguments: &[ir::Value],
-) -> Result<Vec<ir::Value>, CompilerError> {
-    let value = arguments[0];
-    let ty = builder.func.dfg.value_type(value);
-    let result = match name {
-        "a64.rev" => builder.ins().bswap(value),
-        "a64.rev16" => {
-            let low_mask = if ty == types::I64 {
-                0x00ff_00ff_00ff_00ff
-            } else {
-                0x00ff_00ff
-            };
-            let mask = integer_constant(builder, ty, low_mask);
-            let low = builder.ins().band(value, mask);
-            let low = builder.ins().ishl_imm_u(low, 8);
-            let high = builder.ins().ushr_imm_u(value, 8);
-            let mask = integer_constant(builder, ty, low_mask);
-            let high = builder.ins().band(high, mask);
-            builder.ins().bor(low, high)
-        }
-        "a64.rev32" if ty == types::I32 => builder.ins().bswap(value),
-        "a64.rev32" => {
-            let swapped = builder.ins().bswap(value);
-            builder.ins().rotl_imm_u(swapped, 32)
-        }
-        "a64.cls" => {
-            let sign = builder.ins().sshr_imm_u(value, i64::from(ty.bits() - 1));
-            let changed = builder.ins().bxor(value, sign);
-            let leading = builder.ins().clz(changed);
-            builder.ins().iadd_imm_s(leading, -1)
-        }
-        _ => return Err(CompilerError::new("unknown one-source native helper")),
     };
     Ok(vec![result])
 }
@@ -4610,11 +4639,210 @@ fn lower_binary(
         IntegerBinaryKind::Add => builder.ins().iadd(lhs, rhs),
         IntegerBinaryKind::Subtract => builder.ins().isub(lhs, rhs),
         IntegerBinaryKind::Multiply => builder.ins().imul(lhs, rhs),
-        IntegerBinaryKind::UnsignedDivide => safe_divide(builder, lhs, rhs, false),
-        IntegerBinaryKind::SignedDivide => safe_divide(builder, lhs, rhs, true),
         IntegerBinaryKind::And => builder.ins().band(lhs, rhs),
         IntegerBinaryKind::Or => builder.ins().bor(lhs, rhs),
         IntegerBinaryKind::Xor => builder.ins().bxor(lhs, rhs),
+    }
+}
+
+fn lower_shift_immediate(
+    builder: &mut FunctionBuilder<'_>,
+    kind: ShiftKind,
+    value: ir::Value,
+    amount: u8,
+) -> ir::Value {
+    if amount == 0 {
+        return value;
+    }
+    match kind {
+        ShiftKind::LogicalLeft => builder.ins().ishl_imm_u(value, i64::from(amount)),
+        ShiftKind::LogicalRight => builder.ins().ushr_imm_u(value, i64::from(amount)),
+        ShiftKind::ArithmeticRight => builder.ins().sshr_imm_u(value, i64::from(amount)),
+        ShiftKind::RotateLeft => builder.ins().rotl_imm_u(value, i64::from(amount)),
+        ShiftKind::RotateRight => {
+            let ty = builder.func.dfg.value_type(value);
+            builder
+                .ins()
+                .rotl_imm_u(value, i64::from(ty.bits()) - i64::from(amount))
+        }
+    }
+}
+
+fn lower_masked_shift(
+    builder: &mut FunctionBuilder<'_>,
+    kind: ShiftKind,
+    value: ir::Value,
+    amount: ir::Value,
+) -> ir::Value {
+    match kind {
+        ShiftKind::LogicalLeft => builder.ins().ishl(value, amount),
+        ShiftKind::LogicalRight => builder.ins().ushr(value, amount),
+        ShiftKind::ArithmeticRight => builder.ins().sshr(value, amount),
+        ShiftKind::RotateLeft => builder.ins().rotl(value, amount),
+        ShiftKind::RotateRight => builder.ins().rotr(value, amount),
+    }
+}
+
+fn integer_mask(width: u8) -> u64 {
+    if width == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << width) - 1
+    }
+}
+
+fn integer_immediate_is_zero(value: Operand) -> bool {
+    matches!(
+        value,
+        Operand::Immediate(
+            Immediate::I1(false)
+                | Immediate::I8(0)
+                | Immediate::I16(0)
+                | Immediate::I32(0)
+                | Immediate::I64(0)
+                | Immediate::I128(0)
+        )
+    )
+}
+
+fn lower_extract_bits(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    lsb: u8,
+    width: u8,
+    signed: bool,
+) -> ir::Value {
+    let bits = builder.func.dfg.value_type(value).bits() as u8;
+    if signed {
+        let left = bits - lsb - width;
+        let positioned = if left == 0 {
+            value
+        } else {
+            builder.ins().ishl_imm_u(value, i64::from(left))
+        };
+        let right = bits - width;
+        if right == 0 {
+            positioned
+        } else {
+            builder.ins().sshr_imm_u(positioned, i64::from(right))
+        }
+    } else {
+        let shifted = if lsb == 0 {
+            value
+        } else {
+            builder.ins().ushr_imm_u(value, i64::from(lsb))
+        };
+        if width == bits {
+            shifted
+        } else {
+            builder
+                .ins()
+                .band_imm_u(shifted, integer_mask(width) as i64)
+        }
+    }
+}
+
+fn lower_insert_bits(
+    builder: &mut FunctionBuilder<'_>,
+    destination: Option<ir::Value>,
+    source: ir::Value,
+    source_lsb: u8,
+    destination_lsb: u8,
+    width: u8,
+) -> ir::Value {
+    let selected = if source_lsb == 0 {
+        source
+    } else {
+        builder.ins().ushr_imm_u(source, i64::from(source_lsb))
+    };
+    let selected = if destination_lsb == 0 {
+        selected
+    } else {
+        builder
+            .ins()
+            .ishl_imm_u(selected, i64::from(destination_lsb))
+    };
+    let mask = integer_mask(width) << destination_lsb;
+    let selected = builder.ins().band_imm_u(selected, mask as i64);
+    if let Some(destination) = destination {
+        let preserved = builder.ins().band_imm_u(destination, (!mask) as i64);
+        builder.ins().bor(preserved, selected)
+    } else {
+        selected
+    }
+}
+
+fn lower_signed_insert_bits(
+    builder: &mut FunctionBuilder<'_>,
+    source: ir::Value,
+    destination_lsb: u8,
+    width: u8,
+) -> ir::Value {
+    let bits = builder.func.dfg.value_type(source).bits() as u8;
+    let field = builder.ins().band_imm_u(source, integer_mask(width) as i64);
+    let field = if destination_lsb == 0 {
+        field
+    } else {
+        builder.ins().ishl_imm_u(field, i64::from(destination_lsb))
+    };
+    let sign = builder.ins().ushr_imm_u(source, i64::from(width - 1));
+    let sign = builder.ins().band_imm_u(sign, 1);
+    let sign = builder.ins().ineg(sign);
+    let top_start = destination_lsb + width;
+    if top_start == bits {
+        field
+    } else {
+        let top = builder
+            .ins()
+            .band_imm_u(sign, (!integer_mask(top_start)) as i64);
+        builder.ins().bor(top, field)
+    }
+}
+
+fn lower_extract_concat(
+    builder: &mut FunctionBuilder<'_>,
+    high: ir::Value,
+    low: ir::Value,
+    lsb: u8,
+) -> ir::Value {
+    if lsb == 0 {
+        return low;
+    }
+    let bits = builder.func.dfg.value_type(low).bits() as u8;
+    let low = builder.ins().ushr_imm_u(low, i64::from(lsb));
+    let high = builder.ins().ishl_imm_u(high, i64::from(bits - lsb));
+    builder.ins().bor(low, high)
+}
+
+fn lower_reverse_bytes(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    container: ByteReverseWidth,
+) -> ir::Value {
+    let ty = builder.func.dfg.value_type(value);
+    match container {
+        ByteReverseWidth::Full => builder.ins().bswap(value),
+        ByteReverseWidth::Bits16 => {
+            let mask = integer_constant(
+                builder,
+                ty,
+                if ty == types::I64 {
+                    0x00ff_00ff_00ff_00ff
+                } else {
+                    0x00ff_00ff
+                },
+            );
+            let low = builder.ins().band(value, mask);
+            let low = builder.ins().ishl_imm_u(low, 8);
+            let high = builder.ins().ushr_imm_u(value, 8);
+            let high = builder.ins().band(high, mask);
+            builder.ins().bor(low, high)
+        }
+        ByteReverseWidth::Bits32 if ty == types::I32 => builder.ins().bswap(value),
+        ByteReverseWidth::Bits32 => {
+            let swapped = builder.ins().bswap(value);
+            builder.ins().rotl_imm_u(swapped, 32)
+        }
     }
 }
 
@@ -6553,6 +6781,72 @@ mod tests {
         });
         assert_eq!(opcode_count(&dead_flags, ir::Opcode::Icmp), 0);
         assert_eq!(opcode_count(&dead_flags, ir::Opcode::Isub), 0);
+    }
+
+    #[test]
+    fn a64_scalar_operations_have_bounded_clif_shapes() {
+        let shift = clif_opcodes(|builder| {
+            let value = builder.ins().iconst(types::I64, 1);
+            let _ = lower_shift_immediate(builder, ShiftKind::LogicalLeft, value, 7);
+        });
+        assert_eq!(opcode_count(&shift, ir::Opcode::Ishl), 1);
+        assert_eq!(opcode_count(&shift, ir::Opcode::Icmp), 0);
+        assert_eq!(opcode_count(&shift, ir::Opcode::Select), 0);
+
+        let variable_shift = clif_opcodes(|builder| {
+            let value = builder.ins().iconst(types::I64, 1);
+            let amount = builder.ins().iconst(types::I64, 65);
+            let _ = lower_masked_shift(builder, ShiftKind::LogicalLeft, value, amount);
+        });
+        assert_eq!(opcode_count(&variable_shift, ir::Opcode::Ishl), 1);
+        assert_eq!(opcode_count(&variable_shift, ir::Opcode::Band), 0);
+        assert_eq!(opcode_count(&variable_shift, ir::Opcode::Icmp), 0);
+
+        let extract = clif_opcodes(|builder| {
+            let value = builder.ins().iconst(types::I64, 1);
+            let _ = lower_extract_bits(builder, value, 7, 17, false);
+        });
+        assert_eq!(opcode_count(&extract, ir::Opcode::Ushr), 1);
+        assert_eq!(opcode_count(&extract, ir::Opcode::Band), 1);
+
+        let multiply_add = clif_opcodes(|builder| {
+            let _ = lower_scalar(
+                builder,
+                ScalarOperation::MultiplyAdd {
+                    lhs: Immediate::I64(1).into(),
+                    rhs: Immediate::I64(2).into(),
+                    addend: Immediate::I64(3).into(),
+                    subtract_product: false,
+                },
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        });
+        assert_eq!(opcode_count(&multiply_add, ir::Opcode::Imul), 1);
+        assert_eq!(opcode_count(&multiply_add, ir::Opcode::Iadd), 1);
+
+        let unary = clif_opcodes(|builder| {
+            let value = builder.ins().iconst(types::I64, 1);
+            let _ = builder.ins().bitrev(value);
+            let _ = lower_reverse_bytes(builder, value, ByteReverseWidth::Full);
+        });
+        assert_eq!(opcode_count(&unary, ir::Opcode::Bitrev), 1);
+        assert_eq!(opcode_count(&unary, ir::Opcode::Bswap), 1);
+
+        let test_bit = clif_opcodes(|builder| {
+            let _ = lower_scalar(
+                builder,
+                ScalarOperation::TestBit {
+                    value: Immediate::I64(1).into(),
+                    bit: 63,
+                    nonzero: false,
+                },
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        });
+        assert_eq!(opcode_count(&test_bit, ir::Opcode::Band), 1);
+        assert_eq!(opcode_count(&test_bit, ir::Opcode::Icmp), 1);
     }
 
     #[test]

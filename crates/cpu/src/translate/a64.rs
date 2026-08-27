@@ -17,10 +17,11 @@ use crate::{
     ir::{
         builder::{BuildError, IrBuilder},
         op::{
-            AddressOperation, AtomicOperation, ByteOrder, CacheMaintenanceOperation, Condition,
-            EffectSet, ExclusiveOperation, FlagBit, FlagOperation, FlagState, GuestAddressWidth,
-            HelperOperation, IntegerBinaryKind, IntegerPredicate, MemoryDescriptor,
-            MemoryOperation, MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation,
+            AddressOperation, AtomicOperation, ByteOrder, ByteReverseWidth,
+            CacheMaintenanceOperation, Condition, EffectSet, ExclusiveOperation, FlagBit,
+            FlagOperation, FlagState, GuestAddressWidth, HelperOperation, IntegerBinaryKind,
+            IntegerPredicate, IntegerSignedness, MemoryDescriptor, MemoryOperation,
+            MemoryPrivilege, OperationEffects, OperationKind, ScalarOperation, SelectTransform,
             ShiftKind, StateRegister, Volatility,
         },
         terminator::{ControlTarget, Terminator},
@@ -369,8 +370,9 @@ mod tests {
         ];
 
         for (module, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
             assert!(
-                !source.contains(forbidden),
+                !production.contains(forbidden),
                 "A64 {module} lifter bypasses typed normalization"
             );
         }
@@ -897,6 +899,160 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn every_supported_a64_integer_family_uses_typed_ir_without_helpers() {
+        for pattern in crate::decode::a64::patterns().iter().filter(|pattern| {
+            matches!(
+                pattern.name,
+                "add-sub-immediate"
+                    | "move-wide"
+                    | "add-sub-shifted"
+                    | "add-sub-extended"
+                    | "add-sub-carry"
+                    | "logical-immediate"
+                    | "logical-shifted"
+                    | "bitfield"
+                    | "extract"
+                    | "data-processing-two-source"
+                    | "conditional-compare-register"
+                    | "conditional-compare-immediate"
+                    | "conditional-select"
+                    | "data-processing-three-source"
+                    | "data-processing-one-source"
+                    | "adr"
+                    | "adrp"
+            )
+        }) {
+            let fixture = pattern
+                .regression_fixture
+                .expect("supported integer patterns have regression fixtures");
+            let block = translate(&[fixture.encoding.bits(), 0xd400_0001]);
+            assert!(
+                !block
+                    .operations
+                    .iter()
+                    .any(|operation| matches!(operation.kind, OperationKind::Helper(_))),
+                "{} emitted a helper",
+                pattern.name
+            );
+        }
+    }
+
+    #[test]
+    fn a64_scalar_families_use_exact_canonical_operations() {
+        let extended = translate(&[0x8b25_c883, 0xd400_0001]);
+        assert!(extended.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::SignExtend { .. })
+        )));
+
+        let zero_shift = translate(&[0x8b05_0083, 0xd400_0001]);
+        assert!(!zero_shift.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(
+                ScalarOperation::ShiftImmediate { .. } | ScalarOperation::Shift { .. }
+            )
+        )));
+        assert!(extended.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::ShiftImmediate {
+                kind: ShiftKind::LogicalLeft,
+                amount: 2,
+                ..
+            })
+        )));
+
+        for (encoding, expected) in [
+            (0x9347_5c83, "signed extract"),
+            (0x9377_1c83, "signed insert"),
+            (0xb347_5c83, "insert"),
+            (0xd347_5c83, "unsigned extract"),
+        ] {
+            let block = translate(&[encoding, 0xd400_0001]);
+            let found = block.operations.iter().any(|operation| {
+                matches!(
+                    (&operation.kind, expected),
+                    (
+                        OperationKind::Scalar(ScalarOperation::ExtractBits { signed: true, .. }),
+                        "signed extract"
+                    ) | (
+                        OperationKind::Scalar(ScalarOperation::SignedInsertBits { .. }),
+                        "signed insert"
+                    ) | (
+                        OperationKind::Scalar(ScalarOperation::InsertBits { .. }),
+                        "insert"
+                    ) | (
+                        OperationKind::Scalar(ScalarOperation::ExtractBits { signed: false, .. }),
+                        "unsigned extract"
+                    )
+                )
+            });
+            assert!(found, "{expected} was not canonicalized");
+        }
+
+        let variable_shift = translate(&[0x9ac5_2083, 0xd400_0001]);
+        assert!(variable_shift.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::ShiftMasked { .. })
+        )));
+
+        let extract_alias = translate(&[0x93c4_4483, 0xd400_0001]);
+        assert!(extract_alias.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::ShiftImmediate {
+                kind: ShiftKind::RotateRight,
+                amount: 17,
+                ..
+            })
+        )));
+        assert!(!extract_alias.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::ExtractConcat { .. })
+        )));
+
+        let transformed_select = translate(&[0xda85_0483, 0xd400_0001]);
+        assert!(
+            transformed_select
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation.kind,
+                    OperationKind::Scalar(ScalarOperation::SelectTransformed {
+                        transform: SelectTransform::Negate,
+                        ..
+                    })
+                ))
+        );
+
+        let widening_multiply = translate(&[0x9b25_1883, 0xd400_0001]);
+        assert!(
+            widening_multiply
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation.kind,
+                    OperationKind::Scalar(ScalarOperation::WideningMultiplyAdd {
+                        signedness: IntegerSignedness::Signed,
+                        ..
+                    })
+                ))
+        );
+
+        let test_bit = translate(&[0xb6f8_0004]);
+        assert!(test_bit.operations.iter().any(|operation| matches!(
+            operation.kind,
+            OperationKind::Scalar(ScalarOperation::TestBit { bit: 63, .. })
+        )));
+
+        let address = translate(&[0x9000_0003, 0xd400_0001]);
+        assert!(
+            !address
+                .operations
+                .iter()
+                .any(|operation| matches!(operation.kind, OperationKind::Address(_)))
+        );
     }
 
     #[test]

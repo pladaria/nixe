@@ -26,6 +26,7 @@ pub struct JitConfiguration {
     max_concurrent_compilations: usize,
     dump_directory: Option<PathBuf>,
     performance_report_directory: Option<PathBuf>,
+    performance_report_title: Box<str>,
 }
 
 impl JitConfiguration {
@@ -60,6 +61,7 @@ impl JitConfiguration {
             max_concurrent_compilations,
             dump_directory: None,
             performance_report_directory: None,
+            performance_report_title: "nixe".into(),
         })
     }
 
@@ -78,6 +80,16 @@ impl JitConfiguration {
     ) -> Self {
         self.performance_report_directory =
             performance_report_directory.filter(|path| !path.as_os_str().is_empty());
+        self
+    }
+
+    /// Sets the executed title used as the performance report file stem.
+    #[must_use]
+    pub fn with_performance_report_title(mut self, title: impl Into<Box<str>>) -> Self {
+        let title = title.into();
+        if !title.trim().is_empty() {
+            self.performance_report_title = title;
+        }
         self
     }
 
@@ -105,6 +117,11 @@ impl JitConfiguration {
     pub fn performance_report_directory(&self) -> Option<&Path> {
         self.performance_report_directory.as_deref()
     }
+
+    #[must_use]
+    pub fn performance_report_title(&self) -> &str {
+        &self.performance_report_title
+    }
 }
 
 impl Default for JitConfiguration {
@@ -115,6 +132,7 @@ impl Default for JitConfiguration {
             max_concurrent_compilations: DEFAULT_MAX_CONCURRENT_COMPILATIONS,
             dump_directory: None,
             performance_report_directory: None,
+            performance_report_title: "nixe".into(),
         }
     }
 }
@@ -200,6 +218,18 @@ mod tests {
                 .with_performance_report_directory(Some(PathBuf::new()))
                 .performance_report_directory(),
             None
+        );
+        assert_eq!(
+            JitConfiguration::default()
+                .with_performance_report_title("es2gears")
+                .performance_report_title(),
+            "es2gears"
+        );
+        assert_eq!(
+            JitConfiguration::default()
+                .with_performance_report_title("   ")
+                .performance_report_title(),
+            "nixe"
         );
     }
 }

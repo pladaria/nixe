@@ -135,26 +135,14 @@ fn lift_test_branch(
     let source = decoded.location;
     let bit_index = u32::from(fields.bit_index);
     let value = read_gpr(builder, source, fields.rd, IrType::I64, Register31::Zero)?;
-    let tested = binary(
-        builder,
-        source,
-        IntegerBinaryKind::And,
-        value,
-        Immediate::I64(1_u64 << bit_index).into(),
-    )?;
-    let predicate = if !fields.nonzero {
-        IntegerPredicate::Equal
-    } else {
-        IntegerPredicate::NotEqual
-    };
     let condition = scalar(
         builder,
         source,
         IrType::I1,
-        ScalarOperation::Compare {
-            predicate,
-            lhs: tested,
-            rhs: Immediate::I64(0).into(),
+        ScalarOperation::TestBit {
+            value,
+            bit: bit_index as u8,
+            nonzero: fields.nonzero,
         },
     )?;
     let displacement = sign_extend(u64::from(u32::from(fields.immediate_14)), 14) << 2;
