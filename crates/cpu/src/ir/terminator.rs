@@ -98,12 +98,6 @@ pub enum Terminator {
         syndrome: Option<u64>,
         fallthrough: ControlTarget,
     },
-    /// Execute exactly one instruction using the reference interpreter.
-    InterpretOne {
-        source: LocationDescriptor,
-        encoding: InstructionEncoding,
-        coverage_id: u32,
-    },
     /// Deterministic report for an instruction implemented by neither engine.
     UnsupportedInstruction {
         source: LocationDescriptor,
@@ -129,7 +123,6 @@ impl Terminator {
         match self {
             Self::Exception { source, .. }
             | Self::ConditionalException { source, .. }
-            | Self::InterpretOne { source, .. }
             | Self::UnsupportedInstruction { source, .. }
             | Self::Stop { source, .. } => Some(*source),
             Self::Direct { .. }
@@ -158,16 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn exception_and_fallback_terminators_preserve_source_context() {
+    fn exception_and_unsupported_terminators_preserve_source_context() {
         let exception = Terminator::Exception {
             source: location(),
             kind: ExceptionKind::SupervisorCall,
             syndrome: Some(4),
-        };
-        let fallback = Terminator::InterpretOne {
-            source: location(),
-            encoding: InstructionEncoding::from_u16(0xbf00),
-            coverage_id: 7,
         };
         let unsupported = Terminator::UnsupportedInstruction {
             source: location(),
@@ -178,7 +166,6 @@ mod tests {
         };
 
         assert_eq!(exception.source(), Some(location()));
-        assert_eq!(fallback.source(), Some(location()));
         assert_eq!(unsupported.source(), Some(location()));
     }
 

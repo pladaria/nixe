@@ -559,14 +559,30 @@ impl fmt::Display for GuestCpuProfile {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessCpuContext {
     profile: GuestCpuProfile,
+    decoder: crate::platform::PlatformDecoder,
     address_space_id: AddressSpaceId,
 }
 
 impl ProcessCpuContext {
     #[must_use]
+    pub const fn for_platform(
+        platform: crate::platform::TargetPlatform,
+        address_space_id: AddressSpaceId,
+    ) -> Self {
+        Self {
+            profile: platform.profile(),
+            decoder: crate::platform::PlatformDecoder::new(platform),
+            address_space_id,
+        }
+    }
+
+    #[must_use]
     pub const fn new(profile: GuestCpuProfile, address_space_id: AddressSpaceId) -> Self {
         Self {
             profile,
+            decoder: crate::platform::PlatformDecoder::new(
+                crate::platform::TargetPlatform::from_profile(profile),
+            ),
             address_space_id,
         }
     }
@@ -577,29 +593,28 @@ impl ProcessCpuContext {
     }
 
     #[must_use]
+    pub const fn decoder(self) -> crate::platform::PlatformDecoder {
+        self.decoder
+    }
+
+    #[must_use]
+    pub const fn platform(self) -> crate::platform::TargetPlatform {
+        self.decoder.platform()
+    }
+
+    #[must_use]
     pub const fn address_space_id(self) -> AddressSpaceId {
         self.address_space_id
     }
 
-    /// Validates process metadata and freezes the initial state for a new thread.
+    /// Freezes the trusted initial execution state for a new thread.
     pub const fn thread_configuration(
         self,
         initial_execution_state: ExecutionState,
-    ) -> Result<ThreadCpuConfiguration, ProcessConfigurationError> {
-        if self
-            .profile
-            .allowed_execution_states
-            .contains(initial_execution_state)
-        {
-            Ok(ThreadCpuConfiguration {
-                profile_id: self.profile.id,
-                initial_execution_state,
-            })
-        } else {
-            Err(ProcessConfigurationError {
-                profile_id: self.profile.id,
-                requested_execution_state: initial_execution_state,
-            })
+    ) -> ThreadCpuConfiguration {
+        ThreadCpuConfiguration {
+            profile_id: self.profile.id,
+            initial_execution_state,
         }
     }
 }
@@ -625,25 +640,6 @@ impl ThreadCpuConfiguration {
         self.initial_execution_state
     }
 }
-
-/// Invalid execution-state selection from process metadata.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProcessConfigurationError {
-    pub profile_id: CpuProfileId,
-    pub requested_execution_state: ExecutionState,
-}
-
-impl fmt::Display for ProcessConfigurationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "process CPU configuration rejected: {} requested-state={}",
-            self.profile_id, self.requested_execution_state
-        )
-    }
-}
-
-impl std::error::Error for ProcessConfigurationError {}
 
 #[cfg(test)]
 mod tests {
@@ -705,21 +701,24 @@ mod tests {
             ExecutionState::A32,
             ExecutionState::T32,
         ] {
-            let configuration = process.thread_configuration(state).unwrap();
+            let configuration = process.thread_configuration(state);
             assert_eq!(configuration.profile_id(), GuestCpuProfile::SWITCH_1_ID);
             assert_eq!(configuration.initial_execution_state(), state);
         }
     }
 
     #[test]
-    fn provisional_switch_2_profile_is_a64_only_and_keeps_unknowns_explicit() {
+    fn provisional_switch_2_profile_keeps_unknowns_explicit() {
         let profile = GuestCpuProfile::switch_2_native();
         let process = ProcessCpuContext::new(profile, AddressSpaceId::new(10));
 
         assert_eq!(profile.architecture(), ArchitectureRevision::Unknown);
-        assert!(process.thread_configuration(ExecutionState::A64).is_ok());
-        assert!(process.thread_configuration(ExecutionState::A32).is_err());
-        assert!(process.thread_configuration(ExecutionState::T32).is_err());
+        assert_eq!(
+            process
+                .thread_configuration(ExecutionState::A64)
+                .initial_execution_state(),
+            ExecutionState::A64
+        );
         for feature in InstructionFeature::ALL {
             assert_eq!(
                 profile.instruction_feature_status(feature),

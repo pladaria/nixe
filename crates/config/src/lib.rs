@@ -37,7 +37,7 @@ pub struct NixeConfig {
     pub system: SystemConfig,
     /// Cross-cutting diagnostic preferences consumed by application runtimes.
     pub diagnostics: DiagnosticsConfig,
-    /// CPU execution-engine selection policy.
+    /// CPU backend selection and resource policy.
     pub cpu: CpuConfig,
     /// GPU shader, pipeline, and backend-derived cache policy.
     pub gpu: GpuCacheConfiguration,
@@ -224,25 +224,24 @@ pub struct DiagnosticsConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CpuConfig {
-    pub engine: CpuEngineSelection,
-    /// Enables capability-gated host-parallel execution. Deterministic
-    /// serialized workers remain the default.
+    pub backend: CpuBackendSelection,
+    /// Enables host-parallel execution. Deterministic serialized workers
+    /// remain the default.
     pub parallel_vcpus: bool,
-    /// Resource policy used only when a registered JIT provider is selected.
+    /// Resource policy used only when the JIT backend is selected.
     pub jit: CpuJitConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CpuEngineSelection {
+pub enum CpuBackendSelection {
     #[default]
-    Auto,
     Jit,
     Interpreter,
 }
 
 /// Product-level JIT resource and diagnostic policy. Compiler implementation
-/// details remain private to the selected provider.
+/// details remain private to the selected backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuJitConfig {
     pub max_cached_regions: usize,
@@ -322,7 +321,7 @@ pub enum ConfigError {
     InvalidInput { path: PathBuf, reason: String },
     /// GPU cache capacities are zero or cannot be represented in bytes.
     InvalidGpu { path: PathBuf, reason: String },
-    /// CPU execution-engine resource settings are invalid.
+    /// CPU backend resource settings are invalid.
     InvalidCpu { path: PathBuf, reason: String },
 }
 
@@ -408,7 +407,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawCpuConfig {
     #[serde(default)]
-    engine: CpuEngineSelection,
+    backend: CpuBackendSelection,
     #[serde(default)]
     parallel_vcpus: bool,
     #[serde(default)]
@@ -641,7 +640,7 @@ fn cpu_configuration(
                 reason: "cpu.jit.cache_mib does not fit in bytes".to_owned(),
             })?;
     Ok(CpuConfig {
-        engine: raw.engine,
+        backend: raw.backend,
         parallel_vcpus: raw.parallel_vcpus,
         jit: CpuJitConfig {
             max_cached_regions: raw.jit.max_cached_regions,
@@ -903,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_engine_selection_and_jit_budgets_are_typed_and_validated() {
+    fn cpu_backend_selection_and_jit_budgets_are_typed_and_validated() {
         let default_file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -916,8 +915,8 @@ mod tests {
             "#,
         );
         assert_eq!(
-            NixeConfig::load(&default_file.path).unwrap().cpu.engine,
-            CpuEngineSelection::Auto
+            NixeConfig::load(&default_file.path).unwrap().cpu.backend,
+            CpuBackendSelection::Jit
         );
         assert!(
             !NixeConfig::load(&default_file.path)
@@ -940,13 +939,13 @@ mod tests {
                 keys = "keys"
                 initial_operation_mode = "handheld"
                 [cpu]
-                engine = "interpreter"
+                backend = "interpreter"
                 parallel_vcpus = true
             "#,
         );
         assert_eq!(
-            NixeConfig::load(&explicit_file.path).unwrap().cpu.engine,
-            CpuEngineSelection::Interpreter
+            NixeConfig::load(&explicit_file.path).unwrap().cpu.backend,
+            CpuBackendSelection::Interpreter
         );
         assert!(
             NixeConfig::load(&explicit_file.path)
@@ -965,7 +964,7 @@ mod tests {
                 keys = "keys"
                 initial_operation_mode = "handheld"
                 [cpu]
-                engine = "jit"
+                backend = "jit"
                 [cpu.jit]
                 max_cached_regions = 256
                 cache_mib = 16
@@ -975,7 +974,7 @@ mod tests {
             "#,
         );
         let jit = NixeConfig::load(&jit_file.path).unwrap().cpu;
-        assert_eq!(jit.engine, CpuEngineSelection::Jit);
+        assert_eq!(jit.backend, CpuBackendSelection::Jit);
         assert_eq!(
             jit.jit,
             CpuJitConfig {
@@ -1024,7 +1023,7 @@ mod tests {
             None
         );
 
-        let invalid_engine = TemporaryConfig::new(
+        let invalid_backend = TemporaryConfig::new(
             r#"
                 version = 2
                 [library]
@@ -1034,11 +1033,11 @@ mod tests {
                 keys = "keys"
                 initial_operation_mode = "handheld"
                 [cpu]
-                engine = "native"
+                backend = "native"
             "#,
         );
         assert!(matches!(
-            NixeConfig::load(&invalid_engine.path),
+            NixeConfig::load(&invalid_backend.path),
             Err(ConfigError::Parse { .. })
         ));
 

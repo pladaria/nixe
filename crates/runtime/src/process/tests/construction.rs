@@ -93,8 +93,8 @@ fn horizon_layout_profiles_keep_allocation_windows_and_resource_limits_distinct(
 
 #[test]
 fn a32_thread_initialization_uses_32_bit_pc_stack_and_tls() {
-    let cpu = ProcessCpuContext::new(GuestCpuProfile::switch_1(), AddressSpaceId::new(7));
-    let configuration = cpu.thread_configuration(ExecutionState::A32).unwrap();
+    let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, AddressSpaceId::new(7));
+    let configuration = cpu.thread_configuration(ExecutionState::A32);
     let mut state = ThreadCpuState::new(configuration);
     initialize_thread(
         &mut state,
@@ -118,8 +118,8 @@ fn a32_thread_initialization_uses_32_bit_pc_stack_and_tls() {
 
 #[test]
 fn a32_created_thread_initialization_uses_create_thread_abi() {
-    let cpu = ProcessCpuContext::new(GuestCpuProfile::switch_1(), AddressSpaceId::new(7));
-    let configuration = cpu.thread_configuration(ExecutionState::A32).unwrap();
+    let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, AddressSpaceId::new(7));
+    let configuration = cpu.thread_configuration(ExecutionState::A32);
     let mut state = ThreadCpuState::new(configuration);
     initialize_created_thread(
         &mut state,

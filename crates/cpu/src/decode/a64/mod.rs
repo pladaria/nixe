@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use crate::{
     coverage::CoverageId,
     location::{ExecutionState, InstructionEncoding, InstructionSize, LocationDescriptor},
-    profile::{GuestCpuProfile, InstructionFeature},
+    profile::InstructionFeature,
 };
 
 use super::{
@@ -72,7 +72,7 @@ pub enum A64Instruction {
     Integer(integer::Instruction),
     Memory(memory::Instruction),
     FpSimd(fp_simd::Instruction),
-    RecognizedFallback { coverage_id: CoverageId },
+    RecognizedUnsupported { coverage_id: CoverageId },
 }
 
 /// Converts a table-classified A64 opcode into the typed lifter contract.
@@ -93,7 +93,7 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedFallback {
+        0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedUnsupported {
             coverage_id: opcode.coverage_id(),
         },
         0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a0 => {
@@ -134,7 +134,8 @@ pub(super) const fn pattern(
 }
 
 static PATTERNS: OnceLock<Box<[InstructionPattern]>> = OnceLock::new();
-static TABLE: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_1_TABLE: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_2_TABLE: OnceLock<DecoderTable> = OnceLock::new();
 
 /// Returns the stable aggregate catalog compiled from family-owned patterns.
 #[must_use]
@@ -151,17 +152,28 @@ pub fn patterns() -> &'static [InstructionPattern] {
 }
 
 pub(crate) fn decode(
-    profile: &GuestCpuProfile,
+    decoder: impl Into<crate::platform::PlatformDecoder>,
     location: LocationDescriptor,
     encoding: InstructionEncoding,
 ) -> DecodeResult {
-    table().decode(profile, location, encoding)
+    platform_table(decoder.into().platform()).decode(location, encoding)
+}
+
+fn platform_table(platform: crate::platform::TargetPlatform) -> &'static DecoderTable {
+    let cell = match platform {
+        crate::platform::TargetPlatform::Switch1 => &SWITCH_1_TABLE,
+        crate::platform::TargetPlatform::Switch2 => &SWITCH_2_TABLE,
+    };
+    cell.get_or_init(|| {
+        DecoderTable::compile_for_platform(patterns(), platform)
+            .expect("valid platform A64 decoder table")
+    })
 }
 
 /// Returns the validated compiled table for consistency tests and diagnostics.
 #[must_use]
 pub fn table() -> &'static DecoderTable {
-    TABLE.get_or_init(|| DecoderTable::compile(patterns()).expect("valid A64 decoder table"))
+    platform_table(crate::platform::TargetPlatform::Switch1)
 }
 
 #[cfg(test)]
@@ -169,7 +181,7 @@ mod tests {
     use super::*;
     use nixe_memory::GuestVirtualAddress;
 
-    use crate::profile::{CapabilityStatus, InstructionFeature};
+    use crate::profile::GuestCpuProfile;
 
     fn decoded_name(profile: GuestCpuProfile, bits: u32) -> &'static str {
         let location = LocationDescriptor::new(
@@ -231,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn lse_atomics_are_classified_only_when_the_guest_profile_enables_them() {
+    fn switch_1_table_omits_lse_atomics() {
         let base = GuestCpuProfile::switch_1();
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0x1000),
@@ -241,30 +253,14 @@ mod tests {
         for bits in [0xb8e0_0041_u32, 0x88e0_fc41, 0x4860_fc82] {
             assert!(matches!(
                 decode(&base, location, bits.into()),
-                DecodeResult::ProfileDisabled { .. }
+                DecodeResult::Unallocated { .. }
             ));
         }
-        let enabled = base.with_instruction_feature(
-            InstructionFeature::LargeSystemExtensions,
-            CapabilityStatus::Enabled,
-        );
-        for (bits, name) in [
-            (0xb8e0_0041, "atomic-read-modify-write"),
-            (0x88e0_fc41, "compare-and-swap"),
-            (0x4860_fc82, "compare-and-swap-pair"),
-        ] {
-            assert_eq!(decoded_name(enabled, bits), name);
-        }
-        assert!(matches!(
-            decode(&enabled, location, 0xb8e0_9041_u32.into()),
-            DecodeResult::Unallocated { .. }
-        ));
     }
 
     #[test]
-    fn representative_fp_and_simd_encodings_are_profile_gated_and_classified() {
-        let profile = GuestCpuProfile::switch_1()
-            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled);
+    fn representative_fp_and_simd_encodings_are_classified() {
+        let profile = GuestCpuProfile::switch_1();
         let cases = [
             (0x4e20_1c00, "simd-bitwise"),
             (0x4e01_0c20, "simd-duplicate-general"),
@@ -349,7 +345,7 @@ mod tests {
         assert_eq!(decoded_name(profile, 0x1e21_c000), "fp-scalar-square-root");
         assert_eq!(
             decoded_name(profile, 0x1ee1_2010),
-            "floating-point-fallback"
+            "floating-point-unsupported"
         );
     }
 
@@ -377,25 +373,22 @@ mod tests {
     }
 
     #[test]
-    fn scalar_fmov_half_precision_forms_are_fp16_gated() {
+    fn switch_1_table_omits_half_precision_semantics() {
         let base_profile = GuestCpuProfile::switch_1();
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
             base_profile.id(),
         );
-        let fp16_profile = base_profile
-            .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled);
-        for (bits, name) in [
-            (0x1eee_1000, "fp-scalar-immediate-half"),
-            (0x1ee0_4205, "fp-scalar-move-half"),
-            (0x1ee0_c0a4, "fp-scalar-absolute-half"),
-        ] {
-            assert!(matches!(
-                decode(&base_profile, location, bits.into()),
-                DecodeResult::ProfileDisabled { .. }
-            ));
-            assert_eq!(decoded_name(fp16_profile, bits), name);
+        for bits in [0x1eee_1000_u32, 0x1ee0_4205, 0x1ee0_c0a4] {
+            let result = decode(&base_profile, location, bits.into());
+            assert!(
+                matches!(
+                    result,
+                    DecodeResult::Unallocated { .. } | DecodeResult::RecognizedUnimplemented(_)
+                ),
+                "encoding {bits:#010x} decoded as {result:?}"
+            );
         }
     }
 
@@ -427,8 +420,7 @@ mod tests {
 
     #[test]
     fn normalization_keeps_instruction_families_distinct() {
-        let profile = GuestCpuProfile::switch_1()
-            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled);
+        let profile = GuestCpuProfile::switch_1();
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0x1000),
             ExecutionState::A64,
@@ -455,7 +447,7 @@ mod tests {
                 A64Instruction::Integer(_) => "integer",
                 A64Instruction::Memory(_) => "memory",
                 A64Instruction::FpSimd(_) => "fp-simd",
-                A64Instruction::RecognizedFallback { .. } => "fallback",
+                A64Instruction::RecognizedUnsupported { .. } => "unsupported",
             };
             assert_eq!(actual_family, expected_family);
         }

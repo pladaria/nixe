@@ -80,8 +80,6 @@ pub enum BlockEndReason {
     Return,
     /// A precise architectural exception ended the block.
     Exception,
-    /// The next instruction must execute once in the reference interpreter.
-    InterpreterFallback,
     /// Neither the lifter nor interpreter supports the instruction.
     UnsupportedInstruction,
     /// The configured guest-instruction bound was reached.
@@ -104,7 +102,6 @@ impl core::fmt::Display for BlockEndReason {
             Self::Call => "call",
             Self::Return => "return",
             Self::Exception => "exception",
-            Self::InterpreterFallback => "interpreter-fallback",
             Self::UnsupportedInstruction => "unsupported-instruction",
             Self::InstructionLimit => "instruction-limit",
             Self::PageBoundary => "page-boundary",

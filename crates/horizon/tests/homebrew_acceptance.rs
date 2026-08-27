@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -9,8 +8,8 @@ use nixe_horizon::{
     IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
 use nixe_runtime::{
-    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder,
-    ProcessExitCause, ProcessLifecycle,
+    CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
+    ProcessBuilder, ProcessExitCause, ProcessLifecycle,
 };
 
 use support::ScheduledProcess;
@@ -19,8 +18,7 @@ use support::ScheduledProcess;
 mod support;
 
 fn reference_process_builder() -> ProcessBuilder {
-    ProcessBuilder::default()
-        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+    ProcessBuilder::default().with_cpu_backend(CpuBackendConfig::Interpreter)
 }
 
 fn asset(relative: &str) -> PathBuf {

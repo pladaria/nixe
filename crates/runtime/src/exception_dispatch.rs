@@ -1,6 +1,6 @@
-//! Engine-independent runtime contract for architectural exception dispatch.
+//! Backend-independent runtime contract for architectural exception dispatch.
 //!
-//! Execution engines report an [`ExceptionDispatchRequest`]. Runtime policy
+//! CPU backends report an [`ExceptionDispatchRequest`]. Runtime policy
 //! handles it and returns an [`ExceptionDispatchOutcome`] which an outer
 //! execution loop applies. Neither side assumes a particular interpreter, JIT,
 //! or future NCE implementation.
@@ -67,7 +67,7 @@ impl std::fmt::Debug for GuestBreakPayload {
     }
 }
 
-pub use nixe_cpu_engine::ExceptionDispatchRequest;
+pub use nixe_cpu::execution::ExceptionDispatchRequest;
 
 pub(crate) trait MemoryMutationControl {
     fn request_mapping_safepoint(&self);
@@ -100,7 +100,7 @@ pub enum ExceptionResume {
 
 /// Runtime object whose lifetime an exception handler requests to end.
 ///
-/// Keeping this distinction in the engine-independent contract lets a future
+/// Keeping this distinction in the backend-independent contract lets a future
 /// multi-thread scheduler remove only the calling thread. The current
 /// single-thread process model converts `CurrentThread` into process exit when
 /// that thread is the last runnable thread.
@@ -178,7 +178,7 @@ pub enum ExceptionHandlingResult<F> {
 
 /// Process resources visible while runtime policy handles an exception.
 ///
-/// This is a borrowed runtime view rather than an engine-owned object. It
+/// This is a borrowed runtime view rather than a backend-owned object. It
 /// exposes guest-domain identities and service boundaries without leaking raw
 /// host pointers or coupling dispatch to the reference interpreter.
 pub struct ExceptionProcessContext<'a> {
@@ -552,7 +552,7 @@ impl std::error::Error for ExceptionRouteError {}
 /// Runtime-owned architectural exception router.
 ///
 /// The borrowed context and associated fault type keep process/thread services
-/// and platform error policy explicit. An execution engine only constructs the
+/// and platform error policy explicit. A CPU backend only constructs the
 /// request and applies the returned control decision.
 pub trait ExceptionDispatcher {
     type Fault;
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn request_preserves_engine_independent_architectural_context() {
+    fn request_preserves_backend_independent_architectural_context() {
         let request =
             ExceptionDispatchRequest::new(source(), ExceptionKind::SupervisorCall, Some(0x2a));
 

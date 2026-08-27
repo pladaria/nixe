@@ -61,9 +61,11 @@ impl ItState {
     }
 
     #[must_use]
-    pub const fn current_condition(self) -> Option<crate::ir::op::Condition> {
+    pub const fn current_condition(self) -> Option<crate::semantics::conditions::Condition> {
         if self.is_active() {
-            Some(crate::ir::op::Condition::from_encoding(self.0 >> 4))
+            Some(crate::semantics::conditions::Condition::from_encoding(
+                self.0 >> 4,
+            ))
         } else {
             None
         }
@@ -468,7 +470,7 @@ impl A32State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::op::Condition;
+    use crate::semantics::conditions::Condition;
 
     fn r(index: u8) -> A32GeneralRegister {
         A32GeneralRegister::new(index).unwrap()

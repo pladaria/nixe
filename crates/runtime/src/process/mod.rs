@@ -12,8 +12,8 @@ use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
 #[cfg(test)]
 use builder::{a32_register, a64_register, initialize_thread, validate_range};
 pub use execution::{
-    ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExit, ProcessExitCause,
-    ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
+    CpuBackendConfig, ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExit,
+    ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
@@ -27,7 +27,6 @@ pub use thread::{
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use nixe_cpu::ir::print::{IrPrintOptions, print_region};
 use nixe_cpu::location::{ExecutionState, LocationDescriptor};
@@ -36,7 +35,8 @@ use nixe_cpu::memory::{
     MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, ProcessMemory,
     SYNTHETIC_PAGE_SIZE, SyntheticRamPage,
 };
-use nixe_cpu::profile::{GuestCpuProfile, ProcessCpuContext};
+use nixe_cpu::platform::TargetPlatform;
+use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
 use nixe_cpu::translate::{
     RegionTranslationConfig, RegionTranslationReport, translate_region_report,
@@ -138,7 +138,7 @@ impl RunnableProcess {
     }
 
     /// Applies one runtime mapping resize after closing new execution leases,
-    /// then publishes the committed epoch to every executor control path.
+    /// then publishes the committed epoch to every CPU-thread control path.
     pub fn resize_memory_mapping(
         &self,
         start: GuestVirtualAddress,
@@ -369,10 +369,7 @@ impl RunnableProcess {
             ThreadCpuState::A64(_) => ExecutionState::A64,
             ThreadCpuState::A32(state) => state.execution_state(),
         };
-        let configuration = self
-            .cpu
-            .thread_configuration(execution_state)
-            .map_err(|_| ThreadCreateError::Internal)?;
+        let configuration = self.cpu.thread_configuration(execution_state);
         let mut state = ThreadCpuState::new(configuration);
         if initialize_created_thread(&mut state, request, tls_base).is_err() {
             let _ = self.handles.close(handle);
@@ -683,7 +680,7 @@ fn install_continuation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessBuildStage {
     Metadata,
-    EngineInitialization,
+    CpuInitialization,
     Placement,
     Preparation,
     Mapping,

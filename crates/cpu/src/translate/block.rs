@@ -14,6 +14,7 @@ use crate::{
     },
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
     memory::InstructionMemory,
+    platform::PlatformDecoder,
     profile::GuestCpuProfile,
 };
 
@@ -52,7 +53,7 @@ impl Default for BasicBlockLimits {
 pub(crate) enum LiftOutcome {
     Continue,
     Terminate(Terminator),
-    Interpret(crate::coverage::CoverageId),
+    Unsupported(crate::coverage::CoverageId),
 }
 
 /// Lazily translates one bounded block beginning at `start`.
@@ -60,6 +61,7 @@ pub(crate) enum LiftOutcome {
 /// Fetch provenance remains in guest domains, each instruction is dispatched
 /// through the decoder and state-specific lifter, and the returned IR has
 /// already passed the common verifier.
+#[cfg(test)]
 pub(crate) fn translate_basic_block(
     config: BasicBlockLimits,
     profile: &GuestCpuProfile,
@@ -67,28 +69,56 @@ pub(crate) fn translate_basic_block(
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrBlock, FrontendError> {
-    translate_basic_block_internal(config, profile, address_space, start, memory, false)
+    translate_basic_block_with_decoder(
+        config,
+        profile.into(),
+        profile,
+        address_space,
+        start,
+        memory,
+    )
 }
 
-pub(crate) fn translate_basic_block_with_disassembly(
+pub(crate) fn translate_basic_block_with_decoder(
     config: BasicBlockLimits,
+    decoder: PlatformDecoder,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrBlock, FrontendError> {
-    translate_basic_block_internal(config, profile, address_space, start, memory, true)
+    translate_basic_block_internal(
+        config,
+        decoder,
+        profile,
+        address_space,
+        start,
+        memory,
+        false,
+    )
+}
+
+pub(crate) fn translate_basic_block_with_disassembly(
+    config: BasicBlockLimits,
+    decoder: PlatformDecoder,
+    profile: &GuestCpuProfile,
+    address_space: AddressSpaceId,
+    start: LocationDescriptor,
+    memory: &(impl InstructionMemory + ?Sized),
+) -> Result<IrBlock, FrontendError> {
+    translate_basic_block_internal(config, decoder, profile, address_space, start, memory, true)
 }
 
 fn translate_basic_block_internal(
     config: BasicBlockLimits,
+    decoder: PlatformDecoder,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
     capture_disassembly: bool,
 ) -> Result<IrBlock, FrontendError> {
-    validate_start(profile, start)?;
+    validate_start(start)?;
     if config.max_guest_instructions.get() > MAX_GUEST_INSTRUCTIONS_PER_BLOCK {
         return Err(internal(
             "configured guest instruction limit exceeds the frontend allocation bound",
@@ -122,7 +152,7 @@ fn translate_basic_block_internal(
         let mut source = InstructionSource::new(location, encoding, fetched_dependencies);
 
         let operations_before_lift = builder.operation_count();
-        let outcome = match crate::decode::decode(profile, location, encoding) {
+        let outcome = match crate::decode::decode(decoder, location, encoding) {
             DecodeResult::Decoded(decoded) => {
                 if capture_disassembly {
                     source = source.with_disassembly(
@@ -137,7 +167,7 @@ fn translate_basic_block_internal(
                         crate::decode::disassemble(&decoded.instruction).to_string(),
                     );
                 }
-                LiftOutcome::Terminate(interpret_terminator(&decoded))
+                LiftOutcome::Terminate(unsupported_terminator(&decoded))
             }
             DecodeResult::Unallocated { reason, .. } => {
                 if capture_disassembly {
@@ -152,19 +182,6 @@ fn translate_basic_block_internal(
             DecodeResult::Reserved { name, reason, .. } => {
                 if capture_disassembly {
                     source = source.with_disassembly(format!("<{name}: reserved: {reason}>"));
-                }
-                LiftOutcome::Terminate(Terminator::Exception {
-                    source: location,
-                    kind: crate::exception::ExceptionKind::UndefinedInstruction,
-                    syndrome: None,
-                })
-            }
-            DecodeResult::ProfileDisabled {
-                name, rejection, ..
-            } => {
-                if capture_disassembly {
-                    source =
-                        source.with_disassembly(format!("<{name}: profile-disabled: {rejection}>"));
                 }
                 LiftOutcome::Terminate(Terminator::Exception {
                     source: location,
@@ -210,11 +227,13 @@ fn translate_basic_block_internal(
                 let reason = end_reason_for_terminator(&terminator);
                 break (terminator, reason);
             }
-            LiftOutcome::Interpret(coverage_id) => {
-                let terminator = Terminator::InterpretOne {
+            LiftOutcome::Unsupported(coverage_id) => {
+                let terminator = Terminator::UnsupportedInstruction {
                     source: location,
                     encoding,
                     coverage_id: coverage_id.get(),
+                    disassembly: "unsupported".into(),
+                    reason: "no JIT semantics are implemented for this instruction".into(),
                 };
                 let reason = end_reason_for_terminator(&terminator);
                 break (terminator, reason);
@@ -248,29 +267,12 @@ const fn end_reason_for_terminator(terminator: &Terminator) -> BlockEndReason {
         Terminator::Exception { .. } | Terminator::ConditionalException { .. } => {
             BlockEndReason::Exception
         }
-        Terminator::InterpretOne { .. } => BlockEndReason::InterpreterFallback,
         Terminator::UnsupportedInstruction { .. } => BlockEndReason::UnsupportedInstruction,
         Terminator::Stop { .. } => BlockEndReason::RuntimeStop,
     }
 }
 
-fn validate_start(
-    profile: &GuestCpuProfile,
-    start: LocationDescriptor,
-) -> Result<(), FrontendError> {
-    if start.profile_id != profile.id() {
-        return Err(internal(
-            "block start profile does not match the selected profile",
-        ));
-    }
-    if !profile
-        .allowed_execution_states()
-        .contains(start.execution_state)
-    {
-        return Err(internal(
-            "block start execution state is disabled by the profile",
-        ));
-    }
+fn validate_start(start: LocationDescriptor) -> Result<(), FrontendError> {
     if !start.is_aligned() {
         return Err(internal("block start PC is not instruction aligned"));
     }
@@ -330,11 +332,15 @@ fn lift_decoded(
     }
 }
 
-fn interpret_terminator(decoded: &DecodedInstruction<DecodedOpcode>) -> Terminator {
-    Terminator::InterpretOne {
+fn unsupported_terminator(decoded: &DecodedInstruction<DecodedOpcode>) -> Terminator {
+    Terminator::UnsupportedInstruction {
         source: decoded.location,
         encoding: decoded.encoding,
         coverage_id: decoded.instruction.coverage_id().get(),
+        disassembly: crate::decode::disassemble(&decoded.instruction)
+            .to_string()
+            .into_boxed_str(),
+        reason: "no JIT semantics are implemented for this instruction".into(),
     }
 }
 
@@ -481,7 +487,6 @@ mod tests {
             Terminator::Return { .. } => "return",
             Terminator::Exception { .. } => "exception",
             Terminator::ConditionalException { .. } => "conditional-exception",
-            Terminator::InterpretOne { .. } => "interpret-one",
             Terminator::UnsupportedInstruction { .. } => "unsupported",
             Terminator::Stop { .. } => "stop",
         }
@@ -743,10 +748,10 @@ mod tests {
             &future_fallback,
         )
         .unwrap();
-        assert_eq!(terminator_family(&block.terminator), "interpret-one");
+        assert_eq!(terminator_family(&block.terminator), "unsupported");
         assert_eq!(
             block.metadata.end_reason,
-            BlockEndReason::InterpreterFallback
+            BlockEndReason::UnsupportedInstruction
         );
         assert_eq!(block.metadata.guest_instruction_count, 1);
 
@@ -1012,7 +1017,10 @@ mod tests {
             &future_fallback,
         )
         .unwrap();
-        assert!(matches!(block.terminator, Terminator::InterpretOne { .. }));
+        assert!(matches!(
+            block.terminator,
+            Terminator::UnsupportedInstruction { .. }
+        ));
     }
 
     #[test]

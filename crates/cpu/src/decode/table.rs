@@ -9,7 +9,7 @@ use crate::{
         DecodedInstruction, ExecutionState, InstructionEncoding, InstructionSize,
         LocationDescriptor,
     },
-    profile::{GuestCpuProfile, InstructionFeature},
+    profile::InstructionFeature,
 };
 
 use super::DecodeResult;
@@ -297,26 +297,34 @@ impl DecoderTable {
         })
     }
 
+    /// Builds the immutable table selected once for a target platform.
+    pub fn compile_for_platform(
+        patterns: &'static [InstructionPattern],
+        platform: crate::platform::TargetPlatform,
+    ) -> Result<Self, TableError> {
+        let patterns = patterns
+            .iter()
+            .copied()
+            .filter(|pattern| {
+                pattern
+                    .required_features
+                    .iter()
+                    .all(|feature| platform.supports(*feature))
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self::compile(Box::leak(patterns))
+    }
+
     /// Classifies one encoding without allocation or a full-table scan.
     #[must_use]
     pub fn decode(
         &self,
-        profile: &GuestCpuProfile,
         location: LocationDescriptor,
         encoding: InstructionEncoding,
     ) -> DecodeResult {
         let diagnostic = InstructionDiagnostic::new(location, encoding);
-        if location.profile_id != profile.id() {
-            return DecodeResult::Unallocated {
-                instruction: diagnostic,
-                reason: "location profile does not match decoder profile",
-            };
-        }
-        if location.execution_state != self.patterns[0].execution_state
-            || !profile
-                .allowed_execution_states()
-                .contains(location.execution_state)
-        {
+        if location.execution_state != self.patterns[0].execution_state {
             return DecodeResult::Unallocated {
                 instruction: diagnostic,
                 reason: "decoder table is unavailable for this execution state",
@@ -346,17 +354,6 @@ impl DecoderTable {
                     allocation_rejection.get_or_insert((false, pattern.name, reason));
                     continue;
                 }
-            }
-            if let Some(rejection) = pattern
-                .required_features
-                .iter()
-                .find_map(|feature| profile.require_instruction_feature(*feature).err())
-            {
-                return DecodeResult::ProfileDisabled {
-                    instruction: diagnostic,
-                    name: pattern.name,
-                    rejection,
-                };
             }
             let decoded =
                 DecodedInstruction::new(location, encoding, DecodedOpcode { pattern, bits });
@@ -580,7 +577,7 @@ mod tests {
     use super::*;
     use nixe_memory::GuestVirtualAddress;
 
-    use crate::profile::CapabilityStatus;
+    use crate::profile::GuestCpuProfile;
 
     const EMPTY_FIELDS: &[OperandField] = &[];
     const EMPTY_FEATURES: &[InstructionFeature] = &[];
@@ -633,9 +630,7 @@ mod tests {
             ExecutionState::A64,
             profile.id(),
         );
-        let DecodeResult::Decoded(decoded) =
-            table.decode(&profile, location, 0x1234_5678_u32.into())
-        else {
+        let DecodeResult::Decoded(decoded) = table.decode(location, 0x1234_5678_u32.into()) else {
             panic!("expected decoded")
         };
         assert_eq!(decoded.instruction.pattern().name, "narrow");
@@ -670,9 +665,7 @@ mod tests {
         );
 
         reset_operand_extraction_count();
-        let DecodeResult::Decoded(decoded) =
-            table.decode(&profile, location, 0x1200_0fe3_u32.into())
-        else {
+        let DecodeResult::Decoded(decoded) = table.decode(location, 0x1200_0fe3_u32.into()) else {
             panic!("expected decoded")
         };
         assert_eq!(operand_extraction_count(), 0);
@@ -699,23 +692,27 @@ mod tests {
     }
 
     #[test]
-    fn disabled_features_are_reported_by_the_decoder() {
+    fn platform_tables_omit_unsupported_features() {
         static FEATURES: [InstructionFeature; 1] = [InstructionFeature::Crc32];
-        static PATTERNS: [InstructionPattern; 1] = [InstructionPattern {
-            required_features: &FEATURES,
-            ..pattern("feature", 0xff00_0000, 0x1200_0000, 1)
-        }];
-        let table = DecoderTable::compile(&PATTERNS).unwrap();
-        let disabled = GuestCpuProfile::switch_1()
-            .with_instruction_feature(InstructionFeature::Crc32, CapabilityStatus::Disabled);
+        static PATTERNS: [InstructionPattern; 2] = [
+            pattern("base", 0xff00_0000, 0x1100_0000, 1),
+            InstructionPattern {
+                required_features: &FEATURES,
+                ..pattern("feature", 0xff00_0000, 0x1200_0000, 2)
+            },
+        ];
+        let table =
+            DecoderTable::compile_for_platform(&PATTERNS, crate::platform::TargetPlatform::Switch1)
+                .unwrap();
+        let profile = GuestCpuProfile::switch_1();
         let location = LocationDescriptor::new(
             GuestVirtualAddress::new(0),
             ExecutionState::A64,
-            disabled.id(),
+            profile.id(),
         );
         assert!(matches!(
-            table.decode(&disabled, location, 0x1200_0000_u32.into()),
-            DecodeResult::ProfileDisabled { .. }
+            table.decode(location, 0x1200_0000_u32.into()),
+            DecodeResult::Unallocated { .. }
         ));
     }
 }

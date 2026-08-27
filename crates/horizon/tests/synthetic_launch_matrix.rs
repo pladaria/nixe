@@ -2,7 +2,6 @@
 mod support;
 
 use std::fs;
-use std::sync::Arc;
 
 use nixe_cpu::memory::MemoryMappingPurpose;
 use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
@@ -10,13 +9,12 @@ use nixe_horizon::{
     DirectoryEntryKind, HorizonProcess, IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
 use nixe_runtime::{
-    LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, ProcessBuilder,
-    RelocationState,
+    CpuBackendConfig, LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance,
+    ProcessBuilder, RelocationState,
 };
 
 fn reference_process_builder() -> ProcessBuilder {
-    ProcessBuilder::default()
-        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+    ProcessBuilder::default().with_cpu_backend(CpuBackendConfig::Interpreter)
 }
 
 use support::synthetic_packages::{

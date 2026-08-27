@@ -20,7 +20,6 @@ nixe-scheduler.workspace = true
 nixe-video.workspace = true
 
 [dev-dependencies]
-nixe-cpu-engine-interpreter.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true

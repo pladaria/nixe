@@ -3,10 +3,8 @@ members = [
     "apps/cli",
     "crates/config",
     "crates/cpu",
-    "crates/cpu-engine",
-    "crates/cpu-engine-interpreter",
-    "crates/cpu-engine-jit",
-    "crates/cpu-engine-testkit",
+    "crates/cpu-interpreter",
+    "crates/cpu-jit",
     "crates/gpu",
     "crates/gpu-headless",
     "crates/gpu-maxwell",
@@ -56,10 +54,8 @@ tempfile = "3.27"
 twox-hash = { version = "2.1.3", default-features = false, features = ["std", "xxhash3_128"] }
 nixe-config = { path = "crates/config" }
 nixe-cpu = { path = "crates/cpu" }
-nixe-cpu-engine = { path = "crates/cpu-engine" }
-nixe-cpu-engine-interpreter = { path = "crates/cpu-engine-interpreter" }
-nixe-cpu-engine-jit = { path = "crates/cpu-engine-jit" }
-nixe-cpu-engine-testkit = { path = "crates/cpu-engine-testkit" }
+nixe-cpu-interpreter = { path = "crates/cpu-interpreter" }
+nixe-cpu-jit = { path = "crates/cpu-jit" }
 nixe-gpu = { path = "crates/gpu" }
 nixe-gpu-headless = { path = "crates/gpu-headless" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }

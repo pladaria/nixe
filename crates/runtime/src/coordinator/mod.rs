@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use nixe_cpu_engine::{SchedulerRequest, VcpuEventState};
+use nixe_cpu::execution::{SchedulerRequest, VcpuEventState};
 use nixe_scheduler::{
     Completion, CoreSet, GuestThreadId, Lease, MachineSchedulerProfile, ProcessId, Readiness,
     ScheduledThreadConfig, SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState,
@@ -23,7 +23,7 @@ mod worker;
 
 use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
 pub use worker::WorkerFailure;
-use worker::{VcpuWorkerPool, WorkerExecutorKey, WorkerRequest, WorkerRunFailure};
+use worker::{VcpuWorkerPool, WorkerCpuThreadKey, WorkerRequest, WorkerRunFailure};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum VcpuExecutionMode {
@@ -102,7 +102,7 @@ impl AdaptiveExecutionBudget {
 }
 
 /// System-level owner of process lookup and the pure scheduler state machine.
-/// Engine domains remain encapsulated by their registered process runtime.
+/// CPU backend state remains encapsulated by its registered process runtime.
 pub struct RuntimeCoordinator {
     scheduler: SchedulerState,
     processes: BTreeMap<ProcessId, RunnableProcess>,
@@ -256,7 +256,7 @@ impl RuntimeCoordinator {
         Ok(observed)
     }
 
-    /// Quiesces workers and releases every process, engine domain, wait, and
+    /// Quiesces workers and releases every process, CPU backend, wait, and
     /// canonical address-space resource. Repeated shutdown calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
         if self.host_stop_requested {
@@ -348,22 +348,6 @@ impl RuntimeCoordinator {
         mut process: RunnableProcess,
         registration: ProcessRegistration,
     ) -> Result<ProcessId, CoordinatorError> {
-        let parallel = self.execution_mode == VcpuExecutionMode::Parallel;
-        let required =
-            process.engine_requirements(parallel, self.scheduler.profile().vcpus().len());
-        for descriptor in
-            std::iter::once(process.engine_descriptor()).chain(process.fallback_engine_descriptor())
-        {
-            let capabilities = descriptor.capabilities;
-            if !capabilities.contains(required)
-                || !capabilities.supports_profile(process.cpu_context().profile(), required)
-            {
-                return Err(CoordinatorError::EngineUnsupportedForExecutionMode {
-                    engine: descriptor.id,
-                    mode: self.execution_mode,
-                });
-            }
-        }
         let (id, next_process_id) = self
             .process_ids
             .candidate()
@@ -389,10 +373,10 @@ impl RuntimeCoordinator {
                 .expect("registration rollback removes an unleased created thread");
             return Err(error.into());
         }
-        if let Err(error) = self.install_process_executors(id, &mut process, thread) {
+        if let Err(error) = self.install_process_cpu_threads(id, &mut process, thread) {
             self.scheduler
                 .apply(SchedulerCommand::Unregister(thread))
-                .expect("executor installation rollback removes an unleased ready thread");
+                .expect("CPU thread installation rollback removes an unleased ready thread");
             return Err(error);
         }
         let replaced = self.processes.insert(id, process);
@@ -403,7 +387,7 @@ impl RuntimeCoordinator {
     }
 
     /// Stops a process execution domain, quiesces and drops every worker-owned
-    /// executor, then transfers the process solely for final resource teardown.
+    /// CPU thread, then transfers the process solely for final resource teardown.
     /// A removed process is terminal and cannot be registered again.
     pub fn remove_process(&mut self, id: ProcessId) -> Result<RunnableProcess, CoordinatorError> {
         let threads: Vec<_> = self
@@ -423,7 +407,7 @@ impl RuntimeCoordinator {
                 return Err(SchedulerError::ThreadLeased(*thread).into());
             }
         }
-        self.retire_process_executors(id)?;
+        self.retire_process_cpu_threads(id)?;
         let removed_threads: BTreeSet<_> = threads.iter().copied().collect();
         self.priority_donations.retain(|donation| {
             !removed_threads.contains(&donation.owner)
@@ -477,22 +461,16 @@ impl RuntimeCoordinator {
         Ok(terminated)
     }
 
-    fn install_process_executors(
+    fn install_process_cpu_threads(
         &mut self,
         process_id: ProcessId,
         process: &mut RunnableProcess,
         thread: GuestThreadId,
     ) -> Result<(), CoordinatorError> {
-        let key = WorkerExecutorKey {
+        let key = WorkerCpuThreadKey {
             process: process_id,
-            domain: process.engine_domain_id(),
+            cpu_process: process.cpu_process_id(),
         };
-        let fallback_key = process
-            .fallback_engine_domain_id()
-            .map(|domain| WorkerExecutorKey {
-                process: process_id,
-                domain,
-            });
         let vcpus: Vec<_> = self
             .scheduler
             .profile()
@@ -502,26 +480,19 @@ impl RuntimeCoordinator {
             .collect();
         let mut installed = Vec::new();
         for vcpu in vcpus {
-            let executors = match process.create_worker_executors(vcpu) {
-                Ok(executors) => executors,
+            let cpu_thread = match process.create_worker_cpu_thread(vcpu) {
+                Ok(cpu_thread) => cpu_thread,
                 Err(fault) => {
-                    self.rollback_process_executors(process_id, process, &installed);
+                    self.rollback_process_cpu_threads(process_id, process, &installed);
                     return Err(CoordinatorError::Execution {
                         process: process_id,
                         thread,
-                        error: ProcessExecutionError::Engine { fault },
+                        error: ProcessExecutionError::Cpu { fault },
                     });
                 }
             };
-            if let Err(failure) = self.workers.install_executor(vcpu, key, executors.primary) {
-                self.rollback_process_executors(process_id, process, &installed);
-                return Err(CoordinatorError::Worker(failure));
-            }
-            if let (Some(fallback_key), Some(fallback)) = (fallback_key, executors.fallback)
-                && let Err(failure) = self.workers.install_executor(vcpu, fallback_key, fallback)
-            {
-                installed.push(vcpu);
-                self.rollback_process_executors(process_id, process, &installed);
+            if let Err(failure) = self.workers.install_cpu_thread(vcpu, key, cpu_thread) {
+                self.rollback_process_cpu_threads(process_id, process, &installed);
                 return Err(CoordinatorError::Worker(failure));
             }
             installed.push(vcpu);
@@ -529,7 +500,7 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    fn rollback_process_executors(
+    fn rollback_process_cpu_threads(
         &mut self,
         process_id: ProcessId,
         process: &mut RunnableProcess,
@@ -537,13 +508,16 @@ impl RuntimeCoordinator {
     ) {
         let _ = process.request_execution_stop();
         for &vcpu in installed {
-            let preparation = process.executor_teardown_state();
+            let preparation = process.cpu_thread_teardown_state();
             let _ = self.workers.retire_process(vcpu, process_id, preparation);
         }
-        let _ = process.complete_executor_retirement();
+        let _ = process.complete_cpu_thread_retirement();
     }
 
-    fn retire_process_executors(&mut self, process_id: ProcessId) -> Result<(), CoordinatorError> {
+    fn retire_process_cpu_threads(
+        &mut self,
+        process_id: ProcessId,
+    ) -> Result<(), CoordinatorError> {
         let main_thread = self
             .processes
             .get(&process_id)
@@ -556,7 +530,7 @@ impl RuntimeCoordinator {
             .map_err(|fault| CoordinatorError::Execution {
                 process: process_id,
                 thread: main_thread,
-                error: ProcessExecutionError::Engine { fault },
+                error: ProcessExecutionError::Cpu { fault },
             })?;
         let vcpus: Vec<_> = self
             .scheduler
@@ -570,7 +544,7 @@ impl RuntimeCoordinator {
                 .processes
                 .get(&process_id)
                 .expect("the stopping process remains registered")
-                .executor_teardown_state();
+                .cpu_thread_teardown_state();
             self.workers
                 .retire_process(vcpu, process_id, preparation)
                 .map_err(CoordinatorError::Worker)?;
@@ -578,11 +552,11 @@ impl RuntimeCoordinator {
         self.processes
             .get_mut(&process_id)
             .expect("the stopped process remains registered")
-            .complete_executor_retirement()
+            .complete_cpu_thread_retirement()
             .map_err(|fault| CoordinatorError::Execution {
                 process: process_id,
                 thread: main_thread,
-                error: ProcessExecutionError::Engine { fault },
+                error: ProcessExecutionError::Cpu { fault },
             })?;
         Ok(())
     }
@@ -595,7 +569,7 @@ impl RuntimeCoordinator {
     }
 
     /// Publishes an interrupt to one physical emulated CPU. The interrupt
-    /// remains pending until an engine observes it at a bounded safepoint.
+    /// remains pending until a backend observes it at a bounded safepoint.
     pub fn post_vcpu_interrupt(
         &mut self,
         vcpu: VirtualCpuId,
@@ -809,11 +783,6 @@ pub enum CoordinatorError {
     WorkerStartup(std::io::ErrorKind),
     Worker(WorkerFailure),
     ParallelModeRequired,
-    EngineUnsupportedForExecutionMode {
-        engine: nixe_cpu_engine::EngineId,
-        mode: VcpuExecutionMode,
-    },
-    EngineUnavailable(nixe_cpu_engine::CapabilityReport),
     ProcessTeardown {
         process: ProcessId,
         failure: crate::ProcessTeardownFailure,
@@ -908,7 +877,6 @@ pub struct CoordinatorDrainReport {
 
 fn recorded_stop(stop: &ExecutionStop) -> crate::RecordedStop {
     match stop {
-        ExecutionStop::InterpretOne { .. } => crate::RecordedStop::InterpretOne,
         ExecutionStop::BudgetExhausted => crate::RecordedStop::BudgetExhausted,
         ExecutionStop::Safepoint => crate::RecordedStop::Safepoint,
         ExecutionStop::PendingEvent { .. } => crate::RecordedStop::PendingEvent,
@@ -919,7 +887,6 @@ fn recorded_stop(stop: &ExecutionStop) -> crate::RecordedStop {
         ExecutionStop::LoaderReturn { .. } => crate::RecordedStop::LoaderReturn,
         ExecutionStop::FetchFault { .. } => crate::RecordedStop::FetchFault,
         ExecutionStop::UnsupportedSemantics { .. } => crate::RecordedStop::UnsupportedSemantics,
-        ExecutionStop::ProfileDisabled { .. } => crate::RecordedStop::ProfileDisabled,
         ExecutionStop::UnallocatedEncoding { .. } => crate::RecordedStop::UnallocatedEncoding,
     }
 }

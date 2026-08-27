@@ -41,7 +41,7 @@ log_level = "debug"
 # CPU engine selected through the capability registry: "auto", "jit", or
 # "interpreter". Auto prefers the production JIT and falls back to the
 # interpreter only when the host or guest profile cannot satisfy JIT capabilities.
-engine = "auto"
+backend = "jit"
 # Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
 # selected engine provides concurrent executors, bounded safepoints, and
 # acknowledged semantic memory invalidation. False keeps deterministic serialization.

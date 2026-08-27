@@ -8,10 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{CpuConfig, CpuEngineSelection, InitialOperationMode, TimeMode};
-use nixe_cpu_engine::{EngineCapabilities, EnginePreference, EngineProvider, EngineRegistry};
-use nixe_cpu_engine_interpreter::{INTERPRETER_ENGINE_ID, InterpreterProvider};
-use nixe_cpu_engine_jit::{JIT_ENGINE_ID, JitConfiguration, JitProvider};
+use nixe_config::{CpuBackendSelection, CpuConfig, InitialOperationMode, TimeMode};
+use nixe_cpu_jit::JitConfiguration;
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
@@ -25,9 +23,9 @@ use nixe_input::{
 use nixe_loader_title::NacpLanguage;
 use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
-    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder, ProcessExit,
-    ProcessExitCause, ProcessRegistration, ProcessTeardownReport, RunnableProcess,
-    RuntimeCoordinator, VcpuExecutionMode, VirtualClock, VirtualClockMode,
+    CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
+    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
+    RunnableProcess, RuntimeCoordinator, VcpuExecutionMode, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
@@ -46,7 +44,7 @@ pub struct Arguments {
     pub log_level_override: Option<LogLevel>,
     pub identifier: String,
     pub headless: bool,
-    pub cpu_engine_override: Option<CpuEngineSelection>,
+    pub cpu_backend_override: Option<CpuBackendSelection>,
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
@@ -55,7 +53,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         log_level_override,
         identifier,
         headless,
-        cpu_engine_override,
+        cpu_backend_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
     let (frontend, frontend_control, presenter) = if headless {
@@ -71,9 +69,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
-    let cpu_configuration = effective_cpu_configuration(config.cpu.clone(), cpu_engine_override);
-    if let Some(engine) = cpu_engine_override {
-        log::info!("CPU engine selection overridden by CLI: {engine:?}");
+    let cpu_configuration = effective_cpu_configuration(config.cpu.clone(), cpu_backend_override);
+    if let Some(backend) = cpu_backend_override {
+        log::info!("CPU backend selection overridden by CLI: {backend:?}");
     }
     log::info!(
         "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
@@ -168,24 +166,14 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
-    let SelectedCpuEngines { primary, fallback } = select_cpu_engines(
-        cpu_configuration,
-        machine_profile.cpu(),
-        plan.initial_execution_state(),
-        machine_profile.scheduler().vcpus().len(),
-        &title.name,
-    )?;
-    let selected_engine = primary.descriptor();
-    let trace_interpreter =
-        selected_engine.id == INTERPRETER_ENGINE_ID && log::log_enabled!(log::Level::Trace);
-    let mut process_builder = ProcessBuilder::new()
+    let cpu_backend = select_cpu_backend(cpu_configuration, &title.name)?;
+    let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
+        && log::log_enabled!(log::Level::Trace);
+    let process_builder = ProcessBuilder::new()
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config())
-        .with_engine_provider(primary);
-    if let Some(fallback) = fallback {
-        process_builder = process_builder.with_fallback_engine_provider(fallback);
-    }
+        .with_cpu_backend(cpu_backend);
     let process = process_builder
         .build(&plan)
         .map_err(|error| error.to_string())?;
@@ -195,7 +183,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         process.entry_module().entry_address(),
         process.modules().len()
     );
-    log::info!("starting CPU engine {}", selected_engine.name);
+    log::info!("starting CPU backend {}", process.cpu_backend_name());
 
     let initial_operation_mode = match config.system.initial_operation_mode {
         InitialOperationMode::Handheld => OperationMode::Handheld,
@@ -302,31 +290,23 @@ const fn system_language(language: NacpLanguage) -> SystemLanguage {
     }
 }
 
-struct SelectedCpuEngines {
-    primary: Arc<dyn EngineProvider>,
-    fallback: Option<Arc<dyn EngineProvider>>,
-}
-
 fn effective_cpu_configuration(
     configuration: CpuConfig,
-    engine_override: Option<CpuEngineSelection>,
+    backend_override: Option<CpuBackendSelection>,
 ) -> CpuConfig {
     CpuConfig {
-        engine: match engine_override {
-            Some(engine) => engine,
-            None => configuration.engine,
+        backend: match backend_override {
+            Some(backend) => backend,
+            None => configuration.backend,
         },
         ..configuration
     }
 }
 
-fn select_cpu_engines(
+fn select_cpu_backend(
     configuration: CpuConfig,
-    profile: nixe_cpu::profile::GuestCpuProfile,
-    execution_state: nixe_cpu::location::ExecutionState,
-    vcpu_count: usize,
     title_name: &str,
-) -> Result<SelectedCpuEngines, String> {
+) -> Result<CpuBackendConfig, String> {
     let jit_configuration = JitConfiguration::new(
         configuration.jit.max_cached_regions,
         configuration.jit.max_cache_bytes,
@@ -336,70 +316,20 @@ fn select_cpu_engines(
     .with_dump_directory(configuration.jit.dump_directory.clone())
     .with_performance_report_directory(configuration.jit.performance_report_directory.clone())
     .with_performance_report_title(title_name);
-    let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
-    let jit: Arc<dyn EngineProvider> = Arc::new(JitProvider::with_configuration(jit_configuration));
-    let registry = EngineRegistry::new([Arc::clone(&jit), Arc::clone(&interpreter)]);
-    let preference = match configuration.engine {
-        CpuEngineSelection::Auto => EnginePreference::Auto,
-        CpuEngineSelection::Jit => EnginePreference::Explicit(JIT_ENGINE_ID),
-        CpuEngineSelection::Interpreter => EnginePreference::Explicit(INTERPRETER_ENGINE_ID),
-    };
-    let required =
-        cpu_engine_requirements(execution_state, configuration.parallel_vcpus, vcpu_count);
-    let primary = registry
-        .select(profile, required, preference)
-        .map_err(|error| error.to_string())?;
-    let fallback = if primary.descriptor().capabilities.interpret_one_fallback {
-        Some(
-            registry
-                .select(
-                    profile,
-                    required,
-                    EnginePreference::Explicit(INTERPRETER_ENGINE_ID),
-                )
-                .map_err(|error| format!("semantic fallback unavailable: {error}"))?,
-        )
-    } else {
-        None
-    };
-    Ok(SelectedCpuEngines { primary, fallback })
-}
-
-fn cpu_engine_requirements(
-    execution_state: nixe_cpu::location::ExecutionState,
-    parallel_vcpus: bool,
-    vcpu_count: usize,
-) -> EngineCapabilities {
-    let mut required = EngineCapabilities {
-        interpret_one_fallback: false,
-        concurrent_executors: parallel_vcpus,
-        max_safepoint_instructions: parallel_vcpus
-            .then(|| std::num::NonZeroU64::new(u64::MAX).unwrap()),
-        acknowledged_invalidation: parallel_vcpus,
-        deterministic_execution: !parallel_vcpus,
-        canonical_memory_binding: false,
-        max_concurrent_executors: parallel_vcpus.then(|| {
-            std::num::NonZeroUsize::new(vcpu_count)
-                .expect("a machine profile contains at least one vCPU")
-        }),
-        ..EngineCapabilities::default()
-    };
-    match execution_state {
-        nixe_cpu::location::ExecutionState::A64 => required.a64 = true,
-        nixe_cpu::location::ExecutionState::A32 => required.a32 = true,
-        nixe_cpu::location::ExecutionState::T32 => required.t32 = true,
-    }
-    required
+    Ok(match configuration.backend {
+        CpuBackendSelection::Jit => CpuBackendConfig::Jit(jit_configuration),
+        CpuBackendSelection::Interpreter => CpuBackendConfig::Interpreter,
+    })
 }
 
 #[cfg(test)]
-mod engine_selection_tests {
+mod backend_selection_tests {
     use super::*;
 
     #[test]
-    fn cli_engine_override_has_priority_without_replacing_other_cpu_policy() {
+    fn cli_backend_override_has_priority_without_replacing_other_cpu_policy() {
         let configured = CpuConfig {
-            engine: CpuEngineSelection::Interpreter,
+            backend: CpuBackendSelection::Interpreter,
             parallel_vcpus: true,
             jit: nixe_config::CpuJitConfig {
                 max_cached_regions: 7,
@@ -415,81 +345,29 @@ mod engine_selection_tests {
             configured
         );
         assert_eq!(
-            effective_cpu_configuration(configured.clone(), Some(CpuEngineSelection::Jit)),
+            effective_cpu_configuration(configured.clone(), Some(CpuBackendSelection::Jit)),
             CpuConfig {
-                engine: CpuEngineSelection::Jit,
+                backend: CpuBackendSelection::Jit,
                 ..configured.clone()
             }
         );
     }
 
     #[test]
-    fn application_composition_selects_real_engines_and_semantic_fallback_by_capability() {
-        let profile = switch_1_machine_profile();
-        let interpreter = select_cpu_engines(
+    fn application_composition_selects_one_concrete_backend() {
+        let interpreter = select_cpu_backend(
             CpuConfig {
-                engine: CpuEngineSelection::Interpreter,
+                backend: CpuBackendSelection::Interpreter,
                 parallel_vcpus: true,
                 ..CpuConfig::default()
             },
-            profile.cpu(),
-            nixe_cpu::location::ExecutionState::A64,
-            profile.scheduler().vcpus().len(),
             "test-title",
         )
         .unwrap();
-        assert_eq!(interpreter.primary.descriptor().id, INTERPRETER_ENGINE_ID);
-        assert!(interpreter.fallback.is_none());
+        assert!(matches!(interpreter, CpuBackendConfig::Interpreter));
 
-        let auto = select_cpu_engines(
-            CpuConfig::default(),
-            profile.cpu(),
-            nixe_cpu::location::ExecutionState::A64,
-            profile.scheduler().vcpus().len(),
-            "test-title",
-        )
-        .unwrap();
-        let primary = auto.primary.descriptor();
-        let jit_available = JitProvider::new()
-            .probe(
-                profile.cpu(),
-                cpu_engine_requirements(
-                    nixe_cpu::location::ExecutionState::A64,
-                    false,
-                    profile.scheduler().vcpus().len(),
-                ),
-            )
-            .available;
-        assert_eq!(
-            primary.id,
-            if jit_available {
-                JIT_ENGINE_ID
-            } else {
-                INTERPRETER_ENGINE_ID
-            }
-        );
-        assert_eq!(
-            auto.fallback.is_some(),
-            primary.capabilities.interpret_one_fallback
-        );
-
-        let explicit_jit = select_cpu_engines(
-            CpuConfig {
-                engine: CpuEngineSelection::Jit,
-                ..CpuConfig::default()
-            },
-            profile.cpu(),
-            nixe_cpu::location::ExecutionState::A64,
-            profile.scheduler().vcpus().len(),
-            "test-title",
-        );
-        match explicit_jit {
-            Ok(selection) => {
-                assert_eq!(selection.primary.descriptor().id, JIT_ENGINE_ID);
-                assert!(selection.fallback.is_none());
-            }
-            Err(error) => assert!(error.contains("cranelift-jit"), "{error}"),
-        }
+        let jit = select_cpu_backend(CpuConfig::default(), "test-title").unwrap();
+        assert!(matches!(jit, CpuBackendConfig::Jit(_)));
     }
 }
 
@@ -1036,9 +914,6 @@ fn execution_stop_error(
         } => format!(
             "CPU instruction semantics are not implemented: source=[{source}] encoding={encoding} instruction={disassembly} coverage={coverage_id}"
         ),
-        ExecutionStop::ProfileDisabled { error } => {
-            format!("CPU instruction is disabled by the selected CPU profile: {error}")
-        }
         ExecutionStop::UnallocatedEncoding { error } => {
             format!("guest executed an unallocated instruction encoding: {error}")
         }

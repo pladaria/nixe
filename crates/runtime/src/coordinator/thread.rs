@@ -321,7 +321,7 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    /// Applies a topology migration and consumes its executor-local effect at
+    /// Applies a topology migration and consumes its CPU-thread-local effect at
     /// the same coordinator boundary.
     pub fn migrate_thread(
         &mut self,
@@ -344,15 +344,18 @@ impl RuntimeCoordinator {
             ..
         } = decision
         {
-            let domain = self
+            let cpu_process = self
                 .processes
                 .get(&process)
                 .expect("scheduled thread has an owning process")
-                .engine_domain_id();
+                .cpu_process_id();
             self.workers
                 .clear_local_exclusive(
                     old_vcpu,
-                    super::worker::WorkerExecutorKey { process, domain },
+                    super::worker::WorkerCpuThreadKey {
+                        process,
+                        cpu_process,
+                    },
                 )
                 .map_err(CoordinatorError::Worker)?;
         }

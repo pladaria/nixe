@@ -12,7 +12,7 @@ use crate::{
     coverage::CoverageId,
     error::InstructionDiagnostic,
     location::{ExecutionState, InstructionEncoding, InstructionSize, LocationDescriptor},
-    profile::{GuestCpuProfile, InstructionFeature},
+    profile::InstructionFeature,
 };
 use std::sync::OnceLock;
 
@@ -106,8 +106,10 @@ const fn pattern(
 
 static PATTERNS_16_CELL: OnceLock<Box<[InstructionPattern]>> = OnceLock::new();
 static PATTERNS_32_CELL: OnceLock<Box<[InstructionPattern]>> = OnceLock::new();
-static TABLE_16: OnceLock<DecoderTable> = OnceLock::new();
-static TABLE_32: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_1_TABLE_16: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_1_TABLE_32: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_2_TABLE_16: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_2_TABLE_32: OnceLock<DecoderTable> = OnceLock::new();
 
 #[must_use]
 pub fn patterns_16() -> &'static [InstructionPattern] {
@@ -131,7 +133,7 @@ pub fn patterns_32() -> &'static [InstructionPattern] {
 }
 
 pub(crate) fn decode(
-    profile: &GuestCpuProfile,
+    decoder: crate::platform::PlatformDecoder,
     location: LocationDescriptor,
     encoding: InstructionEncoding,
 ) -> DecodeResult {
@@ -143,7 +145,7 @@ pub(crate) fn decode(
                     reason: "permanently undefined T32 encoding",
                 };
             }
-            table_16().decode(profile, location, encoding)
+            platform_table_16(decoder.platform()).decode(location, encoding)
         }
         InstructionSize::Bits32 => {
             if !crate::location::is_t32_32_bit_prefix((encoding.bits() >> 16) as u16) {
@@ -152,18 +154,38 @@ pub(crate) fn decode(
                     reason: "32-bit T32 encoding lacks a 32-bit prefix",
                 };
             }
-            table_32().decode(profile, location, encoding)
+            platform_table_32(decoder.platform()).decode(location, encoding)
         }
     }
 }
 
 #[must_use]
 pub fn table_16() -> &'static DecoderTable {
-    TABLE_16
-        .get_or_init(|| DecoderTable::compile(patterns_16()).expect("valid T32-16 decoder table"))
+    platform_table_16(crate::platform::TargetPlatform::Switch1)
 }
 #[must_use]
 pub fn table_32() -> &'static DecoderTable {
-    TABLE_32
-        .get_or_init(|| DecoderTable::compile(patterns_32()).expect("valid T32-32 decoder table"))
+    platform_table_32(crate::platform::TargetPlatform::Switch1)
+}
+
+fn platform_table_16(platform: crate::platform::TargetPlatform) -> &'static DecoderTable {
+    let cell = match platform {
+        crate::platform::TargetPlatform::Switch1 => &SWITCH_1_TABLE_16,
+        crate::platform::TargetPlatform::Switch2 => &SWITCH_2_TABLE_16,
+    };
+    cell.get_or_init(|| {
+        DecoderTable::compile_for_platform(patterns_16(), platform)
+            .expect("valid platform T32-16 decoder table")
+    })
+}
+
+fn platform_table_32(platform: crate::platform::TargetPlatform) -> &'static DecoderTable {
+    let cell = match platform {
+        crate::platform::TargetPlatform::Switch1 => &SWITCH_1_TABLE_32,
+        crate::platform::TargetPlatform::Switch2 => &SWITCH_2_TABLE_32,
+    };
+    cell.get_or_init(|| {
+        DecoderTable::compile_for_platform(patterns_32(), platform)
+            .expect("valid platform T32-32 decoder table")
+    })
 }
