@@ -1,11 +1,7 @@
 //! Normalized integer memory instructions.
 
+use super::pattern;
 use crate::decode::table::InstructionPattern;
-use crate::profile::InstructionFeature;
-
-use super::{NO_FEATURES, pattern};
-
-const LSE: &[InstructionFeature] = &[InstructionFeature::LargeSystemExtensions];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
@@ -15,9 +11,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0022,
         61,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "load-store-unsigned",
         0x3f00_0000,
@@ -25,9 +19,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0023,
         60,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "load-store-unscaled",
         0x3f20_0c00,
@@ -35,9 +27,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0024,
         120,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "load-store-post-index",
         0x3f20_0c00,
@@ -45,9 +35,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0025,
         119,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x3800_0401),
     pattern(
         "load-store-pre-index",
@@ -56,9 +44,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0026,
         118,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x3800_0c01),
     pattern(
         "load-store-register",
@@ -67,9 +53,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0027,
         117,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0xf861_6800),
     pattern(
         "load-store-pair",
@@ -78,9 +62,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0028,
         59,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "load-acquire",
         0x3fe0_fc00,
@@ -88,9 +70,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0029,
         147,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "store-release",
         0x3fe0_fc00,
@@ -98,9 +78,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002a,
         146,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "load-exclusive",
         0x3fe0_7c00,
@@ -108,9 +86,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002b,
         145,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "store-exclusive",
         0x3f20_7c00,
@@ -118,9 +94,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002c,
         144,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     // Armv8.1-A FEAT_LSE atomic memory operations. The generic RMW pattern is
     // narrowed to allocated operations by the architectural allocation pass.
     // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDADD--LDADDA--LDADDAL--LDADDL--Atomic-add-on-word-or-doubleword-in-memory-
@@ -131,9 +105,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002d,
         151,
         &[],
-        LSE,
     )
-    .lowered()
     .fixture32(0xb8e0_0041),
     // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/CAS--CASA--CASAL--CASL--Compare-and-swap-word-or-doubleword-in-memory-
     pattern(
@@ -143,9 +115,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002e,
         153,
         &[],
-        LSE,
     )
-    .lowered()
     .fixture32(0x88e0_fc41),
     // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/CASP--CASPA--CASPAL--CASPL--Compare-and-swap-pair-of-words-or-doublewords-in-memory-
     pattern(
@@ -155,9 +125,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_002f,
         152,
         &[],
-        LSE,
     )
-    .lowered()
     .fixture32(0x4860_fc82),
 ];
 

@@ -176,16 +176,11 @@ not normal entries in the process handle table.
 ## The command buffer and TLS
 
 For ordinary `SendSyncRequest`, the message occupies the IPC command buffer at
-the beginning of the thread-local region. The CPU's TLS register identifies
-that region:
+the beginning of the thread-local region. The A64 `TPIDR_EL0` register
+identifies that region.
 
-| CPU mode | Register used by Nixe |
-| --- | --- |
-| AArch64 | `TPIDR_EL0` |
-| AArch32 | `TPIDRURW` |
-
-Nixe allocates and maps TLS while building the process, initializes the
-appropriate register, and treats the first `0x100` bytes as the fixed IPC
+Nixe allocates and maps TLS while building the process, initializes that
+register, and treats the first `0x100` bytes as the fixed IPC
 command buffer. This is guest virtual memory. Neither the TLS address nor any
 address contained in a descriptor is a Rust pointer.
 

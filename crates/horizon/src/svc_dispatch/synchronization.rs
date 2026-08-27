@@ -486,13 +486,7 @@ impl HorizonSvcDispatcher {
         let mutex_address = read_register(context.thread().state(), 0);
         let key_address = read_register(context.thread().state(), 1) & !3;
         let tag = read_register(context.thread().state(), 2) as u32;
-        let timeout = match context.thread().state() {
-            ThreadCpuState::A64(_) => read_register(context.thread().state(), 3) as i64,
-            ThreadCpuState::A32(_) => {
-                (read_register(context.thread().state(), 3)
-                    | (read_register(context.thread().state(), 4) << 32)) as i64
-            }
-        };
+        let timeout = read_register(context.thread().state(), 3) as i64;
         if !mutex_address.is_multiple_of(4) {
             result(context, HorizonKernelResult::INVALID_ADDRESS);
             return resume();

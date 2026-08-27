@@ -138,9 +138,8 @@ for the CPU/GPU relationship.
 
 ### Width is process metadata
 
-The NPDM process metadata selects an address-space type independently of
-whether the program executes AArch64 or AArch32 instructions. Public Horizon
-types distinguish:
+The NPDM process metadata selects an address-space type independently of the
+fixed A64 instruction set. Public Horizon types distinguish:
 
 | Process address-space type | Virtual limit used by Nixe |
 | -------------------------- | -------------------------- |
@@ -918,40 +917,15 @@ window-system, or concrete host-backend dependencies to make that test pass.
 
 ### InstructionMemory
 
-`InstructionMemory` is the read-only frontend used by decode and translation.
+`InstructionMemory` is the read-only frontend used by decode and compilation.
 It provides:
 
 - the code-page span containing an address;
-- aligned 16-bit T32 fetches;
-- aligned 32-bit A64/A32 fetches; and
-- 32-bit T32 assembly from two halfword fetches.
+- aligned 32-bit A64 fetches.
 
 Every fetch returns canonical little-endian instruction bits plus
 `CodeDependencies`. A dependency contains the physical page ID, content
 generation, and mapping generation observed while reading.
-
-For a T32 instruction crossing a page:
-
-```text
-fetch first halfword
-        │
-        ▼
-record first physical dependency
-        │
-        ▼
-checked address + 2
-        │
-        ▼
-fetch second halfword
-        │
-        ▼
-record or merge second dependency
-        │
-        ▼
-assemble canonical T32 encoding
-```
-
-The second halfword can fault independently at its exact address.
 
 ### CpuMemory
 
@@ -1173,7 +1147,7 @@ accesses, because a resolved virtual entry already carries its slot.
 
 ### The instruction-fetch path
 
-The normal A64/A32 `fetch32` path is:
+The A64 `fetch32` path is:
 
 ```text
 check 4-byte alignment
@@ -1206,9 +1180,8 @@ read four little-endian bytes
 return bits + physical ID + content and mapping generations
 ```
 
-Aligned 2-byte and 4-byte fetches cannot cross a 4 KiB page because both widths
-divide the page size. Cross-page T32 is handled by the two-fetch default
-described earlier.
+An aligned four-byte fetch cannot cross a 4 KiB page because its width divides
+the page size.
 
 MMIO is never executable in the current model. An executable mapping that
 resolves to an MMIO page produces a typed fetch fault.

@@ -7,7 +7,7 @@ use nixe_memory::{
     GuestVirtualAddress, MappingGeneration,
 };
 
-use crate::error::{InstructionFetchFault, InstructionFetchFaultReason};
+use crate::error::InstructionFetchFault;
 
 pub use nixe_memory::MemoryPermissions;
 
@@ -207,44 +207,12 @@ pub trait InstructionMemory: Send + Sync {
         address: GuestVirtualAddress,
     ) -> Result<CodePageSpan, InstructionFetchFault>;
 
-    /// Fetches a 16-bit T32 halfword at a two-byte-aligned address.
-    fn fetch16(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u16>, InstructionFetchFault>;
-
-    /// Fetches one A64 or A32 word at a four-byte-aligned address.
+    /// Fetches one A64 word at a four-byte-aligned address.
     fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Result<FetchedCode<u32>, InstructionFetchFault>;
-
-    /// Fetches a 32-bit T32 encoding as two architectural halfwords.
-    ///
-    /// The first halfword occupies bits 31:16 of the canonical encoding. This
-    /// default deliberately performs two fetches so a page-boundary instruction
-    /// records both dependencies and faults precisely on its second halfword.
-    fn fetch_t32_32(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        let first = self.fetch16(address_space, address)?;
-        let second_address = address.checked_add(2).ok_or_else(|| {
-            InstructionFetchFault::new(
-                address_space,
-                address,
-                InstructionFetchFaultReason::AddressOverflow,
-            )
-        })?;
-        let second = self.fetch16(address_space, second_address)?;
-        Ok(FetchedCode {
-            bits: (u32::from(first.bits) << 16) | u32::from(second.bits),
-            dependencies: first.dependencies.merge(second.dependencies),
-        })
-    }
 }
 
 /// Width of one architectural data access.

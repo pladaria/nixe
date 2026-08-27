@@ -1,6 +1,6 @@
 //! Architectural condition flags and condition-code evaluation.
 
-/// All Arm condition encodings, shared by A64 and AArch32 consumers.
+/// All A64 condition encodings.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Condition {
     Eq,
@@ -65,16 +65,6 @@ impl Nzcv {
     /// Extracts A64 PSTATE.NZCV from its architectural packed representation.
     #[must_use]
     pub const fn from_a64_nzcv(value: u32) -> Self {
-        Self::from_packed(value)
-    }
-
-    /// Extracts the AArch32 CPSR condition flags without interpreting other bits.
-    #[must_use]
-    pub const fn from_a32_cpsr(value: u32) -> Self {
-        Self::from_packed(value)
-    }
-
-    const fn from_packed(value: u32) -> Self {
         Self {
             negative: value & (1 << 31) != 0,
             zero: value & (1 << 30) != 0,
@@ -127,21 +117,6 @@ pub const fn evaluate_a64(condition: Condition, nzcv: u32) -> bool {
     if inverted(condition) { !result } else { result }
 }
 
-/// Evaluates the ordinary AArch32 condition space.
-///
-/// Encoding `0b1111` (`NV`) belongs to AArch32's unconditional instruction
-/// space and must be classified by the decoder, not passed as a normal
-/// condition. Returning false here prevents accidental conditional execution.
-#[must_use]
-pub const fn evaluate_a32(condition: Condition, cpsr: u32) -> bool {
-    if matches!(condition, Condition::Nv) {
-        return false;
-    }
-    let flags = Nzcv::from_a32_cpsr(cpsr);
-    let result = base_condition(flags, condition);
-    if inverted(condition) { !result } else { result }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,12 +146,9 @@ mod tests {
             let packed = packed_nibble << 28;
             for pair in CONDITIONS[..14].chunks_exact(2) {
                 assert_ne!(evaluate_a64(pair[0], packed), evaluate_a64(pair[1], packed));
-                assert_ne!(evaluate_a32(pair[0], packed), evaluate_a32(pair[1], packed));
             }
             assert!(evaluate_a64(Condition::Al, packed));
             assert!(evaluate_a64(Condition::Nv, packed));
-            assert!(evaluate_a32(Condition::Al, packed));
-            assert!(!evaluate_a32(Condition::Nv, packed));
         }
     }
 
@@ -184,7 +156,7 @@ mod tests {
     fn nzcv_round_trips_without_other_status_bits() {
         for nibble in 0_u32..16 {
             assert_eq!(
-                Nzcv::from_a32_cpsr((nibble << 28) | 0xffff).packed(),
+                Nzcv::from_a64_nzcv((nibble << 28) | 0xffff).packed(),
                 nibble << 28
             );
         }

@@ -4,7 +4,7 @@ mod support;
 use std::fs;
 
 use nixe_cpu::memory::MemoryMappingPurpose;
-use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
+use nixe_cpu::state::a64::A64Register;
 use nixe_horizon::{
     DirectoryEntryKind, HorizonProcess, IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
@@ -328,9 +328,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         )
         .unwrap();
     assert_eq!(entry_mapping.purpose, MemoryMappingPurpose::CodeStatic);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        panic!("synthetic packaged program must initialize AArch64 state");
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(x(0))), 0);
     assert_eq!(
         state.read_x(A64Register::General(x(1))),

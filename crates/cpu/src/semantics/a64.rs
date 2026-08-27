@@ -2,7 +2,7 @@
 
 use crate::{
     memory::{BarrierAccess, BarrierDomain, BarrierOperation, MemoryAccessSize},
-    profile::{CapabilityStatus, GuestCpuProfile, ProfileValue},
+    platform::TargetPlatform,
     semantics::shifts::ShiftKind,
 };
 
@@ -45,7 +45,7 @@ pub enum RuntimeRegisterRead {
 /// Resolves the profile-dependent part of an A64 userspace system-register read.
 #[must_use]
 pub const fn runtime_register_read(
-    profile: GuestCpuProfile,
+    platform: TargetPlatform,
     system_key: u32,
 ) -> Option<RuntimeRegisterRead> {
     match system_key {
@@ -57,17 +57,11 @@ pub const fn runtime_register_read(
         // profile rather than the host cache implementation.
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DCZID-EL0--Data-Cache-Zero-ID-Register
         0xd53b_00e0 => {
-            let cache = profile.cache_maintenance();
-            let ProfileValue::Known(bytes) = cache.data_zero_block_bytes else {
-                return None;
-            };
-            if bytes < 4 || !bytes.is_power_of_two() {
-                return None;
-            }
-            let prohibited = match cache.user_cache_maintenance {
-                CapabilityStatus::Enabled => 0,
-                CapabilityStatus::Disabled => 1 << 4,
-                CapabilityStatus::Unknown => return None,
+            let bytes = platform.data_zero_block_bytes();
+            let prohibited = if platform.user_cache_maintenance_prohibited() {
+                1 << 4
+            } else {
+                0
             };
             Some(RuntimeRegisterRead::Constant(
                 prohibited | (bytes.trailing_zeros() - 2) as u64,

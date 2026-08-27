@@ -1,4 +1,4 @@
-//! A64 logical-immediate and AArch32 modified-immediate expansion.
+//! A64 logical-immediate expansion.
 
 use core::fmt;
 
@@ -9,7 +9,6 @@ pub enum ImmediateError {
     FieldOutOfRange,
     InvalidDataSize(u8),
     ReservedEncoding,
-    UnpredictableEncoding,
 }
 
 impl fmt::Display for ImmediateError {
@@ -23,9 +22,6 @@ impl fmt::Display for ImmediateError {
                 "logical immediate data size {size} is not 32 or 64"
             ),
             Self::ReservedEncoding => formatter.write_str("reserved immediate encoding"),
-            Self::UnpredictableEncoding => {
-                formatter.write_str("architecturally unpredictable immediate encoding")
-            }
         }
     }
 }
@@ -102,54 +98,6 @@ pub fn decode_a64_logical_immediate(
     Ok(decode_a64_bit_masks(imm_n, imm_r, imm_s, data_size, true)?.write_mask)
 }
 
-/// Expands the A32 rotated eight-bit immediate and returns its shifter carry.
-pub fn expand_a32_modified_immediate(
-    immediate: u16,
-    carry_in: bool,
-) -> Result<(u32, bool), ImmediateError> {
-    if immediate >= 1 << 12 {
-        return Err(ImmediateError::FieldOutOfRange);
-    }
-    let rotation = u32::from((immediate >> 8) * 2);
-    let unrotated = u32::from(immediate & 0xff);
-    if rotation == 0 {
-        Ok((unrotated, carry_in))
-    } else {
-        let value = unrotated.rotate_right(rotation);
-        Ok((value, value >> 31 != 0))
-    }
-}
-
-/// Implements Thumb `ThumbExpandImm_C` for the 12-bit `i:imm3:imm8` field.
-pub fn expand_t32_modified_immediate(
-    immediate: u16,
-    carry_in: bool,
-) -> Result<(u32, bool), ImmediateError> {
-    if immediate >= 1 << 12 {
-        return Err(ImmediateError::FieldOutOfRange);
-    }
-    let imm8 = u32::from(immediate & 0xff);
-    if immediate >> 10 == 0 {
-        let mode = (immediate >> 8) & 0b11;
-        if mode != 0 && imm8 == 0 {
-            return Err(ImmediateError::UnpredictableEncoding);
-        }
-        let value = match mode {
-            0 => imm8,
-            1 => (imm8 << 16) | imm8,
-            2 => (imm8 << 24) | (imm8 << 8),
-            3 => imm8 * 0x0101_0101,
-            _ => unreachable!(),
-        };
-        Ok((value, carry_in))
-    } else {
-        let unrotated = 0x80 | u32::from(immediate & 0x7f);
-        let rotation = u32::from((immediate >> 7) & 0x1f);
-        let value = unrotated.rotate_right(rotation);
-        Ok((value, value >> 31 != 0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -185,47 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn a32_rotation_preserves_carry_only_when_unrotated() {
-        assert_eq!(expand_a32_modified_immediate(0x0ab, true), Ok((0xab, true)));
-        assert_eq!(
-            expand_a32_modified_immediate(0x480, false),
-            Ok((0x8000_0000, true))
-        );
-    }
-
-    #[test]
-    fn thumb_replication_and_rotation_rules_are_explicit() {
-        assert_eq!(
-            expand_t32_modified_immediate(0x112, false),
-            Ok((0x0012_0012, false))
-        );
-        assert_eq!(
-            expand_t32_modified_immediate(0x212, true),
-            Ok((0x1200_1200, true))
-        );
-        assert_eq!(
-            expand_t32_modified_immediate(0x312, false),
-            Ok((0x1212_1212, false))
-        );
-        assert_eq!(
-            expand_t32_modified_immediate(0x100, false),
-            Err(ImmediateError::UnpredictableEncoding)
-        );
-        assert_eq!(
-            expand_t32_modified_immediate(0x400, false),
-            Ok((0x8000_0000, true))
-        );
-    }
-
-    #[test]
     fn immediate_encoding_spaces_are_exhaustively_classified() {
-        for immediate in 0..1 << 12 {
-            assert!(expand_a32_modified_immediate(immediate, false).is_ok());
-            let thumb = expand_t32_modified_immediate(immediate, false);
-            let unpredictable = matches!(immediate, 0x100 | 0x200 | 0x300);
-            assert_eq!(thumb.is_err(), unpredictable, "immediate={immediate:#05x}");
-        }
-
         for data_size in [32_u8, 64] {
             let width = BitWidth::new(data_size).unwrap();
             let mut generated = BTreeSet::new();

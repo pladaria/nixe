@@ -178,8 +178,8 @@ impl A64State {
     /// runtime diagnostics. SIMD and thread-pointer state are intentionally
     /// excluded from the compact context.
     #[must_use]
-    pub fn register_context(&self) -> super::A64RegisterContext {
-        super::A64RegisterContext {
+    pub fn register_context(&self) -> super::RegisterContext {
+        super::RegisterContext {
             x: self.x,
             sp: self.sp,
             pc: nixe_memory::GuestVirtualAddress::new(self.pc),

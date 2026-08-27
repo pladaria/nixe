@@ -1,13 +1,13 @@
 use nixe_cpu::execution::{
-    ArchitecturalTimer, CpuExit, CpuProcessId, CpuThreadId, MemoryBinding, RunRequest,
-    TimerSnapshot, VcpuEventState,
+    ArchitecturalTimer, CpuExit, CpuThreadId, MemoryBinding, RunRequest, TimerSnapshot,
+    VcpuEventState,
 };
 use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_cpu::state::{ThreadCpuState, a64::A64State};
-use nixe_cpu_interpreter::InterpreterProcess;
-use nixe_cpu_jit::{JitConfiguration, JitProcess};
+use nixe_cpu::state::a64::A64State;
+use nixe_cpu_interpreter::{InterpreterProcess, InterpreterRunRequest};
+use nixe_cpu_jit::{JitProcess, JitThread};
 use nixe_memory::{
     AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationSource,
 };
@@ -32,7 +32,17 @@ fn concrete_interpreter_and_jit_match_on_a_bounded_synthetic_process() {
     let mut memory = ExecutionMemory::new();
     let page = GuestPhysicalPageId::new(1);
     assert!(memory.add_ram_page(page));
-    assert!(memory.initialize_ram(page, 0, &0xd503_201f_u32.to_le_bytes()));
+    let code = [0xd503_201f_u32, 0x1400_0000];
+    assert!(
+        memory.initialize_ram(
+            page,
+            0,
+            &code
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        )
+    );
     assert!(memory.map_page(SPACE, CODE, page, MemoryPermissions::READ_EXECUTE));
     let binding = MemoryBinding {
         address_space: SPACE,
@@ -47,18 +57,16 @@ fn concrete_interpreter_and_jit_match_on_a_bounded_synthetic_process() {
     let mut interpreter = interpreter_process
         .create_thread(CpuThreadId::new(1))
         .unwrap();
-    let mut jit_process =
-        JitProcess::new(CpuProcessId::new(2), cpu, JitConfiguration::default()).unwrap();
-    jit_process.bind_memory(binding).unwrap();
-    let mut jit = jit_process.create_thread(CpuThreadId::new(2)).unwrap();
+    let jit_process = JitProcess::new(cpu).unwrap();
+    let mut jit = JitThread::new();
 
-    let mut interpreter_state = state();
+    let mut interpreter_state = a64_state();
     let mut jit_state = state();
     let interpreter_report = interpreter
-        .run_slice(request(cpu, &memory, &mut interpreter_state))
+        .run_slice(interpreter_request(&memory, &mut interpreter_state))
         .unwrap();
     let jit_report = jit
-        .run_slice(request(cpu, &memory, &mut jit_state))
+        .run_slice(&jit_process, request(cpu, &memory, &mut jit_state))
         .unwrap();
 
     assert_eq!(interpreter_state, jit_state);
@@ -68,19 +76,37 @@ fn concrete_interpreter_and_jit_match_on_a_bounded_synthetic_process() {
     assert_eq!(jit_report.stop, CpuExit::BudgetExhausted);
 
     drop(jit);
-    jit_process.shutdown().unwrap();
+    jit_process.shutdown();
 }
 
-fn state() -> ThreadCpuState {
+fn state() -> A64State {
+    a64_state()
+}
+
+fn a64_state() -> A64State {
     let mut state = A64State::default();
     state.set_pc(CODE.get());
-    ThreadCpuState::A64(Box::new(state))
+    state
+}
+
+fn interpreter_request<'a>(
+    memory: &'a ExecutionMemory,
+    state: &'a mut A64State,
+) -> InterpreterRunRequest<'a> {
+    InterpreterRunRequest {
+        memory,
+        state,
+        instruction_budget: 1,
+        loader_return: None,
+        timer: &FixedTimer,
+        events: VcpuEventState::default(),
+    }
 }
 
 fn request<'a>(
     cpu: ProcessCpuContext,
     memory: &'a ExecutionMemory,
-    state: &'a mut ThreadCpuState,
+    state: &'a mut A64State,
 ) -> RunRequest<'a> {
     RunRequest {
         cpu,

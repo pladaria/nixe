@@ -202,7 +202,7 @@ mod tests {
             id: GuestThreadId::new(id),
             object: ThreadObject::new(id),
             exit: None,
-            state: Some(ThreadCpuState::A64(Box::default())),
+            state: Some(ThreadCpuState::default()),
             handle: 0,
             stack_bottom: GuestVirtualAddress::new(0),
             stack_top: GuestVirtualAddress::new(0),

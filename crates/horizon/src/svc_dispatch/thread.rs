@@ -7,16 +7,12 @@ impl HorizonSvcDispatcher {
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         // ABI layout and processor-id rules:
         // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#CreateThread
-        let (priority_register, core_register) = match context.thread().state() {
-            ThreadCpuState::A64(_) => (4, 5),
-            ThreadCpuState::A32(_) => (0, 4),
-        };
         let request = PendingRuntimeRequest::CreateThread {
             entry: GuestVirtualAddress::new(read_register(context.thread().state(), 1)),
             argument: read_register(context.thread().state(), 2),
             stack_top: GuestVirtualAddress::new(read_register(context.thread().state(), 3)),
-            priority: read_register(context.thread().state(), priority_register) as u32 as i32,
-            core_id: read_register(context.thread().state(), core_register) as u32 as i32,
+            priority: read_register(context.thread().state(), 4) as u32 as i32,
+            core_id: read_register(context.thread().state(), 5) as u32 as i32,
         };
         self.suspend_for_runtime_request(context.thread().id(), request, "CreateThread")
     }
@@ -106,13 +102,7 @@ impl HorizonSvcDispatcher {
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
         let ideal_core = read_register(context.thread().state(), 1) as u32 as i32;
-        let affinity_mask = match context.thread().state() {
-            ThreadCpuState::A64(_) => read_register(context.thread().state(), 2),
-            ThreadCpuState::A32(_) => {
-                read_register(context.thread().state(), 2)
-                    | (read_register(context.thread().state(), 3) << 32)
-            }
-        };
+        let affinity_mask = read_register(context.thread().state(), 2);
         self.stage_thread_object_request(context, handle, "SetThreadCoreMask", |object_id| {
             PendingRuntimeRequest::SetThreadCoreMask {
                 object_id,
@@ -127,13 +117,7 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#SleepThread
-        let nanoseconds = match context.thread().state() {
-            ThreadCpuState::A64(_) => read_register(context.thread().state(), 0) as i64,
-            ThreadCpuState::A32(_) => {
-                (read_register(context.thread().state(), 0)
-                    | (read_register(context.thread().state(), 1) << 32)) as i64
-            }
-        };
+        let nanoseconds = read_register(context.thread().state(), 0) as i64;
         self.suspend_for_runtime_request(
             context.thread().id(),
             PendingRuntimeRequest::SleepThread { nanoseconds },
@@ -163,12 +147,9 @@ impl HorizonSvcDispatcher {
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        // Architecture-specific ThreadContext layouts and sizes:
+        // Horizon A64 ThreadContext layout and size:
         // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/svc/svc_types_common.hpp#L260-L292
-        let context_size = match context.thread().state() {
-            ThreadCpuState::A64(_) => 0x320,
-            ThreadCpuState::A32(_) => 0x158,
-        };
+        let context_size = 0x320;
         let address = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
         let handle = read_register(context.thread().state(), 1) as u32;
         let end = address.get().checked_add(context_size);

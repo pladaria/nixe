@@ -8,9 +8,9 @@ mod layout;
 mod thread;
 
 pub use builder::ProcessBuilder;
-use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
 #[cfg(test)]
-use builder::{a32_register, a64_register, initialize_thread, validate_range};
+use builder::a64_register;
+use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
 pub use execution::{
     CpuBackendConfig, ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExit,
     ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
@@ -28,8 +28,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use nixe_cpu::ir::print::{IrPrintOptions, print_region};
-use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
     CpuMemory, ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError,
     MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, ProcessMemory,
@@ -37,10 +36,7 @@ use nixe_cpu::memory::{
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_cpu::state::{ThreadCpuState, a32::A32GeneralRegister, a64::A64Register};
-use nixe_cpu::translate::{
-    RegionTranslationConfig, RegionTranslationReport, translate_region_report,
-};
+use nixe_cpu::state::{ThreadCpuState, a64::A64Register};
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
@@ -246,17 +242,8 @@ impl RunnableProcess {
         &self,
         request: &ThreadCreateRequest,
     ) -> Result<(), ThreadCreateError> {
-        let execution_state = match self.main_thread().state() {
-            ThreadCpuState::A64(_) => ExecutionState::A64,
-            ThreadCpuState::A32(state) => state.execution_state(),
-        };
-        let entry_alignment = if execution_state == ExecutionState::T32 {
-            2
-        } else {
-            4
-        };
         if request.entry.get() >= self.address_space.exclusive_limit()
-            || !request.entry.get().is_multiple_of(entry_alignment)
+            || !request.entry.get().is_multiple_of(4)
         {
             return Err(ThreadCreateError::InvalidEntry);
         }
@@ -269,16 +256,11 @@ impl RunnableProcess {
         }) {
             return Err(ThreadCreateError::InvalidEntry);
         }
-        let stack_alignment = if execution_state == ExecutionState::A64 {
-            16
-        } else {
-            8
-        };
         let Some(stack_byte) = request.stack_top.get().checked_sub(1) else {
             return Err(ThreadCreateError::InvalidStack);
         };
         if request.stack_top.get() > self.address_space.exclusive_limit()
-            || !request.stack_top.get().is_multiple_of(stack_alignment)
+            || !request.stack_top.get().is_multiple_of(16)
         {
             return Err(ThreadCreateError::InvalidStack);
         }
@@ -365,12 +347,7 @@ impl RunnableProcess {
                 return Err(ThreadCreateError::ResourceLimit);
             }
         };
-        let execution_state = match self.main_thread().state() {
-            ThreadCpuState::A64(_) => ExecutionState::A64,
-            ThreadCpuState::A32(state) => state.execution_state(),
-        };
-        let configuration = self.cpu.thread_configuration(execution_state);
-        let mut state = ThreadCpuState::new(configuration);
+        let mut state = ThreadCpuState::default();
         if initialize_created_thread(&mut state, request, tls_base).is_err() {
             let _ = self.handles.close(handle);
             self.rollback_thread_tls(tls_base);
@@ -570,43 +547,6 @@ impl RunnableProcess {
     pub(crate) fn request_execution_safepoint(&self) {
         self.execution.request_safepoint();
     }
-
-    /// Translates the entry region with source disassembly and a structured
-    /// failure report. This path is opt-in and never runs during normal build.
-    #[must_use]
-    fn translate_entry_report(&self) -> RegionTranslationReport {
-        translate_region_report(
-            RegionTranslationConfig::default(),
-            &self.cpu.profile(),
-            self.cpu.address_space_id(),
-            self.entry_location(),
-            self.memory.as_ref(),
-        )
-    }
-
-    /// Produces the deterministic verified-IR dump used by the first integration milestone.
-    pub fn print_entry_ir(&self) -> Result<String, ProcessBuildError> {
-        let region = self
-            .translate_entry_report()
-            .into_result()
-            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EntryTranslation, error))?;
-        Ok(print_region(&region, IrPrintOptions::default()))
-    }
-
-    /// Produces the compact source, dependency, end-reason, and IR report used
-    /// for entry-point bring-up without attaching a native debugger.
-    #[must_use]
-    pub fn print_entry_report(&self) -> String {
-        self.translate_entry_report().print()
-    }
-
-    fn entry_location(&self) -> LocationDescriptor {
-        LocationDescriptor::new(
-            GuestVirtualAddress::new(self.entry_module().entry_address()),
-            self.main_thread().state().execution_state(),
-            self.cpu.profile().id(),
-        )
-    }
 }
 
 fn supervisor_call_continuation(
@@ -617,19 +557,11 @@ fn supervisor_call_continuation(
         ExceptionResume::Retry => Ok(source),
         ExceptionResume::At(target) => Ok(target),
         ExceptionResume::Next => {
-            let width = match source.execution_state {
-                ExecutionState::A64 | ExecutionState::A32 => 4,
-                ExecutionState::T32 => 2,
-            };
             let pc = source
                 .pc
-                .checked_add(width)
+                .checked_add(4)
                 .ok_or(ExceptionRouteError::ContinuationAddressOverflow { source })?;
-            Ok(LocationDescriptor::new(
-                pc,
-                source.execution_state,
-                source.profile_id,
-            ))
+            Ok(LocationDescriptor::new(pc, source.profile_id))
         }
     }
 }
@@ -639,8 +571,7 @@ fn install_continuation(
     state: &mut ThreadCpuState,
     target: LocationDescriptor,
 ) -> Result<(), ExceptionRouteError> {
-    let current = state.execution_state();
-    let expected_profile = cpu.profile().id();
+    let expected_profile = cpu.profile_id();
     if target.profile_id != expected_profile {
         return Err(ExceptionRouteError::ContinuationProfileMismatch {
             source: execution::current_location(cpu, state),
@@ -650,29 +581,7 @@ fn install_continuation(
     if !target.is_aligned() {
         return Err(ExceptionRouteError::InvalidContinuationTarget { target });
     }
-    match state {
-        ThreadCpuState::A64(state) if target.execution_state == ExecutionState::A64 => {
-            state.set_pc(target.pc.get());
-        }
-        ThreadCpuState::A32(state) if target.execution_state != ExecutionState::A64 => {
-            let pc = u32::try_from(target.pc.get())
-                .map_err(|_| ExceptionRouteError::InvalidContinuationTarget { target })?;
-            let cpsr = state
-                .cpsr()
-                .with_execution_state(target.execution_state)
-                .expect("AArch32 continuation state was already validated");
-            state.set_cpsr(cpsr);
-            state
-                .set_instruction_address(pc)
-                .map_err(|_| ExceptionRouteError::InvalidContinuationTarget { target })?;
-        }
-        ThreadCpuState::A64(_) | ThreadCpuState::A32(_) => {
-            return Err(ExceptionRouteError::IncompatibleContinuationState {
-                current,
-                target: target.execution_state,
-            });
-        }
-    }
+    state.set_pc(target.pc.get());
     Ok(())
 }
 
@@ -685,7 +594,6 @@ pub enum ProcessBuildStage {
     Preparation,
     Mapping,
     ThreadInitialization,
-    EntryTranslation,
 }
 
 /// Fail-closed process construction error.

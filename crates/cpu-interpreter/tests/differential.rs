@@ -1,14 +1,14 @@
 use std::cell::RefCell;
 
 use nixe_cpu::exclusive::ExclusiveMonitorState;
-use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, CpuThreadId, RunRequest, TimerSnapshot};
-use nixe_cpu::location::InstructionEncoding;
+use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, CpuThreadId, TimerSnapshot};
 use nixe_cpu::memory::{MemoryPermissions, SyntheticMemory};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_cpu::state::{ThreadCpuState, a64::A64State};
+use nixe_cpu::state::a64::A64State;
 use nixe_cpu_interpreter::{
-    InstructionStep, InterpreterContext, InterpreterProcess, execute_one_with_context,
+    InstructionStep, InterpreterContext, InterpreterProcess, InterpreterRunRequest,
+    execute_one_with_context,
 };
 use nixe_memory::GuestPhysicalPageId;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
@@ -37,7 +37,7 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
         let direct_outcome = execute_one_with_context(
             InterpreterContext::new(cpu, &memory, &monitor, &FixedTimer, &events),
             &mut direct,
-            InstructionEncoding::from_u32(encoding),
+            encoding,
         )
         .unwrap();
 
@@ -45,8 +45,7 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
         let mut process = InterpreterProcess::new(cpu);
         let mut thread = process.create_thread(CpuThreadId::new(1)).unwrap();
         let report = thread
-            .run_slice(RunRequest {
-                cpu,
+            .run_slice(InterpreterRunRequest {
                 memory: &memory,
                 state: &mut adapted,
                 instruction_budget: 1,
@@ -71,10 +70,10 @@ fn concrete_thread_matches_direct_single_step_state_counts_and_stops() {
     }
 }
 
-fn state() -> ThreadCpuState {
+fn state() -> A64State {
     let mut state = A64State::default();
     state.set_pc(CODE);
-    ThreadCpuState::A64(Box::new(state))
+    state
 }
 
 fn memory(encoding: u32) -> SyntheticMemory {

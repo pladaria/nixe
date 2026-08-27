@@ -68,7 +68,6 @@ impl ProcessBuilder {
             ));
         }
         let metadata = process_metadata(plan);
-        let execution_state = metadata.execution_state;
         let address_space = metadata.address_space;
         let stack_size = metadata.stack_size;
         let abi = metadata.abi;
@@ -77,7 +76,6 @@ impl ProcessBuilder {
             self.config.target_platform,
             self.config.address_space_id,
         );
-        let thread_configuration = cpu.thread_configuration(execution_state);
         let placements = module_placements(plan, self.config.image_base, address_space)?;
         let modules = prepare_modules(plan, &placements, address_space)?;
         let process_code_start = modules
@@ -215,7 +213,7 @@ impl ProcessBuilder {
         };
 
         let entry = GuestVirtualAddress::new(modules[entry_module].entry_address());
-        let mut state = ThreadCpuState::new(thread_configuration);
+        let mut state = ThreadCpuState::default();
         initialize_thread(
             &mut state,
             entry,
@@ -334,7 +332,6 @@ enum InitialProcessAbi {
 
 #[derive(Clone, Copy)]
 struct ProcessMetadata {
-    execution_state: ExecutionState,
     address_space: ProcessAddressSpace,
     stack_size: u64,
     abi: InitialProcessAbi,
@@ -356,7 +353,6 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
         LaunchKind::Packaged(identity) => {
             let npdm = identity.npdm();
             ProcessMetadata {
-                execution_state: plan.initial_execution_state(),
                 address_space: ProcessAddressSpace::from_npdm(npdm.flags().address_space()),
                 stack_size: u64::from(npdm.main_thread_stack_size()),
                 abi: InitialProcessAbi::Packaged,
@@ -375,7 +371,6 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
             }
         }
         LaunchKind::Homebrew(_) => ProcessMetadata {
-            execution_state: plan.initial_execution_state(),
             address_space: ProcessAddressSpace::Bit64,
             stack_size: DEFAULT_HOME_BREW_STACK_SIZE,
             abi: InitialProcessAbi::Homebrew,
@@ -572,58 +567,26 @@ pub(super) fn initialize_thread(
     abi_context: Option<GuestVirtualAddress>,
     loader_return: Option<GuestVirtualAddress>,
 ) -> Result<(), ProcessBuildError> {
-    match state {
-        ThreadCpuState::A64(state) => {
-            state.set_pc(entry.get());
-            state.write_x(A64Register::StackPointer, stack_top.get());
-            state.set_tpidr_el0(tls_base.get());
-            state.set_tpidrro_el0_from_runtime(tls_base.get());
-            state.write_x(
-                A64Register::General(a64_register(0)),
-                abi_context.map_or(0, GuestVirtualAddress::get),
-            );
-            state.write_x(
-                A64Register::General(a64_register(1)),
-                if abi_context.is_some() {
-                    u64::MAX
-                } else {
-                    u64::from(main_thread_handle)
-                },
-            );
-            state.write_x(
-                A64Register::General(a64_register(30)),
-                loader_return.map_or(0, GuestVirtualAddress::get),
-            );
-        }
-        ThreadCpuState::A32(state) => {
-            let entry = u32::try_from(entry.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 PC exceeds 32 bits",
-                )
-            })?;
-            let stack_top = u32::try_from(stack_top.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 SP exceeds 32 bits",
-                )
-            })?;
-            let tls_base = u32::try_from(tls_base.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 TLS exceeds 32 bits",
-                )
-            })?;
-            state.set_instruction_address(entry).map_err(|error| {
-                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
-            })?;
-            state.write_r(a32_register(13), stack_top);
-            state.set_tpidrurw(tls_base);
-            state.set_tpidruro_from_runtime(tls_base);
-            state.write_r(a32_register(0), 0);
-            state.write_r(a32_register(1), main_thread_handle);
-        }
-    }
+    state.set_pc(entry.get());
+    state.write_x(A64Register::StackPointer, stack_top.get());
+    state.set_tpidr_el0(tls_base.get());
+    state.set_tpidrro_el0_from_runtime(tls_base.get());
+    state.write_x(
+        A64Register::General(a64_register(0)),
+        abi_context.map_or(0, GuestVirtualAddress::get),
+    );
+    state.write_x(
+        A64Register::General(a64_register(1)),
+        if abi_context.is_some() {
+            u64::MAX
+        } else {
+            u64::from(main_thread_handle)
+        },
+    );
+    state.write_x(
+        A64Register::General(a64_register(30)),
+        loader_return.map_or(0, GuestVirtualAddress::get),
+    );
     Ok(())
 }
 
@@ -632,42 +595,11 @@ pub(super) fn initialize_created_thread(
     request: &ThreadCreateRequest,
     tls_base: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {
-    match state {
-        ThreadCpuState::A64(state) => {
-            state.set_pc(request.entry.get());
-            state.write_x(A64Register::StackPointer, request.stack_top.get());
-            state.set_tpidr_el0(tls_base.get());
-            state.set_tpidrro_el0_from_runtime(tls_base.get());
-            state.write_x(A64Register::General(a64_register(0)), request.argument);
-        }
-        ThreadCpuState::A32(state) => {
-            let entry = u32::try_from(request.entry.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 PC exceeds 32 bits",
-                )
-            })?;
-            let stack = u32::try_from(request.stack_top.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 SP exceeds 32 bits",
-                )
-            })?;
-            let tls = u32::try_from(tls_base.get()).map_err(|_| {
-                error(
-                    ProcessBuildStage::ThreadInitialization,
-                    "A32 TLS exceeds 32 bits",
-                )
-            })?;
-            state.set_instruction_address(entry).map_err(|error| {
-                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
-            })?;
-            state.write_r(a32_register(0), request.argument as u32);
-            state.write_r(a32_register(13), stack);
-            state.set_tpidrurw(tls);
-            state.set_tpidruro_from_runtime(tls);
-        }
-    }
+    state.set_pc(request.entry.get());
+    state.write_x(A64Register::StackPointer, request.stack_top.get());
+    state.set_tpidr_el0(tls_base.get());
+    state.set_tpidrro_el0_from_runtime(tls_base.get());
+    state.write_x(A64Register::General(a64_register(0)), request.argument);
     Ok(())
 }
 
@@ -697,10 +629,6 @@ pub(super) fn align_up(value: u64, alignment: u64) -> Result<u64, ProcessBuildEr
 
 pub(super) fn a64_register(index: u8) -> nixe_cpu::state::a64::A64GeneralRegister {
     nixe_cpu::state::a64::A64GeneralRegister::new(index).expect("valid ABI register")
-}
-
-pub(super) fn a32_register(index: u8) -> A32GeneralRegister {
-    A32GeneralRegister::new(index).expect("valid ABI register")
 }
 
 pub(super) fn error(stage: ProcessBuildStage, cause: impl Display) -> ProcessBuildError {

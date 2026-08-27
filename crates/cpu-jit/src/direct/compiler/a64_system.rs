@@ -117,36 +117,34 @@ impl CraneliftTranslator<'_, '_> {
             }
             0xd53b_d040 => self.load_state_u64(offset_of!(NativeContext, tpidr_el0))?,
             0xd53b_d060 => self.load_state_u64(offset_of!(NativeContext, tpidrro_el0))?,
-            system_key => {
-                match runtime_register_read(self.region.key.platform.profile(), system_key) {
-                    Some(RuntimeRegisterRead::Constant(value)) => {
-                        self.builder.ins().iconst(types::I64, value as i64)
-                    }
-                    Some(RuntimeRegisterRead::TimerFrequency) => {
-                        self.call_slow(
-                            slow::timer_frequency as *const () as usize,
-                            &[],
-                            source,
-                            flags,
-                        )?;
-                        self.slow_result(types::I64, offset_of!(NativeContext, slow_result_low))?
-                    }
-                    Some(RuntimeRegisterRead::TimerCounter) => {
-                        self.call_slow(
-                            slow::timer_counter as *const () as usize,
-                            &[],
-                            source,
-                            flags,
-                        )?;
-                        self.slow_result(types::I64, offset_of!(NativeContext, slow_result_low))?
-                    }
-                    None => {
-                        return Err(DirectJitError::unsupported(
-                            "unsupported A64 system-register read",
-                        ));
-                    }
+            system_key => match runtime_register_read(self.region.key.platform, system_key) {
+                Some(RuntimeRegisterRead::Constant(value)) => {
+                    self.builder.ins().iconst(types::I64, value as i64)
                 }
-            }
+                Some(RuntimeRegisterRead::TimerFrequency) => {
+                    self.call_slow(
+                        slow::timer_frequency as *const () as usize,
+                        &[],
+                        source,
+                        flags,
+                    )?;
+                    self.slow_result(types::I64, offset_of!(NativeContext, slow_result_low))?
+                }
+                Some(RuntimeRegisterRead::TimerCounter) => {
+                    self.call_slow(
+                        slow::timer_counter as *const () as usize,
+                        &[],
+                        source,
+                        flags,
+                    )?;
+                    self.slow_result(types::I64, offset_of!(NativeContext, slow_result_low))?
+                }
+                None => {
+                    return Err(DirectJitError::unsupported(
+                        "unsupported A64 system-register read",
+                    ));
+                }
+            },
         };
         self.write_integer(fields.rt, false, value)
     }

@@ -3,9 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use nixe_cpu::decode::a64::{A64Instruction, control};
 use nixe_cpu::decode::{self, DecodeResult, DecodedOpcode};
 use nixe_cpu::exception::ExceptionKind;
-use nixe_cpu::location::{
-    DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor,
-};
+use nixe_cpu::location::{DecodedInstruction, InstructionEncoding, LocationDescriptor};
 use nixe_cpu::memory::{CodePageDependency, InstructionMemory};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
@@ -19,7 +17,6 @@ pub(super) const DEFAULT_MAX_CODE_DEPENDENCIES: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RegionKey {
     pub(super) address_space: AddressSpaceId,
-    pub(super) execution_state: ExecutionState,
     pub(super) start: GuestVirtualAddress,
     pub(super) platform: nixe_cpu::platform::TargetPlatform,
 }
@@ -28,7 +25,6 @@ impl RegionKey {
     pub(super) const fn new(cpu: ProcessCpuContext, start: LocationDescriptor) -> Self {
         Self {
             address_space: cpu.address_space_id(),
-            execution_state: start.execution_state,
             start: start.pc,
             platform: cpu.platform(),
         }
@@ -64,6 +60,7 @@ pub(super) struct NativeRegion {
     pub(super) blocks: Box<[BasicBlockRecord]>,
     pub(super) dependencies: Box<[CodePageDependency]>,
     pub(super) external_exits: Box<[ExternalExitRecord]>,
+    #[cfg(test)]
     pub(super) instruction_count: usize,
 }
 
@@ -127,13 +124,6 @@ pub(super) fn discover_region(
             "direct JIT region limits must be non-zero",
         ));
     }
-    if start.execution_state != ExecutionState::A64 {
-        return Err(DirectJitError::unsupported(format!(
-            "direct JIT does not support {} regions",
-            start.execution_state
-        )));
-    }
-
     let key = RegionKey::new(cpu, start);
     let mut pending = VecDeque::from([start.pc]);
     let mut scheduled = HashSet::from([start.pc]);
@@ -145,8 +135,7 @@ pub(super) fn discover_region(
         if blocks.len() == limits.blocks || instruction_count == limits.instructions {
             break;
         }
-        let block_location =
-            LocationDescriptor::new(block_start, start.execution_state, cpu.profile().id());
+        let block_location = LocationDescriptor::new(block_start, cpu.profile_id());
         let mut pc = block_start;
         let mut instructions = Vec::new();
         let terminator = loop {
@@ -156,7 +145,7 @@ pub(super) fn discover_region(
             if pc != block_start && scheduled.contains(&pc) {
                 break BlockTerminator::Direct { target: pc };
             }
-            let location = LocationDescriptor::new(pc, start.execution_state, cpu.profile().id());
+            let location = LocationDescriptor::new(pc, cpu.profile_id());
             let (encoding, fetched_dependencies) = fetch(memory, key.address_space, location)?;
             for dependency in fetched_dependencies.iter() {
                 if !dependencies.contains(&dependency) {
@@ -195,10 +184,7 @@ pub(super) fn discover_region(
             let decoded = instructions
                 .last()
                 .expect("just pushed decoded instruction");
-            let next = GuestVirtualAddress::new(
-                pc.get()
-                    .wrapping_add(u64::from(decoded.encoding.size().bytes())),
-            );
+            let next = GuestVirtualAddress::new(pc.get().wrapping_add(4));
             match decode::a64::normalize(&decoded.instruction, decoded.encoding) {
                 A64Instruction::Control(control::Instruction::Nop(_))
                 | A64Instruction::Integer(_)
@@ -331,6 +317,7 @@ pub(super) fn discover_region(
         blocks: blocks.into_boxed_slice(),
         dependencies: dependencies.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),
+        #[cfg(test)]
         instruction_count,
     })
 }
@@ -351,38 +338,15 @@ fn fetch(
     address_space: AddressSpaceId,
     location: LocationDescriptor,
 ) -> Result<(InstructionEncoding, nixe_cpu::memory::CodeDependencies), DirectJitError> {
-    match location.execution_state {
-        ExecutionState::A64 | ExecutionState::A32 => {
-            memory.fetch32(address_space, location.pc).map(|fetched| {
-                (
-                    InstructionEncoding::from_u32(fetched.bits),
-                    fetched.dependencies,
-                )
-            })
-        }
-        ExecutionState::T32 => memory
-            .fetch16(address_space, location.pc)
-            .and_then(|first| {
-                if location.execution_state.instruction_size(first.bits)
-                    == nixe_cpu::location::InstructionSize::Bits16
-                {
-                    Ok((
-                        InstructionEncoding::from_u16(first.bits),
-                        first.dependencies,
-                    ))
-                } else {
-                    memory
-                        .fetch_t32_32(address_space, location.pc)
-                        .map(|fetched| {
-                            (
-                                InstructionEncoding::from_u32(fetched.bits),
-                                fetched.dependencies,
-                            )
-                        })
-                }
-            }),
-    }
-    .map_err(|fault| DirectJitError::invalid(format!("direct JIT fetch failed: {fault}")))
+    memory
+        .fetch32(address_space, location.pc)
+        .map(|fetched| {
+            (
+                InstructionEncoding::from_u32(fetched.bits),
+                fetched.dependencies,
+            )
+        })
+        .map_err(|fault| DirectJitError::invalid(format!("direct JIT fetch failed: {fault}")))
 }
 
 fn branch_target(

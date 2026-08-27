@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::{offset_of, size_of};
 
 use cranelift_codegen::ir::{
-    self, AbiParam, Block, InstBuilder, MemFlagsData, Signature, SourceLoc, UserFuncName,
+    self, AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, SourceLoc, UserFuncName,
     condcodes::IntCC, types,
 };
 use cranelift_codegen::isa::CallConv;
@@ -15,11 +15,17 @@ use nixe_cpu::location::DecodedInstruction;
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::GuestVirtualAddress;
 
+use super::lookup::{
+    DIRECT_LOOKUP_MASK, NATIVE_LOOKUP_HEAD_OFFSET, NATIVE_LOOKUP_NODE_ENTRY_OFFSET,
+    NATIVE_LOOKUP_NODE_NEXT_OFFSET, NATIVE_LOOKUP_NODE_PC_OFFSET, NativeLookupSlot, lookup_salt,
+};
 use super::region::{BlockTerminator, NativeRegion};
 use super::{
-    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_UNSUPPORTED,
-    NativeContext,
+    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_RECONCILE,
+    EXIT_UNSUPPORTED, NativeContext,
 };
+
+const GENERAL_REGISTER_COUNT: usize = 31;
 
 mod a64;
 mod a64_fp_simd;
@@ -30,9 +36,13 @@ pub(super) type NativeGateway = unsafe extern "C" fn(*mut NativeContext, usize);
 
 pub(super) struct CompiledRegion {
     pub(super) entry: usize,
+    #[cfg(test)]
     pub(super) native_bytes: usize,
+    #[cfg(test)]
     pub(super) clif_instructions: usize,
+    #[cfg(test)]
     pub(super) register_loads: usize,
+    #[cfg(test)]
     pub(super) register_stores: usize,
 }
 
@@ -42,6 +52,7 @@ pub(super) struct DirectCompiler {
     function_builder: FunctionBuilderContext,
     gateway: NativeGateway,
     next_function: u32,
+    native_bytes: usize,
 }
 
 impl DirectCompiler {
@@ -88,6 +99,7 @@ impl DirectCompiler {
             function_builder,
             gateway,
             next_function: 1,
+            native_bytes: 0,
         })
     }
 
@@ -127,6 +139,7 @@ impl DirectCompiler {
             )?
             .translate(self.module.target_config())?;
         }
+        #[cfg(test)]
         let clif_instructions = self
             .context
             .func
@@ -143,17 +156,27 @@ impl DirectCompiler {
             .expect("defined direct JIT function retains compiled code")
             .code_buffer()
             .len();
+        self.native_bytes = self.native_bytes.saturating_add(native_bytes);
         self.module.finalize_definitions().map_err(module_error)?;
         let entry = self.module.get_finalized_function(function).addr();
         self.module.clear_context(&mut self.context);
+        #[cfg(test)]
         let (accessed, dirty) = register_access(region);
         Ok(CompiledRegion {
             entry,
+            #[cfg(test)]
             native_bytes,
+            #[cfg(test)]
             clif_instructions,
-            register_loads: accessed.into_iter().filter(|accessed| *accessed).count(),
-            register_stores: dirty.into_iter().filter(|dirty| *dirty).count(),
+            #[cfg(test)]
+            register_loads: accessed.count(),
+            #[cfg(test)]
+            register_stores: dirty.count(),
         })
+    }
+
+    pub(super) const fn native_bytes(&self) -> usize {
+        self.native_bytes
     }
 }
 
@@ -266,13 +289,18 @@ struct CraneliftTranslator<'a, 'region> {
     nzcv: ir::Value,
     fpsr: ir::Value,
     budget: ir::Value,
+    loader_return: ir::Value,
     control_pending: ir::Value,
+    invalidation_signal: ir::Value,
+    process_pending: ir::Value,
     initial_flags: ir::Value,
     retired: Variable,
     packed_flags: Variable,
     fpsr_state: Variable,
-    registers: [Option<Variable>; 32],
-    dirty_registers: [bool; 32],
+    registers: [Option<Variable>; GENERAL_REGISTER_COUNT],
+    stack_pointer: Option<Variable>,
+    dirty_registers: [bool; GENERAL_REGISTER_COUNT],
+    dirty_stack_pointer: bool,
     vector_registers: [Option<Variable>; 32],
     dirty_vector_registers: [bool; 32],
     dirty_fpsr: bool,
@@ -314,6 +342,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         let retired = builder.declare_var(types::I64);
         let packed_flags = builder.declare_var(types::I32);
         let fpsr_state = builder.declare_var(types::I32);
+        let (_, dirty_registers) = register_access(region);
         Ok(Self {
             builder,
             region,
@@ -330,13 +359,18 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             nzcv: placeholder,
             fpsr: placeholder,
             budget: placeholder,
+            loader_return: placeholder,
             control_pending: placeholder,
+            invalidation_signal: placeholder,
+            process_pending: placeholder,
             initial_flags: placeholder,
             retired,
             packed_flags,
             fpsr_state,
-            registers: [None; 32],
-            dirty_registers: register_access(region).1,
+            registers: [None; GENERAL_REGISTER_COUNT],
+            stack_pointer: None,
+            dirty_registers: dirty_registers.x,
+            dirty_stack_pointer: dirty_registers.sp,
             vector_registers: [None; 32],
             dirty_vector_registers: vector_register_access(region).1,
             dirty_fpsr: fp_status_access(region).1,
@@ -357,8 +391,14 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.fpsr = self.load_context_pointer(offset_of!(NativeContext, fpsr))?;
         self.budget =
             self.load_context(types::I64, offset_of!(NativeContext, instruction_budget))?;
+        self.loader_return =
+            self.load_context(types::I64, offset_of!(NativeContext, loader_return))?;
         self.control_pending =
             self.load_context_pointer(offset_of!(NativeContext, control_pending))?;
+        self.invalidation_signal =
+            self.load_context_pointer(offset_of!(NativeContext, invalidation_signal))?;
+        self.process_pending =
+            self.load_context_pointer(offset_of!(NativeContext, process_pending))?;
         self.initial_flags = self
             .builder
             .ins()
@@ -376,26 +416,28 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.def_var(self.retired, initial_retired);
 
         let (accessed, _) = register_access(self.region);
-        for (index, accessed) in accessed.into_iter().enumerate() {
+        for (index, accessed) in accessed.x.into_iter().enumerate() {
             if !accessed {
                 continue;
             }
             let variable = self.builder.declare_var(types::I64);
-            let value = if index == 31 {
-                self.builder
-                    .ins()
-                    .load(types::I64, trusted_flags(), self.sp, 0)
-            } else {
-                self.builder.ins().load(
-                    types::I64,
-                    trusted_flags(),
-                    self.x,
-                    i32::try_from(index * size_of::<u64>())
-                        .expect("architectural GPR offset fits i32"),
-                )
-            };
+            let value = self.builder.ins().load(
+                types::I64,
+                trusted_flags(),
+                self.x,
+                i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
+            );
             self.builder.def_var(variable, value);
             self.registers[index] = Some(variable);
+        }
+        if accessed.sp {
+            let variable = self.builder.declare_var(types::I64);
+            let value = self
+                .builder
+                .ins()
+                .load(types::I64, trusted_flags(), self.sp, 0);
+            self.builder.def_var(variable, value);
+            self.stack_pointer = Some(variable);
         }
 
         let (accessed_vectors, _) = vector_register_access(self.region);
@@ -420,6 +462,8 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             self.flags_at_entry
                 .insert(start, LazyFlags::Canonical(self.initial_flags));
         }
+        let initial = LazyFlags::Canonical(self.initial_flags);
+        self.guard_reconciliation(start, &initial)?;
         let pending =
             self.builder
                 .ins()
@@ -431,7 +475,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             .ins()
             .brif(has_control, control_exit, &[], start_block, &[]);
         self.builder.switch_to_block(control_exit);
-        let initial = LazyFlags::Canonical(self.initial_flags);
         self.emit_exit(EXIT_CONTROL, 0, start, &initial)?;
 
         for block_index in 0..self.region.blocks.len() {
@@ -600,19 +643,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                     ));
                 };
                 let target = self.read_register(fields.rn, false)?;
-                let misaligned_bits = self.builder.ins().band_imm_u(target, 3);
-                let misaligned = self
-                    .builder
-                    .ins()
-                    .icmp_imm_s(IntCC::NotEqual, misaligned_bits, 0);
-                let alignment_exit = self.builder.create_block();
-                let aligned = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(misaligned, alignment_exit, &[], aligned, &[]);
-                self.builder.switch_to_block(alignment_exit);
-                self.emit_exit(EXIT_ARCHITECTURAL, 3 << 24, source, &flags)?;
-                self.builder.switch_to_block(aligned);
                 if fields.branch_register_key == 0xd63f_0000 {
                     let return_address = source.get().wrapping_add(4);
                     let value = self.builder.ins().iconst(types::I64, return_address as i64);
@@ -644,6 +674,7 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         if let Some(block) = self.blocks.get(&target).copied() {
             self.propagate_flags(target, flags)?;
             if target.get() <= source.get() {
+                self.guard_reconciliation(target, flags)?;
                 let pending =
                     self.builder
                         .ins()
@@ -686,6 +717,15 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             .ins()
             .atomic_load(types::I64, plain_flags(), cell);
         let linked = self.builder.ins().icmp_imm_s(IntCC::NotEqual, target, 0);
+        let target_pc_value = self
+            .builder
+            .ins()
+            .iconst(types::I64, target_pc.get() as i64);
+        let not_loader_return =
+            self.builder
+                .ins()
+                .icmp(IntCC::NotEqual, target_pc_value, self.loader_return);
+        let linked = self.builder.ins().band(linked, not_loader_return);
         let chain = self.builder.create_block();
         let miss = self.builder.create_block();
         self.builder.ins().brif(linked, chain, &[], miss, &[]);
@@ -711,6 +751,88 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.store_context(target, offset_of!(NativeContext, exit_pc))?;
         let retired = self.builder.use_var(self.retired);
         self.store_context(retired, offset_of!(NativeContext, retired))?;
+        let lookup = self.load_context_pointer(offset_of!(NativeContext, native_lookup))?;
+        let words = self.builder.ins().ushr_imm_u(target, 2);
+        let middle = self.builder.ins().ushr_imm_u(words, 16);
+        let high = self.builder.ins().ushr_imm_u(words, 32);
+        let index = self.builder.ins().bxor(words, middle);
+        let index = self.builder.ins().bxor(index, high);
+        let salt = self
+            .builder
+            .ins()
+            .iconst(types::I64, lookup_salt(self.region.key) as i64);
+        let index = self.builder.ins().bxor(index, salt);
+        let index = self
+            .builder
+            .ins()
+            .band_imm_u(index, DIRECT_LOOKUP_MASK as i64);
+        let slot_offset = self
+            .builder
+            .ins()
+            .imul_imm_u(index, size_of::<NativeLookupSlot>() as i64);
+        let slot = self.builder.ins().iadd(lookup, slot_offset);
+        let head_address = self.builder.ins().iadd_imm_s(
+            slot,
+            i64::try_from(NATIVE_LOOKUP_HEAD_OFFSET).expect("native lookup head offset fits i64"),
+        );
+        let head = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, plain_flags(), head_address);
+        let search = self.builder.create_block();
+        self.builder.append_block_param(search, types::I64);
+        let inspect = self.builder.create_block();
+        let chain = self.builder.create_block();
+        let miss = self.builder.create_block();
+        self.builder.ins().jump(search, &[BlockArg::from(head)]);
+        self.builder.switch_to_block(search);
+        let node = self.builder.block_params(search)[0];
+        let empty = self.builder.ins().icmp_imm_s(IntCC::Equal, node, 0);
+        self.builder.ins().brif(empty, miss, &[], inspect, &[]);
+        self.builder.switch_to_block(inspect);
+        let entry_address = self.builder.ins().iadd_imm_s(
+            node,
+            i64::try_from(NATIVE_LOOKUP_NODE_ENTRY_OFFSET)
+                .expect("native lookup node entry offset fits i64"),
+        );
+        let entry = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, plain_flags(), entry_address);
+        let published_pc = self.builder.ins().load(
+            types::I64,
+            trusted_flags(),
+            node,
+            i32::try_from(NATIVE_LOOKUP_NODE_PC_OFFSET)
+                .expect("native lookup node PC offset fits i32"),
+        );
+        let has_entry = self.builder.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+        let same_pc = self.builder.ins().icmp(IntCC::Equal, published_pc, target);
+        let linked = self.builder.ins().band(has_entry, same_pc);
+        let not_loader_return =
+            self.builder
+                .ins()
+                .icmp(IntCC::NotEqual, target, self.loader_return);
+        let linked = self.builder.ins().band(linked, not_loader_return);
+        let next = self.builder.create_block();
+        self.builder.ins().brif(linked, chain, &[], next, &[]);
+        self.builder.switch_to_block(next);
+        let next_node = self.builder.ins().load(
+            types::I64,
+            trusted_flags(),
+            node,
+            i32::try_from(NATIVE_LOOKUP_NODE_NEXT_OFFSET)
+                .expect("native lookup node next offset fits i32"),
+        );
+        self.builder
+            .ins()
+            .jump(search, &[BlockArg::from(next_node)]);
+        self.builder.switch_to_block(chain);
+        let signature = self.builder.import_signature(tail_signature());
+        self.builder
+            .ins()
+            .return_call_indirect(signature, entry, &[self.context]);
+        self.builder.switch_to_block(miss);
         let kind = self
             .builder
             .ins()
@@ -737,6 +859,33 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.ins().brif(exhausted, exit, &[], execute, &[]);
         self.builder.switch_to_block(exit);
         self.emit_exit(EXIT_BUDGET, 0, source, flags)?;
+        self.builder.switch_to_block(execute);
+        Ok(())
+    }
+
+    fn guard_reconciliation(
+        &mut self,
+        source: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        let current =
+            self.builder
+                .ins()
+                .atomic_load(types::I64, plain_flags(), self.invalidation_signal);
+        let observed =
+            self.load_context(types::I64, offset_of!(NativeContext, invalidation_cursor))?;
+        let invalidated = self.builder.ins().icmp(IntCC::NotEqual, current, observed);
+        let process =
+            self.builder
+                .ins()
+                .atomic_load(types::I32, plain_flags(), self.process_pending);
+        let shutting_down = self.builder.ins().icmp_imm_s(IntCC::NotEqual, process, 0);
+        let pending = self.builder.ins().bor(invalidated, shutting_down);
+        let exit = self.builder.create_block();
+        let execute = self.builder.create_block();
+        self.builder.ins().brif(pending, exit, &[], execute, &[]);
+        self.builder.switch_to_block(exit);
+        self.emit_exit(EXIT_RECONCILE, 0, source, flags)?;
         self.builder.switch_to_block(execute);
         Ok(())
     }
@@ -1066,8 +1215,12 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         if index == 31 && !register31_is_sp {
             return Ok(self.builder.ins().iconst(types::I64, 0));
         }
-        let slot = if index == 31 { 31 } else { usize::from(index) };
-        let variable = self.registers[slot].ok_or_else(|| {
+        let variable = if index == 31 {
+            self.stack_pointer
+        } else {
+            self.registers[usize::from(index)]
+        }
+        .ok_or_else(|| {
             DirectJitError::internal(format!("direct JIT register X{index} was not planned"))
         })?;
         Ok(self.builder.use_var(variable))
@@ -1086,8 +1239,12 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         if index == 31 && !register31_is_sp {
             return Ok(());
         }
-        let slot = if index == 31 { 31 } else { usize::from(index) };
-        let variable = self.registers[slot].ok_or_else(|| {
+        let variable = if index == 31 {
+            self.stack_pointer
+        } else {
+            self.registers[usize::from(index)]
+        }
+        .ok_or_else(|| {
             DirectJitError::internal(format!("direct JIT register X{index} was not planned"))
         })?;
         self.builder.def_var(variable, value);
@@ -1122,17 +1279,19 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                 DirectJitError::internal("dirty direct JIT register has no SSA variable")
             })?;
             let value = self.builder.use_var(variable);
-            if index == 31 {
-                self.builder.ins().store(trusted_flags(), value, self.sp, 0);
-            } else {
-                self.builder.ins().store(
-                    trusted_flags(),
-                    value,
-                    self.x,
-                    i32::try_from(index * size_of::<u64>())
-                        .expect("architectural GPR offset fits i32"),
-                );
-            }
+            self.builder.ins().store(
+                trusted_flags(),
+                value,
+                self.x,
+                i32::try_from(index * size_of::<u64>()).expect("architectural GPR offset fits i32"),
+            );
+        }
+        if self.dirty_stack_pointer {
+            let variable = self.stack_pointer.ok_or_else(|| {
+                DirectJitError::internal("dirty direct JIT stack pointer has no SSA variable")
+            })?;
+            let value = self.builder.use_var(variable);
+            self.builder.ins().store(trusted_flags(), value, self.sp, 0);
         }
         for index in 0..self.dirty_vector_registers.len() {
             if !self.dirty_vector_registers[index] {
@@ -1224,9 +1383,22 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
     }
 }
 
-fn register_access(region: &NativeRegion) -> ([bool; 32], [bool; 32]) {
-    let mut accessed = [false; 32];
-    let mut dirty = [false; 32];
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct IntegerRegisterSet {
+    x: [bool; GENERAL_REGISTER_COUNT],
+    sp: bool,
+}
+
+impl IntegerRegisterSet {
+    #[cfg(test)]
+    fn count(self) -> usize {
+        self.x.into_iter().filter(|set| *set).count() + usize::from(self.sp)
+    }
+}
+
+fn register_access(region: &NativeRegion) -> (IntegerRegisterSet, IntegerRegisterSet) {
+    let mut accessed = IntegerRegisterSet::default();
+    let mut dirty = IntegerRegisterSet::default();
     for block in &region.blocks {
         for decoded in &block.instructions {
             match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
@@ -1332,8 +1504,8 @@ fn fp_simd_uses_exact_status(instruction: fp_simd::Instruction) -> bool {
 
 fn register_access_memory(
     instruction: memory::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut IntegerRegisterSet,
+    dirty: &mut IntegerRegisterSet,
 ) {
     use nixe_cpu::semantics::a64::{ScalarTransfer, pair_transfer, scalar_transfer};
 
@@ -1410,8 +1582,8 @@ fn register_access_memory(
 
 fn register_access_system(
     instruction: system::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut IntegerRegisterSet,
+    dirty: &mut IntegerRegisterSet,
 ) {
     let fields = instruction.operands();
     match instruction {
@@ -1428,8 +1600,8 @@ fn register_access_system(
 
 fn register_access_fp_simd_general(
     instruction: fp_simd::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut IntegerRegisterSet,
+    dirty: &mut IntegerRegisterSet,
 ) {
     let fields = instruction.operands();
     match instruction {
@@ -1671,8 +1843,8 @@ fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
 
 fn register_access_integer(
     instruction: integer::Instruction,
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut IntegerRegisterSet,
+    dirty: &mut IntegerRegisterSet,
 ) {
     let fields = instruction.operands();
     match instruction {
@@ -1741,22 +1913,27 @@ fn register_access_integer(
     }
 }
 
-fn mark_read(accessed: &mut [bool; 32], index: u8, register31_is_sp: bool) {
-    if index != 31 || register31_is_sp {
-        accessed[usize::from(index)] = true;
+fn mark_read(accessed: &mut IntegerRegisterSet, index: u8, register31_is_sp: bool) {
+    if index == 31 {
+        accessed.sp |= register31_is_sp;
+    } else {
+        accessed.x[usize::from(index)] = true;
     }
 }
 
 fn mark_write(
-    accessed: &mut [bool; 32],
-    dirty: &mut [bool; 32],
+    accessed: &mut IntegerRegisterSet,
+    dirty: &mut IntegerRegisterSet,
     index: u8,
     register31_is_sp: bool,
 ) {
-    if index != 31 || register31_is_sp {
+    if index == 31 {
+        accessed.sp |= register31_is_sp;
+        dirty.sp |= register31_is_sp;
+    } else {
         let slot = usize::from(index);
-        accessed[slot] = true;
-        dirty[slot] = true;
+        accessed.x[slot] = true;
+        dirty.x[slot] = true;
     }
 }
 

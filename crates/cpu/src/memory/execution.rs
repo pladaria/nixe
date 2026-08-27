@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::AtomicU64,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
 };
 
@@ -1149,23 +1150,17 @@ impl ExecutionMemory {
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
-        alignment: u8,
     ) -> Result<([u8; N], CodeDependencies), InstructionFetchFault> {
-        if !address.is_aligned_to(u64::from(alignment)) {
+        if !address.is_aligned_to(4) {
             return Err(InstructionFetchFault::new(
                 address_space,
                 address,
-                InstructionFetchFaultReason::Misaligned {
-                    required_alignment: alignment,
-                },
+                InstructionFetchFaultReason::Misaligned,
             ));
         }
         let inner = self.lock_inner();
         let end_offset = page_offset(address) + N;
-        // The only callers request aligned 2-byte or 4-byte architectural
-        // encodings. Both widths divide the page size, so a valid fetch cannot
-        // cross a page. T32 instructions spanning pages are assembled by
-        // `fetch_t32_32` from two independently checked halfword fetches.
+        // A64 instructions are four-byte aligned and cannot cross this page.
         debug_assert!(end_offset <= SYNTHETIC_PAGE_SIZE);
         let mapping = inner.mapping_at(address_space, address).ok_or_else(|| {
             InstructionFetchFault::new(
@@ -1373,6 +1368,10 @@ impl MemoryInvalidationSource for ExecutionMemory {
         self.invalidations.cursor()
     }
 
+    fn invalidation_signal(&self) -> &AtomicU64 {
+        self.invalidations.cursor_signal()
+    }
+
     fn read_invalidations_since(
         &self,
         after: MemoryInvalidationCursor,
@@ -1413,24 +1412,12 @@ impl InstructionMemory for ExecutionMemory {
             .expect("production page arithmetic contains its source address"))
     }
 
-    fn fetch16(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u16>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<2>(address_space, address, 2)?;
-        Ok(FetchedCode {
-            bits: u16::from_le_bytes(bytes),
-            dependencies,
-        })
-    }
-
     fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<4>(address_space, address, 4)?;
+        let (bytes, dependencies) = self.fetch::<4>(address_space, address)?;
         Ok(FetchedCode {
             bits: u32::from_le_bytes(bytes),
             dependencies,
