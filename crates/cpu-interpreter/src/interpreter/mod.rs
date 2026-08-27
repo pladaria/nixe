@@ -202,9 +202,8 @@ pub fn execute_one_with_context(
     );
     let encoding = InstructionEncoding::from_u32(encoding);
     match decode::decode(process.decoder(), source, encoding) {
-        DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
-            execute_decoded(context, state, &decoded)
-        }
+        DecodeResult::Decoded(decoded) => execute_decoded(context, state, &decoded),
+        DecodeResult::RecognizedUnimplemented(decoded) => Err(unsupported(&decoded)),
         DecodeResult::Unallocated {
             instruction,
             reason,

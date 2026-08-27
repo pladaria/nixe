@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{CpuBackendSelection, CpuConfig, InitialOperationMode, TimeMode};
+use nixe_cpu_jit::JitConfiguration;
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
@@ -304,10 +305,15 @@ fn effective_cpu_configuration(
 
 fn select_cpu_backend(
     configuration: CpuConfig,
-    _title_name: &str,
+    title_name: &str,
 ) -> Result<CpuBackendConfig, String> {
     Ok(match configuration.backend {
-        CpuBackendSelection::Jit => CpuBackendConfig::Jit,
+        CpuBackendSelection::Jit => CpuBackendConfig::Jit(
+            JitConfiguration::default()
+                .with_dump_directory(configuration.jit.dump_directory)
+                .with_performance_report_directory(configuration.jit.performance_report_directory)
+                .with_performance_report_title(title_name),
+        ),
         CpuBackendSelection::Interpreter => CpuBackendConfig::Interpreter,
     })
 }
@@ -322,9 +328,6 @@ mod backend_selection_tests {
             backend: CpuBackendSelection::Interpreter,
             parallel_vcpus: true,
             jit: nixe_config::CpuJitConfig {
-                max_cached_regions: 7,
-                max_cache_bytes: 8 * 1024 * 1024,
-                max_concurrent_compilations: 2,
                 dump_directory: Some("jit-diagnostics".into()),
                 performance_report_directory: Some("jit-performance".into()),
             },
@@ -357,7 +360,7 @@ mod backend_selection_tests {
         assert!(matches!(interpreter, CpuBackendConfig::Interpreter));
 
         let jit = select_cpu_backend(CpuConfig::default(), "test-title").unwrap();
-        assert!(matches!(jit, CpuBackendConfig::Jit));
+        assert!(matches!(jit, CpuBackendConfig::Jit(_)));
     }
 }
 

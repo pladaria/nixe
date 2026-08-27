@@ -10,9 +10,11 @@ cranelift-frontend = "=0.134.3"
 cranelift-jit = "=0.134.3"
 cranelift-module = "=0.134.3"
 cranelift-native = "=0.134.3"
+log.workspace = true
 nixe-cpu.workspace = true
 nixe-memory.workspace = true
 
 [dev-dependencies]
 nixe-cpu-interpreter.workspace = true
+tempfile.workspace = true
 toml.workspace = true

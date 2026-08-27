@@ -1224,9 +1224,11 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "log",
  "nixe-cpu",
  "nixe-cpu-interpreter",
  "nixe-memory",
+ "tempfile",
  "toml",
 ]
 

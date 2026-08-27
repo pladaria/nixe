@@ -35,7 +35,7 @@ pub use host_mapped::{
 pub use invalidation::{
     MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,
     MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
-    MemoryInvalidationReservation, MemoryInvalidationSource,
+    MemoryInvalidationOrigin, MemoryInvalidationReservation, MemoryInvalidationSource,
 };
 pub use range::{
     CanonicalBackingRange, CanonicalBackingSegment, CanonicalCpuWriteDependency,

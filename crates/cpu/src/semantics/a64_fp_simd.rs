@@ -6,13 +6,10 @@
 //! and Cranelift instructions are never semantic authorities.
 
 use crate::{
-    decode::a64::{
-        A64HelperToken,
-        fp_simd::{
-            BitwiseOperation, FloatAddOperation, FloatConversion, FloatFusedMultiplyOperation,
-            FloatMultiplyOperation, FloatRoundOperation, FloatToIntegerRounding, Instruction,
-            IntegerComparison, PairwiseOperation, PermuteOperation,
-        },
+    decode::a64::fp_simd::{
+        BitwiseOperation, FloatAddOperation, FloatConversion, FloatFusedMultiplyOperation,
+        FloatMultiplyOperation, FloatRoundOperation, FloatToIntegerRounding, Instruction,
+        IntegerComparison, PairwiseOperation, PermuteOperation,
     },
     semantics::conditions::Condition,
     semantics::{
@@ -32,196 +29,6 @@ pub enum A64FpSimdError {
     Trap,
     /// The instruction belongs to memory or to a family outside this provider.
     Unsupported,
-}
-
-/// Executes a semantic-helper token emitted by the verified A64 frontend.
-pub fn execute_semantic_token(
-    state: &mut A64State,
-    semantic_token: u64,
-) -> Result<(), A64FpSimdError> {
-    execute(state, semantic_instruction(semantic_token))
-}
-
-/// Reconstructs the typed instruction carried by a verified helper call.
-#[must_use]
-pub fn semantic_instruction(semantic_token: u64) -> Instruction {
-    let token = A64HelperToken::from_semantic_abi_value(semantic_token);
-    crate::decode::a64::fp_simd::normalize(token.instruction_id(), token.helper_abi_value())
-}
-
-/// One architectural input consumed by the compact FP/SIMD semantic ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum SemanticInput {
-    RnVector,
-    RmVector,
-    RaVector,
-    RdVector,
-    RnGeneral,
-    Nzcv,
-    Fpcr,
-    Fpsr,
-}
-
-impl SemanticInput {
-    const fn bit(self) -> u8 {
-        1 << self as u8
-    }
-}
-
-/// Exact compact input set for one normalized FP/SIMD instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SemanticInputs(u8);
-
-impl SemanticInputs {
-    pub const NONE: Self = Self(0);
-    pub const RN_VECTOR: Self = Self(SemanticInput::RnVector.bit());
-    pub const RM_VECTOR: Self = Self(SemanticInput::RmVector.bit());
-    pub const RA_VECTOR: Self = Self(SemanticInput::RaVector.bit());
-    pub const RD_VECTOR: Self = Self(SemanticInput::RdVector.bit());
-    pub const RN_GENERAL: Self = Self(SemanticInput::RnGeneral.bit());
-    pub const NZCV: Self = Self(SemanticInput::Nzcv.bit());
-    pub const FPCR: Self = Self(SemanticInput::Fpcr.bit());
-    pub const FPSR: Self = Self(SemanticInput::Fpsr.bit());
-
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    #[must_use]
-    pub const fn contains(self, input: SemanticInput) -> bool {
-        self.0 & input.bit() != 0
-    }
-
-    /// Returns the scratch-ABI argument index after the token at index zero.
-    #[must_use]
-    pub const fn argument_index(self, input: SemanticInput) -> Option<usize> {
-        if !self.contains(input) {
-            return None;
-        }
-        let preceding = self.0 & (input.bit() - 1);
-        Some(1 + preceding.count_ones() as usize)
-    }
-
-    #[must_use]
-    pub const fn argument_count(self) -> usize {
-        1 + self.0.count_ones() as usize
-    }
-}
-
-/// Returns the minimal semantic inputs required by the normalized operation.
-#[must_use]
-pub const fn semantic_inputs(instruction: Instruction) -> SemanticInputs {
-    use SemanticInputs as Inputs;
-
-    let fields = instruction.operands();
-    match instruction {
-        Instruction::DuplicateGeneral(_) | Instruction::InsertGeneral(_) => {
-            let inputs = Inputs::RN_GENERAL;
-            if matches!(instruction, Instruction::InsertGeneral(_)) {
-                inputs.union(Inputs::RD_VECTOR)
-            } else {
-                inputs
-            }
-        }
-        Instruction::DuplicateElement(_)
-        | Instruction::ScalarAbsolute(_)
-        | Instruction::ScalarNegate(_)
-        | Instruction::VectorFloatAbsolute(_)
-        | Instruction::VectorFloatNegate(_)
-        | Instruction::ScalarShiftRightImmediate(_)
-        | Instruction::VectorShiftRightImmediate(_)
-        | Instruction::ScalarShiftLeftImmediate(_)
-        | Instruction::VectorShiftLeftImmediate(_)
-        | Instruction::ShiftLeftLong(_)
-        | Instruction::CountBits(_)
-        | Instruction::AddAcrossVector(_) => Inputs::RN_VECTOR,
-        Instruction::ModifiedImmediate(_) => {
-            if fields.cmode <= 11 && fields.cmode & 1 != 0 {
-                Inputs::RD_VECTOR
-            } else {
-                Inputs::NONE
-            }
-        }
-        Instruction::InsertElement(_) => Inputs::RN_VECTOR.union(Inputs::RD_VECTOR),
-        Instruction::PermuteTwoSource(_)
-        | Instruction::Extract(_)
-        | Instruction::IntegerPairwise(_)
-        | Instruction::IntegerMinMax(_)
-        | Instruction::VectorSignedShiftRegister(_)
-        | Instruction::VectorUnsignedShiftRegister(_) => Inputs::RN_VECTOR.union(Inputs::RM_VECTOR),
-        Instruction::IntegerCompare(_) => {
-            let inputs = Inputs::RN_VECTOR;
-            if fields.compare_with_zero {
-                inputs
-            } else {
-                inputs.union(Inputs::RM_VECTOR)
-            }
-        }
-        Instruction::ShiftRightNarrow(_) | Instruction::ExtractNarrow(_) => {
-            let inputs = Inputs::RN_VECTOR;
-            if fields.vector_128 {
-                inputs.union(Inputs::RD_VECTOR)
-            } else {
-                inputs
-            }
-        }
-        Instruction::VectorSignedIntToFloat(_)
-        | Instruction::VectorUnsignedIntToFloat(_)
-        | Instruction::ScalarVectorSignedIntToFloat(_)
-        | Instruction::ScalarVectorUnsignedIntToFloat(_)
-        | Instruction::ScalarFloatConvert(_)
-        | Instruction::ScalarFloatRound(_)
-        | Instruction::ScalarFloatSquareRoot(_) => {
-            Inputs::RN_VECTOR.union(Inputs::FPCR).union(Inputs::FPSR)
-        }
-        Instruction::VectorFloatDivide(_)
-        | Instruction::ScalarFloatDivide(_)
-        | Instruction::ScalarFloatAdd(_)
-        | Instruction::ScalarFloatMultiply(_) => Inputs::RN_VECTOR
-            .union(Inputs::RM_VECTOR)
-            .union(Inputs::FPCR)
-            .union(Inputs::FPSR),
-        Instruction::ScalarFloatFusedMultiplyAdd(_) => Inputs::RN_VECTOR
-            .union(Inputs::RM_VECTOR)
-            .union(Inputs::RA_VECTOR)
-            .union(Inputs::FPCR)
-            .union(Inputs::FPSR),
-        Instruction::ScalarFloatConditionalSelect(_) => Inputs::RN_VECTOR
-            .union(Inputs::RM_VECTOR)
-            .union(Inputs::NZCV),
-        Instruction::VectorFloatImmediate(_) | Instruction::ScalarFloatImmediate(_) => Inputs::NONE,
-        Instruction::ConditionalCompare(_) => Inputs::RN_VECTOR
-            .union(Inputs::RM_VECTOR)
-            .union(Inputs::NZCV)
-            .union(Inputs::FPCR)
-            .union(Inputs::FPSR),
-        Instruction::Bitwise(_)
-        | Instruction::Integer(_)
-        | Instruction::ScalarTwoSource(_)
-        | Instruction::ScalarMove(_)
-        | Instruction::CompareRegister(_)
-        | Instruction::CompareZero(_)
-        | Instruction::SignedIntToFloat(_)
-        | Instruction::UnsignedIntToFloat(_)
-        | Instruction::FloatToSignedInt(_)
-        | Instruction::FloatToUnsignedInt(_)
-        | Instruction::MoveToGeneral(_)
-        | Instruction::MoveFromGeneral(_)
-        | Instruction::UnsignedMoveToGeneral(_)
-        | Instruction::MemoryPair(_)
-        | Instruction::MemoryUnsigned(_)
-        | Instruction::MemoryUnscaled(_)
-        | Instruction::MemoryPostIndex(_)
-        | Instruction::MemoryPreIndex(_)
-        | Instruction::MemoryRegister(_)
-        | Instruction::MemoryLiteral(_)
-        | Instruction::MemoryMultipleStructures(_)
-        | Instruction::MemoryMultipleStructuresPostIndex(_)
-        | Instruction::MemorySingleStructure(_)
-        | Instruction::MemorySingleStructurePostIndex(_) => Inputs::NONE,
-    }
 }
 
 /// Executes one normalized non-memory A64 FP/SIMD instruction.
@@ -3151,9 +2958,8 @@ fn extract_vector(state: &mut A64State, fields: crate::decode::a64::fp_simd::Ope
 // the upper half. Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SHRN--SHRN2--Shift-right-narrow--immediate--
 fn shift_right_narrow(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
-    let bits = fields.helper_token.helper_abi_value();
-    let immediate_high = (bits >> 19) & 0xf;
-    let immediate_low = (bits >> 16) & 7;
+    let immediate_high = u32::from(fields.shift_immediate >> 3);
+    let immediate_low = u32::from(fields.shift_immediate & 7);
     let destination_lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
     let source_lane_bits = destination_lane_bits * 2;
     let immediate = (immediate_high << 3) | immediate_low;
@@ -3190,8 +2996,7 @@ fn shift_right_immediate(
     fields: crate::decode::a64::fp_simd::Operands,
     scalar: bool,
 ) {
-    let bits = fields.helper_token.helper_abi_value();
-    let immediate = (bits >> 16) & 0x7f;
+    let immediate = u32::from(fields.shift_immediate);
     let immediate_high = immediate >> 3;
     let lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
     let shift = 2 * lane_bits - immediate;
@@ -3230,8 +3035,7 @@ fn shift_left_immediate(
     fields: crate::decode::a64::fp_simd::Operands,
     scalar: bool,
 ) {
-    let bits = fields.helper_token.helper_abi_value();
-    let immediate = (bits >> 16) & 0x7f;
+    let immediate = u32::from(fields.shift_immediate);
     let immediate_high = immediate >> 3;
     let lane_bits = 8_u32 << (31 - immediate_high.leading_zeros());
     let shift = immediate - lane_bits;
@@ -3259,8 +3063,7 @@ fn shift_left_immediate(
 // immediate left shift. A zero shift is exposed architecturally as SXTL/UXTL.
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SSHLL--SSHLL2--Signed-Shift-Left-Long--immediate--
 fn shift_left_long(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
-    let bits = fields.helper_token.helper_abi_value();
-    let immediate = (bits >> 16) & 0x7f;
+    let immediate = u32::from(fields.shift_immediate);
     let immediate_high = immediate >> 3;
     let source_bits = 8_u32 << (31 - immediate_high.leading_zeros());
     let destination_bits = source_bits * 2;
@@ -3367,8 +3170,7 @@ fn count_bits(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operand
 // Arm ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDV--Add-across-vector-
 fn add_across_vector(state: &mut A64State, fields: crate::decode::a64::fp_simd::Operands) {
-    let bits = fields.helper_token.helper_abi_value();
-    let lane_bits = 8_u32 << ((bits >> 22) & 3);
+    let lane_bits = 8_u32 << fields.opc;
     let vector_bits = if fields.vector_128 { 128 } else { 64 };
     let lane_count = vector_bits / lane_bits;
     let lane_mask = (1_u128 << lane_bits) - 1;

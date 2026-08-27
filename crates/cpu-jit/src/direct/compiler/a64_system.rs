@@ -3,9 +3,9 @@ use std::mem::offset_of;
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 use nixe_cpu::decode::a64::system::{Instruction, Operands};
 use nixe_cpu::execution::SchedulerRequest;
-use nixe_cpu::memory::CacheMaintenanceKind;
 use nixe_cpu::semantics::a64::{
-    HintOperation, RuntimeRegisterRead, barrier_operation, hint_operation, runtime_register_read,
+    HintOperation, RuntimeRegisterRead, barrier_operation, cache_maintenance_operation,
+    hint_operation, runtime_register_read,
 };
 use nixe_memory::GuestVirtualAddress;
 
@@ -188,22 +188,13 @@ impl CraneliftTranslator<'_, '_> {
         fields: Operands,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
-        let (kind, uses_address) = match fields.system_key {
-            0xd508_7500 => (CacheMaintenanceKind::InstructionInvalidate, false),
-            0xd50b_7520 => (CacheMaintenanceKind::InstructionInvalidate, true),
-            0xd508_7620 => (CacheMaintenanceKind::DataInvalidate, true),
-            0xd50b_7b20 => (CacheMaintenanceKind::DataClean, true),
-            0xd50b_7e20 => (CacheMaintenanceKind::DataCleanAndInvalidate, true),
-            _ => {
-                return Err(DirectJitError::unsupported(
-                    "unsupported A64 cache-maintenance operation",
-                ));
-            }
-        };
-        if uses_address {
+        let operation = cache_maintenance_operation(fields.system_key).ok_or_else(|| {
+            DirectJitError::unsupported("unsupported A64 cache-maintenance operation")
+        })?;
+        if operation.uses_address {
             let address = self.read_register(fields.rt, false)?;
             self.call_slow(
-                slow::cache_address(kind) as usize,
+                slow::cache_address(operation.kind) as usize,
                 &[address],
                 source,
                 flags,

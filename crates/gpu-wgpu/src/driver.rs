@@ -38,7 +38,9 @@ use wgpu::{
     VertexStepMode as WgpuVertexStepMode,
 };
 
-use crate::{PIPELINE_CACHE_MAGIC, WgpuVisibilityCoordinator};
+use crate::{
+    PIPELINE_CACHE_MAGIC, WgpuExecutionContext, WgpuQueueAccess, WgpuVisibilityCoordinator,
+};
 
 // WebGPU and Maxwell expose at most eight simultaneous color attachments.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
@@ -800,6 +802,7 @@ pub(crate) struct WgpuBackendDriver {
     backend: nixe_gpu::BackendInstanceId,
     device: Device,
     queue: Queue,
+    queue_access: WgpuQueueAccess,
     visibility: Arc<WgpuVisibilityCoordinator>,
     resources: Vec<Option<WgpuResourceSlot>>,
     presentation_images: HashMap<PresentationImageKey, Vec<BackendResourceHandle>>,
@@ -840,13 +843,17 @@ pub(crate) struct WgpuBackendDriver {
 impl WgpuBackendDriver {
     pub(crate) fn new(
         backend: nixe_gpu::BackendInstanceId,
-        device: Device,
-        queue: Queue,
+        execution: WgpuExecutionContext,
         visibility: Arc<WgpuVisibilityCoordinator>,
         pipeline_cache: Option<PipelineCache>,
         pipeline_cache_path: Option<PathBuf>,
         cache_configuration: GpuCacheConfiguration,
     ) -> Self {
+        let WgpuExecutionContext {
+            device,
+            queue,
+            queue_access,
+        } = execution;
         let device_loss = Arc::new(Mutex::new(None));
         let callback_state = Arc::clone(&device_loss);
         device.set_device_lost_callback(move |reason, message| {
@@ -869,6 +876,7 @@ impl WgpuBackendDriver {
             backend,
             device,
             queue,
+            queue_access,
             visibility,
             resources: Vec::new(),
             presentation_images: HashMap::new(),
@@ -2849,8 +2857,11 @@ impl WgpuBackendDriver {
             usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
-        self.queue
-            .write_buffer(&parameter_buffer, 0, &parameter_bytes);
+        {
+            let _queue_access = self.queue_access.lock();
+            self.queue
+                .write_buffer(&parameter_buffer, 0, &parameter_bytes);
+        }
         let pipeline = self.presentation_import_pipeline()?;
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("Nixe presentation import bindings"),
@@ -3010,7 +3021,10 @@ impl WgpuBackendDriver {
             compute.dispatch_workgroups(request.width.div_ceil(8), request.height.div_ceil(8), 1);
         }
         self.upload_staging.finish_and_recall_on_submit(&encoder);
-        self.queue.submit([encoder.finish()]);
+        {
+            let _queue_access = self.queue_access.lock();
+            self.queue.submit([encoder.finish()]);
+        }
         record_uploaded([request.backing.range()], &mut import.uploaded);
         import.cpu_writes =
             nixe_memory::CanonicalCpuWriteDependency::capture(request.backing.range());
@@ -3237,7 +3251,10 @@ impl WgpuBackendDriver {
                     }
                 }
             }
-            self.queue.submit([encoder.finish()]);
+            {
+                let _queue_access = self.queue_access.lock();
+                self.queue.submit([encoder.finish()]);
+            }
             self.finish_writebacks(writebacks)?;
             for writeback in &demanded {
                 let record = self
@@ -3422,7 +3439,10 @@ impl BackendDriver for WgpuBackendDriver {
         self.upload_inputs(accepted, dependencies, &mut encoder)?;
         let encoder = self.encode_submission(accepted, dependencies, encoder)?;
         self.upload_staging.finish_and_recall_on_submit(&encoder);
-        let submission_index = self.queue.submit([encoder.finish()]);
+        let submission_index = {
+            let _queue_access = self.queue_access.lock();
+            self.queue.submit([encoder.finish()])
+        };
         let token = accepted.token();
         self.submissions.insert(
             token,

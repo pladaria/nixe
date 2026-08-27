@@ -3,9 +3,9 @@ use std::thread;
 use std::time::Duration;
 
 use nixe_cpu::memory::{
-    AtomicRmwKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-    MemoryAlignment, MemoryMappingPurpose, MemoryOrdering, MemoryPermissions, MemoryValue,
-    ProcessMemory, SYNTHETIC_PAGE_SIZE,
+    AtomicRmwKind, CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess,
+    MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryMappingPurpose, MemoryOrdering,
+    MemoryPermissions, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
 };
 use nixe_memory::{
     AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
@@ -359,7 +359,7 @@ fn compare_exchange_and_exclusives_cover_every_supported_scalar_width() {
 }
 
 #[test]
-fn only_successful_atomic_writes_publish_executable_invalidation() {
+fn atomic_code_writes_wait_for_instruction_cache_maintenance() {
     let mut memory = ExecutionMemory::new();
     let page = GuestPhysicalPageId::new(77);
     assert!(memory.add_ram_page(page));
@@ -394,8 +394,21 @@ fn only_successful_atomic_writes_publish_executable_invalidation() {
         )
         .unwrap();
     let mut records = Vec::new();
-    memory
+    let after_write = memory
         .read_invalidations_since(cursor, &mut records)
+        .unwrap();
+    assert_eq!(after_write, cursor);
+    assert!(records.is_empty());
+
+    memory
+        .maintain_cache(
+            SPACE,
+            CacheMaintenanceKind::InstructionInvalidate,
+            Some(PRIMARY),
+        )
+        .unwrap();
+    memory
+        .read_invalidations_since(after_write, &mut records)
         .unwrap();
     assert!(records.iter().any(|record| {
         matches!(

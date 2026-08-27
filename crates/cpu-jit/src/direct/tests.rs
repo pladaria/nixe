@@ -5,8 +5,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use nixe_cpu::decode::{self, DecodeResult, DecodeSupport};
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
-    ProcessMemory, SyntheticMemory, SyntheticMmio,
+    CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize,
+    MemoryPermissions, MemoryValue, ProcessMemory, SyntheticMemory, SyntheticMmio,
 };
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -28,6 +28,117 @@ const DATA: u64 = 0x8000;
 const SPACE: AddressSpaceId = AddressSpaceId::new(1);
 
 #[test]
+fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() {
+    let root = tempfile::tempdir().unwrap();
+    let dumps = root.path().join("dumps");
+    let reports = root.path().join("reports");
+    let process = JitProcess::with_configuration(
+        cpu(),
+        JitConfiguration::default()
+            .with_dump_directory(Some(dumps.clone()))
+            .with_performance_report_directory(Some(reports.clone()))
+            .with_performance_report_title("Test Title"),
+    )
+    .unwrap();
+    let memory = memory(&[(0, 0xd503_201f), (4, breakpoint(7))]);
+    let mut state = state(CODE, 0);
+
+    assert!(matches!(
+        JitThread::new()
+            .run(&process, &memory, &mut state, 1)
+            .unwrap(),
+        DirectExit::Budget { .. }
+    ));
+    process.shutdown();
+    process.shutdown();
+
+    let session = std::fs::read_dir(&dumps)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let dump_names: BTreeSet<_> = std::fs::read_dir(session)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(dump_names.iter().any(|name| name.ends_with(".clif")));
+    assert!(dump_names.iter().any(|name| name.ends_with(".bin")));
+    assert!(!dump_names.iter().any(|name| name.contains("nixe-ir")));
+
+    let report_paths: Vec<_> = std::fs::read_dir(reports)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(report_paths.len(), 1);
+    let report_path = &report_paths[0];
+    assert!(
+        report_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("test-title-")
+    );
+    let report: toml::Value =
+        toml::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
+    let table = report.as_table().unwrap();
+    assert_eq!(table["version"].as_integer(), Some(4));
+    let expected: BTreeSet<_> = [
+        "version",
+        "regions_discovered",
+        "guest_blocks_discovered",
+        "regions_compiled",
+        "region_entry_points",
+        "secondary_entry_hits",
+        "compiled_guest_instructions",
+        "unique_guest_instructions",
+        "overlapping_guest_instructions",
+        "lookup_hits",
+        "lookup_misses",
+        "guest_instructions",
+        "clif_instructions",
+        "native_bytes",
+        "compile_time_ns",
+        "native_time_ns",
+        "slow_memory_calls",
+        "invalidations",
+        "invalidation_details",
+        "exit_reasons",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        table.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(table["regions_compiled"].as_integer(), Some(1));
+    assert_eq!(table["region_entry_points"].as_integer(), Some(1));
+    assert_eq!(table["compiled_guest_instructions"].as_integer(), Some(2));
+    assert_eq!(table["unique_guest_instructions"].as_integer(), Some(2));
+    assert_eq!(
+        table["overlapping_guest_instructions"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(table["lookup_misses"].as_integer(), Some(1));
+    assert_eq!(table["guest_instructions"].as_integer(), Some(1));
+    assert!(table["clif_instructions"].as_integer().unwrap() > 0);
+    assert!(table["native_bytes"].as_integer().unwrap() > 0);
+    assert_eq!(
+        table["invalidation_details"]["regions_retired"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        table["invalidation_details"]["mapping"].as_integer(),
+        Some(1)
+    );
+    assert_eq!(
+        table["invalidation_details"]["irrelevant"].as_integer(),
+        Some(1)
+    );
+    assert_eq!(table["exit_reasons"]["budget"].as_integer(), Some(1));
+}
+
+#[test]
 fn normalized_multiblock_region_executes_without_nixe_ir() {
     let memory = memory(&[
         (0x00, 0xd503_201f), // NOP
@@ -37,7 +148,14 @@ fn normalized_multiblock_region_executes_without_nixe_ir() {
         (0x10, breakpoint(0x31)),
     ]);
     let cpu = cpu();
-    let region = discover_region(cpu, &memory, location(CODE), RegionLimits::default()).unwrap();
+    let region = discover_region(
+        cpu,
+        &memory,
+        location(CODE),
+        RegionLimits::default(),
+        |_| false,
+    )
+    .unwrap();
     assert_eq!(region.blocks.len(), 2);
     assert_eq!(region.instruction_count, 4);
     assert_eq!(region.external_exits.len(), 1);
@@ -55,6 +173,70 @@ fn normalized_multiblock_region_executes_without_nixe_ir() {
         }
     );
     assert_eq!(read_x0(&state), 11);
+}
+
+#[test]
+fn multiblock_region_publishes_one_native_function_for_every_block_entry() {
+    let memory = memory(&[
+        (0x00, 0xd503_201f),
+        (0x04, branch(CODE + 4, CODE + 12)),
+        (0x0c, add_x0(1)),
+        (0x10, breakpoint(0x32)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let primary = process.entry_for(&memory, location(CODE)).unwrap().1;
+    let secondary = process.entry_for(&memory, location(CODE + 0x0c)).unwrap().1;
+    assert_eq!(secondary, primary);
+    {
+        let state = process.state.lock().unwrap();
+        assert_eq!(state.compiled_regions, 1);
+        let secondary_key = RegionKey::new(cpu(), location(CODE + 0x0c));
+        assert_eq!(
+            state.lookup.get(secondary_key).unwrap().owner.start.get(),
+            CODE
+        );
+    }
+
+    let mut state = state(CODE + 0x0c, 10);
+    assert_eq!(
+        JitThread::new()
+            .run(&process, &memory, &mut state, 4)
+            .unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE + 0x10),
+            detail: (2 << 24) | 0x32,
+            instructions: 2,
+        }
+    );
+    assert_eq!(read_x0(&state), 11);
+}
+
+#[test]
+fn discovery_stops_at_an_existing_secondary_region_entry() {
+    let target = CODE + 0x100;
+    let secondary = target + 0x0c;
+    let memory = memory(&[
+        (0x00, branch(CODE, secondary)),
+        (0x100, 0xd503_201f),
+        (0x104, branch(target + 4, secondary)),
+        (0x10c, breakpoint(4)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let target_entry = process.entry_for(&memory, location(target)).unwrap().1;
+    assert_eq!(
+        process.entry_for(&memory, location(secondary)).unwrap().1,
+        target_entry
+    );
+    process.entry_for(&memory, location(CODE)).unwrap();
+
+    let state = process.state.lock().unwrap();
+    assert_eq!(state.compiled_regions, 2);
+    let source = state
+        .region_for(RegionKey::new(cpu(), location(CODE)))
+        .unwrap();
+    assert_eq!(source.guest_blocks, 1);
+    assert_eq!(source.entry_keys.len(), 1);
+    assert_eq!(source.links[0].slot.load(Ordering::Acquire), target_entry);
 }
 
 #[test]
@@ -92,6 +274,32 @@ fn conditional_branch_consumes_lazy_flags_in_native_cfg() {
 }
 
 #[test]
+fn cold_unsupported_system_instruction_does_not_reject_the_region() {
+    let memory = memory(&[
+        (0x00, 0xd53b_00e5),                                     // MRS X5,DCZID_EL0
+        (0x04, 0x9240_10a5),                                     // AND X5,X5,#0x1f
+        (0x08, 0xf100_10bf),                                     // CMP X5,#4
+        (0x0c, conditional_branch(CODE + 0x0c, CODE + 0x14, 1)), // B.NE
+        (0x10, 0xd50b_7423), // DC ZVA,X3 (prohibited by Switch 1 DCZID_EL0)
+        (0x14, 0xd503_201f), // NOP
+        (0x18, branch(CODE + 0x18, CODE + 0x18)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let mut state = state(CODE, 0);
+
+    assert_eq!(
+        JitThread::new()
+            .run(&process, &memory, &mut state, 5)
+            .unwrap(),
+        DirectExit::Budget {
+            pc: GuestVirtualAddress::new(CODE + 0x18),
+            instructions: 5,
+        }
+    );
+    assert_eq!(read_register(&state, 5), 0x14);
+}
+
+#[test]
 fn direct_backedge_keeps_register_ssa_until_precise_budget_exit() {
     let memory = memory(&[(0x00, add_x0(1)), (0x04, branch(CODE + 4, CODE))]);
     let process = JitProcess::new(cpu()).unwrap();
@@ -108,7 +316,7 @@ fn direct_backedge_keeps_register_ssa_until_precise_budget_exit() {
 
     let key = RegionKey::new(cpu(), location(CODE));
     let process_state = process.state.lock().unwrap();
-    let compiled = process_state.lookup.get(key).unwrap();
+    let compiled = process_state.region_for(key).unwrap();
     assert_eq!(compiled.guest_blocks, 1);
     assert!(compiled.native_bytes > 0);
     assert_eq!(compiled.dependencies.len(), 1);
@@ -143,8 +351,7 @@ fn call_and_return_use_canonical_state_only_at_region_boundaries() {
 
     let process_state = process.state.lock().unwrap();
     let source = process_state
-        .lookup
-        .get(RegionKey::new(cpu(), location(CODE)))
+        .region_for(RegionKey::new(cpu(), location(CODE)))
         .unwrap();
     let target = process_state
         .lookup
@@ -252,20 +459,6 @@ fn one_process_lock_produces_one_synchronous_compilation_flight() {
 
 #[test]
 fn direct_lookup_uses_collision_fallback_without_replacing_primary_slot() {
-    fn published(key: RegionKey, entry: usize) -> Arc<PublishedRegion> {
-        Arc::new(PublishedRegion {
-            key,
-            entry,
-            native_bytes: 1,
-            clif_instructions: 1,
-            guest_blocks: 1,
-            register_loads: 0,
-            register_stores: 0,
-            dependencies: Box::new([]),
-            links: Box::new([]),
-        })
-    }
-
     let first = RegionKey::new(cpu(), location(CODE));
     let salt = lookup_salt(first);
     let first_slot = index_for_pc(first.start.get(), salt);
@@ -275,8 +468,8 @@ fn direct_lookup_uses_collision_fallback_without_replacing_primary_slot() {
         .unwrap();
     let second = RegionKey::new(cpu(), location(second_pc));
     let mut lookup = RegionLookup::new();
-    lookup.insert(published(first, 1));
-    lookup.insert(published(second, 2));
+    lookup.insert(first, first, 1);
+    lookup.insert(second, second, 2);
     assert_eq!(lookup.get(first).unwrap().entry, 1);
     assert_eq!(lookup.get(second).unwrap().entry, 2);
     assert_eq!(lookup.collision_count(), 1);
@@ -322,8 +515,8 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
     let target_key = RegionKey::new(cpu(), location(target));
     let (old_target, source_link) = {
         let state = process.state.lock().unwrap();
-        let source = state.lookup.get(source_key).unwrap();
-        let target = state.lookup.get(target_key).unwrap();
+        let source = state.region_for(source_key).unwrap();
+        let target = state.region_for(target_key).unwrap();
         assert_eq!(source.links[0].slot.load(Ordering::Acquire), target.entry);
         (Arc::clone(target), Arc::clone(&source.links[0].slot))
     };
@@ -334,6 +527,20 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
             GuestVirtualAddress::new(DATA),
             MemoryAccess::normal(MemoryAccessSize::Word),
             MemoryValue::U32(breakpoint(2)),
+        )
+        .unwrap();
+    process.reconcile(&memory).unwrap();
+    {
+        let state = process.state.lock().unwrap();
+        assert!(state.lookup.get(source_key).is_some());
+        assert!(state.lookup.get(target_key).is_some());
+        assert!(state.retired.is_empty());
+    }
+    memory
+        .maintain_cache(
+            SPACE,
+            CacheMaintenanceKind::InstructionInvalidate,
+            Some(GuestVirtualAddress::new(DATA)),
         )
         .unwrap();
     process.reconcile(&memory).unwrap();
@@ -356,7 +563,69 @@ fn executable_invalidation_unlinks_the_target_and_keeps_native_code_allocated() 
 }
 
 #[test]
-fn mapping_invalidation_conservatively_retires_the_address_space() {
+fn host_write_to_an_executable_alias_invalidates_immediately() {
+    let mut memory = memory(&[(0, breakpoint(1))]);
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        GuestPhysicalPageId::new(1),
+        MemoryPermissions::READ_WRITE,
+    ));
+    let process = JitProcess::new(cpu()).unwrap();
+    let key = RegionKey::new(cpu(), location(CODE));
+    process.entry_for(&memory, location(CODE)).unwrap();
+
+    memory
+        .write_bytes(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            &breakpoint(2).to_le_bytes(),
+        )
+        .unwrap();
+    process.reconcile(&memory).unwrap();
+
+    let state = process.state.lock().unwrap();
+    assert!(state.lookup.get(key).is_none());
+    assert_eq!(state.retired.len(), 1);
+}
+
+#[test]
+fn invalidation_unpublishes_every_entry_of_one_native_region() {
+    let mut memory = memory(&[(0x00, branch(CODE, CODE + 0x0c)), (0x0c, breakpoint(1))]);
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        GuestPhysicalPageId::new(1),
+        MemoryPermissions::READ_WRITE,
+    ));
+    let process = JitProcess::new(cpu()).unwrap();
+    let primary = RegionKey::new(cpu(), location(CODE));
+    let secondary = RegionKey::new(cpu(), location(CODE + 0x0c));
+    process.entry_for(&memory, location(CODE)).unwrap();
+    {
+        let state = process.state.lock().unwrap();
+        assert!(state.lookup.get(primary).is_some());
+        assert!(state.lookup.get(secondary).is_some());
+    }
+
+    memory
+        .write_bytes(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            &breakpoint(2).to_le_bytes(),
+        )
+        .unwrap();
+    process.reconcile(&memory).unwrap();
+
+    let state = process.state.lock().unwrap();
+    assert!(state.lookup.get(primary).is_none());
+    assert!(state.lookup.get(secondary).is_none());
+    assert!(state.regions.is_empty());
+    assert_eq!(state.retired.len(), 1);
+}
+
+#[test]
+fn mapping_invalidation_retires_only_overlapping_code() {
     let mut memory = memory(&[(0, breakpoint(0))]);
     let process = JitProcess::new(cpu()).unwrap();
     process.entry_for(&memory, location(CODE)).unwrap();
@@ -369,9 +638,60 @@ fn mapping_invalidation_conservatively_retires_the_address_space() {
         MemoryPermissions::READ_WRITE,
     ));
     process.reconcile(&memory).unwrap();
+    {
+        let state = process.state.lock().unwrap();
+        assert!(state.lookup.get(key).is_some());
+        assert!(state.retired.is_empty());
+    }
+    memory
+        .set_permissions(
+            SPACE,
+            GuestVirtualAddress::new(CODE),
+            nixe_cpu::memory::SYNTHETIC_PAGE_SIZE as u64,
+            MemoryPermissions::READ,
+        )
+        .unwrap();
+    process.reconcile(&memory).unwrap();
     let state = process.state.lock().unwrap();
     assert!(state.lookup.get(key).is_none());
     assert_eq!(state.retired.len(), 1);
+}
+
+#[test]
+fn mapping_overlap_is_half_open_and_safe_at_the_top_of_address_space() {
+    let ordinary = nixe_cpu::memory::CodePageSpan::containing(
+        GuestVirtualAddress::new(0x1000),
+        Some(GuestVirtualAddress::new(0x2000)),
+        GuestVirtualAddress::new(0x1000),
+    )
+    .unwrap();
+    assert!(!mapping_range_overlaps(
+        ordinary,
+        GuestVirtualAddress::new(0x0000),
+        0x1000,
+    ));
+    assert!(mapping_range_overlaps(
+        ordinary,
+        GuestVirtualAddress::new(0x1fff),
+        1,
+    ));
+    assert!(!mapping_range_overlaps(
+        ordinary,
+        GuestVirtualAddress::new(0x2000),
+        0x1000,
+    ));
+
+    let top = nixe_cpu::memory::CodePageSpan::containing(
+        GuestVirtualAddress::new(u64::MAX - 0xfff),
+        None,
+        GuestVirtualAddress::new(u64::MAX),
+    )
+    .unwrap();
+    assert!(mapping_range_overlaps(
+        top,
+        GuestVirtualAddress::new(u64::MAX),
+        1,
+    ));
 }
 
 struct BlockingTimer {
@@ -441,6 +761,13 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
             GuestVirtualAddress::new(DATA),
             MemoryAccess::normal(MemoryAccessSize::Word),
             MemoryValue::U32(breakpoint(9)),
+        )
+        .unwrap();
+    memory
+        .maintain_cache(
+            SPACE,
+            CacheMaintenanceKind::InstructionInvalidate,
+            Some(GuestVirtualAddress::new(DATA)),
         )
         .unwrap();
     release.wait();
@@ -657,6 +984,39 @@ fn every_platform_fp_simd_catalog_entry_has_a_direct_or_exact_typed_lowering() {
                 .map(|pattern| pattern.coverage_id.get())
                 .collect()
         );
+    }
+}
+
+#[test]
+fn every_recognized_unsupported_catalog_entry_exits_with_its_exact_identity() {
+    for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+        let cpu = ProcessCpuContext::for_platform(platform, SPACE);
+        for pattern in nixe_cpu::decode::a64::patterns()
+            .iter()
+            .filter(|pattern| pattern.decoder == DecodeSupport::RecognizedUnimplemented)
+        {
+            let encoding = pattern
+                .regression_fixture
+                .expect("every unsupported catalog entry has a fixture")
+                .encoding
+                .bits();
+            let memory = memory(&[(0, encoding)]);
+            let process = JitProcess::new(cpu).unwrap();
+            let mut state = state(CODE, 0);
+            let exit = JitThread::new()
+                .run(&process, &memory, &mut state, 1)
+                .unwrap();
+            let DirectExit::Unsupported { pc, instructions } = exit else {
+                panic!("{} did not take the unsupported exit", pattern.name);
+            };
+            assert_eq!(pc, GuestVirtualAddress::new(CODE));
+            assert_eq!(instructions, 0);
+            assert!(matches!(
+                unsupported_exit(&process, &memory, pc, instructions, &state).unwrap(),
+                CpuExit::UnsupportedSemantics { coverage_id, .. }
+                    if coverage_id == pattern.coverage_id
+            ));
+        }
     }
 }
 
@@ -945,7 +1305,7 @@ fn clean_ram_loads_and_stores_leave_the_rust_slow_path_after_arming() {
         let mut state = memory_state();
         assert!(state.set_vector(0, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00));
         thread.run(&process, &memory, &mut state, 1).unwrap();
-        let after_first = thread.slow_memory_calls.load(Ordering::Relaxed);
+        let after_first = process.slow_memory_calls.load(Ordering::Relaxed);
         assert_eq!(after_first, 1, "{encoding:#010x}");
 
         state.set_pc(CODE);
@@ -954,7 +1314,7 @@ fn clean_ram_loads_and_stores_leave_the_rust_slow_path_after_arming() {
         assert!(state.set_vector(0, 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100));
         thread.run(&process, &memory, &mut state, 1).unwrap();
         assert_eq!(
-            thread.slow_memory_calls.load(Ordering::Relaxed),
+            process.slow_memory_calls.load(Ordering::Relaxed),
             after_first,
             "{encoding:#010x} returned to Rust after fastmem was armed"
         );
@@ -1192,7 +1552,7 @@ fn exclusive_atomic_updates_are_indivisible_across_vcpus() {
 }
 
 #[test]
-fn executable_alias_writes_publish_memory_owned_invalidation() {
+fn executable_alias_writes_wait_for_instruction_cache_maintenance() {
     let mut memory = memory(&[(0, 0xf900_0023), (4, breakpoint(0))]); // STR X3,[X1]
     assert!(memory.map_page(
         SPACE,
@@ -1206,10 +1566,22 @@ fn executable_alias_writes_publish_memory_owned_invalidation() {
         .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state, 1)
         .unwrap();
     let mut invalidations = Vec::new();
-    let after = memory
+    let after_write = memory
         .read_invalidations_since(before, &mut invalidations)
         .unwrap();
-    assert!(after > before);
+    assert_eq!(after_write, before);
+    assert!(invalidations.is_empty());
+
+    memory
+        .maintain_cache(
+            SPACE,
+            CacheMaintenanceKind::InstructionInvalidate,
+            Some(GuestVirtualAddress::new(DATA)),
+        )
+        .unwrap();
+    memory
+        .read_invalidations_since(after_write, &mut invalidations)
+        .unwrap();
     assert!(
         invalidations
             .iter()
@@ -1647,6 +2019,22 @@ fn lazy_flags_merge_at_internal_join_without_canonical_reload() {
         thread.run(&process, &memory, &mut state, 4).unwrap();
         assert_eq!(state, expected);
     }
+
+    let mut side_entry = rich_state();
+    side_entry.set_pc(CODE + 0x14);
+    side_entry.set_nzcv(Nzcv::from_bits(Nzcv::Z));
+    let mut expected = side_entry.clone();
+    for offset in [0x14, 0x18] {
+        execute_one(
+            &cpu().platform(),
+            &mut expected,
+            memory_word(&memory, offset),
+        )
+        .unwrap();
+    }
+    thread.run(&process, &memory, &mut side_entry, 2).unwrap();
+    assert_eq!(side_entry, expected);
+    assert_eq!(process.state.lock().unwrap().compiled_regions, 1);
 }
 
 #[test]
@@ -1657,8 +2045,7 @@ fn simple_scalar_shapes_remain_bounded() {
         process.entry_for(&memory, location(CODE)).unwrap();
         let state = process.state.lock().unwrap();
         let region = state
-            .lookup
-            .get(RegionKey::new(cpu(), location(CODE)))
+            .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
         assert!(
             region.clif_instructions <= 104,
@@ -1688,8 +2075,7 @@ fn memory_and_system_shapes_remain_bounded() {
         process.entry_for(&memory, location(CODE)).unwrap();
         let state = process.state.lock().unwrap();
         let region = state
-            .lookup
-            .get(RegionKey::new(cpu(), location(CODE)))
+            .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
         assert!(region.clif_instructions <= 512, "{encoding:#010x}");
         assert!(region.native_bytes <= 4096, "{encoding:#010x}");
@@ -1720,8 +2106,7 @@ fn fp_simd_shapes_remain_bounded_by_family() {
         process.entry_for(&memory, location(CODE)).unwrap();
         let state = process.state.lock().unwrap();
         let region = state
-            .lookup
-            .get(RegionKey::new(cpu(), location(CODE)))
+            .region_for(RegionKey::new(cpu(), location(CODE)))
             .unwrap();
         assert!(
             region.clif_instructions <= clif_limit,

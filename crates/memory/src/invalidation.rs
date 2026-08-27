@@ -48,11 +48,22 @@ pub enum MemoryInvalidationKind {
     InstructionCache { address_space: AddressSpaceId },
 }
 
+/// Producer which published a memory invalidation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MemoryInvalidationOrigin {
+    Mapping,
+    DeviceWrite,
+    HostWrite,
+    CacheMaintenance,
+    Unknown,
+}
+
 /// One completely published invalidation and its stream position.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryInvalidation {
     pub cursor: MemoryInvalidationCursor,
     pub kind: MemoryInvalidationKind,
+    pub origin: MemoryInvalidationOrigin,
 }
 
 /// Failure to consume or publish the bounded invalidation stream.
@@ -115,7 +126,7 @@ impl Default for InvalidationRing {
     }
 }
 
-/// Fixed-capacity source shared by interpreters, JITs, and future NCE domains.
+/// Fixed-capacity source consumed independently by the interpreter and JIT.
 pub struct MemoryInvalidationLog {
     latest: AtomicU64,
     ring: Mutex<InvalidationRing>,
@@ -147,6 +158,14 @@ impl MemoryInvalidationLog {
         &self,
         kind: MemoryInvalidationKind,
     ) -> Result<MemoryInvalidationReservation<'_>, MemoryInvalidationError> {
+        self.reserve_with_origin(kind, default_origin(kind))
+    }
+
+    pub fn reserve_with_origin(
+        &self,
+        kind: MemoryInvalidationKind,
+        origin: MemoryInvalidationOrigin,
+    ) -> Result<MemoryInvalidationReservation<'_>, MemoryInvalidationError> {
         let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
         let cursor = self
             .cursor()
@@ -157,7 +176,11 @@ impl MemoryInvalidationLog {
         Ok(MemoryInvalidationReservation {
             source: self,
             ring,
-            record: MemoryInvalidation { cursor, kind },
+            record: MemoryInvalidation {
+                cursor,
+                kind,
+                origin,
+            },
         })
     }
 
@@ -166,6 +189,22 @@ impl MemoryInvalidationLog {
     pub fn reserve_many<'source, 'kinds>(
         &'source self,
         kinds: &'kinds [MemoryInvalidationKind],
+    ) -> Result<MemoryInvalidationBatchReservation<'source, 'kinds>, MemoryInvalidationError> {
+        self.reserve_many_with_origin(kinds, None)
+    }
+
+    pub fn reserve_many_from<'source, 'kinds>(
+        &'source self,
+        kinds: &'kinds [MemoryInvalidationKind],
+        origin: MemoryInvalidationOrigin,
+    ) -> Result<MemoryInvalidationBatchReservation<'source, 'kinds>, MemoryInvalidationError> {
+        self.reserve_many_with_origin(kinds, Some(origin))
+    }
+
+    fn reserve_many_with_origin<'source, 'kinds>(
+        &'source self,
+        kinds: &'kinds [MemoryInvalidationKind],
+        origin: Option<MemoryInvalidationOrigin>,
     ) -> Result<MemoryInvalidationBatchReservation<'source, 'kinds>, MemoryInvalidationError> {
         let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
         let count =
@@ -183,6 +222,7 @@ impl MemoryInvalidationLog {
             ring,
             kinds,
             first,
+            origin,
         })
     }
 
@@ -232,6 +272,7 @@ pub struct MemoryInvalidationBatchReservation<'source, 'kinds> {
     ring: MutexGuard<'source, InvalidationRing>,
     kinds: &'kinds [MemoryInvalidationKind],
     first: u64,
+    origin: Option<MemoryInvalidationOrigin>,
 }
 
 impl MemoryInvalidationBatchReservation<'_, '_> {
@@ -242,12 +283,26 @@ impl MemoryInvalidationBatchReservation<'_, '_> {
         for (index, kind) in self.kinds.iter().copied().enumerate() {
             let value = self.first + index as u64;
             let cursor = MemoryInvalidationCursor::new(value);
-            self.ring.records[slot(value)] = Some(MemoryInvalidation { cursor, kind });
+            self.ring.records[slot(value)] = Some(MemoryInvalidation {
+                cursor,
+                kind,
+                origin: self.origin.unwrap_or_else(|| default_origin(kind)),
+            });
             self.ring.count = (self.ring.count + 1).min(MEMORY_INVALIDATION_CAPACITY);
         }
         let cursor = MemoryInvalidationCursor::new(self.first + self.kinds.len() as u64 - 1);
         self.source.latest.store(cursor.get(), Ordering::Release);
         cursor
+    }
+}
+
+const fn default_origin(kind: MemoryInvalidationKind) -> MemoryInvalidationOrigin {
+    match kind {
+        MemoryInvalidationKind::Mapping { .. } => MemoryInvalidationOrigin::Mapping,
+        MemoryInvalidationKind::InstructionCache { .. } => {
+            MemoryInvalidationOrigin::CacheMaintenance
+        }
+        MemoryInvalidationKind::ExecutableContent { .. } => MemoryInvalidationOrigin::Unknown,
     }
 }
 
@@ -325,7 +380,9 @@ mod tests {
                 second: None,
             },
         ];
-        let reserved = log.reserve_many(&kinds).unwrap();
+        let reserved = log
+            .reserve_many_from(&kinds, MemoryInvalidationOrigin::HostWrite)
+            .unwrap();
         assert_eq!(log.cursor(), MemoryInvalidationCursor::INITIAL);
         assert_eq!(reserved.commit(), MemoryInvalidationCursor::new(2));
 
@@ -338,5 +395,10 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].kind, kinds[0]);
         assert_eq!(records[1].kind, kinds[1]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.origin == MemoryInvalidationOrigin::HostWrite)
+        );
     }
 }

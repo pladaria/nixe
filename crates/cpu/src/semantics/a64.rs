@@ -1,7 +1,9 @@
 //! Pure architectural decisions shared by A64 execution engines.
 
 use crate::{
-    memory::{BarrierAccess, BarrierDomain, BarrierOperation, MemoryAccessSize},
+    memory::{
+        BarrierAccess, BarrierDomain, BarrierOperation, CacheMaintenanceKind, MemoryAccessSize,
+    },
     platform::TargetPlatform,
     semantics::shifts::ShiftKind,
 };
@@ -107,6 +109,26 @@ pub const fn barrier_operation(opcode: u8, option: u8) -> Option<BarrierOperatio
     } else {
         BarrierOperation::DataMemory { domain, access }
     })
+}
+
+/// One userspace cache-maintenance operation implemented by the memory owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheMaintenanceOperation {
+    pub kind: CacheMaintenanceKind,
+    pub uses_address: bool,
+}
+
+#[must_use]
+pub const fn cache_maintenance_operation(system_key: u32) -> Option<CacheMaintenanceOperation> {
+    let (kind, uses_address) = match system_key {
+        0xd508_7500 => (CacheMaintenanceKind::InstructionInvalidate, false),
+        0xd50b_7520 => (CacheMaintenanceKind::InstructionInvalidate, true),
+        0xd508_7620 => (CacheMaintenanceKind::DataInvalidate, true),
+        0xd50b_7b20 => (CacheMaintenanceKind::DataClean, true),
+        0xd50b_7e20 => (CacheMaintenanceKind::DataCleanAndInvalidate, true),
+        _ => return None,
+    };
+    Some(CacheMaintenanceOperation { kind, uses_address })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

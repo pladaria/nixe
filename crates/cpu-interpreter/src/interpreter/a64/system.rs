@@ -157,26 +157,18 @@ fn execute_system(
     // the CPU-memory owner synchronizes canonical bytes and derived engine code.
     // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/IC-IVAU--Instruction-Cache-line-Invalidate-by-VA-to-PoU
     // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions/DC-CIVAC--Data-or-Unified-Cache-Line-Clean-and-Invalidate-by-VA-to-PoC
-    let (kind, uses_address) = match fields.system_key {
-        0xd508_7500 => (
-            nixe_cpu::memory::CacheMaintenanceKind::InstructionInvalidate,
-            false,
-        ),
-        0xd50b_7520 => (
-            nixe_cpu::memory::CacheMaintenanceKind::InstructionInvalidate,
-            true,
-        ),
-        0xd508_7620 => (nixe_cpu::memory::CacheMaintenanceKind::DataInvalidate, true),
-        0xd50b_7b20 => (nixe_cpu::memory::CacheMaintenanceKind::DataClean, true),
-        0xd50b_7e20 => (
-            nixe_cpu::memory::CacheMaintenanceKind::DataCleanAndInvalidate,
-            true,
-        ),
-        _ => return Ok(false),
+    let Some(operation) = nixe_cpu::semantics::a64::cache_maintenance_operation(fields.system_key)
+    else {
+        return Ok(false);
     };
     let memory = context.memory();
-    let address = uses_address
+    let address = operation
+        .uses_address
         .then(|| nixe_memory::GuestVirtualAddress::new(read(state, fields.rt, 64, false)));
-    memory.maintain_cache(context.process().address_space_id(), kind, address)?;
+    memory.maintain_cache(
+        context.process().address_space_id(),
+        operation.kind,
+        address,
+    )?;
     Ok(true)
 }

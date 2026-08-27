@@ -10,8 +10,8 @@ use crate::{
     BackingIdentityExhausted, BackingStoreId, CanonicalBackingRange, CanonicalBackingSegment,
     CanonicalPageId, ContentGeneration, ContentMutationEpoch, CpuVisibilityRequest, CpuWriteEpoch,
     DeviceAccessDeclaration, DeviceVisibilityRequest, GenerationExhausted, GuestPhysicalPageId,
-    MappingGeneration, MemoryInvalidationKind, MemoryInvalidationLog, MemoryPermissions,
-    NonCpuDeviceId, VisibilityCoordinator, VisibilityError, VisibilityState,
+    MappingGeneration, MemoryInvalidationKind, MemoryInvalidationLog, MemoryInvalidationOrigin,
+    MemoryPermissions, NonCpuDeviceId, VisibilityCoordinator, VisibilityError, VisibilityState,
 };
 
 struct CanonicalBackingStoreInner {
@@ -1122,10 +1122,13 @@ impl CanonicalBackingPage {
             .executable_invalidations
             .get()
             .map(|invalidations| {
-                invalidations.reserve(MemoryInvalidationKind::ExecutableContent {
-                    first: self.identity().page(),
-                    second: None,
-                })
+                invalidations.reserve_with_origin(
+                    MemoryInvalidationKind::ExecutableContent {
+                        first: self.identity().page(),
+                        second: None,
+                    },
+                    MemoryInvalidationOrigin::DeviceWrite,
+                )
             })
             .transpose()
             .map_err(|_| VisibilityError::ResourceExhausted)?;

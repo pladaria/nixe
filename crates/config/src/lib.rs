@@ -73,7 +73,7 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
-        let cpu = cpu_configuration(path, base_directory, raw.cpu)?;
+        let cpu = cpu_configuration(base_directory, raw.cpu);
         let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         Ok(Self {
@@ -240,29 +240,13 @@ pub enum CpuBackendSelection {
     Interpreter,
 }
 
-/// Product-level JIT resource and diagnostic policy. Compiler implementation
-/// details remain private to the selected backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Optional output produced by the direct JIT.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CpuJitConfig {
-    pub max_cached_regions: usize,
-    pub max_cache_bytes: usize,
-    pub max_concurrent_compilations: usize,
-    /// Optional directory for guest-code and neutral-IR compilation dumps.
+    /// Optional directory for per-region CLIF and native-code dumps.
     pub dump_directory: Option<PathBuf>,
     /// Optional directory receiving one aggregate JIT performance report per run.
     pub performance_report_directory: Option<PathBuf>,
-}
-
-impl Default for CpuJitConfig {
-    fn default() -> Self {
-        Self {
-            max_cached_regions: DEFAULT_JIT_MAX_CACHED_REGIONS,
-            max_cache_bytes: DEFAULT_JIT_CACHE_MIB * 1024 * 1024,
-            max_concurrent_compilations: DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS,
-            dump_directory: None,
-            performance_report_directory: None,
-        }
-    }
 }
 
 /// Named mappings from host gamepads to the emulated controller.
@@ -321,8 +305,6 @@ pub enum ConfigError {
     InvalidInput { path: PathBuf, reason: String },
     /// GPU cache capacities are zero or cannot be represented in bytes.
     InvalidGpu { path: PathBuf, reason: String },
-    /// CPU backend resource settings are invalid.
-    InvalidCpu { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -362,11 +344,6 @@ impl Display for ConfigError {
                 "configuration {} has invalid GPU settings: {reason}",
                 path.display()
             ),
-            Self::InvalidCpu { path, reason } => write!(
-                formatter,
-                "configuration {} has invalid CPU settings: {reason}",
-                path.display()
-            ),
         }
     }
 }
@@ -379,8 +356,7 @@ impl Error for ConfigError {
             Self::UnsupportedVersion { .. }
             | Self::InvalidTime { .. }
             | Self::InvalidInput { .. }
-            | Self::InvalidGpu { .. }
-            | Self::InvalidCpu { .. } => None,
+            | Self::InvalidGpu { .. } => None,
         }
     }
 }
@@ -414,39 +390,14 @@ struct RawCpuConfig {
     jit: RawCpuJitConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCpuJitConfig {
-    #[serde(default = "default_jit_max_cached_regions")]
-    max_cached_regions: usize,
-    #[serde(default = "default_jit_cache_mib")]
-    cache_mib: usize,
-    #[serde(default = "default_jit_max_concurrent_compilations")]
-    max_concurrent_compilations: usize,
     #[serde(default)]
     dump_directory: Option<String>,
     #[serde(default)]
     performance_report_directory: Option<String>,
 }
-
-impl Default for RawCpuJitConfig {
-    fn default() -> Self {
-        Self {
-            max_cached_regions: default_jit_max_cached_regions(),
-            cache_mib: default_jit_cache_mib(),
-            max_concurrent_compilations: default_jit_max_concurrent_compilations(),
-            dump_directory: None,
-            performance_report_directory: None,
-        }
-    }
-}
-
-const DEFAULT_JIT_MAX_CACHED_REGIONS: usize = 32_768;
-const DEFAULT_JIT_CACHE_MIB: usize = 512;
-const DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS: usize = 4;
-const MAX_JIT_MAX_CACHED_REGIONS: usize = DEFAULT_JIT_MAX_CACHED_REGIONS;
-const MAX_JIT_CACHE_MIB: usize = DEFAULT_JIT_CACHE_MIB;
-const MAX_JIT_CONCURRENT_COMPILATIONS: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -540,18 +491,6 @@ const fn default_recursive_scan() -> bool {
     true
 }
 
-const fn default_jit_max_cached_regions() -> usize {
-    DEFAULT_JIT_MAX_CACHED_REGIONS
-}
-
-const fn default_jit_cache_mib() -> usize {
-    DEFAULT_JIT_CACHE_MIB
-}
-
-const fn default_jit_max_concurrent_compilations() -> usize {
-    DEFAULT_JIT_MAX_CONCURRENT_COMPILATIONS
-}
-
 fn default_timezone() -> String {
     "UTC".to_owned()
 }
@@ -604,48 +543,11 @@ fn gpu_cache_configuration(
     })
 }
 
-fn cpu_configuration(
-    path: &Path,
-    base_directory: &Path,
-    raw: RawCpuConfig,
-) -> Result<CpuConfig, ConfigError> {
-    if !(1..=MAX_JIT_MAX_CACHED_REGIONS).contains(&raw.jit.max_cached_regions) {
-        return Err(ConfigError::InvalidCpu {
-            path: path.to_owned(),
-            reason: format!(
-                "cpu.jit.max_cached_regions must be between 1 and {MAX_JIT_MAX_CACHED_REGIONS}"
-            ),
-        });
-    }
-    if !(1..=MAX_JIT_CACHE_MIB).contains(&raw.jit.cache_mib) {
-        return Err(ConfigError::InvalidCpu {
-            path: path.to_owned(),
-            reason: format!("cpu.jit.cache_mib must be between 1 and {MAX_JIT_CACHE_MIB}"),
-        });
-    }
-    if !(1..=MAX_JIT_CONCURRENT_COMPILATIONS).contains(&raw.jit.max_concurrent_compilations) {
-        return Err(ConfigError::InvalidCpu {
-            path: path.to_owned(),
-            reason: format!(
-                "cpu.jit.max_concurrent_compilations must be between 1 and {MAX_JIT_CONCURRENT_COMPILATIONS}"
-            ),
-        });
-    }
-    let max_cache_bytes =
-        raw.jit
-            .cache_mib
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| ConfigError::InvalidCpu {
-                path: path.to_owned(),
-                reason: "cpu.jit.cache_mib does not fit in bytes".to_owned(),
-            })?;
-    Ok(CpuConfig {
+fn cpu_configuration(base_directory: &Path, raw: RawCpuConfig) -> CpuConfig {
+    CpuConfig {
         backend: raw.backend,
         parallel_vcpus: raw.parallel_vcpus,
         jit: CpuJitConfig {
-            max_cached_regions: raw.jit.max_cached_regions,
-            max_cache_bytes,
-            max_concurrent_compilations: raw.jit.max_concurrent_compilations,
             dump_directory: raw
                 .jit
                 .dump_directory
@@ -659,7 +561,7 @@ fn cpu_configuration(
                 .map(PathBuf::from)
                 .map(|directory| resolve_path(base_directory, directory)),
         },
-    })
+    }
 }
 
 fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
@@ -902,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_selection_and_jit_budgets_are_typed_and_validated() {
+    fn cpu_backend_selection_and_jit_diagnostics_are_typed() {
         let default_file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -966,9 +868,6 @@ mod tests {
                 [cpu]
                 backend = "jit"
                 [cpu.jit]
-                max_cached_regions = 256
-                cache_mib = 16
-                max_concurrent_compilations = 2
                 dump_directory = "./diagnostics/jit"
                 performance_report_directory = "./diagnostics/jit-performance"
             "#,
@@ -978,9 +877,6 @@ mod tests {
         assert_eq!(
             jit.jit,
             CpuJitConfig {
-                max_cached_regions: 256,
-                max_cache_bytes: 16 * 1024 * 1024,
-                max_concurrent_compilations: 2,
                 dump_directory: Some(jit_file.path.parent().unwrap().join("./diagnostics/jit")),
                 performance_report_directory: Some(
                     jit_file
@@ -1040,30 +936,6 @@ mod tests {
             NixeConfig::load(&invalid_backend.path),
             Err(ConfigError::Parse { .. })
         ));
-
-        for setting in [
-            "max_cached_regions = 0",
-            "cache_mib = 0",
-            "max_concurrent_compilations = 0",
-        ] {
-            let invalid_budget = TemporaryConfig::new(&format!(
-                r#"
-                    version = 2
-                    [library]
-                    paths = []
-                    [system]
-                    preferred_languages = []
-                    keys = "keys"
-                    initial_operation_mode = "handheld"
-                    [cpu.jit]
-                    {setting}
-                "#
-            ));
-            assert!(matches!(
-                NixeConfig::load(&invalid_budget.path),
-                Err(ConfigError::InvalidCpu { .. })
-            ));
-        }
     }
 
     #[test]
