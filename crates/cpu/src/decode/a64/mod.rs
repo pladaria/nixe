@@ -18,48 +18,6 @@ use super::{
     table::{DecodeSupport, DecoderTable, InstructionPattern, OperandField, RegressionFixture},
 };
 
-/// Opaque payload forwarded to exact helpers without being decoded by a
-/// lifter. It is not an operand source and deliberately exposes no bit-field
-/// access API.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct A64HelperToken {
-    instruction_id: u32,
-    encoding: u32,
-}
-
-impl A64HelperToken {
-    pub(super) const fn new(instruction_id: u32, encoding: u32) -> Self {
-        Self {
-            instruction_id,
-            encoding,
-        }
-    }
-
-    #[must_use]
-    pub const fn helper_abi_value(self) -> u32 {
-        self.encoding
-    }
-
-    /// Stable semantic-helper identity containing the normalized instruction
-    /// family and its opaque encoding. Lifters forward this value unchanged;
-    /// only the architectural semantic provider may unpack it.
-    #[must_use]
-    pub const fn semantic_abi_value(self) -> u64 {
-        (self.instruction_id as u64) << 32 | self.encoding as u64
-    }
-
-    pub(crate) const fn from_semantic_abi_value(value: u64) -> Self {
-        Self {
-            instruction_id: (value >> 32) as u32,
-            encoding: value as u32,
-        }
-    }
-
-    pub(crate) const fn instruction_id(self) -> u32 {
-        self.instruction_id
-    }
-}
-
 /// Fully normalized A64 instruction consumed by the family lifters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum A64Instruction {
@@ -76,6 +34,11 @@ pub enum A64Instruction {
 pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64Instruction {
     let bits = encoding.bits();
     let instruction_id = opcode.coverage_id().get();
+    if opcode.pattern().decoder == DecodeSupport::RecognizedUnimplemented {
+        return A64Instruction::RecognizedUnsupported {
+            coverage_id: opcode.coverage_id(),
+        };
+    }
     match instruction_id {
         0x0000_0001 | 0x0000_0002 | 0x0000_0004..=0x0000_000a | 0x0000_0044..=0x0000_0047 => {
             A64Instruction::Control(control::normalize(instruction_id, bits))
@@ -89,9 +52,6 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> A64In
         0x0000_0022..=0x0000_002f => {
             A64Instruction::Memory(memory::normalize(instruction_id, bits))
         }
-        0x0000_0038 | 0x0000_0039 => A64Instruction::RecognizedUnsupported {
-            coverage_id: opcode.coverage_id(),
-        },
         0x0000_0030..=0x0000_0043 | 0x0000_0048..=0x0000_005d | 0x0000_0060..=0x0000_00a0 => {
             A64Instruction::FpSimd(fp_simd::normalize(instruction_id, bits))
         }
@@ -163,4 +123,53 @@ fn platform_table(platform: crate::platform::TargetPlatform) -> &'static Decoder
 #[must_use]
 pub fn table() -> &'static DecoderTable {
     platform_table(crate::platform::TargetPlatform::Switch1)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::{
+        decode::{DecodeResult, table::DecodeSupport},
+        location::LocationDescriptor,
+        platform::TargetPlatform,
+    };
+    use nixe_memory::GuestVirtualAddress;
+
+    use super::*;
+
+    #[test]
+    fn every_platform_catalog_entry_has_one_decodable_fixture_and_identity() {
+        let unique_ids: BTreeSet<_> = patterns()
+            .iter()
+            .map(|pattern| pattern.coverage_id)
+            .collect();
+        assert_eq!(unique_ids.len(), patterns().len());
+
+        for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+            let location =
+                LocationDescriptor::new(GuestVirtualAddress::new(0), platform.profile_id());
+            for pattern in patterns() {
+                let fixture = pattern
+                    .regression_fixture
+                    .expect("every A64 catalog entry has a regression fixture");
+                let decoded = platform_table(platform).decode(location, fixture.encoding);
+                let (coverage_id, support) = match decoded {
+                    DecodeResult::Decoded(decoded) => {
+                        (decoded.instruction.coverage_id(), DecodeSupport::Ready)
+                    }
+                    DecodeResult::RecognizedUnimplemented(decoded) => (
+                        decoded.instruction.coverage_id(),
+                        DecodeSupport::RecognizedUnimplemented,
+                    ),
+                    rejected => panic!(
+                        "{platform:?} rejected fixture for {}: {rejected:?}",
+                        pattern.name
+                    ),
+                };
+                assert_eq!(coverage_id, pattern.coverage_id);
+                assert_eq!(support, pattern.decoder);
+            }
+        }
+    }
 }

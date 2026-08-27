@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use nixe_gpu_wgpu::{WgpuPresentationContext, resident_texture};
+use nixe_gpu_wgpu::{WgpuPresentationContext, WgpuQueueAccess, resident_texture};
 use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
 use wgpu::{
     Backend, BindGroup, BindGroupLayout, Buffer, BufferDescriptor, BufferUsages, Color,
@@ -158,6 +158,7 @@ struct Presenter {
     surface: Surface<'static>,
     device: Device,
     queue: Queue,
+    queue_access: WgpuQueueAccess,
     surface_configuration: SurfaceConfiguration,
     bind_group_layout: BindGroupLayout,
     sampler: Sampler,
@@ -171,6 +172,7 @@ struct Presenter {
     frame_rate: FrameRateTracker,
     displayed_title: String,
     configured: bool,
+    surface_reconfigure_pending: bool,
 }
 
 impl Presenter {
@@ -189,6 +191,7 @@ impl Presenter {
         );
         let device = context.device().clone();
         let queue = context.queue().clone();
+        let queue_access = context.queue_access().clone();
         let size = window.inner_size();
         let mut surface_configuration = surface
             .get_default_config(adapter, size.width.max(1), size.height.max(1))
@@ -295,6 +298,7 @@ impl Presenter {
             surface,
             device,
             queue,
+            queue_access,
             surface_configuration,
             bind_group_layout,
             sampler,
@@ -308,6 +312,7 @@ impl Presenter {
             frame_rate: FrameRateTracker::new(Instant::now()),
             displayed_title: String::new(),
             configured: false,
+            surface_reconfigure_pending: false,
         };
         presenter.resize(size.width, size.height);
         presenter.update_title();
@@ -317,9 +322,10 @@ impl Presenter {
     fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             self.configured = false;
+            self.surface_reconfigure_pending = false;
             return;
         }
-        if self.configured
+        if (self.configured || self.surface_reconfigure_pending)
             && self.surface_configuration.width == width
             && self.surface_configuration.height == height
         {
@@ -327,10 +333,18 @@ impl Presenter {
         }
         self.surface_configuration.width = width;
         self.surface_configuration.height = height;
+        self.surface_reconfigure_pending = true;
+    }
+
+    fn configure_surface_if_pending(&mut self) {
+        if !self.surface_reconfigure_pending {
+            return;
+        }
+        let _queue_access = self.queue_access.lock();
         self.surface
             .configure(&self.device, &self.surface_configuration);
         self.configured = true;
-        self.update_title();
+        self.surface_reconfigure_pending = false;
     }
 
     fn recreate_surface(&mut self) -> Result<(), WindowError> {
@@ -338,10 +352,8 @@ impl Presenter {
             .instance
             .create_surface(Arc::clone(&self.window))
             .map_err(WindowError::surface)?;
-        if self.configured {
-            self.surface
-                .configure(&self.device, &self.surface_configuration);
-        }
+        self.configured = false;
+        self.surface_reconfigure_pending = true;
         Ok(())
     }
 
@@ -407,11 +419,13 @@ impl Presenter {
             0,
             0,
         ];
+        let _queue_access = self.queue_access.lock();
         self.queue
             .write_buffer(&self.sampling_buffer, 0, bytemuck::cast_slice(&parameters));
     }
 
     fn redraw(&mut self) -> Result<(), WindowError> {
+        self.configure_surface_if_pending();
         if !self.configured {
             return Ok(());
         }
@@ -421,8 +435,7 @@ impl Presenter {
             CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
             CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return Ok(()),
             CurrentSurfaceTexture::Outdated => {
-                self.surface
-                    .configure(&self.device, &self.surface_configuration);
+                self.surface_reconfigure_pending = true;
                 self.window.request_redraw();
                 return Ok(());
             }
@@ -481,14 +494,17 @@ impl Presenter {
                 pass.draw(0..3, 0..1);
             }
         }
-        self.queue.submit([encoder.finish()]);
+        {
+            let _queue_access = self.queue_access.lock();
+            self.queue.submit([encoder.finish()]);
+            self.queue.present(surface_texture);
+        }
         self.pending_frame = None;
-        self.queue.present(surface_texture);
         let now = Instant::now();
         self.refresh_title(now);
         if reconfigure_after_present {
-            self.surface
-                .configure(&self.device, &self.surface_configuration);
+            self.surface_reconfigure_pending = true;
+            self.window.request_redraw();
         }
         Ok(())
     }

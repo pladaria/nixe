@@ -8,7 +8,7 @@ mod visibility;
 
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use driver::WgpuBackendDriver;
 use visibility::WgpuVisibilityCoordinator;
@@ -132,6 +132,30 @@ pub struct WgpuAdapterInformation {
     pub backend: HostBackend,
 }
 
+/// Serializes host queue mutation with surface reconfiguration.
+///
+/// WGPU requires the device queue to remain empty while a surface is being
+/// configured. The guest GPU worker and the window presenter share one queue,
+/// so both must hold this access token while submitting or reconfiguring.
+#[derive(Clone, Debug, Default)]
+pub struct WgpuQueueAccess {
+    lock: Arc<Mutex<()>>,
+}
+
+impl WgpuQueueAccess {
+    pub fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+pub(crate) struct WgpuExecutionContext {
+    device: Device,
+    queue: Queue,
+    queue_access: WgpuQueueAccess,
+}
+
 /// Result of accelerated backend initialization.
 pub struct InitializedWgpuBackend {
     runtime: Box<dyn NeutralBackendRuntime>,
@@ -165,6 +189,7 @@ pub struct WgpuPresentationContext {
     adapter: Adapter,
     device: Device,
     queue: Queue,
+    queue_access: WgpuQueueAccess,
 }
 
 impl WgpuPresentationContext {
@@ -191,6 +216,11 @@ impl WgpuPresentationContext {
     #[must_use]
     pub const fn queue(&self) -> &Queue {
         &self.queue
+    }
+
+    #[must_use]
+    pub const fn queue_access(&self) -> &WgpuQueueAccess {
+        &self.queue_access
     }
 }
 
@@ -305,17 +335,22 @@ async fn initialize_backend_async(
         );
         None
     };
+    let queue_access = WgpuQueueAccess::default();
     let presentation = WgpuPresentationContext {
         backend: instance_id,
         instance: instance.clone(),
         adapter: adapter.clone(),
         device: device.clone(),
         queue: queue.clone(),
+        queue_access: queue_access.clone(),
     };
     let driver = WgpuBackendDriver::new(
         instance_id,
-        device,
-        queue,
+        WgpuExecutionContext {
+            device,
+            queue,
+            queue_access,
+        },
         Arc::clone(&visibility),
         pipeline_cache,
         pipeline_cache_path,

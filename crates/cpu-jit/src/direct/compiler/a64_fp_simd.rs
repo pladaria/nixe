@@ -201,9 +201,6 @@ impl CraneliftTranslator<'_, '_> {
             | Instruction::MemorySingleStructurePostIndex(_) => {
                 self.emit_vector_memory(source, instruction, fields, flags)
             }
-            Instruction::MemoryLiteral(_) | Instruction::ScalarTwoSource(_) => Err(
-                DirectJitError::unsupported("unsupported catalogued A64 FP/SIMD instruction"),
-            ),
             _ => self.emit_exact_fp(source, instruction, fields, flags),
         }
     }

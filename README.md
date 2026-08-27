@@ -17,6 +17,9 @@ both platforms whenever technically appropriate.
 
 The project is currently in an early development and research phase.
 
+The current interpreter and direct-JIT design is documented in
+[CPU Architecture](docs/CPU%20Architecture.md).
+
 ## Testing
 
 Run
@@ -32,21 +35,19 @@ To run integration tests against caller-owned titles, copy `.env.integration.exa
 
 ### Differential tests
 
-Optional CPU differential tests require QEMU user-mode (`qemu-aarch64` and `qemu-arm`), the Rust
-`aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` targets, and their cross-linkers.
+Optional CPU differential tests require QEMU user-mode (`qemu-aarch64`), the Rust
+`aarch64-unknown-linux-gnu` target, and its cross-linker.
 
 ```bash
-sudo apt update && sudo apt install qemu-user gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
-rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+sudo apt update && sudo apt install qemu-user gcc-aarch64-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
 ```
 
 Verify with
 
 ```bash
 qemu-aarch64 --version
-qemu-arm --version
 aarch64-linux-gnu-gcc --version
-arm-linux-gnueabihf-gcc --version
 ```
 
 Then run
@@ -64,7 +65,7 @@ NIXE_DIFF_COVERAGE_ID=0x8c cargo test-diff-a64
 
 ### Fuzz tests
 
-CPU decoder, translation, IR verifier, and diagnostic fuzz targets require a nightly Rust toolchain
+CPU decoder and memory fuzz targets require a nightly Rust toolchain
 and `cargo-fuzz`:
 
 ```bash

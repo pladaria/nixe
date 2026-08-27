@@ -832,8 +832,8 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
     ) -> Result<AtomicMemoryResult, DataAccessFault>;
 
     /// Applies the host-side ordering required by an architectural barrier.
-    /// Domain and access remain explicit so a future NCE can map the barrier
-    /// to native execution without depending on JIT-private helpers.
+    /// Domain and access remain explicit so both CPU backends implement the
+    /// same architectural operation without sharing backend-private code.
     fn memory_barrier(&self, barrier: BarrierOperation) {
         apply_host_memory_barrier(barrier);
     }
@@ -843,6 +843,9 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
     /// Canonical RAM is coherent, so data maintenance reconciles ownership
     /// rather than modelling a host cache. Instruction invalidation publishes
     /// through the neutral memory-invalidation stream consumed by every engine.
+    /// Ordinary guest stores deliberately do not invalidate translated code:
+    /// valid A64 self-modifying code makes new instructions visible with an IC
+    /// maintenance operation.
     fn maintain_cache(
         &self,
         address_space: AddressSpaceId,

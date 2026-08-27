@@ -2,8 +2,7 @@
 //!
 //! CPU backends report an [`ExceptionDispatchRequest`]. Runtime policy
 //! handles it and returns an [`ExceptionDispatchOutcome`] which an outer
-//! execution loop applies. Neither side assumes a particular interpreter, JIT,
-//! or future NCE implementation.
+//! execution loop applies. Neither side assumes the interpreter or JIT backend.
 
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::{

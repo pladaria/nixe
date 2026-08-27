@@ -1,7 +1,9 @@
 use core::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
 use nixe_cpu::{
+    decode::table::DecodeSupport,
     location::LocationDescriptor,
     memory::{
         CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, SyntheticMemory,
@@ -84,6 +86,39 @@ fn invalid_instruction_stream_fails_precisely() {
     };
     assert_eq!(rejected_source, source(profile, 0));
     assert_eq!(encoding, 0_u32.into());
+}
+
+#[test]
+fn every_platform_catalog_entry_has_exact_interpreter_ownership() {
+    for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+        let mut covered = BTreeSet::new();
+        for pattern in nixe_cpu::decode::a64::patterns() {
+            assert!(
+                covered.insert(pattern.coverage_id),
+                "duplicate interpreter ownership for {}",
+                pattern.coverage_id
+            );
+            let encoding = pattern
+                .regression_fixture
+                .expect("every interpreter catalog entry has a fixture")
+                .encoding
+                .bits();
+            let mut state = A64State::default();
+            let result = execute_one(&platform, &mut state, encoding);
+            match pattern.decoder {
+                DecodeSupport::Ready => assert!(
+                    !matches!(result, Err(InterpreterError::UnsupportedInstruction { .. })),
+                    "{} has no interpreter handler",
+                    pattern.name
+                ),
+                DecodeSupport::RecognizedUnimplemented => assert!(matches!(
+                    result,
+                    Err(InterpreterError::UnsupportedInstruction { coverage_id, .. })
+                        if coverage_id == pattern.coverage_id
+                )),
+            }
+        }
+    }
 }
 
 fn x(index: u8) -> A64Register {

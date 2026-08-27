@@ -1,10 +1,10 @@
 use std::collections::{HashSet, VecDeque};
 
-use nixe_cpu::decode::a64::{A64Instruction, control};
+use nixe_cpu::decode::a64::{A64Instruction, control, system};
 use nixe_cpu::decode::{self, DecodeResult, DecodedOpcode};
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::location::{DecodedInstruction, InstructionEncoding, LocationDescriptor};
-use nixe_cpu::memory::{CodePageDependency, InstructionMemory};
+use nixe_cpu::memory::{CodePageDependency, CodePageSpan, InstructionMemory};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
@@ -59,6 +59,7 @@ pub(super) struct NativeRegion {
     pub(super) key: RegionKey,
     pub(super) blocks: Box<[BasicBlockRecord]>,
     pub(super) dependencies: Box<[CodePageDependency]>,
+    pub(super) mapping_dependencies: Box<[CodePageSpan]>,
     pub(super) external_exits: Box<[ExternalExitRecord]>,
     #[cfg(test)]
     pub(super) instruction_count: usize,
@@ -118,6 +119,7 @@ pub(super) fn discover_region(
     memory: &(impl InstructionMemory + ?Sized),
     start: LocationDescriptor,
     limits: RegionLimits,
+    published_entry: impl Fn(GuestVirtualAddress) -> bool,
 ) -> Result<NativeRegion, DirectJitError> {
     if limits.instructions == 0 || limits.blocks == 0 || limits.dependencies == 0 {
         return Err(DirectJitError::internal(
@@ -129,6 +131,7 @@ pub(super) fn discover_region(
     let mut scheduled = HashSet::from([start.pc]);
     let mut blocks = Vec::new();
     let mut dependencies = Vec::new();
+    let mut mapping_dependencies = Vec::new();
     let mut instruction_count = 0;
 
     while let Some(block_start) = pending.pop_front() {
@@ -141,6 +144,9 @@ pub(super) fn discover_region(
         let terminator = loop {
             if instruction_count == limits.instructions {
                 break BlockTerminator::Limit { continuation: pc };
+            }
+            if pc != block_start && published_entry(pc) {
+                break BlockTerminator::Direct { target: pc };
             }
             if pc != block_start && scheduled.contains(&pc) {
                 break BlockTerminator::Direct { target: pc };
@@ -160,6 +166,18 @@ pub(super) fn discover_region(
                 .any(|dependency| !dependencies.contains(&dependency))
             {
                 break BlockTerminator::Limit { continuation: pc };
+            }
+            if !mapping_dependencies
+                .iter()
+                .any(|span: &CodePageSpan| span.contains(pc))
+            {
+                mapping_dependencies.push(memory.code_page_span(key.address_space, pc).map_err(
+                    |fault| {
+                        DirectJitError::invalid(format!(
+                            "direct JIT code-page query failed: {fault}"
+                        ))
+                    },
+                )?);
             }
             let decoded = match decode::decode(cpu.decoder(), location, encoding) {
                 DecodeResult::Decoded(decoded) => decoded,
@@ -186,6 +204,11 @@ pub(super) fn discover_region(
                 .expect("just pushed decoded instruction");
             let next = GuestVirtualAddress::new(pc.get().wrapping_add(4));
             match decode::a64::normalize(&decoded.instruction, decoded.encoding) {
+                A64Instruction::System(instruction)
+                    if !system_instruction_supported(cpu.platform(), instruction) =>
+                {
+                    break BlockTerminator::Unsupported;
+                }
                 A64Instruction::Control(control::Instruction::Nop(_))
                 | A64Instruction::Integer(_)
                 | A64Instruction::Memory(_)
@@ -193,28 +216,70 @@ pub(super) fn discover_region(
                 | A64Instruction::FpSimd(_) => pc = next,
                 A64Instruction::Control(control::Instruction::BranchImmediate(fields)) => {
                     let target = branch_target(pc, fields.immediate_26, 26);
-                    schedule(target, limits.blocks, &mut scheduled, &mut pending);
+                    schedule(
+                        target,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
                     break BlockTerminator::Direct { target };
                 }
                 A64Instruction::Control(control::Instruction::ConditionalBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_19, 19);
                     let not_taken = next;
-                    schedule(taken, limits.blocks, &mut scheduled, &mut pending);
-                    schedule(not_taken, limits.blocks, &mut scheduled, &mut pending);
+                    schedule(
+                        taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
+                    schedule(
+                        not_taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::CompareBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_19, 19);
                     let not_taken = next;
-                    schedule(taken, limits.blocks, &mut scheduled, &mut pending);
-                    schedule(not_taken, limits.blocks, &mut scheduled, &mut pending);
+                    schedule(
+                        taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
+                    schedule(
+                        not_taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::TestBranch(fields)) => {
                     let taken = branch_target(pc, fields.immediate_14, 14);
                     let not_taken = next;
-                    schedule(taken, limits.blocks, &mut scheduled, &mut pending);
-                    schedule(not_taken, limits.blocks, &mut scheduled, &mut pending);
+                    schedule(
+                        taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
+                    schedule(
+                        not_taken,
+                        limits.blocks,
+                        &published_entry,
+                        &mut scheduled,
+                        &mut pending,
+                    );
                     break BlockTerminator::Conditional { taken, not_taken };
                 }
                 A64Instruction::Control(control::Instruction::BranchLinkImmediate(fields)) => {
@@ -316,19 +381,53 @@ pub(super) fn discover_region(
         key,
         blocks: blocks.into_boxed_slice(),
         dependencies: dependencies.into_boxed_slice(),
+        mapping_dependencies: mapping_dependencies.into_boxed_slice(),
         external_exits: external_exits.into_boxed_slice(),
         #[cfg(test)]
         instruction_count,
     })
 }
 
+fn system_instruction_supported(
+    platform: nixe_cpu::platform::TargetPlatform,
+    instruction: system::Instruction,
+) -> bool {
+    let fields = instruction.operands();
+    match instruction {
+        system::Instruction::Hint(_) => {
+            nixe_cpu::semantics::a64::hint_operation(fields.hint).is_some()
+                || matches!(fields.hint, 32 | 34 | 36 | 38)
+        }
+        system::Instruction::ReadRegister(_) => {
+            matches!(
+                fields.system_key,
+                0xd53b_4200 | 0xd53b_4400 | 0xd53b_4420 | 0xd53b_d040 | 0xd53b_d060
+            ) || nixe_cpu::semantics::a64::runtime_register_read(platform, fields.system_key)
+                .is_some()
+        }
+        system::Instruction::WriteRegister(_) => matches!(
+            fields.system_key,
+            0xd51b_4200 | 0xd51b_4400 | 0xd51b_4420 | 0xd51b_d040
+        ),
+        system::Instruction::Barrier(_) => nixe_cpu::semantics::a64::barrier_operation(
+            fields.barrier_opcode,
+            fields.barrier_option,
+        )
+        .is_some(),
+        system::Instruction::System(_) => {
+            nixe_cpu::semantics::a64::cache_maintenance_operation(fields.system_key).is_some()
+        }
+    }
+}
+
 fn schedule(
     target: GuestVirtualAddress,
     block_limit: usize,
+    published_entry: &impl Fn(GuestVirtualAddress) -> bool,
     scheduled: &mut HashSet<GuestVirtualAddress>,
     pending: &mut VecDeque<GuestVirtualAddress>,
 ) {
-    if scheduled.len() < block_limit && scheduled.insert(target) {
+    if !published_entry(target) && scheduled.len() < block_limit && scheduled.insert(target) {
         pending.push_back(target);
     }
 }

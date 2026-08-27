@@ -38,28 +38,16 @@ timezone = "Europe/Madrid"
 log_level = "debug"
 
 [cpu]
-# CPU engine selected through the capability registry: "auto", "jit", or
-# "interpreter". Auto prefers the production JIT and falls back to the
-# interpreter only when the host or guest profile cannot satisfy JIT capabilities.
+# CPU backend: "jit" or "interpreter". Neither backend falls back to the other.
 backend = "jit"
-# Opt-in host-parallel vCPU execution. The runtime rejects this mode unless the
-# selected engine provides concurrent executors, bounded safepoints, and
-# acknowledged semantic memory invalidation. False keeps deterministic serialization.
+# Opt-in host-parallel vCPU execution. False keeps deterministic serialization.
 parallel_vcpus = false
 
 [cpu.jit]
-# Per-process-domain native-code working set. Values may lower, but never exceed,
-# the architectural hard bounds enforced by the JIT provider.
-max_cached_regions = 32768
-cache_mib = 512
-# Native compilation uses an automatic per-domain worker pool sized to half of
-# the host logical cores, with at least one worker. This retained bound applies
-# only to the cache's short publication critical section.
-max_concurrent_compilations = 4
-# Optional compilation diagnostics. Missing or empty disables all JIT dumps;
-# relative paths are resolved from the directory containing this file.
+# Optional per-region CLIF and native-code dumps. Missing or empty disables
+# dumps; relative paths are resolved from this file.
 # dump_directory = "./dump/jit"
-# Directory receiving timestamped low-overhead JIT reports at coordinated shutdown.
+# Directory receiving one timestamped aggregate JIT report at shutdown.
 performance_report_directory = "./dump/jit-perf/"
 
 [gpu]

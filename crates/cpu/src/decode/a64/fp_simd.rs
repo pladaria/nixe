@@ -2,7 +2,7 @@
 
 use crate::decode::table::InstructionPattern;
 
-use super::{A64HelperToken, pattern};
+use super::pattern;
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
@@ -259,6 +259,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         30,
         &[],
     )
+    .fixture32(0x1e20_4800)
     .recognized_unimplemented(),
     pattern(
         "fp-simd-load-store-unsigned",
@@ -1121,7 +1122,6 @@ pub struct Operands {
     pub vector_128: bool,
     pub subtract: bool,
     pub scaled: bool,
-    pub helper_token: A64HelperToken,
     pub immediate_5: u8,
     pub rt2: u8,
     pub immediate_7: u8,
@@ -1174,7 +1174,6 @@ impl Operands {
             vector_128: false,
             subtract: false,
             scaled: false,
-            helper_token: A64HelperToken::new(0, 0),
             immediate_5: 0,
             rt2: 0,
             immediate_7: 0,
@@ -1315,7 +1314,6 @@ instructions!(
     MemoryPair,
     Bitwise,
     Integer,
-    ScalarTwoSource,
     ScalarMove,
     ScalarAbsolute,
     ScalarNegate,
@@ -1339,7 +1337,6 @@ instructions!(
     MemoryPostIndex,
     MemoryPreIndex,
     MemoryRegister,
-    MemoryLiteral,
     MemoryMultipleStructures,
     MemoryMultipleStructuresPostIndex,
     MemorySingleStructure,
@@ -1394,7 +1391,6 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         vector_128: bits & (1 << 30) != 0,
         subtract: bits & (1 << 29) != 0,
         scaled: bits & (1 << 12) != 0,
-        helper_token: A64HelperToken::new(instruction_id, bits),
         immediate_5: ((bits >> 16) & 0x1f) as u8,
         rt2: ((bits >> 10) & 0x1f) as u8,
         immediate_7: ((bits >> 15) & 0x7f) as u8,
@@ -1474,7 +1470,6 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0049 => Instruction::MemoryPair(operands),
         0x0000_0030 => Instruction::Bitwise(operands),
         0x0000_0031 => Instruction::Integer(operands),
-        0x0000_0032 => Instruction::ScalarTwoSource(operands),
         0x0000_0035 | 0x0000_0089 => Instruction::ScalarMove(operands),
         0x0000_008d | 0x0000_008f => Instruction::ScalarAbsolute(operands),
         0x0000_008e | 0x0000_0090 => Instruction::ScalarNegate(operands),
@@ -1502,7 +1497,6 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         0x0000_0040 => Instruction::MemoryPostIndex(operands),
         0x0000_0041 => Instruction::MemoryPreIndex(operands),
         0x0000_0042 => Instruction::MemoryRegister(operands),
-        0x0000_0043 => Instruction::MemoryLiteral(operands),
         0x0000_004c => Instruction::MemoryMultipleStructures(operands),
         0x0000_004d => Instruction::MemoryMultipleStructuresPostIndex(operands),
         0x0000_0062 => Instruction::MemorySingleStructure(operands),

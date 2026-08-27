@@ -18,7 +18,7 @@ use nixe_memory::{
     ContentGeneration, ContentMutationEpoch, FastmemArena, FastmemView, GuestPhysicalPageId,
     GuestVirtualAddress, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
     MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
-    MemoryInvalidationSource,
+    MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 
 use crate::{
@@ -925,10 +925,13 @@ impl ExecutionMemory {
             return false;
         };
         let invalidation = match inner.executable_content_page(slot) {
-            Some(first) => match invalidations.reserve(MemoryInvalidationKind::ExecutableContent {
-                first,
-                second: None,
-            }) {
+            Some(first) => match invalidations.reserve_with_origin(
+                MemoryInvalidationKind::ExecutableContent {
+                    first,
+                    second: None,
+                },
+                MemoryInvalidationOrigin::HostWrite,
+            ) {
                 Ok(invalidation) => Some(invalidation),
                 Err(_) => return false,
             },
@@ -1052,7 +1055,10 @@ impl ExecutionMemory {
             }
         }
         let invalidation = (!invalidation_kinds.is_empty())
-            .then(|| self.invalidations.reserve_many(&invalidation_kinds))
+            .then(|| {
+                self.invalidations
+                    .reserve_many_from(&invalidation_kinds, MemoryInvalidationOrigin::HostWrite)
+            })
             .transpose()
             .map_err(|reason| {
                 DataAccessFault::new(
@@ -1228,7 +1234,7 @@ impl ExecutionMemory {
                 DataAccessFaultReason::InvalidAtomicAccess,
             ));
         }
-        let (backing, executable_page) = {
+        let backing = {
             let inner = self.lock_inner();
             resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
             let resolved = resolve_access(
@@ -1252,10 +1258,7 @@ impl ExecutionMemory {
             else {
                 unreachable!()
             };
-            (
-                backing.clone(),
-                inner.executable_content_page(resolved.first.physical_slot),
-            )
+            backing.clone()
         };
         backing.prepare_cpu_access().map_err(|reason| {
             DataAccessFault::new(
@@ -1313,23 +1316,6 @@ impl ExecutionMemory {
                     DataAccessFaultReason::ContentGenerationExhausted,
                 )
             })?;
-            let invalidation = executable_page
-                .map(|first| {
-                    self.invalidations
-                        .reserve(MemoryInvalidationKind::ExecutableContent {
-                            first,
-                            second: None,
-                        })
-                })
-                .transpose()
-                .map_err(|reason| {
-                    DataAccessFault::new(
-                        address_space,
-                        address,
-                        DataAccessKind::Write,
-                        DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                    )
-                })?;
             replacement.copy_le_bytes(&mut bytes[..byte_count]);
             super::contracts::begin_ordered_write(access.ordering);
             match backing.write_preflighted(
@@ -1339,9 +1325,6 @@ impl ExecutionMemory {
                 next_generation,
             ) {
                 Ok(()) => {
-                    if let Some(invalidation) = invalidation {
-                        invalidation.commit();
-                    }
                     super::contracts::complete_ordered_read(access.ordering);
                     return Ok(AtomicMemoryResult {
                         previous,
@@ -1794,32 +1777,6 @@ impl CpuMemory for ExecutionMemory {
             });
         }
 
-        let first_code_page = inner.executable_content_page(resolved.first.physical_slot);
-        let second_code_page = if let Some(second) = resolved.second
-            && second.physical_slot != resolved.first.physical_slot
-        {
-            inner.executable_content_page(second.physical_slot)
-        } else {
-            None
-        };
-        let invalidation = first_code_page
-            .or(second_code_page)
-            .map(|first| {
-                self.invalidations
-                    .reserve(MemoryInvalidationKind::ExecutableContent {
-                        first,
-                        second: second_code_page.filter(|second| *second != first),
-                    })
-            })
-            .transpose()
-            .map_err(|reason| {
-                DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                )
-            })?;
         let byte_count = access.size.bytes();
         let mut bytes = [0_u8; 16];
         value.copy_le_bytes(&mut bytes[..byte_count]);
@@ -1961,9 +1918,6 @@ impl CpuMemory for ExecutionMemory {
                 }
             }
         }
-        if let Some(invalidation) = invalidation {
-            invalidation.commit();
-        }
         Ok(DataWriteResult {
             region: MemoryRegionKind::Ram,
         })
@@ -2067,10 +2021,13 @@ impl CpuMemory for ExecutionMemory {
         match kind {
             super::CacheMaintenanceKind::InstructionInvalidate => {
                 self.invalidations
-                    .reserve(MemoryInvalidationKind::ExecutableContent {
-                        first: mapping.physical_page,
-                        second: None,
-                    })
+                    .reserve_with_origin(
+                        MemoryInvalidationKind::ExecutableContent {
+                            first: mapping.physical_page,
+                            second: None,
+                        },
+                        MemoryInvalidationOrigin::CacheMaintenance,
+                    )
                     .map_err(|reason| {
                         DataAccessFault::new(
                             address_space,
@@ -2088,11 +2045,13 @@ impl CpuMemory for ExecutionMemory {
                 let reservation = inner
                     .executable_content_page(mapping.physical_slot)
                     .map(|first| {
-                        self.invalidations
-                            .reserve(MemoryInvalidationKind::ExecutableContent {
+                        self.invalidations.reserve_with_origin(
+                            MemoryInvalidationKind::ExecutableContent {
                                 first,
                                 second: None,
-                            })
+                            },
+                            MemoryInvalidationOrigin::CacheMaintenance,
+                        )
                     })
                     .transpose()
                     .map_err(|reason| {
@@ -2292,24 +2251,6 @@ impl CpuMemory for ExecutionMemory {
                 DataAccessFaultReason::ContentGenerationExhausted,
             )
         })?;
-        let invalidation = inner
-            .executable_content_page(resolved.first.physical_slot)
-            .map(|first| {
-                self.invalidations
-                    .reserve(MemoryInvalidationKind::ExecutableContent {
-                        first,
-                        second: None,
-                    })
-            })
-            .transpose()
-            .map_err(|reason| {
-                DataAccessFault::new(
-                    address_space,
-                    address,
-                    DataAccessKind::Write,
-                    DataAccessFaultReason::HostBacking(reason.to_string().into()),
-                )
-            })?;
         let mut bytes = [0_u8; 16];
         let byte_count = access.size.bytes();
         value.copy_le_bytes(&mut bytes[..byte_count]);
@@ -2337,9 +2278,6 @@ impl CpuMemory for ExecutionMemory {
                     DataAccessFaultReason::HostBacking(reason.to_string().into()),
                 ));
             }
-        }
-        if let Some(invalidation) = invalidation {
-            invalidation.commit();
         }
         Ok((
             DataWriteResult {
@@ -2451,7 +2389,10 @@ impl ProcessMemory for ExecutionMemory {
             kinds
         };
         let invalidation = (!invalidation_kinds.is_empty())
-            .then(|| self.invalidations.reserve_many(&invalidation_kinds))
+            .then(|| {
+                self.invalidations
+                    .reserve_many_from(&invalidation_kinds, MemoryInvalidationOrigin::HostWrite)
+            })
             .transpose()
             .map_err(|reason| {
                 DataAccessFault::new(
@@ -2774,7 +2715,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use crate::memory::MemoryAccessSize;
+    use crate::memory::{CacheMaintenanceKind, MemoryAccessSize};
     use nixe_memory::{
         CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
         DeviceVisibilityRequest, FASTMEM_READ, FASTMEM_WRITE, FastmemEntry, NonCpuDeviceId,
@@ -3125,6 +3066,7 @@ mod tests {
                     first: physical_page,
                     second: None,
                 },
+                origin: MemoryInvalidationOrigin::DeviceWrite,
             }]
         );
         assert!(matches!(
@@ -3255,8 +3197,21 @@ mod tests {
             .write(space, writable, access, MemoryValue::U8(0x11))
             .unwrap();
         let mut invalidations = Vec::new();
-        memory
+        let after_write = memory
             .read_invalidations_since(before_write, &mut invalidations)
+            .unwrap();
+        assert_eq!(after_write, before_write);
+        assert!(invalidations.is_empty());
+
+        memory
+            .maintain_cache(
+                space,
+                CacheMaintenanceKind::InstructionInvalidate,
+                Some(executable_alias),
+            )
+            .unwrap();
+        memory
+            .read_invalidations_since(after_write, &mut invalidations)
             .unwrap();
         assert!(matches!(
             invalidations.as_slice(),

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use nixe_cpu::decode::{self, DecodeResult};
 use nixe_cpu::exception::ExceptionKind;
@@ -16,7 +17,7 @@ use nixe_cpu::execution::{
     ExecutionReport, MemoryBinding, RunRequest, SchedulerRequest, VcpuEventState,
 };
 use nixe_cpu::location::{InstructionEncoding, LocationDescriptor};
-use nixe_cpu::memory::{CodePageDependency, CpuMemory, DataAccessFault};
+use nixe_cpu::memory::{CodePageDependency, CodePageSpan, CpuMemory, DataAccessFault};
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv};
 use nixe_memory::{
@@ -24,11 +25,15 @@ use nixe_memory::{
     MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationSource,
 };
 
+use crate::configuration::JitConfiguration;
+use crate::diagnostics::Diagnostics;
+use crate::performance::{ExitReason, InvalidationMetrics, Performance};
+
 use self::compiler::{DirectCompiler, NativeGateway};
 use self::lookup::{NativeLookupSlot, RegionLookup};
 use self::region::{RegionKey, RegionLimits, discover_region};
 
-const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_NATIVE_CODE_BYTES: usize = 1024 * 1024 * 1024;
 
 const EXIT_NONE: u32 = 0;
 const EXIT_DISPATCH: u32 = 1;
@@ -311,6 +316,7 @@ struct StaticLink {
 
 struct PublishedRegion {
     key: RegionKey,
+    entry_keys: Box<[RegionKey]>,
     entry: usize,
     #[cfg(test)]
     native_bytes: usize,
@@ -322,12 +328,14 @@ struct PublishedRegion {
     #[cfg(test)]
     register_stores: usize,
     dependencies: Box<[CodePageDependency]>,
+    mapping_dependencies: Box<[CodePageSpan]>,
     links: Box<[StaticLink]>,
 }
 
 struct ProcessState {
     compiler: DirectCompiler,
     lookup: RegionLookup,
+    regions: HashMap<RegionKey, Arc<PublishedRegion>>,
     incoming: HashMap<RegionKey, Vec<Arc<AtomicUsize>>>,
     physical_dependencies: HashMap<GuestPhysicalPageId, HashSet<RegionKey>>,
     retired: Vec<Arc<PublishedRegion>>,
@@ -336,6 +344,16 @@ struct ProcessState {
     native_bytes: usize,
     compiled_regions: usize,
     compiled_guest_blocks: usize,
+    compiled_keys: Option<HashSet<RegionKey>>,
+    compiled_guest_pcs: Option<HashSet<RegionKey>>,
+}
+
+impl ProcessState {
+    #[cfg(test)]
+    fn region_for(&self, key: RegionKey) -> Option<&Arc<PublishedRegion>> {
+        let owner = self.lookup.get(key)?.owner;
+        self.regions.get(&owner)
+    }
 }
 
 pub struct JitProcess {
@@ -343,19 +361,57 @@ pub struct JitProcess {
     limits: RegionLimits,
     max_native_code_bytes: usize,
     pending: AtomicU32,
+    diagnostics: Option<Diagnostics>,
+    performance: Option<Performance>,
+    slow_memory_calls: AtomicU64,
     state: Mutex<ProcessState>,
 }
 
 impl JitProcess {
     pub fn new(cpu: ProcessCpuContext) -> Result<Self, DirectJitError> {
+        Self::with_configuration(cpu, JitConfiguration::default())
+    }
+
+    pub fn with_configuration(
+        cpu: ProcessCpuContext,
+        configuration: JitConfiguration,
+    ) -> Result<Self, DirectJitError> {
+        let diagnostics = configuration
+            .dump_directory()
+            .map(Diagnostics::new)
+            .transpose()
+            .map_err(DirectJitError::unsupported)?;
+        let performance = configuration
+            .performance_report_directory()
+            .map(|directory| Performance::new(directory, configuration.performance_report_title()))
+            .transpose()
+            .map_err(DirectJitError::unsupported)?;
+        if let Some(diagnostics) = &diagnostics {
+            log::info!(
+                "JIT compilation dumps enabled: directory={}",
+                diagnostics.directory().display()
+            );
+        }
+        if let Some(performance) = &performance {
+            log::info!(
+                "JIT performance report enabled: path={}",
+                performance.path().display()
+            );
+        }
+        let compiled_keys = performance.is_some().then(HashSet::new);
+        let compiled_guest_pcs = performance.is_some().then(HashSet::new);
         Ok(Self {
             cpu,
             limits: RegionLimits::default(),
             max_native_code_bytes: DEFAULT_MAX_NATIVE_CODE_BYTES,
             pending: AtomicU32::new(0),
+            diagnostics,
+            performance,
+            slow_memory_calls: AtomicU64::new(0),
             state: Mutex::new(ProcessState {
                 compiler: DirectCompiler::new()?,
                 lookup: RegionLookup::new(),
+                regions: HashMap::new(),
                 incoming: HashMap::new(),
                 physical_dependencies: HashMap::new(),
                 retired: Vec::new(),
@@ -364,6 +420,8 @@ impl JitProcess {
                 native_bytes: 0,
                 compiled_regions: 0,
                 compiled_guest_blocks: 0,
+                compiled_keys,
+                compiled_guest_pcs,
             }),
         })
     }
@@ -375,21 +433,45 @@ impl JitProcess {
     ) -> Result<(NativeGateway, usize, u64), DirectJitError> {
         let key = RegionKey::new(self.cpu, location);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        reconcile_invalidations(&mut state, memory, key.address_space)?;
+        reconcile_invalidations(
+            &mut state,
+            memory,
+            key.address_space,
+            self.performance.as_ref(),
+        )?;
         if self.pending.load(Ordering::Acquire) != 0 {
             return Err(DirectJitError::shutdown());
         }
-        if let Some(region) = state.lookup.get(key) {
+        if let Some(entry) = state.lookup.get(key) {
+            if let Some(performance) = &self.performance {
+                performance.record_lookup(true);
+                if entry.owner != key {
+                    performance.record_secondary_entry_hit();
+                }
+            }
             return Ok((
                 state.compiler.gateway(),
-                region.entry,
+                entry.entry,
                 state.invalidation_cursor.get(),
             ));
         }
+        if let Some(performance) = &self.performance {
+            performance.record_lookup(false);
+        }
 
         let (region, link_targets, slots, compiled) = loop {
-            let region = discover_region(self.cpu, memory, location, self.limits)?;
-            let invalidated = reconcile_invalidations(&mut state, memory, key.address_space)?;
+            let region = discover_region(self.cpu, memory, location, self.limits, |pc| {
+                state.lookup.get(key.at(pc)).is_some()
+            })?;
+            if let Some(performance) = &self.performance {
+                performance.record_discovery(region.blocks.len());
+            }
+            let invalidated = reconcile_invalidations(
+                &mut state,
+                memory,
+                key.address_space,
+                self.performance.as_ref(),
+            )?;
             if invalidated.affects(&region) {
                 continue;
             }
@@ -404,7 +486,25 @@ impl JitProcess {
                 .collect();
             let slot_addresses: Vec<_> =
                 slots.iter().map(|slot| Arc::as_ptr(slot).addr()).collect();
-            let compiled = state.compiler.compile(&region, &slot_addresses)?;
+            let compile_started = self.performance.as_ref().map(|_| Instant::now());
+            let mut compiled =
+                state
+                    .compiler
+                    .compile(&region, &slot_addresses, self.diagnostics.is_some())?;
+            if let Some(performance) = &self.performance {
+                performance.record_compilation(
+                    compiled.clif_instructions,
+                    compiled.native_bytes,
+                    compile_started
+                        .expect("enabled performance captured compilation start")
+                        .elapsed(),
+                );
+            }
+            if let (Some(diagnostics), Some(dump)) = (&self.diagnostics, compiled.dump.take()) {
+                diagnostics
+                    .write(region.key.start, dump)
+                    .map_err(DirectJitError::internal)?;
+            }
             state.native_bytes = state.compiler.native_bytes();
             if state.native_bytes > self.max_native_code_bytes {
                 return Err(DirectJitError::capacity(format!(
@@ -415,7 +515,12 @@ impl JitProcess {
                     state.compiled_guest_blocks,
                 )));
             }
-            let invalidated = reconcile_invalidations(&mut state, memory, key.address_space)?;
+            let invalidated = reconcile_invalidations(
+                &mut state,
+                memory,
+                key.address_space,
+                self.performance.as_ref(),
+            )?;
             if self.pending.load(Ordering::Acquire) != 0 {
                 return Err(DirectJitError::shutdown());
             }
@@ -424,6 +529,28 @@ impl JitProcess {
             }
         };
         let entry = compiled.entry;
+        let entry_keys: Vec<_> = region
+            .blocks
+            .iter()
+            .map(|block| key.at(block.start.pc))
+            .collect();
+        if let Some(performance) = &self.performance {
+            let mut instructions = 0;
+            let mut unique = 0;
+            let compiled_guest_pcs = state
+                .compiled_guest_pcs
+                .as_mut()
+                .expect("enabled performance retains compiled guest PCs");
+            for decoded in region
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+            {
+                instructions += 1;
+                unique += usize::from(compiled_guest_pcs.insert(key.at(decoded.location.pc)));
+            }
+            performance.record_region_coverage(entry_keys.len(), instructions, unique);
+        }
 
         let links: Vec<_> = link_targets
             .into_iter()
@@ -432,6 +559,7 @@ impl JitProcess {
             .collect();
         let published = Arc::new(PublishedRegion {
             key,
+            entry_keys: entry_keys.into_boxed_slice(),
             entry,
             #[cfg(test)]
             native_bytes: compiled.native_bytes,
@@ -443,6 +571,7 @@ impl JitProcess {
             #[cfg(test)]
             register_stores: compiled.register_stores,
             dependencies: region.dependencies,
+            mapping_dependencies: region.mapping_dependencies,
             links: links.into_boxed_slice(),
         });
 
@@ -463,14 +592,31 @@ impl JitProcess {
                 .or_default()
                 .insert(key);
         }
-        if let Some(incoming) = state.incoming.get(&key) {
-            for slot in incoming {
-                slot.store(entry, Ordering::Release);
-            }
-        }
         state.compiled_regions += 1;
         state.compiled_guest_blocks += published.guest_blocks;
-        state.lookup.insert(Arc::clone(&published));
+        if state
+            .compiled_keys
+            .as_mut()
+            .is_some_and(|keys| !keys.insert(key))
+            && let Some(performance) = &self.performance
+        {
+            performance.record_region_recompilation();
+        }
+        let previous = state.regions.insert(key, Arc::clone(&published));
+        assert!(
+            previous.is_none(),
+            "a native region owner is published once"
+        );
+        for &entry_key in &published.entry_keys {
+            state.lookup.insert(entry_key, key, entry);
+        }
+        for &entry_key in &published.entry_keys {
+            if let Some(incoming) = state.incoming.get(&entry_key) {
+                for slot in incoming {
+                    slot.store(entry, Ordering::Release);
+                }
+            }
+        }
         Ok((
             state.compiler.gateway(),
             published.entry,
@@ -480,7 +626,12 @@ impl JitProcess {
 
     fn reconcile(&self, memory: &(impl CpuMemory + ?Sized)) -> Result<(), DirectJitError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        reconcile_invalidations(&mut state, memory, self.cpu.address_space_id())?;
+        reconcile_invalidations(
+            &mut state,
+            memory,
+            self.cpu.address_space_id(),
+            self.performance.as_ref(),
+        )?;
         Ok(())
     }
 
@@ -495,9 +646,19 @@ impl JitProcess {
     pub fn shutdown(&self) {
         self.pending.store(1, Ordering::Release);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let keys: Vec<_> = state.lookup.keys().collect();
+        let keys: Vec<_> = state.regions.keys().copied().collect();
         for key in keys {
             retire_region(&mut state, key);
+        }
+        drop(state);
+        if let Some(performance) = &self.performance {
+            match performance.write(self.slow_memory_calls.load(Ordering::Relaxed)) {
+                Ok(()) => log::info!(
+                    "JIT performance report written: path={}",
+                    performance.path().display()
+                ),
+                Err(detail) => log::error!("JIT performance report failed: {detail}"),
+            }
         }
     }
 
@@ -510,11 +671,18 @@ impl JitProcess {
 struct InvalidationSummary {
     all: bool,
     physical_pages: HashSet<GuestPhysicalPageId>,
+    mapping_ranges: Vec<(GuestVirtualAddress, u64)>,
 }
 
 impl InvalidationSummary {
     fn affects(&self, region: &region::NativeRegion) -> bool {
         self.all
+            || self.mapping_ranges.iter().any(|&(start, size)| {
+                region
+                    .mapping_dependencies
+                    .iter()
+                    .any(|span| mapping_range_overlaps(*span, start, size))
+            })
             || region
                 .dependencies
                 .iter()
@@ -526,21 +694,29 @@ fn reconcile_invalidations(
     state: &mut ProcessState,
     memory: &(impl MemoryInvalidationSource + ?Sized),
     address_space: nixe_memory::AddressSpaceId,
+    performance: Option<&Performance>,
 ) -> Result<InvalidationSummary, DirectJitError> {
     let mut records = std::mem::take(&mut state.invalidations);
     records.clear();
     let cursor = match memory.read_invalidations_since(state.invalidation_cursor, &mut records) {
         Ok(cursor) => cursor,
         Err(MemoryInvalidationError::HistoryLost { latest, .. }) => {
+            if let Some(performance) = performance {
+                performance.record_history_lost();
+            }
             state.invalidation_cursor = latest;
             state.invalidations = records;
-            let keys: Vec<_> = state.lookup.keys().collect();
+            let keys: Vec<_> = state.regions.keys().copied().collect();
+            let retired = keys.len();
             for key in keys {
                 retire_region(state, key);
             }
+            if let Some(performance) = performance {
+                performance.record_regions_retired(retired);
+            }
             return Ok(InvalidationSummary {
                 all: true,
-                physical_pages: HashSet::new(),
+                ..InvalidationSummary::default()
             });
         }
         Err(error) => {
@@ -553,13 +729,39 @@ fn reconcile_invalidations(
     state.invalidation_cursor = cursor;
 
     let mut summary = InvalidationSummary::default();
+    let has_regions = !state.regions.is_empty();
+    let mut metrics = InvalidationMetrics::default();
     for record in &records {
+        let relevant = match record.kind {
+            MemoryInvalidationKind::Mapping {
+                address_space: changed,
+                start,
+                size,
+            } => {
+                changed == address_space
+                    && state.regions.values().any(|region| {
+                        region
+                            .mapping_dependencies
+                            .iter()
+                            .any(|span| mapping_range_overlaps(*span, start, size))
+                    })
+            }
+            MemoryInvalidationKind::InstructionCache {
+                address_space: changed,
+            } => changed == address_space && has_regions,
+            MemoryInvalidationKind::ExecutableContent { first, second } => {
+                state.physical_dependencies.contains_key(&first)
+                    || second.is_some_and(|page| state.physical_dependencies.contains_key(&page))
+            }
+        };
+        metrics.record(*record, relevant);
         match record.kind {
             MemoryInvalidationKind::Mapping {
                 address_space: changed,
-                ..
-            }
-            | MemoryInvalidationKind::InstructionCache {
+                start,
+                size,
+            } if changed == address_space => summary.mapping_ranges.push((start, size)),
+            MemoryInvalidationKind::InstructionCache {
                 address_space: changed,
             } if changed == address_space => summary.all = true,
             MemoryInvalidationKind::ExecutableContent { first, second } => {
@@ -571,8 +773,8 @@ fn reconcile_invalidations(
         }
     }
 
-    let keys: HashSet<_> = if summary.all {
-        state.lookup.keys().collect()
+    let mut keys: HashSet<_> = if summary.all {
+        state.regions.keys().copied().collect()
     } else {
         summary
             .physical_pages
@@ -582,28 +784,64 @@ fn reconcile_invalidations(
             .copied()
             .collect()
     };
+    if !summary.all && !summary.mapping_ranges.is_empty() {
+        keys.extend(state.regions.values().filter_map(|region| {
+            summary
+                .mapping_ranges
+                .iter()
+                .any(|&(start, size)| {
+                    region
+                        .mapping_dependencies
+                        .iter()
+                        .any(|span| mapping_range_overlaps(*span, start, size))
+                })
+                .then_some(region.key)
+        }));
+    }
+    let retired = keys.len();
     for key in keys {
         retire_region(state, key);
+    }
+    if let Some(performance) = performance {
+        performance.record_invalidations(&metrics);
+        performance.record_regions_retired(retired);
     }
     state.invalidations = records;
     Ok(summary)
 }
 
-fn retire_region(state: &mut ProcessState, key: RegionKey) {
-    if let Some(incoming) = state.incoming.get(&key) {
-        for slot in incoming {
-            slot.store(0, Ordering::Release);
-        }
+fn mapping_range_overlaps(span: CodePageSpan, start: GuestVirtualAddress, size: u64) -> bool {
+    if size == 0 {
+        return false;
     }
-    let Some(region) = state.lookup.remove(key) else {
+    let changed_start = u128::from(start.get());
+    let changed_end = (changed_start + u128::from(size)).min(1_u128 << 64);
+    let span_start = u128::from(span.start.get());
+    let span_end = span
+        .end_exclusive
+        .map_or(1_u128 << 64, |end| u128::from(end.get()));
+    changed_start < span_end && span_start < changed_end
+}
+
+fn retire_region(state: &mut ProcessState, key: RegionKey) {
+    let owner = state.lookup.get(key).map_or(key, |entry| entry.owner);
+    let Some(region) = state.regions.remove(&owner) else {
         return;
     };
+    for &entry_key in &region.entry_keys {
+        if let Some(incoming) = state.incoming.get(&entry_key) {
+            for slot in incoming {
+                slot.store(0, Ordering::Release);
+            }
+        }
+        state.lookup.remove(entry_key);
+    }
     for dependency in &region.dependencies {
         let remove_page = state
             .physical_dependencies
             .get_mut(&dependency.page)
             .is_some_and(|keys| {
-                keys.remove(&key);
+                keys.remove(&owner);
                 keys.is_empty()
             });
         if remove_page {
@@ -628,7 +866,6 @@ pub struct JitThread {
     exclusive: Mutex<ExclusiveMonitorState>,
     #[cfg(test)]
     events: VcpuEventState,
-    slow_memory_calls: AtomicU64,
     #[cfg(test)]
     rust_dispatches: AtomicU64,
 }
@@ -655,7 +892,6 @@ impl JitThread {
             exclusive: Mutex::new(ExclusiveMonitorState::default()),
             #[cfg(test)]
             events: VcpuEventState::default(),
-            slow_memory_calls: AtomicU64::new(0),
             #[cfg(test)]
             rust_dispatches: AtomicU64::new(0),
         }
@@ -860,13 +1096,17 @@ impl JitThread {
             instruction_budget,
             loader_return,
             &self.control,
-            &self.slow_memory_calls,
+            &process.slow_memory_calls,
             native_lookup,
             &process.pending,
         );
         loop {
             let pc = GuestVirtualAddress::new(unsafe { *context.pc });
             if pc.get() == context.loader_return {
+                if let Some(performance) = &process.performance {
+                    performance.record_exit(ExitReason::LoaderReturn);
+                    performance.record_guest_instructions(context.retired);
+                }
                 return Ok(DirectExit::LoaderReturn {
                     pc,
                     result_code: state.read_x(A64Register::General(
@@ -878,8 +1118,19 @@ impl JitThread {
             let location = LocationDescriptor::new(pc, process.cpu.profile_id());
             let (gateway, entry, invalidation_cursor) = process.entry_for(memory, location)?;
             context.invalidation_cursor = invalidation_cursor;
+            let native_started = process.performance.as_ref().map(|_| Instant::now());
             unsafe { gateway(&mut context, entry) };
+            if let Some(performance) = &process.performance {
+                performance.record_native_time(
+                    native_started
+                        .expect("enabled performance captured native start")
+                        .elapsed(),
+                );
+            }
             let exit = context.exit()?;
+            if let Some(performance) = &process.performance {
+                performance.record_exit(exit_reason(&exit));
+            }
             if matches!(exit, DirectExit::Reconcile) {
                 process.reconcile(memory)?;
                 continue;
@@ -889,8 +1140,26 @@ impl JitThread {
                 self.rust_dispatches.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            if let Some(performance) = &process.performance {
+                performance.record_guest_instructions(direct_exit_instructions(&exit));
+            }
             return Ok(exit);
         }
+    }
+}
+
+fn exit_reason(exit: &DirectExit) -> ExitReason {
+    match exit {
+        DirectExit::Dispatch { .. } => ExitReason::Dispatch,
+        DirectExit::Budget { .. } => ExitReason::Budget,
+        DirectExit::Control { .. } => ExitReason::Control,
+        DirectExit::Architectural { .. } => ExitReason::Architectural,
+        DirectExit::Unsupported { .. } => ExitReason::Unsupported,
+        DirectExit::DataFault { .. } => ExitReason::DataFault,
+        DirectExit::Scheduled { .. } => ExitReason::Scheduled,
+        DirectExit::LoaderReturn { .. } => ExitReason::LoaderReturn,
+        DirectExit::Internal { .. } => ExitReason::Internal,
+        DirectExit::Reconcile => ExitReason::Reconcile,
     }
 }
 

@@ -15,14 +15,16 @@ use nixe_cpu::location::DecodedInstruction;
 use nixe_cpu::semantics::conditions::Condition;
 use nixe_memory::GuestVirtualAddress;
 
+use crate::diagnostics::RegionDump;
+
 use super::lookup::{
     DIRECT_LOOKUP_MASK, NATIVE_LOOKUP_HEAD_OFFSET, NATIVE_LOOKUP_NODE_ENTRY_OFFSET,
     NATIVE_LOOKUP_NODE_NEXT_OFFSET, NATIVE_LOOKUP_NODE_PC_OFFSET, NativeLookupSlot, lookup_salt,
 };
 use super::region::{BlockTerminator, NativeRegion};
 use super::{
-    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_RECONCILE,
-    EXIT_UNSUPPORTED, NativeContext,
+    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_INTERNAL,
+    EXIT_RECONCILE, EXIT_UNSUPPORTED, NativeContext,
 };
 
 const GENERAL_REGISTER_COUNT: usize = 31;
@@ -36,10 +38,9 @@ pub(super) type NativeGateway = unsafe extern "C" fn(*mut NativeContext, usize);
 
 pub(super) struct CompiledRegion {
     pub(super) entry: usize,
-    #[cfg(test)]
     pub(super) native_bytes: usize,
-    #[cfg(test)]
     pub(super) clif_instructions: usize,
+    pub(super) dump: Option<RegionDump>,
     #[cfg(test)]
     pub(super) register_loads: usize,
     #[cfg(test)]
@@ -111,6 +112,7 @@ impl DirectCompiler {
         &mut self,
         region: &NativeRegion,
         static_slots: &[usize],
+        capture_dump: bool,
     ) -> Result<CompiledRegion, DirectJitError> {
         self.context.func.signature = tail_signature();
         self.context.func.name = UserFuncName::user(1, self.next_function);
@@ -139,7 +141,6 @@ impl DirectCompiler {
             )?
             .translate(self.module.target_config())?;
         }
-        #[cfg(test)]
         let clif_instructions = self
             .context
             .func
@@ -147,6 +148,7 @@ impl DirectCompiler {
             .blocks()
             .map(|block| self.context.func.layout.block_insts(block).count())
             .sum();
+        let clif = capture_dump.then(|| self.context.func.display().to_string());
         self.module
             .define_function(function, &mut self.context)
             .map_err(module_error)?;
@@ -156,6 +158,13 @@ impl DirectCompiler {
             .expect("defined direct JIT function retains compiled code")
             .code_buffer()
             .len();
+        let native = capture_dump.then(|| {
+            self.context
+                .compiled_code()
+                .expect("defined direct JIT function retains compiled code")
+                .code_buffer()
+                .to_vec()
+        });
         self.native_bytes = self.native_bytes.saturating_add(native_bytes);
         self.module.finalize_definitions().map_err(module_error)?;
         let entry = self.module.get_finalized_function(function).addr();
@@ -164,10 +173,11 @@ impl DirectCompiler {
         let (accessed, dirty) = register_access(region);
         Ok(CompiledRegion {
             entry,
-            #[cfg(test)]
             native_bytes,
-            #[cfg(test)]
             clif_instructions,
+            dump: clif
+                .zip(native)
+                .map(|(clif, native)| RegionDump { clif, native }),
             #[cfg(test)]
             register_loads: accessed.count(),
             #[cfg(test)]
@@ -457,25 +467,45 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             self.vector_registers[index] = Some(variable);
         }
 
-        let start = self.region.key.start;
-        if !self.merged_flag_entries.contains(&start) {
-            self.flags_at_entry
-                .insert(start, LazyFlags::Canonical(self.initial_flags));
-        }
-        let initial = LazyFlags::Canonical(self.initial_flags);
-        self.guard_reconciliation(start, &initial)?;
+        let entry_pc = self
+            .builder
+            .ins()
+            .load(types::I64, trusted_flags(), self.pc, 0);
+        let current =
+            self.builder
+                .ins()
+                .atomic_load(types::I64, plain_flags(), self.invalidation_signal);
+        let observed =
+            self.load_context(types::I64, offset_of!(NativeContext, invalidation_cursor))?;
+        let invalidated = self.builder.ins().icmp(IntCC::NotEqual, current, observed);
+        let process =
+            self.builder
+                .ins()
+                .atomic_load(types::I32, plain_flags(), self.process_pending);
+        let shutting_down = self.builder.ins().icmp_imm_s(IntCC::NotEqual, process, 0);
+        let reconcile = self.builder.ins().bor(invalidated, shutting_down);
+        let reconcile_exit = self.builder.create_block();
+        let control_check = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(reconcile, reconcile_exit, &[], control_check, &[]);
+        self.builder.switch_to_block(reconcile_exit);
+        self.finish_exit_value(EXIT_RECONCILE, 0, entry_pc)?;
+        self.builder.switch_to_block(control_check);
         let pending =
             self.builder
                 .ins()
                 .atomic_load(types::I32, plain_flags(), self.control_pending);
         let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
         let control_exit = self.builder.create_block();
-        let start_block = self.block(start)?;
+        let dispatch = self.builder.create_block();
         self.builder
             .ins()
-            .brif(has_control, control_exit, &[], start_block, &[]);
+            .brif(has_control, control_exit, &[], dispatch, &[]);
         self.builder.switch_to_block(control_exit);
-        self.emit_exit(EXIT_CONTROL, 0, start, &initial)?;
+        self.finish_exit_value(EXIT_CONTROL, 0, entry_pc)?;
+        self.builder.switch_to_block(dispatch);
+        self.emit_entry_dispatch(entry_pc)?;
 
         for block_index in 0..self.region.blocks.len() {
             self.translate_block(block_index)?;
@@ -488,6 +518,26 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.seal_all_blocks();
         self.builder.finalize(target_config);
         Ok(())
+    }
+
+    fn emit_entry_dispatch(&mut self, entry_pc: ir::Value) -> Result<(), DirectJitError> {
+        if self.region.blocks.len() == 1 {
+            let target = self.block(self.region.key.start)?;
+            self.builder.ins().jump(target, &[]);
+            return Ok(());
+        }
+        for record in &self.region.blocks {
+            let target = self.block(record.start.pc)?;
+            let expected = self
+                .builder
+                .ins()
+                .iconst(types::I64, record.start.pc.get() as i64);
+            let matches = self.builder.ins().icmp(IntCC::Equal, entry_pc, expected);
+            let next = self.builder.create_block();
+            self.builder.ins().brif(matches, target, &[], next, &[]);
+            self.builder.switch_to_block(next);
+        }
+        self.finish_exit_value(EXIT_INTERNAL, 0, entry_pc)
     }
 
     fn translate_block(&mut self, block_index: usize) -> Result<(), DirectJitError> {
@@ -509,6 +559,9 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             let instruction =
                 nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding);
             let terminal = index + 1 == record.instructions.len();
+            if terminal && matches!(record.terminator, BlockTerminator::Unsupported) {
+                break;
+            }
             match instruction {
                 A64Instruction::Control(control::Instruction::Nop(_)) => {
                     self.retire_one();
@@ -543,7 +596,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
                     | control::Instruction::SupervisorCall(_)
                     | control::Instruction::Breakpoint(_),
                 ) => self.retire_one(),
-                _ if terminal && matches!(record.terminator, BlockTerminator::Unsupported) => {}
                 _ => {
                     return Err(unsupported_instruction(decoded));
                 }
@@ -1346,6 +1398,15 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         pc: GuestVirtualAddress,
     ) -> Result<(), DirectJitError> {
         let pc = self.builder.ins().iconst(types::I64, pc.get() as i64);
+        self.finish_exit_value(kind, detail, pc)
+    }
+
+    fn finish_exit_value(
+        &mut self,
+        kind: u32,
+        detail: u32,
+        pc: ir::Value,
+    ) -> Result<(), DirectJitError> {
         self.store_context(pc, offset_of!(NativeContext, exit_pc))?;
         let kind = self.builder.ins().iconst(types::I32, i64::from(kind));
         self.store_context(kind, offset_of!(NativeContext, exit_kind))?;
@@ -1809,13 +1870,16 @@ fn register_access_fp_simd_vector(
         fp_simd::Instruction::SignedIntToFloat(_) | fp_simd::Instruction::UnsignedIntToFloat(_) => {
             write(accessed, dirty, fields.rd);
         }
-        fp_simd::Instruction::ScalarTwoSource(_) | fp_simd::Instruction::MemoryLiteral(_) => {}
     }
 }
 
 fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
     let starts: HashSet<_> = region.blocks.iter().map(|block| block.start.pc).collect();
-    let mut predecessors = HashMap::from([(region.key.start, 1_usize)]);
+    let mut predecessors: HashMap<_, _> = starts
+        .iter()
+        .copied()
+        .map(|start| (start, 1_usize))
+        .collect();
     for block in &region.blocks {
         let mut record = |target| {
             if starts.contains(&target) {
