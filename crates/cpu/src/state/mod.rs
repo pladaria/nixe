@@ -158,8 +158,8 @@ mod tests {
             AddressSpaceId::new(1),
         );
 
-        let a64 = ThreadCpuState::new(process.thread_configuration(ExecutionState::A64).unwrap());
-        let t32 = ThreadCpuState::new(process.thread_configuration(ExecutionState::T32).unwrap());
+        let a64 = ThreadCpuState::new(process.thread_configuration(ExecutionState::A64));
+        let t32 = ThreadCpuState::new(process.thread_configuration(ExecutionState::T32));
 
         assert!(matches!(a64, ThreadCpuState::A64(_)));
         assert!(matches!(t32, ThreadCpuState::A32(_)));

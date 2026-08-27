@@ -148,7 +148,16 @@ pub fn translate_region_report(
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
 ) -> RegionTranslationReport {
-    match translate_region_with_disassembly(config, profile, address_space, start, memory) {
+    match translate_region_with_disassembly(
+        config,
+        crate::platform::PlatformDecoder::new(crate::platform::TargetPlatform::from_profile(
+            *profile,
+        )),
+        profile,
+        address_space,
+        start,
+        memory,
+    ) {
         Ok(region) => RegionTranslationReport::Translated(region),
         Err(error) => failure(start, error),
     }

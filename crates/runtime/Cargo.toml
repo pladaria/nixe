@@ -8,7 +8,8 @@ license.workspace = true
 getrandom.workspace = true
 log.workspace = true
 nixe-cpu.workspace = true
-nixe-cpu-engine.workspace = true
+nixe-cpu-interpreter.workspace = true
+nixe-cpu-jit.workspace = true
 nixe-loader-executable.workspace = true
 nixe-loader-content.workspace = true
 nixe-loader-storage.workspace = true
@@ -17,7 +18,5 @@ nixe-memory.workspace = true
 nixe-scheduler.workspace = true
 
 [dev-dependencies]
-nixe-cpu-engine-interpreter.workspace = true
-nixe-cpu-engine-testkit.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

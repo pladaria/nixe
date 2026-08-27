@@ -170,7 +170,7 @@ impl ProcessMemoryLayout {
 pub struct ProcessBuildConfig {
     pub process_id: u64,
     pub address_space_id: AddressSpaceId,
-    pub cpu_profile: GuestCpuProfile,
+    pub target_platform: TargetPlatform,
     pub memory_layout_profile: ProcessMemoryLayoutProfile,
     pub image_base: GuestVirtualAddress,
     /// Physical-memory resource limit assigned to the emulated process.
@@ -184,7 +184,7 @@ impl Default for ProcessBuildConfig {
         Self {
             process_id: 1,
             address_space_id: AddressSpaceId::new(1),
-            cpu_profile: GuestCpuProfile::switch_1(),
+            target_platform: TargetPlatform::Switch1,
             memory_layout_profile: ProcessMemoryLayoutProfile::Horizon2Plus,
             image_base: GuestVirtualAddress::new(DEFAULT_IMAGE_BASE),
             physical_memory_limit: DEFAULT_PHYSICAL_MEMORY_LIMIT,

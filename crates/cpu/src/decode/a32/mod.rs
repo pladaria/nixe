@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use crate::{
     coverage::CoverageId,
     location::{ExecutionState, InstructionEncoding, InstructionSize, LocationDescriptor},
-    profile::{GuestCpuProfile, InstructionFeature},
+    profile::InstructionFeature,
 };
 
 use super::{
@@ -28,7 +28,7 @@ pub enum A32Instruction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NormalizedA32 {
-    pub condition: crate::ir::op::Condition,
+    pub condition: crate::semantics::conditions::Condition,
     pub instruction: A32Instruction,
 }
 
@@ -44,9 +44,9 @@ pub fn normalize(opcode: &DecodedOpcode, encoding: InstructionEncoding) -> Norma
         _ => unreachable!("A32 pattern lacks typed normalization"),
     };
     let condition = if id == 0x0001_0006 || bits >> 28 == 0xf {
-        crate::ir::op::Condition::Al
+        crate::semantics::conditions::Condition::Al
     } else {
-        crate::ir::op::Condition::from_encoding((bits >> 28) as u8)
+        crate::semantics::conditions::Condition::from_encoding((bits >> 28) as u8)
     };
     NormalizedA32 {
         condition,
@@ -83,7 +83,8 @@ pub(super) const fn pattern(
 }
 
 static PATTERNS: OnceLock<Box<[InstructionPattern]>> = OnceLock::new();
-static TABLE: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_1_TABLE: OnceLock<DecoderTable> = OnceLock::new();
+static SWITCH_2_TABLE: OnceLock<DecoderTable> = OnceLock::new();
 
 #[must_use]
 pub fn patterns() -> &'static [InstructionPattern] {
@@ -98,14 +99,25 @@ pub fn patterns() -> &'static [InstructionPattern] {
 }
 
 pub(crate) fn decode(
-    profile: &GuestCpuProfile,
+    decoder: crate::platform::PlatformDecoder,
     location: LocationDescriptor,
     encoding: InstructionEncoding,
 ) -> DecodeResult {
-    table().decode(profile, location, encoding)
+    platform_table(decoder.platform()).decode(location, encoding)
+}
+
+fn platform_table(platform: crate::platform::TargetPlatform) -> &'static DecoderTable {
+    let cell = match platform {
+        crate::platform::TargetPlatform::Switch1 => &SWITCH_1_TABLE,
+        crate::platform::TargetPlatform::Switch2 => &SWITCH_2_TABLE,
+    };
+    cell.get_or_init(|| {
+        DecoderTable::compile_for_platform(patterns(), platform)
+            .expect("valid platform A32 decoder table")
+    })
 }
 
 #[must_use]
 pub fn table() -> &'static DecoderTable {
-    TABLE.get_or_init(|| DecoderTable::compile(patterns()).expect("valid A32 decoder table"))
+    platform_table(crate::platform::TargetPlatform::Switch1)
 }

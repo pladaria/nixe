@@ -69,9 +69,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
         }
-        DecodeResult::Unallocated { .. }
-        | DecodeResult::Reserved { .. }
-        | DecodeResult::ProfileDisabled { .. } => {}
+        DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {}
     }
 
     let source_width = BitWidth::new(input[6]);

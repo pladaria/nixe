@@ -6,7 +6,7 @@ use nixe_scheduler::{MachineSchedulerProfile, PriorityRange, VirtualCpuDescripto
 #[derive(Clone, Debug)]
 pub struct HorizonMachineProfile {
     scheduler: MachineSchedulerProfile,
-    cpu: nixe_cpu::profile::GuestCpuProfile,
+    platform: nixe_cpu::platform::TargetPlatform,
     memory_layout: nixe_runtime::ProcessMemoryLayoutProfile,
     architectural_timer_frequency: u64,
 }
@@ -18,14 +18,14 @@ impl HorizonMachineProfile {
     }
 
     #[must_use]
-    pub const fn cpu(&self) -> nixe_cpu::profile::GuestCpuProfile {
-        self.cpu
+    pub const fn platform(&self) -> nixe_cpu::platform::TargetPlatform {
+        self.platform
     }
 
     #[must_use]
     pub fn process_build_config(&self) -> nixe_runtime::ProcessBuildConfig {
         nixe_runtime::ProcessBuildConfig {
-            cpu_profile: self.cpu,
+            target_platform: self.platform,
             memory_layout_profile: self.memory_layout,
             architectural_timer_frequency: self.architectural_timer_frequency,
             ..nixe_runtime::ProcessBuildConfig::default()
@@ -38,7 +38,7 @@ impl HorizonMachineProfile {
 pub fn switch_1_machine_profile() -> HorizonMachineProfile {
     HorizonMachineProfile {
         scheduler: switch_1_scheduler_profile(),
-        cpu: nixe_cpu::profile::GuestCpuProfile::switch_1(),
+        platform: nixe_cpu::platform::TargetPlatform::Switch1,
         memory_layout: nixe_runtime::ProcessMemoryLayoutProfile::Horizon2Plus,
         architectural_timer_frequency: 19_200_000,
     }
@@ -78,8 +78,8 @@ mod tests {
         assert_eq!(profile.priorities().lowest(), 63);
         assert_eq!(profile.all_cores().len(), 4);
         assert_eq!(
-            machine.cpu(),
-            nixe_cpu::profile::GuestCpuProfile::switch_1()
+            machine.platform(),
+            nixe_cpu::platform::TargetPlatform::Switch1
         );
         assert_eq!(
             machine.process_build_config().architectural_timer_frequency,

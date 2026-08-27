@@ -1,7 +1,12 @@
 # CPU Dynamic Recompiler Technical Specification
 
-Status: normative architecture; implementation is tracked by
-[`notes/jit.md`](../notes/jit.md)
+Status: superseded architecture record, 2026-08-27.
+
+The active CPU architecture is the
+[CPU Architecture Simplification Plan](../notes/CPU%20Architecture%20Simplification%20Plan.md).
+This document describes the pre-S00 private-IR, generic-engine, fallback,
+tiered-compilation, bounded-cache, and reclamation design. It remains historical
+evidence only and must not guide new CPU implementation work.
 
 Audience: CPU, memory, kernel, scheduler, and GPU implementers
 

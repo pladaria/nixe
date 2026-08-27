@@ -133,9 +133,6 @@ fn verify_end_reason(block: &IrBlock) -> Result<(), VerificationError> {
             block.terminator,
             Terminator::Exception { .. } | Terminator::ConditionalException { .. }
         ),
-        BlockEndReason::InterpreterFallback => {
-            matches!(block.terminator, Terminator::InterpretOne { .. })
-        }
         BlockEndReason::UnsupportedInstruction => {
             matches!(block.terminator, Terminator::UnsupportedInstruction { .. })
         }
@@ -1546,10 +1543,7 @@ fn verify_terminator(
         Terminator::Exception { source, .. } | Terminator::Stop { source, .. } => {
             verify_terminator_source(*source, block)
         }
-        Terminator::InterpretOne {
-            source, encoding, ..
-        }
-        | Terminator::UnsupportedInstruction {
+        Terminator::UnsupportedInstruction {
             source, encoding, ..
         } => {
             verify_terminator_source(*source, block)?;
@@ -1769,7 +1763,6 @@ fn verify_internalized_direct_edges(
         | Terminator::Call { .. }
         | Terminator::Return { .. }
         | Terminator::Exception { .. }
-        | Terminator::InterpretOne { .. }
         | Terminator::UnsupportedInstruction { .. }
         | Terminator::Stop { .. } => Ok(()),
     }
@@ -1831,7 +1824,6 @@ fn verify_internal_targets(
         }
         Terminator::ConditionalException { fallthrough, .. } => verify(fallthrough),
         Terminator::Exception { .. }
-        | Terminator::InterpretOne { .. }
         | Terminator::UnsupportedInstruction { .. }
         | Terminator::Stop { .. } => Ok(()),
     }
@@ -1901,7 +1893,6 @@ fn expected_region_exits(region: &IrRegion) -> Vec<RegionExit> {
                     fallthrough,
                 );
             }
-            Terminator::InterpretOne { .. } => push_exit(&mut exits, RegionExitKind::Interpreter),
             Terminator::UnsupportedInstruction { .. } => {
                 push_exit(&mut exits, RegionExitKind::UnsupportedInstruction)
             }

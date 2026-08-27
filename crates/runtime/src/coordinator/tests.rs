@@ -3,7 +3,7 @@ use crate::process::tests::{
     synthetic_instruction_process_for_coordinator, synthetic_process_for_coordinator,
     synthetic_svc_process_for_coordinator,
 };
-use nixe_cpu_engine::SchedulerRequest;
+use nixe_cpu::execution::SchedulerRequest;
 use nixe_scheduler::{PriorityRange, VirtualCpuDescriptor};
 
 fn profile() -> MachineSchedulerProfile {
@@ -59,9 +59,9 @@ fn registration_removal_and_identity_retirement_are_atomic() {
     assert!(matches!(
         error,
         CoordinatorError::Execution {
-            error: ProcessExecutionError::Engine { fault },
+            error: ProcessExecutionError::Cpu { fault },
             ..
-        } if fault.kind == nixe_cpu_engine::EngineFaultKind::Unavailable
+        } if fault.kind == nixe_cpu::execution::CpuFaultKind::Unavailable
     ));
     let replacement = coordinator
         .register_process(

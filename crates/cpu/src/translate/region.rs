@@ -18,11 +18,12 @@ use crate::{
     },
     location::LocationDescriptor,
     memory::{CodePageDependency, InstructionMemory},
+    platform::PlatformDecoder,
     profile::GuestCpuProfile,
 };
 
 use super::block::{
-    BasicBlockLimits, MAX_GUEST_INSTRUCTIONS_PER_BLOCK, translate_basic_block,
+    BasicBlockLimits, MAX_GUEST_INSTRUCTIONS_PER_BLOCK, translate_basic_block_with_decoder,
     translate_basic_block_with_disassembly,
 };
 
@@ -79,21 +80,50 @@ pub fn translate_region(
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrRegion, FrontendError> {
-    translate_region_internal(config, profile, address_space, start, memory, false)
+    translate_region_with_decoder(
+        config,
+        profile.into(),
+        profile,
+        address_space,
+        start,
+        memory,
+    )
 }
 
-pub(crate) fn translate_region_with_disassembly(
+/// Forms a production region through the process-bound decoder.
+pub fn translate_region_with_decoder(
     config: RegionTranslationConfig,
+    decoder: PlatformDecoder,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
     memory: &(impl InstructionMemory + ?Sized),
 ) -> Result<IrRegion, FrontendError> {
-    translate_region_internal(config, profile, address_space, start, memory, true)
+    translate_region_internal(
+        config,
+        decoder,
+        profile,
+        address_space,
+        start,
+        memory,
+        false,
+    )
+}
+
+pub(crate) fn translate_region_with_disassembly(
+    config: RegionTranslationConfig,
+    decoder: PlatformDecoder,
+    profile: &GuestCpuProfile,
+    address_space: AddressSpaceId,
+    start: LocationDescriptor,
+    memory: &(impl InstructionMemory + ?Sized),
+) -> Result<IrRegion, FrontendError> {
+    translate_region_internal(config, decoder, profile, address_space, start, memory, true)
 }
 
 fn translate_region_internal(
     config: RegionTranslationConfig,
+    decoder: PlatformDecoder,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     start: LocationDescriptor,
@@ -112,6 +142,7 @@ fn translate_region_internal(
         cut_blocks_at_entry(
             &mut blocks,
             config,
+            decoder,
             profile,
             address_space,
             location,
@@ -142,13 +173,21 @@ fn translate_region_internal(
         let candidate_result = if capture_disassembly {
             translate_basic_block_with_disassembly(
                 block_config,
+                decoder,
                 profile,
                 address_space,
                 location,
                 memory,
             )
         } else {
-            translate_basic_block(block_config, profile, address_space, location, memory)
+            translate_basic_block_with_decoder(
+                block_config,
+                decoder,
+                profile,
+                address_space,
+                location,
+                memory,
+            )
         };
         let candidate = match candidate_result {
             Ok(candidate) => candidate,
@@ -219,6 +258,7 @@ fn translate_region_internal(
 fn cut_blocks_at_entry(
     blocks: &mut [IrBlock],
     config: RegionTranslationConfig,
+    decoder: PlatformDecoder,
     profile: &GuestCpuProfile,
     address_space: AddressSpaceId,
     entry: LocationDescriptor,
@@ -249,14 +289,16 @@ fn cut_blocks_at_entry(
         let prefix = if capture_disassembly {
             translate_basic_block_with_disassembly(
                 block_config,
+                decoder,
                 profile,
                 address_space,
                 block.metadata.start,
                 memory,
             )?
         } else {
-            translate_basic_block(
+            translate_basic_block_with_decoder(
                 block_config,
+                decoder,
                 profile,
                 address_space,
                 block.metadata.start,
@@ -365,7 +407,6 @@ fn discoverable_successors(
         | Terminator::Call { .. }
         | Terminator::Return { .. }
         | Terminator::Exception { .. }
-        | Terminator::InterpretOne { .. }
         | Terminator::UnsupportedInstruction { .. }
         | Terminator::Stop { .. } => {}
     }
@@ -413,7 +454,6 @@ fn internalize_edges(blocks: &mut [IrBlock], profile: &GuestCpuProfile) {
             | Terminator::Call { .. }
             | Terminator::Return { .. }
             | Terminator::Exception { .. }
-            | Terminator::InterpretOne { .. }
             | Terminator::UnsupportedInstruction { .. }
             | Terminator::Stop { .. } => {}
         }
@@ -495,7 +535,6 @@ fn external_exits(blocks: &[IrBlock]) -> Result<Vec<RegionExit>, FrontendError> 
                     fallthrough,
                 );
             }
-            Terminator::InterpretOne { .. } => exits.push(exit(id, RegionExitKind::Interpreter)),
             Terminator::UnsupportedInstruction { .. } => {
                 exits.push(exit(id, RegionExitKind::UnsupportedInstruction))
             }

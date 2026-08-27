@@ -2,7 +2,6 @@
 mod support;
 
 use std::fs;
-use std::sync::Arc;
 use std::time::Duration;
 
 use nixe_cpu::location::ExecutionState;
@@ -22,17 +21,16 @@ use nixe_horizon::{
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{
-    EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
-    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExitCause,
-    ProcessLifecycle, ProcessObject, ProcessRegistration, ReadableEventObject, RunnableProcess,
-    RuntimeCoordinator, SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult,
-    SharedMemoryObject, ThreadLifecycle, WritableEventObject,
+    CpuBackendConfig, EventObject, ExceptionHandlingResult, ExceptionTerminationReason,
+    ExceptionTerminationScope, Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder,
+    ProcessExitCause, ProcessLifecycle, ProcessObject, ProcessRegistration, ReadableEventObject,
+    RunnableProcess, RuntimeCoordinator, SessionMessage, SessionObject, SessionRequestOwner,
+    SessionRequestResult, SharedMemoryObject, ThreadLifecycle, WritableEventObject,
 };
 use support::ScheduledProcess;
 
 fn reference_process_builder() -> ProcessBuilder {
-    ProcessBuilder::default()
-        .with_engine_provider(Arc::new(nixe_cpu_engine_interpreter::InterpreterProvider))
+    ProcessBuilder::default().with_cpu_backend(CpuBackendConfig::Interpreter)
 }
 
 fn request_owner(thread_id: u64) -> SessionRequestOwner {

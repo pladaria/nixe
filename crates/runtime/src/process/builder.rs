@@ -6,8 +6,7 @@ pub struct ProcessBuilder {
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
-    engine_provider: Option<Arc<dyn nixe_cpu_engine::EngineProvider>>,
-    fallback_engine_provider: Option<Arc<dyn nixe_cpu_engine::EngineProvider>>,
+    cpu_backend: execution::CpuBackendConfig,
 }
 
 impl std::fmt::Debug for ProcessBuilder {
@@ -17,20 +16,7 @@ impl std::fmt::Debug for ProcessBuilder {
             .field("config", &self.config)
             .field("virtual_clock", &self.virtual_clock)
             .field("sd_card_root", &self.sd_card_root)
-            .field(
-                "engine_provider",
-                &self
-                    .engine_provider
-                    .as_ref()
-                    .map(|provider| provider.descriptor()),
-            )
-            .field(
-                "fallback_engine_provider",
-                &self
-                    .fallback_engine_provider
-                    .as_ref()
-                    .map(|provider| provider.descriptor()),
-            )
+            .field("cpu_backend", &self.cpu_backend)
             .finish()
     }
 }
@@ -38,8 +24,6 @@ impl std::fmt::Debug for ProcessBuilder {
 impl ProcessBuilder {
     /// Creates a process builder using Switch 1 defaults.
     ///
-    /// The application must inject a selected CPU engine provider before
-    /// [`Self::build`]; runtime deliberately has no concrete-engine default.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -65,23 +49,10 @@ impl ProcessBuilder {
         self
     }
 
-    /// Injects the provider used to create the process-local execution domain.
+    /// Selects the concrete CPU backend used by this process.
     #[must_use]
-    pub fn with_engine_provider(
-        mut self,
-        provider: Arc<dyn nixe_cpu_engine::EngineProvider>,
-    ) -> Self {
-        self.engine_provider = Some(provider);
-        self
-    }
-
-    /// Injects the semantic engine used for exact `InterpretOne` exits.
-    #[must_use]
-    pub fn with_fallback_engine_provider(
-        mut self,
-        provider: Arc<dyn nixe_cpu_engine::EngineProvider>,
-    ) -> Self {
-        self.fallback_engine_provider = Some(provider);
+    pub fn with_cpu_backend(mut self, backend: execution::CpuBackendConfig) -> Self {
+        self.cpu_backend = backend;
         self
     }
 
@@ -90,12 +61,6 @@ impl ProcessBuilder {
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
     /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
-        let engine_provider = self.engine_provider.as_deref().ok_or_else(|| {
-            ProcessBuildError::new(
-                ProcessBuildStage::EngineInitialization,
-                "a CPU engine provider must be selected by the application",
-            )
-        })?;
         if self.config.architectural_timer_frequency == 0 {
             return Err(ProcessBuildError::new(
                 ProcessBuildStage::Metadata,
@@ -108,54 +73,11 @@ impl ProcessBuilder {
         let stack_size = metadata.stack_size;
         let abi = metadata.abi;
         let random_entropy = generate_process_entropy()?;
-        let cpu = ProcessCpuContext::new(self.config.cpu_profile, self.config.address_space_id);
-        let required = engine_requirements(execution_state);
-        let report = engine_provider.probe(self.config.cpu_profile, required);
-        if !report.available
-            || report.descriptor != engine_provider.descriptor()
-            || !report.descriptor.capabilities.is_coherent()
-            || !report.descriptor.capabilities.contains(required)
-            || !report
-                .descriptor
-                .capabilities
-                .supports_profile(self.config.cpu_profile, required)
-        {
-            return Err(ProcessBuildError::new(
-                ProcessBuildStage::EngineInitialization,
-                format!(
-                    "CPU engine {} rejected guest profile {}: {:?}",
-                    report.descriptor.name, self.config.cpu_profile, report.rejections
-                ),
-            ));
-        }
-        if let Some(fallback) = self.fallback_engine_provider.as_deref() {
-            let report = fallback.probe(
-                self.config.cpu_profile,
-                engine_requirements(execution_state),
-            );
-            let fallback_required = engine_requirements(execution_state);
-            if !report.available
-                || report.descriptor != fallback.descriptor()
-                || !report.descriptor.capabilities.is_coherent()
-                || !report.descriptor.capabilities.contains(fallback_required)
-                || !report
-                    .descriptor
-                    .capabilities
-                    .supports_profile(self.config.cpu_profile, fallback_required)
-                || report.descriptor.capabilities.interpret_one_fallback
-            {
-                return Err(ProcessBuildError::new(
-                    ProcessBuildStage::EngineInitialization,
-                    format!(
-                        "fallback CPU engine {} rejected guest profile {}",
-                        report.descriptor.name, self.config.cpu_profile
-                    ),
-                ));
-            }
-        }
-        let thread_configuration = cpu
-            .thread_configuration(execution_state)
-            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Metadata, error))?;
+        let cpu = ProcessCpuContext::for_platform(
+            self.config.target_platform,
+            self.config.address_space_id,
+        );
+        let thread_configuration = cpu.thread_configuration(execution_state);
         let placements = module_placements(plan, self.config.image_base, address_space)?;
         let modules = prepare_modules(plan, &placements, address_space)?;
         let process_code_start = modules
@@ -337,27 +259,13 @@ impl ProcessBuilder {
                 "initial process mappings exceed the configured physical-memory limit",
             ));
         }
-        let domain_id = execution::allocate_engine_domain_id().ok_or_else(|| {
+        let cpu_process_id = execution::allocate_cpu_process_id().ok_or_else(|| {
             ProcessBuildError::new(
-                ProcessBuildStage::EngineInitialization,
-                "engine domain identity exhausted",
+                ProcessBuildStage::CpuInitialization,
+                "CPU process identity exhausted",
             )
         })?;
-        let fallback_domain = self
-            .fallback_engine_provider
-            .as_deref()
-            .map(|provider| {
-                execution::allocate_engine_domain_id()
-                    .map(|id| (id, provider))
-                    .ok_or_else(|| {
-                        ProcessBuildError::new(
-                            ProcessBuildStage::EngineInitialization,
-                            "fallback engine domain identity exhausted",
-                        )
-                    })
-            })
-            .transpose()?;
-        let execution = execution::ProcessExecutionControl::with_provider(
+        let execution = execution::ProcessExecutionControl::new(
             execution::ProcessExecutionConfiguration {
                 virtual_clock: self.virtual_clock.clone(),
                 timer_frequency: self.config.architectural_timer_frequency,
@@ -367,11 +275,10 @@ impl ProcessBuilder {
                 ),
             },
             &memory,
-            domain_id,
-            engine_provider,
-            fallback_domain,
+            cpu_process_id,
+            &self.cpu_backend,
         )
-        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::EngineInitialization, error))?;
+        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
             process_id: self.config.process_id,
             lifecycle: nixe_scheduler::ProcessLifecycle::Running,
@@ -402,15 +309,6 @@ impl ProcessBuilder {
             execution,
         };
         Ok(process)
-    }
-}
-
-fn engine_requirements(state: ExecutionState) -> nixe_cpu_engine::EngineCapabilities {
-    nixe_cpu_engine::EngineCapabilities {
-        a64: state == ExecutionState::A64,
-        a32: state == ExecutionState::A32,
-        t32: state == ExecutionState::T32,
-        ..Default::default()
     }
 }
 
@@ -638,7 +536,7 @@ fn install_homebrew_loader_return(
     address: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {
     let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
-    // If an execution engine misses the runtime return-address boundary, the
+    // If a CPU backend misses the runtime return-address boundary, the
     // mapped fallback still performs the ABI-prescribed process exit.
     page[..4].copy_from_slice(&HOME_BREW_EXIT_PROCESS_INSTRUCTION.to_le_bytes());
     memory

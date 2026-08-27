@@ -19,6 +19,7 @@ pub use region::{
     MAX_BLOCKS_PER_REGION, MAX_CODE_DEPENDENCIES_PER_REGION, MAX_GUEST_BYTES_PER_REGION,
     MAX_GUEST_INSTRUCTIONS_PER_BASIC_BLOCK, MAX_GUEST_INSTRUCTIONS_PER_REGION,
     MAX_IR_OPERATIONS_PER_REGION, RegionTranslationConfig, translate_region,
+    translate_region_with_decoder,
 };
 
 #[cfg(test)]

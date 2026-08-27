@@ -3,10 +3,7 @@
 use core::fmt;
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
-use crate::{
-    location::{InstructionEncoding, LocationDescriptor},
-    profile::{CapabilityStatus, InstructionFeature, InstructionFeatureRejection},
-};
+use crate::location::{InstructionEncoding, LocationDescriptor};
 
 /// Reproduction context shared by instruction decode diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -169,44 +166,6 @@ impl fmt::Display for DecodeFailure {
 
 impl std::error::Error for DecodeFailure {}
 
-/// A known instruction whose required capability is disabled by the profile.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ProfileDisabledInstruction {
-    /// PC, state, profile, and raw bits required to reproduce the rejection.
-    pub instruction: InstructionDiagnostic,
-    /// Named architectural capability required by the encoding.
-    pub required_feature: InstructionFeature,
-    /// Evidence status recorded by the selected profile.
-    pub status: CapabilityStatus,
-}
-
-impl ProfileDisabledInstruction {
-    /// Creates a profile-disabled instruction diagnostic.
-    #[must_use]
-    pub const fn new(
-        instruction: InstructionDiagnostic,
-        rejection: InstructionFeatureRejection,
-    ) -> Self {
-        Self {
-            instruction,
-            required_feature: rejection.feature,
-            status: rejection.status,
-        }
-    }
-}
-
-impl fmt::Display for ProfileDisabledInstruction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "profile-disabled instruction: {} feature={} status={}",
-            self.instruction, self.required_feature, self.status
-        )
-    }
-}
-
-impl std::error::Error for ProfileDisabledInstruction {}
-
 /// An encoding architecturally classified as unallocated.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UnallocatedEncoding {
@@ -319,8 +278,6 @@ pub enum FrontendError {
     InstructionFetch(InstructionFetchFault),
     /// The decoder could not produce semantics for an encoding.
     Decode(DecodeFailure),
-    /// The profile rejected a recognized instruction.
-    ProfileDisabled(ProfileDisabledInstruction),
     /// The architecture classifies the encoding as unallocated.
     Unallocated(UnallocatedEncoding),
     /// Produced or supplied IR failed verification.
@@ -334,7 +291,6 @@ impl fmt::Display for FrontendError {
         match self {
             Self::InstructionFetch(error) => error.fmt(f),
             Self::Decode(error) => error.fmt(f),
-            Self::ProfileDisabled(error) => error.fmt(f),
             Self::Unallocated(error) => error.fmt(f),
             Self::InvalidIr(error) => error.fmt(f),
             Self::Internal(error) => error.fmt(f),
@@ -347,7 +303,6 @@ impl std::error::Error for FrontendError {
         Some(match self {
             Self::InstructionFetch(error) => error,
             Self::Decode(error) => error,
-            Self::ProfileDisabled(error) => error,
             Self::Unallocated(error) => error,
             Self::InvalidIr(error) => error,
             Self::Internal(error) => error,
@@ -367,7 +322,6 @@ macro_rules! impl_frontend_error_from {
 
 impl_frontend_error_from!(InstructionFetchFault, InstructionFetch);
 impl_frontend_error_from!(DecodeFailure, Decode);
-impl_frontend_error_from!(ProfileDisabledInstruction, ProfileDisabled);
 impl_frontend_error_from!(UnallocatedEncoding, Unallocated);
 impl_frontend_error_from!(InvalidIr, InvalidIr);
 impl_frontend_error_from!(FrontendInternalError, Internal);
@@ -405,20 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn distinct_error_classes_remain_machine_matchable() {
-        let disabled = FrontendError::from(ProfileDisabledInstruction::new(
-            instruction(),
-            InstructionFeatureRejection {
-                feature: InstructionFeature::Crc32,
-                status: CapabilityStatus::Disabled,
-            },
-        ));
+    fn unallocated_errors_remain_machine_matchable() {
         let unallocated = FrontendError::from(UnallocatedEncoding::new(
             instruction(),
             "reserved encoding field",
         ));
 
-        assert!(matches!(disabled, FrontendError::ProfileDisabled(_)));
         assert!(matches!(unallocated, FrontendError::Unallocated(_)));
     }
 

@@ -1,6 +1,16 @@
 # CPU Runtime Concurrency Contract
 
-Status: normative for the current runtime and scheduler architecture
+Status: normative for runtime, scheduler, memory, fault, and lifetime behavior;
+pre-S00 CPU engine topology is superseded.
+
+The [CPU Architecture Simplification Plan](../notes/CPU%20Architecture%20Simplification%20Plan.md)
+governs all new CPU architecture work. References below to generic providers,
+domains, executors, semantic fallback, compilation flights, eviction,
+retirement epochs, or future NCE implementations describe the implementation
+being replaced and must not guide new work. The concurrency, canonical-memory,
+fault, ordering, invalidation, scheduling-event, and teardown guarantees remain
+binding unless that plan replaces their mechanism while preserving their
+guest-visible behavior. S10 will rewrite this document after the S09 cutover.
 
 ## Ownership boundary
 

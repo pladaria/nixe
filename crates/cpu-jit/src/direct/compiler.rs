@@ -1,0 +1,1819 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::{offset_of, size_of};
+
+use cranelift_codegen::ir::{
+    self, AbiParam, Block, InstBuilder, MemFlagsData, Signature, SourceLoc, UserFuncName,
+    condcodes::IntCC, types,
+};
+use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Linkage, Module, default_libcall_names};
+use nixe_cpu::decode::a64::{A64Instruction, control, fp_simd, integer, memory, system};
+use nixe_cpu::location::DecodedInstruction;
+use nixe_cpu::semantics::conditions::Condition;
+use nixe_memory::GuestVirtualAddress;
+
+use super::region::{BlockTerminator, NativeRegion};
+use super::{
+    DirectJitError, EXIT_ARCHITECTURAL, EXIT_BUDGET, EXIT_CONTROL, EXIT_DISPATCH, EXIT_UNSUPPORTED,
+    NativeContext,
+};
+
+mod a64;
+mod a64_fp_simd;
+mod a64_memory;
+mod a64_system;
+
+pub(super) type NativeGateway = unsafe extern "C" fn(*mut NativeContext, usize);
+
+pub(super) struct CompiledRegion {
+    pub(super) entry: usize,
+    pub(super) native_bytes: usize,
+    pub(super) clif_instructions: usize,
+    pub(super) register_loads: usize,
+    pub(super) register_stores: usize,
+}
+
+pub(super) struct DirectCompiler {
+    module: JITModule,
+    context: cranelift_codegen::Context,
+    function_builder: FunctionBuilderContext,
+    gateway: NativeGateway,
+    next_function: u32,
+}
+
+impl DirectCompiler {
+    pub(super) fn new() -> Result<Self, DirectJitError> {
+        let isa_builder = cranelift_native::builder().map_err(|detail| {
+            DirectJitError::unsupported(format!("direct JIT host ISA is unavailable: {detail}"))
+        })?;
+        let mut flags = settings::builder();
+        for (name, value) in [
+            ("preserve_frame_pointers", "true"),
+            ("use_colocated_libcalls", "false"),
+            ("is_pic", "false"),
+            ("opt_level", "speed"),
+            ("regalloc_algorithm", "backtracking"),
+            (
+                "enable_verifier",
+                if cfg!(any(debug_assertions, test)) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ] {
+            flags.set(name, value).map_err(|error| {
+                DirectJitError::internal(format!(
+                    "direct JIT Cranelift setting {name}={value} failed: {error}"
+                ))
+            })?;
+        }
+        let isa = isa_builder
+            .finish(settings::Flags::new(flags))
+            .map_err(|error| {
+                DirectJitError::unsupported(format!(
+                    "direct JIT host ISA configuration failed: {error}"
+                ))
+            })?;
+        let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+        let mut context = module.make_context();
+        let mut function_builder = FunctionBuilderContext::new();
+        let gateway = compile_gateway(&mut module, &mut context, &mut function_builder)?;
+        Ok(Self {
+            module,
+            context,
+            function_builder,
+            gateway,
+            next_function: 1,
+        })
+    }
+
+    pub(super) const fn gateway(&self) -> NativeGateway {
+        self.gateway
+    }
+
+    pub(super) fn compile(
+        &mut self,
+        region: &NativeRegion,
+        static_slots: &[usize],
+    ) -> Result<CompiledRegion, DirectJitError> {
+        self.context.func.signature = tail_signature();
+        self.context.func.name = UserFuncName::user(1, self.next_function);
+        let function_name = format!(
+            "direct_{:08x}_{:016x}_{:016x}",
+            self.next_function,
+            region.key.address_space.get(),
+            region.key.start.get()
+        );
+        let function = self
+            .module
+            .declare_function(&function_name, Linkage::Local, &self.context.func.signature)
+            .map_err(module_error)?;
+        self.context.func.name = UserFuncName::user(1, function.as_u32());
+        self.next_function = self.next_function.checked_add(1).ok_or_else(|| {
+            DirectJitError::capacity("direct JIT function identity space exhausted")
+        })?;
+
+        {
+            let builder = FunctionBuilder::new(&mut self.context.func, &mut self.function_builder);
+            CraneliftTranslator::new(
+                builder,
+                region,
+                static_slots,
+                self.module.target_config().default_call_conv,
+            )?
+            .translate(self.module.target_config())?;
+        }
+        let clif_instructions = self
+            .context
+            .func
+            .layout
+            .blocks()
+            .map(|block| self.context.func.layout.block_insts(block).count())
+            .sum();
+        self.module
+            .define_function(function, &mut self.context)
+            .map_err(module_error)?;
+        let native_bytes = self
+            .context
+            .compiled_code()
+            .expect("defined direct JIT function retains compiled code")
+            .code_buffer()
+            .len();
+        self.module.finalize_definitions().map_err(module_error)?;
+        let entry = self.module.get_finalized_function(function).addr();
+        self.module.clear_context(&mut self.context);
+        let (accessed, dirty) = register_access(region);
+        Ok(CompiledRegion {
+            entry,
+            native_bytes,
+            clif_instructions,
+            register_loads: accessed.into_iter().filter(|accessed| *accessed).count(),
+            register_stores: dirty.into_iter().filter(|dirty| *dirty).count(),
+        })
+    }
+}
+
+fn compile_gateway(
+    module: &mut JITModule,
+    context: &mut cranelift_codegen::Context,
+    function_builder: &mut FunctionBuilderContext,
+) -> Result<NativeGateway, DirectJitError> {
+    let pointer = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer));
+    signature.params.push(AbiParam::new(pointer));
+    let function = module
+        .declare_function("direct_jit_gateway", Linkage::Local, &signature)
+        .map_err(module_error)?;
+    context.func.signature = signature;
+    context.func.name = UserFuncName::user(0, function.as_u32());
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, function_builder);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let native_context = builder.block_params(entry)[0];
+        let target = builder.block_params(entry)[1];
+        let tail = builder.import_signature(tail_signature());
+        builder.ins().call_indirect(tail, target, &[native_context]);
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize(module.target_config());
+    }
+    module
+        .define_function(function, context)
+        .map_err(module_error)?;
+    module.finalize_definitions().map_err(module_error)?;
+    let entry = module.get_finalized_function(function);
+    module.clear_context(context);
+    Ok(unsafe { std::mem::transmute::<*const u8, NativeGateway>(entry) })
+}
+
+fn tail_signature() -> Signature {
+    let mut signature = Signature::new(CallConv::Tail);
+    signature.params.push(AbiParam::new(types::I64));
+    signature
+}
+
+fn module_error(error: cranelift_module::ModuleError) -> DirectJitError {
+    DirectJitError::internal(format!("direct JIT compilation failed: {error}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LazyFlags {
+    Canonical(ir::Value),
+    Packed(ir::Value),
+    Add {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        result: ir::Value,
+        width: u8,
+    },
+    Subtract {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        result: ir::Value,
+        width: u8,
+    },
+    AddCarry {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        carry: ir::Value,
+        result: ir::Value,
+        width: u8,
+    },
+    SubtractCarry {
+        lhs: ir::Value,
+        rhs: ir::Value,
+        carry: ir::Value,
+        result: ir::Value,
+        width: u8,
+    },
+    Logical {
+        result: ir::Value,
+        width: u8,
+    },
+    Conditional {
+        predicate: ir::Value,
+        when_true: Box<LazyFlags>,
+        when_false: u32,
+    },
+}
+
+impl LazyFlags {
+    const fn dirty(&self) -> bool {
+        !matches!(self, Self::Canonical(_))
+    }
+}
+
+struct CraneliftTranslator<'a, 'region> {
+    builder: FunctionBuilder<'a>,
+    region: &'region NativeRegion,
+    blocks: HashMap<GuestVirtualAddress, Block>,
+    flags_at_entry: HashMap<GuestVirtualAddress, LazyFlags>,
+    merged_flag_entries: HashSet<GuestVirtualAddress>,
+    static_slots: VecDeque<(GuestVirtualAddress, usize)>,
+    prologue: Block,
+    context: ir::Value,
+    x: ir::Value,
+    vector: ir::Value,
+    sp: ir::Value,
+    pc: ir::Value,
+    nzcv: ir::Value,
+    fpsr: ir::Value,
+    budget: ir::Value,
+    control_pending: ir::Value,
+    initial_flags: ir::Value,
+    retired: Variable,
+    packed_flags: Variable,
+    fpsr_state: Variable,
+    registers: [Option<Variable>; 32],
+    dirty_registers: [bool; 32],
+    vector_registers: [Option<Variable>; 32],
+    dirty_vector_registers: [bool; 32],
+    dirty_fpsr: bool,
+    call_conv: CallConv,
+}
+
+impl<'a, 'region> CraneliftTranslator<'a, 'region> {
+    fn new(
+        mut builder: FunctionBuilder<'a>,
+        region: &'region NativeRegion,
+        static_slots: &[usize],
+        call_conv: CallConv,
+    ) -> Result<Self, DirectJitError> {
+        let expected_slots = region
+            .external_exits
+            .iter()
+            .filter(|exit| exit.target.is_some())
+            .count();
+        if static_slots.len() != expected_slots {
+            return Err(DirectJitError::internal(
+                "direct JIT static-link metadata disagrees with region exits",
+            ));
+        }
+        let static_slots = region
+            .external_exits
+            .iter()
+            .filter_map(|exit| exit.target)
+            .zip(static_slots.iter().copied())
+            .collect();
+        let blocks = region
+            .blocks
+            .iter()
+            .map(|block| (block.start.pc, builder.create_block()))
+            .collect();
+        let prologue = builder.create_block();
+        builder.append_block_params_for_function_params(prologue);
+        builder.switch_to_block(prologue);
+        let placeholder = builder.ins().iconst(types::I64, 0);
+        let retired = builder.declare_var(types::I64);
+        let packed_flags = builder.declare_var(types::I32);
+        let fpsr_state = builder.declare_var(types::I32);
+        Ok(Self {
+            builder,
+            region,
+            blocks,
+            flags_at_entry: HashMap::new(),
+            merged_flag_entries: merged_flag_entries(region),
+            static_slots,
+            prologue,
+            context: placeholder,
+            x: placeholder,
+            vector: placeholder,
+            sp: placeholder,
+            pc: placeholder,
+            nzcv: placeholder,
+            fpsr: placeholder,
+            budget: placeholder,
+            control_pending: placeholder,
+            initial_flags: placeholder,
+            retired,
+            packed_flags,
+            fpsr_state,
+            registers: [None; 32],
+            dirty_registers: register_access(region).1,
+            vector_registers: [None; 32],
+            dirty_vector_registers: vector_register_access(region).1,
+            dirty_fpsr: fp_status_access(region).1,
+            call_conv,
+        })
+    }
+
+    fn translate(
+        mut self,
+        target_config: cranelift_codegen::isa::TargetFrontendConfig,
+    ) -> Result<(), DirectJitError> {
+        self.context = self.builder.block_params(self.prologue)[0];
+        self.x = self.load_context_pointer(offset_of!(NativeContext, x))?;
+        self.vector = self.load_context_pointer(offset_of!(NativeContext, vector))?;
+        self.sp = self.load_context_pointer(offset_of!(NativeContext, sp))?;
+        self.pc = self.load_context_pointer(offset_of!(NativeContext, pc))?;
+        self.nzcv = self.load_context_pointer(offset_of!(NativeContext, nzcv))?;
+        self.fpsr = self.load_context_pointer(offset_of!(NativeContext, fpsr))?;
+        self.budget =
+            self.load_context(types::I64, offset_of!(NativeContext, instruction_budget))?;
+        self.control_pending =
+            self.load_context_pointer(offset_of!(NativeContext, control_pending))?;
+        self.initial_flags = self
+            .builder
+            .ins()
+            .load(types::I32, trusted_flags(), self.nzcv, 0);
+        self.builder.def_var(self.packed_flags, self.initial_flags);
+        let initial_fpsr = if fp_status_access(self.region).0 {
+            self.builder
+                .ins()
+                .load(types::I32, trusted_flags(), self.fpsr, 0)
+        } else {
+            self.builder.ins().iconst(types::I32, 0)
+        };
+        self.builder.def_var(self.fpsr_state, initial_fpsr);
+        let initial_retired = self.load_context(types::I64, offset_of!(NativeContext, retired))?;
+        self.builder.def_var(self.retired, initial_retired);
+
+        let (accessed, _) = register_access(self.region);
+        for (index, accessed) in accessed.into_iter().enumerate() {
+            if !accessed {
+                continue;
+            }
+            let variable = self.builder.declare_var(types::I64);
+            let value = if index == 31 {
+                self.builder
+                    .ins()
+                    .load(types::I64, trusted_flags(), self.sp, 0)
+            } else {
+                self.builder.ins().load(
+                    types::I64,
+                    trusted_flags(),
+                    self.x,
+                    i32::try_from(index * size_of::<u64>())
+                        .expect("architectural GPR offset fits i32"),
+                )
+            };
+            self.builder.def_var(variable, value);
+            self.registers[index] = Some(variable);
+        }
+
+        let (accessed_vectors, _) = vector_register_access(self.region);
+        for (index, accessed) in accessed_vectors.into_iter().enumerate() {
+            if !accessed {
+                continue;
+            }
+            let variable = self.builder.declare_var(types::I8X16);
+            let value = self.builder.ins().load(
+                types::I8X16,
+                trusted_flags(),
+                self.vector,
+                i32::try_from(index * size_of::<u128>())
+                    .expect("architectural vector offset fits i32"),
+            );
+            self.builder.def_var(variable, value);
+            self.vector_registers[index] = Some(variable);
+        }
+
+        let start = self.region.key.start;
+        if !self.merged_flag_entries.contains(&start) {
+            self.flags_at_entry
+                .insert(start, LazyFlags::Canonical(self.initial_flags));
+        }
+        let pending =
+            self.builder
+                .ins()
+                .atomic_load(types::I32, plain_flags(), self.control_pending);
+        let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
+        let control_exit = self.builder.create_block();
+        let start_block = self.block(start)?;
+        self.builder
+            .ins()
+            .brif(has_control, control_exit, &[], start_block, &[]);
+        self.builder.switch_to_block(control_exit);
+        let initial = LazyFlags::Canonical(self.initial_flags);
+        self.emit_exit(EXIT_CONTROL, 0, start, &initial)?;
+
+        for block_index in 0..self.region.blocks.len() {
+            self.translate_block(block_index)?;
+        }
+        if !self.static_slots.is_empty() {
+            return Err(DirectJitError::internal(
+                "direct JIT region left static-link slots unused",
+            ));
+        }
+        self.builder.seal_all_blocks();
+        self.builder.finalize(target_config);
+        Ok(())
+    }
+
+    fn translate_block(&mut self, block_index: usize) -> Result<(), DirectJitError> {
+        let record = &self.region.blocks[block_index];
+        let block = self.block(record.start.pc)?;
+        self.builder.switch_to_block(block);
+        let mut flags = if self.merged_flag_entries.contains(&record.start.pc) {
+            LazyFlags::Packed(self.builder.use_var(self.packed_flags))
+        } else {
+            self.flags_at_entry
+                .get(&record.start.pc)
+                .cloned()
+                .unwrap_or(LazyFlags::Canonical(self.initial_flags))
+        };
+        for (index, decoded) in record.instructions.iter().enumerate() {
+            self.builder
+                .set_srcloc(source_location(self.region, decoded));
+            self.guard_budget(decoded.location.pc, &flags)?;
+            let instruction =
+                nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding);
+            let terminal = index + 1 == record.instructions.len();
+            match instruction {
+                A64Instruction::Control(control::Instruction::Nop(_)) => {
+                    self.retire_one();
+                }
+                A64Instruction::Integer(instruction) => {
+                    if let Some(updated) =
+                        self.emit_integer(decoded.location.pc, instruction, &flags)?
+                    {
+                        flags = updated;
+                    }
+                    self.retire_one();
+                }
+                A64Instruction::Memory(instruction) => {
+                    self.emit_memory(decoded.location.pc, instruction, &flags)?;
+                    self.retire_one();
+                }
+                A64Instruction::System(instruction) => {
+                    self.emit_system(decoded.location.pc, instruction, &mut flags)?;
+                    self.retire_one();
+                }
+                A64Instruction::FpSimd(instruction) => {
+                    self.emit_fp_simd(decoded.location.pc, instruction, &mut flags)?;
+                    self.retire_one();
+                }
+                A64Instruction::Control(
+                    control::Instruction::BranchImmediate(_)
+                    | control::Instruction::ConditionalBranch(_)
+                    | control::Instruction::CompareBranch(_)
+                    | control::Instruction::TestBranch(_)
+                    | control::Instruction::BranchLinkImmediate(_)
+                    | control::Instruction::BranchRegister(_)
+                    | control::Instruction::SupervisorCall(_)
+                    | control::Instruction::Breakpoint(_),
+                ) => self.retire_one(),
+                _ if terminal && matches!(record.terminator, BlockTerminator::Unsupported) => {}
+                _ => {
+                    return Err(unsupported_instruction(decoded));
+                }
+            }
+        }
+        self.emit_terminator(record, flags)
+    }
+
+    fn emit_terminator(
+        &mut self,
+        record: &super::region::BasicBlockRecord,
+        flags: LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        // A64 branch targets, link updates, conditions, and register-target
+        // alignment follow Arm DDI 0602 (2025-12), Base Instructions:
+        // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/B-cond--Branch-conditionally-
+        // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/BLR--Branch-with-link-to-register-
+        let source = record
+            .instructions
+            .last()
+            .map_or(record.start.pc, |instruction| instruction.location.pc);
+        match record.terminator {
+            BlockTerminator::Direct { target } => self.emit_edge(source, target, &flags),
+            BlockTerminator::Conditional { taken, not_taken } => {
+                let decoded = record
+                    .instructions
+                    .last()
+                    .expect("conditional block contains its terminator");
+                let condition = match nixe_cpu::decode::a64::normalize(
+                    &decoded.instruction,
+                    decoded.encoding,
+                ) {
+                    A64Instruction::Control(control::Instruction::ConditionalBranch(fields)) => {
+                        self.emit_condition(Condition::from_encoding(fields.condition), &flags)
+                    }
+                    A64Instruction::Control(control::Instruction::CompareBranch(fields)) => {
+                        let value = self.read_register(fields.rd, false)?;
+                        let value = self.integer_value(value, fields.width_64);
+                        let zero = self.builder.ins().icmp_imm_s(IntCC::Equal, value, 0);
+                        if fields.nonzero {
+                            self.invert_bit(zero)
+                        } else {
+                            zero
+                        }
+                    }
+                    A64Instruction::Control(control::Instruction::TestBranch(fields)) => {
+                        let value = self.read_register(fields.rd, false)?;
+                        let shifted = self
+                            .builder
+                            .ins()
+                            .ushr_imm_u(value, i64::from(fields.bit_index));
+                        let bit = self.builder.ins().band_imm_u(shifted, 1);
+                        let set = self.builder.ins().ireduce(types::I8, bit);
+                        if fields.nonzero {
+                            set
+                        } else {
+                            self.invert_bit(set)
+                        }
+                    }
+                    _ => {
+                        return Err(DirectJitError::internal(
+                            "conditional region terminator lacks a conditional instruction",
+                        ));
+                    }
+                };
+                let taken_edge = self.builder.create_block();
+                let not_taken_edge = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(condition, taken_edge, &[], not_taken_edge, &[]);
+                self.builder.switch_to_block(taken_edge);
+                self.emit_edge(source, taken, &flags)?;
+                self.builder.switch_to_block(not_taken_edge);
+                self.emit_edge(source, not_taken, &flags)
+            }
+            BlockTerminator::Call {
+                target,
+                return_address,
+            } => {
+                let value = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, return_address.get() as i64);
+                self.write_register(30, value)?;
+                self.emit_static_exit(target, &flags)
+            }
+            BlockTerminator::Indirect => {
+                let decoded = record
+                    .instructions
+                    .last()
+                    .expect("indirect block contains its terminator");
+                let A64Instruction::Control(control::Instruction::BranchRegister(fields)) =
+                    nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding)
+                else {
+                    return Err(DirectJitError::internal(
+                        "indirect region terminator lacks a register branch",
+                    ));
+                };
+                let target = self.read_register(fields.rn, false)?;
+                let misaligned_bits = self.builder.ins().band_imm_u(target, 3);
+                let misaligned = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::NotEqual, misaligned_bits, 0);
+                let alignment_exit = self.builder.create_block();
+                let aligned = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(misaligned, alignment_exit, &[], aligned, &[]);
+                self.builder.switch_to_block(alignment_exit);
+                self.emit_exit(EXIT_ARCHITECTURAL, 3 << 24, source, &flags)?;
+                self.builder.switch_to_block(aligned);
+                if fields.branch_register_key == 0xd63f_0000 {
+                    let return_address = source.get().wrapping_add(4);
+                    let value = self.builder.ins().iconst(types::I64, return_address as i64);
+                    self.write_register(30, value)?;
+                }
+                self.emit_dynamic_exit(target, &flags)
+            }
+            BlockTerminator::Architectural { kind, syndrome } => {
+                let class = match kind {
+                    nixe_cpu::exception::ExceptionKind::SupervisorCall => 1_u32,
+                    nixe_cpu::exception::ExceptionKind::Breakpoint => 2_u32,
+                    _ => 0,
+                };
+                let immediate = syndrome.unwrap_or(0) as u32 & 0x00ff_ffff;
+                let detail = (class << 24) | immediate;
+                self.emit_exit(EXIT_ARCHITECTURAL, detail, source, &flags)
+            }
+            BlockTerminator::Unsupported => self.emit_exit(EXIT_UNSUPPORTED, 0, source, &flags),
+            BlockTerminator::Limit { continuation } => self.emit_static_exit(continuation, &flags),
+        }
+    }
+
+    fn emit_edge(
+        &mut self,
+        source: GuestVirtualAddress,
+        target: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        if let Some(block) = self.blocks.get(&target).copied() {
+            self.propagate_flags(target, flags)?;
+            if target.get() <= source.get() {
+                let pending =
+                    self.builder
+                        .ins()
+                        .atomic_load(types::I32, plain_flags(), self.control_pending);
+                let has_control = self.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
+                let control = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(has_control, control, &[], block, &[]);
+                self.builder.switch_to_block(control);
+                self.emit_exit(EXIT_CONTROL, 0, target, flags)
+            } else {
+                self.builder.ins().jump(block, &[]);
+                Ok(())
+            }
+        } else {
+            self.emit_static_exit(target, flags)
+        }
+    }
+
+    fn emit_static_exit(
+        &mut self,
+        target_pc: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        let Some((expected, slot)) = self.static_slots.pop_front() else {
+            return Err(DirectJitError::internal(
+                "direct JIT region is missing a static target slot",
+            ));
+        };
+        if expected != target_pc {
+            return Err(DirectJitError::internal(format!(
+                "direct JIT static target order mismatch: expected={expected} actual={target_pc}"
+            )));
+        }
+        self.commit_state(target_pc, flags)?;
+        let cell = self.builder.ins().iconst(types::I64, slot as i64);
+        let target = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, plain_flags(), cell);
+        let linked = self.builder.ins().icmp_imm_s(IntCC::NotEqual, target, 0);
+        let chain = self.builder.create_block();
+        let miss = self.builder.create_block();
+        self.builder.ins().brif(linked, chain, &[], miss, &[]);
+        self.builder.switch_to_block(chain);
+        let signature = self.builder.import_signature(tail_signature());
+        self.builder
+            .ins()
+            .return_call_indirect(signature, target, &[self.context]);
+        self.builder.switch_to_block(miss);
+        self.finish_exit(EXIT_DISPATCH, 0, target_pc)
+    }
+
+    fn emit_dynamic_exit(
+        &mut self,
+        target: ir::Value,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        self.commit_registers()?;
+        self.commit_flags(flags)?;
+        self.builder
+            .ins()
+            .store(trusted_flags(), target, self.pc, 0);
+        self.store_context(target, offset_of!(NativeContext, exit_pc))?;
+        let retired = self.builder.use_var(self.retired);
+        self.store_context(retired, offset_of!(NativeContext, retired))?;
+        let kind = self
+            .builder
+            .ins()
+            .iconst(types::I32, i64::from(EXIT_DISPATCH));
+        self.store_context(kind, offset_of!(NativeContext, exit_kind))?;
+        let detail = self.builder.ins().iconst(types::I32, 0);
+        self.store_context(detail, offset_of!(NativeContext, exit_detail))?;
+        self.builder.ins().return_(&[]);
+        Ok(())
+    }
+
+    fn guard_budget(
+        &mut self,
+        source: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        let retired = self.builder.use_var(self.retired);
+        let exhausted =
+            self.builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, retired, self.budget);
+        let exit = self.builder.create_block();
+        let execute = self.builder.create_block();
+        self.builder.ins().brif(exhausted, exit, &[], execute, &[]);
+        self.builder.switch_to_block(exit);
+        self.emit_exit(EXIT_BUDGET, 0, source, flags)?;
+        self.builder.switch_to_block(execute);
+        Ok(())
+    }
+
+    fn emit_condition(&mut self, condition: Condition, flags: &LazyFlags) -> ir::Value {
+        match condition {
+            Condition::Eq => self.flag_z(flags),
+            Condition::Ne => {
+                let z = self.flag_z(flags);
+                self.invert_bit(z)
+            }
+            Condition::Cs => self.flag_c(flags),
+            Condition::Cc => {
+                let c = self.flag_c(flags);
+                self.invert_bit(c)
+            }
+            Condition::Mi => self.flag_n(flags),
+            Condition::Pl => {
+                let n = self.flag_n(flags);
+                self.invert_bit(n)
+            }
+            Condition::Vs => self.flag_v(flags),
+            Condition::Vc => {
+                let v = self.flag_v(flags);
+                self.invert_bit(v)
+            }
+            Condition::Hi => {
+                let c = self.flag_c(flags);
+                let z = self.flag_z(flags);
+                let not_z = self.invert_bit(z);
+                self.builder.ins().band(c, not_z)
+            }
+            Condition::Ls => {
+                let c = self.flag_c(flags);
+                let z = self.flag_z(flags);
+                let not_c = self.invert_bit(c);
+                self.builder.ins().bor(not_c, z)
+            }
+            Condition::Ge => {
+                let n = self.flag_n(flags);
+                let v = self.flag_v(flags);
+                self.builder.ins().icmp(IntCC::Equal, n, v)
+            }
+            Condition::Lt => {
+                let n = self.flag_n(flags);
+                let v = self.flag_v(flags);
+                self.builder.ins().icmp(IntCC::NotEqual, n, v)
+            }
+            Condition::Gt => {
+                let z = self.flag_z(flags);
+                let n = self.flag_n(flags);
+                let v = self.flag_v(flags);
+                let not_z = self.invert_bit(z);
+                let equal = self.builder.ins().icmp(IntCC::Equal, n, v);
+                self.builder.ins().band(not_z, equal)
+            }
+            Condition::Le => {
+                let z = self.flag_z(flags);
+                let n = self.flag_n(flags);
+                let v = self.flag_v(flags);
+                let different = self.builder.ins().icmp(IntCC::NotEqual, n, v);
+                self.builder.ins().bor(z, different)
+            }
+            Condition::Al | Condition::Nv => self.builder.ins().iconst(types::I8, 1),
+        }
+    }
+
+    fn invert_bit(&mut self, value: ir::Value) -> ir::Value {
+        self.builder.ins().bxor_imm_u(value, 1)
+    }
+
+    fn flag_n(&mut self, flags: &LazyFlags) -> ir::Value {
+        match flags {
+            LazyFlags::Canonical(packed) | LazyFlags::Packed(packed) => {
+                let shifted = self.builder.ins().ushr_imm_u(*packed, 31);
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::Add { result, width, .. }
+            | LazyFlags::Subtract { result, width, .. }
+            | LazyFlags::AddCarry { result, width, .. }
+            | LazyFlags::SubtractCarry { result, width, .. }
+            | LazyFlags::Logical { result, width } => {
+                let shifted = self
+                    .builder
+                    .ins()
+                    .ushr_imm_u(*result, i64::from(*width - 1));
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::Conditional {
+                predicate,
+                when_true,
+                when_false,
+            } => {
+                let when_true = self.flag_n(when_true);
+                let when_false = self
+                    .builder
+                    .ins()
+                    .iconst(types::I8, i64::from((when_false >> 3) & 1));
+                self.builder.ins().select(*predicate, when_true, when_false)
+            }
+        }
+    }
+
+    fn flag_z(&mut self, flags: &LazyFlags) -> ir::Value {
+        match flags {
+            LazyFlags::Canonical(packed) | LazyFlags::Packed(packed) => {
+                let shifted = self.builder.ins().ushr_imm_u(*packed, 30);
+                let bit = self.builder.ins().band_imm_u(shifted, 1);
+                self.builder.ins().ireduce(types::I8, bit)
+            }
+            LazyFlags::Add { result, .. }
+            | LazyFlags::Subtract { result, .. }
+            | LazyFlags::AddCarry { result, .. }
+            | LazyFlags::SubtractCarry { result, .. }
+            | LazyFlags::Logical { result, .. } => {
+                self.builder.ins().icmp_imm_s(IntCC::Equal, *result, 0)
+            }
+            LazyFlags::Conditional {
+                predicate,
+                when_true,
+                when_false,
+            } => {
+                let when_true = self.flag_z(when_true);
+                let when_false = self
+                    .builder
+                    .ins()
+                    .iconst(types::I8, i64::from((when_false >> 2) & 1));
+                self.builder.ins().select(*predicate, when_true, when_false)
+            }
+        }
+    }
+
+    fn flag_c(&mut self, flags: &LazyFlags) -> ir::Value {
+        match flags {
+            LazyFlags::Canonical(packed) | LazyFlags::Packed(packed) => {
+                let shifted = self.builder.ins().ushr_imm_u(*packed, 29);
+                let bit = self.builder.ins().band_imm_u(shifted, 1);
+                self.builder.ins().ireduce(types::I8, bit)
+            }
+            LazyFlags::Add { lhs, result, .. } => {
+                self.builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, *result, *lhs)
+            }
+            LazyFlags::Subtract { lhs, rhs, .. } => {
+                self.builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, *lhs, *rhs)
+            }
+            LazyFlags::AddCarry {
+                lhs, carry, result, ..
+            } => {
+                let wrapped = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, *result, *lhs);
+                let equal = self.builder.ins().icmp(IntCC::Equal, *result, *lhs);
+                let equal_with_carry = self.builder.ins().band(equal, *carry);
+                self.builder.ins().bor(wrapped, equal_with_carry)
+            }
+            LazyFlags::SubtractCarry {
+                lhs, rhs, carry, ..
+            } => {
+                let greater = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, *lhs, *rhs);
+                let equal = self.builder.ins().icmp(IntCC::Equal, *lhs, *rhs);
+                let equal_with_carry = self.builder.ins().band(equal, *carry);
+                self.builder.ins().bor(greater, equal_with_carry)
+            }
+            LazyFlags::Logical { .. } => self.builder.ins().iconst(types::I8, 0),
+            LazyFlags::Conditional {
+                predicate,
+                when_true,
+                when_false,
+            } => {
+                let when_true = self.flag_c(when_true);
+                let when_false = self
+                    .builder
+                    .ins()
+                    .iconst(types::I8, i64::from((when_false >> 1) & 1));
+                self.builder.ins().select(*predicate, when_true, when_false)
+            }
+        }
+    }
+
+    fn flag_v(&mut self, flags: &LazyFlags) -> ir::Value {
+        match flags {
+            LazyFlags::Canonical(packed) | LazyFlags::Packed(packed) => {
+                let shifted = self.builder.ins().ushr_imm_u(*packed, 28);
+                let bit = self.builder.ins().band_imm_u(shifted, 1);
+                self.builder.ins().ireduce(types::I8, bit)
+            }
+            LazyFlags::Add {
+                lhs,
+                rhs,
+                result,
+                width,
+            } => {
+                let xor_operands = self.builder.ins().bxor(*lhs, *rhs);
+                let same_sign = self.builder.ins().bnot(xor_operands);
+                let changed = self.builder.ins().bxor(*lhs, *result);
+                let overflow = self.builder.ins().band(same_sign, changed);
+                let shifted = self
+                    .builder
+                    .ins()
+                    .ushr_imm_u(overflow, i64::from(*width - 1));
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::Subtract {
+                lhs,
+                rhs,
+                result,
+                width,
+            } => {
+                let different = self.builder.ins().bxor(*lhs, *rhs);
+                let changed = self.builder.ins().bxor(*lhs, *result);
+                let overflow = self.builder.ins().band(different, changed);
+                let shifted = self
+                    .builder
+                    .ins()
+                    .ushr_imm_u(overflow, i64::from(*width - 1));
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::AddCarry {
+                lhs,
+                rhs,
+                result,
+                width,
+                ..
+            } => {
+                let xor_operands = self.builder.ins().bxor(*lhs, *rhs);
+                let same_sign = self.builder.ins().bnot(xor_operands);
+                let changed = self.builder.ins().bxor(*lhs, *result);
+                let overflow = self.builder.ins().band(same_sign, changed);
+                let shifted = self
+                    .builder
+                    .ins()
+                    .ushr_imm_u(overflow, i64::from(*width - 1));
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::SubtractCarry {
+                lhs,
+                rhs,
+                result,
+                width,
+                ..
+            } => {
+                let different = self.builder.ins().bxor(*lhs, *rhs);
+                let changed = self.builder.ins().bxor(*lhs, *result);
+                let overflow = self.builder.ins().band(different, changed);
+                let shifted = self
+                    .builder
+                    .ins()
+                    .ushr_imm_u(overflow, i64::from(*width - 1));
+                self.builder.ins().ireduce(types::I8, shifted)
+            }
+            LazyFlags::Logical { .. } => self.builder.ins().iconst(types::I8, 0),
+            LazyFlags::Conditional {
+                predicate,
+                when_true,
+                when_false,
+            } => {
+                let when_true = self.flag_v(when_true);
+                let when_false = self
+                    .builder
+                    .ins()
+                    .iconst(types::I8, i64::from(*when_false & 1));
+                self.builder.ins().select(*predicate, when_true, when_false)
+            }
+        }
+    }
+
+    fn packed_flags(&mut self, flags: &LazyFlags) -> ir::Value {
+        if let LazyFlags::Canonical(value) | LazyFlags::Packed(value) = flags {
+            return *value;
+        }
+        let n = self.flag_n(flags);
+        let z = self.flag_z(flags);
+        let c = self.flag_c(flags);
+        let v = self.flag_v(flags);
+        let n = self.builder.ins().uextend(types::I32, n);
+        let z = self.builder.ins().uextend(types::I32, z);
+        let c = self.builder.ins().uextend(types::I32, c);
+        let v = self.builder.ins().uextend(types::I32, v);
+        let n = self.builder.ins().ishl_imm_u(n, 31);
+        let z = self.builder.ins().ishl_imm_u(z, 30);
+        let c = self.builder.ins().ishl_imm_u(c, 29);
+        let v = self.builder.ins().ishl_imm_u(v, 28);
+        let nz = self.builder.ins().bor(n, z);
+        let cv = self.builder.ins().bor(c, v);
+        self.builder.ins().bor(nz, cv)
+    }
+
+    fn propagate_flags(
+        &mut self,
+        target: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        if self.merged_flag_entries.contains(&target) {
+            let packed = self.packed_flags(flags);
+            self.builder.def_var(self.packed_flags, packed);
+        } else if let Some(existing) = self.flags_at_entry.get(&target) {
+            if existing != flags {
+                return Err(DirectJitError::internal(format!(
+                    "direct JIT flag predecessor analysis missed a merge at {target}"
+                )));
+            }
+        } else {
+            self.flags_at_entry.insert(target, flags.clone());
+        }
+        Ok(())
+    }
+
+    fn retire_one(&mut self) {
+        let retired = self.builder.use_var(self.retired);
+        let retired = self.builder.ins().iadd_imm_s(retired, 1);
+        self.builder.def_var(self.retired, retired);
+    }
+
+    fn read_register(
+        &mut self,
+        index: u8,
+        register31_is_sp: bool,
+    ) -> Result<ir::Value, DirectJitError> {
+        if index == 31 && !register31_is_sp {
+            return Ok(self.builder.ins().iconst(types::I64, 0));
+        }
+        let slot = if index == 31 { 31 } else { usize::from(index) };
+        let variable = self.registers[slot].ok_or_else(|| {
+            DirectJitError::internal(format!("direct JIT register X{index} was not planned"))
+        })?;
+        Ok(self.builder.use_var(variable))
+    }
+
+    fn write_register(&mut self, index: u8, value: ir::Value) -> Result<(), DirectJitError> {
+        self.write_register_with_sp(index, false, value)
+    }
+
+    fn write_register_with_sp(
+        &mut self,
+        index: u8,
+        register31_is_sp: bool,
+        value: ir::Value,
+    ) -> Result<(), DirectJitError> {
+        if index == 31 && !register31_is_sp {
+            return Ok(());
+        }
+        let slot = if index == 31 { 31 } else { usize::from(index) };
+        let variable = self.registers[slot].ok_or_else(|| {
+            DirectJitError::internal(format!("direct JIT register X{index} was not planned"))
+        })?;
+        self.builder.def_var(variable, value);
+        Ok(())
+    }
+
+    fn commit_state(
+        &mut self,
+        target_pc: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        self.commit_registers()?;
+        self.commit_flags(flags)?;
+        let target = self
+            .builder
+            .ins()
+            .iconst(types::I64, target_pc.get() as i64);
+        self.builder
+            .ins()
+            .store(trusted_flags(), target, self.pc, 0);
+        let retired = self.builder.use_var(self.retired);
+        self.store_context(retired, offset_of!(NativeContext, retired))?;
+        Ok(())
+    }
+
+    fn commit_registers(&mut self) -> Result<(), DirectJitError> {
+        for index in 0..self.dirty_registers.len() {
+            if !self.dirty_registers[index] {
+                continue;
+            }
+            let variable = self.registers[index].ok_or_else(|| {
+                DirectJitError::internal("dirty direct JIT register has no SSA variable")
+            })?;
+            let value = self.builder.use_var(variable);
+            if index == 31 {
+                self.builder.ins().store(trusted_flags(), value, self.sp, 0);
+            } else {
+                self.builder.ins().store(
+                    trusted_flags(),
+                    value,
+                    self.x,
+                    i32::try_from(index * size_of::<u64>())
+                        .expect("architectural GPR offset fits i32"),
+                );
+            }
+        }
+        for index in 0..self.dirty_vector_registers.len() {
+            if !self.dirty_vector_registers[index] {
+                continue;
+            }
+            let variable = self.vector_registers[index].ok_or_else(|| {
+                DirectJitError::internal("dirty direct JIT vector register has no SSA variable")
+            })?;
+            let value = self.builder.use_var(variable);
+            self.builder.ins().store(
+                trusted_flags(),
+                value,
+                self.vector,
+                i32::try_from(index * size_of::<u128>())
+                    .expect("architectural vector offset fits i32"),
+            );
+        }
+        if self.dirty_fpsr {
+            let fpsr = self.builder.use_var(self.fpsr_state);
+            self.builder
+                .ins()
+                .store(trusted_flags(), fpsr, self.fpsr, 0);
+        }
+        Ok(())
+    }
+
+    fn commit_flags(&mut self, flags: &LazyFlags) -> Result<(), DirectJitError> {
+        if flags.dirty() {
+            let packed = self.packed_flags(flags);
+            self.builder
+                .ins()
+                .store(trusted_flags(), packed, self.nzcv, 0);
+        }
+        Ok(())
+    }
+
+    fn emit_exit(
+        &mut self,
+        kind: u32,
+        detail: u32,
+        pc: GuestVirtualAddress,
+        flags: &LazyFlags,
+    ) -> Result<(), DirectJitError> {
+        self.commit_state(pc, flags)?;
+        self.finish_exit(kind, detail, pc)
+    }
+
+    fn finish_exit(
+        &mut self,
+        kind: u32,
+        detail: u32,
+        pc: GuestVirtualAddress,
+    ) -> Result<(), DirectJitError> {
+        let pc = self.builder.ins().iconst(types::I64, pc.get() as i64);
+        self.store_context(pc, offset_of!(NativeContext, exit_pc))?;
+        let kind = self.builder.ins().iconst(types::I32, i64::from(kind));
+        self.store_context(kind, offset_of!(NativeContext, exit_kind))?;
+        let detail = self.builder.ins().iconst(types::I32, i64::from(detail));
+        self.store_context(detail, offset_of!(NativeContext, exit_detail))?;
+        self.builder.ins().return_(&[]);
+        Ok(())
+    }
+
+    fn load_context_pointer(&mut self, offset: usize) -> Result<ir::Value, DirectJitError> {
+        self.load_context(types::I64, offset)
+    }
+
+    fn load_context(&mut self, ty: ir::Type, offset: usize) -> Result<ir::Value, DirectJitError> {
+        Ok(self
+            .builder
+            .ins()
+            .load(ty, trusted_flags(), self.context, context_offset(offset)?))
+    }
+
+    fn store_context(&mut self, value: ir::Value, offset: usize) -> Result<(), DirectJitError> {
+        self.builder.ins().store(
+            trusted_flags(),
+            value,
+            self.context,
+            context_offset(offset)?,
+        );
+        Ok(())
+    }
+
+    fn block(&self, pc: GuestVirtualAddress) -> Result<Block, DirectJitError> {
+        self.blocks.get(&pc).copied().ok_or_else(|| {
+            DirectJitError::internal(format!("direct JIT region has no block for {pc}"))
+        })
+    }
+}
+
+fn register_access(region: &NativeRegion) -> ([bool; 32], [bool; 32]) {
+    let mut accessed = [false; 32];
+    let mut dirty = [false; 32];
+    for block in &region.blocks {
+        for decoded in &block.instructions {
+            match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
+                A64Instruction::Integer(instruction) => {
+                    register_access_integer(instruction, &mut accessed, &mut dirty)
+                }
+                A64Instruction::Memory(instruction) => {
+                    register_access_memory(instruction, &mut accessed, &mut dirty)
+                }
+                A64Instruction::System(instruction) => {
+                    register_access_system(instruction, &mut accessed, &mut dirty)
+                }
+                A64Instruction::FpSimd(instruction) => {
+                    register_access_fp_simd_general(instruction, &mut accessed, &mut dirty)
+                }
+                A64Instruction::Control(control::Instruction::BranchLinkImmediate(_)) => {
+                    mark_write(&mut accessed, &mut dirty, 30, false);
+                }
+                A64Instruction::Control(control::Instruction::BranchRegister(fields)) => {
+                    mark_read(&mut accessed, fields.rn, false);
+                    if fields.branch_register_key == 0xd63f_0000 {
+                        mark_write(&mut accessed, &mut dirty, 30, false);
+                    }
+                }
+                A64Instruction::Control(
+                    control::Instruction::CompareBranch(fields)
+                    | control::Instruction::TestBranch(fields),
+                ) => mark_read(&mut accessed, fields.rd, false),
+                _ => {}
+            }
+        }
+    }
+    (accessed, dirty)
+}
+
+fn vector_register_access(region: &NativeRegion) -> ([bool; 32], [bool; 32]) {
+    let mut accessed = [false; 32];
+    let mut dirty = [false; 32];
+    for block in &region.blocks {
+        for decoded in &block.instructions {
+            if let A64Instruction::FpSimd(instruction) =
+                nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding)
+            {
+                register_access_fp_simd_vector(instruction, &mut accessed, &mut dirty);
+            }
+        }
+    }
+    (accessed, dirty)
+}
+
+fn fp_status_access(region: &NativeRegion) -> (bool, bool) {
+    let mut accessed = false;
+    let mut dirty = false;
+    for block in &region.blocks {
+        for decoded in &block.instructions {
+            match nixe_cpu::decode::a64::normalize(&decoded.instruction, decoded.encoding) {
+                A64Instruction::FpSimd(instruction) if fp_simd_uses_exact_status(instruction) => {
+                    accessed = true;
+                    dirty = true;
+                }
+                A64Instruction::System(system::Instruction::ReadRegister(fields))
+                    if fields.system_key == 0xd53b_4420 =>
+                {
+                    accessed = true;
+                }
+                A64Instruction::System(system::Instruction::WriteRegister(fields))
+                    if fields.system_key == 0xd51b_4420 =>
+                {
+                    accessed = true;
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    (accessed, dirty)
+}
+
+fn fp_simd_uses_exact_status(instruction: fp_simd::Instruction) -> bool {
+    matches!(
+        instruction,
+        fp_simd::Instruction::SignedIntToFloat(_)
+            | fp_simd::Instruction::UnsignedIntToFloat(_)
+            | fp_simd::Instruction::FloatToSignedInt(_)
+            | fp_simd::Instruction::FloatToUnsignedInt(_)
+            | fp_simd::Instruction::CompareRegister(_)
+            | fp_simd::Instruction::CompareZero(_)
+            | fp_simd::Instruction::ConditionalCompare(_)
+            | fp_simd::Instruction::VectorSignedIntToFloat(_)
+            | fp_simd::Instruction::VectorUnsignedIntToFloat(_)
+            | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)
+            | fp_simd::Instruction::ScalarVectorUnsignedIntToFloat(_)
+            | fp_simd::Instruction::VectorFloatDivide(_)
+            | fp_simd::Instruction::ScalarFloatConvert(_)
+            | fp_simd::Instruction::ScalarFloatDivide(_)
+            | fp_simd::Instruction::ScalarFloatRound(_)
+            | fp_simd::Instruction::ScalarFloatAdd(_)
+            | fp_simd::Instruction::ScalarFloatMultiply(_)
+            | fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_)
+            | fp_simd::Instruction::ScalarFloatSquareRoot(_)
+    )
+}
+
+fn register_access_memory(
+    instruction: memory::Instruction,
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+) {
+    use nixe_cpu::semantics::a64::{ScalarTransfer, pair_transfer, scalar_transfer};
+
+    let fields = instruction.operands();
+    if !matches!(instruction, memory::Instruction::Literal(_)) {
+        mark_read(accessed, fields.rn, true);
+    }
+    if matches!(instruction, memory::Instruction::Register(_)) {
+        mark_read(accessed, fields.rm, false);
+    }
+    match instruction {
+        memory::Instruction::Literal(_) => mark_write(accessed, dirty, fields.rt, false),
+        memory::Instruction::Unsigned(_)
+        | memory::Instruction::Unscaled(_)
+        | memory::Instruction::PostIndex(_)
+        | memory::Instruction::PreIndex(_)
+        | memory::Instruction::Register(_) => {
+            match scalar_transfer(
+                fields.opc,
+                nixe_cpu::semantics::a64::memory_size(fields.size),
+            ) {
+                Some(ScalarTransfer::Store) => mark_read(accessed, fields.rt, false),
+                Some(ScalarTransfer::Load(_)) => mark_write(accessed, dirty, fields.rt, false),
+                None => {}
+            }
+            if matches!(
+                instruction,
+                memory::Instruction::PostIndex(_) | memory::Instruction::PreIndex(_)
+            ) {
+                mark_write(accessed, dirty, fields.rn, true);
+            }
+        }
+        memory::Instruction::Pair(_) => {
+            if pair_transfer(fields.size, fields.load).is_some() {
+                if fields.load {
+                    mark_write(accessed, dirty, fields.rt, false);
+                    mark_write(accessed, dirty, fields.rt2, false);
+                } else {
+                    mark_read(accessed, fields.rt, false);
+                    mark_read(accessed, fields.rt2, false);
+                }
+                if matches!(fields.mode, 1 | 3) {
+                    mark_write(accessed, dirty, fields.rn, true);
+                }
+            }
+        }
+        memory::Instruction::LoadAcquire(_) | memory::Instruction::LoadExclusive(_) => {
+            mark_write(accessed, dirty, fields.rt, false);
+        }
+        memory::Instruction::StoreRelease(_) => mark_read(accessed, fields.rt, false),
+        memory::Instruction::StoreExclusive(_) => {
+            mark_read(accessed, fields.rt, false);
+            mark_write(accessed, dirty, fields.rm, false);
+        }
+        memory::Instruction::AtomicReadModifyWrite(_) => {
+            mark_read(accessed, fields.rm, false);
+            mark_write(accessed, dirty, fields.rt, false);
+        }
+        memory::Instruction::CompareAndSwap(_) => {
+            mark_read(accessed, fields.rm, false);
+            mark_read(accessed, fields.rt, false);
+            mark_write(accessed, dirty, fields.rm, false);
+        }
+        memory::Instruction::CompareAndSwapPair(_) => {
+            mark_read(accessed, fields.rm, false);
+            mark_read(accessed, fields.rm.wrapping_add(1), false);
+            mark_read(accessed, fields.rt, false);
+            mark_read(accessed, fields.rt.wrapping_add(1), false);
+            mark_write(accessed, dirty, fields.rm, false);
+            mark_write(accessed, dirty, fields.rm.wrapping_add(1), false);
+        }
+    }
+}
+
+fn register_access_system(
+    instruction: system::Instruction,
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+) {
+    let fields = instruction.operands();
+    match instruction {
+        system::Instruction::ReadRegister(_) => mark_write(accessed, dirty, fields.rt, false),
+        system::Instruction::WriteRegister(_) => mark_read(accessed, fields.rt, false),
+        system::Instruction::System(_) if fields.system_key != 0xd508_7500 => {
+            mark_read(accessed, fields.rt, false);
+        }
+        system::Instruction::Hint(_)
+        | system::Instruction::Barrier(_)
+        | system::Instruction::System(_) => {}
+    }
+}
+
+fn register_access_fp_simd_general(
+    instruction: fp_simd::Instruction,
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+) {
+    let fields = instruction.operands();
+    match instruction {
+        fp_simd::Instruction::DuplicateGeneral(_)
+        | fp_simd::Instruction::InsertGeneral(_)
+        | fp_simd::Instruction::MoveFromGeneral(_)
+        | fp_simd::Instruction::SignedIntToFloat(_)
+        | fp_simd::Instruction::UnsignedIntToFloat(_) => {
+            mark_read(accessed, fields.rn, false);
+        }
+        fp_simd::Instruction::UnsignedMoveToGeneral(_)
+        | fp_simd::Instruction::MoveToGeneral(_)
+        | fp_simd::Instruction::FloatToSignedInt(_)
+        | fp_simd::Instruction::FloatToUnsignedInt(_) => {
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        fp_simd::Instruction::MemoryUnsigned(_)
+        | fp_simd::Instruction::MemoryUnscaled(_)
+        | fp_simd::Instruction::MemoryPostIndex(_)
+        | fp_simd::Instruction::MemoryPreIndex(_)
+        | fp_simd::Instruction::MemoryRegister(_)
+        | fp_simd::Instruction::MemoryPair(_)
+        | fp_simd::Instruction::MemoryMultipleStructures(_)
+        | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
+        | fp_simd::Instruction::MemorySingleStructure(_)
+        | fp_simd::Instruction::MemorySingleStructurePostIndex(_) => {
+            mark_read(accessed, fields.rn, true);
+            if matches!(instruction, fp_simd::Instruction::MemoryRegister(_))
+                || (matches!(
+                    instruction,
+                    fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
+                        | fp_simd::Instruction::MemorySingleStructurePostIndex(_)
+                ) && fields.rm != 31)
+            {
+                mark_read(accessed, fields.rm, false);
+            }
+            if matches!(
+                instruction,
+                fp_simd::Instruction::MemoryPostIndex(_)
+                    | fp_simd::Instruction::MemoryPreIndex(_)
+                    | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_)
+                    | fp_simd::Instruction::MemorySingleStructurePostIndex(_)
+            ) || (matches!(instruction, fp_simd::Instruction::MemoryPair(_))
+                && matches!(fields.mode, 1 | 3))
+            {
+                mark_write(accessed, dirty, fields.rn, true);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn register_access_fp_simd_vector(
+    instruction: fp_simd::Instruction,
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+) {
+    let fields = instruction.operands();
+    let read = |accessed: &mut [bool; 32], index: u8| {
+        accessed[usize::from(index)] = true;
+    };
+    let write = |accessed: &mut [bool; 32], dirty: &mut [bool; 32], index: u8| {
+        accessed[usize::from(index)] = true;
+        dirty[usize::from(index)] = true;
+    };
+    match instruction {
+        fp_simd::Instruction::UnsignedMoveToGeneral(_)
+        | fp_simd::Instruction::MoveToGeneral(_)
+        | fp_simd::Instruction::FloatToSignedInt(_)
+        | fp_simd::Instruction::FloatToUnsignedInt(_)
+        | fp_simd::Instruction::CompareZero(_) => read(accessed, fields.rn),
+        fp_simd::Instruction::CompareRegister(_) | fp_simd::Instruction::ConditionalCompare(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rm);
+        }
+        fp_simd::Instruction::MemoryUnsigned(_)
+        | fp_simd::Instruction::MemoryUnscaled(_)
+        | fp_simd::Instruction::MemoryPostIndex(_)
+        | fp_simd::Instruction::MemoryPreIndex(_)
+        | fp_simd::Instruction::MemoryRegister(_) => {
+            if fields.load {
+                write(accessed, dirty, fields.rd);
+            } else {
+                read(accessed, fields.rd);
+            }
+        }
+        fp_simd::Instruction::MemoryPair(_) => {
+            for register in [fields.rd, fields.rt2] {
+                if fields.load {
+                    write(accessed, dirty, register);
+                } else {
+                    read(accessed, register);
+                }
+            }
+        }
+        fp_simd::Instruction::MemoryMultipleStructures(_)
+        | fp_simd::Instruction::MemoryMultipleStructuresPostIndex(_) => {
+            let count = match fields.structure_opcode {
+                0b0010 => 4,
+                0b0110 => 3,
+                0b1010 => 2,
+                _ => 1,
+            };
+            for index in 0..count {
+                let register = fields.rd.wrapping_add(index) & 31;
+                if fields.load {
+                    write(accessed, dirty, register);
+                } else {
+                    read(accessed, register);
+                }
+            }
+        }
+        fp_simd::Instruction::MemorySingleStructure(_)
+        | fp_simd::Instruction::MemorySingleStructurePostIndex(_) => {
+            read(accessed, fields.rd);
+            if fields.load {
+                write(accessed, dirty, fields.rd);
+            }
+        }
+        fp_simd::Instruction::MoveFromGeneral(_)
+        | fp_simd::Instruction::DuplicateGeneral(_)
+        | fp_simd::Instruction::ModifiedImmediate(_)
+        | fp_simd::Instruction::ScalarFloatImmediate(_)
+        | fp_simd::Instruction::VectorFloatImmediate(_) => {
+            if matches!(instruction, fp_simd::Instruction::ModifiedImmediate(_))
+                && fields.cmode <= 11
+                && fields.cmode & 1 != 0
+                || matches!(instruction, fp_simd::Instruction::MoveFromGeneral(_))
+                    && fields.size & 2 != 0
+                    && fields.opc == 2
+            {
+                read(accessed, fields.rd);
+            }
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::InsertElement(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rd);
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::InsertGeneral(_)
+        | fp_simd::Instruction::ShiftRightNarrow(_)
+        | fp_simd::Instruction::ExtractNarrow(_) => {
+            read(accessed, fields.rn);
+            if !matches!(instruction, fp_simd::Instruction::InsertGeneral(_)) && fields.vector_128 {
+                read(accessed, fields.rd);
+            }
+            if matches!(instruction, fp_simd::Instruction::InsertGeneral(_)) {
+                read(accessed, fields.rd);
+            }
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::Bitwise(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rm);
+            read(accessed, fields.rd);
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::Integer(_)
+        | fp_simd::Instruction::IntegerCompare(_)
+        | fp_simd::Instruction::IntegerPairwise(_)
+        | fp_simd::Instruction::IntegerMinMax(_)
+        | fp_simd::Instruction::PermuteTwoSource(_)
+        | fp_simd::Instruction::Extract(_)
+        | fp_simd::Instruction::VectorSignedShiftRegister(_)
+        | fp_simd::Instruction::VectorUnsignedShiftRegister(_)
+        | fp_simd::Instruction::VectorFloatDivide(_)
+        | fp_simd::Instruction::ScalarFloatDivide(_)
+        | fp_simd::Instruction::ScalarFloatAdd(_)
+        | fp_simd::Instruction::ScalarFloatMultiply(_)
+        | fp_simd::Instruction::ScalarFloatConditionalSelect(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rm);
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::ScalarFloatFusedMultiplyAdd(_) => {
+            read(accessed, fields.rn);
+            read(accessed, fields.rm);
+            read(accessed, fields.ra);
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::ScalarMove(_)
+        | fp_simd::Instruction::ScalarAbsolute(_)
+        | fp_simd::Instruction::ScalarNegate(_)
+        | fp_simd::Instruction::VectorFloatAbsolute(_)
+        | fp_simd::Instruction::VectorFloatNegate(_)
+        | fp_simd::Instruction::DuplicateElement(_)
+        | fp_simd::Instruction::ScalarShiftRightImmediate(_)
+        | fp_simd::Instruction::VectorShiftRightImmediate(_)
+        | fp_simd::Instruction::ScalarShiftLeftImmediate(_)
+        | fp_simd::Instruction::VectorShiftLeftImmediate(_)
+        | fp_simd::Instruction::ShiftLeftLong(_)
+        | fp_simd::Instruction::CountBits(_)
+        | fp_simd::Instruction::AddAcrossVector(_)
+        | fp_simd::Instruction::VectorSignedIntToFloat(_)
+        | fp_simd::Instruction::VectorUnsignedIntToFloat(_)
+        | fp_simd::Instruction::ScalarVectorSignedIntToFloat(_)
+        | fp_simd::Instruction::ScalarVectorUnsignedIntToFloat(_)
+        | fp_simd::Instruction::ScalarFloatConvert(_)
+        | fp_simd::Instruction::ScalarFloatRound(_)
+        | fp_simd::Instruction::ScalarFloatSquareRoot(_) => {
+            read(accessed, fields.rn);
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::SignedIntToFloat(_) | fp_simd::Instruction::UnsignedIntToFloat(_) => {
+            write(accessed, dirty, fields.rd);
+        }
+        fp_simd::Instruction::ScalarTwoSource(_) | fp_simd::Instruction::MemoryLiteral(_) => {}
+    }
+}
+
+fn merged_flag_entries(region: &NativeRegion) -> HashSet<GuestVirtualAddress> {
+    let starts: HashSet<_> = region.blocks.iter().map(|block| block.start.pc).collect();
+    let mut predecessors = HashMap::from([(region.key.start, 1_usize)]);
+    for block in &region.blocks {
+        let mut record = |target| {
+            if starts.contains(&target) {
+                *predecessors.entry(target).or_default() += 1;
+            }
+        };
+        match block.terminator {
+            BlockTerminator::Direct { target } => record(target),
+            BlockTerminator::Conditional { taken, not_taken } => {
+                record(taken);
+                record(not_taken);
+            }
+            BlockTerminator::Call { .. }
+            | BlockTerminator::Indirect
+            | BlockTerminator::Architectural { .. }
+            | BlockTerminator::Unsupported
+            | BlockTerminator::Limit { .. } => {}
+        }
+    }
+    predecessors
+        .into_iter()
+        .filter_map(|(target, count)| (count > 1).then_some(target))
+        .collect()
+}
+
+fn register_access_integer(
+    instruction: integer::Instruction,
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+) {
+    let fields = instruction.operands();
+    match instruction {
+        integer::Instruction::MoveWide(_) => {
+            let opcode = u8::from(fields.subtract) * 2 + u8::from(fields.set_flags);
+            if opcode == 3 {
+                mark_read(accessed, fields.rd, false);
+            }
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::AddSubImmediate(_) => {
+            mark_read(accessed, fields.rn, true);
+            mark_write(accessed, dirty, fields.rd, !fields.set_flags);
+        }
+        integer::Instruction::AddSubExtended(_) => {
+            mark_read(accessed, fields.rn, true);
+            mark_read(accessed, fields.rm, false);
+            mark_write(accessed, dirty, fields.rd, !fields.set_flags);
+        }
+        integer::Instruction::AddSubShifted(_) | integer::Instruction::AddSubCarry(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_read(accessed, fields.rm, false);
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::LogicalImmediate(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::LogicalShifted(_)
+        | integer::Instruction::Extract(_)
+        | integer::Instruction::TwoSource(_)
+        | integer::Instruction::ConditionalSelect(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_read(accessed, fields.rm, false);
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::Bitfield(_) => {
+            mark_read(accessed, fields.rn, false);
+            if u8::from(fields.subtract) * 2 + u8::from(fields.set_flags) == 1 {
+                mark_read(accessed, fields.rd, false);
+            }
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::ConditionalCompareRegister(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_read(accessed, fields.rm, false);
+        }
+        integer::Instruction::ConditionalCompareImmediate(_) => {
+            mark_read(accessed, fields.rn, false);
+        }
+        integer::Instruction::ThreeSource(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_read(accessed, fields.rm, false);
+            if !matches!(fields.opcode_3, 2 | 6) {
+                mark_read(accessed, fields.ra, false);
+            }
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::OneSource(_) => {
+            mark_read(accessed, fields.rn, false);
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+        integer::Instruction::Adr(_) | integer::Instruction::Adrp(_) => {
+            mark_write(accessed, dirty, fields.rd, false);
+        }
+    }
+}
+
+fn mark_read(accessed: &mut [bool; 32], index: u8, register31_is_sp: bool) {
+    if index != 31 || register31_is_sp {
+        accessed[usize::from(index)] = true;
+    }
+}
+
+fn mark_write(
+    accessed: &mut [bool; 32],
+    dirty: &mut [bool; 32],
+    index: u8,
+    register31_is_sp: bool,
+) {
+    if index != 31 || register31_is_sp {
+        let slot = usize::from(index);
+        accessed[slot] = true;
+        dirty[slot] = true;
+    }
+}
+
+fn source_location(
+    region: &NativeRegion,
+    instruction: &DecodedInstruction<nixe_cpu::decode::DecodedOpcode>,
+) -> SourceLoc {
+    let offset = instruction
+        .location
+        .pc
+        .get()
+        .wrapping_sub(region.key.start.get());
+    SourceLoc::new(
+        u32::try_from(offset)
+            .unwrap_or(u32::MAX - 1)
+            .saturating_add(1),
+    )
+}
+
+fn unsupported_instruction(
+    decoded: &DecodedInstruction<nixe_cpu::decode::DecodedOpcode>,
+) -> DirectJitError {
+    DirectJitError::unsupported(format!(
+        "direct JIT instruction is not implemented: {} encoding={} disassembly={}",
+        decoded.location,
+        decoded.encoding,
+        nixe_cpu::decode::disassemble(&decoded.instruction)
+    ))
+}
+
+fn context_offset(offset: usize) -> Result<i32, DirectJitError> {
+    i32::try_from(offset)
+        .map_err(|_| DirectJitError::internal("direct JIT native-context offset exceeds i32"))
+}
+
+fn trusted_flags() -> MemFlagsData {
+    MemFlagsData::trusted()
+}
+
+fn plain_flags() -> MemFlagsData {
+    MemFlagsData::new()
+}
+
+const _: () = assert!(size_of::<NativeContext>() <= i32::MAX as usize);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_policy_is_speed_with_backtracking() {
+        let compiler = DirectCompiler::new().unwrap();
+        let flags = compiler.module.isa().flags();
+        assert_eq!(flags.opt_level(), settings::OptLevel::Speed);
+        assert_eq!(
+            flags.regalloc_algorithm(),
+            settings::RegallocAlgorithm::Backtracking
+        );
+    }
+}

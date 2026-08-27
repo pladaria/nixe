@@ -18,7 +18,7 @@ revision may additionally be recorded when behavior differs between revisions,
 but tests should not depend on network access or scrape Arm's website.
 
 The interpreter/IR differential suite and optional QEMU oracle are owned by
-`nixe-cpu-engine-interpreter`. Run them with:
+`nixe-cpu-interpreter`. Run them with:
 
 ```bash
 cargo test-diff

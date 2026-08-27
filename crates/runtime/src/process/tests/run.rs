@@ -39,13 +39,12 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
         panic!("homebrew fixture must initialize A64");
     };
     state.write_x(A64Register::General(a64_register(0)), 0);
-    let mut executor = process
+    let mut cpu_thread = process
         .execution
-        .create_worker_executors(nixe_scheduler::VirtualCpuId::new(0))
-        .unwrap()
-        .primary;
+        .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap();
 
-    let first = process.run_with_executor(executor.as_mut(), 1).unwrap();
+    let first = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(first.instructions_executed, 1);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -54,7 +53,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
     assert_eq!(state.pc(), entry + 4);
 
-    let second = process.run_with_executor(executor.as_mut(), 1).unwrap();
+    let second = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -63,7 +62,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
     assert_eq!(state.pc(), entry + 8);
 
-    let svc = process.run_with_executor(executor.as_mut(), 1).unwrap();
+    let svc = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(svc.instructions_executed, 1);
     assert!(matches!(
         svc.stop,
@@ -83,7 +82,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
             .unwrap(),
         crate::ExceptionHandlingResult::Resumed
     );
-    let resumed = process.run_with_executor(executor.as_mut(), 1).unwrap();
+    let resumed = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(resumed.instructions_executed, 1);
     assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
     let ThreadCpuState::A64(state) = process.main_thread().state() else {
@@ -168,15 +167,14 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             MemoryValue::U32(7),
         )
         .unwrap();
-    let mut executor = process
+    let mut cpu_thread = process
         .execution
-        .create_worker_executors(nixe_scheduler::VirtualCpuId::new(0))
-        .unwrap()
-        .primary;
+        .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+        .unwrap();
 
     assert_eq!(
         process
-            .run_with_executor(executor.as_mut(), 1)
+            .run_with_cpu_thread(&mut cpu_thread, 1)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -188,7 +186,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     state.write_x(A64Register::General(a64_register(0)), 9);
     assert_eq!(
         process
-            .run_with_executor(executor.as_mut(), 1)
+            .run_with_cpu_thread(&mut cpu_thread, 1)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -216,7 +214,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     state.set_pc(entry);
     assert_eq!(
         process
-            .run_with_executor(executor.as_mut(), 1)
+            .run_with_cpu_thread(&mut cpu_thread, 1)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -236,7 +234,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     state.write_x(A64Register::General(a64_register(0)), 13);
     assert_eq!(
         process
-            .run_with_executor(executor.as_mut(), 1)
+            .run_with_cpu_thread(&mut cpu_thread, 1)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -298,49 +296,29 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
 }
 
 #[test]
-fn reference_execution_distinguishes_unsupported_profile_and_unallocated_code() {
+fn reference_execution_rejects_unsupported_and_invalid_code() {
     let (_directory, plan) = plan();
 
     let mut unsupported = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut unsupported, 0xd503_20df); // unimplemented reserved HINT #6
-    let report = unsupported.run(1).unwrap();
-    assert!(matches!(
-        report.stop,
-        crate::ExecutionStop::UnsupportedSemantics { .. }
-    ));
-    assert!(report.to_string().contains("unsupported-semantics"));
-
-    let mut profile_disabled = reference_process_builder()
-        .with_config(ProcessBuildConfig {
-            cpu_profile: GuestCpuProfile::switch_2_native(),
-            ..ProcessBuildConfig::default()
-        })
-        .build(&plan)
-        .unwrap();
-    replace_entry_instruction(&mut profile_disabled, 0x4e22_1c20);
-    let report = profile_disabled.run(1).unwrap();
-    assert_eq!(
-        report.stop.exception_dispatch_request().unwrap().kind(),
-        nixe_cpu::exception::ExceptionKind::UndefinedInstruction
-    );
-    assert!(matches!(
-        report.stop,
-        crate::ExecutionStop::ProfileDisabled { .. }
-    ));
-    assert!(report.to_string().contains("profile-disabled"));
+    let crate::ProcessExecutionError::Cpu { fault } = unsupported.run(1).unwrap_err() else {
+        panic!("unsupported instruction must be a CPU fault");
+    };
+    assert_eq!(fault.kind, nixe_cpu::execution::CpuFaultKind::Unavailable);
+    assert_eq!(fault.instructions_executed, 0);
+    assert!(fault.message.contains("unsupported instruction"));
 
     let mut unallocated = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut unallocated, 0);
-    let report = unallocated.run(1).unwrap();
+    let crate::ProcessExecutionError::Cpu { fault } = unallocated.run(1).unwrap_err() else {
+        panic!("invalid instruction must be a CPU fault");
+    };
     assert_eq!(
-        report.stop.exception_dispatch_request().unwrap().kind(),
-        nixe_cpu::exception::ExceptionKind::UndefinedInstruction
+        fault.kind,
+        nixe_cpu::execution::CpuFaultKind::InvalidRequest
     );
-    assert!(matches!(
-        report.stop,
-        crate::ExecutionStop::UnallocatedEncoding { .. }
-    ));
-    assert!(report.to_string().contains("unallocated-encoding"));
+    assert_eq!(fault.instructions_executed, 0);
+    assert!(fault.message.contains("invalid instruction stream"));
 }
 
 #[test]

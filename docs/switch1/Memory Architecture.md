@@ -1,5 +1,17 @@
 # Nintendo Switch 1 Memory Architecture
 
+Status: memory authority remains current; pre-S00 CPU/JIT topology is
+superseded.
+
+The [CPU Architecture Simplification Plan](../../notes/CPU%20Architecture%20Simplification%20Plan.md)
+governs new CPU and JIT work. References in this document to generic engine
+providers/domains/executors, semantic fallback, bounded JIT region caches,
+eviction, retirement epochs, or NCE mirrors describe the implementation being
+replaced. They remain historical context until S10 rewrites those passages.
+Address-space identity, permissions, aliases, canonical physical contents,
+faults, atomics, ordering, executable invalidation, and CPU/GPU visibility
+remain authoritative.
+
 This document explains the Nintendo Switch 1 memory model from the point of
 view of an application, the Horizon kernel, and an emulator. It then describes
 Nixe's current implementation in enough detail to safely inspect or modify the

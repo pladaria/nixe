@@ -17,7 +17,6 @@ pub enum RegionExitKind {
     Call,
     Return,
     Exception,
-    Interpreter,
     UnsupportedInstruction,
     Stop,
 }

@@ -112,6 +112,68 @@ impl Default for A64State {
 }
 
 impl A64State {
+    /// Returns the canonical general-register storage for an execution engine.
+    ///
+    /// The returned slice is the architectural state itself, not a native
+    /// frame copy. An engine may retain raw pointers derived from it only while
+    /// it holds exclusive access to this state.
+    #[must_use]
+    pub fn general_register_storage_mut(&mut self) -> &mut [u64; GENERAL_REGISTER_COUNT] {
+        &mut self.x
+    }
+
+    /// Returns the canonical stack-pointer storage for an execution engine.
+    #[must_use]
+    pub fn stack_pointer_storage_mut(&mut self) -> &mut u64 {
+        &mut self.sp
+    }
+
+    /// Returns the canonical program-counter storage for an execution engine.
+    #[must_use]
+    pub fn program_counter_storage_mut(&mut self) -> &mut u64 {
+        &mut self.pc
+    }
+
+    /// Returns the canonical packed-flag storage for an execution engine.
+    #[must_use]
+    pub fn nzcv_storage_mut(&mut self) -> &mut Nzcv {
+        &mut self.nzcv
+    }
+
+    /// Returns the canonical SIMD/floating-point register storage for an execution engine.
+    ///
+    /// Each entry is the complete 128-bit architectural V register. An engine
+    /// may retain raw pointers derived from this storage only while it holds
+    /// exclusive access to this state.
+    #[must_use]
+    pub fn vector_register_storage_mut(&mut self) -> &mut [u128; VECTOR_REGISTER_COUNT] {
+        &mut self.vector
+    }
+
+    /// Returns the canonical floating-point control storage for an execution engine.
+    #[must_use]
+    pub fn fpcr_storage_mut(&mut self) -> &mut u32 {
+        &mut self.fpcr
+    }
+
+    /// Returns the canonical floating-point status storage for an execution engine.
+    #[must_use]
+    pub fn fpsr_storage_mut(&mut self) -> &mut u32 {
+        &mut self.fpsr
+    }
+
+    /// Returns the writable user thread-pointer storage for an execution engine.
+    #[must_use]
+    pub fn tpidr_el0_storage_mut(&mut self) -> &mut u64 {
+        &mut self.tpidr_el0
+    }
+
+    /// Returns the runtime-owned read-only thread-pointer storage for an execution engine.
+    #[must_use]
+    pub fn tpidrro_el0_storage_mut(&mut self) -> &mut u64 {
+        &mut self.tpidrro_el0
+    }
+
     /// Copies the general-purpose register and flag subset used by bounded
     /// runtime diagnostics. SIMD and thread-pointer state are intentionally
     /// excluded from the compact context.

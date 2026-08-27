@@ -1,6 +1,56 @@
 //! Architectural condition flags and condition-code evaluation.
 
-use crate::ir::op::Condition;
+/// All Arm condition encodings, shared by A64 and AArch32 consumers.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Condition {
+    Eq,
+    Ne,
+    Cs,
+    Cc,
+    Mi,
+    Pl,
+    Vs,
+    Vc,
+    Hi,
+    Ls,
+    Ge,
+    Lt,
+    Gt,
+    Le,
+    Al,
+    Nv,
+}
+
+impl Condition {
+    /// Decodes the complete four-bit Arm condition space.
+    #[must_use]
+    pub const fn from_encoding(encoding: u8) -> Self {
+        match encoding & 0xf {
+            0 => Self::Eq,
+            1 => Self::Ne,
+            2 => Self::Cs,
+            3 => Self::Cc,
+            4 => Self::Mi,
+            5 => Self::Pl,
+            6 => Self::Vs,
+            7 => Self::Vc,
+            8 => Self::Hi,
+            9 => Self::Ls,
+            10 => Self::Ge,
+            11 => Self::Lt,
+            12 => Self::Gt,
+            13 => Self::Le,
+            14 => Self::Al,
+            15 => Self::Nv,
+            _ => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub const fn encoding(self) -> u8 {
+        self as u8
+    }
+}
 
 /// The four integer condition flags in architectural N, Z, C, V order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

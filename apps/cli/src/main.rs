@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nixe_config::CpuEngineSelection;
+use nixe_config::CpuBackendSelection;
 
 enum Command {
     Input,
@@ -62,7 +62,7 @@ fn parse_arguments(
 ) -> Result<Option<Invocation>, String> {
     let mut config_path = None;
     let mut log_level = None;
-    let mut cpu_engine = None;
+    let mut cpu_backend = None;
     let mut headless = false;
     let mut positionals = Vec::new();
     let mut arguments = arguments;
@@ -102,23 +102,22 @@ fn parse_arguments(
             headless = true;
             continue;
         }
-        if argument == "--cpu-engine" {
-            if cpu_engine.is_some() {
-                return Err("--cpu-engine may only be specified once".to_owned());
+        if argument == "--cpu-backend" {
+            if cpu_backend.is_some() {
+                return Err("--cpu-backend may only be specified once".to_owned());
             }
             let value = arguments
                 .next()
-                .ok_or_else(|| "--cpu-engine requires auto, jit, or interpreter".to_owned())?;
+                .ok_or_else(|| "--cpu-backend requires jit or interpreter".to_owned())?;
             let value = value
                 .to_str()
-                .ok_or_else(|| "CPU engine must be valid UTF-8".to_owned())?;
-            cpu_engine = Some(match value {
-                "auto" => CpuEngineSelection::Auto,
-                "jit" => CpuEngineSelection::Jit,
-                "interpreter" => CpuEngineSelection::Interpreter,
+                .ok_or_else(|| "CPU backend must be valid UTF-8".to_owned())?;
+            cpu_backend = Some(match value {
+                "jit" => CpuBackendSelection::Jit,
+                "interpreter" => CpuBackendSelection::Interpreter,
                 _ => {
                     return Err(format!(
-                        "invalid CPU engine {value:?}; expected auto, jit, or interpreter"
+                        "invalid CPU backend {value:?}; expected jit or interpreter"
                     ));
                 }
             });
@@ -135,8 +134,8 @@ fn parse_arguments(
             if headless {
                 return Err("--headless is only valid with run".to_owned());
             }
-            if cpu_engine.is_some() {
-                return Err("--cpu-engine is only valid with run".to_owned());
+            if cpu_backend.is_some() {
+                return Err("--cpu-backend is only valid with run".to_owned());
             }
             Ok(Some(Invocation {
                 command: Command::Input,
@@ -147,8 +146,8 @@ fn parse_arguments(
             if headless {
                 return Err("--headless is only valid with run".to_owned());
             }
-            if cpu_engine.is_some() {
-                return Err("--cpu-engine is only valid with run".to_owned());
+            if cpu_backend.is_some() {
+                return Err("--cpu-backend is only valid with run".to_owned());
             }
             Ok(Some(Invocation {
                 command: Command::List(commands::list::Arguments {
@@ -169,7 +168,7 @@ fn parse_arguments(
                     log_level_override: log_level,
                     identifier,
                     headless,
-                    cpu_engine_override: cpu_engine,
+                    cpu_backend_override: cpu_backend,
                 }),
                 log_level: log_level.unwrap_or_default(),
             }))
@@ -194,7 +193,7 @@ fn print_usage(program: &OsStr) {
            run <id|name>   Run a title\n\n\
          Run options:\n  \
            --headless              Run without creating a host window\n  \
-           --cpu-engine <engine>   Override CPU engine: auto, jit, or interpreter\n\n\
+           --cpu-backend <backend> Override CPU backend: jit or interpreter\n\n\
          Log levels:\n  \
            error, warn, info, debug, trace\n  \
            --log-level overrides diagnostics.log_level from nixe.toml\n  \
@@ -262,28 +261,27 @@ mod tests {
             assert_eq!(arguments.log_level_override, None);
             assert_eq!(arguments.identifier, identifier);
             assert!(!arguments.headless);
-            assert_eq!(arguments.cpu_engine_override, None);
+            assert_eq!(arguments.cpu_backend_override, None);
             assert_eq!(invocation.log_level, logging::LogLevel::Info);
         }
     }
 
     #[test]
-    fn parses_every_cpu_engine_before_or_after_run() {
+    fn parses_every_cpu_backend_before_or_after_run() {
         for (value, expected) in [
-            ("auto", CpuEngineSelection::Auto),
-            ("jit", CpuEngineSelection::Jit),
-            ("interpreter", CpuEngineSelection::Interpreter),
+            ("jit", CpuBackendSelection::Jit),
+            ("interpreter", CpuBackendSelection::Interpreter),
         ] {
             for values in [
-                vec!["--cpu-engine", value, "run", "hello-world"],
-                vec!["run", "--cpu-engine", value, "hello-world"],
-                vec!["run", "hello-world", "--cpu-engine", value],
+                vec!["--cpu-backend", value, "run", "hello-world"],
+                vec!["run", "--cpu-backend", value, "hello-world"],
+                vec!["run", "hello-world", "--cpu-backend", value],
             ] {
                 let invocation = parse_arguments(arguments(&values)).unwrap().unwrap();
                 let Command::Run(arguments) = invocation.command else {
                     panic!("expected run command");
                 };
-                assert_eq!(arguments.cpu_engine_override, Some(expected));
+                assert_eq!(arguments.cpu_backend_override, Some(expected));
             }
         }
     }
@@ -354,17 +352,17 @@ mod tests {
             &["list", "--headless"][..],
             &["input", "--headless"][..],
             &["run", "--headless", "--headless", "hello-world"][..],
-            &["--cpu-engine", "jit", "list"][..],
-            &["input", "--cpu-engine", "interpreter"][..],
-            &["run", "hello-world", "--cpu-engine", "native"][..],
-            &["run", "hello-world", "--cpu-engine"][..],
+            &["--cpu-backend", "jit", "list"][..],
+            &["input", "--cpu-backend", "interpreter"][..],
+            &["run", "hello-world", "--cpu-backend", "native"][..],
+            &["run", "hello-world", "--cpu-backend"][..],
             &[
                 "run",
                 "hello-world",
-                "--cpu-engine",
+                "--cpu-backend",
                 "jit",
-                "--cpu-engine",
-                "auto",
+                "--cpu-backend",
+                "interpreter",
             ][..],
             &["--unknown", "list"][..],
             &["--config", "list"][..],

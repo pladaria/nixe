@@ -83,6 +83,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -504,6 +510,38 @@ name = "cranelift-isle"
 version = "0.134.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf79003ebfa1eed5e87f3b84446ad5236f540268289960e14f387dc9b28e40b7"
+
+[[package]]
+name = "cranelift-jit"
+version = "0.134.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2336d9ac773a092b1bff25988b298fe47d7921c2e6019d8243f5bb52d1c78d0d"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-entity",
+ "cranelift-module",
+ "cranelift-native",
+ "libc",
+ "log",
+ "memmap2",
+ "region",
+ "target-lexicon",
+ "wasmtime-internal-jit-icache-coherence",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cranelift-module"
+version = "0.134.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c89882b932e6ae6b9c9a9c0d4ee784c53208d2db5cccb6e099e298cf35572cf"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "cranelift-control",
+]
 
 [[package]]
 name = "cranelift-native"
@@ -1021,6 +1059,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1123,9 +1170,8 @@ dependencies = [
  "log",
  "nixe-config",
  "nixe-cpu",
- "nixe-cpu-engine",
- "nixe-cpu-engine-interpreter",
- "nixe-cpu-engine-jit",
+ "nixe-cpu-interpreter",
+ "nixe-cpu-jit",
  "nixe-gpu",
  "nixe-gpu-wgpu",
  "nixe-horizon",
@@ -1162,7 +1208,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nixe-cpu-engine"
+name = "nixe-cpu-interpreter"
 version = "0.1.0"
 dependencies = [
  "nixe-cpu",
@@ -1170,41 +1216,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "nixe-cpu-engine-interpreter"
-version = "0.1.0"
-dependencies = [
- "nixe-cpu",
- "nixe-cpu-engine",
- "nixe-memory",
-]
-
-[[package]]
-name = "nixe-cpu-engine-jit"
+name = "nixe-cpu-jit"
 version = "0.1.0"
 dependencies = [
  "cc",
  "chrono",
  "cranelift-codegen",
  "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
  "cranelift-native",
  "libc",
  "log",
  "nixe-cpu",
- "nixe-cpu-engine",
- "nixe-cpu-engine-interpreter",
+ "nixe-cpu-interpreter",
  "nixe-memory",
  "toml",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nixe-cpu-engine-testkit"
-version = "0.1.0"
-dependencies = [
- "nixe-cpu",
- "nixe-cpu-engine",
- "nixe-cpu-engine-interpreter",
- "nixe-memory",
 ]
 
 [[package]]
@@ -1255,7 +1283,6 @@ dependencies = [
  "chrono-tz",
  "log",
  "nixe-cpu",
- "nixe-cpu-engine-interpreter",
  "nixe-gpu",
  "nixe-gpu-maxwell",
  "nixe-input",
@@ -1332,9 +1359,8 @@ dependencies = [
  "getrandom 0.4.3",
  "log",
  "nixe-cpu",
- "nixe-cpu-engine",
- "nixe-cpu-engine-interpreter",
- "nixe-cpu-engine-testkit",
+ "nixe-cpu-interpreter",
+ "nixe-cpu-jit",
  "nixe-loader-content",
  "nixe-loader-executable",
  "nixe-loader-storage",
@@ -1959,6 +1985,18 @@ dependencies = [
  "log",
  "rustc-hash 2.1.3",
  "smallvec",
+]
+
+[[package]]
+name = "region"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6b6ebd13bc009aef9cd476c1310d49ac354d36e240cf1bd753290f3dc7199a7"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+ "mach2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2641,6 +2679,18 @@ checksum = "8a0092c4b9d070ac5e278b6d0db10f5e71214190f0347ca57502b4692f796321"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
+]
+
+[[package]]
+name = "wasmtime-internal-jit-icache-coherence"
+version = "47.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5684ba160951baad06a725696f3c590e2fb0e8067c2aebee27bf7f9259058e85"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasmtime-internal-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

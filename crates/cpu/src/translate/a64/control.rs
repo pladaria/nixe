@@ -59,7 +59,9 @@ fn lift_branch_register(
     let masked = fields.branch_register_key;
     let rn = fields.rn;
     if !matches!(masked, 0xd61f_0000 | 0xd63f_0000 | 0xd65f_0000) {
-        return Ok(LiftOutcome::Interpret(crate::coverage::CoverageId::new(5)));
+        return Ok(LiftOutcome::Unsupported(crate::coverage::CoverageId::new(
+            5,
+        )));
     }
     let address_bits = read_gpr(builder, source, rn, IrType::I64, Register31::Zero)?;
     let address = guest_address_from_integer(builder, source, address_bits)?;

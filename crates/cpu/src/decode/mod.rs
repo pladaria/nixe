@@ -1,4 +1,4 @@
-//! Declarative, profile-aware instruction decoding.
+//! Declarative instruction decoding through one platform-bound table set.
 
 pub mod a32;
 pub mod a64;
@@ -11,7 +11,7 @@ use core::fmt;
 
 use crate::{
     location::{DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor},
-    profile::GuestCpuProfile,
+    platform::PlatformDecoder,
 };
 
 pub use table::{
@@ -35,12 +35,6 @@ pub enum DecodeResult {
         name: &'static str,
         reason: &'static str,
     },
-    /// The profile does not enable a required architectural feature.
-    ProfileDisabled {
-        instruction: crate::error::InstructionDiagnostic,
-        name: &'static str,
-        rejection: crate::profile::InstructionFeatureRejection,
-    },
     /// The architecture and operands are known, but semantics are not present.
     RecognizedUnimplemented(DecodedInstruction<DecodedOpcode>),
 }
@@ -48,30 +42,15 @@ pub enum DecodeResult {
 /// Decodes one canonical instruction according to its execution state.
 #[must_use]
 pub fn decode(
-    profile: &GuestCpuProfile,
+    decoder: impl Into<PlatformDecoder>,
     location: LocationDescriptor,
     encoding: InstructionEncoding,
 ) -> DecodeResult {
-    if location.profile_id != profile.id() {
-        return DecodeResult::Unallocated {
-            instruction: crate::error::InstructionDiagnostic::new(location, encoding),
-            reason: "location profile does not match decoder profile",
-        };
-    }
-    if !profile
-        .allowed_execution_states()
-        .contains(location.execution_state)
-    {
-        return DecodeResult::Unallocated {
-            instruction: crate::error::InstructionDiagnostic::new(location, encoding),
-            reason: "execution state is unavailable in this profile",
-        };
-    }
-
+    let decoder = decoder.into();
     match location.execution_state {
-        ExecutionState::A64 => a64::decode(profile, location, encoding),
-        ExecutionState::A32 => a32::decode(profile, location, encoding),
-        ExecutionState::T32 => t32::decode(profile, location, encoding),
+        ExecutionState::A64 => a64::decode(decoder, location, encoding),
+        ExecutionState::A32 => a32::decode(decoder, location, encoding),
+        ExecutionState::T32 => t32::decode(decoder, location, encoding),
     }
 }
 
@@ -100,7 +79,7 @@ mod tests {
     use crate::{
         coverage::CoverageId,
         location::InstructionSize,
-        profile::{CapabilityStatus, InstructionFeature},
+        profile::{CapabilityStatus, GuestCpuProfile, InstructionFeature},
     };
 
     fn location(profile: GuestCpuProfile, state: ExecutionState) -> LocationDescriptor {
@@ -314,55 +293,24 @@ mod tests {
         ));
     }
 
-    // Arm DDI 0487 defines feature-dependent instruction availability. This
-    // test exercises the actual decoder gate rather than only the profile API.
     #[test]
-    fn decoder_profile_feature_goldens_cover_enabled_disabled_and_unknown() {
-        let enabled = GuestCpuProfile::switch_1();
-        let disabled = enabled
+    fn decoder_selection_is_fixed_by_platform_not_profile_mutation() {
+        let switch_1 = GuestCpuProfile::switch_1();
+        let mutated = switch_1
             .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Disabled);
-        let unknown = GuestCpuProfile::switch_2_native();
+        let switch_2 = GuestCpuProfile::switch_2_native();
         let encoding = InstructionEncoding::from_u32(0x4e20_1c00); // AND V0.16B,V0.16B,V0.16B
 
         assert!(matches!(
-            decode(&enabled, location(enabled, ExecutionState::A64), encoding),
+            decode(&switch_1, location(switch_1, ExecutionState::A64), encoding),
             DecodeResult::Decoded(_)
         ));
         assert!(matches!(
-            decode(
-                &disabled,
-                location(disabled, ExecutionState::A64),
-                encoding
-            ),
-            DecodeResult::ProfileDisabled { rejection, .. }
-                if rejection.feature == InstructionFeature::AdvancedSimd
-                    && rejection.status == CapabilityStatus::Disabled
-        ));
-        assert!(matches!(
-            decode(
-                &unknown,
-                location(unknown, ExecutionState::A64),
-                encoding
-            ),
-            DecodeResult::ProfileDisabled { rejection, .. }
-                if rejection.feature == InstructionFeature::AdvancedSimd
-                    && rejection.status == CapabilityStatus::Unknown
-        ));
-
-        // Use a conditional-space VFP encoding so feature rejection remains
-        // independently observable from A32 unconditional-space allocation.
-        let a32_simd = InstructionEncoding::from_u32(0xee00_0a00);
-        assert!(matches!(
-            decode(&enabled, location(enabled, ExecutionState::A32), a32_simd),
+            decode(&mutated, location(mutated, ExecutionState::A64), encoding),
             DecodeResult::Decoded(_)
         ));
         assert!(matches!(
-            decode(&disabled, location(disabled, ExecutionState::A32), a32_simd),
-            DecodeResult::ProfileDisabled { .. }
-        ));
-
-        assert!(matches!(
-            decode(&unknown, location(unknown, ExecutionState::A32), a32_simd),
+            decode(&switch_2, location(switch_2, ExecutionState::A64), encoding),
             DecodeResult::Unallocated { .. }
         ));
     }
@@ -409,9 +357,7 @@ mod tests {
             DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
                 decoded
             }
-            DecodeResult::Unallocated { .. }
-            | DecodeResult::Reserved { .. }
-            | DecodeResult::ProfileDisabled { .. } => return,
+            DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => return,
         };
         assert!(decoded.instruction.operands().len() <= 8);
         assert_eq!(decoded.encoding.size(), decoded.instruction.pattern().size);

@@ -14,7 +14,7 @@ use crate::{
             IntegerComparison, PairwiseOperation, PermuteOperation,
         },
     },
-    ir::op::Condition,
+    semantics::conditions::Condition,
     semantics::{
         a64::signed_immediate as sign_extend,
         bits::{BitWidth, replicate},

@@ -380,7 +380,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     // Arm A64 vector FABS/FNEG clear or toggle each active lane's sign bit
     // without processing the floating-point value. Base 2S/4S/2D forms are
     // covered here; optional half precision remains feature-gated behind the
-    // recognized Advanced SIMD fallback. Arm ARM DDI 0602 (2025-12):
+    // recognized Advanced SIMD unsupported classification. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FABS--vector---Floating-point-Absolute-value--vector--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNEG--vector---Floating-point-Negate--vector--
     pattern(
@@ -437,7 +437,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     // Arm A64 FCCMP/FCCMPE conditionally compare scalar S/D operands or copy
     // an immediate NZCV value. FCCMPE signals every NaN while FCCMP signals
     // only signaling NaNs. Optional half precision remains feature-gated
-    // behind the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // behind the recognized unsupported classification. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCCMP--FCCMPE---Floating-point-Conditional-Compare--scalar--
     pattern(
         "fp-scalar-floating-point-conditional-compare",
@@ -808,7 +808,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD_FP16,
     ),
     // Arm A64 FCVT (scalar) base single/double precision conversions. The
-    // optional half-precision forms remain behind the recognized fallback.
+    // optional half-precision forms remain behind the recognized unsupported classification.
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVT--scalar---Floating-point-Convert-precision--scalar--
     pattern(
@@ -830,7 +830,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD,
     ),
     // Arm A64 FDIV (scalar), base single/double precision forms. The optional
-    // half-precision form remains behind the recognized fallback.
+    // half-precision form remains behind the recognized unsupported classification.
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--scalar---Floating-point-Divide--scalar--
     pattern(
@@ -867,7 +867,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD,
     ),
     // Arm A64 FMUL/FNMUL (scalar), base single/double precision forms. The
-    // optional half-precision forms remain behind the recognized fallback.
+    // optional half-precision forms remain behind the recognized unsupported classification.
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMUL--scalar---Floating-point-Multiply--scalar--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FNMUL--Floating-point-Negated-Multiply--scalar--
@@ -908,7 +908,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     // Arm A64 FCSEL (scalar), base single/double precision forms. FCSEL is a
     // bitwise choice between scalar register contents and does not process the
     // selected value as floating point. Optional half precision remains behind
-    // the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // the recognized unsupported classification. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCSEL--Floating-point-Conditional-Select--scalar--
     pattern(
         "fp-scalar-floating-point-conditional-select",
@@ -921,7 +921,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     ),
     // Arm A64 FRINTN/P/M/Z/A/X/I (scalar), base single/double precision
     // forms. Optional half-precision and later FRINT32/64 forms remain behind
-    // the recognized fallback. Arm ARM DDI 0602 (2025-12):
+    // the recognized unsupported classification. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FRINTN--FRINTP--FRINTM--FRINTZ--FRINTA--FRINTX--FRINTI--Floating-point-Round-to-Integer--scalar--
     pattern(
         "fp-scalar-round-nearest-even",
@@ -987,7 +987,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         SIMD,
     ),
     pattern(
-        "advanced-simd-fallback",
+        "advanced-simd-unsupported",
         0x1e00_0000,
         0x0e00_0000,
         0x0000_0038,
@@ -997,7 +997,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     )
     .recognized_unimplemented(),
     pattern(
-        "floating-point-fallback",
+        "floating-point-unsupported",
         0x1f00_0000,
         0x1e00_0000,
         0x0000_0039,
@@ -1008,7 +1008,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     .recognized_unimplemented(),
     // Arm A64 SCVTF/UCVTF (scalar, integer), restricted here to the base
     // W/X-to-S/D forms used by Switch1. Optional FP16 forms remain behind the
-    // recognized floating-point fallback until their feature-gated semantics
+    // recognized floating-point unsupported classification until their feature-gated semantics
     // are implemented. Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/SCVTF--scalar--integer---Signed-integer-Convert-to-Floating-point--scalar--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UCVTF--scalar--integer---Unsigned-integer-Convert-to-Floating-point--scalar--
@@ -1082,7 +1082,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
     .fixture32(0x1e19_e027),
     // Arm A64 scalar floating-point to integer conversions with an explicit
     // rounding direction. These cover the base S/D-to-W/X forms; optional
-    // FP16 forms remain classified by the feature-gated fallback. Arm ARM
+    // FP16 forms remain classified by the feature-gated unsupported classification. Arm ARM
     // DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTNS--scalar--integer---Floating-point-Convert-to-Signed-integer--rounding-to-nearest-with-ties-to-even--scalar--
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FCVTNU--scalar--integer---Floating-point-Convert-to-Unsigned-integer--rounding-to-nearest-with-ties-to-even--scalar--
@@ -1252,6 +1252,8 @@ pub struct Operands {
     pub immediate_5: u8,
     pub rt2: u8,
     pub immediate_7: u8,
+    /// Normalized `immh:immb` field used by Advanced SIMD shifts.
+    pub shift_immediate: u8,
     pub mode: u8,
     pub immediate_8: u8,
     pub cmode: u8,
@@ -1275,6 +1277,60 @@ pub struct Operands {
     pub float_add_operation: Option<FloatAddOperation>,
     pub float_multiply_operation: Option<FloatMultiplyOperation>,
     pub float_fused_multiply_operation: Option<FloatFusedMultiplyOperation>,
+}
+
+impl Operands {
+    /// Empty normalized operand set used as the base of typed execution calls.
+    /// Callers populate only the fields consumed by the selected instruction
+    /// family; no raw instruction is decoded again.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            rd: 0,
+            rn: 0,
+            rm: 0,
+            ra: 0,
+            size: 0,
+            opc: 0,
+            option: 0,
+            immediate_9: 0,
+            immediate_12: 0,
+            immediate_19: 0,
+            load: false,
+            quad: false,
+            vector_128: false,
+            subtract: false,
+            scaled: false,
+            helper_token: A64HelperToken::new(0, 0),
+            immediate_5: 0,
+            rt2: 0,
+            immediate_7: 0,
+            shift_immediate: 0,
+            mode: 0,
+            immediate_8: 0,
+            cmode: 0,
+            structure_opcode: 0,
+            bitwise_operation: None,
+            integer_comparison: None,
+            pairwise_operation: None,
+            permute_operation: None,
+            compare_with_zero: false,
+            signaling_compare: false,
+            operation_bit: false,
+            immediate_4: 0,
+            nzcv_immediate: 0,
+            condition: 0,
+            element_size: 0,
+            fp_immediate_8: 0,
+            float_conversion: None,
+            float_to_integer_rounding: None,
+            fixed_point_fraction_bits: None,
+            float_round_operation: None,
+            float_add_operation: None,
+            float_multiply_operation: None,
+            float_fused_multiply_operation: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1469,6 +1525,7 @@ pub(crate) fn normalize(instruction_id: u32, bits: u32) -> Instruction {
         immediate_5: ((bits >> 16) & 0x1f) as u8,
         rt2: ((bits >> 10) & 0x1f) as u8,
         immediate_7: ((bits >> 15) & 0x7f) as u8,
+        shift_immediate: ((bits >> 16) & 0x7f) as u8,
         mode: ((bits >> 23) & 3) as u8,
         immediate_8: ((((bits >> 16) & 7) << 5) | ((bits >> 5) & 0x1f)) as u8,
         cmode: ((bits >> 12) & 0xf) as u8,

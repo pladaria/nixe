@@ -1,0 +1,1634 @@
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use nixe_cpu::decode::table::LoweringAvailability;
+use nixe_cpu::decode::{self, DecodeResult};
+use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+use nixe_cpu::memory::{
+    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
+    ProcessMemory, SyntheticMemory, SyntheticMmio,
+};
+use nixe_cpu::platform::TargetPlatform;
+use nixe_cpu::profile::InstructionFeature;
+use nixe_cpu::profile::ProcessCpuContext;
+use nixe_cpu::state::ThreadCpuState;
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv};
+use nixe_cpu_interpreter::{
+    InstructionStep, InterpreterContext, execute_one, execute_one_with_context,
+};
+use nixe_memory::{
+    AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MemoryInvalidationKind,
+    MemoryInvalidationSource,
+};
+
+use super::lookup::RegionLookup;
+use super::region::{RegionKey, RegionLimits, discover_region};
+use super::*;
+
+const CODE: u64 = 0x1000;
+const DATA: u64 = 0x8000;
+const SPACE: AddressSpaceId = AddressSpaceId::new(1);
+
+#[test]
+fn normalized_multiblock_region_executes_without_nixe_ir() {
+    let memory = memory(&[
+        (0x00, 0xd503_201f), // NOP
+        (0x04, branch(CODE + 4, CODE + 12)),
+        (0x08, add_x0(7)),
+        (0x0c, add_x0(1)),
+        (0x10, breakpoint(0x31)),
+    ]);
+    let cpu = cpu();
+    let region = discover_region(cpu, &memory, location(CODE), RegionLimits::default()).unwrap();
+    assert_eq!(region.blocks.len(), 2);
+    assert_eq!(region.instruction_count, 4);
+    assert_eq!(region.external_exits.len(), 1);
+
+    let process = JitProcess::new(cpu).unwrap();
+    let thread = JitThread::new();
+    let mut state = state(CODE, 10);
+    let exit = thread.run(&process, &memory, &mut state, 10).unwrap();
+    assert_eq!(
+        exit,
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE + 0x10),
+            detail: (2 << 24) | 0x31,
+            instructions: 4,
+        }
+    );
+    assert_eq!(read_x0(&state), 11);
+}
+
+#[test]
+fn conditional_branch_consumes_lazy_flags_in_native_cfg() {
+    let memory = memory(&[
+        (0x00, 0xf100_0400),                                // SUBS X0,X0,#1
+        (0x04, conditional_branch(CODE + 4, CODE + 12, 1)), // B.NE
+        (0x08, breakpoint(1)),
+        (0x0c, breakpoint(2)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+
+    let mut zero = state(CODE, 1);
+    assert_eq!(
+        thread.run(&process, &memory, &mut zero, 8).unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE + 8),
+            detail: (2 << 24) | 1,
+            instructions: 3,
+        }
+    );
+    assert!(zero.nzcv().zero());
+
+    let mut nonzero = state(CODE, 2);
+    assert_eq!(
+        thread.run(&process, &memory, &mut nonzero, 8).unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE + 12),
+            detail: (2 << 24) | 2,
+            instructions: 3,
+        }
+    );
+    assert!(!nonzero.nzcv().zero());
+}
+
+#[test]
+fn direct_backedge_keeps_register_ssa_until_precise_budget_exit() {
+    let memory = memory(&[(0x00, add_x0(1)), (0x04, branch(CODE + 4, CODE))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    let mut state = state(CODE, 0);
+    assert_eq!(
+        thread.run(&process, &memory, &mut state, 5).unwrap(),
+        DirectExit::Budget {
+            pc: GuestVirtualAddress::new(CODE + 4),
+            instructions: 5,
+        }
+    );
+    assert_eq!(read_x0(&state), 3);
+
+    let key = RegionKey::new(cpu(), location(CODE));
+    let process_state = process.state.lock().unwrap();
+    let compiled = process_state.lookup.get(key).unwrap();
+    assert_eq!(compiled.guest_blocks, 1);
+    assert!(compiled.native_bytes > 0);
+    assert_eq!(compiled.dependencies.len(), 1);
+    assert_eq!(compiled.register_loads, 1);
+    assert_eq!(compiled.register_stores, 1);
+}
+
+#[test]
+fn call_and_return_use_canonical_state_only_at_region_boundaries() {
+    let memory = memory(&[
+        (0x00, branch_link(CODE, CODE + 0x10)),
+        (0x04, breakpoint(3)),
+        (0x10, add_x0(1)),
+        (0x14, 0xd65f_03c0), // RET X30
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    let mut state = state(CODE, 4);
+    assert_eq!(
+        thread.run(&process, &memory, &mut state, 10).unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE + 4),
+            detail: (2 << 24) | 3,
+            instructions: 4,
+        }
+    );
+    assert_eq!(read_x0(&state), 5);
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(30).unwrap())),
+        CODE + 4
+    );
+
+    let process_state = process.state.lock().unwrap();
+    let source = process_state
+        .lookup
+        .get(RegionKey::new(cpu(), location(CODE)))
+        .unwrap();
+    let target = process_state
+        .lookup
+        .get(RegionKey::new(cpu(), location(CODE + 0x10)))
+        .unwrap();
+    assert_eq!(source.links.len(), 1);
+    assert_eq!(source.links[0].slot.load(Ordering::Acquire), target.entry);
+}
+
+#[test]
+fn budget_and_control_exit_before_the_next_guest_instruction() {
+    let memory = memory(&[(0x00, 0xd503_201f), (0x04, breakpoint(0))]);
+    let process = JitProcess::new(cpu()).unwrap();
+
+    let thread = JitThread::new();
+    let mut budget_state = state(CODE, 0);
+    assert_eq!(
+        thread.run(&process, &memory, &mut budget_state, 1).unwrap(),
+        DirectExit::Budget {
+            pc: GuestVirtualAddress::new(CODE + 4),
+            instructions: 1,
+        }
+    );
+
+    let preempted = JitThread::new();
+    preempted.request_preempt();
+    let mut control_state = state(CODE, 0);
+    assert_eq!(
+        preempted
+            .run(&process, &memory, &mut control_state, 10)
+            .unwrap(),
+        DirectExit::Control {
+            pc: GuestVirtualAddress::new(CODE),
+            instructions: 0,
+        }
+    );
+}
+
+#[test]
+fn one_process_lock_produces_one_synchronous_compilation_flight() {
+    let memory = Arc::new(memory(&[(0x00, breakpoint(0))]));
+    let process = Arc::new(JitProcess::new(cpu()).unwrap());
+    let mut joins = Vec::new();
+    for _ in 0..4 {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        joins.push(std::thread::spawn(move || {
+            process
+                .entry_for(memory.as_ref(), location(CODE))
+                .unwrap()
+                .1
+        }));
+    }
+    let entries: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+    assert!(entries.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(process.state.lock().unwrap().compiled_regions, 1);
+}
+
+#[test]
+fn direct_lookup_uses_collision_fallback_without_replacing_primary_slot() {
+    fn published(key: RegionKey, entry: usize) -> Arc<PublishedRegion> {
+        Arc::new(PublishedRegion {
+            key,
+            entry,
+            native_bytes: 1,
+            clif_instructions: 1,
+            guest_blocks: 1,
+            register_loads: 0,
+            register_stores: 0,
+            dependencies: Box::new([]),
+            links: Box::new([]),
+        })
+    }
+
+    let first = RegionKey::new(cpu(), location(CODE));
+    let second = RegionKey::new(cpu(), location(CODE + 0x400));
+    let mut lookup = RegionLookup::new();
+    lookup.insert(published(first, 1));
+    lookup.insert(published(second, 2));
+    assert_eq!(lookup.get(first).unwrap().entry, 1);
+    assert_eq!(lookup.get(second).unwrap().entry, 2);
+    assert_eq!(lookup.collision_count(), 1);
+}
+
+#[test]
+fn every_platform_scalar_control_catalog_entry_compiles_directly() {
+    const INTEGER_FIXTURES: [u32; 17] = [
+        0x9100_0400,
+        0xd280_0020,
+        0x8b01_0000,
+        0x8b21_4000,
+        0x9a01_0000,
+        0x9240_0000,
+        0xaa01_0000,
+        0xd340_fc00,
+        0x93c1_0400,
+        0x9ac1_2000,
+        0xfa41_0000,
+        0xfa41_0800,
+        0x9a81_0000,
+        0x9b01_0800,
+        0xdac0_1000,
+        0x1000_0000,
+        0x9000_0000,
+    ];
+    const CONTROL_FIXTURES: [u32; 11] = [
+        0xd503_201f,
+        0x1400_0000,
+        0x9400_0000,
+        0xd61f_0000,
+        0xd63f_0000,
+        0xd65f_03c0,
+        0x5400_0000,
+        0xb400_0000,
+        0x3600_0000,
+        0xd400_0001,
+        0xd420_0000,
+    ];
+    const EXPECTED_IDS: [u32; 28] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x10, 0x11, 0x12, 0x13, 0x14,
+        0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x20, 0x21, 0x44, 0x45,
+    ];
+
+    for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+        let cpu = ProcessCpuContext::for_platform(platform, SPACE);
+        let mut covered = BTreeSet::new();
+        for encoding in INTEGER_FIXTURES.into_iter().chain(CONTROL_FIXTURES) {
+            let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+            let location = location_for(cpu, CODE);
+            let decoded = match decode::decode(cpu.decoder(), location, encoding.into()) {
+                DecodeResult::Decoded(decoded) => decoded,
+                result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
+            };
+            covered.insert(decoded.instruction.coverage_id().get());
+            JitProcess::new(cpu)
+                .unwrap()
+                .entry_for(&memory, location)
+                .unwrap_or_else(|error| {
+                    panic!("{platform:?} failed direct compilation of {encoding:#010x}: {error}")
+                });
+        }
+        let catalog: BTreeSet<_> = nixe_cpu::decode::a64::patterns()
+            .iter()
+            .filter(|pattern| {
+                pattern.lowering == LoweringAvailability::Implemented
+                    && pattern
+                        .required_features
+                        .iter()
+                        .all(|feature| platform.supports(*feature))
+                    && scalar_control_catalog_id(pattern.coverage_id.get())
+            })
+            .map(|pattern| pattern.coverage_id.get())
+            .collect();
+        assert_eq!(catalog, EXPECTED_IDS.into_iter().collect());
+        assert_eq!(covered, catalog);
+    }
+}
+
+fn scalar_control_catalog_id(id: u32) -> bool {
+    matches!(
+        id,
+        0x01 | 0x02 | 0x03 | 0x04..=0x0a | 0x10..=0x1d | 0x20 | 0x21 | 0x44 | 0x45
+    )
+}
+
+#[test]
+fn every_platform_memory_system_catalog_entry_compiles_directly() {
+    for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+        let cpu = ProcessCpuContext::for_platform(platform, SPACE);
+        let catalog: Vec<_> = nixe_cpu::decode::a64::patterns()
+            .iter()
+            .filter(|pattern| {
+                pattern.lowering == LoweringAvailability::Implemented
+                    && pattern
+                        .required_features
+                        .iter()
+                        .all(|feature| platform.supports(*feature))
+                    && matches!(pattern.coverage_id.get(), 0x0b..=0x0f | 0x22..=0x2f)
+            })
+            .collect();
+        let mut covered = BTreeSet::new();
+        for pattern in catalog.iter().copied() {
+            let encoding = pattern
+                .regression_fixture
+                .expect("implemented catalog entry has a regression fixture")
+                .encoding
+                .bits();
+            let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+            let location = location_for(cpu, CODE);
+            let decoded = match decode::decode(cpu.decoder(), location, encoding.into()) {
+                DecodeResult::Decoded(decoded) => decoded,
+                result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
+            };
+            covered.insert(decoded.instruction.coverage_id().get());
+            JitProcess::new(cpu)
+                .unwrap()
+                .entry_for(&memory, location)
+                .unwrap_or_else(|error| {
+                    panic!("{platform:?} failed direct compilation of {encoding:#010x}: {error}")
+                });
+        }
+        assert_eq!(
+            covered,
+            catalog
+                .into_iter()
+                .map(|pattern| pattern.coverage_id.get())
+                .collect()
+        );
+    }
+}
+
+#[test]
+fn every_platform_fp_simd_catalog_entry_has_a_direct_or_exact_typed_lowering() {
+    for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+        let cpu = ProcessCpuContext::for_platform(platform, SPACE);
+        let catalog: Vec<_> = nixe_cpu::decode::a64::patterns()
+            .iter()
+            .filter(|pattern| {
+                pattern.lowering == LoweringAvailability::Implemented
+                    && pattern
+                        .required_features
+                        .iter()
+                        .all(|feature| platform.supports(*feature))
+                    && pattern
+                        .required_features
+                        .contains(&InstructionFeature::AdvancedSimd)
+            })
+            .collect();
+        let mut covered = BTreeSet::new();
+        for pattern in catalog.iter().copied() {
+            let encoding = pattern
+                .regression_fixture
+                .expect("implemented FP/SIMD entry has a regression fixture")
+                .encoding
+                .bits();
+            let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+            let location = location_for(cpu, CODE);
+            let decoded = match decode::decode(cpu.decoder(), location, encoding.into()) {
+                DecodeResult::Decoded(decoded) => decoded,
+                result => panic!("{platform:?} rejected {encoding:#010x}: {result:?}"),
+            };
+            covered.insert(decoded.instruction.coverage_id().get());
+            JitProcess::new(cpu)
+                .unwrap()
+                .entry_for(&memory, location)
+                .unwrap_or_else(|error| {
+                    panic!("{platform:?} failed direct FP/SIMD compilation of {encoding:#010x}: {error}")
+                });
+        }
+        assert_eq!(
+            covered,
+            catalog
+                .into_iter()
+                .map(|pattern| pattern.coverage_id.get())
+                .collect()
+        );
+    }
+}
+
+#[test]
+fn direct_simd_integer_moves_permutations_and_shifts_match_the_interpreter() {
+    let cases = [
+        0x4e01_0c20_u32, // DUP V0.16B,W1
+        0x4e22_1c20,     // AND V0.16B,V1.16B,V2.16B
+        0x4e22_8420,     // ADD V0.16B,V1.16B,V2.16B
+        0x4e22_bc20,     // ADDP V0.16B,V1.16B,V2.16B
+        0x4e21_34a3,     // CMGT V3.16B,V5.16B,V1.16B
+        0x4e02_1823,     // UZP1 V3.16B,V1.16B,V2.16B
+        0x6e02_4023,     // EXT V3.16B,V1.16B,V2.16B,#8
+        0x0f0c_8400,     // SHRN V0.8B,V0.8H,#4
+        0x2f0f_0420,     // USHR V0.8B,V1.8B,#1
+        0x0e22_4420,     // SSHL V0.8B,V1.8B,V2.8B
+        0x4e20_5862,     // CNT V2.16B,V3.16B
+        0x4e31_b862,     // ADDV B2,V3.16B
+    ];
+    for encoding in cases {
+        let mut initial = rich_state();
+        for register in 0_u8..32 {
+            let byte = register.wrapping_mul(7).wrapping_add(3);
+            let value = u128::from_le_bytes([byte; 16]) ^ 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+            assert!(initial.set_vector(register, value));
+        }
+        assert_matches_interpreter(encoding, initial);
+    }
+}
+
+#[test]
+fn compact_simd_emitters_match_the_interpreter_across_shapes_and_operations() {
+    let cases = [
+        // Bitwise operations, including destination-as-mask forms.
+        0x4e22_1c20_u32,
+        0x4e62_1c20,
+        0x4ea2_1c20,
+        0x4ee2_1c20,
+        0x6e22_1c20,
+        0x6e62_1c20,
+        0x6ea2_1c20,
+        0x6ee2_1c20,
+        // Pairwise integer operations.
+        0x4e22_bc20,
+        0x4e22_a420,
+        0x4e22_ac20,
+        0x6e22_a420,
+        0x6e22_ac20,
+        0x0e62_bc20,
+        0x6ea2_a420,
+        0x4ee2_bc20,
+        // Element-wise min/max and comparisons.
+        0x0ebf_6fdf,
+        0x4e21_34a3,
+        0x6e21_34a3,
+        0x4e21_3ca3,
+        0x6e21_3ca3,
+        0x4e21_8ca3,
+        0x6e21_8ca3,
+        0x4e20_8823,
+        0x6e20_8823,
+        0x4e20_9823,
+        0x4ee1_34a3,
+        0x2e21_3ca3,
+        // Permutations and byte extracts.
+        0x4e02_1823,
+        0x4e02_5824,
+        0x4e02_2825,
+        0x4e02_6826,
+        0x0e02_3827,
+        0x4e42_6828,
+        0x4e82_5829,
+        0x4ec2_782a,
+        0x6e02_4023,
+        0x2e0b_3949,
+        0x6e1f_43ff,
+        // Narrowing and immediate shifts.
+        0x0f0c_8400,
+        0x4f0c_8420,
+        0x0e21_2820,
+        0x0e61_2862,
+        0x0ea1_28a4,
+        0x4e21_28e6,
+        0x4e61_2928,
+        0x4ea1_296a,
+        0x2f0f_0420,
+        0x4f0f_0630,
+        0x2f1f_04a4,
+        0x6f10_04e6,
+        0x2f3f_0528,
+        0x6f20_056a,
+        0x5f60_57de,
+        0x0f20_a7fe,
+        // Signed and unsigned variable shifts across lane widths and aliases.
+        0x0e22_4420,
+        0x2e24_4462,
+        0x0ebd_47fd,
+        0x0e62_4420,
+        0x0ea2_4420,
+        0x4ee2_4420,
+        // Across-vector reductions.
+        0x0e31_bbde,
+        0x4e31_b862,
+        0x0e71_b8a4,
+        0x4e71_b8e6,
+        0x4eb1_b928,
+    ];
+    for encoding in cases {
+        let mut initial = rich_state();
+        for register in 0_u8..32 {
+            let low = u64::from(register)
+                .wrapping_mul(0x0102_0304_0506_0708)
+                .wrapping_add(0x807f_01ff_55aa_cc33);
+            let high = low.rotate_left(u32::from(register));
+            assert!(initial.set_vector(register, u128::from(low) | (u128::from(high) << 64)));
+        }
+        assert_matches_interpreter(encoding, initial);
+    }
+}
+
+#[test]
+fn direct_simd_quadword_and_pair_memory_match_the_interpreter() {
+    let words = [
+        (0, 0x3d80_0080_u32),  // STR Q0,[X4]
+        (4, 0x3dc0_0082_u32),  // LDR Q2,[X4]
+        (8, 0xad01_0480_u32),  // STP Q0,Q1,[X4,#32]
+        (12, 0xad41_0c82_u32), // LDP Q2,Q3,[X4,#32]
+        (16, breakpoint(0)),
+    ];
+    let expected_memory = memory_with_words_and_data(&words);
+    let actual_memory = memory_with_words_and_data(&words);
+    let mut initial = rich_state();
+    write_register(&mut initial, 4, DATA);
+    assert!(initial.set_vector(0, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00));
+    assert!(initial.set_vector(1, 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100));
+
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for (_, encoding) in words[..4].iter().copied() {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding.into()).unwrap(),
+            InstructionStep::Continue,
+            "{encoding:#010x}"
+        );
+    }
+
+    let mut actual = initial;
+    assert_eq!(
+        JitThread::new()
+            .run(
+                &JitProcess::new(cpu()).unwrap(),
+                &actual_memory,
+                &mut actual,
+                4,
+            )
+            .unwrap(),
+        DirectExit::Budget {
+            pc: GuestVirtualAddress::new(CODE + 16),
+            instructions: 4,
+        }
+    );
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+    assert_memory_prefix_equal(&actual_memory, &expected_memory, 64);
+}
+
+#[test]
+fn direct_exact_fp_matches_normal_special_rounding_saturation_and_status_cases() {
+    let mut normal = rich_state();
+    assert!(normal.set_vector(1, u128::from(1.25_f64.to_bits())));
+    assert!(normal.set_vector(2, u128::from(2.5_f64.to_bits())));
+    assert_matches_interpreter(0x1e62_2820, normal); // FADD D0,D1,D2
+
+    let halfway = (970_u64) << 52; // 2^-53, half an ulp at 1.0.
+    for mode in 0_u32..=3 {
+        let mut rounding = rich_state();
+        rounding.set_fpcr(mode << 22);
+        assert!(rounding.set_vector(1, u128::from(1.0_f64.to_bits())));
+        assert!(rounding.set_vector(2, u128::from(halfway)));
+        assert_matches_interpreter(0x1e62_2820, rounding); // FADD D0,D1,D2
+    }
+
+    let mut nan = rich_state();
+    nan.set_fpsr(0x80);
+    assert!(nan.set_vector(0, u128::from(0x7ff8_0000_0000_0001_u64)));
+    assert!(nan.set_vector(1, u128::from(1.0_f64.to_bits())));
+    assert_matches_interpreter(0x1e61_2000, nan); // FCMP D0,D1
+
+    let mut infinity = rich_state();
+    infinity.set_fpsr(0x80);
+    assert!(infinity.set_vector(1, u128::from(1.0_f32.to_bits())));
+    assert!(infinity.set_vector(2, 0));
+    assert_matches_interpreter(0x1e22_1820, infinity); // FDIV S0,S1,S2
+
+    let mut denormal = rich_state();
+    denormal.set_fpcr(1 << 24); // FZ
+    assert!(denormal.set_vector(1, 1));
+    assert!(denormal.set_vector(2, u128::from(1.0_f64.to_bits())));
+    assert_matches_interpreter(0x1e62_0820, denormal); // FMUL D0,D1,D2
+
+    for value in [f64::INFINITY, f64::NAN, -0.5] {
+        let mut saturation = rich_state();
+        assert!(saturation.set_vector(1, u128::from(value.to_bits())));
+        assert_matches_interpreter(0x9e79_0020, saturation); // FCVTZU X0,D1
+    }
+}
+
+#[test]
+fn direct_exact_fp_enabled_exception_is_atomic() {
+    let encoding = 0x1e62_2820_u32; // FADD D0,D1,D2
+    let mut initial = rich_state();
+    initial.set_fpcr(1 << 8); // IOE
+    initial.set_fpsr(0x80);
+    assert!(initial.set_vector(0, u128::MAX));
+    assert!(initial.set_vector(1, u128::from(f64::INFINITY.to_bits())));
+    assert!(initial.set_vector(2, u128::from(f64::NEG_INFINITY.to_bits())));
+
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    assert!(matches!(
+        execute_one(&cpu().profile(), &mut expected, encoding.into()).unwrap(),
+        InstructionStep::Exit(nixe_cpu::execution::CpuExit::ArchitecturalException {
+            kind: nixe_cpu::exception::ExceptionKind::FloatingPoint,
+            ..
+        })
+    ));
+
+    let mut actual = initial;
+    assert_eq!(
+        JitThread::new()
+            .run(
+                &JitProcess::new(cpu()).unwrap(),
+                &memory(&[(0, encoding), (4, breakpoint(0))]),
+                &mut actual,
+                1,
+            )
+            .unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE),
+            detail: 6 << 24,
+            instructions: 1,
+        }
+    );
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+}
+
+#[test]
+fn scalar_memory_addressing_and_transfer_forms_match_the_interpreter() {
+    let cases = [
+        0xf940_0020, // LDR X0,[X1]
+        0xf900_0023, // STR X3,[X1]
+        0xb940_0020, // LDR W0,[X1]
+        0xb900_0023, // STR W3,[X1]
+        0x3940_0020, // LDRB W0,[X1]
+        0x3900_0023, // STRB W3,[X1]
+        0x3980_0020, // LDRSB X0,[X1]
+        0x39c0_0020, // LDRSB W0,[X1]
+        0xb980_0020, // LDRSW X0,[X1]
+        0xf840_0020, // LDUR X0,[X1]
+        0xf840_8420, // LDR X0,[X1],#8
+        0xf840_8c20, // LDR X0,[X1,#8]!
+        0xf862_6820, // LDR X0,[X1,X2]
+        0xa940_0c20, // LDP X0,X3,[X1]
+        0xa900_0c20, // STP X0,X3,[X1]
+        0x6940_0c20, // LDPSW X0,X3,[X1]
+        0x5800_0040, // LDR X0,[PC,#8]
+        0xc8df_fc20, // LDAR X0,[X1]
+        0xc89f_fc23, // STLR X3,[X1]
+    ];
+    for encoding in cases {
+        assert_memory_matches_interpreter(encoding);
+    }
+}
+
+#[test]
+fn clean_ram_loads_and_stores_leave_the_rust_slow_path_after_arming() {
+    for encoding in [
+        0xf940_0020, // LDR X0,[X1]
+        0xf900_0023, // STR X3,[X1]
+        0x3dc0_0020, // LDR Q0,[X1]
+        0x3d80_0020, // STR Q0,[X1]
+    ] {
+        let memory = execution_memory_with_data(encoding);
+        let process = JitProcess::new(cpu()).unwrap();
+        let thread = JitThread::new();
+        let mut state = memory_state();
+        assert!(state.set_vector(0, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00));
+        thread.run(&process, &memory, &mut state, 1).unwrap();
+        let after_first = thread.slow_memory_calls.load(Ordering::Relaxed);
+        assert_eq!(after_first, 1, "{encoding:#010x}");
+
+        state.set_pc(CODE);
+        write_register(&mut state, 0, 0);
+        write_register(&mut state, 3, 0x1122_3344_5566_7788);
+        assert!(state.set_vector(0, 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100));
+        thread.run(&process, &memory, &mut state, 1).unwrap();
+        assert_eq!(
+            thread.slow_memory_calls.load(Ordering::Relaxed),
+            after_first,
+            "{encoding:#010x} returned to Rust after fastmem was armed"
+        );
+    }
+}
+
+#[test]
+fn unmapped_memory_fault_matches_the_interpreter_at_the_faulting_pc() {
+    let encoding = 0xf940_0020; // LDR X0,[X1]
+    let expected_memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let actual_memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let mut initial = memory_state();
+    write_register(&mut initial, 1, DATA);
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    let InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault {
+        source,
+        fault: expected_fault,
+    }) = execute_one_with_context(context, &mut expected, encoding.into()).unwrap()
+    else {
+        panic!("reference interpreter did not report a data fault")
+    };
+
+    let mut actual = initial;
+    let DirectExit::DataFault {
+        pc,
+        fault,
+        instructions,
+    } = JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+            1,
+        )
+        .unwrap()
+    else {
+        panic!("direct JIT did not report a data fault")
+    };
+    assert_eq!(pc, source.pc);
+    assert_eq!(fault, expected_fault);
+    assert_eq!(instructions, 1);
+    assert_eq!(actual.pc(), CODE);
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+}
+
+#[test]
+fn pair_second_access_fault_preserves_load_destinations_and_first_store() {
+    for encoding in [0x2940_0c20_u32, 0x2900_0c20] {
+        let expected_memory = memory_with_data(encoding);
+        let actual_memory = memory_with_data(encoding);
+        let mut initial = memory_state();
+        write_register(&mut initial, 1, DATA + 4092);
+        let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+        let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+        let events = nixe_cpu::execution::VcpuEventState::default();
+        let context =
+            InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+        assert!(matches!(
+            execute_one_with_context(context, &mut expected, encoding.into()).unwrap(),
+            InstructionStep::Exit(nixe_cpu::execution::CpuExit::DataFault { .. })
+        ));
+        let mut actual = initial;
+        assert!(matches!(
+            JitThread::new()
+                .run(
+                    &JitProcess::new(cpu()).unwrap(),
+                    &actual_memory,
+                    &mut actual,
+                    1,
+                )
+                .unwrap(),
+            DirectExit::DataFault { .. }
+        ));
+        let ThreadCpuState::A64(expected) = expected else {
+            unreachable!()
+        };
+        assert_eq!(actual, *expected, "{encoding:#010x}");
+        assert_memory_prefix_equal(&actual_memory, &expected_memory, 4096);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MmioEvent {
+    Read(u64, MemoryAccess),
+    Write(u64, MemoryAccess, MemoryValue),
+}
+
+struct RecordingMmio {
+    events: Arc<Mutex<Vec<MmioEvent>>>,
+}
+
+impl SyntheticMmio for RecordingMmio {
+    fn read(&mut self, offset: u64, access: MemoryAccess) -> Result<MemoryValue, Box<str>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(MmioEvent::Read(offset, access));
+        Ok(MemoryValue::U64(0x0123_4567_89ab_cdef))
+    }
+
+    fn write(
+        &mut self,
+        offset: u64,
+        access: MemoryAccess,
+        value: MemoryValue,
+    ) -> Result<(), Box<str>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(MmioEvent::Write(offset, access, value));
+        Ok(())
+    }
+}
+
+#[test]
+fn special_page_accesses_use_precise_typed_slow_calls() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut memory = memory(&[
+        (0, 0xf940_0020), // LDR X0,[X1]
+        (4, 0xf900_0023), // STR X3,[X1]
+        (8, breakpoint(0)),
+    ]);
+    let page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_mmio_page(
+        page,
+        RecordingMmio {
+            events: Arc::clone(&events),
+        },
+    ));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    let mut state = memory_state();
+    let exit = JitThread::new()
+        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state, 2)
+        .unwrap();
+    assert!(matches!(
+        exit,
+        DirectExit::Budget {
+            instructions: 2,
+            ..
+        }
+    ));
+    assert_eq!(read_x0(&state), 0x0123_4567_89ab_cdef);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], MmioEvent::Read(0, _)));
+    assert!(matches!(
+        events[1],
+        MmioEvent::Write(0, _, MemoryValue::U64(0x8877_6655_4433_2211))
+    ));
+}
+
+#[test]
+fn exclusive_load_store_round_trip_matches_the_interpreter() {
+    let words = [
+        (0, 0xc85f_7c20), // LDXR X0,[X1]
+        (4, 0xc800_7c23), // STXR W0,X3,[X1]
+        (8, breakpoint(0)),
+    ];
+    let expected_memory = memory_with_words_and_data(&words);
+    let actual_memory = memory_with_words_and_data(&words);
+    let mut expected = ThreadCpuState::A64(Box::new(memory_state()));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    for encoding in [0xc85f_7c20_u32, 0xc800_7c23] {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding.into()).unwrap(),
+            InstructionStep::Continue
+        );
+    }
+    let mut actual = memory_state();
+    JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+            2,
+        )
+        .unwrap();
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+    assert_memory_prefix_equal(&actual_memory, &expected_memory, 16);
+}
+
+#[test]
+fn exclusive_atomic_updates_are_indivisible_across_vcpus() {
+    const VCPUS: usize = 4;
+    const ITERATIONS: usize = 100;
+    let cpu = cpu();
+    let memory = Arc::new(memory_with_words_and_data(&[
+        (0x00, 0x885f_7c40),                                // LDXR W0,[X2]
+        (0x04, 0x1100_0400),                                // ADD W0,W0,#1
+        (0x08, 0x8801_7c40),                                // STXR W1,W0,[X2]
+        (0x0c, compare_branch(CODE + 0x0c, CODE, 1, true)), // CBNZ W1,loop
+        (0x10, breakpoint(0)),
+    ]));
+    let process = Arc::new(JitProcess::new(cpu).unwrap());
+    let mut workers = Vec::new();
+    for _ in 0..VCPUS {
+        let memory = Arc::clone(&memory);
+        let process = Arc::clone(&process);
+        workers.push(std::thread::spawn(move || {
+            let thread = JitThread::new();
+            let mut state = A64State::default();
+            write_register(&mut state, 2, DATA);
+            for _ in 0..ITERATIONS {
+                state.set_pc(CODE);
+                let exit = thread
+                    .run(&process, memory.as_ref(), &mut state, 1_000)
+                    .unwrap();
+                assert!(matches!(exit, DirectExit::Architectural { .. }));
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let result = memory
+        .read(
+            SPACE,
+            GuestVirtualAddress::new(DATA),
+            MemoryAccess::normal(MemoryAccessSize::Word),
+        )
+        .unwrap()
+        .value;
+    let initial = u32::from_le_bytes([0, 1, 2, 3]);
+    assert_eq!(
+        result,
+        MemoryValue::U32(initial + (VCPUS * ITERATIONS) as u32)
+    );
+}
+
+#[test]
+fn executable_alias_writes_publish_memory_owned_invalidation() {
+    let mut memory = memory(&[(0, 0xf900_0023), (4, breakpoint(0))]); // STR X3,[X1]
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        GuestPhysicalPageId::new(1),
+        MemoryPermissions::READ_WRITE,
+    ));
+    let before = memory.invalidation_cursor();
+    let mut state = memory_state();
+    JitThread::new()
+        .run(&JitProcess::new(cpu()).unwrap(), &memory, &mut state, 1)
+        .unwrap();
+    let mut invalidations = Vec::new();
+    let after = memory
+        .read_invalidations_since(before, &mut invalidations)
+        .unwrap();
+    assert!(after > before);
+    assert!(
+        invalidations
+            .iter()
+            .any(|invalidation| match invalidation.kind {
+                MemoryInvalidationKind::ExecutableContent { first, second } => {
+                    first == GuestPhysicalPageId::new(1) && second.is_none()
+                }
+                _ => false,
+            })
+    );
+}
+
+struct FixedTimer;
+
+impl nixe_cpu::execution::ArchitecturalTimer for FixedTimer {
+    fn snapshot(&self) -> nixe_cpu::execution::TimerSnapshot {
+        nixe_cpu::execution::TimerSnapshot {
+            counter: 0x1234_5678_9abc_def0,
+            frequency: 19_200_000,
+        }
+    }
+}
+
+#[test]
+fn system_register_timer_barrier_and_cache_paths_match_the_interpreter() {
+    let encodings = [
+        0xd51b_4200, // MSR NZCV,X0
+        0xd53b_4204, // MRS X4,NZCV
+        0xd51b_d043, // MSR TPIDR_EL0,X3
+        0xd53b_d045, // MRS X5,TPIDR_EL0
+        0xd53b_0026, // MRS X6,CTR_EL0
+        0xd53b_00e7, // MRS X7,DCZID_EL0
+        0xd53b_e008, // MRS X8,CNTFRQ_EL0
+        0xd53b_e029, // MRS X9,CNTVCT_EL0
+        0xd503_3bbf, // DMB ISH
+        0xd50b_7521, // IC IVAU,X1
+    ];
+    let mut words: Vec<_> = encodings
+        .iter()
+        .enumerate()
+        .map(|(index, encoding)| ((index * 4) as u64, *encoding))
+        .collect();
+    words.push(((encodings.len() * 4) as u64, breakpoint(0)));
+    let expected_memory = memory_with_words_and_data(&words);
+    let actual_memory = memory_with_words_and_data(&words);
+    let mut initial = memory_state();
+    write_register(&mut initial, 0, 0xa000_0000);
+    write_register(&mut initial, 3, 0xfeed_face_cafe_beef);
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &FixedTimer, &events);
+    for encoding in encodings {
+        assert_eq!(
+            execute_one_with_context(context, &mut expected, encoding.into()).unwrap(),
+            InstructionStep::Continue,
+            "{encoding:#010x}"
+        );
+    }
+
+    let mut actual = initial;
+    let actual_events = nixe_cpu::execution::VcpuEventState::default();
+    let exit = JitThread::new()
+        .run_with_runtime(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual,
+            encodings.len() as u64,
+            &FixedTimer,
+            &actual_events,
+        )
+        .unwrap();
+    assert!(matches!(
+        exit,
+        DirectExit::Budget {
+            instructions: 10,
+            ..
+        }
+    ));
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+}
+
+#[test]
+fn scheduling_hints_publish_the_next_pc_and_exact_request() {
+    let yield_memory = memory(&[(0, 0xd503_203f), (4, breakpoint(0))]);
+    let mut yield_state = state(CODE, 0);
+    let exit = JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &yield_memory,
+            &mut yield_state,
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        exit,
+        DirectExit::Scheduled {
+            pc: GuestVirtualAddress::new(CODE),
+            request: nixe_cpu::execution::SchedulerRequest::Yield,
+            instructions: 1,
+        }
+    );
+    assert_eq!(yield_state.pc(), CODE + 4);
+
+    let wfe_memory = memory(&[(0, 0xd503_205f), (4, breakpoint(0))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    let mut waiting = state(CODE, 0);
+    assert_eq!(
+        thread.run(&process, &wfe_memory, &mut waiting, 1).unwrap(),
+        DirectExit::Scheduled {
+            pc: GuestVirtualAddress::new(CODE),
+            request: nixe_cpu::execution::SchedulerRequest::WaitForEvent,
+            instructions: 1,
+        }
+    );
+    thread.events.signal_event();
+    let mut resumed = state(CODE, 0);
+    assert!(matches!(
+        thread.run(&process, &wfe_memory, &mut resumed, 1).unwrap(),
+        DirectExit::Budget {
+            instructions: 1,
+            ..
+        }
+    ));
+    assert_eq!(resumed.pc(), CODE + 4);
+}
+
+fn assert_memory_matches_interpreter(encoding: u32) {
+    let expected_memory = memory_with_data(encoding);
+    let actual_memory = memory_with_data(encoding);
+    let mut expected_state = ThreadCpuState::A64(Box::new(memory_state()));
+    let monitor = RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    let context = InterpreterContext::new(cpu(), &expected_memory, &monitor, &ZeroTimer, &events);
+    assert_eq!(
+        execute_one_with_context(context, &mut expected_state, encoding.into()).unwrap(),
+        InstructionStep::Continue,
+        "{encoding:#010x}"
+    );
+
+    let mut actual_state = memory_state();
+    let exit = JitThread::new()
+        .run(
+            &JitProcess::new(cpu()).unwrap(),
+            &actual_memory,
+            &mut actual_state,
+            1,
+        )
+        .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
+    assert!(matches!(
+        exit,
+        DirectExit::Budget {
+            instructions: 1,
+            ..
+        }
+    ));
+    let ThreadCpuState::A64(expected_state) = expected_state else {
+        unreachable!()
+    };
+    assert_eq!(actual_state, *expected_state, "{encoding:#010x}");
+    let mut expected_bytes = [0_u8; 32];
+    let mut actual_bytes = [0_u8; 32];
+    expected_memory
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut expected_bytes)
+        .unwrap();
+    actual_memory
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut actual_bytes)
+        .unwrap();
+    assert_eq!(actual_bytes, expected_bytes, "{encoding:#010x}");
+}
+
+fn memory_state() -> A64State {
+    let mut state = rich_state();
+    write_register(&mut state, 1, DATA);
+    write_register(&mut state, 2, 8);
+    write_register(&mut state, 3, 0x8877_6655_4433_2211);
+    state
+}
+
+fn memory_with_data(encoding: u32) -> SyntheticMemory {
+    let mut memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.initialize_ram(code_page, 8, &0x1020_3040_5060_7080_u64.to_le_bytes(),));
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(data_page));
+    let bytes: Vec<_> = (0_u8..=255).collect();
+    assert!(memory.initialize_ram(data_page, 0, &bytes));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+}
+
+fn memory_with_words_and_data(words: &[(u64, u32)]) -> SyntheticMemory {
+    let mut memory = memory(words);
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(data_page));
+    let bytes: Vec<_> = (0_u8..=255).collect();
+    assert!(memory.initialize_ram(data_page, 0, &bytes));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+}
+
+fn assert_memory_prefix_equal(actual: &SyntheticMemory, expected: &SyntheticMemory, length: usize) {
+    let mut actual_bytes = vec![0; length];
+    let mut expected_bytes = vec![0; length];
+    actual
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut actual_bytes)
+        .unwrap();
+    expected
+        .read_bytes(SPACE, GuestVirtualAddress::new(DATA), &mut expected_bytes)
+        .unwrap();
+    assert_eq!(actual_bytes, expected_bytes);
+}
+
+fn execution_memory_with_data(encoding: u32) -> ExecutionMemory {
+    let mut memory = ExecutionMemory::new();
+    let code_page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(code_page));
+    assert!(memory.initialize_ram(code_page, 0, &encoding.to_le_bytes()));
+    assert!(memory.initialize_ram(code_page, 4, &breakpoint(0).to_le_bytes()));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        code_page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    let data_page = GuestPhysicalPageId::new(2);
+    assert!(memory.add_ram_page(data_page));
+    let bytes: Vec<_> = (0_u8..=255).collect();
+    assert!(memory.initialize_ram(data_page, 0, &bytes));
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(DATA),
+        data_page,
+        MemoryPermissions::READ_WRITE,
+    ));
+    memory
+}
+
+#[test]
+fn every_scalar_integer_family_matches_the_reference_interpreter() {
+    let encodings = [
+        0x9100_0400, // ADD X0,X0,#1
+        0xd280_0020, // MOVZ X0,#1
+        0x8b01_0000, // ADD X0,X0,X1
+        0x8b21_4000, // ADD X0,X0,W1,UXTW
+        0x9a01_0000, // ADC X0,X0,X1
+        0x9240_0000, // AND X0,X0,#1
+        0xaa01_0000, // ORR X0,X0,X1
+        0xd340_fc00, // UBFM X0,X0,#0,#63
+        0x93c1_0400, // EXTR X0,X0,X1,#1
+        0x9ac1_2000, // LSLV X0,X0,X1
+        0xfa41_0000, // CCMP X0,X1,#0,EQ
+        0xfa41_0800, // CCMP X0,#1,#0,EQ
+        0x9a81_0000, // CSEL X0,X0,X1,EQ
+        0x9b01_0800, // MADD X0,X0,X1,X2
+        0xdac0_1000, // CLZ X0,X0
+        0x1000_0000, // ADR X0,#0
+        0x9000_0000, // ADRP X0,#0
+    ];
+    for encoding in encodings {
+        assert_matches_interpreter(encoding, rich_state());
+    }
+}
+
+#[test]
+fn scalar_edge_cases_match_the_reference_interpreter() {
+    let representative = [
+        0xf2d5_79a0, // MOVK X0,#0xabcd,LSL#32
+        0xab02_0c20, // ADDS X0,X1,X2,LSL#3
+        0x6b82_1c20, // SUBS W0,W1,W2,ASR#7
+        0x8b21_cbe0, // ADD X0,SP,W1,SXTW#2
+        0xba02_0020, // ADCS X0,X1,X2
+        0x7a02_0020, // SBCS W0,W1,W2
+        0x9208_9c20, // AND X0,X1,#0xff00ff00ff00ff00
+        0x6ae2_1420, // BICS W0,W1,W2,ROR#5
+        0x331b_0c20, // BFI W0,W1,#5,#4
+        0x3300_1020, // BFXIL W0,W1,#0,#5
+        0x93c2_3420, // EXTR X0,X1,X2,#13
+        0x9ac2_0820, // UDIV X0,X1,X2
+        0x9ac2_0c20, // SDIV X0,X1,X2
+        0x9ac2_2420, // LSRV X0,X1,X2
+        0x9ac2_2820, // ASRV X0,X1,X2
+        0x9ac2_2c20, // RORV X0,X1,X2
+        0xfa42_102a, // CCMP X1,X2,#10,NE
+        0xfa47_0825, // CCMP X1,#7,#5,EQ
+        0x9a82_b420, // CSINC X0,X1,X2,LT
+        0xda82_a020, // CSINV X0,X1,X2,GE
+        0xda82_8420, // CSNEG X0,X1,X2,HI
+        0x9b02_0c20, // MADD X0,X1,X2,X3
+        0x1b02_8c20, // MSUB W0,W1,W2,W3
+        0x9b22_0c20, // SMADDL X0,W1,W2,X3
+        0x9b22_8c20, // SMSUBL X0,W1,W2,X3
+        0x9b42_7c20, // SMULH X0,X1,X2
+        0x9ba2_0c20, // UMADDL X0,W1,W2,X3
+        0x9ba2_8c20, // UMSUBL X0,W1,W2,X3
+        0x9bc2_7c20, // UMULH X0,X1,X2
+        0xdac0_0020, // RBIT X0,X1
+        0xdac0_0420, // REV16 X0,X1
+        0xdac0_0820, // REV32 X0,X1
+        0xdac0_0c20, // REV X0,X1
+        0xdac0_1020, // CLZ X0,X1
+        0xdac0_1420, // CLS X0,X1
+    ];
+    for encoding in representative {
+        assert_matches_interpreter(encoding, rich_state());
+    }
+
+    let mut divide_by_zero = rich_state();
+    write_register(&mut divide_by_zero, 2, 0);
+    assert_matches_interpreter(0x9ac2_0820, divide_by_zero.clone());
+    assert_matches_interpreter(0x9ac2_0c20, divide_by_zero);
+
+    let mut signed_overflow = rich_state();
+    write_register(&mut signed_overflow, 1, i64::MIN as u64);
+    write_register(&mut signed_overflow, 2, u64::MAX);
+    assert_matches_interpreter(0x9ac2_0c20, signed_overflow);
+}
+
+#[test]
+fn scalar_control_edges_match_the_reference_interpreter() {
+    let mut initial = rich_state();
+    write_register(&mut initial, 0, CODE);
+    for encoding in [
+        0xd503_201f, // NOP
+        0x1400_0000, // B .
+        0x9400_0000, // BL .
+        0xd61f_0000, // BR X0
+        0xd63f_0000, // BLR X0
+        0xd65f_03c0, // RET X30
+        0x5400_0000, // B.EQ .
+        0xb500_0000, // CBNZ X0,.
+        0xb628_0000, // TBZ X0,#37,.
+    ] {
+        assert_control_matches_interpreter(encoding, initial.clone());
+    }
+
+    let mut unaligned = initial;
+    write_register(&mut unaligned, 0, CODE + 1);
+    let mut expected = ThreadCpuState::A64(Box::new(unaligned.clone()));
+    let expected_exit = execute_one(&cpu().profile(), &mut expected, 0xd63f_0000_u32.into())
+        .expect("unaligned BLR is an architectural exit");
+    assert!(matches!(expected_exit, InstructionStep::Exit(_)));
+    let memory = memory(&[(0, 0xd63f_0000)]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let mut actual = unaligned;
+    assert_eq!(
+        JitThread::new()
+            .run(&process, &memory, &mut actual, 1)
+            .unwrap(),
+        DirectExit::Architectural {
+            pc: GuestVirtualAddress::new(CODE),
+            detail: 3 << 24,
+            instructions: 1,
+        }
+    );
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected);
+}
+
+#[test]
+fn every_a64_condition_matches_for_every_nzcv_combination() {
+    for condition in 0_u32..16 {
+        let encoding = 0x9a82_0020 | (condition << 12); // CSEL X0,X1,X2,cond
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        let thread = JitThread::new();
+        for packed in 0_u32..16 {
+            let mut actual = rich_state();
+            actual.set_nzcv(Nzcv::from_bits(packed << 28));
+            let mut expected = ThreadCpuState::A64(Box::new(actual.clone()));
+            assert_eq!(
+                execute_one(&cpu().profile(), &mut expected, encoding.into()).unwrap(),
+                InstructionStep::Continue
+            );
+            thread.run(&process, &memory, &mut actual, 1).unwrap();
+            let ThreadCpuState::A64(expected) = expected else {
+                unreachable!()
+            };
+            assert_eq!(
+                actual, *expected,
+                "condition={condition:#x} nzcv={packed:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lazy_flags_merge_at_internal_join_without_canonical_reload() {
+    let memory = memory(&[
+        (0x00, conditional_branch(CODE, CODE + 0x0c, 0)), // B.EQ
+        (0x04, 0xb100_0421),                              // ADDS X1,X1,#1
+        (0x08, branch(CODE + 8, CODE + 0x14)),
+        (0x0c, 0xf100_0421), // SUBS X1,X1,#1
+        (0x10, branch(CODE + 0x10, CODE + 0x14)),
+        (0x14, 0x9a82_0022), // CSEL X2,X1,X2,EQ
+        (0x18, breakpoint(9)),
+    ]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let thread = JitThread::new();
+    for initial_flags in [Nzcv::from_bits(Nzcv::Z), Nzcv::from_bits(0)] {
+        let mut state = rich_state();
+        state.set_nzcv(initial_flags);
+        let mut expected = ThreadCpuState::A64(Box::new(state.clone()));
+        for offset in if initial_flags.zero() {
+            [0x00, 0x0c, 0x10, 0x14]
+        } else {
+            [0x00, 0x04, 0x08, 0x14]
+        } {
+            let encoding = memory_word(&memory, offset);
+            execute_one(&cpu().profile(), &mut expected, encoding.into()).unwrap();
+        }
+        thread.run(&process, &memory, &mut state, 4).unwrap();
+        let ThreadCpuState::A64(expected) = expected else {
+            unreachable!()
+        };
+        assert_eq!(state, *expected);
+    }
+}
+
+#[test]
+fn simple_scalar_shapes_remain_bounded() {
+    for encoding in [0x9100_0400, 0xaa01_0000, 0x9a81_0000] {
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .lookup
+            .get(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        assert!(region.clif_instructions <= 96, "{encoding:#010x}");
+        assert!(region.native_bytes <= 768, "{encoding:#010x}");
+    }
+}
+
+#[test]
+fn memory_and_system_shapes_remain_bounded() {
+    for encoding in [
+        0xf940_0020, // LDR X0,[X1]
+        0xf900_0023, // STR X3,[X1]
+        0xc8df_fc20, // LDAR X0,[X1]
+        0xc85f_7c20, // LDXR X0,[X1]
+        0xd53b_e020, // MRS X0,CNTVCT_EL0
+        0xd503_3bbf, // DMB ISH
+    ] {
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .lookup
+            .get(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        assert!(region.clif_instructions <= 512, "{encoding:#010x}");
+        assert!(region.native_bytes <= 4096, "{encoding:#010x}");
+    }
+}
+
+#[test]
+fn fp_simd_shapes_remain_bounded_by_family() {
+    let cases = [
+        ("integer-add", 0x4e22_8420_u32, 96, 768),
+        ("bitwise-select", 0x6e62_1c20, 96, 768),
+        ("compare", 0x4e21_34a3, 96, 768),
+        ("min-max", 0x0ebf_6fdf, 96, 768),
+        ("pairwise", 0x4e22_a420, 96, 768),
+        ("permute", 0x4e02_1823, 96, 768),
+        ("extract", 0x6e02_4023, 96, 768),
+        ("narrow", 0x0f0c_8400, 96, 768),
+        ("immediate-shift", 0x2f0f_0420, 96, 768),
+        ("shift-left-long", 0x0f20_a7fe, 96, 768),
+        ("register-shift", 0x0e22_4420, 128, 1280),
+        ("reduction", 0x4e31_b862, 96, 768),
+        ("exact-fp", 0x1e62_2820, 144, 1024),
+        ("quadword-memory", 0x3dc0_0020, 192, 1280),
+    ];
+    for (family, encoding, clif_limit, native_limit) in cases {
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .lookup
+            .get(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        assert!(
+            region.clif_instructions <= clif_limit,
+            "{family}: {} CLIF instructions exceed {clif_limit}",
+            region.clif_instructions
+        );
+        assert!(
+            region.native_bytes <= native_limit,
+            "{family}: {} native bytes exceed {native_limit}",
+            region.native_bytes
+        );
+    }
+}
+
+fn cpu() -> ProcessCpuContext {
+    ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE)
+}
+
+fn location(pc: u64) -> LocationDescriptor {
+    location_for(cpu(), pc)
+}
+
+fn location_for(cpu: ProcessCpuContext, pc: u64) -> LocationDescriptor {
+    LocationDescriptor::new(
+        GuestVirtualAddress::new(pc),
+        ExecutionState::A64,
+        cpu.profile().id(),
+    )
+}
+
+fn rich_state() -> A64State {
+    let mut state = state(CODE, 0x8000_0000_0000_0001);
+    write_register(&mut state, 1, 0xfedc_ba98_7654_3210);
+    write_register(&mut state, 2, 3);
+    write_register(&mut state, 3, 0x1234_5678_9abc_def0);
+    write_register(&mut state, 30, CODE);
+    state.write_x(A64Register::StackPointer, 0x7fff_0000);
+    state.set_nzcv(Nzcv::from_bits(Nzcv::Z | Nzcv::C));
+    state
+}
+
+fn write_register(state: &mut A64State, index: u8, value: u64) {
+    state.write_x(
+        A64Register::General(A64GeneralRegister::new(index).unwrap()),
+        value,
+    );
+}
+
+fn assert_matches_interpreter(encoding: u32, initial: A64State) {
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    assert_eq!(
+        execute_one(&cpu().profile(), &mut expected, encoding.into()).unwrap(),
+        InstructionStep::Continue,
+        "{encoding:#010x}"
+    );
+
+    let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let mut actual = initial;
+    JitThread::new()
+        .run(&process, &memory, &mut actual, 1)
+        .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected, "{encoding:#010x}");
+}
+
+fn assert_control_matches_interpreter(encoding: u32, initial: A64State) {
+    let mut expected = ThreadCpuState::A64(Box::new(initial.clone()));
+    assert_eq!(
+        execute_one(&cpu().profile(), &mut expected, encoding.into()).unwrap(),
+        InstructionStep::Continue,
+        "{encoding:#010x}"
+    );
+    let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+    let process = JitProcess::new(cpu()).unwrap();
+    let mut actual = initial;
+    JitThread::new()
+        .run(&process, &memory, &mut actual, 1)
+        .unwrap_or_else(|error| panic!("{encoding:#010x}: {error}"));
+    let ThreadCpuState::A64(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(actual, *expected, "{encoding:#010x}");
+}
+
+fn memory_word(memory: &SyntheticMemory, offset: u64) -> u32 {
+    let fetched = nixe_cpu::memory::InstructionMemory::fetch32(
+        memory,
+        SPACE,
+        GuestVirtualAddress::new(CODE + offset),
+    )
+    .unwrap();
+    fetched.bits
+}
+
+fn state(pc: u64, x0: u64) -> A64State {
+    let mut state = A64State::default();
+    state.set_pc(pc);
+    state.write_x(
+        A64Register::General(A64GeneralRegister::new(0).unwrap()),
+        x0,
+    );
+    state
+}
+
+fn read_x0(state: &A64State) -> u64 {
+    state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap()))
+}
+
+fn memory(words: &[(u64, u32)]) -> SyntheticMemory {
+    let mut memory = SyntheticMemory::new();
+    let page = GuestPhysicalPageId::new(1);
+    assert!(memory.add_ram_page(page));
+    for &(offset, encoding) in words {
+        assert!(memory.initialize_ram(page, offset as usize, &encoding.to_le_bytes()));
+    }
+    assert!(memory.map_page(
+        SPACE,
+        GuestVirtualAddress::new(CODE),
+        page,
+        MemoryPermissions::READ_EXECUTE,
+    ));
+    memory
+}
+
+fn add_x0(immediate: u16) -> u32 {
+    0x9100_0000 | (u32::from(immediate) << 10)
+}
+
+fn branch(source: u64, target: u64) -> u32 {
+    direct_branch(0x1400_0000, source, target)
+}
+
+fn branch_link(source: u64, target: u64) -> u32 {
+    direct_branch(0x9400_0000, source, target)
+}
+
+fn direct_branch(base: u32, source: u64, target: u64) -> u32 {
+    let displacement = target.wrapping_sub(source) as i64;
+    base | (((displacement >> 2) as u32) & 0x03ff_ffff)
+}
+
+fn conditional_branch(source: u64, target: u64, condition: u8) -> u32 {
+    let displacement = target.wrapping_sub(source) as i64;
+    0x5400_0000 | ((((displacement >> 2) as u32) & 0x7ffff) << 5) | u32::from(condition)
+}
+
+fn compare_branch(source: u64, target: u64, register: u8, nonzero: bool) -> u32 {
+    let displacement = target.wrapping_sub(source) as i64;
+    0x3400_0000
+        | (u32::from(nonzero) << 24)
+        | ((((displacement >> 2) as u32) & 0x7ffff) << 5)
+        | u32::from(register)
+}
+
+fn breakpoint(immediate: u16) -> u32 {
+    0xd420_0000 | (u32::from(immediate) << 5)
+}

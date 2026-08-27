@@ -168,20 +168,13 @@ impl RuntimeCoordinator {
             .processes
             .get(&lease.process)
             .expect("the dispatched process remains registered");
-        let executor = WorkerExecutorKey {
+        let cpu_thread = WorkerCpuThreadKey {
             process: lease.process,
-            domain: process.engine_domain_id(),
+            cpu_process: process.cpu_process_id(),
         };
-        let fallback = process
-            .fallback_engine_domain_id()
-            .map(|domain| WorkerExecutorKey {
-                process: lease.process,
-                domain,
-            });
         if let Err(failure) = self.workers.dispatch(WorkerRequest {
             lease,
-            executor,
-            fallback,
+            cpu_thread,
             execution,
         }) {
             self.processes

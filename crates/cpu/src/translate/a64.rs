@@ -61,8 +61,8 @@ fn lift_inner(
         A64Instruction::Integer(instruction) => integer::lift(builder, decoded, instruction)?,
         A64Instruction::Memory(instruction) => memory::lift(builder, decoded, instruction)?,
         A64Instruction::FpSimd(instruction) => fp_simd::lift(builder, decoded, instruction)?,
-        A64Instruction::RecognizedFallback { .. } => {
-            LiftOutcome::Interpret(decoded.instruction.coverage_id())
+        A64Instruction::RecognizedUnsupported { .. } => {
+            LiftOutcome::Unsupported(decoded.instruction.coverage_id())
         }
     };
     Ok(outcome)
@@ -512,9 +512,9 @@ mod tests {
         ));
 
         // The same architectural write is visible before a deterministic
-        // unsupported boundary for a hint implemented by neither engine.
-        let fallback = translate(&[0xf100_0400, 0xd503_20df]);
-        assert!(fallback.operations.iter().any(|operation| matches!(
+        // unsupported boundary for a hint implemented by neither backend.
+        let unsupported = translate(&[0xf100_0400, 0xd503_20df]);
+        assert!(unsupported.operations.iter().any(|operation| matches!(
             operation.kind,
             OperationKind::WriteFlags {
                 state: FlagState::A64Nzcv,
@@ -522,7 +522,7 @@ mod tests {
             }
         )));
         assert!(matches!(
-            fallback.terminator,
+            unsupported.terminator,
             Terminator::UnsupportedInstruction { .. }
         ));
 

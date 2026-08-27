@@ -301,7 +301,7 @@ impl LaunchPlan {
         &self.kind
     }
     /// Returns the architectural execution state selected by immutable launch
-    /// metadata before an engine provider is chosen.
+    /// metadata before the CPU backend is constructed.
     pub fn initial_execution_state(&self) -> ExecutionState {
         match &self.kind {
             LaunchKind::Packaged(identity) if identity.npdm().flags().is_64_bit_instruction() => {

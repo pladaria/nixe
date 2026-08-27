@@ -1,7 +1,13 @@
 # Native Code Execution Platform Feasibility
 
-Status: design record
+Status: superseded design record
 Revision: 2026-08-11
+Superseded: 2026-08-27 by the
+[CPU Architecture Simplification Plan](../notes/CPU%20Architecture%20Simplification%20Plan.md).
+
+This note records why the hypothetical NCE providers were considered. Its
+provider/domain/executor contracts are not an active implementation target and
+must not be used to retain generic NCE scaffolding during the CPU replacement.
 
 This note records integration seams, not provider commitments. Nixe must probe
 each facility at runtime and expose an unavailable engine with a typed reason.

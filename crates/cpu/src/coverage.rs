@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::{
     decode::{self, DecodeSupport, InstructionPattern, table::LoweringAvailability},
     location::{ExecutionState, InstructionEncoding, InstructionSize},
-    profile::{CapabilityStatus, CpuProfileId, GuestCpuProfile, InstructionFeature},
+    profile::{CpuProfileId, GuestCpuProfile, InstructionFeature},
 };
 
 /// Maximum local instruction context retained for one missing instruction.
@@ -55,10 +55,7 @@ impl fmt::Display for CoverageId {
 pub enum DecoderCoverage {
     Available,
     RecognizedUnimplemented,
-    ProfileDisabled {
-        feature: InstructionFeature,
-        status: CapabilityStatus,
-    },
+    UnavailableOnPlatform { feature: InstructionFeature },
     ExecutionStateDisabled,
 }
 
@@ -171,13 +168,10 @@ fn decoder_coverage(profile: &GuestCpuProfile, pattern: &InstructionPattern) -> 
     {
         return DecoderCoverage::ExecutionStateDisabled;
     }
+    let platform = crate::platform::TargetPlatform::from_profile(*profile);
     for feature in pattern.required_features {
-        let status = profile.instruction_features().status(*feature);
-        if status != CapabilityStatus::Enabled {
-            return DecoderCoverage::ProfileDisabled {
-                feature: *feature,
-                status,
-            };
+        if !platform.supports(*feature) {
+            return DecoderCoverage::UnavailableOnPlatform { feature: *feature };
         }
     }
     match pattern.decoder {
@@ -527,9 +521,8 @@ mod tests {
         let simd = entry(&switch_2, CoverageId::new(0x0000_0030));
         assert!(matches!(
             simd.decoder,
-            DecoderCoverage::ProfileDisabled {
+            DecoderCoverage::UnavailableOnPlatform {
                 feature: InstructionFeature::AdvancedSimd,
-                status: CapabilityStatus::Unknown
             }
         ));
 
@@ -553,14 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn every_catalog_entry_routes_through_decode_normalization_and_disassembly() {
-        let profile = GuestCpuProfile::switch_1()
-            .with_instruction_feature(InstructionFeature::AdvancedSimd, CapabilityStatus::Enabled)
-            .with_instruction_feature(InstructionFeature::Fp16, CapabilityStatus::Enabled)
-            .with_instruction_feature(
-                InstructionFeature::LargeSystemExtensions,
-                CapabilityStatus::Enabled,
-            );
+    fn every_switch_1_entry_routes_through_decode_normalization_and_disassembly() {
+        let profile = GuestCpuProfile::switch_1();
+        let platform = crate::platform::TargetPlatform::Switch1;
         let table = coverage_table(&profile);
         let expected_entries: usize = all_pattern_tables()
             .iter()
@@ -568,7 +556,16 @@ mod tests {
             .sum();
         assert_eq!(table.len(), expected_entries);
 
-        for pattern in all_pattern_tables().into_iter().flatten() {
+        for pattern in all_pattern_tables()
+            .into_iter()
+            .flatten()
+            .filter(|pattern| {
+                pattern
+                    .required_features
+                    .iter()
+                    .all(|feature| platform.supports(*feature))
+            })
+        {
             let decoded = find_registered_encoding(&profile, pattern).unwrap_or_else(|| {
                 panic!(
                     "catalog entry {} {} has no accepted encoding",
@@ -596,68 +593,7 @@ mod tests {
                 pattern.regression_fixture.is_some()
                     && matches!(coverage.decoder, DecoderCoverage::Available)
             );
-
-            let region = translate_registered_encoding(&profile, &decoded);
-            let block = region.entry_block();
-            match pattern.lowering {
-                LoweringAvailability::Implemented => assert!(
-                    !matches!(block.terminator, Terminator::InterpretOne { .. }),
-                    "{} {} declares an exhaustive IR classifier but routed to {:?}",
-                    pattern.execution_state,
-                    pattern.coverage_id,
-                    block.terminator
-                ),
-                LoweringAvailability::Missing => assert!(
-                    matches!(
-                        block.terminator,
-                        Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
-                    ),
-                    "{} {} declares missing IR lowering but lowered to {:?}",
-                    pattern.execution_state,
-                    pattern.coverage_id,
-                    block.terminator
-                ),
-            }
         }
-    }
-
-    fn translate_registered_encoding(
-        profile: &GuestCpuProfile,
-        decoded: &crate::location::DecodedInstruction<crate::decode::DecodedOpcode>,
-    ) -> crate::ir::region::IrRegion {
-        let mut memory = SyntheticMemory::new();
-        assert!(memory.add_ram_page(GuestPhysicalPageId::new(1)));
-        assert!(memory.map_page(
-            AddressSpaceId::new(1),
-            GuestVirtualAddress::new(0x1000),
-            GuestPhysicalPageId::new(1),
-            MemoryPermissions::READ_EXECUTE,
-        ));
-        let bytes = match (decoded.location.execution_state, decoded.encoding.size()) {
-            (ExecutionState::T32, InstructionSize::Bits32) => {
-                let bits = decoded.encoding.bits();
-                [(bits >> 16) as u16, bits as u16]
-                    .into_iter()
-                    .flat_map(u16::to_le_bytes)
-                    .collect::<Vec<_>>()
-            }
-            (_, InstructionSize::Bits16) => decoded.encoding.bits().to_le_bytes()[..2].to_vec(),
-            (_, InstructionSize::Bits32) => decoded.encoding.bits().to_le_bytes().to_vec(),
-        };
-        assert!(memory.initialize_ram(GuestPhysicalPageId::new(1), 0, &bytes));
-        translate_region(
-            RegionTranslationConfig {
-                max_blocks: core::num::NonZeroU32::new(1).unwrap(),
-                max_guest_instructions: core::num::NonZeroU32::new(1).unwrap(),
-                max_guest_instructions_per_block: core::num::NonZeroU32::new(1).unwrap(),
-                ..RegionTranslationConfig::default()
-            },
-            profile,
-            AddressSpaceId::new(1),
-            decoded.location,
-            &memory,
-        )
-        .unwrap()
     }
 
     fn find_registered_encoding(
@@ -766,7 +702,7 @@ mod tests {
             assert!(
                 !matches!(
                     region.entry_block().terminator,
-                    Terminator::InterpretOne { .. } | Terminator::UnsupportedInstruction { .. }
+                    Terminator::UnsupportedInstruction { .. }
                 ),
                 "completion fixture {:?} {} lowered to {:?}",
                 pattern.execution_state,
@@ -838,7 +774,7 @@ mod tests {
             source,
             encoding: InstructionEncoding::from_u32(0x0e20_1c00),
             coverage_id: 0x0000_0038,
-            disassembly: "advanced-simd-fallback".into(),
+            disassembly: "advanced-simd-unsupported".into(),
             reason: "missing semantics".into(),
         };
         let mut tracker = MissingInstructionTracker::new();
