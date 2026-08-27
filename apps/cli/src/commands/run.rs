@@ -173,6 +173,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         machine_profile.cpu(),
         plan.initial_execution_state(),
         machine_profile.scheduler().vcpus().len(),
+        &title.name,
     )?;
     let selected_engine = primary.descriptor();
     let trace_interpreter =
@@ -324,6 +325,7 @@ fn select_cpu_engines(
     profile: nixe_cpu::profile::GuestCpuProfile,
     execution_state: nixe_cpu::location::ExecutionState,
     vcpu_count: usize,
+    title_name: &str,
 ) -> Result<SelectedCpuEngines, String> {
     let jit_configuration = JitConfiguration::new(
         configuration.jit.max_cached_regions,
@@ -332,7 +334,8 @@ fn select_cpu_engines(
     )
     .map_err(|error| format!("invalid JIT resource configuration: {error}"))?
     .with_dump_directory(configuration.jit.dump_directory.clone())
-    .with_performance_report_directory(configuration.jit.performance_report_directory.clone());
+    .with_performance_report_directory(configuration.jit.performance_report_directory.clone())
+    .with_performance_report_title(title_name);
     let interpreter: Arc<dyn EngineProvider> = Arc::new(InterpreterProvider);
     let jit: Arc<dyn EngineProvider> = Arc::new(JitProvider::with_configuration(jit_configuration));
     let registry = EngineRegistry::new([Arc::clone(&jit), Arc::clone(&interpreter)]);
@@ -432,6 +435,7 @@ mod engine_selection_tests {
             profile.cpu(),
             nixe_cpu::location::ExecutionState::A64,
             profile.scheduler().vcpus().len(),
+            "test-title",
         )
         .unwrap();
         assert_eq!(interpreter.primary.descriptor().id, INTERPRETER_ENGINE_ID);
@@ -442,6 +446,7 @@ mod engine_selection_tests {
             profile.cpu(),
             nixe_cpu::location::ExecutionState::A64,
             profile.scheduler().vcpus().len(),
+            "test-title",
         )
         .unwrap();
         let primary = auto.primary.descriptor();
@@ -476,14 +481,12 @@ mod engine_selection_tests {
             profile.cpu(),
             nixe_cpu::location::ExecutionState::A64,
             profile.scheduler().vcpus().len(),
+            "test-title",
         );
         match explicit_jit {
             Ok(selection) => {
                 assert_eq!(selection.primary.descriptor().id, JIT_ENGINE_ID);
-                assert_eq!(
-                    selection.fallback.unwrap().descriptor().id,
-                    INTERPRETER_ENGINE_ID
-                );
+                assert!(selection.fallback.is_none());
             }
             Err(error) => assert!(error.contains("cranelift-jit"), "{error}"),
         }

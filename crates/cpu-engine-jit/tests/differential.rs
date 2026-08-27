@@ -339,6 +339,110 @@ fn a64_lazy_arithmetic_flags_match_reference_edge_cases() {
     }
 }
 
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn a64_typed_scalar_ir_matches_reference_edge_cases() {
+    // Representative encodings cover extended/shifted operands, every bitfield
+    // canonical form, EXTR, Arm division policy, variable shifts, transformed
+    // selects, multiply families, unary bit operations, TBZ/TBNZ, MOVK, ADR,
+    // and ADRP. See Arm ARM DDI 0602, Base Instructions.
+    let instructions = [
+        0x8b25_c883, // add x3,x4,w5,sxtw #2
+        0x8b05_1c83, // add x3,x4,x5,lsl #7
+        0x8ae5_2483, // bic x3,x4,x5,ror #9
+        0x9347_5c83, // sbfx x3,x4,#7,#17
+        0x9377_1c83, // sbfiz x3,x4,#9,#8
+        0xb347_5c83, // bfxil x3,x4,#7,#17
+        0xb377_1c83, // bfi x3,x4,#9,#8
+        0xd347_5c83, // ubfx x3,x4,#7,#17
+        0xd377_1c83, // ubfiz x3,x4,#9,#8
+        0x93c5_4483, // extr x3,x4,x5,#17
+        0x9ac5_0883, // udiv x3,x4,x5
+        0x9ac5_0c83, // sdiv x3,x4,x5
+        0x9ac5_2083, // lslv x3,x4,x5
+        0x9ac5_2483, // lsrv x3,x4,x5
+        0x9ac5_2883, // asrv x3,x4,x5
+        0x9ac5_2c83, // rorv x3,x4,x5
+        0x9a85_0083, // csel x3,x4,x5,eq
+        0x9a85_0483, // csinc x3,x4,x5,eq
+        0xda85_0083, // csinv x3,x4,x5,eq
+        0xda85_0483, // csneg x3,x4,x5,eq
+        0x9b05_1883, // madd x3,x4,x5,x6
+        0x9b05_9883, // msub x3,x4,x5,x6
+        0x9b25_1883, // smaddl x3,w4,w5,x6
+        0x9b25_9883, // smsubl x3,w4,w5,x6
+        0x9ba5_1883, // umaddl x3,w4,w5,x6
+        0x9ba5_9883, // umsubl x3,w4,w5,x6
+        0x9b45_7c83, // smulh x3,x4,x5
+        0x9bc5_7c83, // umulh x3,x4,x5
+        0xdac0_0083, // rbit x3,x4
+        0xdac0_0483, // rev16 x3,x4
+        0xdac0_0883, // rev32 x3,x4
+        0xdac0_0c83, // rev x3,x4
+        0xdac0_1083, // clz x3,x4
+        0xdac0_1483, // cls x3,x4
+        0xb6f8_0004, // tbz x4,#63,.
+        0x3738_0004, // tbnz w4,#7,.
+        0xf2d5_79a3, // movk x3,#0xabcd,lsl #32
+        0x1000_0003, // adr x3,.
+        0x9000_0003, // adrp x3,.
+        0x93c4_4483, // ror x3,x4,#17 (EXTR alias)
+        0x93c5_0083, // extr x3,x4,x5,#0
+        0x1ac5_0883, // udiv w3,w4,w5
+        0x1ac5_0c83, // sdiv w3,w4,w5
+        0x1ac5_2083, // lslv w3,w4,w5
+        0x1ac5_2483, // lsrv w3,w4,w5
+        0x1ac5_2883, // asrv w3,w4,w5
+        0x1ac5_2c83, // rorv w3,w4,w5
+        0x1b05_1883, // madd w3,w4,w5,w6
+        0x1b05_9883, // msub w3,w4,w5,w6
+        0x5ac0_0083, // rbit w3,w4
+        0x5ac0_0483, // rev16 w3,w4
+        0x5ac0_0883, // rev w3,w4
+        0x5ac0_1083, // clz w3,w4
+        0x5ac0_1483, // cls w3,w4
+    ];
+    let operands = [
+        (0_u64, 0_u64, 0_u64, 0_u32),
+        (u64::MAX, 0, 1, Nzcv::Z),
+        (i64::MIN as u64, u64::MAX, 0x0123_4567_89ab_cdef, 0),
+        (0x0123_4567_89ab_cdef, 65, 0xfedc_ba98_7654_3210, Nzcv::Z),
+    ];
+    let mut interpreter = EngineHarness::new(&InterpreterProvider, 0x70, 0x70);
+    let mut jit = EngineHarness::new(&JitProvider::new(), 0x71, 0x71);
+
+    for (instruction_index, encoding) in instructions.into_iter().enumerate() {
+        for (operand_index, (lhs, rhs, addend, flags)) in operands.into_iter().enumerate() {
+            let code_page = GuestPhysicalPageId::new(
+                0x32_0000 + (instruction_index * operands.len() + operand_index) as u64,
+            );
+            let memory = raw_a64_memory(encoding, code_page);
+            let mut initial = A64State::default();
+            initial.set_pc(CODE.get());
+            for (index, value) in [(3, 0xa5a5_5a5a_a5a5_5a5a), (4, lhs), (5, rhs), (6, addend)] {
+                initial.write_x(
+                    A64Register::General(A64GeneralRegister::new(index).unwrap()),
+                    value,
+                );
+            }
+            initial.set_nzcv(Nzcv::from_bits(flags));
+            let mut interpreter_state = ThreadCpuState::A64(Box::new(initial.clone()));
+            let mut jit_state = ThreadCpuState::A64(Box::new(initial));
+
+            let interpreter_report = interpreter.run(&memory, &mut interpreter_state).unwrap();
+            let jit_report = jit.run(&memory, &mut jit_state).unwrap();
+            assert_eq!(
+                jit_report, interpreter_report,
+                "encoding {encoding:#010x}, operand set {operand_index}"
+            );
+            assert_eq!(
+                jit_state, interpreter_state,
+                "encoding {encoding:#010x}, operand set {operand_index}"
+            );
+        }
+    }
+}
+
 fn raw_a64_memory(encoding: u32, code_page: GuestPhysicalPageId) -> SyntheticMemory {
     let mut memory = SyntheticMemory::new();
     assert!(memory.add_ram_page(code_page));

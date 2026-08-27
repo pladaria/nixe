@@ -83,20 +83,17 @@ fn lift_move_wide(
                 width,
                 Register31::Zero,
             )?;
-            let mask = !(0xffff_u64 << shift);
-            let retained = binary(
+            scalar(
                 builder,
                 decoded.location,
-                IntegerBinaryKind::And,
-                old,
-                immediate_for(width, mask).into(),
-            )?;
-            binary(
-                builder,
-                decoded.location,
-                IntegerBinaryKind::Or,
-                retained,
-                immediate_for(width, imm).into(),
+                width,
+                ScalarOperation::InsertBits {
+                    destination: old,
+                    source: immediate_for(width, u64::from(fields.immediate_16)).into(),
+                    source_lsb: 0,
+                    destination_lsb: shift as u8,
+                    width: 16,
+                },
             )?
         }
         _ => return Ok(unsupported(decoded)),
@@ -256,10 +253,10 @@ fn shifted_register(
             builder,
             source,
             width,
-            ScalarOperation::Shift {
+            ScalarOperation::ShiftImmediate {
                 kind,
                 value,
-                amount: immediate_for(width, u64::from(amount)).into(),
+                amount: amount as u8,
             },
         )?))
     }
@@ -316,19 +313,61 @@ fn lift_add_sub_extended(
         width,
         Register31::Zero,
     )?;
-    let extension = (u32::from(fields.extension)) as u64;
-    let result = helper(
-        builder,
-        decoded.location,
-        "a64.extend-register",
-        vec![
-            rm,
-            Immediate::I8(extension as u8).into(),
-            Immediate::I8(shift as u8).into(),
-        ],
-        &[width],
-        OperationEffects::default(),
-    )?[0];
+    let extension = u32::from(fields.extension);
+    let source_width = match extension & 3 {
+        0 => IrType::I8,
+        1 => IrType::I16,
+        2 => IrType::I32,
+        3 => IrType::I64,
+        _ => unreachable!(),
+    };
+    let narrowed = if source_width.bit_width() < width.bit_width() {
+        scalar(
+            builder,
+            decoded.location,
+            source_width,
+            ScalarOperation::Truncate {
+                value: rm,
+                to: source_width,
+            },
+        )?
+    } else {
+        rm
+    };
+    let extended = if source_width.bit_width() < width.bit_width() {
+        scalar(
+            builder,
+            decoded.location,
+            width,
+            if extension & 4 == 0 {
+                ScalarOperation::ZeroExtend {
+                    value: narrowed,
+                    to: width,
+                }
+            } else {
+                ScalarOperation::SignExtend {
+                    value: narrowed,
+                    to: width,
+                }
+            },
+        )?
+    } else {
+        narrowed
+    };
+    let result = if shift == 0 {
+        extended
+    } else {
+        scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ShiftImmediate {
+                kind: ShiftKind::LogicalLeft,
+                value: extended,
+                amount: shift as u8,
+            },
+        )?
+    };
     let lhs = read_gpr(
         builder,
         decoded.location,
@@ -341,7 +380,7 @@ fn lift_add_sub_extended(
         builder,
         decoded.location,
         lhs,
-        result.into(),
+        result,
         AddSubSpec {
             subtract: fields.subtract,
             set_flags,
@@ -538,12 +577,11 @@ fn lift_logical_shifted(
         return Ok(unsupported(decoded));
     };
     if fields.invert {
-        rhs = binary(
+        rhs = scalar(
             builder,
             decoded.location,
-            IntegerBinaryKind::Xor,
-            rhs,
-            immediate_for(width, u64::MAX).into(),
+            width,
+            ScalarOperation::Not { value: rhs },
         )?;
     }
     let lhs = read_gpr(
@@ -579,7 +617,10 @@ fn lift_bitfield(
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let n = fields.n;
-    if n != (width == IrType::I64) || (width == IrType::I32 && fields.subtract_product) {
+    let bits = width.bit_width().expect("A64 integer width is fixed") as u8;
+    let imm_r = fields.immediate_6_high;
+    let imm_s = u32::from(fields.shift_amount) as u8;
+    if n != (width == IrType::I64) || imm_r >= bits || imm_s >= bits {
         return Ok(unsupported(decoded));
     }
     let opc = u32::from((fields.subtract as u8) * 2 + fields.set_flags as u8);
@@ -593,37 +634,85 @@ fn lift_bitfield(
         width,
         Register31::Zero,
     )?;
-    let destination = read_gpr(
-        builder,
-        decoded.location,
-        fields.rd,
-        width,
-        Register31::Zero,
-    )?;
-    let name = match opc {
-        0 => "a64.sbfm",
-        1 => "a64.bfm",
-        2 => "a64.ubfm",
+    let value = match (opc, imm_r <= imm_s) {
+        (0, true) => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ExtractBits {
+                value: source_value,
+                lsb: imm_r,
+                width: imm_s - imm_r + 1,
+                signed: true,
+            },
+        )?,
+        (0, false) => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::SignedInsertBits {
+                source: source_value,
+                destination_lsb: bits - imm_r,
+                width: imm_s + 1,
+            },
+        )?,
+        (1, true) if imm_r == 0 && imm_s + 1 == bits => source_value,
+        (1, non_wrapping) => {
+            let destination = read_gpr(
+                builder,
+                decoded.location,
+                fields.rd,
+                width,
+                Register31::Zero,
+            )?;
+            let (source_lsb, destination_lsb, field_width) = if non_wrapping {
+                (imm_r, 0, imm_s - imm_r + 1)
+            } else {
+                (0, bits - imm_r, imm_s + 1)
+            };
+            scalar(
+                builder,
+                decoded.location,
+                width,
+                ScalarOperation::InsertBits {
+                    destination,
+                    source: source_value,
+                    source_lsb,
+                    destination_lsb,
+                    width: field_width,
+                },
+            )?
+        }
+        (2, true) => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ExtractBits {
+                value: source_value,
+                lsb: imm_r,
+                width: imm_s - imm_r + 1,
+                signed: false,
+            },
+        )?,
+        (2, false) => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::InsertBits {
+                destination: immediate_for(width, 0).into(),
+                source: source_value,
+                source_lsb: 0,
+                destination_lsb: bits - imm_r,
+                width: imm_s + 1,
+            },
+        )?,
         _ => unreachable!(),
     };
-    let value = helper(
-        builder,
-        decoded.location,
-        name,
-        vec![
-            destination,
-            source_value,
-            Immediate::I8(fields.immediate_6_high).into(),
-            Immediate::I8((u32::from(fields.shift_amount)) as u8).into(),
-        ],
-        &[width],
-        OperationEffects::default(),
-    )?[0];
     write_gpr(
         builder,
         decoded.location,
         fields.rd,
-        value.into(),
+        value,
         Register31::Zero,
     )?;
     Ok(LiftOutcome::Continue)
@@ -639,13 +728,6 @@ fn lift_extract(
     if (fields.n) != (width == IrType::I64) || (width == IrType::I32 && lsb >= 32) {
         return Ok(unsupported(decoded));
     }
-    let first = read_gpr(
-        builder,
-        decoded.location,
-        fields.rn,
-        width,
-        Register31::Zero,
-    )?;
     let second = read_gpr(
         builder,
         decoded.location,
@@ -653,19 +735,43 @@ fn lift_extract(
         width,
         Register31::Zero,
     )?;
-    let value = helper(
-        builder,
-        decoded.location,
-        "a64.extr",
-        vec![first, second, Immediate::I8(lsb as u8).into()],
-        &[width],
-        OperationEffects::default(),
-    )?[0];
+    let value = if lsb == 0 {
+        second
+    } else if fields.rn == fields.rm {
+        scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ShiftImmediate {
+                kind: ShiftKind::RotateRight,
+                value: second,
+                amount: lsb as u8,
+            },
+        )?
+    } else {
+        let first = read_gpr(
+            builder,
+            decoded.location,
+            fields.rn,
+            width,
+            Register31::Zero,
+        )?;
+        scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ExtractConcat {
+                high: first,
+                low: second,
+                lsb: lsb as u8,
+            },
+        )?
+    };
     write_gpr(
         builder,
         decoded.location,
         fields.rd,
-        value.into(),
+        value,
         Register31::Zero,
     )?;
     Ok(LiftOutcome::Continue)
@@ -685,49 +791,40 @@ fn lift_two_source(
         width,
         Register31::Zero,
     )?;
-    let mut rhs = read_gpr(
+    let rhs = read_gpr(
         builder,
         decoded.location,
         fields.rm,
         width,
         Register31::Zero,
     )?;
-    if matches!(opcode, 8..=11) {
-        rhs = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::And,
-            rhs,
-            immediate_for(width, if width == IrType::I64 { 63 } else { 31 }).into(),
-        )?;
-    }
     let operation = match opcode {
-        2 => ScalarOperation::Binary {
-            kind: IntegerBinaryKind::UnsignedDivide,
+        2 => ScalarOperation::Divide {
+            signedness: IntegerSignedness::Unsigned,
             lhs,
             rhs,
         },
-        3 => ScalarOperation::Binary {
-            kind: IntegerBinaryKind::SignedDivide,
+        3 => ScalarOperation::Divide {
+            signedness: IntegerSignedness::Signed,
             lhs,
             rhs,
         },
-        8 => ScalarOperation::Shift {
+        8 => ScalarOperation::ShiftMasked {
             kind: ShiftKind::LogicalLeft,
             value: lhs,
             amount: rhs,
         },
-        9 => ScalarOperation::Shift {
+        9 => ScalarOperation::ShiftMasked {
             kind: ShiftKind::LogicalRight,
             value: lhs,
             amount: rhs,
         },
-        10 => ScalarOperation::Shift {
+        10 => ScalarOperation::ShiftMasked {
             kind: ShiftKind::ArithmeticRight,
             value: lhs,
             amount: rhs,
         },
-        11 => ScalarOperation::Shift {
+        11 => ScalarOperation::ShiftMasked {
             kind: ShiftKind::RotateRight,
             value: lhs,
             amount: rhs,
@@ -839,48 +936,44 @@ fn lift_conditional_select(
         width,
         Register31::Zero,
     )?;
-    let mut false_value = read_gpr(
+    let false_value = read_gpr(
         builder,
         decoded.location,
         fields.rm,
         width,
         Register31::Zero,
     )?;
-    let op = fields.subtract;
-    let op2 = fields.bit10;
-    if op {
-        false_value = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Xor,
-            false_value,
-            immediate_for(width, u64::MAX).into(),
-        )?;
-    }
-    if op2 {
-        false_value = binary(
-            builder,
-            decoded.location,
-            IntegerBinaryKind::Add,
-            false_value,
-            immediate_for(width, 1).into(),
-        )?;
-    }
     let cond = evaluate_condition(
         builder,
         decoded.location,
         Condition::from_encoding(fields.condition),
     )?;
-    let result = scalar(
-        builder,
-        decoded.location,
-        width,
-        ScalarOperation::Select {
+    let operation = match (fields.subtract, fields.bit10) {
+        (false, false) => ScalarOperation::Select {
             condition: cond,
             when_true: true_value,
             when_false: false_value,
         },
-    )?;
+        (false, true) => ScalarOperation::SelectTransformed {
+            condition: cond,
+            when_true: true_value,
+            when_false: false_value,
+            transform: SelectTransform::Increment,
+        },
+        (true, false) => ScalarOperation::SelectTransformed {
+            condition: cond,
+            when_true: true_value,
+            when_false: false_value,
+            transform: SelectTransform::Invert,
+        },
+        (true, true) => ScalarOperation::SelectTransformed {
+            condition: cond,
+            when_true: true_value,
+            when_false: false_value,
+            transform: SelectTransform::Negate,
+        },
+    };
+    let result = scalar(builder, decoded.location, width, operation)?;
     write_gpr(
         builder,
         decoded.location,
@@ -898,105 +991,107 @@ fn lift_three_source(
 ) -> Result<LiftOutcome, BuildError> {
     let width = integer_width(fields);
     let opcode = u32::from(fields.opcode_3);
-    if opcode != 0 {
-        if matches!(opcode, 2 | 6) && (u32::from(fields.ra)) != 31 {
-            return Ok(unsupported(decoded));
-        }
-        let name = match (opcode, fields.subtract_product) {
-            (1, false) => "a64.smaddl",
-            (1, true) => "a64.smsubl",
-            (2, false) => "a64.smulh",
-            (5, false) => "a64.umaddl",
-            (5, true) => "a64.umsubl",
-            (6, false) => "a64.umulh",
-            _ => return Ok(unsupported(decoded)),
-        };
-        let operand_width = if matches!(opcode, 1 | 5) {
-            IrType::I32
-        } else {
-            IrType::I64
-        };
-        let mut values = vec![
-            read_gpr(
+    let (result_width, operation) = match opcode {
+        0 => {
+            let lhs = read_gpr(
                 builder,
                 decoded.location,
                 fields.rn,
-                operand_width,
+                width,
                 Register31::Zero,
-            )?,
-            read_gpr(
+            )?;
+            let rhs = read_gpr(
                 builder,
                 decoded.location,
                 fields.rm,
-                operand_width,
+                width,
                 Register31::Zero,
-            )?,
-        ];
-        if matches!(opcode, 1 | 5) {
-            values.push(read_gpr(
+            )?;
+            let addend = read_gpr(
+                builder,
+                decoded.location,
+                fields.ra,
+                width,
+                Register31::Zero,
+            )?;
+            (
+                width,
+                ScalarOperation::MultiplyAdd {
+                    lhs,
+                    rhs,
+                    addend,
+                    subtract_product: fields.subtract_product,
+                },
+            )
+        }
+        1 | 5 => {
+            let lhs = read_gpr(
+                builder,
+                decoded.location,
+                fields.rn,
+                IrType::I32,
+                Register31::Zero,
+            )?;
+            let rhs = read_gpr(
+                builder,
+                decoded.location,
+                fields.rm,
+                IrType::I32,
+                Register31::Zero,
+            )?;
+            let addend = read_gpr(
                 builder,
                 decoded.location,
                 fields.ra,
                 IrType::I64,
                 Register31::Zero,
-            )?);
+            )?;
+            (
+                IrType::I64,
+                ScalarOperation::WideningMultiplyAdd {
+                    signedness: if opcode == 1 {
+                        IntegerSignedness::Signed
+                    } else {
+                        IntegerSignedness::Unsigned
+                    },
+                    lhs,
+                    rhs,
+                    addend,
+                    subtract_product: fields.subtract_product,
+                },
+            )
         }
-        let result = helper(
-            builder,
-            decoded.location,
-            name,
-            values,
-            &[IrType::I64],
-            OperationEffects::default(),
-        )?[0];
-        write_gpr(
-            builder,
-            decoded.location,
-            fields.rd,
-            result.into(),
-            Register31::Zero,
-        )?;
-        return Ok(LiftOutcome::Continue);
-    }
-    let lhs = read_gpr(
-        builder,
-        decoded.location,
-        fields.rn,
-        width,
-        Register31::Zero,
-    )?;
-    let rhs = read_gpr(
-        builder,
-        decoded.location,
-        fields.rm,
-        width,
-        Register31::Zero,
-    )?;
-    let addend = read_gpr(
-        builder,
-        decoded.location,
-        fields.ra,
-        width,
-        Register31::Zero,
-    )?;
-    let product = binary(
-        builder,
-        decoded.location,
-        IntegerBinaryKind::Multiply,
-        lhs,
-        rhs,
-    )?;
-    let result = binary(
-        builder,
-        decoded.location,
-        if fields.subtract_product {
-            IntegerBinaryKind::Subtract
-        } else {
-            IntegerBinaryKind::Add
-        },
-        addend,
-        product,
-    )?;
+        2 | 6 if fields.ra == 31 && !fields.subtract_product => {
+            let lhs = read_gpr(
+                builder,
+                decoded.location,
+                fields.rn,
+                IrType::I64,
+                Register31::Zero,
+            )?;
+            let rhs = read_gpr(
+                builder,
+                decoded.location,
+                fields.rm,
+                IrType::I64,
+                Register31::Zero,
+            )?;
+            (
+                IrType::I64,
+                ScalarOperation::MultiplyHigh {
+                    signedness: if opcode == 2 {
+                        IntegerSignedness::Signed
+                    } else {
+                        IntegerSignedness::Unsigned
+                    },
+                    lhs,
+                    rhs,
+                },
+            )
+        }
+        _ => return Ok(unsupported(decoded)),
+    };
+    let result = scalar(builder, decoded.location, result_width, operation)?;
     write_gpr(
         builder,
         decoded.location,
@@ -1028,30 +1123,32 @@ fn lift_one_source(
             width,
             ScalarOperation::ReverseBits { value: input },
         )?,
+        1..=3 => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::ReverseBytes {
+                value: input,
+                container: match opcode {
+                    1 => ByteReverseWidth::Bits16,
+                    2 => ByteReverseWidth::Bits32,
+                    3 => ByteReverseWidth::Full,
+                    _ => unreachable!(),
+                },
+            },
+        )?,
         4 => scalar(
             builder,
             decoded.location,
             width,
             ScalarOperation::CountLeadingZeros { value: input },
         )?,
-        1 | 2 | 3 | 5 => {
-            let name = match opcode {
-                1 => "a64.rev16",
-                2 => "a64.rev32",
-                3 => "a64.rev",
-                5 => "a64.cls",
-                _ => unreachable!(),
-            };
-            helper(
-                builder,
-                decoded.location,
-                name,
-                vec![input],
-                &[width],
-                OperationEffects::default(),
-            )?[0]
-                .into()
-        }
+        5 => scalar(
+            builder,
+            decoded.location,
+            width,
+            ScalarOperation::CountLeadingSignBits { value: input },
+        )?,
         _ => return Ok(unsupported(decoded)),
     };
     write_gpr(
@@ -1077,16 +1174,11 @@ fn lift_adr(
     } else {
         decoded.location.pc.wrapping_offset(immediate)
     };
-    let value = guest_address_to_integer(
-        builder,
-        decoded.location,
-        Immediate::Address(address).into(),
-    )?;
     write_gpr(
         builder,
         decoded.location,
         fields.rd,
-        value,
+        Immediate::I64(address.get()).into(),
         Register31::Zero,
     )?;
     Ok(LiftOutcome::Continue)

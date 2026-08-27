@@ -29,7 +29,7 @@ pub(crate) struct JitPerformanceReport {
 }
 
 impl JitPerformanceReport {
-    pub(crate) fn new(directory: &Path) -> Result<Self, Box<str>> {
+    pub(crate) fn new(directory: &Path, title: &str) -> Result<Self, Box<str>> {
         fs::create_dir_all(directory).map_err(|error| {
             format!(
                 "cannot create JIT performance report directory {}: {error}",
@@ -43,8 +43,9 @@ impl JitPerformanceReport {
             .unwrap_or_default()
             .as_millis();
         let timestamp: DateTime<Utc> = started.into();
+        let title = report_file_stem(title);
         let path = directory.join(format!(
-            "jit-performance-{}-{}.toml",
+            "{title}-{}-{}.toml",
             timestamp.format("%Y%m%dT%H%M%S%.3fZ"),
             std::process::id()
         ));
@@ -213,6 +214,58 @@ impl JitPerformanceReport {
             )
             .into_boxed_str()
         })
+    }
+}
+
+fn report_file_stem(title: &str) -> String {
+    const MAX_CHARACTERS: usize = 80;
+
+    let mut stem = String::new();
+    let mut separator_pending = false;
+    for character in title.trim().chars() {
+        if character.is_alphanumeric() {
+            if separator_pending && !stem.is_empty() {
+                stem.push('-');
+            }
+            separator_pending = false;
+            for lowercase in character.to_lowercase() {
+                stem.push(lowercase);
+            }
+        } else {
+            separator_pending = true;
+        }
+        if stem.chars().count() >= MAX_CHARACTERS {
+            break;
+        }
+    }
+    stem.truncate(
+        stem.char_indices()
+            .nth(MAX_CHARACTERS)
+            .map_or(stem.len(), |(index, _)| index),
+    );
+    while stem.ends_with('-') {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        "nixe".to_owned()
+    } else {
+        stem
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::report_file_stem;
+
+    #[test]
+    fn report_file_stem_is_safe_stable_and_bounded() {
+        assert_eq!(report_file_stem("es2gears"), "es2gears");
+        assert_eq!(
+            report_file_stem("  Super Mario™ Odyssey  "),
+            "super-mario-odyssey"
+        );
+        assert_eq!(report_file_stem("///"), "nixe");
+        assert!(report_file_stem(&"a".repeat(100)).chars().count() <= 80);
     }
 }
 

@@ -463,6 +463,17 @@ fn verify_scalar(
             expect_type(index, carry_in, IrType::I1, "carry input")?;
             expect_results(index, results, &[ty])
         }
+        ScalarOperation::Divide { lhs, rhs, .. }
+        | ScalarOperation::MultiplyHigh { lhs, rhs, .. } => {
+            let ty = same_integer(index, lhs, rhs, "integer operands")?;
+            if matches!(operation, ScalarOperation::MultiplyHigh { .. }) && ty != IrType::I64 {
+                return Err(VerificationError::operation(
+                    index,
+                    "high multiply requires I64 operands",
+                ));
+            }
+            expect_results(index, results, &[ty])
+        }
         ScalarOperation::Compare { lhs, rhs, .. } => {
             same_integer(index, lhs, rhs, "comparison operands")?;
             expect_results(index, results, &[IrType::I1])
@@ -476,12 +487,130 @@ fn verify_scalar(
             expect_type(index, when_false, when_true.ty(), "select false value")?;
             expect_results(index, results, &[when_true.ty()])
         }
+        ScalarOperation::SelectTransformed {
+            condition,
+            when_true,
+            when_false,
+            ..
+        } => {
+            expect_type(index, condition, IrType::I1, "select condition")?;
+            require_integer(index, when_true, "transformed select true value")?;
+            expect_type(index, when_false, when_true.ty(), "select false value")?;
+            expect_results(index, results, &[when_true.ty()])
+        }
         ScalarOperation::Shift { value, amount, .. } => {
             require_integer(index, value, "shift value")?;
             require_integer(index, amount, "shift amount")?;
             expect_results(index, results, &[value.ty()])
         }
-        ScalarOperation::CountLeadingZeros { value } | ScalarOperation::ReverseBits { value } => {
+        ScalarOperation::ShiftImmediate { value, amount, .. } => {
+            require_integer(index, value, "immediate-shift value")?;
+            if u32::from(amount)
+                >= u32::from(value.ty().bit_width().expect("integer type has a width"))
+            {
+                return Err(VerificationError::operation(
+                    index,
+                    "immediate shift amount must be smaller than the value width",
+                ));
+            }
+            expect_results(index, results, &[value.ty()])
+        }
+        ScalarOperation::ShiftMasked { value, amount, .. } => {
+            let ty = same_integer(index, value, amount, "masked-shift operands")?;
+            expect_results(index, results, &[ty])
+        }
+        ScalarOperation::TestBit { value, bit, .. } => {
+            require_integer(index, value, "bit-test value")?;
+            if u32::from(bit)
+                >= u32::from(value.ty().bit_width().expect("integer type has a width"))
+            {
+                return Err(VerificationError::operation(
+                    index,
+                    "tested bit must be within the value width",
+                ));
+            }
+            expect_results(index, results, &[IrType::I1])
+        }
+        ScalarOperation::MultiplyAdd {
+            lhs, rhs, addend, ..
+        } => {
+            let ty = same_integer(index, lhs, rhs, "multiply operands")?;
+            expect_type(index, addend, ty, "multiply addend")?;
+            expect_results(index, results, &[ty])
+        }
+        ScalarOperation::WideningMultiplyAdd {
+            lhs, rhs, addend, ..
+        } => {
+            expect_type(index, lhs, IrType::I32, "widening multiply lhs")?;
+            expect_type(index, rhs, IrType::I32, "widening multiply rhs")?;
+            expect_type(index, addend, IrType::I64, "widening multiply addend")?;
+            expect_results(index, results, &[IrType::I64])
+        }
+        ScalarOperation::ExtractBits {
+            value, lsb, width, ..
+        } => {
+            require_integer(index, value, "bitfield source")?;
+            verify_bit_range(index, value.ty(), lsb, width, "extracted bitfield")?;
+            expect_results(index, results, &[value.ty()])
+        }
+        ScalarOperation::InsertBits {
+            destination,
+            source,
+            source_lsb,
+            destination_lsb,
+            width,
+        } => {
+            let ty = same_integer(index, destination, source, "bitfield operands")?;
+            verify_bit_range(index, ty, source_lsb, width, "source bitfield")?;
+            verify_bit_range(index, ty, destination_lsb, width, "destination bitfield")?;
+            expect_results(index, results, &[ty])
+        }
+        ScalarOperation::SignedInsertBits {
+            source,
+            destination_lsb,
+            width,
+        } => {
+            require_integer(index, source, "signed bitfield source")?;
+            verify_bit_range(
+                index,
+                source.ty(),
+                destination_lsb,
+                width,
+                "signed destination bitfield",
+            )?;
+            expect_results(index, results, &[source.ty()])
+        }
+        ScalarOperation::ExtractConcat { high, low, lsb } => {
+            let ty = same_integer(index, high, low, "concatenated extract operands")?;
+            if u32::from(lsb) >= u32::from(ty.bit_width().expect("integer type has a width")) {
+                return Err(VerificationError::operation(
+                    index,
+                    "concatenated extract offset must be smaller than the operand width",
+                ));
+            }
+            expect_results(index, results, &[ty])
+        }
+        ScalarOperation::ReverseBytes { value, container } => {
+            require_integer(index, value, "byte-reverse value")?;
+            let container_width = match container {
+                super::op::ByteReverseWidth::Bits16 => 16,
+                super::op::ByteReverseWidth::Bits32 => 32,
+                super::op::ByteReverseWidth::Full => {
+                    value.ty().bit_width().expect("integer type has a width")
+                }
+            };
+            if value.ty().bit_width().expect("integer type has a width") % container_width != 0 {
+                return Err(VerificationError::operation(
+                    index,
+                    "byte-reverse container must divide the value width",
+                ));
+            }
+            expect_results(index, results, &[value.ty()])
+        }
+        ScalarOperation::CountLeadingZeros { value }
+        | ScalarOperation::CountLeadingSignBits { value }
+        | ScalarOperation::Not { value }
+        | ScalarOperation::ReverseBits { value } => {
             require_integer(index, value, "bit operation value")?;
             expect_results(index, results, &[value.ty()])
         }
@@ -520,6 +649,25 @@ fn verify_scalar(
             expect_results(index, results, &[to])
         }
     }
+}
+
+fn verify_bit_range(
+    index: usize,
+    ty: IrType,
+    lsb: u8,
+    width: u8,
+    description: &str,
+) -> Result<(), VerificationError> {
+    if width == 0
+        || u32::from(lsb) + u32::from(width)
+            > u32::from(ty.bit_width().expect("integer type has a width"))
+    {
+        return Err(VerificationError::operation(
+            index,
+            format!("{description} must be non-empty and within the operand width"),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_flags(
@@ -1153,7 +1301,9 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
         OperationKind::WriteFlags { flags, .. } => operands.push(*flags),
         OperationKind::Scalar(operation) => match *operation {
             ScalarOperation::Binary { lhs, rhs, .. }
-            | ScalarOperation::Compare { lhs, rhs, .. } => operands.extend([lhs, rhs]),
+            | ScalarOperation::Divide { lhs, rhs, .. }
+            | ScalarOperation::Compare { lhs, rhs, .. }
+            | ScalarOperation::MultiplyHigh { lhs, rhs, .. } => operands.extend([lhs, rhs]),
             ScalarOperation::AddCarry {
                 lhs, rhs, carry_in, ..
             }
@@ -1164,10 +1314,38 @@ fn operands(kind: &OperationKind) -> Vec<Operand> {
                 condition,
                 when_true,
                 when_false,
+            }
+            | ScalarOperation::SelectTransformed {
+                condition,
+                when_true,
+                when_false,
+                ..
             } => operands.extend([condition, when_true, when_false]),
-            ScalarOperation::Shift { value, amount, .. } => operands.extend([value, amount]),
+            ScalarOperation::Shift { value, amount, .. }
+            | ScalarOperation::ShiftMasked { value, amount, .. } => {
+                operands.extend([value, amount]);
+            }
+            ScalarOperation::MultiplyAdd {
+                lhs, rhs, addend, ..
+            }
+            | ScalarOperation::WideningMultiplyAdd {
+                lhs, rhs, addend, ..
+            } => operands.extend([lhs, rhs, addend]),
+            ScalarOperation::InsertBits {
+                destination,
+                source,
+                ..
+            } => operands.extend([destination, source]),
+            ScalarOperation::ExtractConcat { high, low, .. } => operands.extend([high, low]),
             ScalarOperation::CountLeadingZeros { value }
+            | ScalarOperation::CountLeadingSignBits { value }
+            | ScalarOperation::Not { value }
             | ScalarOperation::ReverseBits { value }
+            | ScalarOperation::ReverseBytes { value, .. }
+            | ScalarOperation::ShiftImmediate { value, .. }
+            | ScalarOperation::TestBit { value, .. }
+            | ScalarOperation::ExtractBits { value, .. }
+            | ScalarOperation::SignedInsertBits { source: value, .. }
             | ScalarOperation::ZeroExtend { value, .. }
             | ScalarOperation::SignExtend { value, .. }
             | ScalarOperation::Truncate { value, .. }
