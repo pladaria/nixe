@@ -17,8 +17,6 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
         "cranelift-native = \"=0.134.3\"",
         "nixe-cpu.workspace = true",
         "nixe-memory.workspace = true",
-        "libc = \"0.2\"",
-        "windows-sys = { version = \"0.61\"",
     ] {
         assert!(
             manifest.contains(required),
@@ -49,42 +47,7 @@ fn jit_owns_cranelift_without_a_production_interpreter_or_runtime_dependency() {
     }
 
     let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    assert!(
-        library.contains("#[cfg(test)]\nmod direct;"),
-        "the replacement JIT must remain internal until the atomic S09 cutover"
-    );
-    assert!(
-        !library.contains("pub mod direct;"),
-        "the replacement JIT must not be exposed as a production selector"
-    );
-
-    let direct = root.join("src/direct");
-    for path in fs::read_dir(direct)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-    {
-        if path.extension().is_some_and(|extension| extension == "rs") {
-            let source = fs::read_to_string(&path).unwrap();
-            for forbidden in [
-                "nixe_cpu::ir",
-                "IrOperation",
-                "OperationKind",
-                "translate_region",
-                "CompilationPool",
-                "CodeTier",
-                "Promotion",
-                "ExecutionFrame",
-                "HelperScratch",
-                "SemanticHelper",
-            ] {
-                assert!(
-                    !source.contains(forbidden),
-                    "{} imports the superseded JIT architecture through {forbidden}",
-                    path.display()
-                );
-            }
-        }
-    }
+    assert!(library.contains("pub use direct::{JitProcess, JitThread};"));
 }
 
 #[test]

@@ -10,14 +10,10 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     assert_eq!(report.instructions_executed, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
-    let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
-        panic!("homebrew fixture must report A64 context");
-    };
+    let context = &report.context;
     assert_eq!(context.pc.get(), entry + 0x80);
     assert!(report.to_string().contains("flags=N0Z0C0V0"));
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        panic!("homebrew fixture must initialize A64");
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.pc(), entry + 0x80);
 }
 
@@ -35,9 +31,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
         ],
     );
     let entry = process.entry_module().entry_address();
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        panic!("homebrew fixture must initialize A64");
-    };
+    let state = process.main_thread_mut().state_mut();
     state.write_x(A64Register::General(a64_register(0)), 0);
     let mut cpu_thread = process
         .execution
@@ -47,18 +41,14 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     let first = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(first.instructions_executed, 1);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
     assert_eq!(state.pc(), entry + 4);
 
     let second = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
     assert_eq!(state.pc(), entry + 8);
 
@@ -85,9 +75,7 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     let resumed = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
     assert_eq!(resumed.instructions_executed, 1);
     assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_x(A64Register::General(a64_register(0))), 7);
     assert_eq!(state.pc(), entry + 16);
 }
@@ -121,9 +109,7 @@ fn fixed_virtual_timer_is_stable_across_reference_slices() {
     assert_eq!(second.instructions_executed, 1);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
 
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(
         state.read_x(A64Register::General(a64_register(1))),
         frequency
@@ -145,9 +131,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     );
     let entry = process.entry_module().entry_address();
     let data = {
-        let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-            panic!("homebrew fixture must initialize A64");
-        };
+        let state = process.main_thread_mut().state_mut();
         let address = GuestVirtualAddress::new(
             state
                 .read_x(A64Register::StackPointer)
@@ -179,9 +163,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             .stop,
         crate::ExecutionStop::BudgetExhausted
     );
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        unreachable!();
-    };
+    let state = process.main_thread_mut().state_mut();
     assert_eq!(state.read_w(A64Register::General(a64_register(0))), 7);
     state.write_x(A64Register::General(a64_register(0)), 9);
     assert_eq!(
@@ -191,9 +173,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             .stop,
         crate::ExecutionStop::BudgetExhausted
     );
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_w(A64Register::General(a64_register(1))), 0);
     assert_eq!(
         process
@@ -208,9 +188,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
         MemoryValue::U32(9)
     );
 
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        unreachable!();
-    };
+    let state = process.main_thread_mut().state_mut();
     state.set_pc(entry);
     assert_eq!(
         process
@@ -228,9 +206,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             MemoryValue::U32(11),
         )
         .unwrap();
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        unreachable!();
-    };
+    let state = process.main_thread_mut().state_mut();
     state.write_x(A64Register::General(a64_register(0)), 13);
     assert_eq!(
         process
@@ -239,9 +215,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
             .stop,
         crate::ExecutionStop::BudgetExhausted
     );
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        unreachable!();
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.read_w(A64Register::General(a64_register(1))), 1);
     assert_eq!(
         process
@@ -267,9 +241,7 @@ fn reference_execution_observes_safepoints_before_fetch() {
     let report = process.run(10).unwrap();
     assert_eq!(report.instructions_executed, 0);
     assert_eq!(report.stop, crate::ExecutionStop::Safepoint);
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        panic!("homebrew fixture must initialize A64");
-    };
+    let state = process.main_thread().state();
     assert_eq!(state.pc(), entry);
 }
 
@@ -277,9 +249,7 @@ fn reference_execution_observes_safepoints_before_fetch() {
 fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        panic!("homebrew fixture must initialize A64");
-    };
+    let state = process.main_thread_mut().state_mut();
     state.set_pc(0x1000);
 
     let report = process.run(1).unwrap();
@@ -288,9 +258,7 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
         report.stop,
         crate::ExecutionStop::FetchFault { .. }
     ));
-    let nixe_cpu::state::RegisterContext::A64(context) = &report.context else {
-        panic!("homebrew fixture must report A64 context");
-    };
+    let context = &report.context;
     assert_eq!(context.pc.get(), 0x1000);
     assert!(report.to_string().contains("fetch-fault"));
 }
@@ -364,9 +332,7 @@ fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
 
     let mut data_fault = reference_process_builder().build(&plan).unwrap();
     replace_entry_instruction(&mut data_fault, 0xf940_0020); // LDR X0,[X1]
-    let ThreadCpuState::A64(state) = data_fault.main_thread_mut().state_mut() else {
-        panic!("homebrew fixture must initialize A64");
-    };
+    let state = data_fault.main_thread_mut().state_mut();
     state.write_x(
         nixe_cpu::state::a64::A64Register::General(a64_register(1)),
         0x1000,

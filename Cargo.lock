@@ -1219,20 +1219,15 @@ dependencies = [
 name = "nixe-cpu-jit"
 version = "0.1.0"
 dependencies = [
- "cc",
- "chrono",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
- "libc",
- "log",
  "nixe-cpu",
  "nixe-cpu-interpreter",
  "nixe-memory",
  "toml",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

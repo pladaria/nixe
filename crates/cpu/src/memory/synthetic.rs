@@ -8,6 +8,7 @@ use nixe_memory::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::AtomicU64,
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
@@ -608,15 +609,12 @@ impl SyntheticMemory {
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
-        alignment: u8,
     ) -> Result<([u8; N], CodeDependencies), InstructionFetchFault> {
-        if !address.is_aligned_to(u64::from(alignment)) {
+        if !address.is_aligned_to(4) {
             return Err(InstructionFetchFault::new(
                 address_space,
                 address,
-                InstructionFetchFaultReason::Misaligned {
-                    required_alignment: alignment,
-                },
+                InstructionFetchFaultReason::Misaligned,
             ));
         }
         let inner = self.lock_inner();
@@ -745,6 +743,10 @@ impl MemoryInvalidationSource for SyntheticMemory {
         self.invalidations.cursor()
     }
 
+    fn invalidation_signal(&self) -> &AtomicU64 {
+        self.invalidations.cursor_signal()
+    }
+
     fn read_invalidations_since(
         &self,
         after: MemoryInvalidationCursor,
@@ -800,24 +802,12 @@ impl InstructionMemory for SyntheticMemory {
             .expect("synthetic page arithmetic contains its source address"))
     }
 
-    fn fetch16(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedCode<u16>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<2>(address_space, address, 2)?;
-        Ok(FetchedCode {
-            bits: u16::from_le_bytes(bytes),
-            dependencies,
-        })
-    }
-
     fn fetch32(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
     ) -> Result<FetchedCode<u32>, InstructionFetchFault> {
-        let (bytes, dependencies) = self.fetch::<4>(address_space, address, 4)?;
+        let (bytes, dependencies) = self.fetch::<4>(address_space, address)?;
         Ok(FetchedCode {
             bits: u32::from_le_bytes(bytes),
             dependencies,
@@ -2139,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn a64_and_a32_words_use_explicit_little_endian_canonicalization() {
+    fn a64_words_use_explicit_little_endian_canonicalization() {
         let memory = code_memory();
 
         let a64_or_a32 = memory.fetch32(SPACE, CODE).unwrap();
@@ -2222,17 +2212,12 @@ mod tests {
         let misaligned = memory
             .fetch32(SPACE, CODE.checked_add(2).unwrap())
             .unwrap_err();
-        let denied = memory.fetch16(SPACE, ALIAS).unwrap_err();
+        let denied = memory.fetch32(SPACE, ALIAS).unwrap_err();
         let unmapped = memory
-            .fetch16(SPACE, GuestVirtualAddress::new(0x9000))
+            .fetch32(SPACE, GuestVirtualAddress::new(0x9000))
             .unwrap_err();
 
-        assert_eq!(
-            misaligned.reason,
-            InstructionFetchFaultReason::Misaligned {
-                required_alignment: 4
-            }
-        );
+        assert_eq!(misaligned.reason, InstructionFetchFaultReason::Misaligned);
         assert_eq!(
             denied.reason,
             InstructionFetchFaultReason::ExecutePermissionDenied
@@ -2388,51 +2373,6 @@ mod tests {
             MemoryProtectionErrorReason::GenerationExhausted
         );
         assert_eq!(memory.mapping_info(SPACE, CODE), Some(before_mapping));
-    }
-
-    #[test]
-    fn t32_cross_page_fetch_records_both_pages_in_address_order() {
-        let mut memory = SyntheticMemory::new();
-        assert!(memory.add_ram_page(PAGE_1));
-        assert!(memory.add_ram_page(PAGE_2));
-        assert!(memory.initialize_ram(PAGE_1, SYNTHETIC_PAGE_SIZE - 2, &[0x00, 0xf0]));
-        assert!(memory.initialize_ram(PAGE_2, 0, &[0x01, 0xf8]));
-        assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
-        assert!(memory.map_page(
-            SPACE,
-            GuestVirtualAddress::new(0x2000),
-            PAGE_2,
-            MemoryPermissions::READ_EXECUTE
-        ));
-
-        let fetched = memory
-            .fetch_t32_32(SPACE, GuestVirtualAddress::new(0x1ffe))
-            .unwrap();
-
-        assert_eq!(fetched.bits, 0xf000_f801);
-        assert_eq!(
-            fetched
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.page)
-                .collect::<Vec<_>>(),
-            vec![PAGE_1, PAGE_2]
-        );
-    }
-
-    #[test]
-    fn t32_second_halfword_fault_identifies_the_unavailable_address() {
-        let mut memory = SyntheticMemory::new();
-        assert!(memory.add_ram_page(PAGE_1));
-        assert!(memory.initialize_ram(PAGE_1, SYNTHETIC_PAGE_SIZE - 2, &[0x00, 0xf0]));
-        assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ_EXECUTE));
-
-        let fault = memory
-            .fetch_t32_32(SPACE, GuestVirtualAddress::new(0x1ffe))
-            .unwrap_err();
-
-        assert_eq!(fault.address, GuestVirtualAddress::new(0x2000));
-        assert_eq!(fault.reason, InstructionFetchFaultReason::Unmapped);
     }
 
     #[test]
@@ -2792,11 +2732,6 @@ mod tests {
         assert_eq!(
             synthetic.mapping_info(SPACE, ALIAS),
             execution.mapping_info(SPACE, ALIAS)
-        );
-        let thumb_address = GuestVirtualAddress::new(0x1ffe);
-        assert_eq!(
-            synthetic.fetch_t32_32(SPACE, thumb_address),
-            execution.fetch_t32_32(SPACE, thumb_address)
         );
         for address in [
             CODE.checked_add(2).unwrap(),

@@ -5,7 +5,7 @@
 //! execution loop applies. Neither side assumes a particular interpreter, JIT,
 //! or future NCE implementation.
 
-use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::{
     memory::{
         ExecutionMemory, MemoryAttributes, MemoryMappingError, MemoryMappingPurpose,
@@ -88,8 +88,7 @@ pub(crate) struct ExceptionProcessResources<'a> {
 pub enum ExceptionResume {
     /// Continue after the exception-raising instruction.
     ///
-    /// For a supervisor call this advances by the architectural SVC encoding
-    /// width: four bytes in A64/A32 and two bytes in T32.
+    /// For a supervisor call this advances by the four-byte A64 encoding width.
     Next,
     /// Continue at an explicit guest location selected by runtime policy.
     At(LocationDescriptor),
@@ -492,10 +491,6 @@ pub enum ExceptionRouteError {
         source: LocationDescriptor,
         target: LocationDescriptor,
     },
-    IncompatibleContinuationState {
-        current: ExecutionState,
-        target: ExecutionState,
-    },
     InvalidContinuationTarget {
         target: LocationDescriptor,
     },
@@ -528,10 +523,6 @@ impl std::fmt::Display for ExceptionRouteError {
             Self::ContinuationProfileMismatch { source, target } => write!(
                 formatter,
                 "exception continuation changes the immutable CPU profile: source=[{source}] target=[{target}]"
-            ),
-            Self::IncompatibleContinuationState { current, target } => write!(
-                formatter,
-                "exception continuation cannot change the current thread representation from {current} to {target}"
             ),
             Self::InvalidContinuationTarget { target } => {
                 write!(
@@ -566,21 +557,13 @@ pub trait ExceptionDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use nixe_cpu::{
-        exception::ExceptionKind,
-        location::{ExecutionState, LocationDescriptor},
-        profile::CpuProfileId,
-    };
+    use nixe_cpu::{exception::ExceptionKind, location::LocationDescriptor, profile::CpuProfileId};
     use nixe_memory::GuestVirtualAddress;
 
     use super::*;
 
     fn source() -> LocationDescriptor {
-        LocationDescriptor::new(
-            GuestVirtualAddress::new(0x7100_1000),
-            ExecutionState::A64,
-            CpuProfileId::new(7),
-        )
+        LocationDescriptor::new(GuestVirtualAddress::new(0x7100_1000), CpuProfileId::new(7))
     }
 
     #[test]

@@ -105,7 +105,7 @@ fn execute_mrs(context: InterpreterContext<'_>, state: &mut A64State, fields: Op
         0xd53b_d040 => state.tpidr_el0(),
         0xd53b_d060 => state.tpidrro_el0(),
         system_key => match nixe_cpu::semantics::a64::runtime_register_read(
-            context.process().profile(),
+            context.process().platform(),
             system_key,
         ) {
             Some(RuntimeRegisterRead::Constant(value)) => value,

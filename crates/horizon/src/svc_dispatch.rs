@@ -16,7 +16,6 @@ use nixe_cpu::memory::{
     ProcessMemory,
 };
 use nixe_cpu::state::ThreadCpuState;
-use nixe_cpu::state::a32::A32GeneralRegister;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_memory::CanonicalRangeTranslationError;
 use nixe_memory::GuestVirtualAddress;
@@ -1078,10 +1077,7 @@ fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult
 }
 
 fn thread_tls(state: &ThreadCpuState) -> GuestVirtualAddress {
-    match state {
-        ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
-        ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
-    }
+    GuestVirtualAddress::new(state.tpidr_el0())
 }
 
 fn session_request_owner(context: &ExceptionDispatchContext<'_>) -> SessionRequestOwner {
@@ -1181,16 +1177,9 @@ fn read_c_name(
 }
 
 fn read_register(state: &ThreadCpuState, index: u8) -> u64 {
-    match state {
-        ThreadCpuState::A64(state) => state.read_x(A64Register::General(
-            A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
-        )),
-        ThreadCpuState::A32(state) => {
-            u64::from(state.read_r(
-                A32GeneralRegister::new(index).expect("AArch32 ABI register index is valid"),
-            ))
-        }
-    }
+    state.read_x(A64Register::General(
+        A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
+    ))
 }
 
 const fn runtime_fault(operation: &'static str) -> HorizonSvcFault {
@@ -1240,85 +1229,42 @@ fn horizon_affinity_mask(affinity: &nixe_scheduler::CoreSet) -> Option<u64> {
 }
 
 fn encode_thread_context(state: &ThreadCpuState) -> Vec<u8> {
-    match state {
-        ThreadCpuState::A64(state) => {
-            let mut bytes = vec![0_u8; 0x320];
-            for index in 0..29_u8 {
-                put_context_u64(
-                    &mut bytes,
-                    usize::from(index) * 8,
-                    state.read_x(A64Register::General(
-                        A64GeneralRegister::new(index).expect("context GPR index is valid"),
-                    )),
-                );
-            }
-            put_context_u64(
-                &mut bytes,
-                0xe8,
-                state.read_x(A64Register::General(
-                    A64GeneralRegister::new(29).expect("frame-pointer index is valid"),
-                )),
-            );
-            put_context_u64(
-                &mut bytes,
-                0xf0,
-                state.read_x(A64Register::General(
-                    A64GeneralRegister::new(30).expect("link-register index is valid"),
-                )),
-            );
-            put_context_u64(&mut bytes, 0xf8, state.read_x(A64Register::StackPointer));
-            put_context_u64(&mut bytes, 0x100, state.pc());
-            put_context_u32(&mut bytes, 0x108, state.nzcv().bits());
-            for index in 0..32_u8 {
-                let value = state.vector(index).expect("context vector index is valid");
-                let offset = 0x110 + usize::from(index) * 16;
-                bytes[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
-            }
-            put_context_u32(&mut bytes, 0x310, state.fpcr());
-            put_context_u32(&mut bytes, 0x314, state.fpsr());
-            put_context_u64(&mut bytes, 0x318, state.tpidr_el0());
-            bytes
-        }
-        ThreadCpuState::A32(state) => {
-            let mut bytes = vec![0_u8; 0x158];
-            for index in 0..13_u8 {
-                put_context_u32(
-                    &mut bytes,
-                    usize::from(index) * 4,
-                    state.read_r(
-                        A32GeneralRegister::new(index).expect("context GPR index is valid"),
-                    ),
-                );
-            }
-            put_context_u32(
-                &mut bytes,
-                0x34,
-                state.read_r(A32GeneralRegister::new(13).expect("SP index is valid")),
-            );
-            put_context_u32(
-                &mut bytes,
-                0x38,
-                state.read_r(A32GeneralRegister::new(14).expect("LR index is valid")),
-            );
-            put_context_u32(&mut bytes, 0x3c, state.instruction_address());
-            put_context_u32(&mut bytes, 0x40, state.cpsr().bits());
-            for index in 0..32_u8 {
-                put_context_u64(
-                    &mut bytes,
-                    0x48 + usize::from(index) * 8,
-                    state
-                        .read_d(index)
-                        .expect("context D-register index is valid"),
-                );
-            }
-            put_context_u32(&mut bytes, 0x148, state.fpscr());
-            // FPEXC is privileged architectural state and is not part of the
-            // user-mode CPU state. Horizon returns it cleared here.
-            put_context_u32(&mut bytes, 0x14c, 0);
-            put_context_u32(&mut bytes, 0x150, state.tpidrurw());
-            bytes
-        }
+    let mut bytes = vec![0_u8; 0x320];
+    for index in 0..29_u8 {
+        put_context_u64(
+            &mut bytes,
+            usize::from(index) * 8,
+            state.read_x(A64Register::General(
+                A64GeneralRegister::new(index).expect("context GPR index is valid"),
+            )),
+        );
     }
+    put_context_u64(
+        &mut bytes,
+        0xe8,
+        state.read_x(A64Register::General(
+            A64GeneralRegister::new(29).expect("frame-pointer index is valid"),
+        )),
+    );
+    put_context_u64(
+        &mut bytes,
+        0xf0,
+        state.read_x(A64Register::General(
+            A64GeneralRegister::new(30).expect("link-register index is valid"),
+        )),
+    );
+    put_context_u64(&mut bytes, 0xf8, state.read_x(A64Register::StackPointer));
+    put_context_u64(&mut bytes, 0x100, state.pc());
+    put_context_u32(&mut bytes, 0x108, state.nzcv().bits());
+    for index in 0..32_u8 {
+        let value = state.vector(index).expect("context vector index is valid");
+        let offset = 0x110 + usize::from(index) * 16;
+        bytes[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+    put_context_u32(&mut bytes, 0x310, state.fpcr());
+    put_context_u32(&mut bytes, 0x314, state.fpsr());
+    put_context_u64(&mut bytes, 0x318, state.tpidr_el0());
+    bytes
 }
 
 fn put_context_u32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -1330,75 +1276,24 @@ fn put_context_u64(bytes: &mut [u8], offset: usize, value: u64) {
 }
 
 fn read_reply_timeout(state: &ThreadCpuState, user_buffer: bool) -> i64 {
-    match state {
-        ThreadCpuState::A64(_) => read_register(state, if user_buffer { 6 } else { 4 }) as i64,
-        ThreadCpuState::A32(a32) => {
-            let (low_index, high_index) = if user_buffer { (5, 6) } else { (0, 4) };
-            let low = u64::from(
-                a32.read_r(
-                    A32GeneralRegister::new(low_index)
-                        .expect("AArch32 reply timeout low register is valid"),
-                ),
-            );
-            let high = u64::from(
-                a32.read_r(
-                    A32GeneralRegister::new(high_index)
-                        .expect("AArch32 reply timeout high register is valid"),
-                ),
-            );
-            (low | (high << 32)) as i64
-        }
-    }
+    read_register(state, if user_buffer { 6 } else { 4 }) as i64
 }
 
 fn write_register(state: &mut ThreadCpuState, index: u8, value: u64) {
-    match state {
-        ThreadCpuState::A64(state) => state.write_x(
-            A64Register::General(
-                A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
-            ),
-            value,
+    state.write_x(
+        A64Register::General(
+            A64GeneralRegister::new(index).expect("A64 ABI register index is valid"),
         ),
-        ThreadCpuState::A32(state) => state.write_r(
-            A32GeneralRegister::new(index).expect("AArch32 ABI register index is valid"),
-            value as u32,
-        ),
-    }
+        value,
+    );
 }
 
 fn write_u64(state: &mut ThreadCpuState, index: u8, value: u64) {
-    match state {
-        ThreadCpuState::A64(_) => write_register(state, index, value),
-        ThreadCpuState::A32(state) => {
-            // The Horizon AArch32 ABI returns 64-bit IDs in consecutive
-            // low/high register pairs, for example R1:R2.
-            state.write_r(
-                A32GeneralRegister::new(index).expect("AArch32 ABI register index is valid"),
-                value as u32,
-            );
-            state.write_r(
-                A32GeneralRegister::new(index + 1).expect("AArch32 ABI register pair is valid"),
-                (value >> 32) as u32,
-            );
-        }
-    }
+    write_register(state, index, value);
 }
 
 fn read_wait_timeout(state: &ThreadCpuState) -> i64 {
-    match state {
-        ThreadCpuState::A64(_) => read_register(state, 3) as i64,
-        ThreadCpuState::A32(state) => {
-            // WaitSynchronization is the exceptional AArch32 layout: the
-            // timeout low/high words occupy R0:R3 rather than a pair.
-            let low = u64::from(state.read_r(
-                A32GeneralRegister::new(0).expect("AArch32 timeout low register is valid"),
-            ));
-            let high = u64::from(state.read_r(
-                A32GeneralRegister::new(3).expect("AArch32 timeout high register is valid"),
-            ));
-            (low | (high << 32)) as i64
-        }
-    }
+    read_register(state, 3) as i64
 }
 
 fn close_handle(
@@ -1729,28 +1624,8 @@ mod tests {
     use nixe_runtime::EventObject;
 
     #[test]
-    fn thread_context_encoding_uses_architecture_specific_horizon_layouts() {
-        let mut a32 = nixe_cpu::state::a32::A32State::a32();
-        a32.write_r(A32GeneralRegister::new(0).expect("R0 exists"), 0x1122_3344);
-        a32.write_r(A32GeneralRegister::new(13).expect("SP exists"), 0x5566_7788);
-        a32.set_instruction_address(0x1000).unwrap();
-        a32.write_d(31, 0x0102_0304_0506_0708);
-        a32.set_fpscr(0xaabb_ccdd);
-        a32.set_tpidrurw(0xdead_beef);
-        let encoded = encode_thread_context(&ThreadCpuState::A32(Box::new(a32)));
-        assert_eq!(encoded.len(), 0x158);
-        assert_eq!(&encoded[0..4], &0x1122_3344_u32.to_le_bytes());
-        assert_eq!(&encoded[0x34..0x38], &0x5566_7788_u32.to_le_bytes());
-        assert_eq!(&encoded[0x3c..0x40], &0x1000_u32.to_le_bytes());
-        assert_eq!(
-            &encoded[0x140..0x148],
-            &0x0102_0304_0506_0708_u64.to_le_bytes()
-        );
-        assert_eq!(&encoded[0x148..0x14c], &0xaabb_ccdd_u32.to_le_bytes());
-        assert_eq!(&encoded[0x14c..0x150], &[0; 4]);
-        assert_eq!(&encoded[0x150..0x154], &0xdead_beef_u32.to_le_bytes());
-
-        let encoded = encode_thread_context(&ThreadCpuState::A64(Box::default()));
+    fn thread_context_encoding_uses_horizon_a64_layout() {
+        let encoded = encode_thread_context(&ThreadCpuState::default());
         assert_eq!(encoded.len(), 0x320);
     }
 

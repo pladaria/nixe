@@ -19,26 +19,5 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "translation"
-path = "fuzz_targets/translation.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "ir_verifier"
-path = "fuzz_targets/ir_verifier.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "diagnostics"
-path = "fuzz_targets/diagnostics.rs"
-test = false
-doc = false
-bench = false
-
 [workspace]
 members = ["."]

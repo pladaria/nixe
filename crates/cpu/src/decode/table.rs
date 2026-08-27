@@ -5,11 +5,7 @@ use core::fmt;
 use crate::{
     coverage::CoverageId,
     error::InstructionDiagnostic,
-    location::{
-        DecodedInstruction, ExecutionState, InstructionEncoding, InstructionSize,
-        LocationDescriptor,
-    },
-    profile::InstructionFeature,
+    location::{DecodedInstruction, InstructionEncoding, LocationDescriptor},
 };
 
 use super::DecodeResult;
@@ -22,13 +18,6 @@ const MAX_OPERANDS: usize = 8;
 pub enum DecodeSupport {
     Ready,
     RecognizedUnimplemented,
-}
-
-/// Availability declared by the shared IR lowerer for one decoder entry.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum LoweringAvailability {
-    Implemented,
-    Missing,
 }
 
 /// One redistributable encoding which exercises a registered decoder entry.
@@ -49,7 +38,6 @@ pub enum AllocationStatus {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RegisterClass {
     A64General,
-    A32General,
 }
 
 /// Stable role of an operand within an instruction.
@@ -95,27 +83,17 @@ pub struct OperandField {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InstructionPattern {
     pub name: &'static str,
-    pub execution_state: ExecutionState,
-    pub size: InstructionSize,
     pub mask: u32,
     pub value: u32,
     pub operands: &'static [OperandField],
-    pub required_features: &'static [InstructionFeature],
     pub coverage_id: CoverageId,
     /// Higher values win intentional overlaps; equal values remain an error.
     pub priority: u16,
     pub decoder: DecodeSupport,
-    pub lowering: LoweringAvailability,
     pub regression_fixture: Option<RegressionFixture>,
 }
 
 impl InstructionPattern {
-    #[must_use]
-    pub const fn lowered(mut self) -> Self {
-        self.lowering = LoweringAvailability::Implemented;
-        self
-    }
-
     #[must_use]
     pub const fn fixture32(mut self, bits: u32) -> Self {
         self.regression_fixture = Some(RegressionFixture {
@@ -125,17 +103,8 @@ impl InstructionPattern {
     }
 
     #[must_use]
-    pub const fn fixture16(mut self, bits: u16) -> Self {
-        self.regression_fixture = Some(RegressionFixture {
-            encoding: InstructionEncoding::from_u16(bits),
-        });
-        self
-    }
-
-    #[must_use]
     pub const fn recognized_unimplemented(mut self) -> Self {
         self.decoder = DecodeSupport::RecognizedUnimplemented;
-        self.lowering = LoweringAvailability::Missing;
         self
     }
 }
@@ -200,15 +169,7 @@ impl DecodedOpcode {
     }
 
     #[must_use]
-    #[cfg(not(test))]
     pub const fn operands(&self) -> DecodedOperands {
-        extract_operands(self.pattern, self.bits)
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    pub fn operands(&self) -> DecodedOperands {
-        OPERAND_EXTRACTION_COUNT.with(|count| count.set(count.get() + 1));
         extract_operands(self.pattern, self.bits)
     }
 
@@ -227,7 +188,6 @@ impl DecodedOpcode {
                 OperandValue::Register { class, index } => {
                     let prefix = match class {
                         RegisterClass::A64General => 'x',
-                        RegisterClass::A32General => 'r',
                     };
                     write!(f, "{}={prefix}{index}", id.name())?;
                 }
@@ -242,8 +202,6 @@ impl DecodedOpcode {
 pub enum TableError {
     Empty,
     TooManyPatterns,
-    MixedExecutionState,
-    MixedInstructionSize,
     InvalidPattern {
         name: &'static str,
         reason: &'static str,
@@ -267,7 +225,7 @@ impl DecoderTable {
     /// Validates patterns and builds an index using the cheapest 8-bit window.
     pub fn compile(patterns: &'static [InstructionPattern]) -> Result<Self, TableError> {
         validate_patterns(patterns)?;
-        let width = patterns[0].size.bits();
+        let width = 32;
         let mut best_shift = 0;
         let mut best_cost = usize::MAX;
         for shift in (0..width).step_by(8) {
@@ -300,20 +258,9 @@ impl DecoderTable {
     /// Builds the immutable table selected once for a target platform.
     pub fn compile_for_platform(
         patterns: &'static [InstructionPattern],
-        platform: crate::platform::TargetPlatform,
+        _platform: crate::platform::TargetPlatform,
     ) -> Result<Self, TableError> {
-        let patterns = patterns
-            .iter()
-            .copied()
-            .filter(|pattern| {
-                pattern
-                    .required_features
-                    .iter()
-                    .all(|feature| platform.supports(*feature))
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self::compile(Box::leak(patterns))
+        Self::compile(patterns)
     }
 
     /// Classifies one encoding without allocation or a full-table scan.
@@ -324,18 +271,6 @@ impl DecoderTable {
         encoding: InstructionEncoding,
     ) -> DecodeResult {
         let diagnostic = InstructionDiagnostic::new(location, encoding);
-        if location.execution_state != self.patterns[0].execution_state {
-            return DecodeResult::Unallocated {
-                instruction: diagnostic,
-                reason: "decoder table is unavailable for this execution state",
-            };
-        }
-        if encoding.size() != self.patterns[0].size {
-            return DecodeResult::Unallocated {
-                instruction: diagnostic,
-                reason: "wrong encoding width for execution state",
-            };
-        }
         let bits = encoding.bits();
         let bucket = ((bits >> self.index_shift) & 0xff) as usize;
         let mut allocation_rejection = None;
@@ -344,7 +279,7 @@ impl DecoderTable {
             if bits & pattern.mask != pattern.value {
                 continue;
             }
-            match super::allocation::validate(pattern.execution_state, pattern.coverage_id, bits) {
+            match super::allocation::validate(pattern.coverage_id, bits) {
                 AllocationStatus::Allocated => {}
                 AllocationStatus::Reserved(reason) => {
                     allocation_rejection.get_or_insert((true, pattern.name, reason));
@@ -418,38 +353,15 @@ const fn extract_operands(pattern: &InstructionPattern, bits: u32) -> DecodedOpe
     result
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static OPERAND_EXTRACTION_COUNT: core::cell::Cell<usize> = const {
-        core::cell::Cell::new(0)
-    };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_operand_extraction_count() {
-    OPERAND_EXTRACTION_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn operand_extraction_count() -> usize {
-    OPERAND_EXTRACTION_COUNT.with(core::cell::Cell::get)
-}
-
 fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> {
-    let Some(first) = patterns.first() else {
+    if patterns.is_empty() {
         return Err(TableError::Empty);
-    };
+    }
     if patterns.len() > usize::from(u16::MAX) + 1 {
         return Err(TableError::TooManyPatterns);
     }
     for pattern in patterns {
-        if pattern.execution_state != first.execution_state {
-            return Err(TableError::MixedExecutionState);
-        }
-        if pattern.size != first.size {
-            return Err(TableError::MixedInstructionSize);
-        }
-        let width_mask = low_mask(pattern.size.bits());
+        let width_mask = u32::MAX;
         if pattern.value & !pattern.mask != 0 || pattern.mask & !width_mask != 0 {
             return Err(TableError::InvalidPattern {
                 name: pattern.name,
@@ -466,7 +378,7 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
         let mut operand_bits = 0_u32;
         for field in pattern.operands {
             let end = field.lsb.checked_add(field.width);
-            if field.width == 0 || end.is_none_or(|end| end > pattern.size.bits()) {
+            if field.width == 0 || end.is_none_or(|end| end > 32) {
                 return Err(TableError::InvalidPattern {
                     name: pattern.name,
                     reason: "operand field lies outside encoding",
@@ -477,12 +389,6 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
                     return Err(TableError::InvalidPattern {
                         name: pattern.name,
                         reason: "A64 register field exceeds five bits",
-                    });
-                }
-                OperandKind::Register(RegisterClass::A32General) if field.width > 4 => {
-                    return Err(TableError::InvalidPattern {
-                        name: pattern.name,
-                        reason: "A32 register field exceeds four bits",
                     });
                 }
                 OperandKind::SignedScaled { scale }
@@ -516,8 +422,7 @@ fn validate_patterns(patterns: &[InstructionPattern]) -> Result<(), TableError> 
             seen[id] = true;
         }
         if let Some(fixture) = pattern.regression_fixture
-            && (fixture.encoding.size() != pattern.size
-                || fixture.encoding.bits() & pattern.mask != pattern.value)
+            && fixture.encoding.bits() & pattern.mask != pattern.value
         {
             return Err(TableError::InvalidPattern {
                 name: pattern.name,
@@ -567,152 +472,5 @@ const fn low_mask(width: u8) -> u32 {
         u32::MAX
     } else {
         (1_u32 << width) - 1
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::mem::size_of;
-
-    use super::*;
-    use nixe_memory::GuestVirtualAddress;
-
-    use crate::profile::GuestCpuProfile;
-
-    const EMPTY_FIELDS: &[OperandField] = &[];
-    const EMPTY_FEATURES: &[InstructionFeature] = &[];
-
-    const fn pattern(name: &'static str, mask: u32, value: u32, id: u32) -> InstructionPattern {
-        InstructionPattern {
-            name,
-            execution_state: ExecutionState::A64,
-            size: InstructionSize::Bits32,
-            mask,
-            value,
-            operands: EMPTY_FIELDS,
-            required_features: EMPTY_FEATURES,
-            coverage_id: CoverageId::new(id),
-            priority: 0,
-            decoder: DecodeSupport::Ready,
-            lowering: LoweringAvailability::Missing,
-            regression_fixture: None,
-        }
-    }
-
-    #[test]
-    fn rejects_ambiguous_patterns_without_priority() {
-        static PATTERNS: [InstructionPattern; 2] = [
-            pattern("broad", 0xff00_0000, 0x1200_0000, 1),
-            pattern("narrow", 0xffff_0000, 0x1234_0000, 2),
-        ];
-        assert_eq!(
-            DecoderTable::compile(&PATTERNS).unwrap_err(),
-            TableError::Overlap {
-                first: "broad",
-                second: "narrow"
-            }
-        );
-    }
-
-    #[test]
-    fn explicit_priority_resolves_overlap() {
-        static PATTERNS: [InstructionPattern; 2] = [
-            pattern("broad", 0xff00_0000, 0x1200_0000, 1),
-            InstructionPattern {
-                priority: 1,
-                ..pattern("narrow", 0xffff_0000, 0x1234_0000, 2)
-            },
-        ];
-        let table = DecoderTable::compile(&PATTERNS).unwrap();
-        let profile = GuestCpuProfile::switch_1();
-        let location = LocationDescriptor::new(
-            GuestVirtualAddress::new(0),
-            ExecutionState::A64,
-            profile.id(),
-        );
-        let DecodeResult::Decoded(decoded) = table.decode(location, 0x1234_5678_u32.into()) else {
-            panic!("expected decoded")
-        };
-        assert_eq!(decoded.instruction.pattern().name, "narrow");
-    }
-
-    #[test]
-    fn decoding_keeps_generic_operand_extraction_lazy() {
-        static FIELDS: [OperandField; 2] = [
-            OperandField {
-                id: OperandId::Destination,
-                lsb: 0,
-                width: 5,
-                kind: OperandKind::Register(RegisterClass::A64General),
-            },
-            OperandField {
-                id: OperandId::Immediate,
-                lsb: 5,
-                width: 7,
-                kind: OperandKind::SignedScaled { scale: 2 },
-            },
-        ];
-        static PATTERNS: [InstructionPattern; 1] = [InstructionPattern {
-            operands: &FIELDS,
-            ..pattern("lazy-operands", 0xff00_0000, 0x1200_0000, 1)
-        }];
-        let table = DecoderTable::compile(&PATTERNS).unwrap();
-        let profile = GuestCpuProfile::switch_1();
-        let location = LocationDescriptor::new(
-            GuestVirtualAddress::new(0),
-            ExecutionState::A64,
-            profile.id(),
-        );
-
-        reset_operand_extraction_count();
-        let DecodeResult::Decoded(decoded) = table.decode(location, 0x1200_0fe3_u32.into()) else {
-            panic!("expected decoded")
-        };
-        assert_eq!(operand_extraction_count(), 0);
-
-        let operands = decoded.instruction.operands();
-        assert_eq!(operand_extraction_count(), 1);
-        assert_eq!(
-            operands.get(OperandId::Destination),
-            Some(OperandValue::Register {
-                class: RegisterClass::A64General,
-                index: 3,
-            })
-        );
-        assert_eq!(
-            operands.get(OperandId::Immediate),
-            Some(OperandValue::Signed(-4))
-        );
-    }
-
-    #[test]
-    fn decoded_results_do_not_embed_fixed_operand_storage() {
-        assert!(size_of::<DecodedOpcode>() <= 2 * size_of::<usize>());
-        assert!(size_of::<DecodeResult>() < size_of::<DecodedOperands>());
-    }
-
-    #[test]
-    fn platform_tables_omit_unsupported_features() {
-        static FEATURES: [InstructionFeature; 1] = [InstructionFeature::Crc32];
-        static PATTERNS: [InstructionPattern; 2] = [
-            pattern("base", 0xff00_0000, 0x1100_0000, 1),
-            InstructionPattern {
-                required_features: &FEATURES,
-                ..pattern("feature", 0xff00_0000, 0x1200_0000, 2)
-            },
-        ];
-        let table =
-            DecoderTable::compile_for_platform(&PATTERNS, crate::platform::TargetPlatform::Switch1)
-                .unwrap();
-        let profile = GuestCpuProfile::switch_1();
-        let location = LocationDescriptor::new(
-            GuestVirtualAddress::new(0),
-            ExecutionState::A64,
-            profile.id(),
-        );
-        assert!(matches!(
-            table.decode(location, 0x1200_0000_u32.into()),
-            DecodeResult::Unallocated { .. }
-        ));
     }
 }

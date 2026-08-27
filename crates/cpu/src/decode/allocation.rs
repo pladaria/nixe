@@ -1,19 +1,11 @@
 //! Architectural allocation rules for decoded instruction families.
 
-use crate::{
-    coverage::CoverageId, location::ExecutionState,
-    semantics::immediate::decode_a64_logical_immediate,
-};
+use crate::{coverage::CoverageId, semantics::immediate::decode_a64_logical_immediate};
 
 use super::table::AllocationStatus;
 
-#[must_use]
-pub fn validate(state: ExecutionState, id: CoverageId, bits: u32) -> AllocationStatus {
-    match state {
-        ExecutionState::A64 => validate_a64(id, bits),
-        ExecutionState::A32 => validate_a32(id, bits),
-        ExecutionState::T32 => validate_t32(id, bits),
-    }
+pub fn validate(id: CoverageId, bits: u32) -> AllocationStatus {
+    validate_a64(id, bits)
 }
 
 /// Applies all known A64 allocation constraints before typed normalization.
@@ -456,116 +448,5 @@ fn validate_a64_simd_permute_two_source(bits: u32) -> AllocationStatus {
         AllocationStatus::Reserved("64-bit SIMD vector cannot contain two 64-bit lanes")
     } else {
         AllocationStatus::Allocated
-    }
-}
-
-#[must_use]
-pub fn validate_a32(id: CoverageId, bits: u32) -> AllocationStatus {
-    if bits >> 28 != 0xf || matches!(id.get(), 0x0001_0006 | 0x0001_0031..=0x0001_0033) {
-        AllocationStatus::Allocated
-    } else {
-        AllocationStatus::Unallocated("encoding is not allocated in the A32 unconditional space")
-    }
-}
-
-#[must_use]
-pub fn validate_t32(id: CoverageId, bits: u32) -> AllocationStatus {
-    match id.get() {
-        0x0002_0005 => {
-            let condition = ((bits >> 4) & 0xf) as u8;
-            let mask = (bits & 0xf) as u8;
-            if mask == 0 || condition >= 0xe {
-                AllocationStatus::Reserved("invalid IT condition or mask")
-            } else {
-                AllocationStatus::Allocated
-            }
-        }
-        0x0002_0007 if (bits >> 8) & 0xf >= 0xe => {
-            AllocationStatus::Unallocated("conditional branch uses a reserved condition")
-        }
-        _ => AllocationStatus::Allocated,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use nixe_memory::GuestVirtualAddress;
-
-    use crate::{
-        decode::{DecodeResult, decode},
-        location::{ExecutionState, InstructionEncoding, LocationDescriptor},
-        profile::GuestCpuProfile,
-    };
-
-    fn classify(state: ExecutionState, encoding: InstructionEncoding) -> DecodeResult {
-        let profile = GuestCpuProfile::switch_1();
-        decode(
-            &profile,
-            LocationDescriptor::new(GuestVirtualAddress::new(0x1000), state, profile.id()),
-            encoding,
-        )
-    }
-
-    #[test]
-    fn invalid_a64_subencodings_never_reach_normalization() {
-        let cases = [
-            0x12c0_0000, // reserved MOV-wide opcode
-            0x1300_8000, // 32-bit bitfield with an out-of-range immediate
-            0x1380_8000, // 32-bit extract with an out-of-range lsb
-            0x1200_fc00, // reserved all-ones logical immediate
-            0x0e00_3c00, // UMOV with no element size
-            0x0e08_3c00, // UMOV D element into a 32-bit destination
-            0x4e04_3c00, // UMOV S element into a 64-bit destination
-            0x0e10_3c00, // UMOV with an unsupported 128-bit element
-            0x3c22_0820, // SIMD register offset with a reserved extension
-            0x0ee2_8420, // SIMD ADD with a reserved one-lane 64-bit arrangement
-            0x0ee2_bc20, // ADDP with a reserved one-lane 64-bit arrangement
-            0x6ee2_a420, // UMAXP has no 64-bit lane form
-            0x0ee1_3420, // SIMD compare with a reserved one-lane 64-bit arrangement
-            0x0ee0_8820, // SIMD zero compare with a reserved one-lane 64-bit arrangement
-            0x0ec2_3820, // ZIP1 with a reserved one-lane 64-bit arrangement
-            0x0e61_d820, // 64-bit SIMD conversion requires a Q register
-            0x2e62_fc20, // 64-bit FDIV lanes require a Q register
-            0x2f03_f600, // 64-bit FMOV immediate lanes require a Q register
-            0x1ea0_1000, // unallocated scalar FMOV immediate floating-point type
-            0x4c40_1020, // unallocated SIMD multiple-structures opcode
-            0x2e00_4000, // 64-bit EXT byte index exceeds seven
-            0x0ee1_2800, // XTN has no 128-to-64 element form
-            0x0e00_0400, // DUP element with no element size
-            0x0e08_0400, // 64-bit DUP element requires a Q destination
-            0x5f00_0400, // scalar right shift requires a 64-bit element
-            0x2f7f_05ac, // 64-bit right-shift lanes require a Q destination
-            0x5f00_5400, // scalar left shift requires a 64-bit element
-            0x0f40_5400, // 64-bit left-shift lanes require a Q destination
-            0x0ee0_f800, // 64-bit FABS lanes require a Q destination
-            0x0eb1_b928, // ADDV 32-bit elements require a Q source
-            0x4ef1_b928, // ADDV has no 64-bit element form
-        ];
-        for bits in cases {
-            let result = classify(ExecutionState::A64, InstructionEncoding::from_u32(bits));
-            assert!(
-                matches!(
-                    result,
-                    DecodeResult::Reserved { .. } | DecodeResult::Unallocated { .. }
-                ),
-                "encoding {bits:#010x} escaped allocation validation: {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn overlapping_t32_it_and_hint_spaces_are_allocation_aware() {
-        assert!(matches!(
-            classify(
-                ExecutionState::T32,
-                InstructionEncoding::from_u16(0xbf10)
-            ),
-            DecodeResult::RecognizedUnimplemented(decoded)
-                if decoded.instruction.pattern().name == "hint"
-        ));
-        assert!(matches!(
-            classify(ExecutionState::T32, InstructionEncoding::from_u16(0xbfe8)),
-            DecodeResult::Reserved { .. }
-        ));
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::decode::table::{InstructionPattern, OperandField, OperandId, OperandKind};
 
-use super::{NO_FEATURES, pattern};
+use super::pattern;
 
 const B_FIELDS: &[OperandField] = &[OperandField {
     id: OperandId::Immediate,
@@ -12,103 +12,15 @@ const B_FIELDS: &[OperandField] = &[OperandField {
 }];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
-    pattern(
-        "nop",
-        u32::MAX,
-        0xd503_201f,
-        0x0000_0001,
-        200,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd503201f),
-    pattern(
-        "b",
-        0xfc00_0000,
-        0x1400_0000,
-        0x0000_0002,
-        199,
-        B_FIELDS,
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0x14000000),
-    pattern(
-        "bl",
-        0xfc00_0000,
-        0x9400_0000,
-        0x0000_0004,
-        198,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0x94000000),
-    pattern(
-        "br",
-        0xffff_fc1f,
-        0xd61f_0000,
-        0x0000_0005,
-        194,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd61f0000),
-    pattern(
-        "blr",
-        0xffff_fc1f,
-        0xd63f_0000,
-        0x0000_0044,
-        194,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd63f0000),
-    pattern(
-        "ret",
-        0xffff_fc1f,
-        0xd65f_0000,
-        0x0000_0045,
-        194,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd65f03c0),
-    pattern(
-        "eret",
-        u32::MAX,
-        0xd69f_03e0,
-        0x0000_0046,
-        194,
-        &[],
-        NO_FEATURES,
-    )
-    .recognized_unimplemented(),
-    pattern(
-        "drps",
-        u32::MAX,
-        0xd6bf_03e0,
-        0x0000_0047,
-        194,
-        &[],
-        NO_FEATURES,
-    )
-    .recognized_unimplemented(),
-    pattern(
-        "b.cond",
-        0xff00_0010,
-        0x5400_0000,
-        0x0000_0006,
-        197,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0x54000000),
+    pattern("nop", u32::MAX, 0xd503_201f, 0x0000_0001, 200, &[]).fixture32(0xd503201f),
+    pattern("b", 0xfc00_0000, 0x1400_0000, 0x0000_0002, 199, B_FIELDS).fixture32(0x14000000),
+    pattern("bl", 0xfc00_0000, 0x9400_0000, 0x0000_0004, 198, &[]).fixture32(0x94000000),
+    pattern("br", 0xffff_fc1f, 0xd61f_0000, 0x0000_0005, 194, &[]).fixture32(0xd61f0000),
+    pattern("blr", 0xffff_fc1f, 0xd63f_0000, 0x0000_0044, 194, &[]).fixture32(0xd63f0000),
+    pattern("ret", 0xffff_fc1f, 0xd65f_0000, 0x0000_0045, 194, &[]).fixture32(0xd65f03c0),
+    pattern("eret", u32::MAX, 0xd69f_03e0, 0x0000_0046, 194, &[]).recognized_unimplemented(),
+    pattern("drps", u32::MAX, 0xd6bf_03e0, 0x0000_0047, 194, &[]).recognized_unimplemented(),
+    pattern("b.cond", 0xff00_0010, 0x5400_0000, 0x0000_0006, 197, &[]).fixture32(0x54000000),
     pattern(
         "compare-branch",
         0x7e00_0000,
@@ -116,9 +28,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0007,
         78,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x34000000),
     pattern(
         "test-branch",
@@ -127,32 +37,10 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0008,
         77,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x36000000),
-    pattern(
-        "svc",
-        0xffe0_001f,
-        0xd400_0001,
-        0x0000_0009,
-        196,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd4000001),
-    pattern(
-        "brk",
-        0xffe0_001f,
-        0xd420_0000,
-        0x0000_000a,
-        195,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd4200000),
+    pattern("svc", 0xffe0_001f, 0xd400_0001, 0x0000_0009, 196, &[]).fixture32(0xd4000001),
+    pattern("brk", 0xffe0_001f, 0xd420_0000, 0x0000_000a, 195, &[]).fixture32(0xd4200000),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

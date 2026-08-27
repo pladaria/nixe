@@ -1,12 +1,8 @@
 //! Normalized floating-point and Advanced SIMD instructions.
 
-use crate::{decode::table::InstructionPattern, profile::InstructionFeature};
+use crate::decode::table::InstructionPattern;
 
 use super::{A64HelperToken, pattern};
-
-const SIMD: &[InstructionFeature] = &[InstructionFeature::AdvancedSimd];
-const SIMD_FP16: &[InstructionFeature] =
-    &[InstructionFeature::AdvancedSimd, InstructionFeature::Fp16];
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     pattern(
@@ -16,7 +12,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0048,
         130,
         &[],
-        SIMD,
     )
     .fixture32(0x4e01_0c20),
     // Arm A64 DUP (element) broadcasts one selected vector element across all
@@ -29,7 +24,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008c,
         174,
         &[],
-        SIMD,
     )
     .fixture32(0x0e04_07ff),
     pattern(
@@ -39,7 +33,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0049,
         131,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD bitwise operations, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/AND--vector---Bitwise-AND--vector--
@@ -57,9 +50,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0030,
         110,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 ADD (vector) and SUB (vector) allocation and operation,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADD--vector---Add-vector-
@@ -71,9 +62,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0031,
         58,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 Advanced SIMD pairwise integer operations,
     // Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/ADDP--vector---Add-Pairwise--vector--
@@ -88,7 +77,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0059,
         151,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-signed-max-pairwise",
@@ -97,7 +85,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_005a,
         152,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-signed-min-pairwise",
@@ -106,7 +93,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_005b,
         153,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-max-pairwise",
@@ -115,7 +101,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_005c,
         154,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-min-pairwise",
@@ -124,7 +109,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_005d,
         155,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD element-wise integer minimum/maximum,
     // Arm ARM DDI 0602 (2025-12):
@@ -139,7 +123,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0066,
         156,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-signed-min",
@@ -148,7 +131,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0067,
         157,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-max",
@@ -157,7 +139,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0068,
         158,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-min",
@@ -166,7 +147,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0069,
         159,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD integer comparisons between registers,
     // Arm ARM DDI 0602 (2025-12):
@@ -183,7 +163,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004e,
         140,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-unsigned-higher",
@@ -192,7 +171,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004f,
         141,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-signed-greater-equal",
@@ -201,7 +179,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0050,
         142,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-unsigned-higher-same",
@@ -210,7 +187,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0051,
         143,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-test-nonzero",
@@ -219,7 +195,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0052,
         144,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-equal",
@@ -228,7 +203,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0053,
         145,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD integer comparisons against zero,
     // Arm ARM DDI 0602 (2025-12):
@@ -244,7 +218,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0054,
         146,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-zero-signed-greater-equal",
@@ -253,7 +226,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0055,
         147,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-zero-equal",
@@ -262,7 +234,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0056,
         148,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-zero-signed-less-equal",
@@ -271,7 +242,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0057,
         149,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-compare-zero-signed-less-than",
@@ -280,7 +250,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0058,
         150,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-two-source",
@@ -289,7 +258,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0032,
         30,
         &[],
-        SIMD,
     )
     .recognized_unimplemented(),
     pattern(
@@ -299,9 +267,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0033,
         122,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-simd-load-store-unscaled",
         0x3f20_0c00,
@@ -309,9 +275,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0034,
         121,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-scalar-move",
         0xffbf_fc00,
@@ -319,9 +283,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0035,
         109,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 FMOV (register), optional half-precision form. The base S/D
     // forms above remain available with Advanced SIMD while H is explicitly
     // gated by FEAT_FP16. Arm ARM DDI 0602 (2025-12):
@@ -333,9 +295,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0089,
         110,
         &[],
-        SIMD_FP16,
-    )
-    .lowered(),
+    ),
     // Arm A64 FABS/FNEG (scalar) only transform the sign bit. Base S/D and
     // optional FP16 forms are kept as distinct feature-gated patterns. Arm ARM
     // DDI 0602 (2025-12):
@@ -348,7 +308,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008d,
         175,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-negate",
@@ -357,7 +316,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008e,
         175,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-absolute-half",
@@ -366,7 +324,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008f,
         176,
         &[],
-        SIMD_FP16,
     ),
     pattern(
         "fp-scalar-negate-half",
@@ -375,7 +332,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0090,
         176,
         &[],
-        SIMD_FP16,
     ),
     // Arm A64 vector FABS/FNEG clear or toggle each active lane's sign bit
     // without processing the floating-point value. Base 2S/4S/2D forms are
@@ -390,7 +346,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009c,
         210,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-floating-point-negate",
@@ -399,7 +354,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009d,
         210,
         &[],
-        SIMD,
     ),
     // Arm A64 FSQRT (scalar), base single/double precision forms. Optional
     // half precision remains independently feature-gated. Arm ARM DDI 0602
@@ -412,7 +366,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0098,
         208,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-compare-register",
@@ -421,9 +374,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0036,
         108,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-compare-zero",
         0xffbf_fc0f,
@@ -431,9 +382,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0037,
         107,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 FCCMP/FCCMPE conditionally compare scalar S/D operands or copy
     // an immediate NZCV value. FCCMPE signals every NaN while FCCMP signals
     // only signaling NaNs. Optional half precision remains feature-gated
@@ -446,7 +395,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009b,
         209,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD modified-immediate encodings and expansion rules,
     // Arm ARM DDI 0602 (2025-12):
@@ -461,7 +409,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004a,
         132,
         &[],
-        SIMD,
     ),
     // Arm A64 FMOV (vector, immediate). This is the floating-point subfamily
     // of the Advanced SIMD modified-immediate encoding: 2S/4S use a 32-bit
@@ -475,7 +422,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0086,
         201,
         &[],
-        SIMD,
     ),
     // Arm A64 UMOV allocation and operation, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/UMOV--Unsigned-Move-vector-element-to-general-purpose-register-
@@ -486,7 +432,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004b,
         133,
         &[],
-        SIMD,
     )
     .fixture32(0x4e08_3c01),
     // Arm A64 INS copies either another vector element or a general-purpose
@@ -501,7 +446,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0060,
         160,
         &[],
-        SIMD,
     )
     .fixture32(0x6e03_07be),
     pattern(
@@ -511,7 +455,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0061,
         159,
         &[],
-        SIMD,
     )
     .fixture32(0x4e03_1d28),
     // Arm A64 Advanced SIMD two-source permutes, Arm ARM DDI 0602 (2025-12):
@@ -528,7 +471,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0064,
         161,
         &[],
-        SIMD,
     )
     .fixture32(0x4e1d_3bde),
     // Arm A64 EXT selects a byte-aligned window from the concatenation of two
@@ -541,7 +483,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0085,
         171,
         &[],
-        SIMD,
     ),
     // Arm A64 SHRN/SHRN2 shifts unsigned lane bit patterns right and narrows
     // them into the lower or upper 64-bit half of the destination:
@@ -553,7 +494,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0065,
         162,
         &[],
-        SIMD,
     )
     .fixture32(0x0f0c_8400),
     // Arm A64 SSHR/USHR shift each signed or unsigned lane right by an
@@ -567,7 +507,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0091,
         203,
         &[],
-        SIMD,
     )
     .fixture32(0x7f60_07fe),
     pattern(
@@ -577,7 +516,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0092,
         202,
         &[],
-        SIMD,
     )
     .fixture32(0x2f0f_0420),
     // Arm A64 SHL shifts each scalar or vector lane left by an immediate in
@@ -591,7 +529,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0099,
         208,
         &[],
-        SIMD,
     )
     .fixture32(0x5f60_57de),
     pattern(
@@ -601,7 +538,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009a,
         207,
         &[],
-        SIMD,
     )
     .fixture32(0x4f3f_556a),
     // Arm A64 SSHLL/SSHLL2 and USHLL/USHLL2 widen signed or unsigned lanes
@@ -616,9 +552,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_00a0,
         210,
         &[],
-        SIMD,
     )
-    .lowered()
     .fixture32(0x0f20_a7fe),
     // Arm A64 SSHL/USHL use the signed low byte of each shift-count lane to
     // select a left (non-negative) or right (negative) shift independently.
@@ -633,7 +567,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0095,
         206,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-shift-left-register",
@@ -642,7 +575,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0096,
         206,
         &[],
-        SIMD,
     ),
     // Arm A64 CNT computes the population count of each byte in a 64-bit or
     // 128-bit vector independently. Arm A64 ISA (2025):
@@ -654,7 +586,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0093,
         204,
         &[],
-        SIMD,
     ),
     // Arm A64 ADDV adds every active vector element and writes the modular
     // scalar result while clearing the remaining destination bits. Arm ARM
@@ -667,7 +598,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0094,
         205,
         &[],
-        SIMD,
     ),
     // Arm A64 XTN/XTN2 extract the low half of every source element into the
     // lower or upper 64-bit half of the destination, respectively. Arm ARM
@@ -680,7 +610,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0088,
         172,
         &[],
-        SIMD,
     ),
     // Arm A64 Advanced SIMD load/store multiple structures allocation and
     // operation, Arm ARM DDI 0602 (2025-12):
@@ -693,7 +622,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004c,
         135,
         &[],
-        SIMD,
     )
     .fixture32(0x4c40_a020),
     pattern(
@@ -703,7 +631,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_004d,
         136,
         &[],
-        SIMD,
     )
     .fixture32(0x4cdf_a041),
     // Arm A64 LD1/ST1 single-structure lane transfers, including immediate
@@ -717,7 +644,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0062,
         158,
         &[],
-        SIMD,
     )
     .fixture32(0x0d40_183d),
     pattern(
@@ -727,7 +653,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0063,
         157,
         &[],
-        SIMD,
     )
     .fixture32(0x0ddf_1e30),
     // Arm A64 Advanced SIMD integer-to-floating-point vector conversions,
@@ -741,7 +666,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006a,
         160,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-unsigned-int-to-float",
@@ -750,7 +674,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006b,
         160,
         &[],
-        SIMD,
     ),
     // Arm A64 SCVTF/UCVTF (scalar, SIMD register), base single/double
     // precision forms. These consume the low integer element of Vn and write
@@ -764,7 +687,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008a,
         173,
         &[],
-        SIMD,
     ),
     pattern(
         "simd-scalar-unsigned-int-to-float",
@@ -773,7 +695,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_008b,
         173,
         &[],
-        SIMD,
     ),
     // Arm A64 FDIV (vector), Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FDIV--vector---Floating-point-Divide--vector--
@@ -784,7 +705,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006c,
         161,
         &[],
-        SIMD,
     ),
     // Arm A64 FMOV (scalar, immediate), including the optional half-precision
     // form, Arm ARM DDI 0602 (2025-12):
@@ -796,7 +716,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006d,
         163,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-immediate-half",
@@ -805,7 +724,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006e,
         164,
         &[],
-        SIMD_FP16,
     ),
     // Arm A64 FCVT (scalar) base single/double precision conversions. The
     // optional half-precision forms remain behind the recognized unsupported classification.
@@ -818,7 +736,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_006f,
         165,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-convert-double-to-single",
@@ -827,7 +744,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0070,
         165,
         &[],
-        SIMD,
     ),
     // Arm A64 FDIV (scalar), base single/double precision forms. The optional
     // half-precision form remains behind the recognized unsupported classification.
@@ -840,7 +756,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0071,
         166,
         &[],
-        SIMD,
     ),
     // Arm A64 FADD/FSUB (scalar), base single/double precision forms. They
     // supersede the broad scalar-two-source classifier while optional
@@ -855,7 +770,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0079,
         168,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-floating-point-subtract",
@@ -864,7 +778,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007a,
         168,
         &[],
-        SIMD,
     ),
     // Arm A64 FMUL/FNMUL (scalar), base single/double precision forms. The
     // optional half-precision forms remain behind the recognized unsupported classification.
@@ -878,7 +791,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007b,
         169,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-floating-point-negated-multiply",
@@ -887,7 +799,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007c,
         169,
         &[],
-        SIMD,
     ),
     // Arm A64 FMADD/FMSUB/FNMADD/FNMSUB (scalar), base single/double
     // precision forms. These are fused operations: the product and addend are
@@ -903,7 +814,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0097,
         207,
         &[],
-        SIMD,
     ),
     // Arm A64 FCSEL (scalar), base single/double precision forms. FCSEL is a
     // bitwise choice between scalar register contents and does not process the
@@ -917,7 +827,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0087,
         170,
         &[],
-        SIMD,
     ),
     // Arm A64 FRINTN/P/M/Z/A/X/I (scalar), base single/double precision
     // forms. Optional half-precision and later FRINT32/64 forms remain behind
@@ -930,7 +839,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0072,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-positive",
@@ -939,7 +847,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0073,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-negative",
@@ -948,7 +855,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0074,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-zero",
@@ -957,7 +863,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0075,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-nearest-away",
@@ -966,7 +871,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0076,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-exact",
@@ -975,7 +879,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0077,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-scalar-round-current-mode",
@@ -984,7 +887,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0078,
         167,
         &[],
-        SIMD,
     ),
     pattern(
         "advanced-simd-unsupported",
@@ -993,7 +895,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0038,
         2,
         &[],
-        SIMD,
     )
     .recognized_unimplemented(),
     pattern(
@@ -1003,7 +904,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0039,
         1,
         &[],
-        SIMD,
     )
     .recognized_unimplemented(),
     // Arm A64 SCVTF/UCVTF (scalar, integer), restricted here to the base
@@ -1019,9 +919,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003a,
         106,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-unsigned-int-to-float",
         0x5fbf_fc00,
@@ -1029,9 +927,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003b,
         105,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 FCVTZS/FCVTZU (scalar, integer), covering the base S/D-to-W/X
     // forms. Both operations round toward zero and return a saturated integer
     // for an out-of-range operand. Arm ARM DDI 0602 (2025-12):
@@ -1044,7 +940,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003c,
         104,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-unsigned-int",
@@ -1053,7 +948,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003d,
         103,
         &[],
-        SIMD,
     ),
     // Arm A64 FCVTZS/FCVTZU (scalar, fixed-point). The scale field encodes
     // `fbits` as 64-scale; the 32-bit destination forms reserve fbits>32.
@@ -1067,7 +961,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009e,
         176,
         &[],
-        SIMD,
     )
     .fixture32(0x1e18_e027),
     pattern(
@@ -1077,7 +970,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_009f,
         175,
         &[],
-        SIMD,
     )
     .fixture32(0x1e19_e027),
     // Arm A64 scalar floating-point to integer conversions with an explicit
@@ -1099,7 +991,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007d,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-unsigned-int-nearest-even",
@@ -1108,7 +999,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007e,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-signed-int-nearest-away",
@@ -1117,7 +1007,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_007f,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-unsigned-int-nearest-away",
@@ -1126,7 +1015,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0080,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-signed-int-positive",
@@ -1135,7 +1023,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0081,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-unsigned-int-positive",
@@ -1144,7 +1031,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0082,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-signed-int-negative",
@@ -1153,7 +1039,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0083,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-float-to-unsigned-int-negative",
@@ -1162,7 +1047,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0084,
         170,
         &[],
-        SIMD,
     ),
     pattern(
         "fp-move-to-general",
@@ -1171,9 +1055,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003e,
         102,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-move-from-general",
         0x5f37_fc00,
@@ -1181,9 +1063,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_003f,
         101,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     // Arm A64 LDR/STR (immediate, SIMD&FP) allocation and operation,
     // including the signed pre-index and post-index forms, Arm ARM DDI 0602 (2025-12):
     // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/LDR--immediate--SIMD-FP---Load-SIMD-FP-register--immediate-offset--
@@ -1195,9 +1075,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0040,
         120,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-simd-load-store-pre-index",
         0x3f20_0c00,
@@ -1205,9 +1083,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0041,
         119,
         &[],
-        SIMD,
-    )
-    .lowered(),
+    ),
     pattern(
         "fp-simd-load-store-register",
         0x3f20_0c00,
@@ -1215,9 +1091,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0042,
         118,
         &[],
-        SIMD,
     )
-    .lowered()
     .fixture32(0x3c22_4820),
     pattern(
         "fp-simd-load-literal",
@@ -1226,7 +1100,6 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0043,
         123,
         &[],
-        SIMD,
     )
     .recognized_unimplemented(),
 ];

@@ -12,13 +12,9 @@ use std::{
 
 use nixe_cpu::{
     decode::{DecodeResult, a64::A64Instruction},
-    location::{ExecutionState, InstructionEncoding, LocationDescriptor},
-    profile::GuestCpuProfile,
-    state::{
-        A32State, A64State, ThreadCpuState,
-        a32::{A32GeneralRegister, Cpsr},
-        a64::{A64GeneralRegister, A64Register, Nzcv},
-    },
+    location::LocationDescriptor,
+    platform::TargetPlatform,
+    state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv},
 };
 use nixe_cpu_interpreter::{InstructionStep, execute_one};
 
@@ -27,23 +23,6 @@ const RUNNER_SOURCE: &str = concat!(
     "/tests/oracle/arm_oracle_runner.c"
 );
 static QEMU_GDB_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Debug)]
-struct OracleMetadata {
-    emulator: String,
-    version: String,
-    profile: &'static str,
-    execution_state: ExecutionState,
-}
-
-#[derive(Clone, Copy)]
-struct OracleConfiguration {
-    state: ExecutionState,
-    compiler_default: &'static str,
-    compiler_environment: &'static str,
-    emulator_default: &'static str,
-    emulator_environment: &'static str,
-}
 
 struct A64OracleFixture {
     _serial: MutexGuard<'static, ()>,
@@ -54,18 +33,11 @@ struct A64OracleFixture {
 
 impl A64OracleFixture {
     fn new() -> Self {
-        let configuration = configurations()[0];
-        let compiler = configured_tool(
-            configuration.compiler_environment,
-            configuration.compiler_default,
-        );
-        let emulator = configured_tool(
-            configuration.emulator_environment,
-            configuration.emulator_default,
-        );
-        let temporary = TestDirectory::new(ExecutionState::A64);
+        let compiler = configured_tool("NIXE_AARCH64_CC", "aarch64-linux-gnu-gcc");
+        let emulator = configured_tool("NIXE_QEMU_AARCH64", "qemu-aarch64");
+        let temporary = TestDirectory::new();
         let runner = temporary.path().join("a64-oracle-runner");
-        compile_runner(&compiler, ExecutionState::A64, &runner);
+        compile_runner(&compiler, &runner);
         let slot = symbol_address(&runner, "nixe_oracle_slot");
         Self {
             _serial: qemu_gdb_test_guard(),
@@ -73,14 +45,6 @@ impl A64OracleFixture {
             slot,
             oracle: QemuA64Oracle::start(&emulator, &runner),
         }
-    }
-}
-
-#[test]
-#[ignore = "requires the optional QEMU user-mode and Arm cross-toolchain dependencies"]
-fn qemu_user_mode_matches_adds_for_a64_a32_and_t32() {
-    for configuration in configurations() {
-        run_configuration(configuration);
     }
 }
 
@@ -130,14 +94,12 @@ fn qemu_a64_matches_control_and_stateless_system_semantics() {
     for (index, (encoding, _)) in cases.iter().enumerate() {
         oracle.write_instruction(slot + index as u64 * 4, *encoding);
     }
-    let profile = GuestCpuProfile::switch_1();
+    let profile = TargetPlatform::Switch1;
     for (index, (encoding, name)) in cases.into_iter().enumerate() {
         let pc = slot + index as u64 * 4;
         let target = pc + 8;
         let mut expected = initial_oracle_a64_state(pc);
-        let ThreadCpuState::A64(state) = &mut expected else {
-            unreachable!()
-        };
+        let state = &mut expected;
         state.write_x(x(0), target);
         state.write_x(x(30), target);
         oracle.write_register(0, target);
@@ -145,14 +107,11 @@ fn qemu_a64_matches_control_and_stateless_system_semantics() {
         oracle.write_raw_register(33, &state.nzcv().bits().to_le_bytes());
         oracle.write_register(A64_PC_REGISTER, pc);
 
-        let outcome = execute_one(&profile, &mut expected, encoding.into())
+        let outcome = execute_one(&profile, &mut expected, encoding)
             .unwrap_or_else(|error| panic!("{name} ({encoding:#010x}) failed in Nixe: {error}"));
         assert!(matches!(outcome, InstructionStep::Continue));
         oracle.step(name, encoding);
 
-        let ThreadCpuState::A64(expected) = expected else {
-            unreachable!()
-        };
         assert_eq!(
             oracle.read_register(30),
             expected.read_x(x(30)),
@@ -167,7 +126,7 @@ fn qemu_a64_matches_control_and_stateless_system_semantics() {
             oracle
                 .read_raw_register(33)
                 .try_into()
-                .expect("32-bit CPSR"),
+                .expect("32-bit NZCV"),
         ) & 0xf000_0000;
         assert_eq!(observed_nzcv, expected.nzcv().bits(), "{name} NZCV");
     }
@@ -181,7 +140,7 @@ fn qemu_a64_matches_every_register_semantic_family() {
     let slot = fixture.slot;
     let objdump = configured_tool("NIXE_AARCH64_OBJDUMP", "aarch64-linux-gnu-objdump");
 
-    let profile = GuestCpuProfile::switch_1();
+    let profile = TargetPlatform::Switch1;
     let mut cases = Vec::new();
     let mut covered = BTreeMap::new();
     for pattern in nixe_cpu::decode::a64::patterns() {
@@ -420,7 +379,7 @@ fn register_semantic_id(id: u32) -> bool {
 }
 
 fn allocated_register_encoding(
-    profile: &GuestCpuProfile,
+    profile: &TargetPlatform,
     coverage_id: u32,
     pattern_mask: u32,
     pattern_value: u32,
@@ -441,8 +400,7 @@ fn allocated_register_encoding(
         let encoding = pattern_value | (variable & !pattern_mask);
         let location = LocationDescriptor::new(
             nixe_memory::GuestVirtualAddress::new(0x1000),
-            ExecutionState::A64,
-            profile.id(),
+            profile.profile_id(),
         );
         let DecodeResult::Decoded(decoded) =
             nixe_cpu::decode::decode(profile, location, encoding.into())
@@ -467,7 +425,7 @@ fn allocated_register_encoding(
     for encoding in allocated_a64_encodings(objdump, temporary, coverage_id, &candidates) {
         let mut state = initial_oracle_a64_state(0x1000);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_one(profile, &mut state, encoding.into())
+            execute_one(profile, &mut state, encoding)
         }))
         .unwrap_or_else(|_| {
             panic!(
@@ -525,7 +483,7 @@ fn allocated_a64_encodings(
     allocated
 }
 
-fn initial_oracle_a64_state(pc: u64) -> ThreadCpuState {
+fn initial_oracle_a64_state(pc: u64) -> A64State {
     let mut state = A64State::default();
     for index in 0..31 {
         state.write_x(
@@ -540,24 +498,21 @@ fn initial_oracle_a64_state(pc: u64) -> ThreadCpuState {
         let lane = 0x3f80_0000_u128 | (u128::from(index) << 32);
         assert!(state.set_vector(index, lane | (lane << 64)));
     }
-    ThreadCpuState::A64(Box::new(state))
+    state
 }
 
 fn compare_a64_register_case(
-    profile: &GuestCpuProfile,
+    profile: &TargetPlatform,
     oracle: &mut QemuA64Oracle,
     slot: u64,
     encoding: u32,
     name: &str,
 ) {
     let mut expected = initial_oracle_a64_state(slot);
-    let ThreadCpuState::A64(initial) = &expected else {
-        unreachable!()
-    };
+    let initial = &expected;
     let location = LocationDescriptor::new(
         nixe_memory::GuestVirtualAddress::new(slot),
-        ExecutionState::A64,
-        profile.id(),
+        profile.profile_id(),
     );
     let decoded = match nixe_cpu::decode::decode(profile, location, encoding.into()) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => decoded,
@@ -606,7 +561,7 @@ fn compare_a64_register_case(
     }
     oracle.write_register(A64_PC_REGISTER, slot);
 
-    let outcome = execute_one(profile, &mut expected, encoding.into())
+    let outcome = execute_one(profile, &mut expected, encoding)
         .unwrap_or_else(|error| panic!("{name} ({encoding:#010x}) failed in Nixe: {error}"));
     assert!(
         matches!(outcome, InstructionStep::Continue),
@@ -614,9 +569,6 @@ fn compare_a64_register_case(
     );
     oracle.step(name, encoding);
 
-    let ThreadCpuState::A64(expected) = expected else {
-        unreachable!()
-    };
     for index in registers.iter().copied().filter(|index| *index < 31) {
         assert_eq!(
             oracle.read_register(u32::from(index)),
@@ -633,7 +585,7 @@ fn compare_a64_register_case(
         oracle
             .read_raw_register(33)
             .try_into()
-            .expect("32-bit CPSR"),
+            .expect("32-bit NZCV"),
     ) & 0xf000_0000;
     assert_eq!(
         qemu_nzcv,
@@ -858,55 +810,16 @@ fn decode_hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn run_configuration(configuration: OracleConfiguration) {
-    let compiler = configured_tool(
-        configuration.compiler_environment,
-        configuration.compiler_default,
-    );
-    let emulator = configured_tool(
-        configuration.emulator_environment,
-        configuration.emulator_default,
-    );
-    let temporary = TestDirectory::new(configuration.state);
-    let runner = temporary.path().join(match configuration.state {
-        ExecutionState::A64 => "a64-oracle-runner",
-        ExecutionState::A32 => "a32-oracle-runner",
-        ExecutionState::T32 => "t32-oracle-runner",
-    });
-    compile_runner(&compiler, configuration.state, &runner);
-    let version = tool_version(&emulator);
-    let metadata = OracleMetadata {
-        emulator: emulator.clone(),
-        version,
-        profile: "armv8-a",
-        execution_state: configuration.state,
-    };
-    eprintln!(
-        "oracle={} version={} profile={} state={}",
-        metadata.emulator, metadata.version, metadata.profile, metadata.execution_state
-    );
-
-    for (lhs, rhs) in operands(configuration.state) {
-        let expected = nixe_adds(configuration.state, lhs, rhs);
-        let observed = qemu_adds(&emulator, &runner, configuration.state, lhs, rhs);
-        assert_eq!(
-            observed, expected,
-            "QEMU mismatch for {} lhs={lhs:#x} rhs={rhs:#x}; metadata={metadata:?}",
-            configuration.state
-        );
-    }
-}
-
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
-    fn new(state: ExecutionState) -> Self {
+    fn new() -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "nixe-qemu-differential-{}-{state}-{nonce}",
+            "nixe-qemu-a64-differential-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create QEMU differential build directory");
@@ -924,60 +837,21 @@ impl Drop for TestDirectory {
     }
 }
 
-fn configurations() -> [OracleConfiguration; 3] {
-    [
-        OracleConfiguration {
-            state: ExecutionState::A64,
-            compiler_default: "aarch64-linux-gnu-gcc",
-            compiler_environment: "NIXE_AARCH64_CC",
-            emulator_default: "qemu-aarch64",
-            emulator_environment: "NIXE_QEMU_AARCH64",
-        },
-        OracleConfiguration {
-            state: ExecutionState::A32,
-            compiler_default: "arm-linux-gnueabihf-gcc",
-            compiler_environment: "NIXE_ARM_CC",
-            emulator_default: "qemu-arm",
-            emulator_environment: "NIXE_QEMU_ARM",
-        },
-        OracleConfiguration {
-            state: ExecutionState::T32,
-            compiler_default: "arm-linux-gnueabihf-gcc",
-            compiler_environment: "NIXE_ARM_CC",
-            emulator_default: "qemu-arm",
-            emulator_environment: "NIXE_QEMU_ARM",
-        },
-    ]
-}
-
 fn configured_tool(environment: &str, default: &str) -> String {
     env::var(environment).unwrap_or_else(|_| default.to_string())
 }
 
-fn compile_runner(compiler: &str, state: ExecutionState, output: &Path) {
-    let mut command = Command::new(compiler);
-    command.args([
-        "-std=c11",
-        "-O2",
-        "-static",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-march=armv8-a",
-    ]);
-    if state != ExecutionState::A64 {
-        command.arg("-mfpu=neon-fp-armv8");
-    }
-    match state {
-        ExecutionState::A32 => {
-            command.arg("-marm");
-        }
-        ExecutionState::T32 => {
-            command.arg("-mthumb");
-        }
-        ExecutionState::A64 => {}
-    }
-    let result = command
+fn compile_runner(compiler: &str, output: &Path) {
+    let result = Command::new(compiler)
+        .args([
+            "-std=c11",
+            "-O2",
+            "-static",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-march=armv8-a",
+        ])
         .arg(RUNNER_SOURCE)
         .arg("-o")
         .arg(output)
@@ -990,133 +864,6 @@ fn compile_runner(compiler: &str, state: ExecutionState, output: &Path) {
     );
 }
 
-fn tool_version(tool: &str) -> String {
-    let output = Command::new(tool)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to query {tool}: {error}"));
-    assert!(output.status.success(), "{tool} --version failed");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn qemu_adds(
-    emulator: &str,
-    runner: &Path,
-    state: ExecutionState,
-    lhs: u64,
-    rhs: u64,
-) -> (u64, u32) {
-    let output = Command::new(emulator)
-        .arg(runner)
-        .arg(format!("{lhs:x}"))
-        .arg(format!("{rhs:x}"))
-        .output()
-        .unwrap_or_else(|error| panic!("failed to launch {emulator}: {error}"));
-    assert!(
-        output.status.success(),
-        "{emulator} oracle failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("oracle output is UTF-8");
-    let fields: BTreeMap<_, _> = stdout
-        .split_whitespace()
-        .map(|field| field.split_once('=').expect("oracle field uses key=value"))
-        .collect();
-    let expected_arch = match state {
-        ExecutionState::A64 => "a64",
-        ExecutionState::A32 => "a32",
-        ExecutionState::T32 => "t32",
-    };
-    assert_eq!(fields.get("arch"), Some(&expected_arch));
-    assert_eq!(fields.get("profile"), Some(&"armv8-a"));
-    (
-        u64::from_str_radix(fields["result"], 16).expect("hexadecimal result"),
-        u32::from_str_radix(fields["flags"], 16).expect("hexadecimal flags"),
-    )
-}
-
-fn nixe_adds(state: ExecutionState, lhs: u64, rhs: u64) -> (u64, u32) {
-    let profile = GuestCpuProfile::switch_1();
-    let (mut state, encoding) = match state {
-        ExecutionState::A64 => {
-            let mut cpu = A64State::default();
-            cpu.write_x(x(1), lhs);
-            cpu.write_x(x(2), rhs);
-            (
-                ThreadCpuState::A64(Box::new(cpu)),
-                InstructionEncoding::from_u32(0xab02_0020), // ADDS X0,X1,X2
-            )
-        }
-        ExecutionState::A32 => {
-            let mut cpu = A32State::a32();
-            cpu.write_r(r(1), lhs as u32);
-            cpu.write_r(r(2), rhs as u32);
-            (
-                ThreadCpuState::A32(Box::new(cpu)),
-                InstructionEncoding::from_u32(0xe091_0002), // ADDS R0,R1,R2
-            )
-        }
-        ExecutionState::T32 => {
-            let mut cpu = A32State::t32();
-            cpu.write_r(r(1), lhs as u32);
-            cpu.write_r(r(2), rhs as u32);
-            (
-                ThreadCpuState::A32(Box::new(cpu)),
-                InstructionEncoding::from_u16(0x1888), // ADDS R0,R1,R2
-            )
-        }
-    };
-    let outcome = execute_one(&profile, &mut state, encoding).expect("Nixe implements ADDS");
-    assert!(matches!(outcome, InstructionStep::Continue));
-    match state {
-        ThreadCpuState::A64(cpu) => (cpu.read_x(x(0)), cpu.nzcv().bits()),
-        ThreadCpuState::A32(cpu) => (
-            u64::from(cpu.read_r(r(0))),
-            cpu.cpsr().bits() & (Cpsr::N | Cpsr::Z | Cpsr::C | Cpsr::V),
-        ),
-    }
-}
-
-fn operands(state: ExecutionState) -> Vec<(u64, u64)> {
-    let mask = if state == ExecutionState::A64 {
-        u64::MAX
-    } else {
-        u64::from(u32::MAX)
-    };
-    let sign = if state == ExecutionState::A64 {
-        1_u64 << 63
-    } else {
-        1_u64 << 31
-    };
-    let mut values = vec![
-        (0, 0),
-        (mask, 1),
-        (sign - 1, 1),
-        (sign, sign),
-        (0x1234_5678 & mask, 0x7654_3210 & mask),
-    ];
-    let mut random = 0x7175_656d_755f_6469_u64;
-    for _ in 0..24 {
-        random ^= random << 13;
-        random ^= random >> 7;
-        random ^= random << 17;
-        let lhs = random & mask;
-        random ^= random << 13;
-        random ^= random >> 7;
-        random ^= random << 17;
-        values.push((lhs, random & mask));
-    }
-    values
-}
-
 fn x(index: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(index).unwrap())
-}
-
-fn r(index: u8) -> A32GeneralRegister {
-    A32GeneralRegister::new(index).unwrap()
 }

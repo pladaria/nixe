@@ -5,12 +5,12 @@ use std::collections::BTreeSet;
 use libfuzzer_sys::fuzz_target;
 use nixe_cpu::{
     decode::{self, DecodeResult, OperandValue},
-    location::{ExecutionState, InstructionEncoding, LocationDescriptor},
-    profile::GuestCpuProfile,
+    location::{InstructionEncoding, LocationDescriptor},
+    platform::TargetPlatform,
     semantics::{
         bits::{self, BitWidth},
         immediate,
-        shifts::{self, A32ShiftKind, ShiftKind},
+        shifts::{self, ShiftKind},
     },
 };
 use nixe_memory::GuestVirtualAddress;
@@ -25,23 +25,16 @@ fuzz_target!(|data: &[u8]| {
     input[..copied].copy_from_slice(&data[..copied]);
 
     let bits = u32::from_le_bytes(input[0..4].try_into().unwrap());
-    let state = match input[4] % 3 {
-        0 => ExecutionState::A64,
-        1 => ExecutionState::A32,
-        _ => ExecutionState::T32,
-    };
-    let encoding = match state {
-        ExecutionState::T32 if input[5] & 1 == 0 => InstructionEncoding::from_u16(bits as u16),
-        _ => InstructionEncoding::from_u32(bits),
-    };
-    let profile = if state == ExecutionState::A64 && input[5] & 2 != 0 {
-        GuestCpuProfile::switch_2_native()
+    let encoding = InstructionEncoding::from_u32(bits);
+    let platform = if input[5] & 1 == 0 {
+        TargetPlatform::Switch1
     } else {
-        GuestCpuProfile::switch_1()
+        TargetPlatform::Switch2
     };
-    let location = LocationDescriptor::new(GuestVirtualAddress::new(0x1000), state, profile.id());
+    let location =
+        LocationDescriptor::new(GuestVirtualAddress::new(0x1000), platform.profile_id());
 
-    match decode::decode(&profile, location, encoding) {
+    match decode::decode(platform, location, encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
             let operands = decoded.instruction.operands();
             assert!(operands.len() <= 8);
@@ -49,25 +42,12 @@ fuzz_target!(|data: &[u8]| {
             for (identity, value) in operands.iter() {
                 assert!(identities.insert(identity));
                 if let OperandValue::Register { class, index } = value {
-                    let maximum = match class {
-                        decode::RegisterClass::A64General => 32,
-                        decode::RegisterClass::A32General => 16,
-                    };
-                    assert!(index < maximum);
+                    assert_eq!(class, decode::RegisterClass::A64General);
+                    assert!(index < 32);
                 }
             }
             assert!(decode::disassemble(&decoded.instruction).to_string().len() <= 512);
-            match state {
-                ExecutionState::A64 => {
-                    let _ = decode::a64::normalize(&decoded.instruction, encoding);
-                }
-                ExecutionState::A32 => {
-                    let _ = decode::a32::normalize(&decoded.instruction, encoding);
-                }
-                ExecutionState::T32 => {
-                    let _ = decode::t32::normalize(&decoded.instruction, encoding);
-                }
-            }
+            let _ = decode::a64::normalize(&decoded.instruction, encoding);
         }
         DecodeResult::Unallocated { .. } | DecodeResult::Reserved { .. } => {}
     }
@@ -84,7 +64,6 @@ fuzz_target!(|data: &[u8]| {
         let _ = bits::rotate_right(value, source_width, u32::from(input[11]));
     }
 
-    let immediate_bits = u16::from_le_bytes([input[12], input[13]]);
     let carry = input[14] & 1 != 0;
     let _ = immediate::decode_a64_bit_masks(
         input[15] & 1 != 0,
@@ -93,8 +72,6 @@ fuzz_target!(|data: &[u8]| {
         input[18],
         input[19] & 1 != 0,
     );
-    let _ = immediate::expand_a32_modified_immediate(immediate_bits, carry);
-    let _ = immediate::expand_t32_modified_immediate(immediate_bits, carry);
     if let Ok(width) = BitWidth::new(input[18]) {
         let kind = match input[19] % 4 {
             0 => ShiftKind::LogicalLeft,
@@ -110,13 +87,4 @@ fuzz_target!(|data: &[u8]| {
             carry,
         );
     }
-    let a32_kind = match input[18] % 5 {
-        0 => A32ShiftKind::LogicalLeft,
-        1 => A32ShiftKind::LogicalRight,
-        2 => A32ShiftKind::ArithmeticRight,
-        3 => A32ShiftKind::RotateRight,
-        _ => A32ShiftKind::RotateRightExtended,
-    };
-    let _ = shifts::a32_shift_with_carry(bits, a32_kind, u32::from(input[19]), carry);
-    let _ = shifts::decode_a32_immediate_shift(input[18], input[19]);
 });

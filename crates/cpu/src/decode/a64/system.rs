@@ -2,31 +2,11 @@
 
 use crate::decode::table::InstructionPattern;
 
-use super::{NO_FEATURES, pattern};
+use super::pattern;
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
-    pattern(
-        "hint",
-        0xffff_f01f,
-        0xd503_201f,
-        0x0000_000b,
-        190,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd503_203f),
-    pattern(
-        "mrs",
-        0xfff0_0000,
-        0xd530_0000,
-        0x0000_000c,
-        70,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd53b_4200),
+    pattern("hint", 0xffff_f01f, 0xd503_201f, 0x0000_000b, 190, &[]).fixture32(0xd503_203f),
+    pattern("mrs", 0xfff0_0000, 0xd530_0000, 0x0000_000c, 70, &[]).fixture32(0xd53b_4200),
     pattern(
         "msr-register",
         0xfff0_0000,
@@ -34,32 +14,10 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_000d,
         69,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0xd51b_4200),
-    pattern(
-        "barrier",
-        0xffff_f01f,
-        0xd503_301f,
-        0x0000_000e,
-        189,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd503_3bbf),
-    pattern(
-        "system",
-        0xffc0_0000,
-        0xd500_0000,
-        0x0000_000f,
-        20,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered()
-    .fixture32(0xd508_7500),
+    pattern("barrier", 0xffff_f01f, 0xd503_301f, 0x0000_000e, 189, &[]).fixture32(0xd503_3bbf),
+    pattern("system", 0xffc0_0000, 0xd500_0000, 0x0000_000f, 20, &[]).fixture32(0xd508_7500),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

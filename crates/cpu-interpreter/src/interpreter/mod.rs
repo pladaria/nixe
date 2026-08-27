@@ -4,10 +4,7 @@
 //! deliberately does not execute frontend IR, making it useful as an
 //! independent oracle for differential tests.
 
-mod a32;
 mod a64;
-mod aarch32;
-mod t32;
 
 use core::{cell::RefCell, fmt};
 
@@ -15,13 +12,11 @@ use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventS
 use nixe_cpu::{
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
-    location::{
-        DecodedInstruction, ExecutionState, InstructionEncoding, LocationDescriptor,
-        current_location,
-    },
+    location::{DecodedInstruction, InstructionEncoding, LocationDescriptor},
     memory::{CpuMemory, SyntheticMemory},
-    profile::{GuestCpuProfile, ProcessCpuContext},
-    state::ThreadCpuState,
+    platform::TargetPlatform,
+    profile::ProcessCpuContext,
+    state::a64::A64State,
 };
 use nixe_memory::AddressSpaceId;
 
@@ -134,11 +129,6 @@ impl ArchitecturalTimer for ZeroTimer {
 /// Deterministic interpreter failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterpreterError {
-    /// Terminator, decoded instruction, and live architectural state disagree.
-    ContextMismatch {
-        source: LocationDescriptor,
-        reason: Box<str>,
-    },
     /// No reference semantics exist for a recognized instruction.
     UnsupportedInstruction {
         source: LocationDescriptor,
@@ -156,12 +146,6 @@ pub enum InterpreterError {
 impl fmt::Display for InterpreterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ContextMismatch { source, reason } => {
-                write!(
-                    formatter,
-                    "interpreter context mismatch: {source} reason={reason}"
-                )
-            }
             Self::UnsupportedInstruction {
                 source,
                 encoding,
@@ -187,16 +171,16 @@ impl std::error::Error for InterpreterError {}
 
 /// Executes one already-fetched instruction as a reference-engine step.
 pub fn execute_one(
-    profile: &GuestCpuProfile,
-    state: &mut ThreadCpuState,
-    encoding: InstructionEncoding,
+    platform: &TargetPlatform,
+    state: &mut A64State,
+    encoding: u32,
 ) -> Result<InstructionStep, InterpreterError> {
     let memory = SyntheticMemory::new();
     let monitor = RefCell::new(Default::default());
     let timer = ZeroTimer;
     let events = VcpuEventState::default();
     let context = InterpreterContext::new(
-        ProcessCpuContext::new(*profile, AddressSpaceId::new(0)),
+        ProcessCpuContext::new(*platform, AddressSpaceId::new(0)),
         &memory,
         &monitor,
         &timer,
@@ -208,11 +192,15 @@ pub fn execute_one(
 /// Executes one instruction with process address-space and memory services.
 pub fn execute_one_with_context(
     context: InterpreterContext<'_>,
-    state: &mut ThreadCpuState,
-    encoding: InstructionEncoding,
+    state: &mut A64State,
+    encoding: u32,
 ) -> Result<InstructionStep, InterpreterError> {
     let process = context.process();
-    let source = current_location(process, state);
+    let source = LocationDescriptor::new(
+        nixe_memory::GuestVirtualAddress::new(state.pc()),
+        process.profile_id(),
+    );
+    let encoding = InstructionEncoding::from_u32(encoding);
     match decode::decode(process.decoder(), source, encoding) {
         DecodeResult::Decoded(decoded) | DecodeResult::RecognizedUnimplemented(decoded) => {
             execute_decoded(context, state, &decoded)
@@ -239,15 +227,10 @@ pub fn execute_one_with_context(
 
 pub(crate) fn execute_decoded(
     context: InterpreterContext<'_>,
-    state: &mut ThreadCpuState,
+    state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<InstructionStep, InterpreterError> {
-    match (state, decoded.location.execution_state) {
-        (ThreadCpuState::A64(state), ExecutionState::A64) => a64::execute(context, state, decoded),
-        (ThreadCpuState::A32(state), ExecutionState::A32) => a32::execute(context, state, decoded),
-        (ThreadCpuState::A32(state), ExecutionState::T32) => t32::execute(context, state, decoded),
-        _ => unreachable!("current location must match canonical architectural state"),
-    }
+    a64::execute(context, state, decoded)
 }
 
 fn unsupported(decoded: &DecodedInstruction<DecodedOpcode>) -> InterpreterError {

@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
     DirectoryEntryKind, HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport,
@@ -83,9 +82,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
-    let ThreadCpuState::A64(state) = process.main_thread().state() else {
-        panic!("NRO must enter in A64 state")
-    };
+    let state = process.main_thread().state();
     assert_ne!(
         state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
         0

@@ -1,6 +1,6 @@
-//! Closed target-platform selection and immutable decoder binding.
+//! Closed platform selection and immutable A64 decoder ownership.
 
-use crate::profile::{GuestCpuProfile, InstructionFeature};
+use crate::profile::CpuProfileId;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum TargetPlatform {
@@ -11,28 +11,23 @@ pub enum TargetPlatform {
 
 impl TargetPlatform {
     #[must_use]
-    pub const fn from_profile(profile: GuestCpuProfile) -> Self {
-        if profile.id().get() == GuestCpuProfile::SWITCH_2_NATIVE_ID.get() {
-            Self::Switch2
-        } else {
-            Self::Switch1
+    pub const fn profile_id(self) -> CpuProfileId {
+        match self {
+            Self::Switch1 => CpuProfileId::new(1),
+            Self::Switch2 => CpuProfileId::new(2),
         }
     }
 
     #[must_use]
-    pub const fn profile(self) -> GuestCpuProfile {
+    pub const fn data_zero_block_bytes(self) -> u32 {
         match self {
-            Self::Switch1 => GuestCpuProfile::switch_1(),
-            Self::Switch2 => GuestCpuProfile::switch_2_native(),
+            Self::Switch1 | Self::Switch2 => 64,
         }
     }
 
     #[must_use]
-    pub const fn supports(self, feature: InstructionFeature) -> bool {
-        match self {
-            Self::Switch1 => matches!(feature, InstructionFeature::AdvancedSimd),
-            Self::Switch2 => false,
-        }
+    pub const fn user_cache_maintenance_prohibited(self) -> bool {
+        matches!(self, Self::Switch1)
     }
 }
 
@@ -53,8 +48,14 @@ impl PlatformDecoder {
     }
 }
 
-impl From<&GuestCpuProfile> for PlatformDecoder {
-    fn from(profile: &GuestCpuProfile) -> Self {
-        Self::new(TargetPlatform::from_profile(*profile))
+impl From<TargetPlatform> for PlatformDecoder {
+    fn from(platform: TargetPlatform) -> Self {
+        Self::new(platform)
+    }
+}
+
+impl From<&TargetPlatform> for PlatformDecoder {
+    fn from(platform: &TargetPlatform) -> Self {
+        Self::new(*platform)
     }
 }

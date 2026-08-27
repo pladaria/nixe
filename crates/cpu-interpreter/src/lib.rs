@@ -10,4 +10,4 @@ mod process;
 pub use interpreter::{
     InstructionStep, InterpreterContext, InterpreterError, execute_one, execute_one_with_context,
 };
-pub use process::{InterpreterProcess, InterpreterThread};
+pub use process::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};

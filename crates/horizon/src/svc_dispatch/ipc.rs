@@ -127,10 +127,7 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
-        let tls = match context.thread().state() {
-            ThreadCpuState::A64(state) => GuestVirtualAddress::new(state.tpidr_el0()),
-            ThreadCpuState::A32(state) => GuestVirtualAddress::new(u64::from(state.tpidrurw())),
-        };
+        let tls = GuestVirtualAddress::new(context.thread().state().tpidr_el0());
         let caller_thread_id = context.thread().object().thread_id();
         match crate::ipc_wire::send_sync_request(
             context.process_mut(),

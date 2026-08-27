@@ -2,7 +2,7 @@
 
 use crate::decode::table::InstructionPattern;
 
-use super::{NO_FEATURES, pattern};
+use super::pattern;
 
 pub(super) const PATTERNS: &[InstructionPattern] = &[
     // Preserve the historical ADD-immediate identity.
@@ -13,20 +13,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0003,
         80,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x9100_0000),
-    pattern(
-        "move-wide",
-        0x1f80_0000,
-        0x1280_0000,
-        0x0000_0010,
-        79,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    pattern("move-wide", 0x1f80_0000, 0x1280_0000, 0x0000_0010, 79, &[]),
     pattern(
         "add-sub-shifted",
         0x1f20_0000,
@@ -34,9 +23,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0011,
         66,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "add-sub-extended",
         0x1f20_0000,
@@ -44,9 +31,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0012,
         67,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "add-sub-carry",
         0x1fe0_fc00,
@@ -54,9 +39,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0013,
         150,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "logical-immediate",
         0x1f80_0000,
@@ -64,9 +47,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0014,
         75,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "logical-shifted",
         0x1f00_0000,
@@ -74,29 +55,9 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0015,
         65,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
-    pattern(
-        "bitfield",
-        0x1f80_0000,
-        0x1300_0000,
-        0x0000_0016,
-        74,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered(),
-    pattern(
-        "extract",
-        0x1f80_0000,
-        0x1380_0000,
-        0x0000_0017,
-        73,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
+    pattern("bitfield", 0x1f80_0000, 0x1300_0000, 0x0000_0016, 74, &[]),
+    pattern("extract", 0x1f80_0000, 0x1380_0000, 0x0000_0017, 73, &[]),
     pattern(
         "data-processing-two-source",
         0x1fe0_0000,
@@ -104,9 +65,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0018,
         72,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x9ac1_2000),
     pattern(
         "conditional-compare-register",
@@ -115,9 +74,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_0019,
         149,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "conditional-compare-immediate",
         0x1fe0_0c00,
@@ -125,9 +82,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_001a,
         148,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "conditional-select",
         0x1fe0_0000,
@@ -135,9 +90,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_001b,
         71,
         &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    ),
     pattern(
         "data-processing-three-source",
         0x1f00_0000,
@@ -145,9 +98,7 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_001c,
         64,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0x9b01_0800),
     pattern(
         "data-processing-one-source",
@@ -156,30 +107,10 @@ pub(super) const PATTERNS: &[InstructionPattern] = &[
         0x0000_001d,
         76,
         &[],
-        NO_FEATURES,
     )
-    .lowered()
     .fixture32(0xdac0_1000),
-    pattern(
-        "adr",
-        0x9f00_0000,
-        0x1000_0000,
-        0x0000_0020,
-        63,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered(),
-    pattern(
-        "adrp",
-        0x9f00_0000,
-        0x9000_0000,
-        0x0000_0021,
-        62,
-        &[],
-        NO_FEATURES,
-    )
-    .lowered(),
+    pattern("adr", 0x9f00_0000, 0x1000_0000, 0x0000_0020, 63, &[]),
+    pattern("adrp", 0x9f00_0000, 0x9000_0000, 0x0000_0021, 62, &[]),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

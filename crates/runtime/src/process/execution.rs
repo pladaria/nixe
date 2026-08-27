@@ -10,12 +10,12 @@ use nixe_cpu::execution::{
     ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
     CpuThreadId, MemoryBinding, RunRequest, TimerSnapshot, VcpuEventState,
 };
-use nixe_cpu::location::{ExecutionState, LocationDescriptor};
+use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::memory::ExecutionMemory;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
-use nixe_cpu_interpreter::{InterpreterProcess, InterpreterThread};
-use nixe_cpu_jit::{JitConfiguration, JitProcess, JitThread};
+use nixe_cpu_interpreter::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};
+use nixe_cpu_jit::{JitProcess, JitThread};
 use nixe_memory::{GuestVirtualAddress, MemoryInvalidationSource};
 
 use crate::{ExceptionTerminationScope, GuestBreakPayload, VirtualClock};
@@ -35,62 +35,64 @@ pub(super) fn allocate_cpu_process_id() -> Option<CpuProcessId> {
 
 pub use nixe_cpu::execution::{CpuExit as ExecutionStop, ExecutionReport};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum CpuBackendConfig {
     Interpreter,
-    Jit(JitConfiguration),
-}
-
-impl Default for CpuBackendConfig {
-    fn default() -> Self {
-        Self::Jit(JitConfiguration::default())
-    }
+    #[default]
+    Jit,
 }
 
 enum CpuBackend {
     Interpreter(InterpreterProcess),
-    Jit(JitProcess),
+    Jit(Arc<JitProcess>),
 }
 
 impl CpuBackend {
     fn new(
         selection: &CpuBackendConfig,
-        id: CpuProcessId,
+        _id: CpuProcessId,
         cpu: ProcessCpuContext,
     ) -> Result<Self, CpuFault> {
         match selection {
             CpuBackendConfig::Interpreter => Ok(Self::Interpreter(InterpreterProcess::new(cpu))),
-            CpuBackendConfig::Jit(configuration) => {
-                JitProcess::new(id, cpu, configuration.clone()).map(Self::Jit)
-            }
+            CpuBackendConfig::Jit => JitProcess::new(cpu)
+                .map(Arc::new)
+                .map(Self::Jit)
+                .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
         }
     }
 
     fn bind_memory(&mut self, binding: MemoryBinding<'_>) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.bind_memory(binding),
-            Self::Jit(process) => process.bind_memory(binding),
+            Self::Jit(_) => Ok(()),
         }
     }
 
     fn create_thread(&mut self, id: CpuThreadId) -> Result<CpuThread, CpuFault> {
         match self {
             Self::Interpreter(process) => process.create_thread(id).map(CpuThread::Interpreter),
-            Self::Jit(process) => process.create_thread(id).map(CpuThread::Jit),
+            Self::Jit(process) => Ok(CpuThread::Jit {
+                process: Arc::clone(process),
+                thread: JitThread::new(),
+            }),
         }
     }
 
     fn request_stop(&mut self) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.request_stop(),
-            Self::Jit(process) => process.request_stop(),
+            Self::Jit(_) => Ok(()),
         }
     }
 
     fn shutdown(&mut self) -> Result<(), CpuFault> {
         match self {
             Self::Interpreter(process) => process.shutdown(),
-            Self::Jit(process) => process.shutdown(),
+            Self::Jit(process) => {
+                process.shutdown();
+                Ok(())
+            }
         }
     }
 
@@ -104,7 +106,10 @@ impl CpuBackend {
 
 pub(crate) enum CpuThread {
     Interpreter(InterpreterThread),
-    Jit(JitThread),
+    Jit {
+        process: Arc<JitProcess>,
+        thread: JitThread,
+    },
 }
 
 impl CpuThread {
@@ -113,19 +118,37 @@ impl CpuThread {
         request: RunRequest<'_>,
     ) -> Result<ExecutionReport, CpuFault> {
         match self {
-            Self::Interpreter(thread) => thread.run_slice(request),
-            Self::Jit(thread) => thread.run_slice(request),
+            Self::Interpreter(thread) => {
+                let RunRequest {
+                    memory,
+                    state,
+                    instruction_budget,
+                    loader_return,
+                    timer,
+                    events,
+                    ..
+                } = request;
+                thread.run_slice(InterpreterRunRequest {
+                    memory,
+                    state,
+                    instruction_budget,
+                    loader_return,
+                    timer,
+                    events,
+                })
+            }
+            Self::Jit { process, thread } => thread.run_slice(process, request),
         }
     }
 
     pub(crate) fn synchronize_address_space(
         &mut self,
         binding: MemoryBinding<'_>,
-        state: &ThreadCpuState,
+        _state: &ThreadCpuState,
     ) -> Result<(), CpuFault> {
         match self {
-            Self::Interpreter(thread) => thread.synchronize_address_space(binding, state),
-            Self::Jit(thread) => thread.synchronize_address_space(binding, state),
+            Self::Interpreter(thread) => thread.synchronize_address_space(binding),
+            Self::Jit { process, thread } => thread.synchronize_address_space(process, binding),
         }
     }
 
@@ -133,25 +156,25 @@ impl CpuThread {
     pub(crate) fn control(&self) -> CpuControl {
         match self {
             Self::Interpreter(thread) => thread.control(),
-            Self::Jit(thread) => thread.control(),
+            Self::Jit { thread, .. } => thread.control(),
         }
     }
 
     pub(crate) fn prepare_shutdown(
         &mut self,
         binding: MemoryBinding<'_>,
-        state: &ThreadCpuState,
+        _state: &ThreadCpuState,
     ) -> Result<(), CpuFault> {
         match self {
-            Self::Interpreter(thread) => thread.prepare_shutdown(binding, state),
-            Self::Jit(thread) => thread.prepare_shutdown(binding, state),
+            Self::Interpreter(thread) => thread.prepare_shutdown(binding),
+            Self::Jit { process, thread } => thread.prepare_shutdown(process, binding),
         }
     }
 
     pub(crate) fn clear_local_exclusive_reservation(&mut self) {
         match self {
             Self::Interpreter(thread) => thread.clear_local_exclusive_reservation(),
-            Self::Jit(thread) => thread.clear_local_exclusive_reservation(),
+            Self::Jit { thread, .. } => thread.clear_local_exclusive_reservation(),
         }
     }
 }
@@ -483,14 +506,17 @@ impl crate::exception_dispatch::MemoryMutationControl for ProcessExecutionContro
     }
 }
 
-fn runtime_fault(cpu: ProcessCpuContext, kind: CpuFaultKind, message: &'static str) -> CpuFault {
-    let configuration = cpu.thread_configuration(ExecutionState::A64);
+fn runtime_fault(
+    _cpu: ProcessCpuContext,
+    kind: CpuFaultKind,
+    message: impl Into<Box<str>>,
+) -> CpuFault {
     CpuFault {
         backend: "runtime",
         kind,
         instructions_executed: 0,
         message: message.into(),
-        context: Box::new(ThreadCpuState::new(configuration).register_context()),
+        context: Box::new(ThreadCpuState::default().register_context()),
     }
 }
 

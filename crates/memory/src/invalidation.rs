@@ -136,6 +136,12 @@ impl MemoryInvalidationLog {
         MemoryInvalidationCursor::new(self.latest.load(Ordering::Acquire))
     }
 
+    /// Returns the stable publication word used by native execution domains.
+    #[must_use]
+    pub fn cursor_signal(&self) -> &AtomicU64 {
+        &self.latest
+    }
+
     /// Reserves the next cursor while a semantic mutation is still fallible.
     pub fn reserve(
         &self,
@@ -265,6 +271,9 @@ impl MemoryInvalidationReservation<'_> {
 /// Read-only invalidation surface required by every executable CPU memory.
 pub trait MemoryInvalidationSource: Send + Sync {
     fn invalidation_cursor(&self) -> MemoryInvalidationCursor;
+
+    /// Returns a stable atomic cursor which changes whenever invalidation is published.
+    fn invalidation_signal(&self) -> &AtomicU64;
 
     fn read_invalidations_since(
         &self,

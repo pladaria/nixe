@@ -73,7 +73,6 @@ fn cpu_frontend_does_not_own_a_concrete_interpreter_engine() {
         "src/coverage.rs",
         "src/decode/allocation.rs",
         "src/decode/table.rs",
-        "src/translate/block.rs",
     ] {
         let source = fs::read_to_string(root.join(relative)).unwrap();
         for forbidden in [

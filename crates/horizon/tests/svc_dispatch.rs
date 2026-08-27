@@ -4,28 +4,24 @@ mod support;
 use std::fs;
 use std::time::Duration;
 
-use nixe_cpu::location::ExecutionState;
 use nixe_cpu::memory::{
     CpuMemory, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingPurpose,
     MemoryPermissions, MemoryValue,
 };
-use nixe_cpu::state::ThreadCpuState;
-use nixe_cpu::state::a32::A32GeneralRegister;
-use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State};
 use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonIpcFault, HorizonIpcResult,
     HorizonKernelResult, HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport,
     IpcDispatcher, IpcService, OperationMode, UnsupportedServiceOperation,
-    switch_1_scheduler_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use nixe_runtime::{
     CpuBackendConfig, EventObject, ExceptionHandlingResult, ExceptionTerminationReason,
     ExceptionTerminationScope, Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder,
-    ProcessExitCause, ProcessLifecycle, ProcessObject, ProcessRegistration, ReadableEventObject,
-    RunnableProcess, RuntimeCoordinator, SessionMessage, SessionObject, SessionRequestOwner,
-    SessionRequestResult, SharedMemoryObject, ThreadLifecycle, WritableEventObject,
+    ProcessExitCause, ProcessLifecycle, ProcessObject, ReadableEventObject, RunnableProcess,
+    SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject,
+    ThreadLifecycle, WritableEventObject,
 };
 use support::ScheduledProcess;
 
@@ -149,28 +145,11 @@ fn fixture_process_with_romfs(
     (directory, ScheduledProcess::new(process))
 }
 
-fn fixture_process_for_state(
-    execution_state: ExecutionState,
-    immediates: &[u8],
-) -> (tempfile::TempDir, ScheduledProcess) {
+fn fixture_process_with_svcs(immediates: &[u8]) -> (tempfile::TempDir, ScheduledProcess) {
     let mut image = synthetic_nro(&[]);
     let entry_offset = 0x80;
     for (index, immediate) in immediates.iter().copied().enumerate() {
-        match execution_state {
-            ExecutionState::A64 => {
-                put_u32(&mut image, entry_offset + index * 4, svc(immediate.into()))
-            }
-            ExecutionState::A32 => put_u32(
-                &mut image,
-                entry_offset + index * 4,
-                0xef00_0000 | u32::from(immediate),
-            ),
-            ExecutionState::T32 => {
-                let offset = entry_offset + index * 2;
-                image[offset..offset + 2]
-                    .copy_from_slice(&(0xdf00 | u16::from(immediate)).to_le_bytes());
-            }
-        }
+        put_u32(&mut image, entry_offset + index * 4, svc(immediate.into()));
     }
 
     let directory = tempfile::tempdir().unwrap();
@@ -181,20 +160,7 @@ fn fixture_process_for_state(
         .build(&plan)
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + entry_offset as u64;
-    match execution_state {
-        ExecutionState::A64 => state(&mut process).set_pc(test_entry),
-        ExecutionState::A32 | ExecutionState::T32 => {
-            let mut state = match execution_state {
-                ExecutionState::A32 => nixe_cpu::state::A32State::a32(),
-                ExecutionState::T32 => nixe_cpu::state::A32State::t32(),
-                ExecutionState::A64 => unreachable!(),
-            };
-            state
-                .set_instruction_address(u32::try_from(test_entry).unwrap())
-                .unwrap();
-            *process.main_thread_mut().state_mut() = ThreadCpuState::A32(Box::new(state));
-        }
-    }
+    state(&mut process).set_pc(test_entry);
     (directory, ScheduledProcess::new(process))
 }
 
@@ -202,53 +168,30 @@ fn x(index: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(index).unwrap())
 }
 
-fn state(process: &mut RunnableProcess) -> &mut nixe_cpu::state::A64State {
-    let ThreadCpuState::A64(state) = process.main_thread_mut().state_mut() else {
-        panic!("homebrew process must use A64")
-    };
-    state.as_mut()
-}
-
-fn abi_register(index: u8) -> A32GeneralRegister {
-    A32GeneralRegister::new(index).unwrap()
+fn state(process: &mut RunnableProcess) -> &mut A64State {
+    process.main_thread_mut().state_mut()
 }
 
 fn read_abi_register(process: &RunnableProcess, index: u8) -> u64 {
-    match process.main_thread().state() {
-        ThreadCpuState::A64(state) => state.read_x(x(index)),
-        ThreadCpuState::A32(state) => u64::from(state.read_r(abi_register(index))),
-    }
+    process.main_thread().state().read_x(x(index))
 }
 
 fn write_abi_register(process: &mut RunnableProcess, index: u8, value: u64) {
-    match process.main_thread_mut().state_mut() {
-        ThreadCpuState::A64(state) => state.write_x(x(index), value),
-        ThreadCpuState::A32(state) => state.write_r(abi_register(index), value as u32),
-    }
+    process
+        .main_thread_mut()
+        .state_mut()
+        .write_x(x(index), value);
 }
 
 fn write_wait_timeout(process: &mut RunnableProcess, timeout: i64) {
-    match process.main_thread_mut().state_mut() {
-        ThreadCpuState::A64(state) => state.write_x(x(3), timeout as u64),
-        ThreadCpuState::A32(state) => {
-            state.write_r(abi_register(0), timeout as u32);
-            state.write_r(abi_register(3), ((timeout as u64) >> 32) as u32);
-        }
-    }
+    process
+        .main_thread_mut()
+        .state_mut()
+        .write_x(x(3), timeout as u64);
 }
 
 fn instruction_address(process: &RunnableProcess) -> u64 {
-    match process.main_thread().state() {
-        ThreadCpuState::A64(state) => state.pc(),
-        ThreadCpuState::A32(state) => u64::from(state.instruction_address()),
-    }
-}
-
-const fn instruction_width(execution_state: ExecutionState) -> u64 {
-    match execution_state {
-        ExecutionState::A64 | ExecutionState::A32 => 4,
-        ExecutionState::T32 => 2,
-    }
+    process.main_thread().state().pc()
 }
 
 fn dispatch_next(
@@ -262,110 +205,80 @@ fn dispatch_next(
 }
 
 #[test]
-fn successful_and_rejected_calls_use_each_execution_state_abi() {
-    for execution_state in [
-        ExecutionState::A64,
-        ExecutionState::A32,
-        ExecutionState::T32,
-    ] {
-        let (_directory, mut process) = fixture_process_for_state(execution_state, &[0x24, 0x21]);
-        let mut dispatcher = HorizonSvcDispatcher::default();
-        let entry = instruction_address(&process);
-        let process_id = process.process_id();
-        write_abi_register(&mut process, 1, u64::from(CURRENT_PROCESS_HANDLE));
-        write_abi_register(&mut process, 2, u64::MAX);
+fn successful_and_rejected_calls_use_the_a64_abi() {
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x24, 0x21]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let entry = instruction_address(&process);
+    let process_id = process.process_id();
+    write_abi_register(&mut process, 1, u64::from(CURRENT_PROCESS_HANDLE));
+    write_abi_register(&mut process, 2, u64::MAX);
 
-        assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
-            ExceptionHandlingResult::Resumed
-        );
-        assert_eq!(
-            read_abi_register(&process, 0),
-            u64::from(HorizonKernelResult::SUCCESS.raw())
-        );
-        if execution_state == ExecutionState::A64 {
-            assert_eq!(read_abi_register(&process, 1), process_id);
-        } else {
-            assert_eq!(read_abi_register(&process, 1), process_id & 0xffff_ffff);
-            assert_eq!(read_abi_register(&process, 2), process_id >> 32);
-        }
-        assert_eq!(
-            instruction_address(&process),
-            entry + instruction_width(execution_state)
-        );
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_abi_register(&process, 0),
+        u64::from(HorizonKernelResult::SUCCESS.raw())
+    );
+    assert_eq!(read_abi_register(&process, 1), process_id);
+    assert_eq!(instruction_address(&process), entry + 4);
 
-        assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
-            ExceptionHandlingResult::Resumed
-        );
-        assert_eq!(
-            read_abi_register(&process, 0),
-            u64::from(HorizonKernelResult::INVALID_HANDLE.raw())
-        );
-        assert_eq!(
-            instruction_address(&process),
-            entry + 2 * instruction_width(execution_state)
-        );
-        assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
-    }
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_abi_register(&process, 0),
+        u64::from(HorizonKernelResult::INVALID_HANDLE.raw())
+    );
+    assert_eq!(instruction_address(&process), entry + 8);
+    assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
 }
 
 #[test]
-fn blocking_wait_suspends_and_retries_in_each_execution_state() {
-    for execution_state in [
-        ExecutionState::A64,
-        ExecutionState::A32,
-        ExecutionState::T32,
-    ] {
-        let (_directory, mut process) = fixture_process_for_state(execution_state, &[0x18]);
-        let mut dispatcher = HorizonSvcDispatcher::default();
-        let source = instruction_address(&process);
-        // The fixture swaps a Homebrew A64 thread for A32/T32 architectural
-        // states; use its low writable data mapping rather than the genuine
-        // 64-bit Homebrew stack region for the AArch32 pointer ABI.
-        let handles_address =
-            GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
-        let (writable, readable) = EventObject::create_pair();
-        let read_handle = process.handles_mut().insert(readable).unwrap();
-        process
-            .memory()
-            .write(
-                process.cpu_context().address_space_id(),
-                handles_address,
-                MemoryAccess::normal(MemoryAccessSize::Word),
-                MemoryValue::U32(read_handle),
-            )
-            .unwrap();
-        write_abi_register(&mut process, 1, handles_address.get());
-        write_abi_register(&mut process, 2, 1);
-        write_wait_timeout(&mut process, -1);
+fn blocking_wait_suspends_and_retries_in_a64() {
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x18]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let source = instruction_address(&process);
+    let handles_address = GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
+    let (writable, readable) = EventObject::create_pair();
+    let read_handle = process.handles_mut().insert(readable).unwrap();
+    process
+        .memory()
+        .write(
+            process.cpu_context().address_space_id(),
+            handles_address,
+            MemoryAccess::normal(MemoryAccessSize::Word),
+            MemoryValue::U32(read_handle),
+        )
+        .unwrap();
+    write_abi_register(&mut process, 1, handles_address.get());
+    write_abi_register(&mut process, 2, 1);
+    write_wait_timeout(&mut process, -1);
 
-        assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
-            ExceptionHandlingResult::Suspended
-        );
-        assert_eq!(
-            process.main_thread_lifecycle(),
-            nixe_scheduler::ThreadLifecycle::Waiting
-        );
-        assert_eq!(instruction_address(&process), source);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Suspended
+    );
+    assert_eq!(
+        process.main_thread_lifecycle(),
+        nixe_scheduler::ThreadLifecycle::Waiting
+    );
+    assert_eq!(instruction_address(&process), source);
 
-        writable.signal();
-        assert!(process.resume());
-        assert_eq!(
-            dispatch_next(&mut process, &mut dispatcher),
-            ExceptionHandlingResult::Resumed
-        );
-        assert_eq!(
-            read_abi_register(&process, 0),
-            u64::from(HorizonKernelResult::SUCCESS.raw())
-        );
-        assert_eq!(read_abi_register(&process, 1), 0);
-        assert_eq!(
-            instruction_address(&process),
-            source + instruction_width(execution_state)
-        );
-    }
+    writable.signal();
+    assert!(process.resume());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_abi_register(&process, 0),
+        u64::from(HorizonKernelResult::SUCCESS.raw())
+    );
+    assert_eq!(read_abi_register(&process, 1), 0);
+    assert_eq!(instruction_address(&process), source + 4);
 }
 
 #[test]
@@ -2848,61 +2761,54 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
         ),
     ];
 
-    for execution_state in [
-        ExecutionState::A64,
-        ExecutionState::A32,
-        ExecutionState::T32,
-    ] {
-        for (immediate, scope, cause) in cases {
-            let (_directory, mut process) =
-                fixture_process_for_state(execution_state, &[0x45, immediate as u8]);
-            let mut dispatcher = HorizonSvcDispatcher::default();
-            let entry = instruction_address(&process);
-            assert_eq!(
-                dispatch_next(&mut process, &mut dispatcher),
-                ExceptionHandlingResult::Resumed
-            );
-            let handles_before_exit = process.handles().len();
-            let exit_source = entry + instruction_width(execution_state);
+    for (immediate, scope, cause) in cases {
+        let (_directory, mut process) = fixture_process_with_svcs(&[0x45, immediate as u8]);
+        let mut dispatcher = HorizonSvcDispatcher::default();
+        let entry = instruction_address(&process);
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        );
+        let handles_before_exit = process.handles().len();
+        let exit_source = entry + 4;
 
-            assert_eq!(
-                dispatch_next(&mut process, &mut dispatcher),
-                ExceptionHandlingResult::Terminated {
-                    scope,
-                    exit_code: 0,
-                    reason: ExceptionTerminationReason::Requested,
-                }
-            );
-            assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
-            assert_eq!(
-                process.exit().unwrap().cause,
-                cause,
-                "wrong lifecycle cause for {execution_state} SVC {immediate:#x}"
-            );
-            assert_eq!(
-                process.exit().unwrap().source.unwrap().pc.get(),
-                exit_source
-            );
-            assert_eq!(process.exit().unwrap().thread_id, 1);
-            assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
-            assert!(process.run_slice(1).is_err());
-            assert!(!process.resume());
-            assert!(!process.terminate());
+        assert_eq!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Terminated {
+                scope,
+                exit_code: 0,
+                reason: ExceptionTerminationReason::Requested,
+            }
+        );
+        assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
+        assert_eq!(
+            process.exit().unwrap().cause,
+            cause,
+            "wrong lifecycle cause for SVC {immediate:#x}"
+        );
+        assert_eq!(
+            process.exit().unwrap().source.unwrap().pc.get(),
+            exit_source
+        );
+        assert_eq!(process.exit().unwrap().thread_id, 1);
+        assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
+        assert!(process.run_slice(1).is_err());
+        assert!(!process.resume());
+        assert!(!process.terminate());
 
-            let teardown = process.teardown();
-            assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
-            assert_eq!(teardown.exit.unwrap().cause, cause);
-            assert_eq!(teardown.threads_released, 1);
-            assert_eq!(teardown.handles_released, handles_before_exit);
-            assert!(teardown.mappings_released > 0);
-            assert!(teardown.physical_pages_released > 0);
-        }
+        let teardown = process.teardown();
+        assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
+        assert_eq!(teardown.exit.unwrap().cause, cause);
+        assert_eq!(teardown.threads_released, 1);
+        assert_eq!(teardown.handles_released, handles_before_exit);
+        assert!(teardown.mappings_released > 0);
+        assert!(teardown.physical_pages_released > 0);
     }
 }
 
 #[test]
 fn create_thread_commits_through_a64_abi() {
-    let (_directory, mut process) = fixture_process_for_state(ExecutionState::A64, &[0x08, 0x09]);
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x08, 0x09]);
     let entry = process.entry_module().entry_address() + 0x80;
     let stack_top = process.entry_module().entry_address() + 0x2800;
     write_abi_register(&mut process, 1, entry);
@@ -2927,10 +2833,7 @@ fn create_thread_commits_through_a64_abi() {
             .unwrap()
     );
     let process = coordinator.process(process_id).unwrap();
-    let result = match process.thread(caller).unwrap().state() {
-        ThreadCpuState::A64(state) => state.read_w(x(0)),
-        ThreadCpuState::A32(state) => state.read_r(A32GeneralRegister::new(0).unwrap()),
-    };
+    let result = process.thread(caller).unwrap().state().read_w(x(0));
     assert_eq!(result, HorizonKernelResult::SUCCESS.raw());
     assert_eq!(process.threads().len(), 2);
     let created = process
@@ -2948,13 +2851,7 @@ fn create_thread_commits_through_a64_abi() {
         nixe_scheduler::ThreadLifecycle::Created
     );
     assert_eq!(created.stack_top.get(), stack_top);
-    match created.state() {
-        ThreadCpuState::A64(state) => assert_eq!(state.read_x(x(0)), 0x1234_5678),
-        ThreadCpuState::A32(state) => assert_eq!(
-            state.read_r(A32GeneralRegister::new(0).unwrap()),
-            0x1234_5678
-        ),
-    }
+    assert_eq!(created.state().read_x(x(0)), 0x1234_5678);
     assert_eq!(
         coordinator.scheduler().thread(caller).unwrap().lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
@@ -2985,82 +2882,6 @@ fn create_thread_commits_through_a64_abi() {
             .unwrap()
             .lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
-    );
-}
-
-#[test]
-fn create_thread_commits_through_aarch32_abi_in_a_32_bit_process() {
-    use support::synthetic_packages::{
-        APPLICATION_ID, MetaKind, Package, aarch32_program_content_with_svc, build_nsp, content_id,
-    };
-
-    let directory = tempfile::tempdir().unwrap();
-    let package = Package {
-        title_id: APPLICATION_ID,
-        version: 0,
-        kind: MetaKind::Application,
-        contents: vec![aarch32_program_content_with_svc(content_id(1), 0x08)],
-    };
-    fs::write(directory.path().join("aarch32.nsp"), build_nsp(&package)).unwrap();
-    let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    assert_eq!(
-        process.main_thread().state().execution_state(),
-        ExecutionState::A32
-    );
-    let entry = process.entry_module().entry_address() + 4;
-    let stack_top = process.main_thread().stack_top.get();
-    write_abi_register(&mut process, 0, 20);
-    write_abi_register(&mut process, 1, entry);
-    write_abi_register(&mut process, 2, 0x1234_5678);
-    write_abi_register(&mut process, 3, stack_top);
-    write_abi_register(&mut process, 4, (-2_i32) as u32 as u64);
-
-    let registration = ProcessRegistration {
-        priority: process.initial_thread_priority(),
-        ideal_vcpu: Some(process.initial_ideal_vcpu()),
-        affinity: switch_1_scheduler_profile().all_cores(),
-    };
-    let mut coordinator = RuntimeCoordinator::new(switch_1_scheduler_profile());
-    let process_id = coordinator.register_process(process, registration).unwrap();
-    let execution = coordinator.run_next(1).unwrap().unwrap();
-    let caller = execution.lease.thread;
-    let mut dispatcher = HorizonSvcDispatcher::default();
-    assert_eq!(
-        coordinator
-            .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
-            .unwrap(),
-        ExceptionHandlingResult::Suspended
-    );
-    assert!(
-        dispatcher
-            .apply_pending_runtime_request(&mut coordinator, process_id, caller)
-            .unwrap()
-    );
-    let process = coordinator.process(process_id).unwrap();
-    let ThreadCpuState::A32(caller_state) = process.thread(caller).unwrap().state() else {
-        panic!("the caller must remain AArch32");
-    };
-    assert_eq!(
-        caller_state.read_r(A32GeneralRegister::new(0).unwrap()),
-        HorizonKernelResult::SUCCESS.raw()
-    );
-    let created = process
-        .threads()
-        .iter()
-        .find_map(|(id, thread)| (*id != caller).then_some(thread))
-        .unwrap();
-    let ThreadCpuState::A32(created_state) = created.state() else {
-        panic!("the created thread must inherit AArch32 execution");
-    };
-    assert_eq!(created_state.instruction_address(), entry as u32);
-    assert_eq!(
-        created_state.read_r(A32GeneralRegister::new(0).unwrap()),
-        0x1234_5678
-    );
-    assert_eq!(
-        created_state.read_r(A32GeneralRegister::new(13).unwrap()),
-        stack_top as u32
     );
 }
 
