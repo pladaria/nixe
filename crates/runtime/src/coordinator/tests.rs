@@ -493,9 +493,22 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
             registration(&coordinator),
         )
         .unwrap();
+    let initial_used = coordinator
+        .process(process)
+        .unwrap()
+        .memory_accounting()
+        .used_non_system_user_physical_memory_size();
     let first = coordinator
         .create_thread(process, valid_thread_request(&coordinator, process))
         .unwrap();
+    assert_eq!(
+        coordinator
+            .process(process)
+            .unwrap()
+            .memory_accounting()
+            .used_non_system_user_physical_memory_size(),
+        initial_used + nixe_cpu::memory::SYNTHETIC_PAGE_SIZE as u64
+    );
     let tls = coordinator
         .process(process)
         .unwrap()
@@ -532,6 +545,14 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
             .thread(first.id)
             .is_none()
     );
+    assert_eq!(
+        coordinator
+            .process(process)
+            .unwrap()
+            .memory_accounting()
+            .used_non_system_user_physical_memory_size(),
+        initial_used
+    );
 
     let replacement = coordinator
         .create_thread(process, valid_thread_request(&coordinator, process))
@@ -544,6 +565,14 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
             .unwrap()
             .tls_base,
         tls
+    );
+    assert_eq!(
+        coordinator
+            .process(process)
+            .unwrap()
+            .memory_accounting()
+            .used_non_system_user_physical_memory_size(),
+        initial_used + nixe_cpu::memory::SYNTHETIC_PAGE_SIZE as u64
     );
 }
 

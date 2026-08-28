@@ -5,6 +5,7 @@ mod dispatch;
 mod exception;
 pub(crate) mod execution;
 mod layout;
+mod memory_accounting;
 mod thread;
 
 pub use builder::ProcessBuilder;
@@ -12,13 +13,14 @@ pub use builder::ProcessBuilder;
 use builder::a64_register;
 use builder::{ThreadPolicy, align_up, error, initialize_created_thread};
 pub use execution::{
-    CpuBackendConfig, ExecutionReport, ExecutionStop, ProcessExecutionError, ProcessExit,
-    ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
+    CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExecutionError,
+    ProcessExit, ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
     ProcessVirtualRegion,
 };
+pub use memory_accounting::ProcessMemoryAccounting;
 pub use thread::{
     GuestThread, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadTable,
     ThreadTableError,
@@ -74,8 +76,7 @@ pub struct RunnableProcess {
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
-    heap_size: u64,
-    initial_memory_size: u64,
+    memory_accounting: ProcessMemoryAccounting,
     memory: std::sync::Arc<ExecutionMemory>,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
@@ -125,7 +126,13 @@ impl RunnableProcess {
     /// Returns the currently committed process heap size.
     #[must_use]
     pub const fn heap_size(&self) -> u64 {
-        self.heap_size
+        self.memory_accounting.heap_size()
+    }
+
+    /// Returns the coherent physical-memory counters used by Horizon queries.
+    #[must_use]
+    pub const fn memory_accounting(&self) -> ProcessMemoryAccounting {
+        self.memory_accounting
     }
 
     #[must_use]
@@ -309,12 +316,7 @@ impl RunnableProcess {
         id: nixe_scheduler::GuestThreadId,
         request: &ThreadCreateRequest,
     ) -> Result<ThreadCreation, ThreadCreateError> {
-        if self
-            .initial_memory_size
-            .saturating_add(self.heap_size)
-            .checked_add(TLS_SIZE)
-            .is_none_or(|size| size > self.memory_layout.memory_capacity())
-        {
+        if !self.memory_accounting.can_commit_normal_memory(TLS_SIZE) {
             return Err(ThreadCreateError::ResourceLimit);
         }
         let recycled_tls = self.free_thread_tls.pop_first();
@@ -379,7 +381,7 @@ impl RunnableProcess {
         if recycled_tls.is_none() {
             self.next_thread_tls = tls_base;
         }
-        self.initial_memory_size += TLS_SIZE;
+        self.memory_accounting.commit_normal_memory(TLS_SIZE);
         Ok(ThreadCreation { id, handle })
     }
 
@@ -404,7 +406,7 @@ impl RunnableProcess {
 
     fn release_thread_tls(&mut self, tls_base: GuestVirtualAddress) {
         self.rollback_thread_tls(tls_base);
-        self.initial_memory_size = self.initial_memory_size.saturating_sub(TLS_SIZE);
+        self.memory_accounting.release_normal_memory(TLS_SIZE);
         if tls_base == self.next_thread_tls {
             self.next_thread_tls = self
                 .next_thread_tls
@@ -535,12 +537,12 @@ impl RunnableProcess {
             handles_released: self.handles.len(),
             address_waiters_released: self.address_waits.waiter_count(),
         };
-        self.execution
-            .shutdown()
-            .map_err(|fault| ProcessTeardownFailure {
+        if let Err(fault) = self.execution.shutdown() {
+            return Err(ProcessTeardownFailure {
                 report: Box::new(report),
                 fault: Box::new(fault),
-            })?;
+            });
+        }
         Ok(report)
     }
 

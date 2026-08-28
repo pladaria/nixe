@@ -378,13 +378,10 @@ pub(crate) fn open_canonical_content(
         Some(keys) => NcaLoader::load_with_key_provider(storage, keys)?,
         None => NcaLoader::load(storage)?,
     };
-    let expected_type = match content.content_type {
-        CnmtContentType::Program => NcaContentType::Program,
-        CnmtContentType::Data => NcaContentType::Data,
-        CnmtContentType::Control => NcaContentType::Control,
-        CnmtContentType::Meta => NcaContentType::Meta,
-        CnmtContentType::HtmlDocument | CnmtContentType::LegalInformation => NcaContentType::Manual,
-        CnmtContentType::DeltaFragment | CnmtContentType::Unknown(_) => {
+    let expected_type = match canonical_nca_content_type(package.content_type, content.content_type)
+    {
+        Some(content_type) => content_type,
+        None => {
             return Err(LoadError::invalid(
                 "canonical package content",
                 format!(
@@ -419,6 +416,26 @@ pub(crate) fn open_canonical_content(
         ));
     }
     Ok(nca)
+}
+
+fn canonical_nca_content_type(
+    package_type: ContentType,
+    content_type: CnmtContentType,
+) -> Option<NcaContentType> {
+    // Add-on CNMT records call their payload Data even though the corresponding
+    // NCA header calls it PublicData. hacPack enforces the same title/NCA pairing:
+    // https://github.com/DarkMatterCore/hacPack/blob/e506cb58b7843d86df7518156debd28f3b575638/main.c#L572-L575
+    match (package_type, content_type) {
+        (ContentType::AddOnContent, CnmtContentType::Data) => Some(NcaContentType::PublicData),
+        (_, CnmtContentType::Program) => Some(NcaContentType::Program),
+        (_, CnmtContentType::Data) => Some(NcaContentType::Data),
+        (_, CnmtContentType::Control) => Some(NcaContentType::Control),
+        (_, CnmtContentType::Meta) => Some(NcaContentType::Meta),
+        (_, CnmtContentType::HtmlDocument | CnmtContentType::LegalInformation) => {
+            Some(NcaContentType::Manual)
+        }
+        (_, CnmtContentType::DeltaFragment | CnmtContentType::Unknown(_)) => None,
+    }
 }
 
 fn open_canonical_entry<C: PackageContent + ?Sized>(
@@ -502,4 +519,27 @@ pub(crate) fn import_ticket_keys<C: PackageContent + ?Sized>(
         }
     }
     warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_on_data_maps_strictly_to_public_data_nca() {
+        assert_eq!(
+            canonical_nca_content_type(ContentType::AddOnContent, CnmtContentType::Data),
+            Some(NcaContentType::PublicData)
+        );
+        for package_type in [
+            ContentType::Application,
+            ContentType::Patch,
+            ContentType::Delta,
+        ] {
+            assert_eq!(
+                canonical_nca_content_type(package_type, CnmtContentType::Data),
+                Some(NcaContentType::Data)
+            );
+        }
+    }
 }

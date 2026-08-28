@@ -27,9 +27,9 @@ use crate::object::{
 use crate::{
     AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HidSystem,
     HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
-    IpcResultCode, IpcService, IpcSession, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
-    MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession, PerformanceSession,
-    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession,
+    IpcResultCode, IpcService, IpcSession, LogManagerSession, LoggerSession, MAX_IPC_LIST_ENTRIES,
+    MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession,
+    PerformanceSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession,
     SettingsEnvironment, SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage,
     SystemSettingsSession, TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
     UserSettingsSession, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
@@ -266,6 +266,8 @@ enum IpcTarget {
     TimeZone(TimeZoneServiceSession),
     Vi(ViSession),
     NvDrv(NvDrvSession),
+    LogManager(LogManagerSession),
+    Logger(LoggerSession),
     SemanticObject(HandleObject),
 }
 
@@ -280,6 +282,7 @@ enum ServiceKind {
     Account,
     Vi(ViServiceKind),
     NvDrv,
+    LogManager,
     Semantic(IpcService),
 }
 
@@ -299,6 +302,7 @@ impl ServiceKind {
             b"time:u" => Some(Self::Time),
             b"acc:u0" => Some(Self::Account),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
+            b"lm" => Some(Self::LogManager),
             _ => ViServiceKind::from_name(name)
                 .map(Self::Vi)
                 .or_else(|| IpcService::from_name(name).map(Self::Semantic)),
@@ -340,6 +344,10 @@ impl IpcTarget {
             Some(Self::Vi(value.clone()))
         } else if let Some(value) = object.downcast_ref::<NvDrvSession>() {
             Some(Self::NvDrv(value.clone()))
+        } else if let Some(value) = object.downcast_ref::<LogManagerSession>() {
+            Some(Self::LogManager(*value))
+        } else if let Some(value) = object.downcast_ref::<LoggerSession>() {
+            Some(Self::Logger(*value))
         } else if object.is::<ReadOnlyFileSystem>()
             || object.is::<HostDirectoryFileSystem>()
             || object.is::<ReadOnlyFile>()
@@ -392,6 +400,8 @@ impl IpcTarget {
             Self::TimeZone(_) => "ITimeZoneService",
             Self::Vi(session) => vi_object_name(session.kind()),
             Self::NvDrv(_) => "nvdrv",
+            Self::LogManager(_) => "lm",
+            Self::Logger(_) => "ILogger",
             Self::SemanticObject(object) => semantic_object_name(object),
         }
     }
@@ -485,12 +495,11 @@ pub(crate) fn send_sync_request_from_buffer(
     };
 
     if request.command_type == CMIF_COMMAND_CLOSE {
-        // libnx sends a CMIF close before releasing an owned session handle.
-        // The semantic endpoint must stop accepting work at this point even
-        // though libnx subsequently issues CloseHandle as a best-effort local
-        // cleanup:
+        // CMIF closes the server-side session protocol, while the client's
+        // kernel handle remains owned until the following CloseHandle. These
+        // lifetimes must stay distinct: Nintendo SDK treats a failed
+        // CloseHandle after this request as a fatal invariant violation.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L195-L209
-        let _ = process.handles_mut().close(handle);
         return Ok(trace_completion(SyncRequestResult::Success));
     }
     if matches!(
@@ -677,6 +686,15 @@ pub(crate) fn send_sync_request_from_buffer(
             }
             Err(error) => return Err(error),
         },
+        IpcTarget::LogManager(_) => dispatch_log_manager(process, request, &hipc)?,
+        IpcTarget::Logger(logger) => {
+            log::trace!(
+                "ILogger for process {} reached command {}",
+                logger.process_id(),
+                request.command_id
+            );
+            unsupported_service_command("ILogger", request.command_id)?
+        }
         IpcTarget::SemanticObject(object) => {
             dispatch_plain_semantic_object(process, &object, request, &hipc)?
         }
@@ -847,6 +865,44 @@ fn dispatch_account(
     }
 }
 
+fn dispatch_log_manager(
+    process: &mut ExceptionProcessContext<'_>,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        // ILogService::OpenLogger receives the kernel-substituted client PID
+        // descriptor and returns one ILogger object:
+        // https://github.com/Atmosphere-NX/Atmosphere/blob/cb4b882e3b176480ac57a1161a85ff175c3f162c/libraries/libstratosphere/source/lm/sf/lm_i_log_service.hpp#L23-L26
+        0 => {
+            if hipc.pid.is_none()
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || !matches!(hipc.receive_statics, ReceiveStatics::None)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let process_id = process.process_id();
+            let handle = process
+                .handles_mut()
+                .insert(LoggerSession::new(process_id))
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing an lm logger handle")
+                })?;
+            log::debug!("lm opened ILogger handle {handle:#x} for process {process_id}");
+            Ok((
+                encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+                Some(handle),
+            ))
+        }
+        command_id => unsupported_service_command("lm", command_id),
+    }
+}
+
 fn connect_service(
     process: &mut ExceptionProcessContext<'_>,
     token: u32,
@@ -884,6 +940,7 @@ fn connect_service(
             host_systems.video.clone(),
         )),
         ServiceKind::NvDrv => process.handles_mut().insert(host_systems.video.nvdrv()),
+        ServiceKind::LogManager => process.handles_mut().insert(LogManagerSession::new()),
         ServiceKind::Semantic(service) => process.handles_mut().insert(IpcSession::new(service)),
     };
     match handle {

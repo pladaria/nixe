@@ -20,7 +20,8 @@ pub(super) fn execute(
 ) -> Result<InstructionStep, InterpreterError> {
     let fields = instruction.operands();
     if matches!(instruction, Instruction::Hint(_))
-        && let Some(operation) = nixe_cpu::semantics::a64::hint_operation(fields.hint)
+        && let Some(operation) =
+            nixe_cpu::semantics::a64::hint_operation(context.process().platform(), fields.hint)
     {
         return execute_architectural_hint(context, state, decoded, operation);
     }

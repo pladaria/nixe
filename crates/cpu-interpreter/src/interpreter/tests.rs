@@ -425,6 +425,39 @@ fn a64_basic_system_semantics_are_exact_and_runtime_hints_remain_explicit() {
 }
 
 #[test]
+fn a64_switch_1_pointer_authentication_hint_family_preserves_link_register() {
+    let profile = TargetPlatform::Switch1;
+    let encodings = [
+        0xd503_20ff_u32, // XPACLRI
+        0xd503_211f,     // PACIA1716
+        0xd503_215f,     // PACIB1716
+        0xd503_219f,     // AUTIA1716
+        0xd503_21df,     // AUTIB1716
+        0xd503_231f,     // PACIAZ
+        0xd503_233f,     // PACIASP
+        0xd503_235f,     // PACIBZ
+        0xd503_237f,     // PACIBSP
+        0xd503_239f,     // AUTIAZ
+        0xd503_23bf,     // AUTIASP
+        0xd503_23df,     // AUTIBZ
+        0xd503_23ff,     // AUTIBSP
+    ];
+    let link_register = 0xabcd_0000_7518_7c14;
+    let mut state = A64State::default();
+    state.write_x(x(30), link_register);
+
+    for encoding in encodings {
+        assert_eq!(
+            execute_one(&profile, &mut state, encoding).unwrap(),
+            InstructionStep::Continue,
+            "{encoding:#010x}"
+        );
+        assert_eq!(state.read_x(x(30)), link_register, "{encoding:#010x}");
+    }
+    assert_eq!(state.pc(), encodings.len() as u64 * 4);
+}
+
+#[test]
 fn a64_simd_duplicate_general_replicates_each_allocated_lane_width() {
     let profile = TargetPlatform::Switch1;
     let mut state = A64State::default();

@@ -1668,6 +1668,29 @@ fn system_register_timer_barrier_and_cache_paths_match_the_interpreter() {
 }
 
 #[test]
+fn switch_1_pointer_authentication_hint_family_matches_the_interpreter() {
+    for encoding in [
+        0xd503_20ff_u32, // XPACLRI
+        0xd503_211f,     // PACIA1716
+        0xd503_215f,     // PACIB1716
+        0xd503_219f,     // AUTIA1716
+        0xd503_21df,     // AUTIB1716
+        0xd503_231f,     // PACIAZ
+        0xd503_233f,     // PACIASP
+        0xd503_235f,     // PACIBZ
+        0xd503_237f,     // PACIBSP
+        0xd503_239f,     // AUTIAZ
+        0xd503_23bf,     // AUTIASP
+        0xd503_23df,     // AUTIBZ
+        0xd503_23ff,     // AUTIBSP
+    ] {
+        let mut initial = rich_state();
+        write_register(&mut initial, 30, 0xabcd_0000_7518_7c14);
+        assert_matches_interpreter(encoding, initial);
+    }
+}
+
+#[test]
 fn scheduling_hints_publish_the_next_pc_and_exact_request() {
     let yield_memory = memory(&[(0, 0xd503_203f), (4, breakpoint(0))]);
     let mut yield_state = state(CODE, 0);
@@ -2079,6 +2102,39 @@ fn memory_and_system_shapes_remain_bounded() {
             .unwrap();
         assert!(region.clif_instructions <= 512, "{encoding:#010x}");
         assert!(region.native_bytes <= 4096, "{encoding:#010x}");
+    }
+}
+
+#[test]
+fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
+    let metrics = |encoding| {
+        let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
+        let process = JitProcess::new(cpu()).unwrap();
+        process.entry_for(&memory, location(CODE)).unwrap();
+        let state = process.state.lock().unwrap();
+        let region = state
+            .region_for(RegionKey::new(cpu(), location(CODE)))
+            .unwrap();
+        (region.clif_instructions, region.native_bytes)
+    };
+    let nop = metrics(0xd503_201f);
+
+    for encoding in [
+        0xd503_20ff_u32,
+        0xd503_211f,
+        0xd503_215f,
+        0xd503_219f,
+        0xd503_21df,
+        0xd503_231f,
+        0xd503_233f,
+        0xd503_235f,
+        0xd503_237f,
+        0xd503_239f,
+        0xd503_23bf,
+        0xd503_23df,
+        0xd503_23ff,
+    ] {
+        assert_eq!(metrics(encoding), nop, "{encoding:#010x}");
     }
 }
 

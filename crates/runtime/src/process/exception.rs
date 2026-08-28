@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_EXIT_STACK_FRAMES: usize = 32;
+
 impl RunnableProcess {
     /// Routes and atomically applies one supervisor-call decision.
     ///
@@ -63,9 +65,8 @@ impl RunnableProcess {
                 address_space_limit: self.address_space.exclusive_limit(),
                 memory_layout: self.memory_layout,
                 random_entropy: self.random_entropy,
-                initial_memory_size: self.initial_memory_size,
             },
-            &mut self.heap_size,
+            &mut self.memory_accounting,
             ExceptionProcessResources {
                 memory: &self.memory,
                 mapping_control: &self.execution,
@@ -136,6 +137,12 @@ impl RunnableProcess {
                         .state_mut(),
                     source,
                 )?;
+                let context = self
+                    .thread(thread_id)
+                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
+                    .state()
+                    .register_context();
+                let frames = self.capture_exit_stack_frames(thread_id, &context);
                 let exit = ProcessExit {
                     cause: match reason {
                         ExceptionTerminationReason::Break {
@@ -161,6 +168,8 @@ impl RunnableProcess {
                     exit_code,
                     source: Some(source),
                     thread_id: thread_id.get(),
+                    context: Some(Box::new(context)),
+                    frames,
                 };
                 let terminate_process = scope == ExceptionTerminationScope::Process || !other_live;
                 if terminate_process {
@@ -214,5 +223,50 @@ impl RunnableProcess {
                 Ok(ExceptionHandlingResult::Fault(fault))
             }
         }
+    }
+
+    fn capture_exit_stack_frames(
+        &self,
+        thread_id: nixe_scheduler::GuestThreadId,
+        context: &nixe_cpu::state::RegisterContext,
+    ) -> Box<[GuestStackFrame]> {
+        let Some(thread) = self.thread(thread_id) else {
+            return Box::new([]);
+        };
+        let stack_bottom = thread.stack_bottom.get();
+        let stack_top = thread.stack_top.get();
+        let mut frame_pointer = context.x[29];
+        let mut frames = Vec::with_capacity(MAX_EXIT_STACK_FRAMES);
+        while frames.len() < MAX_EXIT_STACK_FRAMES
+            && frame_pointer.is_multiple_of(16)
+            && frame_pointer >= stack_bottom
+            && frame_pointer
+                .checked_add(16)
+                .is_some_and(|end| end <= stack_top)
+        {
+            let mut record = [0_u8; 16];
+            if self
+                .memory
+                .read_bytes(
+                    self.cpu.address_space_id(),
+                    GuestVirtualAddress::new(frame_pointer),
+                    &mut record,
+                )
+                .is_err()
+            {
+                break;
+            }
+            let previous = u64::from_le_bytes(record[..8].try_into().unwrap());
+            let return_address = u64::from_le_bytes(record[8..].try_into().unwrap());
+            frames.push(GuestStackFrame {
+                frame_pointer,
+                return_address,
+            });
+            if previous <= frame_pointer {
+                break;
+            }
+            frame_pointer = previous;
+        }
+        frames.into_boxed_slice()
     }
 }

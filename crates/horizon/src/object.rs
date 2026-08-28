@@ -39,6 +39,37 @@ impl ServiceManagerSession {
     }
 }
 
+/// Root session for Horizon's `lm` log service.
+///
+/// The service object exists independently of its command support so SM can
+/// return the real session boundary while unimplemented methods remain fatal.
+/// Interface reference:
+/// https://github.com/Atmosphere-NX/Atmosphere/blob/cb4b882e3b176480ac57a1161a85ff175c3f162c/libraries/libstratosphere/source/lm/sf/lm_i_log_service.hpp
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct LogManagerSession;
+
+impl LogManagerSession {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+/// Per-process logger returned by `ILogService::OpenLogger`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct LoggerSession {
+    process_id: u64,
+}
+
+impl LoggerSession {
+    pub(crate) const fn new(process_id: u64) -> Self {
+        Self { process_id }
+    }
+
+    pub(crate) const fn process_id(self) -> u64 {
+        self.process_id
+    }
+}
+
 /// Client session connected to Horizon's `acc:u0` account service.
 #[derive(Clone, Debug, Default)]
 pub struct AccountSession {

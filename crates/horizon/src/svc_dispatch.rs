@@ -12,8 +12,8 @@ use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{
     DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAttributes,
     MemoryMappingError, MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions,
-    MemoryProtectionError, MemoryProtectionErrorReason, MemoryRegionKind, MemoryValue,
-    ProcessMemory,
+    MemoryProtectionError, MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind,
+    MemoryValue, ProcessMemory,
 };
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -98,13 +98,7 @@ fn set_heap_size(
         result(context, HorizonKernelResult::INVALID_SIZE);
         return resume();
     }
-    if context
-        .process()
-        .used_memory_size()
-        .saturating_sub(context.process().heap_size())
-        .saturating_add(new_size)
-        > layout.memory_capacity()
-    {
+    if !context.process().can_resize_heap(new_size) {
         result(context, HorizonKernelResult::RESOURCE_LIMIT);
         return resume();
     }
@@ -1077,7 +1071,10 @@ fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult
 }
 
 fn thread_tls(state: &ThreadCpuState) -> GuestVirtualAddress {
-    GuestVirtualAddress::new(state.tpidr_el0())
+    // Horizon owns TPIDRRO_EL0 and uses it as the fixed thread-local IPC buffer base.
+    // TPIDR_EL0 belongs to userspace and software is free to repurpose it (including
+    // clearing it), so it cannot be used to locate the kernel-managed TLS region.
+    GuestVirtualAddress::new(state.tpidrro_el0())
 }
 
 fn session_request_owner(context: &ExceptionDispatchContext<'_>) -> SessionRequestOwner {
@@ -1565,13 +1562,29 @@ fn query_memory(
     let output = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
     let address = GuestVirtualAddress::new(read_register(context.thread().state(), 2));
     let limit = context.process().address_space_limit();
-    let Some(query) = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        address,
-        GuestVirtualAddress::new(limit),
-    ) else {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
+    let query = if address.get() >= limit {
+        // Horizon reports one synthetic inaccessible region from the process address-space
+        // limit through the end of the 64-bit range. Nintendo's rtld walks mappings with
+        // `base + size` and relies on this terminal region wrapping the cursor back to zero;
+        // returning InvalidAddress here makes rtld enter its fatal self-loop instead.
+        MemoryQueryResult {
+            base: GuestVirtualAddress::new(limit),
+            size: 0_u64.wrapping_sub(limit),
+            region: None,
+            permissions: MemoryPermissions::NONE,
+            attributes: MemoryAttributes::NONE,
+            purpose: MemoryMappingPurpose::Normal,
+        }
+    } else {
+        let Some(query) = context.process().memory().query_memory(
+            context.process().cpu().address_space_id(),
+            address,
+            GuestVirtualAddress::new(limit),
+        ) else {
+            result(context, HorizonKernelResult::INVALID_ADDRESS);
+            return resume();
+        };
+        query
     };
     let memory_type = match query.region {
         None => 0_u32,

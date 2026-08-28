@@ -477,8 +477,12 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
             return Err(error);
         }
     };
-    let exit_code = result.teardown.exit.map_or(0, |exit| exit.exit_code);
-    let exit_cause = result.teardown.exit.map_or_else(
+    let exit_code = result
+        .teardown
+        .exit
+        .as_ref()
+        .map_or(0, |exit| exit.exit_code);
+    let exit_cause = result.teardown.exit.as_ref().map_or_else(
         || "without an exit record".to_owned(),
         |exit| format!("{:?}", exit.cause),
     );
@@ -873,9 +877,27 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
                     format!(", payload=0x{encoded}")
                 }
             });
+            let source = exit
+                .source
+                .map_or_else(|| "unknown".to_owned(), |source| source.to_string());
+            let registers = exit
+                .context
+                .as_ref()
+                .map_or_else(|| "unavailable".to_owned(), |context| context.to_string());
+            let frames = exit
+                .frames
+                .iter()
+                .map(|frame| {
+                    format!(
+                        "fp=0x{:016x} lr=0x{:016x}",
+                        frame.frame_pointer, frame.return_address
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             Err(format!(
-                "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}{payload}, code={:#x}",
-                exit.exit_code
+                "guest requested a fatal break: reason={reason:#x}, info={info:#x}, size={size:#x}{payload}, source=[{source}], thread={}, registers=[{registers}], frames=[{frames}], code={:#x}",
+                exit.thread_id, exit.exit_code
             ))
         }
     }
@@ -1014,6 +1036,8 @@ mod tests {
             exit_code,
             source: None,
             thread_id: 1,
+            context: None,
+            frames: Box::new([]),
         }
     }
 
@@ -1041,7 +1065,7 @@ mod tests {
 
     #[test]
     fn rejects_fatal_guest_breaks_even_when_the_code_is_zero() {
-        let error = classify_exit(Some(process_exit(
+        let mut exit = process_exit(
             ProcessExitCause::GuestBreak {
                 reason: 0,
                 info: 0x1234,
@@ -1049,10 +1073,37 @@ mod tests {
                 payload: None,
             },
             0,
-        )))
-        .unwrap_err();
+        );
+        let source = nixe_cpu::location::LocationDescriptor::new(
+            nixe_memory::GuestVirtualAddress::new(0x7525_1264),
+            nixe_cpu::profile::CpuProfileId::new(1),
+        );
+        let mut x = [0; nixe_cpu::state::a64::GENERAL_REGISTER_COUNT];
+        x[30] = 0x7522_7af8;
+        exit.source = Some(source);
+        exit.thread_id = 7;
+        exit.context = Some(Box::new(nixe_cpu::state::RegisterContext {
+            x,
+            sp: 0x1076_0ffec0,
+            pc: source.pc,
+            nzcv: nixe_cpu::state::Nzcv::from_bits(nixe_cpu::state::Nzcv::C),
+        }));
+        exit.frames = Box::new([nixe_runtime::GuestStackFrame {
+            frame_pointer: 0x1076_0ffcf0,
+            return_address: 0x7518_7c14,
+        }]);
+
+        let error = classify_exit(Some(exit)).unwrap_err();
         assert!(error.contains("fatal break"));
         assert!(error.contains("info=0x1234"));
+        assert!(
+            error.contains("source=[pc=0x0000000075251264 profile=0x0000000000000001], thread=7")
+        );
+        assert!(error.contains("x30=0x0000000075227af8"));
+        assert!(error.contains("sp=0x00000010760ffec0"));
+        assert!(error.contains("pc=0x0000000075251264"));
+        assert!(error.contains("flags=N0Z0C1V0"));
+        assert!(error.contains("fp=0x00000010760ffcf0 lr=0x0000000075187c14"));
     }
 
     #[test]

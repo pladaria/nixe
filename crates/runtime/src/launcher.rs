@@ -520,19 +520,18 @@ fn load_modules(
         ));
     }
     candidates.sort_by_key(|(role, _, _)| *role);
-    let main_count = candidates
-        .iter()
-        .filter(|(role, _, _)| *role == ModuleRole::Main)
-        .count();
-    if main_count != 1 {
+    if !roles.contains(&ModuleRole::Main) {
         return Err(LaunchError::invalid(
             LaunchStage::ExecutableModules,
             path,
-            format!("ExeFS contains {main_count} main modules; expected one"),
+            "ExeFS has no main module",
         ));
     }
     let mut modules = Vec::with_capacity(candidates.len());
-    let mut module_ids = BTreeSet::new();
+    // Build IDs are patch/debug metadata rather than ExeFS entry identities. Horizon loads
+    // every present role in dependency order, and commercial ExeFS images may store the same
+    // NSO under multiple roles.
+    // Reference: https://github.com/Atmosphere-NX/Atmosphere/blob/cb4b882e3b176480ac57a1161a85ff175c3f162c/docs/components/modules/loader.md#file-replacement
     for (role, name, entry) in candidates {
         let module_started = Instant::now();
         let storage = exefs.open_entry(entry).map_err(|error| {
@@ -541,14 +540,6 @@ fn load_modules(
         let image = NsoLoader::load(storage).map_err(|error| {
             LaunchError::load(LaunchStage::ExecutableModules, path, error).module(&name)
         })?;
-        if !module_ids.insert(*image.executable().module_id()) {
-            return Err(LaunchError::invalid(
-                LaunchStage::ExecutableModules,
-                path,
-                "duplicate executable module identity",
-            )
-            .module(&name));
-        }
         modules.push(LaunchModule::new(
             name.into_boxed_str(),
             role,
@@ -898,10 +889,69 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use nixe_loader_content::ExeFsLoader;
+
     use crate::{LaunchKind, LaunchModuleImage};
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn minimal_nso(module_id: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 0x10b];
+        bytes[..4].copy_from_slice(b"NSO0");
+        put_u32(&mut bytes, 0x10, 0x100);
+        put_u32(&mut bytes, 0x18, 8);
+        put_u32(&mut bytes, 0x1c, 0x10a);
+        put_u32(&mut bytes, 0x20, 0x108);
+        put_u32(&mut bytes, 0x24, 0x1000);
+        put_u32(&mut bytes, 0x28, 1);
+        put_u32(&mut bytes, 0x2c, 1);
+        put_u32(&mut bytes, 0x30, 0x109);
+        put_u32(&mut bytes, 0x34, 0x2000);
+        put_u32(&mut bytes, 0x38, 1);
+        bytes[0x40..0x60].fill(module_id);
+        put_u32(&mut bytes, 0x60, 8);
+        put_u32(&mut bytes, 0x64, 1);
+        put_u32(&mut bytes, 0x68, 1);
+        bytes
+    }
+
+    fn minimal_exefs(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        const HEADER_SIZE: usize = 0x10;
+        const ENTRY_SIZE: usize = 0x18;
+
+        let string_table_size = entries
+            .iter()
+            .map(|(name, _)| name.len() + 1)
+            .sum::<usize>();
+        let data_offset = HEADER_SIZE + entries.len() * ENTRY_SIZE + string_table_size;
+        let data_size = entries.iter().map(|(_, data)| data.len()).sum::<usize>();
+        let mut bytes = vec![0; data_offset + data_size];
+        bytes[..4].copy_from_slice(b"PFS0");
+        put_u32(&mut bytes, 4, entries.len() as u32);
+        put_u32(&mut bytes, 8, string_table_size as u32);
+
+        let mut name_offset = 0;
+        let mut relative_data_offset = 0;
+        for (index, (name, data)) in entries.iter().enumerate() {
+            let entry_offset = HEADER_SIZE + index * ENTRY_SIZE;
+            put_u64(&mut bytes, entry_offset, relative_data_offset as u64);
+            put_u64(&mut bytes, entry_offset + 8, data.len() as u64);
+            put_u32(&mut bytes, entry_offset + 16, name_offset as u32);
+
+            let name_start = HEADER_SIZE + entries.len() * ENTRY_SIZE + name_offset;
+            bytes[name_start..name_start + name.len()].copy_from_slice(name.as_bytes());
+            let file_start = data_offset + relative_data_offset;
+            bytes[file_start..file_start + data.len()].copy_from_slice(data);
+            name_offset += name.len() + 1;
+            relative_data_offset += data.len();
+        }
+        bytes
     }
 
     fn minimal_nro() -> Vec<u8> {
@@ -942,6 +992,37 @@ mod tests {
         assert_eq!(module_role("subsdk"), None);
         assert_eq!(module_role("subsdk-1"), None);
         assert_eq!(module_role("other"), None);
+    }
+
+    #[test]
+    fn distinct_exefs_roles_may_share_one_nso_build_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main");
+        let main = minimal_nso(1);
+        let shared_sdk = minimal_nso(2);
+        fs::write(
+            &path,
+            minimal_exefs(&[
+                ("main", &main),
+                ("subsdk0", &shared_sdk),
+                ("sdk", &shared_sdk),
+            ]),
+        )
+        .unwrap();
+        let exefs = ExeFsLoader::load(Arc::new(FileStorage::open(&path).unwrap())).unwrap();
+
+        let (modules, entry) = load_modules(&path, &exefs).unwrap();
+
+        assert_eq!(entry, 0);
+        assert_eq!(modules.len(), 3);
+        assert_eq!(modules[0].role(), ModuleRole::Main);
+        assert_eq!(modules[1].role(), ModuleRole::SubSdk(0));
+        assert_eq!(modules[2].role(), ModuleRole::Sdk);
+        let module_id = |module: &LaunchModule| match module.image() {
+            LaunchModuleImage::Nso(image) => *image.executable().module_id(),
+            LaunchModuleImage::Nro(_) => panic!("packaged ExeFS module must be an NSO"),
+        };
+        assert_eq!(module_id(&modules[1]), module_id(&modules[2]));
     }
 
     #[test]

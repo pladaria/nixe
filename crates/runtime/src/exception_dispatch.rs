@@ -18,7 +18,8 @@ use nixe_memory::MemoryInvalidationSource;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
-    AddressWaitRegistry, HandleTable, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
+    AddressWaitRegistry, HandleTable, ProcessMemoryAccounting, ProcessMemoryLayout,
+    ProcessMountNamespace, ThreadObject,
 };
 
 /// Maximum number of guest bytes retained from a fatal break payload.
@@ -185,8 +186,7 @@ pub struct ExceptionProcessContext<'a> {
     address_space_limit: u64,
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
-    heap_size: &'a mut u64,
-    initial_memory_size: u64,
+    memory_accounting: &'a mut ProcessMemoryAccounting,
     memory: &'a ExecutionMemory,
     mapping_control: &'a dyn MemoryMutationControl,
     canonical_memory: &'a dyn CanonicalRangeTranslator,
@@ -202,13 +202,12 @@ pub(crate) struct ExceptionProcessMetadata {
     pub address_space_limit: u64,
     pub memory_layout: ProcessMemoryLayout,
     pub random_entropy: [u64; 4],
-    pub initial_memory_size: u64,
 }
 
 impl<'a> ExceptionProcessContext<'a> {
     pub(crate) const fn new(
         metadata: ExceptionProcessMetadata,
-        heap_size: &'a mut u64,
+        memory_accounting: &'a mut ProcessMemoryAccounting,
         resources: ExceptionProcessResources<'a>,
     ) -> Self {
         Self {
@@ -217,8 +216,7 @@ impl<'a> ExceptionProcessContext<'a> {
             address_space_limit: metadata.address_space_limit,
             memory_layout: metadata.memory_layout,
             random_entropy: metadata.random_entropy,
-            heap_size,
-            initial_memory_size: metadata.initial_memory_size,
+            memory_accounting,
             memory: resources.memory,
             mapping_control: resources.mapping_control,
             canonical_memory: resources.canonical_memory,
@@ -259,18 +257,50 @@ impl<'a> ExceptionProcessContext<'a> {
     /// Returns the currently committed heap size.
     #[must_use]
     pub const fn heap_size(&self) -> u64 {
-        *self.heap_size
+        self.memory_accounting.heap_size()
     }
 
     /// Updates heap accounting after an atomic memory resize succeeds.
     pub fn set_heap_size(&mut self, size: u64) {
-        *self.heap_size = size;
+        self.memory_accounting.commit_heap_size(size);
     }
 
-    /// Returns mapped executable, stack, TLS, and ABI memory plus the heap.
+    /// Returns whether a heap resize stays within the shared physical limit.
     #[must_use]
-    pub const fn used_memory_size(&self) -> u64 {
-        self.initial_memory_size + *self.heap_size
+    pub const fn can_resize_heap(&self, size: u64) -> bool {
+        self.memory_accounting.can_resize_heap(size)
+    }
+
+    #[must_use]
+    pub const fn total_user_physical_memory_size(&self) -> u64 {
+        self.memory_accounting.total_user_physical_memory_size()
+    }
+
+    #[must_use]
+    pub const fn used_user_physical_memory_size(&self) -> u64 {
+        self.memory_accounting.used_user_physical_memory_size()
+    }
+
+    #[must_use]
+    pub const fn total_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory_accounting
+            .total_non_system_user_physical_memory_size()
+    }
+
+    #[must_use]
+    pub const fn used_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory_accounting
+            .used_non_system_user_physical_memory_size()
+    }
+
+    #[must_use]
+    pub const fn total_system_resource_size(&self) -> u64 {
+        self.memory_accounting.total_system_resource_size()
+    }
+
+    #[must_use]
+    pub const fn used_system_resource_size(&self) -> u64 {
+        self.memory_accounting.used_system_resource_size()
     }
 
     /// Returns the immutable CPU profile and address-space identity of the

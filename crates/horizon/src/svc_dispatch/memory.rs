@@ -34,6 +34,10 @@ pub(super) fn get_info(
         return resume();
     }
     let layout = context.process().memory_layout();
+    // Horizon derives these six physical-memory views from the same KProcess
+    // counters. Runtime keeps their shared accounting incremental so queries
+    // remain mutually consistent without scanning mappings here.
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_process.cpp
     let value = match info_type {
         2 => layout.alias().base().get(),
         3 => layout.alias().size(),
@@ -43,8 +47,16 @@ pub(super) fn get_info(
         13 => layout.aslr().size(),
         14 => layout.stack().base().get(),
         15 => layout.stack().size(),
-        6 => layout.memory_capacity(),
-        7 => context.process().used_memory_size(),
+        6 => context.process().total_user_physical_memory_size(),
+        7 => context.process().used_user_physical_memory_size(),
+        16 => context.process().total_system_resource_size(),
+        17 => context.process().used_system_resource_size(),
+        21 => context
+            .process()
+            .total_non_system_user_physical_memory_size(),
+        22 => context
+            .process()
+            .used_non_system_user_physical_memory_size(),
         28 => 0,
         _ => {
             return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {

@@ -54,10 +54,10 @@ pub use module_memory::{
 };
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use process::{
-    CpuBackendConfig, ExecutionReport, ExecutionStop, GuestThread, ProcessAddressSpace,
-    ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
-    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryLayout,
-    ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
+    CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread,
+    ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
+    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryAccounting,
+    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
     ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
     ThreadExit, ThreadTable, ThreadTableError,
 };
