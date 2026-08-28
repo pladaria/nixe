@@ -39,11 +39,12 @@ pub use nvdrv::{
 };
 pub use object::{
     AccountSession, AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource,
-    HidSession, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession, LoggerSession,
-    OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, RegionCode, ServiceManagerSession, SettingsEnvironment, SteadyClockSession,
-    SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession, TimeEnvironment,
-    TimeServiceSession, TimeZoneServiceSession, UserSettingsSession,
+    HidSession, HorizonIpcObject, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession,
+    LoggerSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
+    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
+    ReadOnlyFileSystem, RegionCode, SemanticIpcObject, ServiceManagerSession, SettingsEnvironment,
+    SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
+    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession,
 };
 pub use scheduler_profile::{
     HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,

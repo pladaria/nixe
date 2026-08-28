@@ -11,11 +11,53 @@ use std::sync::{Arc, Mutex};
 use chrono_tz::Tz;
 use nixe_loader_storage::StorageRef;
 use nixe_runtime::{
-    HandleObject, ReadOnlyMount, ReadableEventObject, SharedMemoryObject, VirtualClock,
-    WritableEventObject,
+    ReadOnlyMount, ReadableEventObject, SharedMemoryObject, VirtualClock, WritableEventObject,
 };
 
-use crate::IpcService;
+use crate::graphics::ViSession;
+use crate::ipc::IpcService;
+use crate::nvdrv::NvDrvSession;
+
+/// Every Horizon-owned object that may receive an IPC request through a
+/// process handle.
+///
+/// Keeping one exhaustive value in the generic runtime handle table makes
+/// object classification constant-time and compiler-checked. Kernel objects
+/// such as events and shared memory remain independent runtime handle values.
+#[derive(Clone, Debug)]
+pub enum HorizonIpcObject {
+    ServiceManager(ServiceManagerSession),
+    SemanticService(IpcSession),
+    SystemSettings(SystemSettingsSession),
+    UserSettings(UserSettingsSession),
+    PerformanceManager(PerformanceManagerSession),
+    Performance(PerformanceSession),
+    Applet(AppletSession),
+    Account(AccountSession),
+    Hid(HidSession),
+    HidAppletResource(HidAppletResource),
+    Time(TimeServiceSession),
+    SystemClock(SystemClockSession),
+    SteadyClock(SteadyClockSession),
+    TimeZone(TimeZoneServiceSession),
+    Vi(ViSession),
+    NvDrv(NvDrvSession),
+    LogManager(LogManagerSession),
+    Logger(LoggerSession),
+    ParentalControl(ParentalControlFactorySession),
+    ParentalControlService(ParentalControlSession),
+    SemanticObject(SemanticIpcObject),
+}
+
+/// Filesystem objects dispatched by the bounded semantic IPC layer.
+#[derive(Clone, Debug)]
+pub enum SemanticIpcObject {
+    ReadOnlyFileSystem(ReadOnlyFileSystem),
+    HostDirectoryFileSystem(HostDirectoryFileSystem),
+    ReadOnlyFile(ReadOnlyFile),
+    HostFile(HostFile),
+    ReadOnlyDirectory(ReadOnlyDirectory),
+}
 
 /// Client session connected to Horizon's global `sm:` named port.
 #[derive(Clone, Debug)]
@@ -113,28 +155,21 @@ const IPC_ROOT_OBJECT_ID: u32 = 1;
 const MAX_IPC_DOMAIN_OBJECTS: usize = 0x40;
 
 #[derive(Debug)]
-struct IpcDomain {
+struct IpcDomain<T> {
     converted: bool,
     next_object_id: u32,
-    objects: BTreeMap<u32, HandleObject>,
+    objects: BTreeMap<u32, T>,
 }
 
-/// A connected Horizon service session.
-///
-/// Domain child objects retain the same type-erased shared identity used by a
-/// process handle. This keeps conversion from inventing a second lifetime
-/// model while allowing CMIF to address children by object ID.
 #[derive(Clone, Debug)]
-pub struct IpcSession {
-    service: IpcService,
-    domain: Arc<Mutex<IpcDomain>>,
+struct DomainSession<T> {
+    state: Arc<Mutex<IpcDomain<T>>>,
 }
 
-impl IpcSession {
-    pub(crate) fn new(service: IpcService) -> Self {
+impl<T: Clone> DomainSession<T> {
+    fn new() -> Self {
         Self {
-            service,
-            domain: Arc::new(Mutex::new(IpcDomain {
+            state: Arc::new(Mutex::new(IpcDomain {
                 converted: false,
                 next_object_id: IPC_ROOT_OBJECT_ID + 1,
                 objects: BTreeMap::new(),
@@ -142,30 +177,26 @@ impl IpcSession {
         }
     }
 
-    pub(crate) const fn service(&self) -> IpcService {
-        self.service
-    }
-
-    pub(crate) fn is_domain(&self) -> bool {
-        self.domain
+    fn is_domain(&self) -> bool {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .converted
     }
 
-    pub(crate) fn convert_to_domain(&self) -> u32 {
-        self.domain
+    fn convert(&self) -> u32 {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .converted = true;
         IPC_ROOT_OBJECT_ID
     }
 
-    pub(crate) fn object(&self, object_id: u32) -> Option<HandleObject> {
+    fn object(&self, object_id: u32) -> Option<T> {
         if object_id == IPC_ROOT_OBJECT_ID {
             return None;
         }
-        self.domain
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .objects
@@ -173,25 +204,25 @@ impl IpcSession {
             .cloned()
     }
 
-    pub(crate) fn insert_object(&self, object: HandleObject) -> Option<u32> {
-        let mut domain = self
-            .domain
+    fn insert_object(&self, object: T) -> Option<u32> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !domain.converted || domain.objects.len() + 1 >= MAX_IPC_DOMAIN_OBJECTS {
+        if !state.converted || state.objects.len() + 1 >= MAX_IPC_DOMAIN_OBJECTS {
             return None;
         }
-        let object_id = domain.next_object_id;
-        domain.next_object_id = domain.next_object_id.checked_add(1)?;
-        domain.objects.insert(object_id, object);
+        let object_id = state.next_object_id;
+        state.next_object_id = state.next_object_id.checked_add(1)?;
+        state.objects.insert(object_id, object);
         Some(object_id)
     }
 
-    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+    fn close_object(&self, object_id: u32) -> bool {
         if object_id == IPC_ROOT_OBJECT_ID {
             return false;
         }
-        self.domain
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .objects
@@ -200,27 +231,142 @@ impl IpcSession {
     }
 }
 
+/// A connected Horizon service session.
+///
+/// Domain child objects use the same exhaustive semantic identity as process
+/// handles, while their CMIF object IDs retain an independent lifetime.
+#[derive(Clone, Debug)]
+pub struct IpcSession {
+    service: IpcService,
+    domain: DomainSession<SemanticIpcObject>,
+}
+
+impl IpcSession {
+    pub(crate) fn new(service: IpcService) -> Self {
+        Self {
+            service,
+            domain: DomainSession::new(),
+        }
+    }
+
+    pub(crate) const fn service(&self) -> IpcService {
+        self.service
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+
+    pub(crate) fn object(&self, object_id: u32) -> Option<SemanticIpcObject> {
+        self.domain.object(object_id)
+    }
+
+    pub(crate) fn insert_object(&self, object: SemanticIpcObject) -> Option<u32> {
+        self.domain.insert_object(object)
+    }
+
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+        self.domain.close_object(object_id)
+    }
+}
+
+/// Root factory session for Horizon's parental-control services.
+///
+/// The factory is a CMIF domain whose children are per-process
+/// [`ParentalControlSession`] objects. Interface and version split:
+/// https://switchbrew.org/w/index.php?title=Parental_Control_services&oldid=14435
+#[derive(Clone, Debug)]
+pub struct ParentalControlFactorySession {
+    domain: DomainSession<ParentalControlSession>,
+}
+
+impl ParentalControlFactorySession {
+    pub(crate) fn new() -> Self {
+        Self {
+            domain: DomainSession::new(),
+        }
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+
+    pub(crate) fn object(&self, object_id: u32) -> Option<ParentalControlSession> {
+        self.domain.object(object_id)
+    }
+
+    pub(crate) fn insert_object(&self, object: ParentalControlSession) -> Option<u32> {
+        self.domain.insert_object(object)
+    }
+
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+        self.domain.close_object(object_id)
+    }
+}
+
+/// Per-process `IParentalControlService` object returned by `pctl`.
+#[derive(Clone, Debug)]
+pub struct ParentalControlSession {
+    process_id: u64,
+    initialized: Arc<AtomicBool>,
+}
+
+impl ParentalControlSession {
+    pub(crate) fn new(process_id: u64, initialized: bool) -> Self {
+        Self {
+            process_id,
+            initialized: Arc::new(AtomicBool::new(initialized)),
+        }
+    }
+
+    pub(crate) const fn process_id(&self) -> u64 {
+        self.process_id
+    }
+
+    pub(crate) fn initialize(&self) {
+        self.initialized.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod ipc_session_tests {
-    use nixe_runtime::ThreadObject;
-
     use super::*;
 
     #[test]
-    fn generic_domain_retains_child_handle_identity_and_closes_it() {
+    fn generic_domain_retains_and_closes_a_typed_child() {
         let session = IpcSession::new(IpcService::FileSystem);
         assert!(!session.is_domain());
         assert!(
             session
-                .insert_object(HandleObject::new(ThreadObject::new(9)))
+                .insert_object(SemanticIpcObject::HostDirectoryFileSystem(
+                    HostDirectoryFileSystem::new(None),
+                ))
                 .is_none()
         );
         assert_eq!(session.convert_to_domain(), IPC_ROOT_OBJECT_ID);
 
-        let object = HandleObject::new(ThreadObject::new(7));
-        let object_id = session.insert_object(object.clone()).unwrap();
+        let object_id = session
+            .insert_object(SemanticIpcObject::HostDirectoryFileSystem(
+                HostDirectoryFileSystem::new(None),
+            ))
+            .unwrap();
         let retained = session.object(object_id).unwrap();
-        assert!(retained.same_identity(&object));
+        assert!(matches!(
+            retained,
+            SemanticIpcObject::HostDirectoryFileSystem(_)
+        ));
         assert!(session.close_object(object_id));
         assert!(session.object(object_id).is_none());
         assert!(!session.close_object(IPC_ROOT_OBJECT_ID));
@@ -233,9 +379,15 @@ mod ipc_session_tests {
         let cloned = session.clone();
         assert!(cloned.is_domain());
 
-        let object = HandleObject::new(ThreadObject::new(11));
-        let object_id = cloned.insert_object(object.clone()).unwrap();
-        assert!(session.object(object_id).unwrap().same_identity(&object));
+        let object_id = cloned
+            .insert_object(SemanticIpcObject::HostDirectoryFileSystem(
+                HostDirectoryFileSystem::new(None),
+            ))
+            .unwrap();
+        assert!(matches!(
+            session.object(object_id),
+            Some(SemanticIpcObject::HostDirectoryFileSystem(_))
+        ));
         assert!(session.close_object(object_id));
         assert!(cloned.object(object_id).is_none());
     }
@@ -859,6 +1011,62 @@ struct ActiveLibraryApplet {
     input_storage_ids: VecDeque<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+enum AppletMessage {
+    FocusStateChanged = 15,
+}
+
+const APPLET_FOCUS_STATE_IN_FOCUS: u8 = 1;
+
+/// Manual-clear notification paired atomically with the applet message FIFO.
+///
+/// Horizon keeps `ICommonStateGetter::GetEventHandle` signalled exactly while
+/// `ReceiveMessage` has work available. Owning both halves here prevents the
+/// event state from drifting away from the queue as more applet transitions
+/// are implemented.
+/// https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14818#ICommonStateGetter
+#[derive(Debug)]
+struct AppletMessageQueue {
+    writable_event: WritableEventObject,
+    readable_event: ReadableEventObject,
+    messages: VecDeque<AppletMessage>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AppletFocusPolicy {
+    handling_mode: [bool; 3],
+    out_of_focus_suspending_enabled: bool,
+}
+
+impl AppletMessageQueue {
+    fn new() -> Self {
+        let (writable_event, readable_event) = nixe_runtime::EventObject::create_pair();
+        Self {
+            writable_event,
+            readable_event,
+            messages: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, message: AppletMessage) {
+        self.messages.push_back(message);
+        self.writable_event.signal();
+    }
+
+    fn pop(&mut self) -> Option<AppletMessage> {
+        let message = self.messages.pop_front()?;
+        if self.messages.is_empty() {
+            self.writable_event.clear();
+        }
+        Some(message)
+    }
+
+    fn readable_event(&self) -> ReadableEventObject {
+        self.readable_event.clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CreateLibraryAppletError {
     NotDomain,
@@ -916,9 +1124,11 @@ struct AppletDomain {
     operation_mode: OperationMode,
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
-    focus_handling_mode: [bool; 3],
+    focus_policy: AppletFocusPolicy,
     foreground_rights_acquired: bool,
     exit_locked: bool,
+    termination_result: Option<u32>,
+    message_queue: AppletMessageQueue,
     library_applet_launchable_event: WritableEventObject,
     library_applet_launchable_event_reader: ReadableEventObject,
     active_library_applet: Option<ActiveLibraryApplet>,
@@ -940,6 +1150,11 @@ impl AppletSession {
     pub(crate) fn new(operation_mode: OperationMode) -> Self {
         let mut objects = BTreeMap::new();
         objects.insert(APPLET_ROOT_OBJECT_ID, AppletObject::Root);
+        let mut message_queue = AppletMessageQueue::new();
+        // A regular application starts in the foreground. AM publishes the
+        // corresponding focus notification before client initialization so
+        // official SDK code can wait for and consume the initial state.
+        message_queue.push(AppletMessage::FocusStateChanged);
         let (launchable_event, launchable_event_reader) = nixe_runtime::EventObject::create_pair();
         let session = Self {
             domain: Arc::new(Mutex::new(AppletDomain {
@@ -949,9 +1164,11 @@ impl AppletSession {
                 operation_mode,
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
-                focus_handling_mode: [false; 3],
+                focus_policy: AppletFocusPolicy::default(),
                 foreground_rights_acquired: false,
                 exit_locked: false,
+                termination_result: None,
+                message_queue,
                 library_applet_launchable_event: launchable_event,
                 library_applet_launchable_event_reader: launchable_event_reader,
                 active_library_applet: None,
@@ -969,6 +1186,38 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .operation_mode
+    }
+
+    /// Returns the applet-manager focus state exposed to the application.
+    ///
+    /// Nixe currently models one permanently foreground application, so host
+    /// window focus and minimization do not alter this value. A complete AM
+    /// implementation would transition to out-of-focus or background when
+    /// HOME takes foreground ownership, a library applet obscures its caller,
+    /// the system enters sleep, or another applet becomes active. That same
+    /// transition must enqueue the corresponding applet messages, update HID
+    /// ownership, and suspend only this application's guest threads when its
+    /// negotiated focus policy requires it; losing host-window focus should
+    /// remain an optional frontend policy rather than a Horizon transition.
+    pub(crate) const fn current_focus_state(&self) -> u8 {
+        APPLET_FOCUS_STATE_IN_FOCUS
+    }
+
+    pub(crate) fn message_event(&self) -> ReadableEventObject {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .message_queue
+            .readable_event()
+    }
+
+    pub(crate) fn receive_message(&self) -> Option<u32> {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .message_queue
+            .pop()
+            .map(|message| message as u32)
     }
 
     pub(crate) fn is_domain(&self) -> bool {
@@ -1312,9 +1561,7 @@ impl AppletSession {
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if domain.operation_mode_changed_notification != enabled {
-            domain.operation_mode_changed_notification = enabled;
-        }
+        domain.operation_mode_changed_notification = enabled;
     }
 
     pub(crate) fn set_performance_mode_changed_notification(&self, enabled: bool) {
@@ -1322,9 +1569,7 @@ impl AppletSession {
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if domain.performance_mode_changed_notification != enabled {
-            domain.performance_mode_changed_notification = enabled;
-        }
+        domain.performance_mode_changed_notification = enabled;
     }
 
     pub(crate) fn set_focus_handling_mode(&self, mode: [bool; 3]) {
@@ -1332,9 +1577,15 @@ impl AppletSession {
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if domain.focus_handling_mode != mode {
-            domain.focus_handling_mode = mode;
-        }
+        domain.focus_policy.handling_mode = mode;
+    }
+
+    pub(crate) fn set_out_of_focus_suspending_enabled(&self, enabled: bool) {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domain.focus_policy.out_of_focus_suspending_enabled = enabled;
     }
 
     pub(crate) fn acquire_foreground_rights(&self) {
@@ -1342,9 +1593,17 @@ impl AppletSession {
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !domain.foreground_rights_acquired {
-            domain.foreground_rights_acquired = true;
-        }
+        domain.foreground_rights_acquired = true;
+    }
+
+    /// Retains the application result reported to the applet manager.
+    ///
+    /// This is AM lifecycle metadata, not the kernel process exit code.
+    pub(crate) fn set_termination_result(&self, result: u32) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .termination_result = Some(result);
     }
 
     pub(crate) fn set_exit_locked(&self, locked: bool) {
@@ -1388,7 +1647,15 @@ impl AppletSession {
     }
 
     #[cfg(test)]
-    fn requested_runtime_policy(&self) -> (bool, bool, [bool; 3], bool) {
+    fn termination_result(&self) -> Option<u32> {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .termination_result
+    }
+
+    #[cfg(test)]
+    fn requested_runtime_policy(&self) -> (bool, bool, AppletFocusPolicy, bool) {
         let domain = self
             .domain
             .lock()
@@ -1396,7 +1663,7 @@ impl AppletSession {
         (
             domain.operation_mode_changed_notification,
             domain.performance_mode_changed_notification,
-            domain.focus_handling_mode,
+            domain.focus_policy,
             domain.foreground_rights_acquired,
         )
     }
@@ -1449,12 +1716,33 @@ mod applet_tests {
         cloned.set_operation_mode_changed_notification(true);
         cloned.set_performance_mode_changed_notification(true);
         cloned.set_focus_handling_mode([true, false, true]);
+        cloned.set_out_of_focus_suspending_enabled(true);
         cloned.acquire_foreground_rights();
 
         assert_eq!(
             session.requested_runtime_policy(),
-            (true, true, [true, false, true], true)
+            (
+                true,
+                true,
+                AppletFocusPolicy {
+                    handling_mode: [true, false, true],
+                    out_of_focus_suspending_enabled: true,
+                },
+                true,
+            )
         );
+    }
+
+    #[test]
+    fn applet_message_event_tracks_queue_occupancy() {
+        let session = AppletSession::new(OperationMode::Handheld);
+        let event = session.message_event();
+
+        assert!(event.is_signalled());
+        assert_eq!(session.receive_message(), Some(15));
+        assert!(!event.is_signalled());
+        assert_eq!(session.receive_message(), None);
+        assert!(!event.is_signalled());
     }
 
     #[test]
@@ -1470,6 +1758,19 @@ mod applet_tests {
         session.set_exit_locked(false);
         session.set_exit_locked(false);
         assert!(!cloned.exit_locked());
+    }
+
+    #[test]
+    fn applet_termination_result_is_shared_and_last_writer_wins() {
+        let session = AppletSession::new(OperationMode::Console);
+        let cloned = session.clone();
+        assert_eq!(session.termination_result(), None);
+
+        cloned.set_termination_result(0x2a2);
+        assert_eq!(session.termination_result(), Some(0x2a2));
+
+        session.set_termination_result(0);
+        assert_eq!(cloned.termination_result(), Some(0));
     }
 
     #[test]
@@ -1820,10 +2121,10 @@ impl HostDirectoryFileSystem {
 }
 
 /// Writable host file opened through the configured SD-card root.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HostFile {
     path: Arc<str>,
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     readable: bool,
     writable: bool,
     allow_append: bool,
@@ -1839,7 +2140,7 @@ impl HostFile {
     ) -> Self {
         Self {
             path,
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
             readable,
             writable,
             allow_append,

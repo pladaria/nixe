@@ -12,6 +12,7 @@ const MODULE_FS: u32 = 2;
 const MODULE_LR: u32 = 8;
 const MODULE_SF: u32 = 10;
 const MODULE_SM: u32 = 21;
+const MODULE_AM: u32 = 128;
 const MODULE_MASK: u32 = 0x1ff;
 const DESCRIPTION_MASK: u32 = 0x1fff;
 const DESCRIPTION_SHIFT: u32 = 9;
@@ -42,6 +43,9 @@ impl HorizonIpcResult {
     pub const CMIF_UNKNOWN_COMMAND_ID: Self = Self::new(MODULE_SF, 221);
     pub const CMIF_TARGET_NOT_FOUND: Self = Self::new(MODULE_SF, 261);
     pub const CMIF_OUT_OF_DOMAIN_ENTRIES: Self = Self::new(MODULE_SF, 301);
+    /// `ICommonStateGetter::ReceiveMessage` found no queued applet message.
+    /// https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14818#ReceiveMessage
+    pub const AM_NO_MESSAGES: Self = Self::new(MODULE_AM, 3);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
     pub const FS_OUT_OF_RANGE: Self = Self::new(MODULE_FS, 3005);
     pub const FS_ALLOCATION_MEMORY_FAILED: Self = Self::new(MODULE_FS, 3420);
@@ -117,6 +121,7 @@ mod tests {
                 301,
                 0x25a0a,
             ),
+            (HorizonIpcResult::AM_NO_MESSAGES, 128, 3, 0x680),
             (HorizonIpcResult::FS_PATH_NOT_FOUND, 2, 1, 0x202),
             (HorizonIpcResult::FS_OUT_OF_RANGE, 2, 3005, 0x177a02),
             (
