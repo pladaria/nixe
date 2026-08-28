@@ -1,4 +1,4 @@
-use super::super::*;
+use super::prelude::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NvDrvCommand {
@@ -454,7 +454,7 @@ fn nv_ioctl2_buffer_descriptors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc_message::ReceiveStaticDescriptor;
+    use crate::ipc_wire::message::ReceiveStaticDescriptor;
 
     fn buffer(address: u64, size: u64) -> BufferDescriptor {
         BufferDescriptor {

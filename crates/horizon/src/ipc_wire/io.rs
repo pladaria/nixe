@@ -1,6 +1,15 @@
 //! Checked CMIF response encoding, scalar decoding, and guest-memory access.
 
-use super::*;
+use nixe_cpu::memory::{
+    DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess, MemoryAccessSize,
+    MemoryPermissions, MemoryRegionKind, MemoryValue,
+};
+use nixe_memory::GuestVirtualAddress;
+use nixe_runtime::ExceptionProcessContext;
+
+use super::IpcWireError;
+use super::message::{BufferDescriptor, CmifResponse, HipcRequest, ReceiveStatics};
+use crate::HorizonIpcResult;
 
 pub(super) fn write_descriptor_bytes(
     process: &ExceptionProcessContext<'_>,

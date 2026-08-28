@@ -20,7 +20,7 @@ fn reference_process_builder() -> ProcessBuilder {
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
     build_nsp, build_romfs, build_xci, content_id, data_content, program_content,
-    program_content_with_fs_permissions, program_content_without_services,
+    program_content_with_fs_permissions, program_content_without_services, public_data_content,
 };
 
 #[test]
@@ -80,7 +80,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
 }
 
 #[test]
-fn filesystem_operations_require_effective_content_data_read_permission() {
+fn current_process_content_does_not_require_general_mount_permission() {
     fn build_process(
         directory: &tempfile::TempDir,
         filesystem_permissions: u64,
@@ -108,45 +108,43 @@ fn filesystem_operations_require_effective_content_data_read_permission() {
         reference_process_builder().build(&plan).unwrap()
     }
 
-    let denied_directory = tempfile::tempdir().unwrap();
-    let mut denied = build_process(&denied_directory, 0);
-    let denied_session = denied.connect_ipc_service(IpcService::FileSystem).unwrap();
-    assert_eq!(
-        denied.dispatch_ipc(denied_session, IpcRequest::OpenPrimaryFileSystem),
-        Err(IpcResultCode::ACCESS_DENIED)
-    );
-
-    let allowed_directory = tempfile::tempdir().unwrap();
-    let mut allowed = build_process(&allowed_directory, 1);
-    let allowed_session = allowed.connect_ipc_service(IpcService::FileSystem).unwrap();
-    let IpcResponse::Handle(filesystem) = allowed
-        .dispatch_ipc(allowed_session, IpcRequest::OpenPrimaryFileSystem)
+    let directory = tempfile::tempdir().unwrap();
+    let mut process = build_process(&directory, 0);
+    let session = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(filesystem) = process
+        .dispatch_ipc(session, IpcRequest::OpenPrimaryFileSystem)
         .unwrap()
     else {
-        panic!("ApplicationInfo must permit mounting content data");
+        panic!("the process must receive its registered content filesystem");
     };
-
-    let transferred = allowed
-        .handles_mut()
-        .transfer_to(denied.handles_mut(), filesystem)
-        .unwrap();
-    assert_eq!(
-        denied.dispatch_ipc(
-            transferred,
-            IpcRequest::OpenDirectory {
-                path: "/".into(),
-                mode: 3,
+    let IpcResponse::Handle(file) = process
+        .dispatch_ipc(
+            filesystem,
+            IpcRequest::OpenFile {
+                path: "/file".into(),
+                mode: 1,
             },
-        ),
-        Err(IpcResultCode::ACCESS_DENIED)
+        )
+        .unwrap()
+    else {
+        panic!("the content filesystem must return a file handle");
+    };
+    assert_eq!(
+        process
+            .dispatch_ipc(file, IpcRequest::ReadFile { offset: 0, size: 5 })
+            .unwrap(),
+        IpcResponse::Data(b"bytes".to_vec())
     );
 
-    let manager_directory = tempfile::tempdir().unwrap();
-    let mut manager = build_process(&manager_directory, 1 << 11);
-    let manager_session = manager.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let IpcResponse::Handle(storage) = process
+        .dispatch_ipc(session, IpcRequest::OpenPrimaryStorage)
+        .unwrap()
+    else {
+        panic!("the process must receive its registered content storage");
+    };
     assert!(matches!(
-        manager.dispatch_ipc(manager_session, IpcRequest::OpenPrimaryFileSystem),
-        Ok(IpcResponse::Handle(_))
+        process.dispatch_ipc(storage, IpcRequest::GetStorageSize),
+        Ok(IpcResponse::Size(size)) if size > 0
     ));
 }
 
@@ -172,7 +170,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         kind: MetaKind::AddOnContent {
             required_application_version: 0,
         },
-        contents: vec![data_content(
+        contents: vec![public_data_content(
             content_id(0x30),
             FIRST_DLC_ID,
             0,
@@ -185,7 +183,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         kind: MetaKind::AddOnContent {
             required_application_version: 3,
         },
-        contents: vec![data_content(
+        contents: vec![public_data_content(
             content_id(0x40),
             SECOND_DLC_ID,
             0,
@@ -223,7 +221,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         kind: MetaKind::AddOnContent {
             required_application_version: 7,
         },
-        contents: vec![data_content(
+        contents: vec![public_data_content(
             content_id(0x70),
             FIRST_DLC_ID,
             0,
