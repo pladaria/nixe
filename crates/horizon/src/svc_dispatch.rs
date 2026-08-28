@@ -31,7 +31,9 @@ use nixe_scheduler::{GuestThreadId, ProcessId, VirtualCpuId};
 
 use crate::ipc_message::HipcRequest;
 use crate::ipc_wire::{HorizonIpcFault, IpcWireError, NamedPortResult, SyncRequestResult};
-use crate::{UnsupportedHorizonSvc, decode_horizon_svc};
+use crate::{
+    HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc, decode_horizon_svc,
+};
 
 mod ipc;
 mod memory;
@@ -83,6 +85,33 @@ impl HorizonKernelResult {
     #[must_use]
     pub const fn raw(self) -> u32 {
         self.0
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SUCCESS => "Success",
+            Self::NOT_IMPLEMENTED => "NotImplemented",
+            Self::OUT_OF_SESSIONS => "OutOfSessions",
+            Self::THREAD_TERMINATING => "ThreadTerminating",
+            Self::INVALID_HANDLE => "InvalidHandle",
+            Self::INVALID_POINTER => "InvalidPointer",
+            Self::INVALID_ADDRESS => "InvalidAddress",
+            Self::INVALID_SIZE => "InvalidSize",
+            Self::INVALID_CURRENT_MEMORY => "InvalidCurrentMemory",
+            Self::OUT_OF_RESOURCE => "OutOfResource",
+            Self::TIMED_OUT => "TimedOut",
+            Self::CANCELLED => "Cancelled",
+            Self::OUT_OF_RANGE => "OutOfRange",
+            Self::INVALID_STATE => "InvalidState",
+            Self::RESOURCE_LIMIT => "ResourceLimit",
+            Self::NOT_SUPPORTED => "NotSupported",
+            Self::NOT_FOUND => "NotFound",
+            Self::SESSION_CLOSED => "SessionClosed",
+            Self::PORT_CLOSED => "PortClosed",
+            Self::OUT_OF_HANDLES => "OutOfHandles",
+            Self::INVALID_COMBINATION => "InvalidCombination",
+            _ => "UnknownResult",
+        }
     }
 }
 
@@ -304,6 +333,7 @@ pub struct HorizonSvcDispatcher {
     initial_operation_mode: crate::OperationMode,
     time_environment: crate::TimeEnvironment,
     settings_environment: crate::SettingsEnvironment,
+    diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
     hid_system: crate::HidSystem,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
@@ -446,6 +476,7 @@ impl HorizonSvcDispatcher {
             initial_operation_mode,
             time_environment,
             settings_environment,
+            diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
             hid_system: crate::HidSystem::new(),
             named_ports: BTreeMap::new(),
@@ -455,6 +486,13 @@ impl HorizonSvcDispatcher {
             pending_wakes: BTreeMap::new(),
             pending_runtime_requests: BTreeMap::new(),
         }
+    }
+
+    /// Applies guest-log and filesystem diagnostic policy to service dispatch.
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: crate::HorizonDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 
     #[must_use]
@@ -1023,6 +1061,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             }),
         };
         self.observe(immediate, &outcome);
+        trace_completed_svc_result(*descriptor, context.thread().state(), &outcome);
         outcome
     }
 }
@@ -1068,6 +1107,65 @@ fn reject(
 
 fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult) {
     write_register(context.thread_mut().state_mut(), 0, u64::from(value.raw()));
+}
+
+fn trace_completed_svc_result(
+    descriptor: HorizonSvcDescriptor,
+    state: &ThreadCpuState,
+    outcome: &ExceptionDispatchOutcome<HorizonSvcFault>,
+) {
+    if !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
+    let Some(code) = completed_svc_guest_error(descriptor, state, outcome) else {
+        return;
+    };
+    let name = descriptor
+        .unambiguous_name()
+        .unwrap_or("version-dependent SVC");
+    trace_guest_result(Some(descriptor.immediate()), name, code);
+}
+
+fn completed_svc_guest_error(
+    descriptor: HorizonSvcDescriptor,
+    state: &ThreadCpuState,
+    outcome: &ExceptionDispatchOutcome<HorizonSvcFault>,
+) -> Option<HorizonKernelResult> {
+    if descriptor.return_kind() != HorizonSvcReturnKind::Result
+        || matches!(
+            outcome,
+            ExceptionDispatchOutcome::Resume(ExceptionResume::Retry)
+                | ExceptionDispatchOutcome::Suspend(_)
+                | ExceptionDispatchOutcome::Terminate { .. }
+                | ExceptionDispatchOutcome::Fault(_)
+        )
+    {
+        return None;
+    }
+    let code = HorizonKernelResult(read_register(state, 0) as u32);
+    if code == HorizonKernelResult::SUCCESS {
+        return None;
+    }
+    Some(code)
+}
+
+fn trace_guest_result(immediate: Option<u32>, name: &str, code: HorizonKernelResult) {
+    if code == HorizonKernelResult::SUCCESS || !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
+    if let Some(immediate) = immediate {
+        log::trace!(
+            "Horizon SVC returned guest error: immediate={immediate:#x} name={name} result={}({:#x})",
+            code.name(),
+            code.raw()
+        );
+    } else {
+        log::trace!(
+            "Horizon SVC completed asynchronously with guest error: name={name} result={}({:#x})",
+            code.name(),
+            code.raw()
+        );
+    }
 }
 
 fn thread_tls(state: &ThreadCpuState) -> GuestVirtualAddress {
@@ -1200,7 +1298,9 @@ fn finish_pending_caller(
     write_output(state);
     coordinator
         .make_thread_ready(thread_id)
-        .map_err(|_| runtime_fault(operation))
+        .map_err(|_| runtime_fault(operation))?;
+    trace_guest_result(None, operation, code);
+    Ok(())
 }
 
 fn map_thread_operation(
@@ -1640,6 +1740,37 @@ mod tests {
     fn thread_context_encoding_uses_horizon_a64_layout() {
         let encoded = encode_thread_context(&ThreadCpuState::default());
         assert_eq!(encoded.len(), 0x320);
+    }
+
+    #[test]
+    fn completed_result_svc_errors_are_selected_for_generic_tracing() {
+        let mut state = ThreadCpuState::default();
+        write_register(
+            &mut state,
+            0,
+            u64::from(HorizonKernelResult::RESOURCE_LIMIT.raw()),
+        );
+        let completed = ExceptionDispatchOutcome::Resume(ExceptionResume::Next);
+        let retrying = ExceptionDispatchOutcome::Resume(ExceptionResume::Retry);
+
+        assert_eq!(
+            completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &completed),
+            Some(HorizonKernelResult::RESOURCE_LIMIT)
+        );
+        assert_eq!(
+            completed_svc_guest_error(*decode_horizon_svc(0x10).unwrap(), &state, &completed),
+            None
+        );
+        assert_eq!(
+            completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &retrying),
+            None
+        );
+
+        write_register(&mut state, 0, u64::from(HorizonKernelResult::SUCCESS.raw()));
+        assert_eq!(
+            completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &completed),
+            None
+        );
     }
 
     #[test]

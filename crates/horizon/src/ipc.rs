@@ -16,8 +16,9 @@ use nixe_loader_title::TitleId;
 use nixe_runtime::{EventObject, HandleTable, ProcessMountNamespace, RunnableProcess};
 
 use crate::{
-    DirectoryEntry, DirectoryEntryKind, HorizonIpcObject, HostDirectoryFileSystem, HostFile,
-    IpcSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, SemanticIpcObject,
+    DirectoryEntry, DirectoryEntryKind, FileSystemAccessLogMode, HorizonIpcObject,
+    HostDirectoryFileSystem, HostFile, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
+    ReadOnlyFileSystem, ReadOnlyStorage, SemanticIpcObject,
 };
 
 /// Largest path accepted by the semantic filesystem boundary.
@@ -106,7 +107,9 @@ pub struct AddOnContentEntry {
 pub enum IpcRequest {
     SetCurrentProcess,
     OpenPrimaryFileSystem,
+    OpenPrimaryStorage,
     OpenSdCardFileSystem,
+    GetGlobalAccessLogMode,
     CreateFile {
         path: String,
         size: u64,
@@ -125,6 +128,11 @@ pub enum IpcRequest {
     },
     GetFileSize,
     ReadFile {
+        offset: u64,
+        size: usize,
+    },
+    GetStorageSize,
+    ReadStorage {
         offset: u64,
         size: usize,
     },
@@ -169,7 +177,9 @@ pub enum IpcResponse {
     Handle(u32),
     Event(u32),
     Size(u64),
+    FileSystemAccessLogMode(FileSystemAccessLogMode),
     Data(Vec<u8>),
+    StorageData(Vec<u8>),
     DirectoryEntries(Vec<DirectoryEntry>),
     AddOnContentEntries(Vec<AddOnContentEntry>),
 }
@@ -205,9 +215,13 @@ impl IpcDispatcher {
             .cloned()
             .ok_or(IpcResultCode::INVALID_HANDLE)?;
         match object {
-            HorizonIpcObject::SemanticService(session) => {
-                dispatch_session(mounts, handles, &session, request)
-            }
+            HorizonIpcObject::SemanticService(session) => dispatch_session(
+                mounts,
+                handles,
+                &session,
+                request,
+                FileSystemAccessLogMode::None,
+            ),
             HorizonIpcObject::SemanticObject(object) => {
                 dispatch_semantic_object(mounts, handles, &object, request)
             }
@@ -220,8 +234,15 @@ impl IpcDispatcher {
         handles: &mut HandleTable,
         session: &IpcSession,
         request: IpcRequest,
+        file_system_access_log_mode: FileSystemAccessLogMode,
     ) -> Result<IpcResponse, IpcResultCode> {
-        dispatch_session(mounts, handles, session, request)
+        dispatch_session(
+            mounts,
+            handles,
+            session,
+            request,
+            file_system_access_log_mode,
+        )
     }
 
     pub(crate) fn dispatch_semantic_object(
@@ -244,6 +265,7 @@ fn dispatch_semantic_object(
         SemanticIpcObject::ReadOnlyFileSystem(filesystem) => {
             dispatch_filesystem(mounts, handles, filesystem, request)
         }
+        SemanticIpcObject::ReadOnlyStorage(storage) => dispatch_storage(mounts, storage, request),
         SemanticIpcObject::HostDirectoryFileSystem(filesystem) => {
             dispatch_host_filesystem(mounts, handles, filesystem, request)
         }
@@ -260,12 +282,16 @@ fn dispatch_session(
     handles: &mut HandleTable,
     session: &IpcSession,
     request: IpcRequest,
+    file_system_access_log_mode: FileSystemAccessLogMode,
 ) -> Result<IpcResponse, IpcResultCode> {
     if !mounts.allows_service(session.service().name()) {
         return Err(IpcResultCode::ACCESS_DENIED);
     }
     match (session.service(), request) {
         (IpcService::FileSystem, IpcRequest::SetCurrentProcess) => Ok(IpcResponse::None),
+        (IpcService::FileSystem, IpcRequest::GetGlobalAccessLogMode) => Ok(
+            IpcResponse::FileSystemAccessLogMode(file_system_access_log_mode),
+        ),
         (IpcService::FileSystem, IpcRequest::OpenPrimaryFileSystem) => {
             require_content_data_read(mounts)?;
             let mount = mounts
@@ -275,6 +301,17 @@ fn dispatch_session(
             insert_handle(
                 handles,
                 SemanticIpcObject::ReadOnlyFileSystem(ReadOnlyFileSystem::new(mount)),
+            )
+        }
+        (IpcService::FileSystem, IpcRequest::OpenPrimaryStorage) => {
+            require_content_data_read(mounts)?;
+            let storage = mounts
+                .primary()
+                .map(|mount| mount.romfs().storage())
+                .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
+            insert_handle(
+                handles,
+                SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(storage)),
             )
         }
         (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
@@ -467,6 +504,52 @@ fn dispatch_file(
                 .read_at(offset, &mut bytes)
                 .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
             Ok(IpcResponse::Data(bytes))
+        }
+        _ => Err(IpcResultCode::INVALID_COMMAND),
+    }
+}
+
+fn dispatch_storage(
+    mounts: &ProcessMountNamespace,
+    storage: &ReadOnlyStorage,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcResultCode> {
+    require_content_data_read(mounts)?;
+    match request {
+        IpcRequest::GetStorageSize => {
+            let size = storage
+                .storage()
+                .len()
+                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
+            if size > i64::MAX as u64 {
+                return Err(IpcResultCode::OUT_OF_RANGE);
+            }
+            Ok(IpcResponse::Size(size))
+        }
+        IpcRequest::ReadStorage { offset, size } => {
+            if size > MAX_IPC_READ_BYTES {
+                return Err(IpcResultCode::RESOURCE_LIMIT);
+            }
+            if offset > i64::MAX as u64 {
+                return Err(IpcResultCode::OUT_OF_RANGE);
+            }
+            let size_u64 = u64::try_from(size).map_err(|_| IpcResultCode::OUT_OF_RANGE)?;
+            let end = offset
+                .checked_add(size_u64)
+                .ok_or(IpcResultCode::OUT_OF_RANGE)?;
+            let storage_size = storage
+                .storage()
+                .len()
+                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
+            if end > storage_size {
+                return Err(IpcResultCode::OUT_OF_RANGE);
+            }
+            let mut bytes = vec![0; size];
+            storage
+                .storage()
+                .read_at(offset, &mut bytes)
+                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
+            Ok(IpcResponse::StorageData(bytes))
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }

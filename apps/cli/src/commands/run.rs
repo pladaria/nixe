@@ -8,13 +8,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{CpuBackendSelection, CpuConfig, InitialOperationMode, TimeMode};
+use nixe_config::{
+    CpuBackendSelection, CpuConfig, DiagnosticsConfig, GuestLogsLevel, InitialOperationMode,
+    TimeMode,
+};
 use nixe_cpu_jit::JitConfiguration;
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
-    HorizonSvcDispatcher, HorizonSvcFault, OperationMode, SettingsEnvironment, SystemLanguage,
-    TimeEnvironment, UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
+    GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, HorizonSvcFault, OperationMode,
+    SettingsEnvironment, SystemLanguage, TimeEnvironment, UnsupportedNvDrvOperation, VideoSystem,
+    switch_1_machine_profile,
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputManager, ProfiledControllerState,
@@ -45,6 +49,8 @@ pub struct Arguments {
     pub identifier: String,
     pub headless: bool,
     pub cpu_backend_override: Option<CpuBackendSelection>,
+    pub guest_logs_level_override: Option<GuestLogsLevel>,
+    pub file_system_access_log_override: Option<bool>,
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
@@ -54,6 +60,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         identifier,
         headless,
         cpu_backend_override,
+        guest_logs_level_override,
+        file_system_access_log_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
     let (frontend, frontend_control, presenter) = if headless {
@@ -70,6 +78,11 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
     let cpu_configuration = effective_cpu_configuration(config.cpu.clone(), cpu_backend_override);
+    let diagnostics_configuration = effective_diagnostics_configuration(
+        config.diagnostics,
+        guest_logs_level_override,
+        file_system_access_log_override,
+    );
     if let Some(backend) = cpu_backend_override {
         log::info!("CPU backend selection overridden by CLI: {backend:?}");
     }
@@ -205,6 +218,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
+        diagnostics: horizon_diagnostics(diagnostics_configuration),
     };
     log::debug!(
         "virtual time: mode={clock_mode:?}, timezone={}",
@@ -303,6 +317,37 @@ fn effective_cpu_configuration(
     }
 }
 
+const fn effective_diagnostics_configuration(
+    configuration: DiagnosticsConfig,
+    guest_logs_level_override: Option<GuestLogsLevel>,
+    file_system_access_log_override: Option<bool>,
+) -> DiagnosticsConfig {
+    DiagnosticsConfig {
+        log_level: configuration.log_level,
+        guest_logs_level: match guest_logs_level_override {
+            Some(level) => level,
+            None => configuration.guest_logs_level,
+        },
+        file_system_access_log: match file_system_access_log_override {
+            Some(enabled) => enabled,
+            None => configuration.file_system_access_log,
+        },
+    }
+}
+
+const fn horizon_diagnostics(configuration: DiagnosticsConfig) -> HorizonDiagnostics {
+    let guest_logs_level = match configuration.guest_logs_level {
+        GuestLogsLevel::Inherit => GuestLogLevel::Inherit,
+        GuestLogsLevel::Trace => GuestLogLevel::Trace,
+        GuestLogsLevel::Debug => GuestLogLevel::Debug,
+        GuestLogsLevel::Info => GuestLogLevel::Info,
+        GuestLogsLevel::Warn => GuestLogLevel::Warn,
+        GuestLogsLevel::Error => GuestLogLevel::Error,
+        GuestLogsLevel::Off => GuestLogLevel::Off,
+    };
+    HorizonDiagnostics::new(guest_logs_level, configuration.file_system_access_log)
+}
+
 fn select_cpu_backend(
     configuration: CpuConfig,
     title_name: &str,
@@ -362,6 +407,29 @@ mod backend_selection_tests {
         let jit = select_cpu_backend(CpuConfig::default(), "test-title").unwrap();
         assert!(matches!(jit, CpuBackendConfig::Jit(_)));
     }
+
+    #[test]
+    fn cli_guest_diagnostics_override_only_the_selected_policy() {
+        let configured = DiagnosticsConfig {
+            log_level: nixe_config::DiagnosticLogLevel::Info,
+            guest_logs_level: GuestLogsLevel::Warn,
+            file_system_access_log: true,
+        };
+        assert_eq!(
+            effective_diagnostics_configuration(configured, Some(GuestLogsLevel::Off), None),
+            DiagnosticsConfig {
+                guest_logs_level: GuestLogsLevel::Off,
+                ..configured
+            }
+        );
+        assert_eq!(
+            effective_diagnostics_configuration(configured, None, Some(false)),
+            DiagnosticsConfig {
+                file_system_access_log: false,
+                ..configured
+            }
+        );
+    }
 }
 
 fn install_interrupt_handler(
@@ -396,6 +464,7 @@ struct HorizonEnvironment {
     operation_mode: OperationMode,
     time: TimeEnvironment,
     settings: SettingsEnvironment,
+    diagnostics: HorizonDiagnostics,
 }
 
 fn execute_worker(
@@ -522,7 +591,8 @@ fn execute(
         horizon_environment.time,
         horizon_environment.settings,
         video_system,
-    );
+    )
+    .with_diagnostics(horizon_environment.diagnostics);
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
     let mut next_progress = EXECUTION_PROGRESS_INTERVAL;

@@ -3,6 +3,7 @@
 //! Runtime stays console-agnostic; Horizon-specific sessions and services are
 //! layered on its process, mount, and extensible handle primitives.
 
+mod diagnostics;
 mod error_applet;
 mod graphics;
 mod graphics_event;
@@ -18,6 +19,7 @@ mod scheduler_profile;
 mod svc;
 mod svc_dispatch;
 
+pub use diagnostics::{FileSystemAccessLogMode, GuestLogLevel, HorizonDiagnostics};
 pub use error_applet::ErrorAppletDiagnostic;
 pub use graphics::{
     FramebufferError, GraphicsTeardownReport, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
@@ -42,15 +44,17 @@ pub use object::{
     HidSession, HorizonIpcObject, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession,
     LoggerSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
     PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, RegionCode, SemanticIpcObject, ServiceManagerSession, SettingsEnvironment,
-    SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
-    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession,
+    ReadOnlyFileSystem, ReadOnlyStorage, RegionCode, SemanticIpcObject, ServiceManagerSession,
+    SettingsEnvironment, SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage,
+    SystemSettingsSession, TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
+    UserSettingsSession,
 };
 pub use scheduler_profile::{
     HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,
 };
 pub use svc::{
-    HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, UnsupportedHorizonSvc, decode_horizon_svc,
+    HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc,
+    decode_horizon_svc,
 };
 pub use svc_dispatch::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult,

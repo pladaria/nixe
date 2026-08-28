@@ -102,6 +102,8 @@ impl NixeConfig {
             },
             diagnostics: DiagnosticsConfig {
                 log_level: raw.diagnostics.log_level,
+                guest_logs_level: raw.diagnostics.guest_logs_level,
+                file_system_access_log: raw.diagnostics.file_system_access_log,
             },
             cpu,
             gpu,
@@ -215,11 +217,30 @@ pub enum DiagnosticLogLevel {
     Trace,
 }
 
+/// Host severity policy applied to logs emitted by Horizon guests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestLogsLevel {
+    /// Preserve the severity encoded by each guest log packet.
+    #[default]
+    Inherit,
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Off,
+}
+
 /// Cross-cutting diagnostics configuration shared by applications.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagnosticsConfig {
     /// Minimum severity emitted by application loggers.
     pub log_level: DiagnosticLogLevel,
+    /// Host severity policy applied to logs emitted by Horizon guests.
+    pub guest_logs_level: GuestLogsLevel,
+    /// Requests filesystem access logs from the guest SDK.
+    pub file_system_access_log: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -485,6 +506,10 @@ impl Default for RawTimeConfig {
 struct RawDiagnosticsConfig {
     #[serde(default)]
     log_level: DiagnosticLogLevel,
+    #[serde(default)]
+    guest_logs_level: GuestLogsLevel,
+    #[serde(default)]
+    file_system_access_log: bool,
 }
 
 const fn default_recursive_scan() -> bool {
@@ -776,8 +801,48 @@ mod tests {
         assert_eq!(config.system.time.timezone, "UTC");
         assert_eq!(config.system.time.fixed_unix_timestamp, None);
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
+        assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Inherit);
+        assert!(!config.diagnostics.file_system_access_log);
         assert_eq!(config.gpu, GpuCacheConfiguration::default());
         assert!(config.input.profiles.is_empty());
+    }
+
+    #[test]
+    fn guest_diagnostics_are_typed_and_default_to_non_intrusive_policy() {
+        let explicit = TemporaryConfig::new(
+            r#"
+                version = 2
+                [library]
+                paths = []
+                [system]
+                preferred_languages = []
+                keys = "keys"
+                initial_operation_mode = "handheld"
+                [diagnostics]
+                guest_logs_level = "warn"
+                file_system_access_log = true
+            "#,
+        );
+        let config = NixeConfig::load(&explicit.path).unwrap();
+        assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Warn);
+        assert!(config.diagnostics.file_system_access_log);
+
+        for level in ["inherit", "trace", "debug", "info", "warn", "error", "off"] {
+            let file = TemporaryConfig::new(&format!(
+                r#"
+                    version = 2
+                    [library]
+                    paths = []
+                    [system]
+                    preferred_languages = []
+                    keys = "keys"
+                    initial_operation_mode = "handheld"
+                    [diagnostics]
+                    guest_logs_level = "{level}"
+                "#
+            ));
+            NixeConfig::load(&file.path).unwrap();
+        }
     }
 
     #[test]

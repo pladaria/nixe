@@ -10,6 +10,19 @@
 
 use std::fmt::{Display, Formatter};
 
+/// Guest-visible ABI carried in the primary return register after an SVC.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HorizonSvcReturnKind {
+    /// `W0` contains a Horizon `Result` value.
+    Result,
+    /// The primary return register contains ordinary output data.
+    Value,
+    /// The call has no primary return value.
+    Void,
+    /// Successful execution does not return to the caller.
+    NoReturn,
+}
+
 /// One verified Horizon SVC number and all documented meanings for that ID.
 ///
 /// Most numbers have exactly one name. A few numbers were reassigned between
@@ -19,13 +32,19 @@ use std::fmt::{Display, Formatter};
 pub struct HorizonSvcDescriptor {
     immediate: u32,
     documented_names: &'static [&'static str],
+    return_kind: HorizonSvcReturnKind,
 }
 
 impl HorizonSvcDescriptor {
-    const fn new(immediate: u32, documented_names: &'static [&'static str]) -> Self {
+    const fn new(
+        immediate: u32,
+        documented_names: &'static [&'static str],
+        return_kind: HorizonSvcReturnKind,
+    ) -> Self {
         Self {
             immediate,
             documented_names,
+            return_kind,
         }
     }
 
@@ -39,6 +58,12 @@ impl HorizonSvcDescriptor {
     #[must_use]
     pub const fn documented_names(self) -> &'static [&'static str] {
         self.documented_names
+    }
+
+    /// Returns the verified ABI meaning of the primary return register.
+    #[must_use]
+    pub const fn return_kind(self) -> HorizonSvcReturnKind {
+        self.return_kind
     }
 
     /// Returns the unambiguous operation name, or `None` for an ID whose
@@ -94,10 +119,28 @@ pub fn decode_horizon_svc(
 
 macro_rules! svc {
     ($immediate:literal, $name:literal) => {
-        HorizonSvcDescriptor::new($immediate, &[$name])
+        HorizonSvcDescriptor::new($immediate, &[$name], HorizonSvcReturnKind::Result)
     };
     ($immediate:literal, $($name:literal),+ $(,)?) => {
-        HorizonSvcDescriptor::new($immediate, &[$($name),+])
+        HorizonSvcDescriptor::new(
+            $immediate,
+            &[$($name),+],
+            HorizonSvcReturnKind::Result,
+        )
+    };
+    ($immediate:literal, $return_kind:ident => $name:literal) => {
+        HorizonSvcDescriptor::new(
+            $immediate,
+            &[$name],
+            HorizonSvcReturnKind::$return_kind,
+        )
+    };
+    ($immediate:literal, $return_kind:ident => $($name:literal),+ $(,)?) => {
+        HorizonSvcDescriptor::new(
+            $immediate,
+            &[$($name),+],
+            HorizonSvcReturnKind::$return_kind,
+        )
     };
 }
 
@@ -109,16 +152,16 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x04, "MapMemory"),
     svc!(0x05, "UnmapMemory"),
     svc!(0x06, "QueryMemory"),
-    svc!(0x07, "ExitProcess"),
+    svc!(0x07, NoReturn => "ExitProcess"),
     svc!(0x08, "CreateThread"),
     svc!(0x09, "StartThread"),
-    svc!(0x0a, "ExitThread"),
-    svc!(0x0b, "SleepThread"),
+    svc!(0x0a, NoReturn => "ExitThread"),
+    svc!(0x0b, Void => "SleepThread"),
     svc!(0x0c, "GetThreadPriority"),
     svc!(0x0d, "SetThreadPriority"),
     svc!(0x0e, "GetThreadCoreMask"),
     svc!(0x0f, "SetThreadCoreMask"),
-    svc!(0x10, "GetCurrentProcessorNumber"),
+    svc!(0x10, Value => "GetCurrentProcessorNumber"),
     svc!(0x11, "SignalEvent"),
     svc!(0x12, "ClearEvent"),
     svc!(0x13, "MapSharedMemory"),
@@ -131,8 +174,8 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x1a, "ArbitrateLock"),
     svc!(0x1b, "ArbitrateUnlock"),
     svc!(0x1c, "WaitProcessWideKeyAtomic"),
-    svc!(0x1d, "SignalProcessWideKey"),
-    svc!(0x1e, "GetSystemTick"),
+    svc!(0x1d, Void => "SignalProcessWideKey"),
+    svc!(0x1e, Value => "GetSystemTick"),
     svc!(0x1f, "ConnectToNamedPort"),
     svc!(0x20, "SendSyncRequestLight"),
     svc!(0x21, "SendSyncRequest"),
@@ -142,9 +185,9 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x25, "GetThreadId"),
     svc!(0x26, "Break"),
     svc!(0x27, "OutputDebugString"),
-    svc!(0x28, "ReturnFromException"),
+    svc!(0x28, NoReturn => "ReturnFromException"),
     svc!(0x29, "GetInfo"),
-    svc!(0x2a, "FlushEntireDataCache"),
+    svc!(0x2a, Void => "FlushEntireDataCache"),
     svc!(0x2b, "FlushDataCache"),
     svc!(0x2c, "MapPhysicalMemory"),
     svc!(0x2d, "UnmapPhysicalMemory"),
@@ -156,12 +199,12 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x33, "GetThreadContext3"),
     svc!(0x34, "WaitForAddress"),
     svc!(0x35, "SignalToAddress"),
-    svc!(0x36, "SynchronizePreemptionState"),
+    svc!(0x36, Void => "SynchronizePreemptionState"),
     svc!(0x37, "GetResourceLimitPeakValue"),
     svc!(0x39, "CreateIoPool"),
     svc!(0x3a, "CreateIoRegion"),
-    svc!(0x3c, "DumpInfo", "KernelDebug"),
-    svc!(0x3d, "ChangeKernelTraceState"),
+    svc!(0x3c, Void => "DumpInfo", "KernelDebug"),
+    svc!(0x3d, Void => "ChangeKernelTraceState"),
     svc!(0x40, "CreateSession"),
     svc!(0x41, "AcceptSession"),
     svc!(0x42, "ReplyAndReceiveLight"),
@@ -175,7 +218,7 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x4a, "SetUnsafeLimit"),
     svc!(0x4b, "CreateCodeMemory"),
     svc!(0x4c, "ControlCodeMemory"),
-    svc!(0x4d, "SleepSystem"),
+    svc!(0x4d, Void => "SleepSystem"),
     svc!(0x4e, "ReadWriteRegister"),
     svc!(0x4f, "SetProcessActivity"),
     svc!(0x50, "CreateSharedMemory"),
@@ -224,7 +267,7 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x7c, "GetProcessInfo"),
     svc!(0x7d, "CreateResourceLimit"),
     svc!(0x7e, "SetResourceLimitLimitValue"),
-    svc!(0x7f, "CallSecureMonitor"),
+    svc!(0x7f, Value => "CallSecureMonitor"),
     svc!(0x90, "MapInsecurePhysicalMemory"),
     svc!(0x91, "UnmapInsecurePhysicalMemory"),
 ];
@@ -267,6 +310,38 @@ mod tests {
             let decoded = decode_horizon_svc(immediate).unwrap();
             assert_eq!(decoded.documented_names(), expected_names);
             assert_eq!(decoded.unambiguous_name(), None);
+        }
+    }
+
+    #[test]
+    fn records_primary_return_register_semantics() {
+        let non_result_calls = [
+            (0x07, HorizonSvcReturnKind::NoReturn),
+            (0x0a, HorizonSvcReturnKind::NoReturn),
+            (0x0b, HorizonSvcReturnKind::Void),
+            (0x10, HorizonSvcReturnKind::Value),
+            (0x1d, HorizonSvcReturnKind::Void),
+            (0x1e, HorizonSvcReturnKind::Value),
+            (0x28, HorizonSvcReturnKind::NoReturn),
+            (0x2a, HorizonSvcReturnKind::Void),
+            (0x36, HorizonSvcReturnKind::Void),
+            (0x3c, HorizonSvcReturnKind::Void),
+            (0x3d, HorizonSvcReturnKind::Void),
+            (0x4d, HorizonSvcReturnKind::Void),
+            (0x7f, HorizonSvcReturnKind::Value),
+        ];
+
+        for (immediate, expected) in non_result_calls {
+            assert_eq!(
+                decode_horizon_svc(immediate).unwrap().return_kind(),
+                expected
+            );
+        }
+        for immediate in [0x01, 0x18, 0x21, 0x26, 0x45, 0x91] {
+            assert_eq!(
+                decode_horizon_svc(immediate).unwrap().return_kind(),
+                HorizonSvcReturnKind::Result
+            );
         }
     }
 
