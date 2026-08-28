@@ -709,6 +709,11 @@ This is a practical coverage map, not a stable compatibility contract:
 | `set:sys` | 3/4 firmware version |
 | root `apm` | 0 open session, 1 get performance mode |
 | `apm` child session | 0 set configuration, 1 get configuration |
+| `pctl` factory | 0 create initialized service, 1 create uninitialized service |
+| `IParentalControlService` | 1 initialize, 1001 check free-communication permission, 1031 query whether restrictions are enabled |
+| `ICommonStateGetter` | 0 message event, 1 receive message, 5 operation mode, 6 performance mode, 9 focus state |
+| `ISelfController` | 0 exit, 1/2 exit lock, 9 library-applet launchable event, 11/12 mode notifications, 13/16 focus policy, 40 display layer |
+| `IApplicationFunctions` | 22 set termination result, 40 notify running |
 | `hid` | 0 create applet resource |
 | `IAppletResource` | 0 get shared-memory handle |
 
@@ -716,6 +721,13 @@ This is a practical coverage map, not a stable compatibility contract:
 subset of `ICommonStateGetter`, `ISelfController`, `IWindowController`, and
 `IApplicationFunctions`. Other child types may exist in its domain table while
 still returning `CMIF_UNKNOWN_COMMAND_ID` for their methods.
+
+`pctl` follows the real factory/domain/session lifecycle, including the
+firmware 4.0.0 split between `CreateService` and
+`CreateServiceWithoutInitialize`. Nixe currently exposes no parental-control
+profile, so its explicit policy is unrestricted: implemented permission checks
+succeed after initialization. Commands outside that verified policy surface
+remain fail-fast instead of inheriting a generic success response.
 
 ## Current limitations and unstable areas
 
@@ -774,6 +786,11 @@ distinguish wire framing, routing, and semantic failures quickly.
   defining the CMIF helper structures used by the reference client.
 - [libnx `sf/hipc.h`, pinned commit](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/hipc.h),
   defining the HIPC helper structures used by the reference client.
+- [libnx `pctl.c`, pinned commit](https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c),
+  documenting the public factory, domain conversion, initialization split, and
+  implemented client command layouts.
+- [Switchbrew parental-control services, fixed revision](https://switchbrew.org/w/index.php?title=Parental_Control_services&oldid=14435),
+  providing the service interfaces and command/version map.
 - [Atmosphère kernel IPC, pinned commit](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_ipc.cpp),
   used as the public reference for ports, sessions, and IPC SVC behavior.
 - [Atmosphère common result encoding, pinned commit](https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/results/results_common.hpp),

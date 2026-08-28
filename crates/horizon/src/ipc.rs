@@ -13,13 +13,11 @@ use std::sync::Arc;
 
 use nixe_loader_title::TitleId;
 
-use nixe_runtime::{
-    EventObject, HandleObject, HandleTable, ProcessMountNamespace, RunnableProcess,
-};
+use nixe_runtime::{EventObject, HandleTable, ProcessMountNamespace, RunnableProcess};
 
 use crate::{
-    DirectoryEntry, DirectoryEntryKind, HostDirectoryFileSystem, HostFile, IpcSession,
-    ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem,
+    DirectoryEntry, DirectoryEntryKind, HorizonIpcObject, HostDirectoryFileSystem, HostFile,
+    IpcSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, SemanticIpcObject,
 };
 
 /// Largest path accepted by the semantic filesystem boundary.
@@ -191,7 +189,7 @@ impl IpcDispatcher {
             return Err(IpcResultCode::ACCESS_DENIED);
         }
         handles
-            .insert(IpcSession::new(service))
+            .insert(HorizonIpcObject::SemanticService(IpcSession::new(service)))
             .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
     }
 
@@ -203,10 +201,18 @@ impl IpcDispatcher {
         request: IpcRequest,
     ) -> Result<IpcResponse, IpcResultCode> {
         let object = handles
-            .get(target)
+            .get_as::<HorizonIpcObject>(target)
             .cloned()
             .ok_or(IpcResultCode::INVALID_HANDLE)?;
-        Self::dispatch_object(mounts, handles, &object, request)
+        match object {
+            HorizonIpcObject::SemanticService(session) => {
+                dispatch_session(mounts, handles, &session, request)
+            }
+            HorizonIpcObject::SemanticObject(object) => {
+                dispatch_semantic_object(mounts, handles, &object, request)
+            }
+            _ => Err(IpcResultCode::INVALID_COMMAND),
+        }
     }
 
     pub(crate) fn dispatch_session(
@@ -218,26 +224,33 @@ impl IpcDispatcher {
         dispatch_session(mounts, handles, session, request)
     }
 
-    pub(crate) fn dispatch_object(
+    pub(crate) fn dispatch_semantic_object(
         mounts: &ProcessMountNamespace,
         handles: &mut HandleTable,
-        object: &HandleObject,
+        object: &SemanticIpcObject,
         request: IpcRequest,
     ) -> Result<IpcResponse, IpcResultCode> {
-        if let Some(session) = object.downcast_ref::<IpcSession>() {
-            dispatch_session(mounts, handles, session, request)
-        } else if let Some(filesystem) = object.downcast_ref::<ReadOnlyFileSystem>().cloned() {
-            dispatch_filesystem(mounts, handles, &filesystem, request)
-        } else if let Some(filesystem) = object.downcast_ref::<HostDirectoryFileSystem>().cloned() {
-            dispatch_host_filesystem(mounts, handles, &filesystem, request)
-        } else if let Some(file) = object.downcast_ref::<ReadOnlyFile>().cloned() {
-            dispatch_file(mounts, &file, request)
-        } else if let Some(file) = object.downcast_ref::<HostFile>() {
-            dispatch_host_file(mounts, file, request)
-        } else if let Some(directory) = object.downcast_ref::<ReadOnlyDirectory>().cloned() {
-            dispatch_directory(mounts, &directory, request)
-        } else {
-            Err(IpcResultCode::INVALID_COMMAND)
+        dispatch_semantic_object(mounts, handles, object, request)
+    }
+}
+
+fn dispatch_semantic_object(
+    mounts: &ProcessMountNamespace,
+    handles: &mut HandleTable,
+    object: &SemanticIpcObject,
+    request: IpcRequest,
+) -> Result<IpcResponse, IpcResultCode> {
+    match object {
+        SemanticIpcObject::ReadOnlyFileSystem(filesystem) => {
+            dispatch_filesystem(mounts, handles, filesystem, request)
+        }
+        SemanticIpcObject::HostDirectoryFileSystem(filesystem) => {
+            dispatch_host_filesystem(mounts, handles, filesystem, request)
+        }
+        SemanticIpcObject::ReadOnlyFile(file) => dispatch_file(mounts, file, request),
+        SemanticIpcObject::HostFile(file) => dispatch_host_file(mounts, file, request),
+        SemanticIpcObject::ReadOnlyDirectory(directory) => {
+            dispatch_directory(mounts, directory, request)
         }
     }
 }
@@ -259,7 +272,10 @@ fn dispatch_session(
                 .primary()
                 .cloned()
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
-            insert_handle(handles, ReadOnlyFileSystem::new(mount))
+            insert_handle(
+                handles,
+                SemanticIpcObject::ReadOnlyFileSystem(ReadOnlyFileSystem::new(mount)),
+            )
         }
         (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
             require_sd_card_access(mounts)?;
@@ -267,7 +283,10 @@ fn dispatch_session(
             if root.is_none() && mounts.homebrew_executable().is_none() {
                 return Err(IpcResultCode::PATH_NOT_FOUND);
             }
-            insert_handle(handles, HostDirectoryFileSystem::new(root))
+            insert_handle(
+                handles,
+                SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::new(root)),
+            )
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
             u64::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
@@ -359,7 +378,10 @@ fn dispatch_session(
                 .get(mount_index)
                 .cloned()
                 .ok_or(IpcResultCode::OUT_OF_RANGE)?;
-            insert_handle(handles, ReadOnlyFileSystem::new(mount))
+            insert_handle(
+                handles,
+                SemanticIpcObject::ReadOnlyFileSystem(ReadOnlyFileSystem::new(mount)),
+            )
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
@@ -400,7 +422,11 @@ fn dispatch_filesystem(
                 .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
             insert_handle(
                 handles,
-                ReadOnlyFile::new(Arc::from(path), file.size(), storage),
+                SemanticIpcObject::ReadOnlyFile(ReadOnlyFile::new(
+                    Arc::from(path),
+                    file.size(),
+                    storage,
+                )),
             )
         }
         IpcRequest::OpenDirectory { path, .. } => {
@@ -408,7 +434,10 @@ fn dispatch_filesystem(
             let entries = directory_entries(filesystem, &path)?;
             insert_handle(
                 handles,
-                ReadOnlyDirectory::new(Arc::from(path), entries.into()),
+                SemanticIpcObject::ReadOnlyDirectory(ReadOnlyDirectory::new(
+                    Arc::from(path),
+                    entries.into(),
+                )),
             )
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
@@ -495,11 +524,11 @@ fn dispatch_host_filesystem(
                     }
                     return insert_handle(
                         handles,
-                        ReadOnlyFile::new(
+                        SemanticIpcObject::ReadOnlyFile(ReadOnlyFile::new(
                             Arc::from(path),
                             identity.size(),
                             identity.source().clone(),
-                        ),
+                        )),
                     );
                 }
                 if is_homebrew_virtual_directory(identity.guest_path(), &path) {
@@ -526,7 +555,13 @@ fn dispatch_host_filesystem(
                 .map_err(map_host_io_error)?;
             insert_handle(
                 handles,
-                HostFile::new(Arc::from(path), file, readable, writable, allow_append),
+                SemanticIpcObject::HostFile(HostFile::new(
+                    Arc::from(path),
+                    file,
+                    readable,
+                    writable,
+                    allow_append,
+                )),
             )
         }
         IpcRequest::OpenDirectory { path, mode } => {
@@ -543,7 +578,10 @@ fn dispatch_host_filesystem(
             let entries = host_directory_entries(mounts, filesystem, &path, mode)?;
             insert_handle(
                 handles,
-                ReadOnlyDirectory::new(Arc::from(path), entries.into()),
+                SemanticIpcObject::ReadOnlyDirectory(ReadOnlyDirectory::new(
+                    Arc::from(path),
+                    entries.into(),
+                )),
             )
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
@@ -688,12 +726,12 @@ fn require_sd_card_access(mounts: &ProcessMountNamespace) -> Result<(), IpcResul
     }
 }
 
-fn insert_handle<T>(handles: &mut HandleTable, object: T) -> Result<IpcResponse, IpcResultCode>
-where
-    T: nixe_runtime::HandleValue,
-{
+fn insert_handle(
+    handles: &mut HandleTable,
+    object: SemanticIpcObject,
+) -> Result<IpcResponse, IpcResultCode> {
     handles
-        .insert(object)
+        .insert(HorizonIpcObject::SemanticObject(object))
         .map(IpcResponse::Handle)
         .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
 }

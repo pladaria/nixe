@@ -11,7 +11,7 @@ use nixe_cpu::memory::{
     MemoryPermissions, MemoryRegionKind, MemoryValue,
 };
 use nixe_memory::GuestVirtualAddress;
-use nixe_runtime::{EventObject, ExceptionProcessContext, HandleObject, TransferMemoryObject};
+use nixe_runtime::{ExceptionProcessContext, TransferMemoryObject};
 
 use crate::ipc_message::{
     BufferDescriptor, BufferMode, COMMAND_BUFFER_SIZE, CmifRequest, CmifResponse, DomainRequest,
@@ -26,13 +26,14 @@ use crate::object::{
 };
 use crate::{
     AccountSession, AppletSession, DirectoryEntryKind, HidAppletResource, HidSession, HidSystem,
-    HorizonIpcResult, HostDirectoryFileSystem, HostFile, IpcDispatcher, IpcRequest, IpcResponse,
-    IpcResultCode, IpcService, IpcSession, LogManagerSession, LoggerSession, MAX_IPC_LIST_ENTRIES,
-    MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES, NvDrvSession, OperationMode, PerformanceManagerSession,
-    PerformanceSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ServiceManagerSession,
-    SettingsEnvironment, SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage,
-    SystemSettingsSession, TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
-    UserSettingsSession, ViObjectKind, ViServiceKind, ViSession, VideoSystem,
+    HorizonIpcObject, HorizonIpcResult, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
+    IpcService, IpcSession, LogManagerSession, LoggerSession, MAX_IPC_LIST_ENTRIES,
+    MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES, NvDrvSession, OperationMode,
+    ParentalControlFactorySession, ParentalControlSession, PerformanceManagerSession,
+    PerformanceSession, SemanticIpcObject, ServiceManagerSession, SettingsEnvironment,
+    SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
+    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession, ViObjectKind,
+    ViServiceKind, ViSession, VideoSystem,
 };
 
 pub(crate) const NAMED_PORT_NAME_SIZE: usize = 12;
@@ -230,7 +231,11 @@ pub(crate) fn connect_to_named_port(
             }
             log::debug!("ConnectToNamedPort opening a client session to sm:");
             return Ok(
-                match process.handles_mut().insert(ServiceManagerSession::new()) {
+                match process
+                    .handles_mut()
+                    .insert(HorizonIpcObject::ServiceManager(
+                        ServiceManagerSession::new(),
+                    )) {
                     Ok(handle) => NamedPortResult::Connected(handle),
                     Err(_) => NamedPortResult::OutOfHandles,
                 },
@@ -248,29 +253,6 @@ pub(crate) struct HostSystems<'a> {
     pub caller_thread_id: u64,
 }
 
-#[derive(Clone)]
-enum IpcTarget {
-    ServiceManager(ServiceManagerSession),
-    SemanticService(IpcSession),
-    SystemSettings(SystemSettingsSession),
-    UserSettings(UserSettingsSession),
-    PerformanceManager(PerformanceManagerSession),
-    Performance(PerformanceSession),
-    Applet(AppletSession),
-    Account(AccountSession),
-    Hid(HidSession),
-    HidAppletResource(HidAppletResource),
-    Time(TimeServiceSession),
-    SystemClock(SystemClockSession),
-    SteadyClock(SteadyClockSession),
-    TimeZone(TimeZoneServiceSession),
-    Vi(ViSession),
-    NvDrv(NvDrvSession),
-    LogManager(LogManagerSession),
-    Logger(LoggerSession),
-    SemanticObject(HandleObject),
-}
-
 #[derive(Clone, Copy)]
 enum ServiceKind {
     UserSettings,
@@ -283,12 +265,13 @@ enum ServiceKind {
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
+    ParentalControl,
     Semantic(IpcService),
 }
 
 enum SemanticTarget {
     Root,
-    Object(HandleObject),
+    Object(SemanticIpcObject),
 }
 
 impl ServiceKind {
@@ -303,6 +286,7 @@ impl ServiceKind {
             b"acc:u0" => Some(Self::Account),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
+            b"pctl" | b"pctl:a" | b"pctl:r" | b"pctl:s" => Some(Self::ParentalControl),
             _ => ViServiceKind::from_name(name)
                 .map(Self::Vi)
                 .or_else(|| IpcService::from_name(name).map(Self::Semantic)),
@@ -310,60 +294,12 @@ impl ServiceKind {
     }
 }
 
-impl IpcTarget {
-    fn from_object(object: &HandleObject) -> Option<Self> {
-        if let Some(value) = object.downcast_ref::<ServiceManagerSession>() {
-            Some(Self::ServiceManager(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<IpcSession>() {
-            Some(Self::SemanticService(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<SystemSettingsSession>() {
-            Some(Self::SystemSettings(*value))
-        } else if let Some(value) = object.downcast_ref::<UserSettingsSession>() {
-            Some(Self::UserSettings(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<PerformanceManagerSession>() {
-            Some(Self::PerformanceManager(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<PerformanceSession>() {
-            Some(Self::Performance(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<AppletSession>() {
-            Some(Self::Applet(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<AccountSession>() {
-            Some(Self::Account(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<HidSession>() {
-            Some(Self::Hid(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<HidAppletResource>() {
-            Some(Self::HidAppletResource(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<TimeServiceSession>() {
-            Some(Self::Time(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<SystemClockSession>() {
-            Some(Self::SystemClock(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<SteadyClockSession>() {
-            Some(Self::SteadyClock(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<TimeZoneServiceSession>() {
-            Some(Self::TimeZone(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<ViSession>() {
-            Some(Self::Vi(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<NvDrvSession>() {
-            Some(Self::NvDrv(value.clone()))
-        } else if let Some(value) = object.downcast_ref::<LogManagerSession>() {
-            Some(Self::LogManager(*value))
-        } else if let Some(value) = object.downcast_ref::<LoggerSession>() {
-            Some(Self::Logger(*value))
-        } else if object.is::<ReadOnlyFileSystem>()
-            || object.is::<HostDirectoryFileSystem>()
-            || object.is::<ReadOnlyFile>()
-            || object.is::<HostFile>()
-            || object.is::<ReadOnlyDirectory>()
-        {
-            Some(Self::SemanticObject(object.clone()))
-        } else {
-            None
-        }
-    }
-
+impl HorizonIpcObject {
     fn is_domain(&self) -> bool {
         match self {
             Self::Applet(session) => session.is_domain(),
             Self::SemanticService(session) => session.is_domain(),
+            Self::ParentalControl(session) => session.is_domain(),
             _ => false,
         }
     }
@@ -379,10 +315,9 @@ impl IpcTarget {
             Self::ServiceManager(_) => "sm:",
             Self::SemanticService(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
-                .as_ref()
                 .map_or_else(
                     || semantic_service_name(session.service()),
-                    semantic_object_name,
+                    |object| semantic_object_name(&object),
                 ),
             Self::SystemSettings(_) => "set:sys",
             Self::UserSettings(_) => "set",
@@ -402,6 +337,10 @@ impl IpcTarget {
             Self::NvDrv(_) => "nvdrv",
             Self::LogManager(_) => "lm",
             Self::Logger(_) => "ILogger",
+            Self::ParentalControl(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .map_or("pctl", |_| "IParentalControlService"),
+            Self::ParentalControlService(_) => "IParentalControlService",
             Self::SemanticObject(object) => semantic_object_name(object),
         }
     }
@@ -437,8 +376,8 @@ pub(crate) fn send_sync_request_from_buffer(
 ) -> Result<SyncRequestResult, IpcWireError> {
     let Some(target) = process
         .handles()
-        .get(handle)
-        .and_then(IpcTarget::from_object)
+        .get_as::<HorizonIpcObject>(handle)
+        .cloned()
     else {
         return Ok(SyncRequestResult::InvalidHandle);
     };
@@ -507,7 +446,7 @@ pub(crate) fn send_sync_request_from_buffer(
         CMIF_COMMAND_CONTROL | CMIF_COMMAND_CONTROL_WITH_CONTEXT
     ) {
         if request.command_id == 0
-            && let IpcTarget::Applet(applet) = &target
+            && let HorizonIpcObject::Applet(applet) = &target
         {
             // libnx converts appletOE to a domain before opening the
             // application proxy. The control command and returned root object
@@ -525,7 +464,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(trace_completion(SyncRequestResult::Success));
         }
         if request.command_id == 0
-            && let IpcTarget::SemanticService(service) = &target
+            && let HorizonIpcObject::SemanticService(service) = &target
         {
             // Generic CMIF domain conversion and its root object response are
             // defined by libnx's pinned service implementation:
@@ -544,8 +483,25 @@ pub(crate) fn send_sync_request_from_buffer(
             );
             return Ok(trace_completion(SyncRequestResult::Success));
         }
+        if request.command_id == 0
+            && let HorizonIpcObject::ParentalControl(factory) = &target
+        {
+            // The public pctl client converts the factory before asking it to
+            // create IParentalControlService. Keep that real domain boundary:
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c#L20-L24
+            let object_id = factory.convert_to_domain();
+            let response = encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &object_id.to_le_bytes(),
+                None,
+            )?;
+            write_response(process, address, size, &response)?;
+            log::debug!("pctl converted to domain with root object {object_id:#x}");
+            return Ok(trace_completion(SyncRequestResult::Success));
+        }
         if matches!(request.command_id, 2 | 4)
-            && let IpcTarget::SemanticService(service) = &target
+            && let HorizonIpcObject::SemanticService(service) = &target
         {
             // CloneCurrentObject (2) returns a moved session handle. The Ex
             // form (4) additionally carries a session-manager tag which the
@@ -553,9 +509,12 @@ pub(crate) fn send_sync_request_from_buffer(
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L308-L337
             // A cloned `IpcSession` has a distinct process-handle object while
             // retaining the shared domain table of the source connection.
-            let cloned_handle = process.handles_mut().insert(service.clone()).map_err(|_| {
-                IpcWireError::HostResourceExhausted("cloning a CMIF session handle")
-            })?;
+            let cloned_handle = process
+                .handles_mut()
+                .insert(HorizonIpcObject::SemanticService(service.clone()))
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("cloning a CMIF session handle")
+                })?;
             let response = match encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
@@ -579,11 +538,11 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(trace_completion(SyncRequestResult::Success));
         }
         if matches!(request.command_id, 2 | 4)
-            && let IpcTarget::Vi(vi) = &target
+            && let HorizonIpcObject::Vi(vi) = &target
         {
             let cloned_handle = process
                 .handles_mut()
-                .insert(vi.clone())
+                .insert(HorizonIpcObject::Vi(vi.clone()))
                 .map_err(|_| IpcWireError::HostResourceExhausted("cloning a VI session handle"))?;
             let response = encode_response(
                 request.token,
@@ -595,7 +554,7 @@ pub(crate) fn send_sync_request_from_buffer(
             return Ok(trace_completion(SyncRequestResult::Success));
         }
         if matches!(request.command_id, 2 | 4)
-            && let IpcTarget::NvDrv(nvdrv) = &target
+            && let HorizonIpcObject::NvDrv(nvdrv) = &target
         {
             // CMIF cloning creates another service connection into the same
             // nvdrv client. The connections share initialization, descriptors,
@@ -607,9 +566,12 @@ pub(crate) fn send_sync_request_from_buffer(
                     .ok_or(IpcWireError::HostResourceExhausted(
                         "cloning an nvdrv connection",
                     ))?;
-            let cloned_handle = process.handles_mut().insert(cloned_session).map_err(|_| {
-                IpcWireError::HostResourceExhausted("installing a cloned nvdrv session handle")
-            })?;
+            let cloned_handle = process
+                .handles_mut()
+                .insert(HorizonIpcObject::NvDrv(cloned_session))
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("installing a cloned nvdrv session handle")
+                })?;
             let response = encode_response(
                 request.token,
                 HorizonIpcResult::SUCCESS,
@@ -617,6 +579,33 @@ pub(crate) fn send_sync_request_from_buffer(
                 Some(cloned_handle),
             )?;
             write_response(process, address, size, &response)?;
+            return Ok(trace_completion(SyncRequestResult::Success));
+        }
+        if matches!(request.command_id, 2 | 4)
+            && let HorizonIpcObject::ParentalControl(factory) = &target
+        {
+            let cloned_handle = process
+                .handles_mut()
+                .insert(HorizonIpcObject::ParentalControl(factory.clone()))
+                .map_err(|_| {
+                    IpcWireError::HostResourceExhausted("cloning a pctl session handle")
+                })?;
+            let response = match encode_response(
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                Some(cloned_handle),
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = process.handles_mut().close(cloned_handle);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_response(process, address, size, &response) {
+                let _ = process.handles_mut().close(cloned_handle);
+                return Err(error);
+            }
             return Ok(trace_completion(SyncRequestResult::Success));
         }
         let response = match request.command_id {
@@ -634,11 +623,11 @@ pub(crate) fn send_sync_request_from_buffer(
         return Ok(trace_completion(SyncRequestResult::Success));
     }
     let applet_exit_requested = match &target {
-        IpcTarget::Applet(session) => applet_requests_self_exit(session, &request, &hipc),
+        HorizonIpcObject::Applet(session) => applet_requests_self_exit(session, &request, &hipc),
         _ => false,
     };
     let (response, created_handle) = match target {
-        IpcTarget::ServiceManager(manager) => dispatch_service_manager(
+        HorizonIpcObject::ServiceManager(manager) => dispatch_service_manager(
             process,
             &manager,
             request,
@@ -647,33 +636,35 @@ pub(crate) fn send_sync_request_from_buffer(
             time_environment,
             host_systems,
         )?,
-        IpcTarget::SemanticService(service) => {
+        HorizonIpcObject::SemanticService(service) => {
             dispatch_semantic_service(process, &service, request, &hipc)?
         }
-        IpcTarget::SystemSettings(_) => {
+        HorizonIpcObject::SystemSettings(_) => {
             dispatch_system_settings(process, request, &hipc.receive_statics)?
         }
-        IpcTarget::UserSettings(settings) => {
+        HorizonIpcObject::UserSettings(settings) => {
             dispatch_user_settings(process, &settings, request, &hipc)?
         }
-        IpcTarget::PerformanceManager(manager) => {
+        HorizonIpcObject::PerformanceManager(manager) => {
             dispatch_performance_manager(process, &manager, request)?
         }
-        IpcTarget::Performance(session) => dispatch_performance_session(&session, request)?,
-        IpcTarget::Applet(applet) => {
+        HorizonIpcObject::Performance(session) => dispatch_performance_session(&session, request)?,
+        HorizonIpcObject::Applet(applet) => {
             dispatch_applet(process, &applet, request, &hipc, host_systems.video)?
         }
-        IpcTarget::Account(account) => dispatch_account(process, &account, request, &hipc)?,
-        IpcTarget::Hid(hid) => dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?,
-        IpcTarget::HidAppletResource(resource) => {
+        HorizonIpcObject::Account(account) => dispatch_account(process, &account, request, &hipc)?,
+        HorizonIpcObject::Hid(hid) => {
+            dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
+        }
+        HorizonIpcObject::HidAppletResource(resource) => {
             dispatch_hid_applet_resource(process, &resource, request)?
         }
-        IpcTarget::Time(time) => dispatch_time(process, &time, request)?,
-        IpcTarget::SystemClock(clock) => dispatch_system_clock(&clock, request)?,
-        IpcTarget::SteadyClock(clock) => dispatch_steady_clock(&clock, request)?,
-        IpcTarget::TimeZone(timezone) => dispatch_timezone(&timezone, request)?,
-        IpcTarget::Vi(vi) => dispatch_vi(process, &vi, request, &hipc)?,
-        IpcTarget::NvDrv(nvdrv) => match dispatch_nvdrv(
+        HorizonIpcObject::Time(time) => dispatch_time(process, &time, request)?,
+        HorizonIpcObject::SystemClock(clock) => dispatch_system_clock(&clock, request)?,
+        HorizonIpcObject::SteadyClock(clock) => dispatch_steady_clock(&clock, request)?,
+        HorizonIpcObject::TimeZone(timezone) => dispatch_timezone(&timezone, request)?,
+        HorizonIpcObject::Vi(vi) => dispatch_vi(process, &vi, request, &hipc)?,
+        HorizonIpcObject::NvDrv(nvdrv) => match dispatch_nvdrv(
             process,
             &nvdrv,
             request,
@@ -686,8 +677,8 @@ pub(crate) fn send_sync_request_from_buffer(
             }
             Err(error) => return Err(error),
         },
-        IpcTarget::LogManager(_) => dispatch_log_manager(process, request, &hipc)?,
-        IpcTarget::Logger(logger) => {
+        HorizonIpcObject::LogManager(_) => dispatch_log_manager(process, request, &hipc)?,
+        HorizonIpcObject::Logger(logger) => {
             log::trace!(
                 "ILogger for process {} reached command {}",
                 logger.process_id(),
@@ -695,7 +686,13 @@ pub(crate) fn send_sync_request_from_buffer(
             );
             unsupported_service_command("ILogger", request.command_id)?
         }
-        IpcTarget::SemanticObject(object) => {
+        HorizonIpcObject::ParentalControl(factory) => {
+            dispatch_parental_control(process, &factory, request, &hipc)?
+        }
+        HorizonIpcObject::ParentalControlService(service) => {
+            dispatch_parental_control_service(None, &service, request, &hipc)?
+        }
+        HorizonIpcObject::SemanticObject(object) => {
             dispatch_plain_semantic_object(process, &object, request, &hipc)?
         }
     };
@@ -889,7 +886,7 @@ fn dispatch_log_manager(
             let process_id = process.process_id();
             let handle = process
                 .handles_mut()
-                .insert(LoggerSession::new(process_id))
+                .insert(HorizonIpcObject::Logger(LoggerSession::new(process_id)))
                 .map_err(|_| {
                     IpcWireError::HostResourceExhausted("installing an lm logger handle")
                 })?;
@@ -900,6 +897,267 @@ fn dispatch_log_manager(
             ))
         }
         command_id => unsupported_service_command("lm", command_id),
+    }
+}
+
+enum ParentalControlTarget {
+    Factory,
+    Service(ParentalControlSession),
+}
+
+fn dispatch_parental_control(
+    process: &mut ExceptionProcessContext<'_>,
+    factory: &ParentalControlFactorySession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let target = match &request.domain {
+        Some(DomainRequest::Close { object_id }) => {
+            let result = if factory.close_object(*object_id) {
+                HorizonIpcResult::SUCCESS
+            } else {
+                HorizonIpcResult::CMIF_TARGET_NOT_FOUND
+            };
+            return parental_control_response(factory, request.token, result, &[], &[]);
+        }
+        Some(DomainRequest::SendMessage {
+            object_id,
+            input_objects,
+        }) => {
+            if !input_objects.is_empty() {
+                return parental_control_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                );
+            }
+            if *object_id == 1 {
+                ParentalControlTarget::Factory
+            } else {
+                let Some(service) = factory.object(*object_id) else {
+                    return parental_control_response(
+                        factory,
+                        request.token,
+                        HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
+                        &[],
+                        &[],
+                    );
+                };
+                ParentalControlTarget::Service(service)
+            }
+        }
+        None if factory.is_domain() => {
+            return Err(IpcWireError::Malformed(
+                "domain pctl request omitted its domain header",
+            ));
+        }
+        None => ParentalControlTarget::Factory,
+    };
+
+    match target {
+        ParentalControlTarget::Factory => {
+            dispatch_parental_control_factory(process, factory, request, hipc)
+        }
+        ParentalControlTarget::Service(service) => {
+            dispatch_parental_control_service(Some(factory), &service, request, hipc)
+        }
+    }
+}
+
+fn dispatch_parental_control_factory(
+    process: &mut ExceptionProcessContext<'_>,
+    factory: &ParentalControlFactorySession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        // CreateService initializes its child as part of command 0 on older
+        // Horizon versions. Since 4.0.0, command 1 creates an uninitialized
+        // child and the client follows with IParentalControlService::Initialize.
+        // The factory ABI sends one reserved u64 and a PID descriptor:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c#L20-L24
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c#L48-L55
+        command_id @ (0 | 1) => {
+            if hipc.pid.is_none()
+                || request_u64(request.data, 0) != Some(0)
+                || !hipc.copy_handles.is_empty()
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || !matches!(hipc.receive_statics, ReceiveStatics::None)
+            {
+                return parental_control_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                );
+            }
+            let service = ParentalControlSession::new(process.process_id(), command_id == 0);
+            if factory.is_domain() {
+                let Some(object_id) = factory.insert_object(service) else {
+                    return parental_control_response(
+                        factory,
+                        request.token,
+                        HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
+                        &[],
+                        &[],
+                    );
+                };
+                log::debug!(
+                    "pctl opened IParentalControlService as domain object {object_id:#x} for process {}",
+                    process.process_id()
+                );
+                parental_control_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &[],
+                    &[object_id],
+                )
+            } else {
+                let handle = process
+                    .handles_mut()
+                    .insert(HorizonIpcObject::ParentalControlService(service))
+                    .map_err(|_| {
+                        IpcWireError::HostResourceExhausted(
+                            "installing a parental-control child handle",
+                        )
+                    })?;
+                Ok((
+                    encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
+                    Some(handle),
+                ))
+            }
+        }
+        command_id => unsupported_service_command("pctl", command_id),
+    }
+}
+
+fn dispatch_parental_control_service(
+    factory: Option<&ParentalControlFactorySession>,
+    service: &ParentalControlSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match request.command_id {
+        // Initialize was split from factory command 1 in Horizon 4.0.0.
+        // https://switchbrew.org/w/index.php?title=Parental_Control_services&oldid=14435
+        1 => {
+            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                return parental_control_service_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                );
+            }
+            service.initialize();
+            log::debug!(
+                "pctl initialized IParentalControlService for process {}",
+                service.process_id()
+            );
+            parental_control_service_response(
+                factory,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+            )
+        }
+        // Nixe currently has no configured parental-control profile. This is
+        // an explicit unrestricted policy, so the real permission command
+        // succeeds; it is not a blanket success fallback for unknown pctl
+        // methods. A future profile implementation must evaluate title age,
+        // communication, play-timer, and temporary-unlock state here.
+        1001 => {
+            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                return parental_control_service_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                );
+            }
+            if !service.is_initialized() {
+                return parental_control_service_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                    &[],
+                );
+            }
+            parental_control_service_response(
+                factory,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+            )
+        }
+        // IsRestrictionEnabled is the guest-visible policy query. Returning
+        // false is the exact representation of Nixe's current unrestricted
+        // profile, so age ratings never gate launch at this boundary.
+        // The command returns one u8 bool with no input:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c#L91-L93
+        1031 => {
+            if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                return parental_control_service_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                );
+            }
+            if !service.is_initialized() {
+                return parental_control_service_response(
+                    factory,
+                    request.token,
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                    &[],
+                );
+            }
+            parental_control_service_response(
+                factory,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[0],
+            )
+        }
+        command_id => unsupported_service_command("IParentalControlService", command_id),
+    }
+}
+
+fn parental_control_service_response(
+    factory: Option<&ParentalControlFactorySession>,
+    token: u32,
+    result: HorizonIpcResult,
+    data: &[u8],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if let Some(factory) = factory {
+        parental_control_response(factory, token, result, data, &[])
+    } else {
+        Ok((encode_response(token, result, data, None)?, None))
+    }
+}
+
+fn parental_control_response(
+    factory: &ParentalControlFactorySession,
+    token: u32,
+    result: HorizonIpcResult,
+    data: &[u8],
+    domain_objects: &[u32],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if factory.is_domain() {
+        Ok((
+            encode_domain_response(token, result, data, &[], domain_objects)?,
+            None,
+        ))
+    } else {
+        Ok((encode_response(token, result, data, None)?, None))
     }
 }
 
@@ -916,32 +1174,73 @@ fn connect_service(
         ServiceKind::Account | ServiceKind::Vi(_) | ServiceKind::NvDrv
     );
     let handle = match service {
-        ServiceKind::UserSettings => process
-            .handles_mut()
-            .insert(UserSettingsSession::new(host_systems.settings.clone())),
-        ServiceKind::SystemSettings => process.handles_mut().insert(SystemSettingsSession::new()),
-        ServiceKind::Performance => process
-            .handles_mut()
-            .insert(PerformanceManagerSession::new()),
-        ServiceKind::Applet => process
-            .handles_mut()
-            .insert(AppletSession::new(initial_operation_mode)),
+        ServiceKind::UserSettings => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::UserSettings(UserSettingsSession::new(
+                    host_systems.settings.clone(),
+                )))
+        }
+        ServiceKind::SystemSettings => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::SystemSettings(
+                    SystemSettingsSession::new(),
+                ))
+        }
+        ServiceKind::Performance => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::PerformanceManager(
+                    PerformanceManagerSession::new(),
+                ))
+        }
+        ServiceKind::Applet => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::Applet(AppletSession::new(
+                    initial_operation_mode,
+                )))
+        }
         ServiceKind::Hid => process
             .handles_mut()
-            .insert(HidSession::new(host_systems.hid.shared_memory())),
-        ServiceKind::Time => time_environment
-            .create_service()
-            .and_then(|session| process.handles_mut().insert(session)),
+            .insert(HorizonIpcObject::Hid(HidSession::new(
+                host_systems.hid.shared_memory(),
+            ))),
+        ServiceKind::Time => time_environment.create_service().and_then(|session| {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::Time(session))
+        }),
         // libnx opens acc:u0 for application account sessions. Retain the
         // real session identity while unsupported commands remain fail-fast.
-        ServiceKind::Account => process.handles_mut().insert(AccountSession::new()),
-        ServiceKind::Vi(kind) => process.handles_mut().insert(ViSession::new(
-            ViObjectKind::Root(kind),
-            host_systems.video.clone(),
-        )),
-        ServiceKind::NvDrv => process.handles_mut().insert(host_systems.video.nvdrv()),
-        ServiceKind::LogManager => process.handles_mut().insert(LogManagerSession::new()),
-        ServiceKind::Semantic(service) => process.handles_mut().insert(IpcSession::new(service)),
+        ServiceKind::Account => process
+            .handles_mut()
+            .insert(HorizonIpcObject::Account(AccountSession::new())),
+        ServiceKind::Vi(kind) => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::Vi(ViSession::new(
+                    ViObjectKind::Root(kind),
+                    host_systems.video.clone(),
+                )))
+        }
+        ServiceKind::NvDrv => process
+            .handles_mut()
+            .insert(HorizonIpcObject::NvDrv(host_systems.video.nvdrv())),
+        ServiceKind::LogManager => process
+            .handles_mut()
+            .insert(HorizonIpcObject::LogManager(LogManagerSession::new())),
+        ServiceKind::ParentalControl => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::ParentalControl(
+                    ParentalControlFactorySession::new(),
+                ))
+        }
+        ServiceKind::Semantic(service) => process
+            .handles_mut()
+            .insert(HorizonIpcObject::SemanticService(IpcSession::new(service))),
     };
     match handle {
         Ok(handle) => {
@@ -1024,7 +1323,7 @@ fn dispatch_semantic_service(
 
 fn dispatch_plain_semantic_object(
     process: &mut ExceptionProcessContext<'_>,
-    object: &HandleObject,
+    object: &SemanticIpcObject,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -1069,7 +1368,7 @@ fn dispatch_semantic_command(
                 decoded,
             ),
             SemanticTarget::Object(object) => {
-                IpcDispatcher::dispatch_object(mounts, handles, object, decoded)
+                IpcDispatcher::dispatch_semantic_object(mounts, handles, object, decoded)
             }
         }
     };
@@ -1092,19 +1391,13 @@ fn dispatch_semantic_command(
     }
 }
 
-fn semantic_object_name(object: &HandleObject) -> &'static str {
-    if object.is::<ReadOnlyFileSystem>() {
-        "IFileSystem(read-only)"
-    } else if object.is::<HostDirectoryFileSystem>() {
-        "IFileSystem(sd-card)"
-    } else if object.is::<ReadOnlyFile>() {
-        "IFile(read-only)"
-    } else if object.is::<HostFile>() {
-        "IFile(sd-card)"
-    } else if object.is::<ReadOnlyDirectory>() {
-        "IDirectory"
-    } else {
-        "semantic IPC object"
+fn semantic_object_name(object: &SemanticIpcObject) -> &'static str {
+    match object {
+        SemanticIpcObject::ReadOnlyFileSystem(_) => "IFileSystem(read-only)",
+        SemanticIpcObject::HostDirectoryFileSystem(_) => "IFileSystem(sd-card)",
+        SemanticIpcObject::ReadOnlyFile(_) => "IFile(read-only)",
+        SemanticIpcObject::HostFile(_) => "IFile(sd-card)",
+        SemanticIpcObject::ReadOnlyDirectory(_) => "IDirectory",
     }
 }
 
@@ -1173,17 +1466,17 @@ fn decode_root_request(
 
 fn decode_object_request(
     process: &ExceptionProcessContext<'_>,
-    object: &HandleObject,
+    object: &SemanticIpcObject,
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<Option<IpcRequest>, IpcWireError> {
-    if object.is::<ReadOnlyFileSystem>() || object.is::<HostDirectoryFileSystem>() {
-        let is_host = object.is::<HostDirectoryFileSystem>();
-        return match request.command_id {
+    match object {
+        SemanticIpcObject::ReadOnlyFileSystem(_)
+        | SemanticIpcObject::HostDirectoryFileSystem(_) => match request.command_id {
             // IFileSystem::CreateFile/CreateDirectory use the same bounded
             // input-pointer path as open operations:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L816-L840
-            0 if is_host => {
+            0 if matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_)) => {
                 let option = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
                     "create-file request omits its option",
                 ))?;
@@ -1196,9 +1489,11 @@ fn decode_object_request(
                     option,
                 }))
             }
-            2 if is_host => Ok(Some(IpcRequest::CreateDirectory {
-                path: read_path(process, hipc)?,
-            })),
+            2 if matches!(object, SemanticIpcObject::HostDirectoryFileSystem(_)) => {
+                Ok(Some(IpcRequest::CreateDirectory {
+                    path: read_path(process, hipc)?,
+                }))
+            }
             // IFileSystem OpenFile/OpenDirectory use one input pointer path
             // and a u32 mode:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L878-L893
@@ -1214,86 +1509,87 @@ fn decode_object_request(
                 ))?,
             })),
             _ => Ok(None),
-        };
-    }
-    if object.is::<ReadOnlyFile>() || object.is::<HostFile>() {
-        let is_host = object.is::<HostFile>();
-        return match request.command_id {
-            // IFile::Read input layout and map-alias output buffer:
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L980-L994
-            0 => {
-                let offset = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
-                    "file read request omits its offset",
-                ))?;
-                let requested = request_u64(request.data, 16)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(IpcWireError::Malformed(
-                        "file read request size is out of range",
+        },
+        SemanticIpcObject::ReadOnlyFile(_) | SemanticIpcObject::HostFile(_) => {
+            match request.command_id {
+                // IFile::Read input layout and map-alias output buffer:
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L980-L994
+                0 => {
+                    let offset = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
+                        "file read request omits its offset",
                     ))?;
-                let descriptor = one_receive_buffer(hipc)?;
-                let capacity = usize::try_from(descriptor.size)
-                    .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
-                Ok(Some(IpcRequest::ReadFile {
-                    offset,
-                    size: requested.min(capacity).min(MAX_IPC_READ_BYTES),
-                }))
-            }
-            // IFile::Write carries option/padding/offset/size and one
-            // map-alias input buffer:
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L994-L1017
-            1 if is_host => {
-                let option = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
-                    "file write request omits its option",
-                ))?;
-                let offset = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
-                    "file write request omits its offset",
-                ))?;
-                let requested = request_u64(request.data, 16)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(IpcWireError::Malformed(
-                        "file write request size is out of range",
+                    let requested = request_u64(request.data, 16)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or(IpcWireError::Malformed(
+                            "file read request size is out of range",
+                        ))?;
+                    let descriptor = one_receive_buffer(hipc)?;
+                    let capacity = usize::try_from(descriptor.size)
+                        .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
+                    Ok(Some(IpcRequest::ReadFile {
+                        offset,
+                        size: requested.min(capacity).min(MAX_IPC_READ_BYTES),
+                    }))
+                }
+                // IFile::Write carries option/padding/offset/size and one
+                // map-alias input buffer:
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L994-L1017
+                1 if matches!(object, SemanticIpcObject::HostFile(_)) => {
+                    let option = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
+                        "file write request omits its option",
                     ))?;
-                if requested > MAX_IPC_READ_BYTES {
-                    return Err(IpcWireError::UnsupportedService(
-                        UnsupportedServiceOperation::CommandVariant {
-                            service: "IFile",
-                            command_id: request.command_id,
-                            detail: "requested write exceeds Nixe's implemented IPC bound",
-                        },
-                    ));
+                    let offset = request_u64(request.data, 8).ok_or(IpcWireError::Malformed(
+                        "file write request omits its offset",
+                    ))?;
+                    let requested = request_u64(request.data, 16)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or(IpcWireError::Malformed(
+                            "file write request size is out of range",
+                        ))?;
+                    if requested > MAX_IPC_READ_BYTES {
+                        return Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IFile",
+                                command_id: request.command_id,
+                                detail: "requested write exceeds Nixe's implemented IPC bound",
+                            },
+                        ));
+                    }
+                    let descriptor = one_send_buffer(hipc)?;
+                    let capacity = usize::try_from(descriptor.size)
+                        .map_err(|_| IpcWireError::Malformed("file input buffer is too large"))?;
+                    if requested > capacity {
+                        return Err(IpcWireError::Malformed(
+                            "file write size exceeds its input buffer",
+                        ));
+                    }
+                    let mut data = vec![0; requested];
+                    read_bytes(
+                        process,
+                        GuestVirtualAddress::new(descriptor.address),
+                        &mut data,
+                    )?;
+                    Ok(Some(IpcRequest::WriteFile {
+                        offset,
+                        data,
+                        flush: option & 1 != 0,
+                    }))
                 }
-                let descriptor = one_send_buffer(hipc)?;
-                let capacity = usize::try_from(descriptor.size)
-                    .map_err(|_| IpcWireError::Malformed("file input buffer is too large"))?;
-                if requested > capacity {
-                    return Err(IpcWireError::Malformed(
-                        "file write size exceeds its input buffer",
-                    ));
+                2 if matches!(object, SemanticIpcObject::HostFile(_)) => {
+                    Ok(Some(IpcRequest::FlushFile))
                 }
-                let mut data = vec![0; requested];
-                read_bytes(
-                    process,
-                    GuestVirtualAddress::new(descriptor.address),
-                    &mut data,
-                )?;
-                Ok(Some(IpcRequest::WriteFile {
-                    offset,
-                    data,
-                    flush: option & 1 != 0,
-                }))
+                3 if matches!(object, SemanticIpcObject::HostFile(_)) => {
+                    Ok(Some(IpcRequest::SetFileSize {
+                        size: request_u64(request.data, 0).ok_or(IpcWireError::Malformed(
+                            "set-file-size request omits its size",
+                        ))?,
+                    }))
+                }
+                4 => Ok(Some(IpcRequest::GetFileSize)),
+                _ => Ok(None),
             }
-            2 if is_host => Ok(Some(IpcRequest::FlushFile)),
-            3 if is_host => Ok(Some(IpcRequest::SetFileSize {
-                size: request_u64(request.data, 0).ok_or(IpcWireError::Malformed(
-                    "set-file-size request omits its size",
-                ))?,
-            })),
-            4 => Ok(Some(IpcRequest::GetFileSize)),
-            _ => Ok(None),
-        };
-    }
-    if object.is::<ReadOnlyDirectory>() {
-        return match request.command_id {
+        }
+        SemanticIpcObject::ReadOnlyDirectory(_) => match request.command_id {
             // IDirectory::Read returns fixed 0x310-byte FsDirectoryEntry
             // records through one map-alias output buffer:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L1043-L1051
@@ -1311,9 +1607,8 @@ fn decode_object_request(
             }
             1 => Ok(Some(IpcRequest::GetDirectoryEntryCount)),
             _ => Ok(None),
-        };
+        },
     }
-    Ok(None)
 }
 
 fn encode_semantic_response(
@@ -1341,6 +1636,13 @@ fn encode_semantic_response(
                     .handles_mut()
                     .close(handle)
                     .map_err(|_| IpcWireError::Internal("semantic child handle disappeared"))?;
+                let Some(HorizonIpcObject::SemanticObject(object)) =
+                    object.downcast_ref::<HorizonIpcObject>().cloned()
+                else {
+                    return Err(IpcWireError::Internal(
+                        "semantic dispatch returned a non-semantic child handle",
+                    ));
+                };
                 let Some(object_id) =
                     domain_session.and_then(|session| session.insert_object(object))
                 else {
@@ -2035,7 +2337,10 @@ fn dispatch_performance_manager(
     // Command IDs, payloads, and the returned child object follow libnx:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/apm.c
     match request.command_id {
-        0 => match process.handles_mut().insert(manager.open_session()) {
+        0 => match process
+            .handles_mut()
+            .insert(HorizonIpcObject::Performance(manager.open_session()))
+        {
             Ok(handle) => {
                 log::debug!("apm opened performance session handle {handle:#x}");
                 Ok((
@@ -2763,7 +3068,7 @@ fn vi_child(
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let handle = process
         .handles_mut()
-        .insert(ViSession::new(kind, video.clone()))
+        .insert(HorizonIpcObject::Vi(ViSession::new(kind, video.clone())))
         .map_err(|_| IpcWireError::HostResourceExhausted("installing a VI child handle"))?;
     Ok((
         encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
@@ -2867,8 +3172,7 @@ fn dispatch_applet(
             }
             match request.command_id {
                 0 => {
-                    let (_writable, readable) = EventObject::create_pair();
-                    let handle = match process.handles_mut().insert(readable) {
+                    let handle = match process.handles_mut().insert(session.message_event()) {
                         Ok(handle) => handle,
                         Err(_) => {
                             return Err(IpcWireError::HostResourceExhausted(
@@ -2888,9 +3192,13 @@ fn dispatch_applet(
                         Some(handle),
                     ))
                 }
+                1 => match session.receive_message() {
+                    Some(message) => applet_data(request.token, &message.to_le_bytes()),
+                    None => applet_error(request.token, HorizonIpcResult::AM_NO_MESSAGES),
+                },
                 5 => applet_data(request.token, &[session.operation_mode().as_raw()]),
                 6 => applet_data(request.token, &PERFORMANCE_MODE_NORMAL.to_le_bytes()),
-                9 => applet_data(request.token, &[1]), // Application is in focus.
+                9 => applet_data(request.token, &[session.current_focus_state()]),
                 command_id => unsupported_service_command("ICommonStateGetter", command_id),
             }
         }
@@ -2966,23 +3274,17 @@ fn dispatch_applet(
             // These state-mutating command layouts follow pinned libnx:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1113-L1125
             11 => {
-                let Some(enabled) = request.data.first() else {
+                let Some(enabled) = applet_request_bool(request.data, hipc) else {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
-                if request.data[1..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
-                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-                }
-                session.set_operation_mode_changed_notification(*enabled != 0);
+                session.set_operation_mode_changed_notification(enabled);
                 applet_data(request.token, &[])
             }
             12 => {
-                let Some(enabled) = request.data.first() else {
+                let Some(enabled) = applet_request_bool(request.data, hipc) else {
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
-                if request.data[1..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
-                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-                }
-                session.set_performance_mode_changed_notification(*enabled != 0);
+                session.set_performance_mode_changed_notification(enabled);
                 applet_data(request.token, &[])
             }
             13 => {
@@ -2993,6 +3295,17 @@ fn dispatch_applet(
                     return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 }
                 session.set_focus_handling_mode([mode[0] != 0, mode[1] != 0, mode[2] != 0]);
+                applet_data(request.token, &[])
+            }
+            // SetOutOfFocusSuspendingEnabled completes the focus policy set by
+            // command 13. It has no immediate scheduling effect while the
+            // emulated application remains permanently in focus.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L518-L553
+            16 => {
+                let Some(enabled) = applet_request_bool(request.data, hipc) else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                session.set_out_of_focus_suspending_enabled(enabled);
                 applet_data(request.token, &[])
             }
             command_id => unsupported_service_command("ISelfController", command_id),
@@ -3013,6 +3326,19 @@ fn dispatch_applet(
             command_id => unsupported_service_command("IWindowController", command_id),
         },
         AppletObject::ApplicationFunctions => match request.command_id {
+            // SetTerminateResult stores the application result in AM. It does
+            // not terminate the process or replace the kernel exit code.
+            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L2672-L2685
+            22 => {
+                let Some(result) = request_u32(request.data, 0) else {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                };
+                if request.data[4..].iter().any(|byte| *byte != 0) || has_ipc_descriptors(hipc) {
+                    return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                }
+                session.set_termination_result(result);
+                applet_data(request.token, &[])
+            }
             40 if request.data.is_empty() && !has_ipc_descriptors(hipc) => {
                 applet_data(request.token, &[1])
             }
@@ -3360,7 +3686,9 @@ fn dispatch_hid(
             }
             let handle = process
                 .handles_mut()
-                .insert(session.create_applet_resource())
+                .insert(HorizonIpcObject::HidAppletResource(
+                    session.create_applet_resource(),
+                ))
                 .map_err(|_| {
                     IpcWireError::HostResourceExhausted("installing a HID applet-resource handle")
                 })?;
@@ -3467,15 +3795,15 @@ fn dispatch_time(
     // shared-memory handle follow the pinned libnx initialization sequence:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L25-L80
     let child = match request.command_id {
-        0 => Some(HandleObject::new(
+        0 => Some(HorizonIpcObject::SystemClock(
             session.system_clock(SystemClockKind::User),
         )),
-        1 => Some(HandleObject::new(
+        1 => Some(HorizonIpcObject::SystemClock(
             session.system_clock(SystemClockKind::Network),
         )),
-        2 => Some(HandleObject::new(session.steady_clock())),
-        3 => Some(HandleObject::new(session.timezone_service())),
-        4 => Some(HandleObject::new(
+        2 => Some(HorizonIpcObject::SteadyClock(session.steady_clock())),
+        3 => Some(HorizonIpcObject::TimeZone(session.timezone_service())),
+        4 => Some(HorizonIpcObject::SystemClock(
             session.system_clock(SystemClockKind::Local),
         )),
         20 => {
@@ -3492,7 +3820,7 @@ fn dispatch_time(
     };
     let handle = process
         .handles_mut()
-        .insert_object(child.expect("time child command was selected"))
+        .insert(child.expect("time child command was selected"))
         .map_err(|_| {
             IpcWireError::HostResourceExhausted("installing a time service child handle")
         })?;
@@ -3639,6 +3967,11 @@ fn applet_error(
     result: HorizonIpcResult,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     Ok((encode_domain_response(token, result, &[], &[], &[])?, None))
+}
+
+fn applet_request_bool(data: &[u8], hipc: &HipcRequest<'_>) -> Option<bool> {
+    let (&value, padding) = data.split_first()?;
+    (!has_ipc_descriptors(hipc) && padding.iter().all(|byte| *byte == 0)).then_some(value != 0)
 }
 
 const fn applet_object_name(object: AppletObject) -> &'static str {
@@ -4022,16 +4355,17 @@ mod tests {
         };
 
         assert_eq!(
-            IpcTarget::NvDrv(NvDrvSession::default()).diagnostic_name(&request),
+            HorizonIpcObject::NvDrv(NvDrvSession::default()).diagnostic_name(&request),
             "nvdrv"
         );
         assert_eq!(
-            IpcTarget::SemanticService(IpcSession::new(IpcService::FileSystem))
+            HorizonIpcObject::SemanticService(IpcSession::new(IpcService::FileSystem))
                 .diagnostic_name(&request),
             "fsp-srv"
         );
         assert_eq!(
-            IpcTarget::SystemSettings(SystemSettingsSession::new()).diagnostic_name(&request),
+            HorizonIpcObject::SystemSettings(SystemSettingsSession::new())
+                .diagnostic_name(&request),
             "set:sys"
         );
     }
