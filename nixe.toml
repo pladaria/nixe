@@ -36,6 +36,11 @@ timezone = "Europe/Madrid"
 [diagnostics]
 # Minimum severity emitted by the CLI logger.
 log_level = "debug"
+# Preserve each Horizon guest log packet's severity. A concrete level forces
+# all guest messages to that host level; "off" discards them.
+guest_logs_level = "inherit"
+# Ask the guest filesystem SDK to emit access logs through Horizon's logger.
+file_system_access_log = true
 
 [cpu]
 # CPU backend: "jit" or "interpreter". Neither backend falls back to the other.

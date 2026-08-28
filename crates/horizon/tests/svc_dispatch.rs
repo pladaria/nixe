@@ -10,9 +10,10 @@ use nixe_cpu::memory::{
 };
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State};
 use nixe_horizon::{
-    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonIpcFault, HorizonIpcObject,
-    HorizonIpcResult, HorizonKernelResult, HorizonProcess, HorizonSvcDispatcher, HorizonSvcFault,
-    HorizonSvcSupport, IpcDispatcher, IpcService, OperationMode, UnsupportedServiceOperation,
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, GuestLogLevel, HorizonDiagnostics,
+    HorizonIpcFault, HorizonIpcObject, HorizonIpcResult, HorizonKernelResult, HorizonProcess,
+    HorizonSvcDispatcher, HorizonSvcFault, HorizonSvcSupport, IpcDispatcher, IpcService,
+    OperationMode, UnsupportedServiceOperation, switch_1_machine_profile,
 };
 use nixe_input::{EmulatedButtonState, EmulatedControllerState};
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
@@ -2739,7 +2740,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
 }
 
 #[test]
-fn log_manager_opens_a_process_logger_but_logger_methods_remain_fail_fast() {
+fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     let (_directory, mut process) = fixture_process(&[
         svc(0x1f),
         svc(0x21),
@@ -2822,23 +2823,41 @@ fn log_manager_opens_a_process_logger_but_logger_methods_remain_fail_fast() {
         Some(HorizonIpcObject::Logger(_))
     ));
 
+    let packet_address = process
+        .main_thread()
+        .stack_bottom
+        .checked_add(0x400)
+        .unwrap();
+    let mut packet = vec![0_u8; 0x18];
+    put_u64(&mut packet, 8, 11);
+    packet[16] = 3;
+    packet[18] = 1;
+    let payload = [6, 3, b's', b'd', b'k', 2, 5, b'h', b'e', b'l', b'l', b'o'];
+    put_u32(&mut packet, 20, payload.len() as u32);
+    packet.extend_from_slice(&payload);
+    write_guest_bytes(&process, packet_address, &packet);
+
     let mut log = [0_u8; 0x100];
-    put_u32(&mut log, 0, 4);
-    put_u32(&mut log, 4, 8);
-    put_u32(&mut log, 16, 0x4943_4653);
+    put_u32(&mut log, 0, 4 | (1 << 16) | (1 << 20));
+    put_u32(&mut log, 4, 5);
+    put_send_static(
+        &mut log,
+        8,
+        packet_address.get(),
+        u16::try_from(packet.len()).unwrap(),
+    );
+    put_u32(&mut log, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &log);
     state(&mut process).write_w(x(0), logger_handle);
     assert_eq!(
         dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {
-            immediate: 0x21,
-            fault: Box::new(HorizonIpcFault::unsupported_service(
-                UnsupportedServiceOperation::Command {
-                    service: "ILogger",
-                    command_id: 0,
-                },
-            )),
-        })
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, packet_address), 1);
+    assert_eq!(
+        read_guest_u32(&process, packet_address.checked_add(4).unwrap()),
+        0
     );
 }
 
@@ -2910,10 +2929,12 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
         svc(0x21),
         svc(0x21),
         svc(0x21),
+        svc(0x21),
         svc(0x16),
         svc(0x21),
     ]);
-    let mut dispatcher = HorizonSvcDispatcher::default();
+    let mut dispatcher = HorizonSvcDispatcher::default()
+        .with_diagnostics(HorizonDiagnostics::new(GuestLogLevel::Inherit, true));
     let source_handle = process.connect_ipc_service(IpcService::FileSystem).unwrap();
     let source_identity = process.handles().get(source_handle).unwrap().clone();
     let tls = process.main_thread().tls_base;
@@ -2950,6 +2971,23 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
         process.handles().get_as::<HorizonIpcObject>(cloned_handle),
         Some(HorizonIpcObject::SemanticService(_))
     ));
+
+    let mut access_log_mode = [0_u8; 0x100];
+    put_u32(&mut access_log_mode, 0, 4);
+    put_u32(&mut access_log_mode, 4, 10);
+    access_log_mode[16] = 1;
+    access_log_mode[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut access_log_mode, 20, 1);
+    put_u32(&mut access_log_mode, 32, 0x4943_4653);
+    put_u32(&mut access_log_mode, 40, 1005);
+    write_guest_bytes(&process, tls, &access_log_mode);
+    state(&mut process).write_w(x(0), cloned_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 1);
 
     let mut query_pointer_size = convert;
     put_u32(&mut query_pointer_size, 24, 3);
@@ -3142,6 +3180,126 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     assert_eq!(
         read_guest_bytes(&process, output_address.checked_add(0x304).unwrap(), 1),
         [1]
+    );
+}
+
+#[test]
+fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
+    let files: &[(&str, &[u8])] = &[("hello.txt", b"hello from RomFS")];
+    let expected_romfs = support::synthetic_packages::build_romfs(files);
+    let (_directory, mut process) = fixture_process_with_romfs(
+        &[svc(0x21), svc(0x21), svc(0x21), svc(0x21), svc(0x21)],
+        files,
+    );
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let filesystem_session = process.connect_ipc_service(IpcService::FileSystem).unwrap();
+    let tls = process.main_thread().tls_base;
+    let output_address = process
+        .main_thread()
+        .stack_bottom
+        .checked_add(0x800)
+        .unwrap();
+
+    let mut convert = [0_u8; 0x100];
+    put_u32(&mut convert, 0, 5);
+    put_u32(&mut convert, 4, 8);
+    put_u32(&mut convert, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert);
+    state(&mut process).write_w(x(0), filesystem_session);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut set_process = [0_u8; 0x100];
+    put_u32(&mut set_process, 0, 4);
+    put_u32(&mut set_process, 4, 13 | (1 << 31));
+    put_u32(&mut set_process, 8, 1);
+    put_u64(&mut set_process, 12, process.process_id());
+    set_process[32] = 1;
+    set_process[34..36].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut set_process, 36, 1);
+    put_u32(&mut set_process, 48, 0x4943_4653);
+    put_u32(&mut set_process, 56, 1);
+    write_guest_bytes(&process, tls, &set_process);
+    state(&mut process).write_w(x(0), filesystem_session);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut open_storage = [0_u8; 0x100];
+    put_u32(&mut open_storage, 0, 4);
+    put_u32(&mut open_storage, 4, 10);
+    open_storage[16] = 1;
+    open_storage[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut open_storage, 20, 1);
+    put_u32(&mut open_storage, 32, 0x4943_4653);
+    put_u32(&mut open_storage, 40, 200);
+    write_guest_bytes(&process, tls, &open_storage);
+    state(&mut process).write_w(x(0), filesystem_session);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let storage_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(storage_object, 2);
+
+    let mut get_size = [0_u8; 0x100];
+    put_u32(&mut get_size, 0, 4);
+    put_u32(&mut get_size, 4, 10);
+    get_size[16] = 1;
+    get_size[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut get_size, 20, storage_object);
+    put_u32(&mut get_size, 32, 0x4943_4653);
+    put_u32(&mut get_size, 40, 4);
+    write_guest_bytes(&process, tls, &get_size);
+    state(&mut process).write_w(x(0), filesystem_session);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            read_guest_bytes(&process, tls.checked_add(48).unwrap(), 8)
+                .try_into()
+                .unwrap()
+        ),
+        expected_romfs.len() as u64
+    );
+
+    let read_size = 0x50_u64;
+    let mut read_storage = [0_u8; 0x100];
+    put_u32(&mut read_storage, 0, 4 | (1 << 24));
+    put_u32(&mut read_storage, 4, 16);
+    put_receive_buffer(&mut read_storage, 8, output_address.get(), read_size);
+    read_storage[32] = 1;
+    read_storage[34..36].copy_from_slice(&32_u16.to_le_bytes());
+    put_u32(&mut read_storage, 36, storage_object);
+    put_u32(&mut read_storage, 48, 0x4943_4653);
+    put_u32(&mut read_storage, 56, 0);
+    put_u64(&mut read_storage, 64, 0);
+    put_u64(&mut read_storage, 72, read_size);
+    write_guest_bytes(&process, tls, &read_storage);
+    state(&mut process).write_w(x(0), filesystem_session);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    // A domain response with no scalar payload occupies twelve HIPC data
+    // words. IStorage::Read must not reuse IFile::Read's returned-byte count.
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(4).unwrap()) & 0x3ff,
+        12
+    );
+    assert_eq!(
+        read_guest_bytes(&process, output_address, read_size as usize),
+        expected_romfs[..read_size as usize]
     );
 }
 
@@ -3453,6 +3611,31 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
             .unwrap()
             .attributes,
         MemoryAttributes::UNCACHED
+    );
+}
+
+#[test]
+fn switch_1_application_profile_accepts_a_heap_larger_than_the_test_default() {
+    let (_directory, mut process) = fixture_process_with_config(
+        &[svc(0x01)],
+        switch_1_machine_profile().process_build_config(),
+    );
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let heap_size = 0x7000_0000;
+
+    state(&mut process).write_x(x(1), heap_size);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    assert_eq!(process.heap_size(), heap_size);
+    assert_eq!(
+        state(&mut process).read_x(x(1)),
+        process.memory_layout().heap().base().get()
     );
 }
 

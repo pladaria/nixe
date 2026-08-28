@@ -139,6 +139,7 @@ impl HorizonSvcDispatcher {
                 video: &self.video_system,
                 hid: &self.hid_system,
                 settings: &self.settings_environment,
+                diagnostics: &self.diagnostics,
                 caller_thread_id,
             },
         ) {
@@ -226,6 +227,7 @@ impl HorizonSvcDispatcher {
                 video: &self.video_system,
                 hid: &self.hid_system,
                 settings: &self.settings_environment,
+                diagnostics: &self.diagnostics,
                 caller_thread_id,
             },
         ) {

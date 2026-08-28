@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nixe_config::CpuBackendSelection;
+use nixe_config::{CpuBackendSelection, GuestLogsLevel};
 
 enum Command {
     Input,
@@ -63,6 +63,8 @@ fn parse_arguments(
     let mut config_path = None;
     let mut log_level = None;
     let mut cpu_backend = None;
+    let mut guest_logs_level = None;
+    let mut file_system_access_log = None;
     let mut headless = false;
     let mut positionals = Vec::new();
     let mut arguments = arguments;
@@ -102,6 +104,26 @@ fn parse_arguments(
             headless = true;
             continue;
         }
+        if argument == "--guest-logs-level" {
+            if guest_logs_level.is_some() {
+                return Err("--guest-logs-level may only be specified once".to_owned());
+            }
+            let value = arguments
+                .next()
+                .ok_or_else(|| "--guest-logs-level requires a level".to_owned())?;
+            let value = value
+                .to_str()
+                .ok_or_else(|| "guest log level must be valid UTF-8".to_owned())?;
+            guest_logs_level = Some(parse_guest_logs_level(value)?);
+            continue;
+        }
+        if argument == "--file-system-access-log" || argument == "--no-file-system-access-log" {
+            if file_system_access_log.is_some() {
+                return Err("filesystem access-log policy may only be specified once".to_owned());
+            }
+            file_system_access_log = Some(argument == "--file-system-access-log");
+            continue;
+        }
         if argument == "--cpu-backend" {
             if cpu_backend.is_some() {
                 return Err("--cpu-backend may only be specified once".to_owned());
@@ -137,6 +159,9 @@ fn parse_arguments(
             if cpu_backend.is_some() {
                 return Err("--cpu-backend is only valid with run".to_owned());
             }
+            if guest_logs_level.is_some() || file_system_access_log.is_some() {
+                return Err("guest diagnostic options are only valid with run".to_owned());
+            }
             Ok(Some(Invocation {
                 command: Command::Input,
                 log_level: log_level.unwrap_or_default(),
@@ -148,6 +173,9 @@ fn parse_arguments(
             }
             if cpu_backend.is_some() {
                 return Err("--cpu-backend is only valid with run".to_owned());
+            }
+            if guest_logs_level.is_some() || file_system_access_log.is_some() {
+                return Err("guest diagnostic options are only valid with run".to_owned());
             }
             Ok(Some(Invocation {
                 command: Command::List(commands::list::Arguments {
@@ -169,6 +197,8 @@ fn parse_arguments(
                     identifier,
                     headless,
                     cpu_backend_override: cpu_backend,
+                    guest_logs_level_override: guest_logs_level,
+                    file_system_access_log_override: file_system_access_log,
                 }),
                 log_level: log_level.unwrap_or_default(),
             }))
@@ -184,6 +214,21 @@ fn parse_arguments(
     }
 }
 
+fn parse_guest_logs_level(value: &str) -> Result<GuestLogsLevel, String> {
+    match value {
+        "inherit" => Ok(GuestLogsLevel::Inherit),
+        "trace" => Ok(GuestLogsLevel::Trace),
+        "debug" => Ok(GuestLogsLevel::Debug),
+        "info" => Ok(GuestLogsLevel::Info),
+        "warn" => Ok(GuestLogsLevel::Warn),
+        "error" => Ok(GuestLogsLevel::Error),
+        "off" => Ok(GuestLogsLevel::Off),
+        _ => Err(format!(
+            "invalid guest log level {value:?}; expected inherit, trace, debug, info, warn, error, or off"
+        )),
+    }
+}
+
 fn print_usage(program: &OsStr) {
     eprintln!(
         "Usage: {} [--config <file>] [--log-level <level>] <command>\n\n\
@@ -193,11 +238,17 @@ fn print_usage(program: &OsStr) {
            run <id|name>   Run a title\n\n\
          Run options:\n  \
            --headless              Run without creating a host window\n  \
-           --cpu-backend <backend> Override CPU backend: jit or interpreter\n\n\
+           --cpu-backend <backend> Override CPU backend: jit or interpreter\n  \
+           --guest-logs-level <level> Override diagnostics.guest_logs_level\n  \
+           --file-system-access-log Enable guest filesystem access logs\n  \
+           --no-file-system-access-log Disable guest filesystem access logs\n\n\
          Log levels:\n  \
            error, warn, info, debug, trace\n  \
            --log-level overrides diagnostics.log_level from nixe.toml\n  \
            debug reports phase timings; trace adds execution and service diagnostics\n\n\
+         Guest log levels:\n  \
+           inherit, trace, debug, info, warn, error, off\n  \
+           inherit preserves the severity encoded by the Horizon guest\n\n\
          Configuration is discovered from NIXE_CONFIG, ./nixe.toml, or the\n\
          platform user configuration unless --config is supplied.",
         program.to_string_lossy()
@@ -262,6 +313,8 @@ mod tests {
             assert_eq!(arguments.identifier, identifier);
             assert!(!arguments.headless);
             assert_eq!(arguments.cpu_backend_override, None);
+            assert_eq!(arguments.guest_logs_level_override, None);
+            assert_eq!(arguments.file_system_access_log_override, None);
             assert_eq!(invocation.log_level, logging::LogLevel::Info);
         }
     }
@@ -299,6 +352,44 @@ mod tests {
             };
             assert_eq!(arguments.identifier, "hello-world");
             assert!(arguments.headless);
+        }
+    }
+
+    #[test]
+    fn parses_guest_diagnostic_overrides_before_or_after_run() {
+        for values in [
+            &[
+                "--guest-logs-level",
+                "inherit",
+                "--file-system-access-log",
+                "run",
+                "hello-world",
+            ][..],
+            &[
+                "run",
+                "hello-world",
+                "--guest-logs-level",
+                "error",
+                "--no-file-system-access-log",
+            ][..],
+        ] {
+            let invocation = parse_arguments(arguments(values)).unwrap().unwrap();
+            let Command::Run(arguments) = invocation.command else {
+                panic!("expected run command");
+            };
+            if values.contains(&"inherit") {
+                assert_eq!(
+                    arguments.guest_logs_level_override,
+                    Some(GuestLogsLevel::Inherit)
+                );
+                assert_eq!(arguments.file_system_access_log_override, Some(true));
+            } else {
+                assert_eq!(
+                    arguments.guest_logs_level_override,
+                    Some(GuestLogsLevel::Error)
+                );
+                assert_eq!(arguments.file_system_access_log_override, Some(false));
+            }
         }
     }
 

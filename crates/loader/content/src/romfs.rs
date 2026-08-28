@@ -100,6 +100,15 @@ impl RomFsArchive {
         &self.files
     }
 
+    /// Returns the bounded image beginning at the RomFS header.
+    ///
+    /// This is the same lazy storage view used to index and open files. It is
+    /// retained so consumers such as Horizon's `IStorage` interface can expose
+    /// the exact effective image without rebuilding or copying it.
+    pub fn storage(&self) -> StorageRef {
+        self.storage.clone()
+    }
+
     /// Finds a file by an exact absolute path.
     pub fn file(&self, path: &str) -> Option<&RomFsFile> {
         self.files

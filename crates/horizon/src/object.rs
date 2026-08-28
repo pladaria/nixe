@@ -53,6 +53,7 @@ pub enum HorizonIpcObject {
 #[derive(Clone, Debug)]
 pub enum SemanticIpcObject {
     ReadOnlyFileSystem(ReadOnlyFileSystem),
+    ReadOnlyStorage(ReadOnlyStorage),
     HostDirectoryFileSystem(HostDirectoryFileSystem),
     ReadOnlyFile(ReadOnlyFile),
     HostFile(HostFile),
@@ -97,19 +98,49 @@ impl LogManagerSession {
 }
 
 /// Per-process logger returned by `ILogService::OpenLogger`.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LoggerSession {
     process_id: u64,
+    state: Arc<Mutex<LoggerState>>,
 }
 
 impl LoggerSession {
-    pub(crate) const fn new(process_id: u64) -> Self {
-        Self { process_id }
+    pub(crate) fn new(process_id: u64) -> Self {
+        Self {
+            process_id,
+            state: Arc::new(Mutex::new(LoggerState::default())),
+        }
     }
 
-    pub(crate) const fn process_id(self) -> u64 {
+    pub(crate) const fn process_id(&self) -> u64 {
         self.process_id
     }
+
+    pub(crate) fn with_state<R>(&self, operation: impl FnOnce(&mut LoggerState) -> R) -> R {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operation(&mut state)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LoggerState {
+    pub(crate) messages: BTreeMap<u64, GuestLogMessage>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GuestLogMessage {
+    pub(crate) severity: u8,
+    pub(crate) verbosity: u8,
+    pub(crate) text: Vec<u8>,
+    pub(crate) module: Vec<u8>,
+    pub(crate) file: Vec<u8>,
+    pub(crate) function: Vec<u8>,
+    pub(crate) thread_name: Vec<u8>,
+    pub(crate) process_name: Vec<u8>,
+    pub(crate) line: Option<u32>,
 }
 
 /// Client session connected to Horizon's `acc:u0` account service.
@@ -2046,6 +2077,30 @@ impl ReadOnlyFileSystem {
 
     pub(crate) const fn mount(&self) -> &ReadOnlyMount {
         &self.mount
+    }
+}
+
+/// A bounded immutable storage object backed by a lazy loader storage view.
+#[derive(Clone)]
+pub struct ReadOnlyStorage {
+    storage: StorageRef,
+}
+
+impl ReadOnlyStorage {
+    pub(crate) fn new(storage: StorageRef) -> Self {
+        Self { storage }
+    }
+
+    pub(crate) const fn storage(&self) -> &StorageRef {
+        &self.storage
+    }
+}
+
+impl Debug for ReadOnlyStorage {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadOnlyStorage")
+            .finish_non_exhaustive()
     }
 }
 
