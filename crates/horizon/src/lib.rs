@@ -39,8 +39,8 @@ pub use nvdrv::{
 };
 pub use object::{
     AccountSession, AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource,
-    HidSession, HostDirectoryFileSystem, HostFile, IpcSession, OperationMode,
-    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
+    HidSession, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession, LoggerSession,
+    OperationMode, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
     ReadOnlyFileSystem, RegionCode, ServiceManagerSession, SettingsEnvironment, SteadyClockSession,
     SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession, TimeEnvironment,
     TimeServiceSession, TimeZoneServiceSession, UserSettingsSession,

@@ -3,8 +3,8 @@ use super::*;
 impl RunnableProcess {
     /// Returns the process exit record retained until teardown.
     #[must_use]
-    pub const fn exit(&self) -> Option<ProcessExit> {
-        self.process_exit
+    pub const fn exit(&self) -> Option<&ProcessExit> {
+        self.process_exit.as_ref()
     }
 
     /// Returns the selected concrete CPU backend name.
@@ -56,6 +56,8 @@ impl RunnableProcess {
             exit_code: 0,
             source: None,
             thread_id,
+            context: None,
+            frames: Box::new([]),
         };
         let terminated = !matches!(
             self.lifecycle,
@@ -187,6 +189,8 @@ impl RunnableProcess {
                 exit_code: *result_code,
                 source: Some(*source),
                 thread_id: object_thread_id,
+                context: Some(Box::new(thread.state().register_context())),
+                frames: Box::new([]),
             };
             nixe_scheduler::transition_process(
                 &mut self.lifecycle,

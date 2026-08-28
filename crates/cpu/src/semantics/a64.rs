@@ -19,12 +19,12 @@ pub enum HintOperation {
     SendEventLocal,
 }
 
-/// Normalizes the baseline A64 scheduling and event hints.
+/// Normalizes baseline A64 hints and profile-owned compatibility aliases.
 ///
 /// Arm A-profile A64 instruction definitions (2025-12):
 /// https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Instructions
 #[must_use]
-pub const fn hint_operation(immediate: u8) -> Option<HintOperation> {
+pub const fn hint_operation(platform: TargetPlatform, immediate: u8) -> Option<HintOperation> {
     match immediate {
         0 => Some(HintOperation::NoOperation),
         1 => Some(HintOperation::Yield),
@@ -32,6 +32,14 @@ pub const fn hint_operation(immediate: u8) -> Option<HintOperation> {
         3 => Some(HintOperation::WaitForInterrupt),
         4 => Some(HintOperation::SendEvent),
         5 => Some(HintOperation::SendEventLocal),
+        // These backwards-compatible Pointer Authentication aliases occupy
+        // HINT space and therefore execute as NOP on Switch 1's Cortex-A57,
+        // which predates FEAT_PAuth. Keep Switch 2 explicit until its CPU
+        // feature profile and PAC state are modeled instead of silently
+        // discarding an operation that may alter X30 there.
+        7 | 8 | 10 | 12 | 14 | 24..=31 if matches!(platform, TargetPlatform::Switch1) => {
+            Some(HintOperation::NoOperation)
+        }
         _ => None,
     }
 }
@@ -242,6 +250,17 @@ pub const fn signed_immediate(value: u64, bits: u8) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_1_pointer_authentication_hint_family_is_compatibility_nop_space() {
+        for immediate in [7, 8, 10, 12, 14, 24, 25, 26, 27, 28, 29, 30, 31] {
+            assert_eq!(
+                hint_operation(TargetPlatform::Switch1, immediate),
+                Some(HintOperation::NoOperation)
+            );
+            assert_eq!(hint_operation(TargetPlatform::Switch2, immediate), None);
+        }
+    }
 
     #[test]
     fn scalar_transfer_table_covers_legal_boundaries() {

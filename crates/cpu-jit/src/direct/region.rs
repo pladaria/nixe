@@ -395,7 +395,7 @@ fn system_instruction_supported(
     let fields = instruction.operands();
     match instruction {
         system::Instruction::Hint(_) => {
-            nixe_cpu::semantics::a64::hint_operation(fields.hint).is_some()
+            nixe_cpu::semantics::a64::hint_operation(platform, fields.hint).is_some()
                 || matches!(fields.hint, 32 | 34 | 36 | 38)
         }
         system::Instruction::ReadRegister(_) => {

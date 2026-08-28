@@ -202,12 +202,26 @@ pub enum ProcessExitCause {
     },
 }
 
+/// One A64 frame-pointer record retained for post-teardown diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GuestStackFrame {
+    /// Address of the frame record in the guest stack.
+    pub frame_pointer: u64,
+    /// Saved link register belonging to the caller.
+    pub return_address: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessExit {
     pub cause: ProcessExitCause,
     pub exit_code: u64,
     pub source: Option<LocationDescriptor>,
     pub thread_id: u64,
+    /// Architectural state captured at the terminating instruction, when the
+    /// runtime owns a resident CPU state for the exiting thread.
+    pub context: Option<Box<RegisterContext>>,
+    /// Bounded A64 frame-pointer walk captured before guest memory is released.
+    pub frames: Box<[GuestStackFrame]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -254,7 +268,7 @@ impl Display for ProcessExecutionError {
 
 impl Error for ProcessExecutionError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProcessTeardownReport {
     pub previous_lifecycle: nixe_scheduler::ProcessLifecycle,
     pub exit: Option<ProcessExit>,

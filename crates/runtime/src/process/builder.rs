@@ -138,6 +138,10 @@ impl ProcessBuilder {
                 }
             }
         }
+        let code_size = u64::try_from(memory.physical_page_count())
+            .ok()
+            .and_then(|pages| pages.checked_mul(SYNTHETIC_PAGE_SIZE as u64))
+            .ok_or_else(|| error(ProcessBuildStage::Mapping, "process code size overflows"))?;
 
         let stack_size = align_up(stack_size.max(SYNTHETIC_PAGE_SIZE as u64), TLS_SIZE)?;
         if stack_size + (RESOURCE_GUARD_SIZE * 3) + (TLS_SIZE * 2) > memory_layout.stack().size() {
@@ -242,7 +246,7 @@ impl ProcessBuilder {
         threads.insert(main_thread).map_err(|error| {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
         })?;
-        let initial_memory_size = u64::try_from(memory.physical_page_count())
+        let initial_mapped_size = u64::try_from(memory.physical_page_count())
             .ok()
             .and_then(|pages| pages.checked_mul(SYNTHETIC_PAGE_SIZE as u64))
             .ok_or_else(|| {
@@ -251,12 +255,19 @@ impl ProcessBuilder {
                     "process memory accounting overflows",
                 )
             })?;
-        if initial_memory_size > memory_layout.memory_capacity() {
-            return Err(error(
+        let memory_accounting = ProcessMemoryAccounting::new(
+            memory_layout.memory_capacity(),
+            initial_mapped_size,
+            code_size,
+            stack_size,
+            metadata.system_resource_size,
+        )
+        .ok_or_else(|| {
+            error(
                 ProcessBuildStage::Mapping,
-                "initial process mappings exceed the configured physical-memory limit",
-            ));
-        }
+                "initial process mappings and system resource exceed the configured physical-memory limit",
+            )
+        })?;
         let cpu_process_id = execution::allocate_cpu_process_id().ok_or_else(|| {
             ProcessBuildError::new(
                 ProcessBuildStage::CpuInitialization,
@@ -285,8 +296,7 @@ impl ProcessBuilder {
             address_space,
             memory_layout,
             random_entropy,
-            heap_size: 0,
-            initial_memory_size,
+            memory_accounting,
             memory: std::sync::Arc::new(memory),
             modules: modules.into_boxed_slice(),
             entry_module,
@@ -338,6 +348,7 @@ struct ProcessMetadata {
     priority: i32,
     ideal_vcpu: nixe_scheduler::VirtualCpuId,
     thread_policy: Option<ThreadPolicy>,
+    system_resource_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +379,7 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
                         min_core: u32::from(min_core),
                         max_core: u32::from(max_core),
                     }),
+                system_resource_size: u64::from(npdm.system_resource_size()),
             }
         }
         LaunchKind::Homebrew(_) => ProcessMetadata {
@@ -377,6 +389,7 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
             priority: 44,
             ideal_vcpu: nixe_scheduler::VirtualCpuId::new(0),
             thread_policy: None,
+            system_resource_size: 0,
         },
     }
 }

@@ -41,7 +41,7 @@ impl CraneliftTranslator<'_, '_> {
         fields: Operands,
         flags: &LazyFlags,
     ) -> Result<(), DirectJitError> {
-        match hint_operation(fields.hint) {
+        match hint_operation(self.region.key.platform, fields.hint) {
             Some(HintOperation::NoOperation) => Ok(()),
             Some(HintOperation::Yield) => {
                 self.emit_scheduler_branch(source, SchedulerRequest::Yield, None, flags)
