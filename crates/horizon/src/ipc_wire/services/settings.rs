@@ -1,4 +1,4 @@
-use super::super::*;
+use super::prelude::*;
 
 const FIRMWARE_VERSION_SIZE: usize = 0x100;
 

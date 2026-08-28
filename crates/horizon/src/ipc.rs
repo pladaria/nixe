@@ -25,6 +25,8 @@ use crate::{
 pub const MAX_IPC_PATH_BYTES: usize = 0x300;
 /// Largest file payload returned by one request.
 pub const MAX_IPC_READ_BYTES: usize = 1024 * 1024;
+/// Largest raw storage payload returned by one request.
+pub const MAX_IPC_STORAGE_READ_BYTES: usize = 256 * 1024 * 1024;
 /// Largest number of directory or add-on entries returned by one request.
 pub const MAX_IPC_LIST_ENTRIES: usize = 1024;
 // Guest-visible file and directory mode bits follow libnx's pinned FsOpenMode
@@ -179,7 +181,7 @@ pub enum IpcResponse {
     Size(u64),
     FileSystemAccessLogMode(FileSystemAccessLogMode),
     Data(Vec<u8>),
-    StorageData(Vec<u8>),
+    StorageRead { offset: u64, size: usize },
     DirectoryEntries(Vec<DirectoryEntry>),
     AddOnContentEntries(Vec<AddOnContentEntry>),
 }
@@ -263,17 +265,15 @@ fn dispatch_semantic_object(
 ) -> Result<IpcResponse, IpcResultCode> {
     match object {
         SemanticIpcObject::ReadOnlyFileSystem(filesystem) => {
-            dispatch_filesystem(mounts, handles, filesystem, request)
+            dispatch_filesystem(handles, filesystem, request)
         }
-        SemanticIpcObject::ReadOnlyStorage(storage) => dispatch_storage(mounts, storage, request),
+        SemanticIpcObject::ReadOnlyStorage(storage) => dispatch_storage(storage, request),
         SemanticIpcObject::HostDirectoryFileSystem(filesystem) => {
             dispatch_host_filesystem(mounts, handles, filesystem, request)
         }
-        SemanticIpcObject::ReadOnlyFile(file) => dispatch_file(mounts, file, request),
+        SemanticIpcObject::ReadOnlyFile(file) => dispatch_file(file, request),
         SemanticIpcObject::HostFile(file) => dispatch_host_file(mounts, file, request),
-        SemanticIpcObject::ReadOnlyDirectory(directory) => {
-            dispatch_directory(mounts, directory, request)
-        }
+        SemanticIpcObject::ReadOnlyDirectory(directory) => dispatch_directory(directory, request),
     }
 }
 
@@ -292,8 +292,11 @@ fn dispatch_session(
         (IpcService::FileSystem, IpcRequest::GetGlobalAccessLogMode) => Ok(
             IpcResponse::FileSystemAccessLogMode(file_system_access_log_mode),
         ),
+        // The `ByCurrentProcess` commands resolve content from the process
+        // registration established by SetCurrentProcess. `CanMountContentData`
+        // applies to the generic content mount commands, not to these commands:
+        // https://switchbrew.org/w/index.php?title=Filesystem_services&oldid=14757#Permissions
         (IpcService::FileSystem, IpcRequest::OpenPrimaryFileSystem) => {
-            require_content_data_read(mounts)?;
             let mount = mounts
                 .primary()
                 .cloned()
@@ -304,7 +307,6 @@ fn dispatch_session(
             )
         }
         (IpcService::FileSystem, IpcRequest::OpenPrimaryStorage) => {
-            require_content_data_read(mounts)?;
             let storage = mounts
                 .primary()
                 .map(|mount| mount.romfs().storage())
@@ -406,7 +408,6 @@ fn dispatch_session(
                 mount_index,
             },
         ) => {
-            require_content_data_read(mounts)?;
             let add_on = mounts
                 .add_on(title_id)
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
@@ -435,12 +436,10 @@ fn add_on_entry(add_on: &nixe_runtime::AddOnContent) -> Result<AddOnContentEntry
 }
 
 fn dispatch_filesystem(
-    mounts: &ProcessMountNamespace,
     handles: &mut HandleTable,
     filesystem: &ReadOnlyFileSystem,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
-    require_content_data_read(mounts)?;
     match request {
         IpcRequest::OpenFile { path, mode } => {
             if mode != FILE_OPEN_READ {
@@ -481,12 +480,7 @@ fn dispatch_filesystem(
     }
 }
 
-fn dispatch_file(
-    mounts: &ProcessMountNamespace,
-    file: &ReadOnlyFile,
-    request: IpcRequest,
-) -> Result<IpcResponse, IpcResultCode> {
-    require_content_data_read(mounts)?;
+fn dispatch_file(file: &ReadOnlyFile, request: IpcRequest) -> Result<IpcResponse, IpcResultCode> {
     match request {
         IpcRequest::GetFileSize => Ok(IpcResponse::Size(file.size())),
         IpcRequest::ReadFile { offset, size } => {
@@ -510,11 +504,9 @@ fn dispatch_file(
 }
 
 fn dispatch_storage(
-    mounts: &ProcessMountNamespace,
     storage: &ReadOnlyStorage,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
-    require_content_data_read(mounts)?;
     match request {
         IpcRequest::GetStorageSize => {
             let size = storage
@@ -527,7 +519,7 @@ fn dispatch_storage(
             Ok(IpcResponse::Size(size))
         }
         IpcRequest::ReadStorage { offset, size } => {
-            if size > MAX_IPC_READ_BYTES {
+            if size > MAX_IPC_STORAGE_READ_BYTES {
                 return Err(IpcResultCode::RESOURCE_LIMIT);
             }
             if offset > i64::MAX as u64 {
@@ -544,12 +536,7 @@ fn dispatch_storage(
             if end > storage_size {
                 return Err(IpcResultCode::OUT_OF_RANGE);
             }
-            let mut bytes = vec![0; size];
-            storage
-                .storage()
-                .read_at(offset, &mut bytes)
-                .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
-            Ok(IpcResponse::StorageData(bytes))
+            Ok(IpcResponse::StorageRead { offset, size })
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
@@ -767,11 +754,9 @@ fn dispatch_host_file(
 }
 
 fn dispatch_directory(
-    mounts: &ProcessMountNamespace,
     directory: &ReadOnlyDirectory,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
-    require_content_data_read(mounts)?;
     match request {
         IpcRequest::GetDirectoryEntryCount => Ok(IpcResponse::Size(
             u64::try_from(directory.entries().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
@@ -790,14 +775,6 @@ fn dispatch_directory(
             Ok(IpcResponse::DirectoryEntries(result))
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
-    }
-}
-
-fn require_content_data_read(mounts: &ProcessMountNamespace) -> Result<(), IpcResultCode> {
-    if mounts.allows_content_data_read() {
-        Ok(())
-    } else {
-        Err(IpcResultCode::ACCESS_DENIED)
     }
 }
 
@@ -1053,5 +1030,54 @@ fn validate_list_limit(limit: usize) -> Result<(), IpcResultCode> {
         Err(IpcResultCode::RESOURCE_LIMIT)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nixe_loader_storage::{Storage, StorageError};
+
+    use super::*;
+
+    struct SizedStorage(u64);
+
+    impl Storage for SizedStorage {
+        fn len(&self) -> Result<u64, StorageError> {
+            Ok(self.0)
+        }
+
+        fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> Result<(), StorageError> {
+            panic!("semantic storage dispatch must defer payload transfer to the wire boundary")
+        }
+    }
+
+    #[test]
+    fn storage_reads_use_the_dedicated_limit_without_materializing_the_payload() {
+        let storage =
+            ReadOnlyStorage::new(Arc::new(SizedStorage(MAX_IPC_STORAGE_READ_BYTES as u64)));
+
+        assert_eq!(
+            dispatch_storage(
+                &storage,
+                IpcRequest::ReadStorage {
+                    offset: 0,
+                    size: MAX_IPC_STORAGE_READ_BYTES,
+                },
+            ),
+            Ok(IpcResponse::StorageRead {
+                offset: 0,
+                size: MAX_IPC_STORAGE_READ_BYTES,
+            })
+        );
+        assert_eq!(
+            dispatch_storage(
+                &storage,
+                IpcRequest::ReadStorage {
+                    offset: 0,
+                    size: MAX_IPC_STORAGE_READ_BYTES + 1,
+                },
+            ),
+            Err(IpcResultCode::RESOURCE_LIMIT)
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use nixe_cpu::memory::{
     CpuMemory, MemoryAccess, MemoryAccessSize, MemoryAttributes, MemoryMappingPurpose,
-    MemoryPermissions, MemoryValue,
+    MemoryPermissions, MemoryValue, ProcessMemory,
 };
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State};
 use nixe_horizon::{
@@ -3185,20 +3185,36 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
 
 #[test]
 fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
-    let files: &[(&str, &[u8])] = &[("hello.txt", b"hello from RomFS")];
-    let expected_romfs = support::synthetic_packages::build_romfs(files);
+    const READ_SIZE: usize = 5 * 1024 * 1024;
+    const HEAP_SIZE: u64 = 6 * 1024 * 1024;
+    let payload = vec![0x5a; READ_SIZE];
+    let files = [("large.bin", payload.as_slice())];
+    let expected_romfs = support::synthetic_packages::build_romfs(&files);
     let (_directory, mut process) = fixture_process_with_romfs(
-        &[svc(0x21), svc(0x21), svc(0x21), svc(0x21), svc(0x21)],
-        files,
+        &[
+            svc(0x01),
+            svc(0x21),
+            svc(0x21),
+            svc(0x21),
+            svc(0x21),
+            svc(0x21),
+        ],
+        &files,
     );
     let mut dispatcher = HorizonSvcDispatcher::default();
     let filesystem_session = process.connect_ipc_service(IpcService::FileSystem).unwrap();
     let tls = process.main_thread().tls_base;
-    let output_address = process
-        .main_thread()
-        .stack_bottom
-        .checked_add(0x800)
-        .unwrap();
+
+    state(&mut process).write_x(x(1), HEAP_SIZE);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    let output_address = GuestVirtualAddress::new(state(&mut process).read_x(x(1)));
 
     let mut convert = [0_u8; 0x100];
     put_u32(&mut convert, 0, 5);
@@ -3269,7 +3285,7 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
         expected_romfs.len() as u64
     );
 
-    let read_size = 0x50_u64;
+    let read_size = READ_SIZE as u64;
     let mut read_storage = [0_u8; 0x100];
     put_u32(&mut read_storage, 0, 4 | (1 << 24));
     put_u32(&mut read_storage, 4, 16);
@@ -3297,10 +3313,16 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
         read_guest_u32(&process, tls.checked_add(4).unwrap()) & 0x3ff,
         12
     );
-    assert_eq!(
-        read_guest_bytes(&process, output_address, read_size as usize),
-        expected_romfs[..read_size as usize]
-    );
+    let mut actual = vec![0; READ_SIZE];
+    process
+        .memory()
+        .read_bytes(
+            process.cpu_context().address_space_id(),
+            output_address,
+            &mut actual,
+        )
+        .unwrap();
+    assert!(actual == expected_romfs[..READ_SIZE]);
 }
 
 fn write_guest_bytes(process: &RunnableProcess, start: GuestVirtualAddress, bytes: &[u8]) {

@@ -1,4 +1,6 @@
-use super::super::*;
+use super::prelude::*;
+
+const PERFORMANCE_MODE_NORMAL: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PerformanceManagerCommand {

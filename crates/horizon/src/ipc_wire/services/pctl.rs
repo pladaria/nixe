@@ -1,4 +1,4 @@
-use super::super::*;
+use super::prelude::*;
 
 enum ParentalControlTarget {
     Factory,

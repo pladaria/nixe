@@ -86,11 +86,25 @@ fn program_content_with_npdm_policy(
 }
 
 pub fn data_content(id: [u8; 16], title_id: u64, id_offset: u8, romfs: Vec<u8>) -> Content {
+    romfs_content(id, title_id, id_offset, 4, romfs)
+}
+
+pub fn public_data_content(id: [u8; 16], title_id: u64, id_offset: u8, romfs: Vec<u8>) -> Content {
+    romfs_content(id, title_id, id_offset, 5, romfs)
+}
+
+fn romfs_content(
+    id: [u8; 16],
+    title_id: u64,
+    id_offset: u8,
+    nca_content_type: u8,
+    romfs: Vec<u8>,
+) -> Content {
     Content {
         id,
         content_type: 2,
         id_offset,
-        nca: build_nca(title_id, 4, vec![romfs_section(romfs)]),
+        nca: build_nca(title_id, nca_content_type, vec![romfs_section(romfs)]),
     }
 }
 

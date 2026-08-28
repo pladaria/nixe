@@ -1,12 +1,26 @@
 //! Built-in Horizon service dispatchers, grouped by service family.
 
+use crate::IpcService;
+
+pub(in crate::ipc_wire) const fn semantic_service_name(service: IpcService) -> &'static str {
+    match service {
+        IpcService::FileSystem => "fsp-srv",
+        IpcService::AddOnContent => "aoc:u",
+    }
+}
+
 mod account;
+mod aoc;
 mod apm;
 mod applet;
+pub(super) mod content;
+pub(super) mod fsp;
 mod hid;
 mod lm;
 mod nvdrv;
 mod pctl;
+mod prelude;
+pub(super) mod response;
 mod settings;
 mod sm;
 mod time;

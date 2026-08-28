@@ -1,4 +1,4 @@
-use super::super::*;
+use super::prelude::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HidCommand {

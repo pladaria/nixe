@@ -29,7 +29,7 @@ use nixe_runtime::{
 };
 use nixe_scheduler::{GuestThreadId, ProcessId, VirtualCpuId};
 
-use crate::ipc_message::HipcRequest;
+use crate::ipc_wire::message::HipcRequest;
 use crate::ipc_wire::{HorizonIpcFault, IpcWireError, NamedPortResult, SyncRequestResult};
 use crate::{
     HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc, decode_horizon_svc,

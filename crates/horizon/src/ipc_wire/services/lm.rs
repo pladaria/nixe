@@ -1,4 +1,4 @@
-use super::super::*;
+use super::prelude::*;
 
 use crate::diagnostics::{GuestLogLevel, GuestLogSeverity};
 use crate::object::GuestLogMessage;
