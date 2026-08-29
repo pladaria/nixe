@@ -83,6 +83,29 @@ pub(super) fn dispatch_control(
             write_domain_conversion(process, address, size, request.token, object_id)?;
             log::debug!("pctl converted to domain with root object {object_id:#x}");
         }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Time(service)) => {
+            let object_id = service.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("time:u converted to domain with root object {object_id:#x}");
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::NetworkInterface(manager),
+        ) => {
+            let object_id = manager.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("nifm:u converted to domain with root object {object_id:#x}");
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Account(account)) => {
+            let object_id = account.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("acc:u0 converted to domain with root object {object_id:#x}");
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Bsd(session)) => {
+            let object_id = session.convert_to_domain();
+            write_domain_conversion(process, address, size, request.token, object_id)?;
+            log::debug!("bsd:u converted to domain with root object {object_id:#x}");
+        }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
             HorizonIpcObject::SemanticService(service),
@@ -149,6 +172,20 @@ pub(super) fn dispatch_control(
                 HorizonIpcObject::ParentalControl(factory.clone()),
                 "cloning a pctl session handle",
             )?;
+        }
+        (
+            CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
+            HorizonIpcObject::Bsd(session),
+        ) => {
+            let cloned_handle = install_clone(
+                process,
+                address,
+                size,
+                request.token,
+                HorizonIpcObject::Bsd(session.clone()),
+                "cloning a BSD session handle",
+            )?;
+            log::debug!("bsd:u cloned session {handle:#x} as {cloned_handle:#x}");
         }
         (CmifControlCommand::QueryPointerBufferSize, _) => {
             // Zero makes libnx use map-alias buffers, which the descriptor

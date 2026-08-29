@@ -1665,7 +1665,7 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
 #[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 35));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 40));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::new(
@@ -2154,6 +2154,106 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let application_functions_object_id = read_guest_u32(&process, tls.checked_add(48).unwrap());
     assert_eq!(application_functions_object_id, 9);
 
+    let mut pop_preselected_user = [0_u8; 0x100];
+    put_u32(&mut pop_preselected_user, 0, 4);
+    put_u32(&mut pop_preselected_user, 4, 12);
+    pop_preselected_user[16] = 1;
+    pop_preselected_user[18..20].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(
+        &mut pop_preselected_user,
+        20,
+        application_functions_object_id,
+    );
+    put_u32(&mut pop_preselected_user, 32, 0x4943_4653);
+    put_u32(&mut pop_preselected_user, 40, 1);
+    put_u32(&mut pop_preselected_user, 48, 2);
+    write_guest_bytes(&process, tls, &pop_preselected_user);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    let launch_parameter_storage = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(launch_parameter_storage, 10);
+
+    let mut open_launch_parameter = [0_u8; 0x100];
+    put_u32(&mut open_launch_parameter, 0, 4);
+    put_u32(&mut open_launch_parameter, 4, 10);
+    open_launch_parameter[16] = 1;
+    open_launch_parameter[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut open_launch_parameter, 20, launch_parameter_storage);
+    put_u32(&mut open_launch_parameter, 32, 0x4943_4653);
+    put_u32(&mut open_launch_parameter, 40, 0);
+    write_guest_bytes(&process, tls, &open_launch_parameter);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let launch_parameter_accessor = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(launch_parameter_accessor, 11);
+
+    let mut get_launch_parameter_size = open_launch_parameter;
+    put_u32(
+        &mut get_launch_parameter_size,
+        20,
+        launch_parameter_accessor,
+    );
+    write_guest_bytes(&process, tls, &get_launch_parameter_size);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            read_guest_bytes(&process, tls.checked_add(48).unwrap(), 8)
+                .try_into()
+                .unwrap()
+        ),
+        0x88
+    );
+
+    let launch_parameter_output = name.checked_add(0x100).unwrap();
+    let mut read_launch_parameter = [0_u8; 0x100];
+    put_u32(&mut read_launch_parameter, 0, 4 | (1 << 24));
+    put_u32(&mut read_launch_parameter, 4, 16 | (3 << 10));
+    put_receive_buffer(
+        &mut read_launch_parameter,
+        8,
+        launch_parameter_output.get(),
+        0x88,
+    );
+    read_launch_parameter[32] = 1;
+    read_launch_parameter[34..36].copy_from_slice(&32_u16.to_le_bytes());
+    put_u32(&mut read_launch_parameter, 36, launch_parameter_accessor);
+    put_u32(&mut read_launch_parameter, 48, 0x4943_4653);
+    put_u32(&mut read_launch_parameter, 56, 11);
+    put_u64(&mut read_launch_parameter, 64, 0);
+    write_guest_bytes(&process, tls, &read_launch_parameter);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let launch_parameter = read_guest_bytes(&process, launch_parameter_output, 0x88);
+    assert_eq!(&launch_parameter[..4], &0xc794_97ca_u32.to_le_bytes());
+    assert_eq!(launch_parameter[4], 1);
+    assert_eq!(&launch_parameter[8..24], &1_u128.to_le_bytes());
+    assert!(launch_parameter[24..].iter().all(|byte| *byte == 0));
+
+    write_guest_bytes(&process, tls, &pop_preselected_user);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::AM_NO_MESSAGES.raw()
+    );
+
     let mut set_terminate_result = [0_u8; 0x100];
     put_u32(&mut set_terminate_result, 0, 4);
     put_u32(&mut set_terminate_result, 4, 12);
@@ -2374,6 +2474,172 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         }
     );
     assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
+}
+
+#[test]
+fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x15),
+        svc(0x21),
+        svc(0x16),
+        svc(0x21),
+    ]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    let tls = process.main_thread().tls_base;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+
+    let mut register_sm = [0_u8; 0x100];
+    put_u32(&mut register_sm, 0, 4);
+    put_u32(&mut register_sm, 4, 10 | (1 << 31));
+    put_u32(&mut register_sm, 8, 1);
+    put_u32(&mut register_sm, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register_sm);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut get_bsd = [0_u8; 0x100];
+    put_u32(&mut get_bsd, 0, 4);
+    put_u32(&mut get_bsd, 4, 10);
+    put_u32(&mut get_bsd, 16, 0x4943_4653);
+    put_u32(&mut get_bsd, 24, 1);
+    get_bsd[32..38].copy_from_slice(b"bsd:u\0");
+    write_guest_bytes(&process, tls, &get_bsd);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let monitor_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process.handles().get_as::<HorizonIpcObject>(monitor_handle),
+        Some(HorizonIpcObject::Bsd(_))
+    ));
+
+    write_guest_bytes(&process, tls, &get_bsd);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let primary_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert_ne!(primary_handle, monitor_handle);
+    assert!(matches!(
+        process.handles().get_as::<HorizonIpcObject>(primary_handle),
+        Some(HorizonIpcObject::Bsd(_))
+    ));
+
+    let mut convert_primary = [0_u8; 0x100];
+    put_u32(&mut convert_primary, 0, 5);
+    put_u32(&mut convert_primary, 4, 8);
+    put_u32(&mut convert_primary, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert_primary);
+    state(&mut process).write_w(x(0), primary_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut clone_primary = [0_u8; 0x100];
+    put_u32(&mut clone_primary, 0, 5);
+    put_u32(&mut clone_primary, 4, 8);
+    put_u32(&mut clone_primary, 16, 0x4943_4653);
+    put_u32(&mut clone_primary, 24, 2);
+    write_guest_bytes(&process, tls, &clone_primary);
+    state(&mut process).write_w(x(0), primary_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let cloned_primary_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert_ne!(cloned_primary_handle, primary_handle);
+    assert!(matches!(
+        process
+            .handles()
+            .get_as::<HorizonIpcObject>(cloned_primary_handle),
+        Some(HorizonIpcObject::Bsd(_))
+    ));
+
+    let transfer_address = name;
+    const TRANSFER_SIZE: u64 = 0x1000;
+    state(&mut process).write_x(x(1), transfer_address.get());
+    state(&mut process).write_x(x(2), TRANSFER_SIZE);
+    state(&mut process).write_w(x(3), 0);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    let transfer_handle = state(&mut process).read_w(x(1));
+
+    let mut register_bsd = [0_u8; 0x100];
+    put_u32(&mut register_bsd, 0, 4);
+    put_u32(&mut register_bsd, 4, 24 | (1 << 31));
+    put_u32(&mut register_bsd, 8, 3);
+    put_u32(&mut register_bsd, 20, transfer_handle);
+    register_bsd[32] = 1;
+    register_bsd[34..36].copy_from_slice(&64_u16.to_le_bytes());
+    put_u32(&mut register_bsd, 36, 1);
+    put_u32(&mut register_bsd, 48, 0x4943_4653);
+    let config = [1_u32, 0x8000, 0x10000, 0x40000, 0x40000, 0x2400, 0xa500, 4];
+    for (index, value) in config.into_iter().enumerate() {
+        put_u32(&mut register_bsd, 64 + index * 4, value);
+    }
+    put_u64(&mut register_bsd, 104, TRANSFER_SIZE);
+    write_guest_bytes(&process, tls, &register_bsd);
+    state(&mut process).write_w(x(0), cloned_primary_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(4).unwrap()) & 0x3ff,
+        13
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 0);
+
+    state(&mut process).write_w(x(0), transfer_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert!(process.handles().get(transfer_handle).is_none());
+
+    let mut start_monitoring = [0_u8; 0x100];
+    put_u32(&mut start_monitoring, 0, 4);
+    put_u32(&mut start_monitoring, 4, 9 | (1 << 31));
+    put_u32(&mut start_monitoring, 8, 1);
+    put_u32(&mut start_monitoring, 32, 0x4943_4653);
+    put_u32(&mut start_monitoring, 40, 1);
+    put_u64(&mut start_monitoring, 48, 0);
+    write_guest_bytes(&process, tls, &start_monitoring);
+    state(&mut process).write_w(x(0), monitor_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 }
 
 #[test]
@@ -2740,6 +3006,322 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
 }
 
 #[test]
+fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+    ]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..40].copy_from_slice(b"time:u\0\0");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let time_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process.handles().get_as::<HorizonIpcObject>(time_handle),
+        Some(HorizonIpcObject::Time(_))
+    ));
+
+    let mut open_user_clock = [0_u8; 0x100];
+    put_u32(&mut open_user_clock, 0, 4);
+    put_u32(&mut open_user_clock, 4, 8);
+    put_u32(&mut open_user_clock, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &open_user_clock);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let user_clock_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process
+            .handles()
+            .get_as::<HorizonIpcObject>(user_clock_handle),
+        Some(HorizonIpcObject::SystemClock(_))
+    ));
+
+    let mut get_current_time = [0_u8; 0x100];
+    put_u32(&mut get_current_time, 0, 4);
+    put_u32(&mut get_current_time, 4, 8);
+    put_u32(&mut get_current_time, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &get_current_time);
+    state(&mut process).write_w(x(0), user_clock_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut convert = [0_u8; 0x100];
+    put_u32(&mut convert, 0, 5);
+    put_u32(&mut convert, 4, 8);
+    put_u32(&mut convert, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut open_domain_user_clock = [0_u8; 0x100];
+    put_u32(&mut open_domain_user_clock, 0, 4);
+    put_u32(&mut open_domain_user_clock, 4, 10);
+    open_domain_user_clock[16] = 1;
+    open_domain_user_clock[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut open_domain_user_clock, 20, 1);
+    put_u32(&mut open_domain_user_clock, 32, 0x4943_4653);
+    put_u32(&mut open_domain_user_clock, 40, 0);
+    write_guest_bytes(&process, tls, &open_domain_user_clock);
+    state(&mut process).write_w(x(0), time_handle);
+    let handles_before_domain_child = process.handles().len();
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let user_clock_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(user_clock_object, 2);
+    assert_eq!(process.handles().len(), handles_before_domain_child);
+
+    let mut get_clock_context = open_domain_user_clock;
+    put_u32(&mut get_clock_context, 20, user_clock_object);
+    put_u32(&mut get_clock_context, 40, 2);
+    write_guest_bytes(&process, tls, &get_clock_context);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(
+        read_guest_bytes(&process, tls.checked_add(64).unwrap(), 16),
+        b"NixeTimeSource01"
+    );
+
+    let clock_context: [u8; 0x20] = read_guest_bytes(&process, tls.checked_add(48).unwrap(), 0x20)
+        .try_into()
+        .unwrap();
+    let mut calculate_monotonic_base = [0_u8; 0x100];
+    put_u32(&mut calculate_monotonic_base, 0, 4);
+    put_u32(&mut calculate_monotonic_base, 4, 18);
+    calculate_monotonic_base[16] = 1;
+    calculate_monotonic_base[18..20].copy_from_slice(&48_u16.to_le_bytes());
+    put_u32(&mut calculate_monotonic_base, 20, 1);
+    put_u32(&mut calculate_monotonic_base, 32, 0x4943_4653);
+    put_u32(&mut calculate_monotonic_base, 40, 300);
+    calculate_monotonic_base[48..80].copy_from_slice(&clock_context);
+    write_guest_bytes(&process, tls, &calculate_monotonic_base);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(
+        i64::from_le_bytes(
+            read_guest_bytes(&process, tls.checked_add(48).unwrap(), 8)
+                .try_into()
+                .unwrap()
+        ),
+        i64::from_le_bytes(clock_context[..8].try_into().unwrap())
+    );
+
+    calculate_monotonic_base[64] ^= 1;
+    write_guest_bytes(&process, tls, &calculate_monotonic_base);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::TIME_NOT_COMPARABLE.raw()
+    );
+
+    let mut close_user_clock = [0_u8; 0x100];
+    put_u32(&mut close_user_clock, 0, 4);
+    put_u32(&mut close_user_clock, 4, 6);
+    close_user_clock[16] = 2;
+    put_u32(&mut close_user_clock, 20, user_clock_object);
+    write_guest_bytes(&process, tls, &close_user_clock);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+
+    write_guest_bytes(&process, tls, &get_clock_context);
+    state(&mut process).write_w(x(0), time_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_TARGET_NOT_FOUND.raw()
+    );
+}
+
+#[test]
+fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
+    let (_directory, mut process) = fixture_process(&[
+        svc(0x1f),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+        svc(0x21),
+    ]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+    let name = process.main_thread().stack_bottom;
+    write_guest_bytes(&process, name, b"sm:\0");
+    state(&mut process).write_x(x(1), name.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let sm_handle = state(&mut process).read_w(x(1));
+    let tls = process.main_thread().tls_base;
+
+    let mut register = [0_u8; 0x100];
+    put_u32(&mut register, 0, 4);
+    put_u32(&mut register, 4, 10 | (1 << 31));
+    put_u32(&mut register, 8, 1);
+    put_u32(&mut register, 32, 0x4943_4653);
+    write_guest_bytes(&process, tls, &register);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+
+    let mut get_service = [0_u8; 0x100];
+    put_u32(&mut get_service, 0, 4);
+    put_u32(&mut get_service, 4, 10);
+    put_u32(&mut get_service, 16, 0x4943_4653);
+    put_u32(&mut get_service, 24, 1);
+    get_service[32..40].copy_from_slice(b"nifm:u\0\0");
+    write_guest_bytes(&process, tls, &get_service);
+    state(&mut process).write_w(x(0), sm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let nifm_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process.handles().get_as::<HorizonIpcObject>(nifm_handle),
+        Some(HorizonIpcObject::NetworkInterface(_))
+    ));
+
+    let mut convert = [0_u8; 0x100];
+    put_u32(&mut convert, 0, 5);
+    put_u32(&mut convert, 4, 8);
+    put_u32(&mut convert, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut create_general_service = [0_u8; 0x100];
+    put_u32(&mut create_general_service, 0, 4);
+    put_u32(&mut create_general_service, 4, 13 | (1 << 31));
+    put_u32(&mut create_general_service, 8, 1);
+    put_u64(&mut create_general_service, 12, process.process_id());
+    create_general_service[32] = 1;
+    create_general_service[34..36].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut create_general_service, 36, 1);
+    put_u32(&mut create_general_service, 48, 0x4943_4653);
+    put_u32(&mut create_general_service, 56, 5);
+    let handles_before_child = process.handles().len();
+    write_guest_bytes(&process, tls, &create_general_service);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    let general_service_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(general_service_object, 2);
+    assert_eq!(process.handles().len(), handles_before_child);
+
+    let mut close_general_service = [0_u8; 0x100];
+    put_u32(&mut close_general_service, 0, 4);
+    put_u32(&mut close_general_service, 4, 6);
+    close_general_service[16] = 2;
+    put_u32(&mut close_general_service, 20, general_service_object);
+    write_guest_bytes(&process, tls, &close_general_service);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+
+    let mut query_closed_service = [0_u8; 0x100];
+    put_u32(&mut query_closed_service, 0, 4);
+    put_u32(&mut query_closed_service, 4, 10);
+    query_closed_service[16] = 1;
+    query_closed_service[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut query_closed_service, 20, general_service_object);
+    put_u32(&mut query_closed_service, 32, 0x4943_4653);
+    put_u32(&mut query_closed_service, 40, 18);
+    write_guest_bytes(&process, tls, &query_closed_service);
+    state(&mut process).write_w(x(0), nifm_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_TARGET_NOT_FOUND.raw()
+    );
+}
+
+#[test]
 fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     let (_directory, mut process) = fixture_process(&[
         svc(0x1f),
@@ -2863,7 +3445,9 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
 
 #[test]
 fn account_application_info_binds_the_calling_process() {
-    let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21), svc(0x21), svc(0x21)]);
+    let mut instructions = vec![svc(0x1f)];
+    instructions.extend(std::iter::repeat_n(svc(0x21), 10));
+    let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = HorizonSvcDispatcher::default();
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
@@ -2920,6 +3504,124 @@ fn account_application_info_binds_the_calling_process() {
         ExceptionHandlingResult::Resumed
     );
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+
+    let mut get_plain_manager = [0_u8; 0x100];
+    put_u32(&mut get_plain_manager, 0, 4);
+    put_u32(&mut get_plain_manager, 4, 12);
+    put_u32(&mut get_plain_manager, 16, 0x4943_4653);
+    put_u32(&mut get_plain_manager, 24, 101);
+    get_plain_manager[32..48].copy_from_slice(&1_u128.to_le_bytes());
+    write_guest_bytes(&process, tls, &get_plain_manager);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    let plain_manager_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
+    assert!(matches!(
+        process
+            .handles()
+            .get_as::<HorizonIpcObject>(plain_manager_handle),
+        Some(HorizonIpcObject::AccountManagerForApplication(_))
+    ));
+
+    let mut convert = [0_u8; 0x100];
+    put_u32(&mut convert, 0, 5);
+    put_u32(&mut convert, 4, 8);
+    put_u32(&mut convert, 16, 0x4943_4653);
+    write_guest_bytes(&process, tls, &convert);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
+
+    let mut domain_initialize = [0_u8; 0x100];
+    put_u32(&mut domain_initialize, 0, 4);
+    put_u32(&mut domain_initialize, 4, 13 | (1 << 31));
+    put_u32(&mut domain_initialize, 8, 1);
+    put_u64(&mut domain_initialize, 12, process.process_id());
+    domain_initialize[32] = 1;
+    domain_initialize[34..36].copy_from_slice(&24_u16.to_le_bytes());
+    put_u32(&mut domain_initialize, 36, 1);
+    put_u32(&mut domain_initialize, 48, 0x4943_4653);
+    put_u32(&mut domain_initialize, 56, 100);
+    write_guest_bytes(&process, tls, &domain_initialize);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+
+    let mut malformed_get_manager = [0_u8; 0x100];
+    put_u32(&mut malformed_get_manager, 0, 4);
+    put_u32(&mut malformed_get_manager, 4, 10);
+    malformed_get_manager[16] = 1;
+    malformed_get_manager[18..20].copy_from_slice(&16_u16.to_le_bytes());
+    put_u32(&mut malformed_get_manager, 20, 1);
+    put_u32(&mut malformed_get_manager, 32, 0x4943_4653);
+    put_u32(&mut malformed_get_manager, 40, 101);
+    write_guest_bytes(&process, tls, &malformed_get_manager);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
+    let mut get_domain_manager = [0_u8; 0x100];
+    put_u32(&mut get_domain_manager, 0, 4);
+    put_u32(&mut get_domain_manager, 4, 14);
+    get_domain_manager[16] = 1;
+    get_domain_manager[18..20].copy_from_slice(&32_u16.to_le_bytes());
+    put_u32(&mut get_domain_manager, 20, 1);
+    put_u32(&mut get_domain_manager, 32, 0x4943_4653);
+    put_u32(&mut get_domain_manager, 40, 101);
+    get_domain_manager[48..64].copy_from_slice(&1_u128.to_le_bytes());
+    let handles_before_domain_manager = process.handles().len();
+    write_guest_bytes(&process, tls, &get_domain_manager);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    let domain_manager_object = read_guest_u32(&process, tls.checked_add(48).unwrap());
+    assert_eq!(domain_manager_object, 2);
+    assert_eq!(process.handles().len(), handles_before_domain_manager);
+
+    let mut close_domain_manager = [0_u8; 0x100];
+    put_u32(&mut close_domain_manager, 0, 4);
+    put_u32(&mut close_domain_manager, 4, 6);
+    close_domain_manager[16] = 2;
+    put_u32(&mut close_domain_manager, 20, domain_manager_object);
+    write_guest_bytes(&process, tls, &close_domain_manager);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+
+    let mut query_closed_manager = malformed_get_manager;
+    put_u32(&mut query_closed_manager, 20, domain_manager_object);
+    put_u32(&mut query_closed_manager, 40, 0);
+    write_guest_bytes(&process, tls, &query_closed_manager);
+    state(&mut process).write_w(x(0), account_handle);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_TARGET_NOT_FOUND.raw()
+    );
 }
 
 #[test]
@@ -3637,6 +4339,111 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
 }
 
 #[test]
+fn map_memory_moves_user_access_through_one_physical_stack_alias() {
+    let (_directory, mut process) = fixture_process(&[svc(0x01), svc(0x04), svc(0x06), svc(0x05)]);
+    let mut dispatcher = HorizonSvcDispatcher::default();
+
+    state(&mut process).write_x(x(1), 0x20_0000);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+
+    let source = process.memory_layout().heap().base();
+    let destination = process
+        .memory_layout()
+        .stack()
+        .base()
+        .checked_add(0x10_0000)
+        .unwrap();
+    let size = 0x4000;
+    let initial_used_memory = process.memory_accounting().used_user_physical_memory_size();
+    write_guest_bytes(&process, source, &0x1122_3344_u32.to_le_bytes());
+
+    state(&mut process).write_x(x(0), destination.get());
+    state(&mut process).write_x(x(1), source.get());
+    state(&mut process).write_x(x(2), size);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    let source_mapping = process
+        .memory()
+        .mapping_info(process.cpu_context().address_space_id(), source)
+        .unwrap();
+    let destination_mapping = process
+        .memory()
+        .mapping_info(process.cpu_context().address_space_id(), destination)
+        .unwrap();
+    assert_eq!(
+        source_mapping.physical_page,
+        destination_mapping.physical_page
+    );
+    assert_eq!(source_mapping.permissions, MemoryPermissions::NONE);
+    assert_eq!(
+        source_mapping.attributes,
+        MemoryAttributes::PERMISSION_LOCKED
+    );
+    assert_eq!(
+        destination_mapping.permissions,
+        MemoryPermissions::READ_WRITE
+    );
+    assert_eq!(destination_mapping.purpose, MemoryMappingPurpose::Stack);
+    assert_eq!(
+        process.memory_accounting().used_user_physical_memory_size(),
+        initial_used_memory
+    );
+
+    let query_output = process.main_thread().stack_bottom;
+    state(&mut process).write_x(x(0), query_output.get());
+    state(&mut process).write_x(x(2), destination.get());
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        read_guest_u32(&process, query_output.checked_add(0x10).unwrap()),
+        0x0b
+    );
+
+    write_guest_bytes(&process, destination, &0xaabb_ccdd_u32.to_le_bytes());
+    state(&mut process).write_x(x(0), destination.get());
+    state(&mut process).write_x(x(1), source.get());
+    state(&mut process).write_x(x(2), size);
+    assert_eq!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    );
+    assert_eq!(
+        state(&mut process).read_w(x(0)),
+        HorizonKernelResult::SUCCESS.raw()
+    );
+    assert_eq!(read_guest_u32(&process, source), 0xaabb_ccdd);
+    assert!(
+        process
+            .memory()
+            .query_memory(
+                process.cpu_context().address_space_id(),
+                destination,
+                GuestVirtualAddress::new(process.address_space().exclusive_limit())
+            )
+            .is_some_and(|query| query.region.is_none())
+    );
+    assert_eq!(
+        process.memory_accounting().used_user_physical_memory_size(),
+        initial_used_memory
+    );
+}
+
+#[test]
 fn switch_1_application_profile_accepts_a_heap_larger_than_the_test_default() {
     let (_directory, mut process) = fixture_process_with_config(
         &[svc(0x01)],
@@ -3804,7 +4611,7 @@ fn heap_shrinks_to_zero_and_memory_state_capabilities_are_enforced() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Rejected(HorizonSvcFault::InvalidMemoryState {
             immediate: 0x03,
-            purpose: MemoryMappingPurpose::Normal,
+            purpose: MemoryMappingPurpose::Stack,
             ..
         })
     ));

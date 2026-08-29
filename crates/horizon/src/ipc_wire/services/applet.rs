@@ -329,6 +329,70 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                 return unsupported_service_command("IApplicationFunctions", request.command_id);
             };
             match command {
+                // PopLaunchParameter consumes one AM launch-channel entry and
+                // returns it as an IStorage object in this same domain. libnx
+                // uses kind 2 during account initialization to obtain the
+                // preselected user selected by the launcher.
+                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1765-L1777
+                ApplicationFunctionsCommand::PopLaunchParameter => {
+                    let Some(kind) =
+                        request_u32(request.data, 0).and_then(AppletLaunchParameterKind::from_raw)
+                    else {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    };
+                    if !has_only_transport_padding(request.data, 4) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    match session.pop_launch_parameter(kind) {
+                        Ok(storage_object_id) => {
+                            let user = session.user();
+                            log::debug!(
+                                "IApplicationFunctions returned {kind:?} for user {} ({}) as domain object {storage_object_id:#x}",
+                                user.name(),
+                                user.id(),
+                            );
+                            Ok((
+                                encode_domain_response(
+                                    request.token,
+                                    HorizonIpcResult::SUCCESS,
+                                    &[],
+                                    &[],
+                                    &[storage_object_id],
+                                )?,
+                                None,
+                            ))
+                        }
+                        Err(PopAppletLaunchParameterError::NotAvailable) => {
+                            applet_error(request.token, HorizonIpcResult::AM_NO_MESSAGES)
+                        }
+                        Err(PopAppletLaunchParameterError::DomainCapacityExhausted) => {
+                            Err(IpcWireError::HostResourceExhausted(
+                                "allocating a launch-parameter storage domain object",
+                            ))
+                        }
+                        Err(PopAppletLaunchParameterError::ObjectIdExhausted) => {
+                            Err(IpcWireError::HostResourceExhausted(
+                                "allocating a launch-parameter storage object ID",
+                            ))
+                        }
+                        Err(PopAppletLaunchParameterError::StorageIdExhausted) => {
+                            Err(IpcWireError::HostResourceExhausted(
+                                "allocating a launch-parameter storage backing ID",
+                            ))
+                        }
+                        Err(PopAppletLaunchParameterError::NotDomain) => {
+                            Err(IpcWireError::Internal(
+                                "launch parameter escaped its applet domain session",
+                            ))
+                        }
+                    }
+                }
                 // SetTerminateResult stores the application result in AM. It does
                 // not terminate the process or replace the kernel exit code.
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L2672-L2685
@@ -842,6 +906,10 @@ mod tests {
 
     #[test]
     fn application_function_ids_decode_to_semantic_commands() {
+        assert_eq!(
+            ApplicationFunctionsCommand::decode(1),
+            Some(ApplicationFunctionsCommand::PopLaunchParameter)
+        );
         assert_eq!(
             ApplicationFunctionsCommand::decode(22),
             Some(ApplicationFunctionsCommand::SetTerminateResult)

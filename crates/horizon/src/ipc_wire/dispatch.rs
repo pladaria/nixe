@@ -14,6 +14,7 @@ use super::{IpcWireError, UnsupportedServiceOperation};
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::ExceptionProcessContext;
 
+use crate::object::{NetworkInterfaceObject, TimeObject};
 use crate::{
     HidSystem, HorizonIpcObject, OperationMode, SettingsEnvironment, TimeEnvironment, VideoSystem,
 };
@@ -38,6 +39,10 @@ impl HorizonIpcObject {
             Self::Applet(session) => session.is_domain(),
             Self::SemanticService(session) => session.is_domain(),
             Self::ParentalControl(session) => session.is_domain(),
+            Self::Time(session) => session.is_domain(),
+            Self::NetworkInterface(session) => session.is_domain(),
+            Self::Account(session) => session.is_domain(),
+            Self::Bsd(session) => session.is_domain(),
             _ => false,
         }
     }
@@ -64,10 +69,24 @@ impl HorizonIpcObject {
             Self::Applet(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("appletOE", services::applet_object_name),
-            Self::Account(_) => "acc:u0",
+            Self::Account(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .map_or("acc:u0", |object| match object {
+                    crate::object::AccountObject::BaasManagerForApplication(_) => {
+                        "IManagerForApplication"
+                    }
+                }),
+            Self::AccountManagerForApplication(_) => "IManagerForApplication",
+            Self::Bsd(_) => "bsd:u",
             Self::Hid(_) => "hid",
             Self::HidAppletResource(_) => "IAppletResource",
-            Self::Time(_) => "time:u",
+            Self::Time(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .map_or("time:u", |object| match object {
+                    TimeObject::SystemClock(_) => "ISystemClock",
+                    TimeObject::SteadyClock(_) => "ISteadyClock",
+                    TimeObject::TimeZone(_) => "ITimeZoneService",
+                }),
             Self::SystemClock(_) => "ISystemClock",
             Self::SteadyClock(_) => "ISteadyClock",
             Self::TimeZone(_) => "ITimeZoneService",
@@ -79,6 +98,12 @@ impl HorizonIpcObject {
                 .and_then(|object_id| session.object(object_id))
                 .map_or("pctl", |_| "IParentalControlService"),
             Self::ParentalControlService(_) => "IParentalControlService",
+            Self::NetworkInterface(session) => domain_object
+                .and_then(|object_id| session.object(object_id))
+                .map_or("nifm:u", |object| match object {
+                    NetworkInterfaceObject::GeneralService(_) => "IGeneralService",
+                }),
+            Self::NetworkGeneralService(_) => "IGeneralService",
             Self::SemanticObject(object) => object_name(object),
         }
     }
@@ -225,14 +250,22 @@ pub(crate) fn send_sync_request_from_buffer(
         HorizonIpcObject::Account(account) => {
             services::dispatch_account(process, &account, request, &hipc)?
         }
+        HorizonIpcObject::AccountManagerForApplication(manager) => {
+            services::dispatch_account_manager_for_application(&manager, request)?
+        }
+        HorizonIpcObject::Bsd(session) => {
+            services::dispatch_bsd(process, &session, request, &hipc)?
+        }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, &hid, host_systems.hid, request, &hipc)?
         }
         HorizonIpcObject::HidAppletResource(resource) => {
             services::dispatch_hid_applet_resource(process, &resource, request)?
         }
-        HorizonIpcObject::Time(time) => services::dispatch_time(process, &time, request)?,
-        HorizonIpcObject::SystemClock(clock) => services::dispatch_system_clock(&clock, request)?,
+        HorizonIpcObject::Time(time) => services::dispatch_time(process, &time, request, &hipc)?,
+        HorizonIpcObject::SystemClock(clock) => {
+            services::dispatch_system_clock(&clock, request, &hipc)?
+        }
         HorizonIpcObject::SteadyClock(clock) => services::dispatch_steady_clock(&clock, request)?,
         HorizonIpcObject::TimeZone(timezone) => services::dispatch_timezone(&timezone, request)?,
         HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, &vi, request, &hipc)?,
@@ -262,6 +295,12 @@ pub(crate) fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::ParentalControlService(service) => {
             services::dispatch_parental_control_service(None, &service, request, &hipc)?
+        }
+        HorizonIpcObject::NetworkInterface(manager) => {
+            services::dispatch_network_interface(process, &manager, request, &hipc)?
+        }
+        HorizonIpcObject::NetworkGeneralService(service) => {
+            services::dispatch_network_general_service(&service, request)?
         }
         HorizonIpcObject::SemanticObject(object) => {
             dispatch_plain_object(process, &object, request, &hipc)?

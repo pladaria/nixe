@@ -36,7 +36,8 @@ use super::{
     AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
     CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
     DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass,
-    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest, MemoryAlignment,
+    MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason, MemoryMappingProperties,
     MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, MemoryProtectionErrorReason,
     MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
     SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo, SyntheticMmio,
@@ -338,6 +339,40 @@ impl ExecutionMemoryInner {
         }
     }
 
+    fn set_mapping_properties(
+        &mut self,
+        address_space: AddressSpaceId,
+        virtual_page: u64,
+        properties: MemoryMappingProperties,
+        mapping_generation: MappingGeneration,
+    ) {
+        self.invalidate_fastmem_page(address_space, virtual_page);
+        let (physical_slot, was_executable_content, is_executable_content) = {
+            let mapping = self
+                .mappings
+                .get_mut(address_space, virtual_page)
+                .expect("mapping-property range was preflighted");
+            let was_executable_content = mapping.observes_executable_content();
+            mapping.permissions = properties.permissions;
+            mapping.purpose = properties.purpose;
+            mapping.attributes = properties.attributes;
+            mapping.mapping_generation = mapping_generation;
+            (
+                mapping.physical_slot,
+                was_executable_content,
+                mapping.observes_executable_content(),
+            )
+        };
+        self.update_executable_content_mapping_count(
+            physical_slot,
+            was_executable_content,
+            is_executable_content,
+        );
+        if !was_executable_content && is_executable_content {
+            self.invalidate_fastmem_physical_slot(physical_slot);
+        }
+    }
+
     fn executable_content_page(&self, physical_slot: usize) -> Option<GuestPhysicalPageId> {
         let slot = self.physical_slots.get(physical_slot)?.as_ref()?;
         if slot.executable_content_mapping_count == 0 {
@@ -447,6 +482,10 @@ impl ExecutionMemoryInner {
 }
 
 impl ExecutionMapping {
+    fn properties(self) -> MemoryMappingProperties {
+        MemoryMappingProperties::new(self.permissions, self.purpose, self.attributes)
+    }
+
     fn observes_executable_content(self) -> bool {
         self.permissions.contains(MemoryPermissions::EXECUTE) || self.purpose.is_code()
     }
@@ -2571,6 +2610,218 @@ impl ProcessMemory for ExecutionMemory {
             );
         }
         inner.next_page_id = next_page_id;
+        mutation.commit();
+        invalidation.commit();
+        Ok(())
+    }
+
+    fn map_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError> {
+        let MemoryAliasRequest {
+            address_space,
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        } = request;
+        let error = |address, reason| MemoryAliasError {
+            address_space,
+            address,
+            reason,
+        };
+        let (Some(source_range), Some(destination_range)) = (
+            PageRange::new(source, size),
+            PageRange::new(destination, size),
+        ) else {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        };
+        if source_range.is_empty() {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        }
+
+        let mut mutation = self.begin_mapping_mutation();
+        let mut inner = self.lock_inner();
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let Some(source_mapping) = inner.mappings.get(address_space, source_page) else {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            };
+            if source_mapping.properties() != source_before
+                || !matches!(
+                    inner.page(source_mapping.physical_slot),
+                    Some(ExecutionPhysicalPage::Ram(_))
+                )
+            {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            }
+            if inner
+                .mappings
+                .get(address_space, destination_page)
+                .is_some()
+            {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            }
+        }
+
+        let invalidation_kinds = [
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: source,
+                size,
+            },
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: destination,
+                size,
+            },
+        ];
+        let invalidation = self
+            .invalidations
+            .reserve_many(&invalidation_kinds)
+            .map_err(|_| error(source, MemoryAliasErrorReason::ResourceExhausted))?;
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(source, MemoryAliasErrorReason::GenerationExhausted))?;
+
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let source_mapping = inner
+                .mappings
+                .get(address_space, source_page)
+                .expect("alias source range was preflighted");
+            inner.set_mapping_properties(
+                address_space,
+                source_page,
+                source_after,
+                mapping_generation,
+            );
+            inner.insert_mapping(
+                address_space,
+                destination_page,
+                ExecutionMapping {
+                    physical_page: source_mapping.physical_page,
+                    physical_slot: source_mapping.physical_slot,
+                    mapping_generation,
+                    permissions: destination_properties.permissions,
+                    purpose: destination_properties.purpose,
+                    attributes: destination_properties.attributes,
+                },
+            );
+        }
+        mutation.commit();
+        invalidation.commit();
+        Ok(())
+    }
+
+    fn unmap_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError> {
+        let MemoryAliasRequest {
+            address_space,
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        } = request;
+        let error = |address, reason| MemoryAliasError {
+            address_space,
+            address,
+            reason,
+        };
+        let (Some(source_range), Some(destination_range)) = (
+            PageRange::new(source, size),
+            PageRange::new(destination, size),
+        ) else {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        };
+        if source_range.is_empty() {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        }
+
+        let mut mutation = self.begin_mapping_mutation();
+        let mut inner = self.lock_inner();
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let Some(source_mapping) = inner.mappings.get(address_space, source_page) else {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            };
+            if source_mapping.properties() != source_before {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            }
+            let Some(destination_mapping) = inner.mappings.get(address_space, destination_page)
+            else {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            };
+            if destination_mapping.properties() != destination_properties {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            }
+            if source_mapping.physical_page != destination_mapping.physical_page
+                || source_mapping.physical_slot != destination_mapping.physical_slot
+            {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::PhysicalIdentityMismatch,
+                ));
+            }
+        }
+
+        let invalidation_kinds = [
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: source,
+                size,
+            },
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: destination,
+                size,
+            },
+        ];
+        let invalidation = self
+            .invalidations
+            .reserve_many(&invalidation_kinds)
+            .map_err(|_| error(source, MemoryAliasErrorReason::ResourceExhausted))?;
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(source, MemoryAliasErrorReason::GenerationExhausted))?;
+
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let removed = inner
+                .remove_mapping(address_space, destination_page)
+                .expect("alias destination range was preflighted");
+            debug_assert_ne!(inner.mapping_count(removed.physical_slot), 0);
+            inner.set_mapping_properties(
+                address_space,
+                source_page,
+                source_after,
+                mapping_generation,
+            );
+        }
         mutation.commit();
         invalidation.commit();
         Ok(())

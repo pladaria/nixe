@@ -12,6 +12,7 @@ const MODULE_FS: u32 = 2;
 const MODULE_LR: u32 = 8;
 const MODULE_SF: u32 = 10;
 const MODULE_SM: u32 = 21;
+const MODULE_TIME: u32 = 116;
 const MODULE_AM: u32 = 128;
 const MODULE_MASK: u32 = 0x1ff;
 const DESCRIPTION_MASK: u32 = 0x1fff;
@@ -43,6 +44,12 @@ impl HorizonIpcResult {
     pub const CMIF_UNKNOWN_COMMAND_ID: Self = Self::new(MODULE_SF, 221);
     pub const CMIF_TARGET_NOT_FOUND: Self = Self::new(MODULE_SF, 261);
     pub const CMIF_OUT_OF_DOMAIN_ENTRIES: Self = Self::new(MODULE_SF, 301);
+    /// The supplied time context and the current steady clock have different
+    /// source IDs, so their time points cannot be compared.
+    /// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libvapours/include/vapours/results/time_results.hpp
+    pub const TIME_NOT_COMPARABLE: Self = Self::new(MODULE_TIME, 200);
+    /// A time calculation exceeded Horizon's signed 64-bit representation.
+    pub const TIME_OVERFLOWED: Self = Self::new(MODULE_TIME, 201);
     /// `ICommonStateGetter::ReceiveMessage` found no queued applet message.
     /// https://switchbrew.org/w/index.php?title=Applet_Manager_services&oldid=14818#ReceiveMessage
     pub const AM_NO_MESSAGES: Self = Self::new(MODULE_AM, 3);
@@ -121,6 +128,8 @@ mod tests {
                 301,
                 0x25a0a,
             ),
+            (HorizonIpcResult::TIME_NOT_COMPARABLE, 116, 200, 0x19074),
+            (HorizonIpcResult::TIME_OVERFLOWED, 116, 201, 0x19274),
             (HorizonIpcResult::AM_NO_MESSAGES, 128, 3, 0x680),
             (HorizonIpcResult::FS_PATH_NOT_FOUND, 2, 1, 0x202),
             (HorizonIpcResult::FS_OUT_OF_RANGE, 2, 3005, 0x177a02),

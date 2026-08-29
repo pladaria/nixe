@@ -1,4 +1,10 @@
 use super::prelude::*;
+use crate::object::{MonotonicClockError, TimeObject};
+
+enum TimeTarget {
+    Root,
+    Object(TimeObject),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimeServiceCommand {
@@ -8,6 +14,7 @@ enum TimeServiceCommand {
     TimeZoneService,
     StandardLocalSystemClock,
     SharedMemoryNativeHandle,
+    CalculateMonotonicSystemClockBaseTimePoint,
 }
 
 impl TimeServiceCommand {
@@ -19,6 +26,7 @@ impl TimeServiceCommand {
             3 => Some(Self::TimeZoneService),
             4 => Some(Self::StandardLocalSystemClock),
             20 => Some(Self::SharedMemoryNativeHandle),
+            300 => Some(Self::CalculateMonotonicSystemClockBaseTimePoint),
             _ => None,
         }
     }
@@ -28,6 +36,7 @@ impl TimeServiceCommand {
 enum SystemClockCommand {
     GetCurrentTime,
     SetCurrentTime,
+    GetSystemClockContext,
 }
 
 impl SystemClockCommand {
@@ -35,6 +44,7 @@ impl SystemClockCommand {
         match command_id {
             0 => Some(Self::GetCurrentTime),
             1 => Some(Self::SetCurrentTime),
+            2 => Some(Self::GetSystemClockContext),
             _ => None,
         }
     }
@@ -80,24 +90,92 @@ pub(in crate::ipc_wire) fn dispatch_time(
     process: &mut ExceptionProcessContext<'_>,
     session: &TimeServiceSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let target = match &request.domain {
+        Some(DomainRequest::Close { object_id }) => {
+            let result = if session.close_object(*object_id) {
+                HorizonIpcResult::SUCCESS
+            } else {
+                HorizonIpcResult::CMIF_TARGET_NOT_FOUND
+            };
+            return time_response(session, request.token, result, &[], &[], &[]);
+        }
+        Some(DomainRequest::SendMessage {
+            object_id,
+            input_objects,
+        }) => {
+            if !input_objects.is_empty() {
+                return time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
+            if *object_id == 1 {
+                TimeTarget::Root
+            } else {
+                let Some(object) = session.object(*object_id) else {
+                    return time_response(
+                        session,
+                        request.token,
+                        HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
+                        &[],
+                        &[],
+                        &[],
+                    );
+                };
+                TimeTarget::Object(object)
+            }
+        }
+        None if session.is_domain() => {
+            return Err(IpcWireError::Malformed(
+                "domain time:u request omitted its domain header",
+            ));
+        }
+        None => TimeTarget::Root,
+    };
+
+    match target {
+        TimeTarget::Root => dispatch_time_root(process, session, request, hipc),
+        TimeTarget::Object(TimeObject::SystemClock(clock)) => {
+            dispatch_system_clock_target(Some(session), &clock, request, hipc)
+        }
+        TimeTarget::Object(TimeObject::SteadyClock(clock)) => {
+            dispatch_steady_clock_target(Some(session), &clock, request)
+        }
+        TimeTarget::Object(TimeObject::TimeZone(timezone)) => {
+            dispatch_timezone_target(Some(session), &timezone, request)
+        }
+    }
+}
+
+fn dispatch_time_root(
+    process: &mut ExceptionProcessContext<'_>,
+    session: &TimeServiceSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = TimeServiceCommand::decode(request.command_id) else {
         return unsupported_service_command("time:u", request.command_id);
     };
     let child = match command {
-        TimeServiceCommand::StandardUserSystemClock => Some(HorizonIpcObject::SystemClock(
+        TimeServiceCommand::StandardUserSystemClock => Some(TimeObject::SystemClock(
             session.system_clock(SystemClockKind::User),
         )),
-        TimeServiceCommand::StandardNetworkSystemClock => Some(HorizonIpcObject::SystemClock(
+        TimeServiceCommand::StandardNetworkSystemClock => Some(TimeObject::SystemClock(
             session.system_clock(SystemClockKind::Network),
         )),
         TimeServiceCommand::StandardSteadyClock => {
-            Some(HorizonIpcObject::SteadyClock(session.steady_clock()))
+            Some(TimeObject::SteadyClock(session.steady_clock()))
         }
         TimeServiceCommand::TimeZoneService => {
-            Some(HorizonIpcObject::TimeZone(session.timezone_service()))
+            Some(TimeObject::TimeZone(session.timezone_service()))
         }
-        TimeServiceCommand::StandardLocalSystemClock => Some(HorizonIpcObject::SystemClock(
+        TimeServiceCommand::StandardLocalSystemClock => Some(TimeObject::SystemClock(
             session.system_clock(SystemClockKind::Local),
         )),
         TimeServiceCommand::SharedMemoryNativeHandle => {
@@ -108,15 +186,105 @@ pub(in crate::ipc_wire) fn dispatch_time(
                     IpcWireError::HostResourceExhausted("installing a time shared-memory handle")
                 })?;
             log::debug!("time:u returned shared-memory handle {handle:#x}");
-            return semantic_success(request.token, false, &[], &[handle], &[], None);
+            return time_response(
+                session,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                &[handle],
+                &[],
+            );
+        }
+        // Command 300 consumes one 0x20-byte SystemClockContext and returns
+        // the POSIX base corresponding to Nixe's monotonic epoch:
+        // https://switchbrew.org/w/index.php?title=PSC_services&oldid=14556#time:su,_time:s
+        TimeServiceCommand::CalculateMonotonicSystemClockBaseTimePoint => {
+            let Some(encoded_context) = request.data.get(..0x20) else {
+                return time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            };
+            if !has_only_transport_padding(request.data, 0x20) || has_ipc_descriptors(hipc) {
+                return time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
+            let result = session.calculate_monotonic_system_clock_base_time_point(
+                encoded_context.try_into().unwrap(),
+            );
+            return match result {
+                Ok(base_time) => time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::SUCCESS,
+                    &base_time.to_le_bytes(),
+                    &[],
+                    &[],
+                ),
+                Err(MonotonicClockError::NotComparable) => time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::TIME_NOT_COMPARABLE,
+                    &[],
+                    &[],
+                    &[],
+                ),
+                Err(MonotonicClockError::Overflowed) => time_response(
+                    session,
+                    request.token,
+                    HorizonIpcResult::TIME_OVERFLOWED,
+                    &[],
+                    &[],
+                    &[],
+                ),
+            };
         }
     };
-    let handle = process
-        .handles_mut()
-        .insert(child.expect("time child command was selected"))
-        .map_err(|_| {
-            IpcWireError::HostResourceExhausted("installing a time service child handle")
-        })?;
+
+    let child = child.expect("time child command was selected");
+    if session.is_domain() {
+        // Domain-converted services return child object IDs in the CMIF
+        // domain response instead of allocating process handles:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L250-L266
+        let Some(object_id) = session.insert_object(child) else {
+            return time_response(
+                session,
+                request.token,
+                HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES,
+                &[],
+                &[],
+                &[],
+            );
+        };
+        log::debug!("time:u {command:?} returned domain object {object_id:#x}");
+        return time_response(
+            session,
+            request.token,
+            HorizonIpcResult::SUCCESS,
+            &[],
+            &[],
+            &[object_id],
+        );
+    }
+
+    let child = match child {
+        TimeObject::SystemClock(clock) => HorizonIpcObject::SystemClock(clock),
+        TimeObject::SteadyClock(clock) => HorizonIpcObject::SteadyClock(clock),
+        TimeObject::TimeZone(timezone) => HorizonIpcObject::TimeZone(timezone),
+    };
+    let handle = process.handles_mut().insert(child).map_err(|_| {
+        IpcWireError::HostResourceExhausted("installing a time service child handle")
+    })?;
     log::debug!("time:u {command:?} returned child session handle {handle:#x}");
     semantic_success(request.token, false, &[], &[], &[], Some(handle))
 }
@@ -124,37 +292,112 @@ pub(in crate::ipc_wire) fn dispatch_time(
 pub(in crate::ipc_wire) fn dispatch_system_clock(
     session: &SystemClockSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    dispatch_system_clock_target(None, session, request, hipc)
+}
+
+fn dispatch_system_clock_target(
+    parent: Option<&TimeServiceSession>,
+    session: &SystemClockSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = SystemClockCommand::decode(request.command_id) else {
         return unsupported_service_command("ISystemClock", request.command_id);
     };
     match command {
         SystemClockCommand::GetCurrentTime => {
+            if !has_only_transport_padding(request.data, 0) || has_ipc_descriptors(hipc) {
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
             let timestamp = session.current_time();
-            semantic_success(
+            time_object_response(
+                parent,
                 request.token,
-                false,
+                HorizonIpcResult::SUCCESS,
                 &timestamp.to_le_bytes(),
                 &[],
                 &[],
-                None,
             )
         }
         SystemClockCommand::SetCurrentTime => {
             let Some(timestamp) = request.data.get(..8) else {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
             };
+            if !has_only_transport_padding(request.data, 8) || has_ipc_descriptors(hipc) {
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
             session
                 .set_current_time(i64::from_le_bytes(timestamp.try_into().unwrap()))
                 .map_err(|_| {
                     IpcWireError::HostResourceExhausted("updating the emulated system clock")
                 })?;
-            semantic_success(request.token, false, &[], &[], &[], None)
+            time_object_response(
+                parent,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &[],
+                &[],
+                &[],
+            )
+        }
+        // Command 2 returns the clock epoch followed by the steady-clock
+        // point and its source ID as one 0x20-byte SystemClockContext:
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/time.h
+        SystemClockCommand::GetSystemClockContext => {
+            if !has_only_transport_padding(request.data, 0) || has_ipc_descriptors(hipc) {
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
+            }
+            time_object_response(
+                parent,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &session.context(),
+                &[],
+                &[],
+            )
         }
     }
 }
 
 pub(in crate::ipc_wire) fn dispatch_steady_clock(
+    session: &SteadyClockSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    dispatch_steady_clock_target(None, session, request)
+}
+
+fn dispatch_steady_clock_target(
+    parent: Option<&TimeServiceSession>,
     session: &SteadyClockSession,
     request: CmifRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -167,11 +410,23 @@ pub(in crate::ipc_wire) fn dispatch_steady_clock(
             let mut data = [0_u8; 0x18];
             data[..8].copy_from_slice(&time_point.to_le_bytes());
             data[8..].copy_from_slice(&source_id);
-            semantic_success(request.token, false, &data, &[], &[], None)
+            time_object_response(
+                parent,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &data,
+                &[],
+                &[],
+            )
         }
-        SteadyClockCommand::GetInternalOffset => {
-            semantic_success(request.token, false, &0_i64.to_le_bytes(), &[], &[], None)
-        }
+        SteadyClockCommand::GetInternalOffset => time_object_response(
+            parent,
+            request.token,
+            HorizonIpcResult::SUCCESS,
+            &0_i64.to_le_bytes(),
+            &[],
+            &[],
+        ),
     }
 }
 
@@ -179,33 +434,109 @@ pub(in crate::ipc_wire) fn dispatch_timezone(
     session: &TimeZoneServiceSession,
     request: CmifRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    dispatch_timezone_target(None, session, request)
+}
+
+fn dispatch_timezone_target(
+    parent: Option<&TimeServiceSession>,
+    session: &TimeZoneServiceSession,
+    request: CmifRequest<'_>,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = TimeZoneCommand::decode(request.command_id) else {
         return unsupported_service_command("ITimeZoneService", request.command_id);
     };
     match command {
-        TimeZoneCommand::GetDeviceLocationName => semantic_success(
+        TimeZoneCommand::GetDeviceLocationName => time_object_response(
+            parent,
             request.token,
-            false,
+            HorizonIpcResult::SUCCESS,
             &session.location_name(),
             &[],
             &[],
-            None,
         ),
-        TimeZoneCommand::GetTotalLocationNameCount => {
-            semantic_success(request.token, false, &1_u32.to_le_bytes(), &[], &[], None)
-        }
+        TimeZoneCommand::GetTotalLocationNameCount => time_object_response(
+            parent,
+            request.token,
+            HorizonIpcResult::SUCCESS,
+            &1_u32.to_le_bytes(),
+            &[],
+            &[],
+        ),
         TimeZoneCommand::ToCalendarTimeWithMyRule => {
             let Some(timestamp) = request_u64(request.data, 0) else {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                );
             };
             let Ok(timestamp) = i64::try_from(timestamp) else {
-                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                    &[],
+                    &[],
+                    &[],
+                );
             };
             let Some(data) = encode_calendar_time(session.timezone(), timestamp) else {
-                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                return time_object_response(
+                    parent,
+                    request.token,
+                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
+                    &[],
+                    &[],
+                    &[],
+                );
             };
-            semantic_success(request.token, false, &data, &[], &[], None)
+            time_object_response(
+                parent,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &data,
+                &[],
+                &[],
+            )
         }
+    }
+}
+
+fn time_object_response(
+    parent: Option<&TimeServiceSession>,
+    token: u32,
+    result: HorizonIpcResult,
+    data: &[u8],
+    copy_handles: &[u32],
+    domain_objects: &[u32],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if let Some(parent) = parent {
+        time_response(parent, token, result, data, copy_handles, domain_objects)
+    } else if result == HorizonIpcResult::SUCCESS {
+        semantic_success(token, false, data, copy_handles, domain_objects, None)
+    } else {
+        Ok((encode_response(token, result, data, None)?, None))
+    }
+}
+
+fn time_response(
+    session: &TimeServiceSession,
+    token: u32,
+    result: HorizonIpcResult,
+    data: &[u8],
+    copy_handles: &[u32],
+    domain_objects: &[u32],
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    if session.is_domain() {
+        let response = encode_domain_response(token, result, data, copy_handles, domain_objects)?;
+        Ok((response, copy_handles.first().copied()))
+    } else if result == HorizonIpcResult::SUCCESS {
+        semantic_success(token, false, data, copy_handles, &[], None)
+    } else {
+        Ok((encode_response(token, result, data, None)?, None))
     }
 }
 

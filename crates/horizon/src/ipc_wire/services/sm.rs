@@ -9,10 +9,12 @@ enum ServiceKind {
     Hid,
     Time,
     Account,
+    Bsd,
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
     ParentalControl,
+    NetworkInterface,
     Semantic(IpcService),
 }
 
@@ -26,9 +28,11 @@ impl ServiceKind {
             b"hid" => Some(Self::Hid),
             b"time:u" => Some(Self::Time),
             b"acc:u0" => Some(Self::Account),
+            b"bsd:u" => Some(Self::Bsd),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
             b"pctl" | b"pctl:a" | b"pctl:r" | b"pctl:s" => Some(Self::ParentalControl),
+            b"nifm:u" => Some(Self::NetworkInterface),
             _ => ViServiceKind::from_name(name)
                 .map(Self::Vi)
                 .or_else(|| IpcService::from_name(name).map(Self::Semantic)),
@@ -135,6 +139,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
             };
             connect_service(
                 process,
+                manager,
                 request.token,
                 service,
                 initial_operation_mode,
@@ -147,6 +152,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
 
 fn connect_service(
     process: &mut ExceptionProcessContext<'_>,
+    manager: &ServiceManagerSession,
     token: u32,
     service: ServiceKind,
     initial_operation_mode: OperationMode,
@@ -201,6 +207,9 @@ fn connect_service(
         ServiceKind::Account => process
             .handles_mut()
             .insert(HorizonIpcObject::Account(AccountSession::new())),
+        ServiceKind::Bsd => process
+            .handles_mut()
+            .insert(HorizonIpcObject::Bsd(manager.bsd_session())),
         ServiceKind::Vi(kind) => {
             process
                 .handles_mut()
@@ -220,6 +229,13 @@ fn connect_service(
                 .handles_mut()
                 .insert(HorizonIpcObject::ParentalControl(
                     ParentalControlFactorySession::new(),
+                ))
+        }
+        ServiceKind::NetworkInterface => {
+            process
+                .handles_mut()
+                .insert(HorizonIpcObject::NetworkInterface(
+                    NetworkInterfaceManagerSession::new(),
                 ))
         }
         ServiceKind::Semantic(service) => process

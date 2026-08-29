@@ -128,6 +128,7 @@ command_enum!(WindowControllerCommand {
 });
 
 command_enum!(ApplicationFunctionsCommand {
+    1 => PopLaunchParameter,
     22 => SetTerminateResult,
     40 => NotifyRunning,
 });

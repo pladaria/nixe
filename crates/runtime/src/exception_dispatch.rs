@@ -7,8 +7,9 @@
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::{
     memory::{
-        ExecutionMemory, MemoryAttributes, MemoryMappingError, MemoryMappingPurpose,
-        MemoryPermissions, MemoryProtectionError, ProcessMemory,
+        ExecutionMemory, MemoryAliasError, MemoryAliasRequest, MemoryAttributes,
+        MemoryMappingError, MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions,
+        MemoryProtectionError, ProcessMemory,
     },
     profile::ProcessCpuContext,
     state::ThreadCpuState,
@@ -333,6 +334,54 @@ impl<'a> ExceptionProcessContext<'a> {
             permissions,
             purpose,
         )?;
+        self.mapping_control
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
+        Ok(())
+    }
+
+    pub fn map_memory_alias(
+        &self,
+        destination: nixe_memory::GuestVirtualAddress,
+        source: nixe_memory::GuestVirtualAddress,
+        size: u64,
+        source_before: MemoryMappingProperties,
+        source_after: MemoryMappingProperties,
+        destination_properties: MemoryMappingProperties,
+    ) -> Result<(), MemoryAliasError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory.map_alias(MemoryAliasRequest::new(
+            self.cpu.address_space_id(),
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        ))?;
+        self.mapping_control
+            .publish_memory_invalidation(self.memory.invalidation_cursor());
+        Ok(())
+    }
+
+    pub fn unmap_memory_alias(
+        &self,
+        destination: nixe_memory::GuestVirtualAddress,
+        source: nixe_memory::GuestVirtualAddress,
+        size: u64,
+        source_before: MemoryMappingProperties,
+        source_after: MemoryMappingProperties,
+        destination_properties: MemoryMappingProperties,
+    ) -> Result<(), MemoryAliasError> {
+        self.mapping_control.request_mapping_safepoint();
+        self.memory.unmap_alias(MemoryAliasRequest::new(
+            self.cpu.address_space_id(),
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        ))?;
         self.mapping_control
             .publish_memory_invalidation(self.memory.invalidation_cursor());
         Ok(())
