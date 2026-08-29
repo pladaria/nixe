@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use nixe_cpu::exception::ExceptionKind;
 use nixe_cpu::memory::{
-    DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAttributes,
-    MemoryMappingError, MemoryMappingErrorReason, MemoryMappingPurpose, MemoryPermissions,
-    MemoryProtectionError, MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind,
-    MemoryValue, ProcessMemory,
+    DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize, MemoryAliasError,
+    MemoryAliasErrorReason, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError,
+    MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory,
 };
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -69,6 +69,7 @@ impl HorizonKernelResult {
     pub const INVALID_ADDRESS: Self = Self(0xcc01);
     pub const INVALID_SIZE: Self = Self(0xca01);
     pub const INVALID_CURRENT_MEMORY: Self = Self(0xd401);
+    pub const INVALID_MEMORY_REGION: Self = Self(0xdc01);
     pub const OUT_OF_RESOURCE: Self = Self(0xce01);
     pub const TIMED_OUT: Self = Self(0xea01);
     pub const CANCELLED: Self = Self(0xec01);
@@ -98,6 +99,7 @@ impl HorizonKernelResult {
             Self::INVALID_ADDRESS => "InvalidAddress",
             Self::INVALID_SIZE => "InvalidSize",
             Self::INVALID_CURRENT_MEMORY => "InvalidCurrentMemory",
+            Self::INVALID_MEMORY_REGION => "InvalidMemoryRegion",
             Self::OUT_OF_RESOURCE => "OutOfResource",
             Self::TIMED_OUT => "TimedOut",
             Self::CANCELLED => "Cancelled",
@@ -185,6 +187,9 @@ pub enum HorizonSvcFault {
     MemoryMapping {
         fault: MemoryMappingError,
     },
+    MemoryAlias {
+        fault: MemoryAliasError,
+    },
     CanonicalMemory {
         immediate: u32,
         fault: CanonicalRangeTranslationError,
@@ -238,6 +243,20 @@ impl HorizonSvcFault {
                 }
                 MemoryMappingErrorReason::GenerationExhausted => None,
             },
+            Self::MemoryAlias { fault } => match fault.reason {
+                MemoryAliasErrorReason::InvalidRange
+                | MemoryAliasErrorReason::SourceStateMismatch
+                | MemoryAliasErrorReason::DestinationStateMismatch => {
+                    Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
+                }
+                MemoryAliasErrorReason::PhysicalIdentityMismatch => {
+                    Some(HorizonKernelResult::INVALID_MEMORY_REGION)
+                }
+                MemoryAliasErrorReason::ResourceExhausted => {
+                    Some(HorizonKernelResult::OUT_OF_RESOURCE)
+                }
+                MemoryAliasErrorReason::GenerationExhausted => None,
+            },
             Self::CanonicalMemory { .. } | Self::Ipc { .. } | Self::InternalRuntime { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
@@ -283,6 +302,12 @@ impl Display for HorizonSvcFault {
             }
             Self::MemoryMapping { fault } => {
                 write!(formatter, "Horizon memory mapping failed: {fault:?}")
+            }
+            Self::MemoryAlias { fault } => {
+                write!(
+                    formatter,
+                    "Horizon memory alias transition failed: {fault:?}"
+                )
             }
             Self::CanonicalMemory { immediate, fault } => write!(
                 formatter,
@@ -1007,6 +1032,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x01 => set_heap_size(context),
             0x02 => set_memory_permission(context),
             0x03 => set_memory_attribute(context),
+            0x04 => map_memory(context),
+            0x05 => unmap_memory(context),
             0x06 => query_memory(context, immediate),
             0x07 => terminate(ExceptionTerminationScope::Process),
             0x08 => self.create_thread(context),
@@ -1077,8 +1104,8 @@ impl Default for HorizonSvcDispatcher {
 
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
-        0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10 | 0x13 | 0x14
-        | 0x15 | 0x16 | 0x25 | 0x32 | 0x40 | 0x41 | 0x45 | 0x70 | 0x71 | 0x72 => {
+        0x04 | 0x05 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10
+        | 0x13 | 0x14 | 0x15 | 0x16 | 0x25 | 0x32 | 0x40 | 0x41 | 0x45 | 0x70 | 0x71 | 0x72 => {
             HorizonSvcSupport::Complete
         }
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c | 0x1d
@@ -1696,6 +1723,7 @@ fn query_memory(
             MemoryMappingPurpose::ModuleCodeStatic => 8,
             MemoryMappingPurpose::ModuleCodeMutable => 9,
             MemoryMappingPurpose::ThreadLocal => 0x0c,
+            MemoryMappingPurpose::Stack => 0x0b,
             MemoryMappingPurpose::Heap => 5,
             MemoryMappingPurpose::SharedMemory => 6,
         },

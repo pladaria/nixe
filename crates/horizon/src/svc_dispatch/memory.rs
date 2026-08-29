@@ -166,6 +166,198 @@ pub(super) fn set_memory_permission(
     }
 }
 
+pub(super) fn map_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let (destination, source, size) = match memory_alias_arguments(context) {
+        Ok(arguments) => arguments,
+        Err(code) => {
+            result(context, code);
+            return resume();
+        }
+    };
+    let Some(source_query) = query_complete_range(context, source, size).filter(|query| {
+        query.region == Some(MemoryRegionKind::Ram)
+            && query.permissions == MemoryPermissions::READ_WRITE
+            && query.attributes == MemoryAttributes::NONE
+            && allows_memory_alias_source(query.purpose)
+    }) else {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    };
+    let destination_is_free = query_complete_range(context, destination, size)
+        .is_some_and(|query| query.region.is_none());
+    if !destination_is_free {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    }
+
+    let source_before = mapping_properties(source_query);
+    let source_after = MemoryMappingProperties::new(
+        MemoryPermissions::NONE,
+        source_query.purpose,
+        MemoryAttributes::PERMISSION_LOCKED,
+    );
+    let destination_properties = MemoryMappingProperties::new(
+        MemoryPermissions::READ_WRITE,
+        MemoryMappingPurpose::Stack,
+        MemoryAttributes::NONE,
+    );
+    // Horizon moves user access from the source to a Stack-state virtual alias;
+    // both ranges retain the same physical pages. Public reference, pinned to
+    // the implementation used for these state transitions:
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_page_table_base.cpp#L961-L1020
+    match context.process().map_memory_alias(
+        destination,
+        source,
+        size,
+        source_before,
+        source_after,
+        destination_properties,
+    ) {
+        Ok(()) => {
+            log::debug!("mapped memory alias from {source} to {destination} ({size:#x} bytes)");
+            result(context, HorizonKernelResult::SUCCESS);
+            resume()
+        }
+        Err(fault) => reject(context, HorizonSvcFault::MemoryAlias { fault }),
+    }
+}
+
+pub(super) fn unmap_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let (destination, source, size) = match memory_alias_arguments(context) {
+        Ok(arguments) => arguments,
+        Err(code) => {
+            result(context, code);
+            return resume();
+        }
+    };
+    let Some(source_query) = query_complete_range(context, source, size).filter(|query| {
+        query.region == Some(MemoryRegionKind::Ram)
+            && query.permissions == MemoryPermissions::NONE
+            && query.attributes == MemoryAttributes::PERMISSION_LOCKED
+            && allows_memory_alias_source(query.purpose)
+    }) else {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    };
+    let Some(destination_query) =
+        query_complete_range(context, destination, size).filter(|query| {
+            query.region == Some(MemoryRegionKind::Ram)
+                && query.permissions == MemoryPermissions::READ_WRITE
+                && query.purpose == MemoryMappingPurpose::Stack
+                && query.attributes == MemoryAttributes::NONE
+        })
+    else {
+        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+        return resume();
+    };
+
+    let source_before = mapping_properties(source_query);
+    let source_after = MemoryMappingProperties::new(
+        MemoryPermissions::READ_WRITE,
+        source_query.purpose,
+        MemoryAttributes::NONE,
+    );
+    let destination_properties = mapping_properties(destination_query);
+    // Unmapping must verify that the Stack range still contains the exact page
+    // group borrowed from the locked source before restoring source access:
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_page_table_base.cpp#L1022-L1083
+    match context.process().unmap_memory_alias(
+        destination,
+        source,
+        size,
+        source_before,
+        source_after,
+        destination_properties,
+    ) {
+        Ok(()) => {
+            log::debug!(
+                "unmapped memory alias from {destination} and restored {source} ({size:#x} bytes)"
+            );
+            result(context, HorizonKernelResult::SUCCESS);
+            resume()
+        }
+        Err(fault) => reject(context, HorizonSvcFault::MemoryAlias { fault }),
+    }
+}
+
+fn memory_alias_arguments(
+    context: &ExceptionDispatchContext<'_>,
+) -> Result<(GuestVirtualAddress, GuestVirtualAddress, u64), HorizonKernelResult> {
+    let destination = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
+    let source = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
+    let size = read_register(context.thread().state(), 2);
+    // Public SVC ABI validation and register order:
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_memory.cpp#L72-L128
+    if !destination.is_aligned_to(USER_BUFFER_ALIGNMENT)
+        || !source.is_aligned_to(USER_BUFFER_ALIGNMENT)
+    {
+        return Err(HorizonKernelResult::INVALID_ADDRESS);
+    }
+    if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
+        return Err(HorizonKernelResult::INVALID_SIZE);
+    }
+    let Some(source_end) = source.get().checked_add(size) else {
+        return Err(HorizonKernelResult::INVALID_CURRENT_MEMORY);
+    };
+    let Some(destination_end) = destination.get().checked_add(size) else {
+        return Err(HorizonKernelResult::INVALID_CURRENT_MEMORY);
+    };
+    if source_end > context.process().address_space_limit() {
+        return Err(HorizonKernelResult::INVALID_CURRENT_MEMORY);
+    }
+    let stack = context.process().memory_layout().stack();
+    let stack_end = stack
+        .base()
+        .get()
+        .checked_add(stack.size())
+        .expect("validated process stack region does not overflow");
+    if destination.get() < stack.base().get() || destination_end > stack_end {
+        return Err(HorizonKernelResult::INVALID_MEMORY_REGION);
+    }
+    Ok((destination, source, size))
+}
+
+fn query_complete_range(
+    context: &ExceptionDispatchContext<'_>,
+    start: GuestVirtualAddress,
+    size: u64,
+) -> Option<MemoryQueryResult> {
+    let end = start.get().checked_add(size)?;
+    context
+        .process()
+        .memory()
+        .query_memory(
+            context.process().cpu().address_space_id(),
+            start,
+            GuestVirtualAddress::new(context.process().address_space_limit()),
+        )
+        .filter(|query| {
+            query.base.get() <= start.get()
+                && query
+                    .base
+                    .get()
+                    .checked_add(query.size)
+                    .is_some_and(|query_end| query_end >= end)
+        })
+}
+
+fn mapping_properties(query: MemoryQueryResult) -> MemoryMappingProperties {
+    MemoryMappingProperties::new(query.permissions, query.purpose, query.attributes)
+}
+
+fn allows_memory_alias_source(purpose: MemoryMappingPurpose) -> bool {
+    matches!(
+        purpose,
+        MemoryMappingPurpose::CodeMutable
+            | MemoryMappingPurpose::ModuleCodeMutable
+            | MemoryMappingPurpose::Heap
+    )
+}
+
 pub(super) fn map_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
     hid_system: &mut crate::HidSystem,

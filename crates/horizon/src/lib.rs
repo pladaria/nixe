@@ -3,6 +3,7 @@
 //! Runtime stays console-agnostic; Horizon-specific sessions and services are
 //! layered on its process, mount, and extensible handle primitives.
 
+mod bsd;
 mod diagnostics;
 mod error_applet;
 mod graphics;
@@ -17,7 +18,9 @@ mod parcel;
 mod scheduler_profile;
 mod svc;
 mod svc_dispatch;
+mod user;
 
+pub use bsd::BsdSession;
 pub use diagnostics::{FileSystemAccessLogMode, GuestLogLevel, HorizonDiagnostics};
 pub use error_applet::ErrorAppletDiagnostic;
 pub use graphics::{
@@ -40,14 +43,15 @@ pub use nvdrv::{
     UnsupportedNvDrvOperation,
 };
 pub use object::{
-    AccountSession, AppletSession, DirectoryEntry, DirectoryEntryKind, HidAppletResource,
-    HidSession, HorizonIpcObject, HostDirectoryFileSystem, HostFile, IpcSession, LogManagerSession,
-    LoggerSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
-    PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, ReadOnlyStorage, RegionCode, SemanticIpcObject, ServiceManagerSession,
-    SettingsEnvironment, SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage,
-    SystemSettingsSession, TimeEnvironment, TimeServiceSession, TimeZoneServiceSession,
-    UserSettingsSession,
+    AccountManagerForApplicationSession, AccountSession, AppletSession, DirectoryEntry,
+    DirectoryEntryKind, HidAppletResource, HidSession, HorizonIpcObject, HostDirectoryFileSystem,
+    HostFile, IpcSession, LogManagerSession, LoggerSession, NetworkGeneralServiceSession,
+    NetworkInterfaceManagerSession, OperationMode, ParentalControlFactorySession,
+    ParentalControlSession, PerformanceManagerSession, PerformanceSession, ReadOnlyDirectory,
+    ReadOnlyFile, ReadOnlyFileSystem, ReadOnlyStorage, RegionCode, SemanticIpcObject,
+    ServiceManagerSession, SettingsEnvironment, SteadyClockSession, SystemClockKind,
+    SystemClockSession, SystemLanguage, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
+    TimeZoneServiceSession, UserSettingsSession,
 };
 pub use scheduler_profile::{
     HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,

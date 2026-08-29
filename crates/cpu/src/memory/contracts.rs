@@ -600,6 +600,7 @@ pub enum MemoryMappingPurpose {
     ModuleCodeStatic,
     ModuleCodeMutable,
     ThreadLocal,
+    Stack,
     Heap,
     SharedMemory,
 }
@@ -630,6 +631,67 @@ impl MemoryMappingPurpose {
             self,
             Self::CodeMutable | Self::ModuleCodeMutable | Self::Heap
         )
+    }
+}
+
+/// Complete guest-visible metadata attached to one ordinary virtual mapping.
+///
+/// Mapping transactions compare these properties before mutating anything so
+/// platform policy cannot accidentally apply a stale address-space decision.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryMappingProperties {
+    pub permissions: MemoryPermissions,
+    pub purpose: MemoryMappingPurpose,
+    pub attributes: MemoryAttributes,
+}
+
+impl MemoryMappingProperties {
+    #[must_use]
+    pub const fn new(
+        permissions: MemoryPermissions,
+        purpose: MemoryMappingPurpose,
+        attributes: MemoryAttributes,
+    ) -> Self {
+        Self {
+            permissions,
+            purpose,
+            attributes,
+        }
+    }
+}
+
+/// One fully specified atomic alias transition.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryAliasRequest {
+    pub address_space: AddressSpaceId,
+    pub destination: GuestVirtualAddress,
+    pub source: GuestVirtualAddress,
+    pub size: u64,
+    pub source_before: MemoryMappingProperties,
+    pub source_after: MemoryMappingProperties,
+    pub destination_properties: MemoryMappingProperties,
+}
+
+impl MemoryAliasRequest {
+    #[must_use]
+    pub const fn new(
+        address_space: AddressSpaceId,
+        destination: GuestVirtualAddress,
+        source: GuestVirtualAddress,
+        size: u64,
+        source_before: MemoryMappingProperties,
+        source_after: MemoryMappingProperties,
+        destination_properties: MemoryMappingProperties,
+    ) -> Self {
+        Self {
+            address_space,
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        }
     }
 }
 
@@ -919,6 +981,14 @@ pub trait ProcessMemory: CpuMemory {
         purpose: MemoryMappingPurpose,
     ) -> Result<(), MemoryMappingError>;
 
+    /// Atomically aliases existing RAM pages at an unmapped destination while
+    /// replacing the source mapping metadata.
+    fn map_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError>;
+
+    /// Atomically removes an alias after verifying its physical identity and
+    /// restores the source mapping metadata.
+    fn unmap_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError>;
+
     /// Atomically replaces permissions on a complete page-aligned mapped range.
     fn set_permissions(
         &self,
@@ -937,6 +1007,24 @@ pub trait ProcessMemory: CpuMemory {
         mask: MemoryAttributes,
         value: MemoryAttributes,
     ) -> Result<(), MemoryProtectionError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MemoryAliasErrorReason {
+    InvalidRange,
+    SourceStateMismatch,
+    DestinationStateMismatch,
+    PhysicalIdentityMismatch,
+    ResourceExhausted,
+    GenerationExhausted,
+}
+
+/// Pointer-free reason an atomic virtual alias transition was rejected.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MemoryAliasError {
+    pub address_space: AddressSpaceId,
+    pub address: GuestVirtualAddress,
+    pub reason: MemoryAliasErrorReason,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -28,14 +28,24 @@ pub(super) fn write_descriptor_bytes(
 }
 
 pub(super) fn has_ipc_descriptors(hipc: &HipcRequest<'_>) -> bool {
-    hipc.pid.is_some()
-        || !hipc.copy_handles.is_empty()
+    hipc.pid.is_some() || has_ipc_descriptors_other_than_pid(hipc)
+}
+
+pub(super) fn has_ipc_descriptors_other_than_pid(hipc: &HipcRequest<'_>) -> bool {
+    !hipc.copy_handles.is_empty()
         || !hipc.move_handles.is_empty()
         || !hipc.send_statics.is_empty()
         || !hipc.send_buffers.is_empty()
         || !hipc.receive_buffers.is_empty()
         || !hipc.exchange_buffers.is_empty()
         || !matches!(hipc.receive_statics, ReceiveStatics::None)
+}
+
+/// Plain CMIF rounds its data-word region up, while domain CMIF reports the
+/// semantic payload length. Accept only zeroes in either transport's tail.
+pub(super) fn has_only_transport_padding(data: &[u8], payload_size: usize) -> bool {
+    data.get(payload_size..)
+        .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
 }
 
 pub(super) fn cmif_error(

@@ -164,6 +164,17 @@ impl ProcessBuilder {
             stack_bottom,
             stack_size,
         )?;
+        if !memory.set_mapping_purpose(
+            self.config.address_space_id,
+            stack_bottom,
+            stack_size,
+            MemoryMappingPurpose::Stack,
+        ) {
+            return Err(error(
+                ProcessBuildStage::Mapping,
+                "installed main stack could not retain its purpose",
+            ));
+        }
         install_zero_pages(
             &mut memory,
             self.config.address_space_id,

@@ -120,13 +120,7 @@ fn dispatch_parental_control_factory(
         | ParentalControlFactoryCommand::CreateServiceWithoutInitialize) => {
             if hipc.pid.is_none()
                 || request_u64(request.data, 0) != Some(0)
-                || !hipc.copy_handles.is_empty()
-                || !hipc.move_handles.is_empty()
-                || !hipc.send_statics.is_empty()
-                || !hipc.send_buffers.is_empty()
-                || !hipc.receive_buffers.is_empty()
-                || !hipc.exchange_buffers.is_empty()
-                || !matches!(hipc.receive_statics, ReceiveStatics::None)
+                || has_ipc_descriptors_other_than_pid(hipc)
             {
                 return parental_control_response(
                     factory,

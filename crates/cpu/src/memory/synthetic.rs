@@ -24,7 +24,8 @@ use super::{
     AtomicMemoryResult, AtomicRmwKind, CodeDependencies, CodePageDependency, CodePageSpan,
     CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, DataReadResult,
     DataWriteResult, FetchedCode, InstructionMemory, MemoryAccess, MemoryAccessClass,
-    MemoryAlignment, MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason,
+    MemoryAliasError, MemoryAliasErrorReason, MemoryAliasRequest, MemoryAlignment,
+    MemoryAttributes, MemoryMappingError, MemoryMappingErrorReason, MemoryMappingProperties,
     MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, MemoryProtectionErrorReason,
     MemoryQueryResult, MemoryRegionKind, MemoryValue, ProcessMemory, SYNTHETIC_PAGE_SIZE,
     SyntheticInstallError, SyntheticInstallStage, SyntheticMappingInfo, SyntheticMmio,
@@ -38,6 +39,12 @@ struct Mapping {
     permissions: MemoryPermissions,
     purpose: MemoryMappingPurpose,
     attributes: MemoryAttributes,
+}
+
+impl Mapping {
+    fn properties(self) -> MemoryMappingProperties {
+        MemoryMappingProperties::new(self.permissions, self.purpose, self.attributes)
+    }
 }
 
 enum PhysicalPage {
@@ -1780,6 +1787,222 @@ impl ProcessMemory for SyntheticMemory {
         Ok(())
     }
 
+    fn map_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError> {
+        let MemoryAliasRequest {
+            address_space,
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        } = request;
+        let error = |address, reason| MemoryAliasError {
+            address_space,
+            address,
+            reason,
+        };
+        let (Some(source_range), Some(destination_range)) = (
+            PageRange::new(source, size),
+            PageRange::new(destination, size),
+        ) else {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        };
+        if source_range.is_empty() {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        }
+
+        let mut inner = self.lock_inner();
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let Some(source_mapping) = inner.mappings.get(&(address_space, source_page)).copied()
+            else {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            };
+            if source_mapping.properties() != source_before
+                || !matches!(
+                    inner.pages.get(&source_mapping.physical_page),
+                    Some(PhysicalPage::Ram { .. })
+                )
+            {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            }
+            if inner
+                .mappings
+                .contains_key(&(address_space, destination_page))
+            {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            }
+        }
+
+        let invalidation_kinds = [
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: source,
+                size,
+            },
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: destination,
+                size,
+            },
+        ];
+        let invalidation = self
+            .invalidations
+            .reserve_many(&invalidation_kinds)
+            .map_err(|_| error(source, MemoryAliasErrorReason::ResourceExhausted))?;
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(source, MemoryAliasErrorReason::GenerationExhausted))?;
+
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let source_mapping = inner.mappings[&(address_space, source_page)];
+            let mapping = inner
+                .mappings
+                .get_mut(&(address_space, source_page))
+                .expect("alias source range was preflighted");
+            mapping.permissions = source_after.permissions;
+            mapping.purpose = source_after.purpose;
+            mapping.attributes = source_after.attributes;
+            mapping.mapping_generation = mapping_generation;
+            let previous = inner.mappings.insert(
+                (address_space, destination_page),
+                Mapping {
+                    physical_page: source_mapping.physical_page,
+                    mapping_generation,
+                    permissions: destination_properties.permissions,
+                    purpose: destination_properties.purpose,
+                    attributes: destination_properties.attributes,
+                },
+            );
+            debug_assert!(previous.is_none());
+        }
+        invalidation.commit();
+        Ok(())
+    }
+
+    fn unmap_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError> {
+        let MemoryAliasRequest {
+            address_space,
+            destination,
+            source,
+            size,
+            source_before,
+            source_after,
+            destination_properties,
+        } = request;
+        let error = |address, reason| MemoryAliasError {
+            address_space,
+            address,
+            reason,
+        };
+        let (Some(source_range), Some(destination_range)) = (
+            PageRange::new(source, size),
+            PageRange::new(destination, size),
+        ) else {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        };
+        if source_range.is_empty() {
+            return Err(error(source, MemoryAliasErrorReason::InvalidRange));
+        }
+
+        let mut inner = self.lock_inner();
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let Some(source_mapping) = inner.mappings.get(&(address_space, source_page)).copied()
+            else {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            };
+            if source_mapping.properties() != source_before {
+                return Err(error(
+                    page_address(source_page),
+                    MemoryAliasErrorReason::SourceStateMismatch,
+                ));
+            }
+            let Some(destination_mapping) = inner
+                .mappings
+                .get(&(address_space, destination_page))
+                .copied()
+            else {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            };
+            if destination_mapping.properties() != destination_properties {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::DestinationStateMismatch,
+                ));
+            }
+            if source_mapping.physical_page != destination_mapping.physical_page {
+                return Err(error(
+                    page_address(destination_page),
+                    MemoryAliasErrorReason::PhysicalIdentityMismatch,
+                ));
+            }
+        }
+
+        let invalidation_kinds = [
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: source,
+                size,
+            },
+            MemoryInvalidationKind::Mapping {
+                address_space,
+                start: destination,
+                size,
+            },
+        ];
+        let invalidation = self
+            .invalidations
+            .reserve_many(&invalidation_kinds)
+            .map_err(|_| error(source, MemoryAliasErrorReason::ResourceExhausted))?;
+        let mapping_generation = take_mapping_generation(&mut inner.next_mapping_generation)
+            .ok_or_else(|| error(source, MemoryAliasErrorReason::GenerationExhausted))?;
+
+        for (source_page, destination_page) in (source_range.first..source_range.end)
+            .zip(destination_range.first..destination_range.end)
+        {
+            let removed = inner
+                .mappings
+                .remove(&(address_space, destination_page))
+                .expect("alias destination range was preflighted");
+            debug_assert!(
+                inner
+                    .mappings
+                    .values()
+                    .any(|mapping| mapping.physical_page == removed.physical_page)
+            );
+            let mapping = inner
+                .mappings
+                .get_mut(&(address_space, source_page))
+                .expect("alias source range was preflighted");
+            mapping.permissions = source_after.permissions;
+            mapping.purpose = source_after.purpose;
+            mapping.attributes = source_after.attributes;
+            mapping.mapping_generation = mapping_generation;
+        }
+        invalidation.commit();
+        Ok(())
+    }
+
     fn set_permissions(
         &self,
         address_space: AddressSpaceId,
@@ -2417,6 +2640,301 @@ mod tests {
                 .value,
             MemoryValue::U32(0x5566_7788)
         );
+    }
+
+    fn exercise_atomic_alias_lifecycle(memory: &dyn ProcessMemory) {
+        let source = GuestVirtualAddress::new(0x20_0000);
+        let destination = GuestVirtualAddress::new(0x40_0000);
+        let size = (SYNTHETIC_PAGE_SIZE * 2) as u64;
+        let source_properties = MemoryMappingProperties::new(
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::Heap,
+            MemoryAttributes::NONE,
+        );
+        let locked_source = MemoryMappingProperties::new(
+            MemoryPermissions::NONE,
+            MemoryMappingPurpose::Heap,
+            MemoryAttributes::PERMISSION_LOCKED,
+        );
+        let alias_properties = MemoryMappingProperties::new(
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::Stack,
+            MemoryAttributes::NONE,
+        );
+        memory
+            .resize_zeroed_mapping(
+                SPACE,
+                source,
+                0,
+                size,
+                source_properties.permissions,
+                source_properties.purpose,
+            )
+            .unwrap();
+        memory
+            .write(
+                SPACE,
+                source,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0x1122_3344),
+            )
+            .unwrap();
+
+        memory
+            .map_alias(MemoryAliasRequest::new(
+                SPACE,
+                destination,
+                source,
+                size,
+                source_properties,
+                locked_source,
+                alias_properties,
+            ))
+            .unwrap();
+        assert_eq!(
+            memory
+                .read(SPACE, source, MemoryAccess::normal(MemoryAccessSize::Word))
+                .unwrap_err()
+                .reason,
+            DataAccessFaultReason::ReadPermissionDenied
+        );
+        assert_eq!(
+            memory
+                .read(
+                    SPACE,
+                    destination,
+                    MemoryAccess::normal(MemoryAccessSize::Word)
+                )
+                .unwrap()
+                .value,
+            MemoryValue::U32(0x1122_3344)
+        );
+        memory
+            .write(
+                SPACE,
+                destination,
+                MemoryAccess::normal(MemoryAccessSize::Word),
+                MemoryValue::U32(0xaabb_ccdd),
+            )
+            .unwrap();
+
+        memory
+            .unmap_alias(MemoryAliasRequest::new(
+                SPACE,
+                destination,
+                source,
+                size,
+                locked_source,
+                source_properties,
+                alias_properties,
+            ))
+            .unwrap();
+        assert_eq!(
+            memory
+                .read(SPACE, source, MemoryAccess::normal(MemoryAccessSize::Word))
+                .unwrap()
+                .value,
+            MemoryValue::U32(0xaabb_ccdd)
+        );
+        assert!(
+            memory
+                .query_memory(SPACE, destination, GuestVirtualAddress::new(0x80_0000))
+                .is_some_and(|query| query.region.is_none())
+        );
+        let restored = memory
+            .query_memory(SPACE, source, GuestVirtualAddress::new(0x80_0000))
+            .unwrap();
+        assert_eq!(restored.permissions, source_properties.permissions);
+        assert_eq!(restored.purpose, source_properties.purpose);
+        assert_eq!(restored.attributes, source_properties.attributes);
+    }
+
+    #[test]
+    fn process_memory_alias_transactions_preserve_physical_storage_and_contents() {
+        let synthetic = SyntheticMemory::new();
+        exercise_atomic_alias_lifecycle(&synthetic);
+        assert_eq!(synthetic.physical_page_count(), 2);
+
+        let execution = ExecutionMemory::new();
+        exercise_atomic_alias_lifecycle(&execution);
+        assert_eq!(execution.physical_page_count(), 2);
+    }
+
+    #[test]
+    fn alias_destination_collision_rejects_without_changing_the_source() {
+        let memory = SyntheticMemory::new();
+        let source = GuestVirtualAddress::new(0x20_0000);
+        let destination = GuestVirtualAddress::new(0x40_0000);
+        let size = SYNTHETIC_PAGE_SIZE as u64;
+        let source_properties = MemoryMappingProperties::new(
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::Heap,
+            MemoryAttributes::NONE,
+        );
+        for address in [source, destination] {
+            memory
+                .resize_zeroed_mapping(
+                    SPACE,
+                    address,
+                    0,
+                    size,
+                    source_properties.permissions,
+                    source_properties.purpose,
+                )
+                .unwrap();
+        }
+
+        let error = memory
+            .map_alias(MemoryAliasRequest::new(
+                SPACE,
+                destination,
+                source,
+                size,
+                source_properties,
+                MemoryMappingProperties::new(
+                    MemoryPermissions::NONE,
+                    MemoryMappingPurpose::Heap,
+                    MemoryAttributes::PERMISSION_LOCKED,
+                ),
+                MemoryMappingProperties::new(
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Stack,
+                    MemoryAttributes::NONE,
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            MemoryAliasErrorReason::DestinationStateMismatch
+        );
+        let source_query = memory
+            .query_memory(SPACE, source, GuestVirtualAddress::new(0x80_0000))
+            .unwrap();
+        assert_eq!(source_query.permissions, source_properties.permissions);
+        assert_eq!(source_query.attributes, source_properties.attributes);
+        assert_eq!(memory.physical_page_count(), 2);
+    }
+
+    #[test]
+    fn unmap_alias_rejects_a_different_physical_page_group_without_changes() {
+        let mut memory = SyntheticMemory::new();
+        let source = GuestVirtualAddress::new(0x20_0000);
+        let destination = GuestVirtualAddress::new(0x40_0000);
+        let size = SYNTHETIC_PAGE_SIZE as u64;
+        for address in [source, destination] {
+            memory
+                .resize_zeroed_mapping(
+                    SPACE,
+                    address,
+                    0,
+                    size,
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                )
+                .unwrap();
+        }
+        assert!(memory.set_mapping_purpose(SPACE, destination, size, MemoryMappingPurpose::Stack));
+        memory
+            .set_permissions(SPACE, source, size, MemoryPermissions::NONE)
+            .unwrap();
+        memory
+            .set_attributes(
+                SPACE,
+                source,
+                size,
+                MemoryAttributes::PERMISSION_LOCKED,
+                MemoryAttributes::PERMISSION_LOCKED,
+            )
+            .unwrap();
+        let locked_source = MemoryMappingProperties::new(
+            MemoryPermissions::NONE,
+            MemoryMappingPurpose::Heap,
+            MemoryAttributes::PERMISSION_LOCKED,
+        );
+        let destination_properties = MemoryMappingProperties::new(
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::Stack,
+            MemoryAttributes::NONE,
+        );
+
+        let error = memory
+            .unmap_alias(MemoryAliasRequest::new(
+                SPACE,
+                destination,
+                source,
+                size,
+                locked_source,
+                MemoryMappingProperties::new(
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Heap,
+                    MemoryAttributes::NONE,
+                ),
+                destination_properties,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            MemoryAliasErrorReason::PhysicalIdentityMismatch
+        );
+        assert_eq!(
+            memory.mapping_info(SPACE, source).unwrap().attributes,
+            locked_source.attributes
+        );
+        assert_eq!(
+            memory.mapping_info(SPACE, destination).unwrap().purpose,
+            destination_properties.purpose
+        );
+        assert_eq!(memory.physical_page_count(), 2);
+    }
+
+    #[test]
+    fn alias_generation_exhaustion_is_atomic() {
+        let mut memory = SyntheticMemory::new();
+        let source = GuestVirtualAddress::new(0x20_0000);
+        let destination = GuestVirtualAddress::new(0x40_0000);
+        let size = SYNTHETIC_PAGE_SIZE as u64;
+        let source_properties = MemoryMappingProperties::new(
+            MemoryPermissions::READ_WRITE,
+            MemoryMappingPurpose::Heap,
+            MemoryAttributes::NONE,
+        );
+        memory
+            .resize_zeroed_mapping(
+                SPACE,
+                source,
+                0,
+                size,
+                source_properties.permissions,
+                source_properties.purpose,
+            )
+            .unwrap();
+        memory.inner_mut().next_mapping_generation = None;
+
+        let error = memory
+            .map_alias(MemoryAliasRequest::new(
+                SPACE,
+                destination,
+                source,
+                size,
+                source_properties,
+                MemoryMappingProperties::new(
+                    MemoryPermissions::NONE,
+                    MemoryMappingPurpose::Heap,
+                    MemoryAttributes::PERMISSION_LOCKED,
+                ),
+                MemoryMappingProperties::new(
+                    MemoryPermissions::READ_WRITE,
+                    MemoryMappingPurpose::Stack,
+                    MemoryAttributes::NONE,
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(error.reason, MemoryAliasErrorReason::GenerationExhausted);
+        assert_eq!(
+            memory.mapping_info(SPACE, source).unwrap().permissions,
+            source_properties.permissions
+        );
+        assert!(memory.mapping_info(SPACE, destination).is_none());
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]

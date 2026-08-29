@@ -17,6 +17,8 @@ use nixe_runtime::{
 use crate::graphics::ViSession;
 use crate::ipc::IpcService;
 use crate::nvdrv::NvDrvSession;
+use crate::user::{DEFAULT_USER, UserIdentity};
+use crate::{BsdSession, bsd::BsdServiceRegistry};
 
 /// Every Horizon-owned object that may receive an IPC request through a
 /// process handle.
@@ -34,6 +36,8 @@ pub enum HorizonIpcObject {
     Performance(PerformanceSession),
     Applet(AppletSession),
     Account(AccountSession),
+    AccountManagerForApplication(AccountManagerForApplicationSession),
+    Bsd(BsdSession),
     Hid(HidSession),
     HidAppletResource(HidAppletResource),
     Time(TimeServiceSession),
@@ -46,6 +50,8 @@ pub enum HorizonIpcObject {
     Logger(LoggerSession),
     ParentalControl(ParentalControlFactorySession),
     ParentalControlService(ParentalControlSession),
+    NetworkInterface(NetworkInterfaceManagerSession),
+    NetworkGeneralService(NetworkGeneralServiceSession),
     SemanticObject(SemanticIpcObject),
 }
 
@@ -64,12 +70,14 @@ pub enum SemanticIpcObject {
 #[derive(Clone, Debug)]
 pub struct ServiceManagerSession {
     registered: Arc<AtomicBool>,
+    bsd: BsdServiceRegistry,
 }
 
 impl ServiceManagerSession {
     pub(crate) fn new() -> Self {
         Self {
             registered: Arc::new(AtomicBool::new(false)),
+            bsd: BsdServiceRegistry::default(),
         }
     }
 
@@ -79,6 +87,10 @@ impl ServiceManagerSession {
 
     pub(crate) fn is_registered(&self) -> bool {
         self.registered.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bsd_session(&self) -> BsdSession {
+        self.bsd.open_session()
     }
 }
 
@@ -144,9 +156,21 @@ pub(crate) struct GuestLogMessage {
 }
 
 /// Client session connected to Horizon's `acc:u0` account service.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AccountSession {
     state: Arc<Mutex<AccountState>>,
+    domain: DomainSession<AccountObject>,
+    user: UserIdentity,
+}
+
+impl Default for AccountSession {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AccountState::default())),
+            domain: DomainSession::new(),
+            user: DEFAULT_USER,
+        }
+    }
 }
 
 impl AccountSession {
@@ -159,6 +183,52 @@ impl AccountSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .application_process_id = Some(process_id);
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+        self.domain.close_object(object_id)
+    }
+
+    pub(crate) fn object(&self, object_id: u32) -> Option<AccountObject> {
+        self.domain.object(object_id)
+    }
+
+    pub(crate) fn insert_object(&self, object: AccountObject) -> Option<u32> {
+        self.domain.insert_object(object)
+    }
+
+    pub(crate) const fn user(&self) -> UserIdentity {
+        self.user
+    }
+}
+
+/// Interface identities hosted by a domain-converted `acc:u0` session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccountObject {
+    BaasManagerForApplication(AccountManagerForApplicationSession),
+}
+
+/// Nintendo-account manager associated with one local application user.
+///
+/// This object does not imply that the local user has an online account. Its
+/// methods will expose Nixe's disconnected policy as they are implemented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountManagerForApplicationSession {
+    // Retained for manager methods which will expose per-user online state.
+    _user: UserIdentity,
+}
+
+impl AccountManagerForApplicationSession {
+    pub(crate) const fn new(user: UserIdentity) -> Self {
+        Self { _user: user }
     }
 }
 
@@ -179,6 +249,20 @@ mod account_tests {
         session.initialize_application_info(42);
 
         assert_eq!(clone.state.lock().unwrap().application_process_id, Some(42));
+        assert_eq!(clone.convert_to_domain(), IPC_ROOT_OBJECT_ID);
+        assert!(session.is_domain());
+        assert_eq!(session.user(), DEFAULT_USER);
+
+        let manager = AccountManagerForApplicationSession::new(session.user());
+        let object_id = session
+            .insert_object(AccountObject::BaasManagerForApplication(manager))
+            .unwrap();
+        assert_eq!(
+            clone.object(object_id),
+            Some(AccountObject::BaasManagerForApplication(manager))
+        );
+        assert!(clone.close_object(object_id));
+        assert_eq!(session.object(object_id), None);
     }
 }
 
@@ -371,6 +455,70 @@ impl ParentalControlSession {
     }
 }
 
+/// Root session for Horizon's user network-interface manager (`nifm:u`).
+///
+/// The root is normally converted to a domain before it creates the
+/// per-process general service:
+/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nifm.c
+#[derive(Clone, Debug)]
+pub struct NetworkInterfaceManagerSession {
+    domain: DomainSession<NetworkInterfaceObject>,
+}
+
+impl NetworkInterfaceManagerSession {
+    pub(crate) fn new() -> Self {
+        Self {
+            domain: DomainSession::new(),
+        }
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+
+    pub(crate) fn object(&self, object_id: u32) -> Option<NetworkInterfaceObject> {
+        self.domain.object(object_id)
+    }
+
+    pub(crate) fn insert_object(&self, object: NetworkInterfaceObject) -> Option<u32> {
+        self.domain.insert_object(object)
+    }
+
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+        self.domain.close_object(object_id)
+    }
+}
+
+/// Interface identity hosted by a domain-converted `nifm:u` session.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum NetworkInterfaceObject {
+    GeneralService(NetworkGeneralServiceSession),
+}
+
+/// Per-process `nn::nifm::detail::IGeneralService` session.
+///
+/// Nixe does not expose a network backend yet. Once connection-status methods
+/// are implemented, this object must report the explicit disconnected state
+/// until such a backend is configured.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NetworkGeneralServiceSession {
+    process_id: u64,
+}
+
+impl NetworkGeneralServiceSession {
+    pub(crate) const fn new(process_id: u64) -> Self {
+        Self { process_id }
+    }
+
+    pub(crate) const fn process_id(&self) -> u64 {
+        self.process_id
+    }
+}
+
 #[cfg(test)]
 mod ipc_session_tests {
     use super::*;
@@ -421,6 +569,30 @@ mod ipc_session_tests {
         ));
         assert!(session.close_object(object_id));
         assert!(cloned.object(object_id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod network_interface_tests {
+    use super::*;
+
+    #[test]
+    fn domain_retains_and_closes_the_general_service() {
+        let session = NetworkInterfaceManagerSession::new();
+
+        assert_eq!(session.convert_to_domain(), IPC_ROOT_OBJECT_ID);
+        let object_id = session
+            .insert_object(NetworkInterfaceObject::GeneralService(
+                NetworkGeneralServiceSession::new(42),
+            ))
+            .unwrap();
+        assert!(matches!(
+            session.object(object_id),
+            Some(NetworkInterfaceObject::GeneralService(service))
+                if service.process_id() == 42
+        ));
+        assert!(session.close_object(object_id));
+        assert!(session.object(object_id).is_none());
     }
 }
 
@@ -692,16 +864,74 @@ struct TimeState {
     location_name: [u8; TIME_LOCATION_NAME_SIZE],
     timezone: Tz,
     shared_memory: SharedMemoryObject,
-    clock_offsets: Mutex<[i64; 3]>,
+    clock_contexts: Mutex<[SystemClockContext; 3]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SystemClockContext {
+    offset: i64,
+    steady_time_point: i64,
+    source_id: [u8; 16],
+}
+
+impl SystemClockContext {
+    fn decode(encoded: [u8; 0x20]) -> Self {
+        Self {
+            offset: i64::from_le_bytes(encoded[..8].try_into().unwrap()),
+            steady_time_point: i64::from_le_bytes(encoded[8..16].try_into().unwrap()),
+            source_id: encoded[16..].try_into().unwrap(),
+        }
+    }
+
+    fn encode(self) -> [u8; 0x20] {
+        let mut encoded = [0; 0x20];
+        encoded[..8].copy_from_slice(&self.offset.to_le_bytes());
+        encoded[8..16].copy_from_slice(&self.steady_time_point.to_le_bytes());
+        encoded[16..].copy_from_slice(&self.source_id);
+        encoded
+    }
+
+    fn monotonic_base_time_point(
+        self,
+        current_steady_time: i64,
+        monotonic_elapsed: i64,
+    ) -> Result<i64, MonotonicClockError> {
+        self.offset
+            .checked_add(current_steady_time)
+            .and_then(|time| time.checked_sub(monotonic_elapsed))
+            .ok_or(MonotonicClockError::Overflowed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MonotonicClockError {
+    NotComparable,
+    Overflowed,
 }
 
 impl TimeState {
     fn current_time(&self, kind: SystemClockKind) -> i64 {
-        self.clock.unix_seconds().saturating_add(
-            self.clock_offsets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()],
-        )
+        let context = self.clock_context(kind);
+        context.offset.saturating_add(self.steady_seconds())
+    }
+
+    fn clock_context(&self, kind: SystemClockKind) -> SystemClockContext {
+        self.clock_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()]
+    }
+
+    fn steady_seconds(&self) -> i64 {
+        i64::try_from(self.clock.elapsed().as_secs()).unwrap_or(i64::MAX)
+    }
+
+    fn steady_and_monotonic_seconds(&self) -> (i64, i64) {
+        let monotonic_elapsed = self.steady_seconds();
+        // The standard steady clock currently has no internal offset, so its
+        // time point and Nixe's monotonic process epoch advance together. Keep
+        // both values explicit because Horizon command 300 relates these two
+        // clock domains, and a future steady-clock offset would separate them.
+        (monotonic_elapsed, monotonic_elapsed)
     }
 
     fn set_current_time(
@@ -709,23 +939,24 @@ impl TimeState {
         kind: SystemClockKind,
         unix_seconds: i64,
     ) -> Result<(), nixe_runtime::HandleError> {
-        self.clock_offsets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()] =
-            unix_seconds.saturating_sub(self.clock.unix_seconds());
-        let steady_seconds = i64::try_from(self.clock.elapsed().as_secs()).unwrap_or(i64::MAX);
-        let offset = unix_seconds.saturating_sub(steady_seconds);
-        let shared_offset = match kind {
-            SystemClockKind::Network => 0x80,
-            SystemClockKind::User | SystemClockKind::Local => 0x38,
+        let steady_time_point = self.steady_seconds();
+        let context = SystemClockContext {
+            offset: unix_seconds.saturating_sub(steady_time_point),
+            steady_time_point,
+            source_id: TIME_SOURCE_ID,
         };
-        write_system_clock_context(
-            &self.shared_memory,
-            shared_offset,
-            offset,
-            steady_seconds,
-            TIME_SOURCE_ID,
-        )
+        let shared_offset = match kind {
+            SystemClockKind::User => Some(0x38),
+            SystemClockKind::Network => Some(0x80),
+            SystemClockKind::Local => None,
+        };
+        if let Some(shared_offset) = shared_offset {
+            write_system_clock_context(&self.shared_memory, shared_offset, context)?;
+        }
+        self.clock_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[kind.index()] = context;
+        Ok(())
     }
 }
 
@@ -733,6 +964,15 @@ impl TimeState {
 #[derive(Clone, Debug)]
 pub struct TimeServiceSession {
     state: Arc<TimeState>,
+    domain: DomainSession<TimeObject>,
+}
+
+/// Child interface retained by a domain-converted `time:u` session.
+#[derive(Clone, Debug)]
+pub(crate) enum TimeObject {
+    SystemClock(SystemClockSession),
+    SteadyClock(SteadyClockSession),
+    TimeZone(TimeZoneServiceSession),
 }
 
 impl TimeServiceSession {
@@ -747,16 +987,42 @@ impl TimeServiceSession {
             .clock
             .unix_seconds()
             .saturating_sub(elapsed_seconds);
-        initialise_time_shared_memory(&shared_memory, wall_anchor, TIME_SOURCE_ID)?;
+        let initial_context = SystemClockContext {
+            offset: wall_anchor,
+            steady_time_point: 0,
+            source_id: TIME_SOURCE_ID,
+        };
+        initialise_time_shared_memory(&shared_memory, initial_context)?;
         Ok(Self {
             state: Arc::new(TimeState {
                 clock: environment.clock,
                 location_name: environment.location_name,
                 timezone: environment.timezone,
                 shared_memory,
-                clock_offsets: Mutex::new([0; 3]),
+                clock_contexts: Mutex::new([initial_context; 3]),
             }),
+            domain: DomainSession::new(),
         })
+    }
+
+    pub(crate) fn is_domain(&self) -> bool {
+        self.domain.is_domain()
+    }
+
+    pub(crate) fn convert_to_domain(&self) -> u32 {
+        self.domain.convert()
+    }
+
+    pub(crate) fn object(&self, object_id: u32) -> Option<TimeObject> {
+        self.domain.object(object_id)
+    }
+
+    pub(crate) fn insert_object(&self, object: TimeObject) -> Option<u32> {
+        self.domain.insert_object(object)
+    }
+
+    pub(crate) fn close_object(&self, object_id: u32) -> bool {
+        self.domain.close_object(object_id)
     }
 
     pub(crate) fn system_clock(&self, kind: SystemClockKind) -> SystemClockSession {
@@ -780,6 +1046,18 @@ impl TimeServiceSession {
 
     pub(crate) fn shared_memory(&self) -> SharedMemoryObject {
         self.state.shared_memory.clone()
+    }
+
+    pub(crate) fn calculate_monotonic_system_clock_base_time_point(
+        &self,
+        encoded_context: [u8; 0x20],
+    ) -> Result<i64, MonotonicClockError> {
+        let context = SystemClockContext::decode(encoded_context);
+        if context.source_id != TIME_SOURCE_ID {
+            return Err(MonotonicClockError::NotComparable);
+        }
+        let (current_steady_time, monotonic_elapsed) = self.state.steady_and_monotonic_seconds();
+        context.monotonic_base_time_point(current_steady_time, monotonic_elapsed)
     }
 }
 
@@ -819,6 +1097,10 @@ impl SystemClockSession {
     ) -> Result<(), nixe_runtime::HandleError> {
         self.state.set_current_time(self.kind, unix_seconds)
     }
+
+    pub(crate) fn context(&self) -> [u8; 0x20] {
+        self.state.clock_context(self.kind).encode()
+    }
 }
 
 /// Horizon `ISteadyClock` object.
@@ -852,18 +1134,17 @@ impl TimeZoneServiceSession {
 
 fn initialise_time_shared_memory(
     memory: &SharedMemoryObject,
-    unix_seconds: i64,
-    source_id: [u8; 16],
+    initial_context: SystemClockContext,
 ) -> Result<(), nixe_runtime::HandleError> {
     // libnx's lock-free reader and the three object offsets define this 4 KiB
     // layout. Both copies begin identical and use an even counter:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L96-L158
     let mut steady = [0_u8; 0x18];
-    steady[8..].copy_from_slice(&source_id);
+    steady[8..].copy_from_slice(&initial_context.source_id);
     write_shared_object(memory, 0x00, &steady)?;
 
-    write_system_clock_context(memory, 0x38, unix_seconds, 0, source_id)?;
-    write_system_clock_context(memory, 0x80, unix_seconds, 0, source_id)
+    write_system_clock_context(memory, 0x38, initial_context)?;
+    write_system_clock_context(memory, 0x80, initial_context)
 }
 
 fn write_shared_object(
@@ -878,19 +1159,15 @@ fn write_shared_object(
 fn write_system_clock_context(
     memory: &SharedMemoryObject,
     offset: usize,
-    clock_offset: i64,
-    steady_time_point: i64,
-    source_id: [u8; 16],
+    context: SystemClockContext,
 ) -> Result<(), nixe_runtime::HandleError> {
-    let mut context = [0_u8; 0x20];
-    context[..8].copy_from_slice(&clock_offset.to_le_bytes());
-    context[8..16].copy_from_slice(&steady_time_point.to_le_bytes());
-    context[16..].copy_from_slice(&source_id);
-    write_shared_object(memory, offset, &context)
+    write_shared_object(memory, offset, &context.encode())
 }
 
 const APPLET_ROOT_OBJECT_ID: u32 = 1;
 const MAX_APPLET_DOMAIN_OBJECTS: usize = 64;
+const PRESELECTED_USER_LAUNCH_PARAMETER_SIZE: usize = 0x88;
+const PRESELECTED_USER_LAUNCH_PARAMETER_MAGIC: u32 = 0xc794_97ca;
 
 /// Operation mode reported by Horizon's application applet service.
 ///
@@ -909,6 +1186,29 @@ pub enum OperationMode {
 impl OperationMode {
     pub(crate) const fn as_raw(self) -> u8 {
         self as u8
+    }
+}
+
+/// Kinds accepted by `IApplicationFunctions::PopLaunchParameter`.
+///
+/// Values follow the pinned libnx `AppletLaunchParameterKind` ABI:
+/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/applet.h#L74-L80
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u32)]
+pub(crate) enum AppletLaunchParameterKind {
+    UserChannel = 1,
+    PreselectedUser = 2,
+    Unknown = 3,
+}
+
+impl AppletLaunchParameterKind {
+    pub(crate) const fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            1 => Self::UserChannel,
+            2 => Self::PreselectedUser,
+            3 => Self::Unknown,
+            _ => return None,
+        })
     }
 }
 
@@ -1114,6 +1414,15 @@ pub(crate) enum CreateAppletStorageError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PopAppletLaunchParameterError {
+    NotDomain,
+    NotAvailable,
+    DomainCapacityExhausted,
+    ObjectIdExhausted,
+    StorageIdExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenAppletStorageAccessorError {
     StorageNotFound,
     DomainCapacityExhausted,
@@ -1159,6 +1468,8 @@ struct AppletDomain {
     foreground_rights_acquired: bool,
     exit_locked: bool,
     termination_result: Option<u32>,
+    user: UserIdentity,
+    launch_parameters: BTreeMap<AppletLaunchParameterKind, VecDeque<Vec<u8>>>,
     message_queue: AppletMessageQueue,
     library_applet_launchable_event: WritableEventObject,
     library_applet_launchable_event_reader: ReadableEventObject,
@@ -1186,6 +1497,12 @@ impl AppletSession {
         // corresponding focus notification before client initialization so
         // official SDK code can wait for and consume the initial state.
         message_queue.push(AppletMessage::FocusStateChanged);
+        let user = DEFAULT_USER;
+        let mut launch_parameters = BTreeMap::new();
+        launch_parameters.insert(
+            AppletLaunchParameterKind::PreselectedUser,
+            VecDeque::from([encode_preselected_user_launch_parameter(user)]),
+        );
         let (launchable_event, launchable_event_reader) = nixe_runtime::EventObject::create_pair();
         let session = Self {
             domain: Arc::new(Mutex::new(AppletDomain {
@@ -1199,6 +1516,8 @@ impl AppletSession {
                 foreground_rights_acquired: false,
                 exit_locked: false,
                 termination_result: None,
+                user,
+                launch_parameters,
                 message_queue,
                 library_applet_launchable_event: launchable_event,
                 library_applet_launchable_event_reader: launchable_event_reader,
@@ -1210,6 +1529,13 @@ impl AppletSession {
         // No library applet occupies the process-local launch slot initially.
         session.set_library_applet_launchable(true);
         session
+    }
+
+    pub(crate) fn user(&self) -> UserIdentity {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .user
     }
 
     pub(crate) fn operation_mode(&self) -> OperationMode {
@@ -1377,6 +1703,55 @@ impl AppletSession {
         let next_storage_id = storage_id
             .checked_add(1)
             .ok_or(CreateAppletStorageError::AllocationFailed)?;
+        domain.storages.insert(storage_id, bytes);
+        domain
+            .objects
+            .insert(object_id, AppletObject::Storage { storage_id });
+        domain.next_object_id = next_object_id;
+        domain.next_storage_id = next_storage_id;
+        Ok(object_id)
+    }
+
+    /// Removes one launch parameter and exposes its backing as an `IStorage`.
+    ///
+    /// Capacity and identifier checks happen before the queue is mutated, so a
+    /// host-side resource failure never consumes guest-visible launch state.
+    pub(crate) fn pop_launch_parameter(
+        &self,
+        kind: AppletLaunchParameterKind,
+    ) -> Result<u32, PopAppletLaunchParameterError> {
+        let mut domain = self
+            .domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !domain.converted {
+            return Err(PopAppletLaunchParameterError::NotDomain);
+        }
+        if domain.objects.len() >= MAX_APPLET_DOMAIN_OBJECTS {
+            return Err(PopAppletLaunchParameterError::DomainCapacityExhausted);
+        }
+        if domain
+            .launch_parameters
+            .get(&kind)
+            .is_none_or(VecDeque::is_empty)
+        {
+            return Err(PopAppletLaunchParameterError::NotAvailable);
+        }
+
+        let object_id = domain.next_object_id;
+        let next_object_id = object_id
+            .checked_add(1)
+            .ok_or(PopAppletLaunchParameterError::ObjectIdExhausted)?;
+        let storage_id = domain.next_storage_id;
+        let next_storage_id = storage_id
+            .checked_add(1)
+            .ok_or(PopAppletLaunchParameterError::StorageIdExhausted)?;
+        let bytes = domain
+            .launch_parameters
+            .get_mut(&kind)
+            .and_then(VecDeque::pop_front)
+            .expect("launch parameter availability was checked while holding the lock");
+
         domain.storages.insert(storage_id, bytes);
         domain
             .objects
@@ -1700,6 +2075,18 @@ impl AppletSession {
     }
 }
 
+fn encode_preselected_user_launch_parameter(user: UserIdentity) -> Vec<u8> {
+    // accountInitialize consumes this exact AM-owned storage layout: 0x88
+    // bytes, a fixed header, then AccountUid at offset 0x8. The nickname is
+    // intentionally absent; clients obtain it from the account profile API.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L182-L214
+    let mut bytes = vec![0; PRESELECTED_USER_LAUNCH_PARAMETER_SIZE];
+    bytes[..4].copy_from_slice(&PRESELECTED_USER_LAUNCH_PARAMETER_MAGIC.to_le_bytes());
+    bytes[4] = 1;
+    bytes[8..24].copy_from_slice(&user.id().encode());
+    bytes
+}
+
 #[cfg(test)]
 mod applet_tests {
     use super::*;
@@ -1884,6 +2271,45 @@ mod applet_tests {
     }
 
     #[test]
+    fn preselected_user_launch_parameter_is_stable_and_consumed_once() {
+        let session = AppletSession::new(OperationMode::Console);
+        assert_eq!(session.user(), DEFAULT_USER);
+        assert_eq!(
+            session.pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser),
+            Err(PopAppletLaunchParameterError::NotDomain)
+        );
+
+        session.convert_to_domain();
+        let storage_object = session
+            .pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser)
+            .unwrap();
+        let AppletObject::Storage { storage_id } = session.object(storage_object).unwrap() else {
+            panic!("PopLaunchParameter returned the wrong object kind");
+        };
+        let bytes = session
+            .read_storage(storage_id, 0, PRESELECTED_USER_LAUNCH_PARAMETER_SIZE)
+            .unwrap();
+        assert_eq!(bytes.len(), PRESELECTED_USER_LAUNCH_PARAMETER_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            PRESELECTED_USER_LAUNCH_PARAMETER_MAGIC
+        );
+        assert_eq!(bytes[4], 1);
+        assert_eq!(&bytes[5..8], &[0; 3]);
+        assert_eq!(&bytes[8..24], &1_u128.to_le_bytes());
+        assert!(bytes[24..].iter().all(|byte| *byte == 0));
+
+        assert_eq!(
+            session.pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser),
+            Err(PopAppletLaunchParameterError::NotAvailable)
+        );
+        assert_eq!(
+            session.pop_launch_parameter(AppletLaunchParameterKind::UserChannel),
+            Err(PopAppletLaunchParameterError::NotAvailable)
+        );
+    }
+
+    #[test]
     fn library_applet_input_channel_retains_storage_after_sender_close() {
         let session = AppletSession::new(OperationMode::Console);
         session.convert_to_domain();
@@ -2043,11 +2469,16 @@ mod time_tests {
         )
         .unwrap();
         let service = environment.create_service().unwrap();
+        let user_clock = service.system_clock(SystemClockKind::User);
 
+        assert_eq!(user_clock.current_time(), 1_704_067_200);
+        let context = user_clock.context();
         assert_eq!(
-            service.system_clock(SystemClockKind::User).current_time(),
+            i64::from_le_bytes(context[..8].try_into().unwrap()),
             1_704_067_200
         );
+        assert_eq!(i64::from_le_bytes(context[8..16].try_into().unwrap()), 0);
+        assert_eq!(&context[16..], &TIME_SOURCE_ID);
         assert_eq!(
             &service.timezone_service().location_name()[..13],
             b"Europe/Madrid"
@@ -2061,6 +2492,79 @@ mod time_tests {
             1_704_067_200
         );
         assert_eq!(&user_context[16..], &TIME_SOURCE_ID);
+
+        user_clock.set_current_time(1_704_067_260).unwrap();
+        assert_eq!(user_clock.current_time(), 1_704_067_260);
+        let context = user_clock.context();
+        assert_eq!(
+            i64::from_le_bytes(context[..8].try_into().unwrap()),
+            1_704_067_260
+        );
+        let mut shared_context = [0; 0x20];
+        memory.read(0x40, &mut shared_context).unwrap();
+        assert_eq!(shared_context, context);
+
+        assert_eq!(
+            service
+                .calculate_monotonic_system_clock_base_time_point(context)
+                .unwrap(),
+            1_704_067_260
+        );
+
+        let mut foreign_context = context;
+        foreign_context[16] ^= 1;
+        assert_eq!(
+            service.calculate_monotonic_system_clock_base_time_point(foreign_context),
+            Err(MonotonicClockError::NotComparable)
+        );
+        assert_eq!(
+            SystemClockContext {
+                offset: i64::MAX,
+                steady_time_point: 0,
+                source_id: TIME_SOURCE_ID,
+            }
+            .monotonic_base_time_point(1, 0),
+            Err(MonotonicClockError::Overflowed)
+        );
+    }
+
+    #[test]
+    fn time_domain_retains_every_child_interface_until_close() {
+        let service = TimeEnvironment::default().create_service().unwrap();
+
+        assert!(!service.is_domain());
+        assert_eq!(service.convert_to_domain(), IPC_ROOT_OBJECT_ID);
+        let user_clock = service
+            .insert_object(TimeObject::SystemClock(
+                service.system_clock(SystemClockKind::User),
+            ))
+            .unwrap();
+        let steady_clock = service
+            .insert_object(TimeObject::SteadyClock(service.steady_clock()))
+            .unwrap();
+        let timezone = service
+            .insert_object(TimeObject::TimeZone(service.timezone_service()))
+            .unwrap();
+
+        assert_eq!(user_clock, 2);
+        assert_eq!(steady_clock, 3);
+        assert_eq!(timezone, 4);
+        assert!(matches!(
+            service.object(user_clock),
+            Some(TimeObject::SystemClock(_))
+        ));
+        assert!(matches!(
+            service.object(steady_clock),
+            Some(TimeObject::SteadyClock(_))
+        ));
+        assert!(matches!(
+            service.object(timezone),
+            Some(TimeObject::TimeZone(_))
+        ));
+
+        assert!(service.close_object(user_clock));
+        assert!(service.object(user_clock).is_none());
+        assert!(!service.close_object(user_clock));
     }
 }
 
