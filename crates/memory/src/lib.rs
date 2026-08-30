@@ -31,13 +31,11 @@ pub use backing::{
     CanonicalWriteBatchError,
 };
 pub use direct::{
-    CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectArenaMetrics,
-    DirectBackendPolicy, DirectHostCapabilities, DirectMapRequest, DirectMemoryError,
-    DirectProtectRequest, DirectProtection, DirectStoreControl,
+    CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
+    DirectHostCapabilities, DirectMapRequest, DirectMemoryError, DirectProtectRequest,
+    DirectProtection, DirectStoreControl,
 };
-pub use execution_gate::{
-    ExecutionGate, ExecutionGateMetrics, ExecutionSharedGuard, ExecutionTransitionGuard,
-};
+pub use execution_gate::{ExecutionGate, ExecutionSharedGuard, ExecutionTransitionGuard};
 pub use host_mapped::{HostMappedBacking, HostMappedError};
 pub use invalidation::{
     MEMORY_INVALIDATION_CAPACITY, MemoryInvalidation, MemoryInvalidationCursor,

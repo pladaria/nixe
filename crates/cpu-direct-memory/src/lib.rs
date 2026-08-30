@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use nixe_cpu::memory::{
     CpuMemory, DataAccessFault, DataAccessKind, DirectFaultResolution, MemoryAccess,
-    MemoryAccessClass, MemoryAccessSize, MemoryOrdering, MemoryRegionKind, MemoryValue,
+    MemoryAccessClass, MemoryAccessSize, MemoryOrdering, MemoryValue,
 };
 use nixe_memory::{
     AddressSpaceId, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectStoreControl,
@@ -342,62 +342,6 @@ impl CapturedFault {
         read_host_integer(context, register)
     }
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FaultRuntimeMetrics {
-    pub captured: u64,
-    pub retries: u64,
-    pub escapes: u64,
-    pub fatal_dispatches: u64,
-    pub unattributed: u64,
-    pub nested: u64,
-    pub sigbus: u64,
-    pub checked_reads: u64,
-    pub checked_writes: u64,
-    pub tracking_writes: u64,
-    pub mmio_reads: u64,
-    pub mmio_writes: u64,
-    pub jit_faults: u64,
-    pub interpreter_faults: u64,
-    pub guest_faults: u64,
-}
-
-#[derive(Default)]
-struct Metrics {
-    captured: AtomicU64,
-    retries: AtomicU64,
-    escapes: AtomicU64,
-    fatal_dispatches: AtomicU64,
-    unattributed: AtomicU64,
-    nested: AtomicU64,
-    sigbus: AtomicU64,
-    checked_reads: AtomicU64,
-    checked_writes: AtomicU64,
-    tracking_writes: AtomicU64,
-    mmio_reads: AtomicU64,
-    mmio_writes: AtomicU64,
-    jit_faults: AtomicU64,
-    interpreter_faults: AtomicU64,
-    guest_faults: AtomicU64,
-}
-
-static METRICS: Metrics = Metrics {
-    captured: AtomicU64::new(0),
-    retries: AtomicU64::new(0),
-    escapes: AtomicU64::new(0),
-    fatal_dispatches: AtomicU64::new(0),
-    unattributed: AtomicU64::new(0),
-    nested: AtomicU64::new(0),
-    sigbus: AtomicU64::new(0),
-    checked_reads: AtomicU64::new(0),
-    checked_writes: AtomicU64::new(0),
-    tracking_writes: AtomicU64::new(0),
-    mmio_reads: AtomicU64::new(0),
-    mmio_writes: AtomicU64::new(0),
-    jit_faults: AtomicU64::new(0),
-    interpreter_faults: AtomicU64::new(0),
-    guest_faults: AtomicU64::new(0),
-};
 
 #[derive(Debug)]
 #[repr(C)]
@@ -1336,7 +1280,6 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
     opaque: *mut libc::c_void,
     _fault: *mut CapturedFault,
 ) -> FaultDisposition {
-    record_frontend_fault(FaultFrontend::Interpreter);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let context = unsafe { &*opaque.cast::<ScalarDispatcherContext>() };
         let call = context.current_call.load(Ordering::Acquire);
@@ -1359,17 +1302,9 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
                         match memory.read(call.address_space, call.address, call.access) {
                             Ok(result) => {
                                 call.output = result.value.bits() as u64;
-                                record_checked_completion(
-                                    DataAccessKind::Read,
-                                    result.region.into(),
-                                );
                             }
                             Err(fault) => {
                                 call.data_fault = Some(fault);
-                                record_checked_completion(
-                                    DataAccessKind::Read,
-                                    CheckedCompletion::GuestFault,
-                                );
                             }
                         }
                     }
@@ -1379,15 +1314,9 @@ unsafe extern "C" fn dispatch_scalar_stub_fault(
                         call.access,
                         MemoryValue::from_bits(call.access.size, u128::from(call.value)),
                     ) {
-                        Ok(result) => {
-                            record_checked_completion(DataAccessKind::Write, result.region.into())
-                        }
+                        Ok(_) => {}
                         Err(fault) => {
                             call.data_fault = Some(fault);
-                            record_checked_completion(
-                                DataAccessKind::Write,
-                                CheckedCompletion::GuestFault,
-                            );
                         }
                     },
                 }
@@ -1603,88 +1532,6 @@ impl Display for FaultRuntimeError {
 
 impl std::error::Error for FaultRuntimeError {}
 
-#[must_use]
-pub fn metrics() -> FaultRuntimeMetrics {
-    FaultRuntimeMetrics {
-        captured: METRICS.captured.load(Ordering::Relaxed),
-        retries: METRICS.retries.load(Ordering::Relaxed),
-        escapes: METRICS.escapes.load(Ordering::Relaxed),
-        fatal_dispatches: METRICS.fatal_dispatches.load(Ordering::Relaxed),
-        unattributed: METRICS.unattributed.load(Ordering::Relaxed),
-        nested: METRICS.nested.load(Ordering::Relaxed),
-        sigbus: METRICS.sigbus.load(Ordering::Relaxed),
-        checked_reads: METRICS.checked_reads.load(Ordering::Relaxed),
-        checked_writes: METRICS.checked_writes.load(Ordering::Relaxed),
-        tracking_writes: METRICS.tracking_writes.load(Ordering::Relaxed),
-        mmio_reads: METRICS.mmio_reads.load(Ordering::Relaxed),
-        mmio_writes: METRICS.mmio_writes.load(Ordering::Relaxed),
-        jit_faults: METRICS.jit_faults.load(Ordering::Relaxed),
-        interpreter_faults: METRICS.interpreter_faults.load(Ordering::Relaxed),
-        guest_faults: METRICS.guest_faults.load(Ordering::Relaxed),
-    }
-}
-
-/// Records classification performed on the normal dispatcher stack.
-pub fn record_checked_completion(kind: DataAccessKind, completion: CheckedCompletion) {
-    match kind {
-        DataAccessKind::Read => METRICS.checked_reads.fetch_add(1, Ordering::Relaxed),
-        DataAccessKind::Write => METRICS.checked_writes.fetch_add(1, Ordering::Relaxed),
-    };
-    if completion == CheckedCompletion::GuestFault {
-        METRICS.guest_faults.fetch_add(1, Ordering::Relaxed);
-    }
-    match (kind, completion) {
-        (DataAccessKind::Write, CheckedCompletion::Ram) => {
-            METRICS.tracking_writes.fetch_add(1, Ordering::Relaxed);
-        }
-        (DataAccessKind::Read, CheckedCompletion::Mmio) => {
-            METRICS.mmio_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        (DataAccessKind::Write, CheckedCompletion::Mmio) => {
-            METRICS.mmio_writes.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {}
-    }
-}
-
-/// Semantic category of an operation completed after an attributed fault.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CheckedCompletion {
-    Ram,
-    Mmio,
-    GuestFault,
-}
-
-impl From<MemoryRegionKind> for CheckedCompletion {
-    fn from(region: MemoryRegionKind) -> Self {
-        match region {
-            MemoryRegionKind::Ram => Self::Ram,
-            MemoryRegionKind::Device => Self::Mmio,
-        }
-    }
-}
-
-/// CPU frontend which owns one attributed direct-memory fault.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FaultFrontend {
-    Jit,
-    Interpreter,
-}
-
-pub fn record_frontend_fault(frontend: FaultFrontend) {
-    match frontend {
-        FaultFrontend::Jit => &METRICS.jit_faults,
-        FaultFrontend::Interpreter => &METRICS.interpreter_faults,
-    }
-    .fetch_add(1, Ordering::Relaxed);
-}
-
-/// Records an architecture-specific cold re-entry used instead of retrying a
-/// native instruction through an incomplete libc context restore.
-pub fn record_retry_reentry() {
-    METRICS.retries.fetch_add(1, Ordering::Relaxed);
-}
-
 unsafe extern "C" {
     fn nixe_direct_memory_invoke(
         slot: *mut libc::c_void,
@@ -1728,7 +1575,6 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
     let disposition = unsafe { dispatcher(slot.opaque.load(Ordering::Relaxed), &mut fault) };
     match disposition {
         FaultDisposition::Retry => {
-            METRICS.retries.fetch_add(1, Ordering::Relaxed);
             #[cfg(target_arch = "x86_64")]
             {
                 let context = unsafe { &mut *(*slot.context.get()).as_mut_ptr() };
@@ -1752,7 +1598,6 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
             }
         }
         FaultDisposition::Escape => {
-            METRICS.escapes.fetch_add(1, Ordering::Relaxed);
             slot.dispatching.store(false, Ordering::Release);
             unsafe {
                 nixe_direct_escape_now(
@@ -1762,7 +1607,6 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
             }
         }
         FaultDisposition::Fatal => {
-            METRICS.fatal_dispatches.fetch_add(1, Ordering::Relaxed);
             fatal_signal(slot.signal.load(Ordering::Relaxed));
         }
     }
@@ -1781,14 +1625,10 @@ unsafe extern "C" fn signal_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    if signal == libc::SIGBUS {
-        METRICS.sigbus.fetch_add(1, Ordering::Relaxed);
-    }
     if info.is_null()
         || context.is_null()
         || !accepted_memory_fault_code(signal, unsafe { (*info).si_code })
     {
-        METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context) };
     }
     let tid = current_tid();
@@ -1803,11 +1643,9 @@ unsafe extern "C" fn signal_handler(
         }
     }
     let Some(slot) = selected else {
-        METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context) };
     };
     if !slot.active.load(Ordering::Acquire) {
-        METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context) };
     }
     if slot
@@ -1815,7 +1653,6 @@ unsafe extern "C" fn signal_handler(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        METRICS.nested.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context) };
     }
     let fault_address = unsafe { (*info).si_addr().addr() };
@@ -1829,12 +1666,10 @@ unsafe extern "C" fn signal_handler(
         .flatten();
     if fault_address < arena_base || fault_address >= arena_guard_end {
         slot.dispatching.store(false, Ordering::Release);
-        METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context.cast()) };
     }
     let Some(site) = site else {
         slot.dispatching.store(false, Ordering::Release);
-        METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
         unsafe { chain_or_reraise(signal, info, context.cast()) };
     };
     unsafe {
@@ -1849,7 +1684,6 @@ unsafe extern "C" fn signal_handler(
         let source = (*context).uc_mcontext.fpregs;
         let Some(fpstate_size) = x86_fpstate_size(source) else {
             slot.dispatching.store(false, Ordering::Release);
-            METRICS.unattributed.fetch_add(1, Ordering::Relaxed);
             chain_or_reraise(signal, info, context.cast());
         };
         copy_signal_bytes(
@@ -1875,7 +1709,6 @@ unsafe extern "C" fn signal_handler(
         site as *const NativeFaultSite as *mut NativeFaultSite,
         Ordering::Release,
     );
-    METRICS.captured.fetch_add(1, Ordering::Relaxed);
     let dispatch_top = slot.dispatcher_stack_top.load(Ordering::Acquire);
     unsafe { redirect_to_landing(&mut *context, slot, dispatch_top) };
 }
@@ -2491,7 +2324,6 @@ mod tests {
         };
         assert_eq!(mapped, target);
         assert_eq!(unsafe { libc::ftruncate(fd, 0) }, 0);
-        let before = metrics().sigbus;
         let mut context = SyntheticContext {
             address: target.cast(),
             observed: 0,
@@ -2512,7 +2344,6 @@ mod tests {
         }
         .unwrap();
         assert_eq!(outcome, InvocationOutcome::Escaped);
-        assert_eq!(metrics().sigbus, before + 1);
         assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
@@ -2859,102 +2690,6 @@ mod tests {
                 .add(address.get() as usize / DIRECT_PAGE_SIZE)
         };
         assert_ne!(control_slot.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[ignore = "manual release microbenchmark"]
-    fn fixed_scalar_stubs_materially_beat_checked_scalar_accesses() {
-        const ITERATIONS: u64 = 1_000_000;
-        let mut memory = ExecutionMemory::new();
-        let space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
-        let page = GuestPhysicalPageId::new(1);
-        assert!(memory.add_ram_page(page));
-        assert!(memory.initialize_ram(page, 0, &0xa5c3_9678_1234_fedc_u64.to_le_bytes()));
-        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
-        memory
-            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
-            .unwrap();
-        let mut direct = unsafe {
-            DirectScalarFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
-        }
-        .unwrap();
-        direct.begin_slice().unwrap();
-        direct
-            .write(
-                &memory,
-                GuestVirtualAddress::new(0x8000),
-                address,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword),
-                MemoryValue::U64(0),
-            )
-            .unwrap();
-        for size in [
-            MemoryAccessSize::Byte,
-            MemoryAccessSize::Halfword,
-            MemoryAccessSize::Word,
-            MemoryAccessSize::Doubleword,
-        ] {
-            let access = MemoryAccess::normal(size);
-            for _ in 0..1_000 {
-                std::hint::black_box(
-                    direct
-                        .read(&memory, GuestVirtualAddress::new(0x8000), address, access)
-                        .unwrap(),
-                );
-                std::hint::black_box(memory.read(space, address, access).unwrap());
-            }
-            let started = std::time::Instant::now();
-            for _ in 0..ITERATIONS {
-                std::hint::black_box(
-                    direct
-                        .read(&memory, GuestVirtualAddress::new(0x8000), address, access)
-                        .unwrap(),
-                );
-            }
-            let direct_elapsed = started.elapsed();
-            let started = std::time::Instant::now();
-            for _ in 0..ITERATIONS {
-                std::hint::black_box(memory.read(space, address, access).unwrap());
-            }
-            let checked_elapsed = started.elapsed();
-            let started = std::time::Instant::now();
-            for value in 0..ITERATIONS {
-                direct
-                    .write(
-                        &memory,
-                        GuestVirtualAddress::new(0x8000),
-                        address,
-                        access,
-                        MemoryValue::from_bits(size, u128::from(value)),
-                    )
-                    .unwrap();
-            }
-            let direct_store_elapsed = started.elapsed();
-            let started = std::time::Instant::now();
-            for value in 0..ITERATIONS {
-                memory
-                    .write(
-                        space,
-                        address,
-                        access,
-                        MemoryValue::from_bits(size, u128::from(value)),
-                    )
-                    .unwrap();
-            }
-            let checked_store_elapsed = started.elapsed();
-            eprintln!(
-                "width={} direct_stub_ns_per_read={} checked_ns_per_read={} direct_stub_ns_per_store={} checked_ns_per_store={}",
-                size.bytes(),
-                direct_elapsed.as_nanos() / u128::from(ITERATIONS),
-                checked_elapsed.as_nanos() / u128::from(ITERATIONS),
-                direct_store_elapsed.as_nanos() / u128::from(ITERATIONS),
-                checked_store_elapsed.as_nanos() / u128::from(ITERATIONS),
-            );
-            assert!(direct_elapsed.as_nanos() * 100 < checked_elapsed.as_nanos() * 90);
-            assert!(direct_store_elapsed.as_nanos() * 100 < checked_store_elapsed.as_nanos() * 90);
-        }
-        direct.end_slice().unwrap();
     }
 }
 

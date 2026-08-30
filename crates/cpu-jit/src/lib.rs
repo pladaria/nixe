@@ -6,10 +6,6 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("nixe-cpu-jit requires Linux direct-memory support");
 
-mod configuration;
-mod diagnostics;
 mod direct;
-mod performance;
 
-pub use configuration::JitConfiguration;
 pub use direct::{JitProcess, JitThread};

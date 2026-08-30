@@ -3,21 +3,14 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_memory::{
-    AddressSpaceId, ContentGeneration, ContentMutationEpoch, DirectArenaMetrics,
-    ExecutionGateMetrics, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration,
+    AddressSpaceId, ContentGeneration, ContentMutationEpoch, GuestPhysicalPageId,
+    GuestVirtualAddress, MappingGeneration,
 };
 
 use crate::error::InstructionFetchFault;
 use crate::memory::ExecutionMemoryLease;
 
 pub use nixe_memory::MemoryPermissions;
-
-/// Optional transition-boundary diagnostics for a selected direct backend.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DirectMemoryMetrics {
-    pub arena: DirectArenaMetrics,
-    pub execution_gate: ExecutionGateMetrics,
-}
 
 /// Page size used by the synthetic and production memory backends.
 pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
@@ -874,16 +867,6 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
     ) -> Option<nixe_memory::DirectAddressSpaceView> {
         None
     }
-
-    /// Returns cold-path diagnostics without adding work to successful guest
-    /// accesses. Checked and synthetic backends return no direct metrics.
-    fn direct_memory_metrics(&self, _address_space: AddressSpaceId) -> Option<DirectMemoryMetrics> {
-        None
-    }
-
-    /// Enables cold host-state sampling for an explicitly requested direct
-    /// performance report. Normal execution does not perform this sampling.
-    fn enable_direct_memory_metrics(&self, _address_space: AddressSpaceId) {}
 
     /// Stable transition-gate identity used only to validate a direct
     /// execution lease at a frontend boundary.

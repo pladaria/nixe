@@ -73,7 +73,7 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
-        let cpu = cpu_configuration(base_directory, raw.cpu);
+        let cpu = cpu_configuration(raw.cpu);
         let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         Ok(Self {
@@ -249,8 +249,6 @@ pub struct CpuConfig {
     /// Enables host-parallel execution. Deterministic serialized workers
     /// remain the default.
     pub parallel_vcpus: bool,
-    /// Resource policy used only when the JIT backend is selected.
-    pub jit: CpuJitConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -259,15 +257,6 @@ pub enum CpuBackendSelection {
     #[default]
     Jit,
     Interpreter,
-}
-
-/// Optional output produced by the direct JIT.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CpuJitConfig {
-    /// Optional directory for per-region CLIF and native-code dumps.
-    pub dump_directory: Option<PathBuf>,
-    /// Optional directory receiving one aggregate JIT performance report per run.
-    pub performance_report_directory: Option<PathBuf>,
 }
 
 /// Named mappings from host gamepads to the emulated controller.
@@ -407,17 +396,6 @@ struct RawCpuConfig {
     backend: CpuBackendSelection,
     #[serde(default)]
     parallel_vcpus: bool,
-    #[serde(default)]
-    jit: RawCpuJitConfig,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCpuJitConfig {
-    #[serde(default)]
-    dump_directory: Option<String>,
-    #[serde(default)]
-    performance_report_directory: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -568,24 +546,10 @@ fn gpu_cache_configuration(
     })
 }
 
-fn cpu_configuration(base_directory: &Path, raw: RawCpuConfig) -> CpuConfig {
+fn cpu_configuration(raw: RawCpuConfig) -> CpuConfig {
     CpuConfig {
         backend: raw.backend,
         parallel_vcpus: raw.parallel_vcpus,
-        jit: CpuJitConfig {
-            dump_directory: raw
-                .jit
-                .dump_directory
-                .filter(|directory| !directory.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|directory| resolve_path(base_directory, directory)),
-            performance_report_directory: raw
-                .jit
-                .performance_report_directory
-                .filter(|directory| !directory.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|directory| resolve_path(base_directory, directory)),
-        },
     }
 }
 
@@ -869,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_selection_and_jit_diagnostics_are_typed() {
+    fn cpu_backend_selection_is_typed() {
         let default_file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -891,11 +855,6 @@ mod tests {
                 .cpu
                 .parallel_vcpus
         );
-        assert_eq!(
-            NixeConfig::load(&default_file.path).unwrap().cpu.jit,
-            CpuJitConfig::default()
-        );
-
         let explicit_file = TemporaryConfig::new(
             r#"
                 version = 2
@@ -919,69 +878,6 @@ mod tests {
                 .unwrap()
                 .cpu
                 .parallel_vcpus
-        );
-
-        let jit_file = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [cpu]
-                backend = "jit"
-                [cpu.jit]
-                dump_directory = "./diagnostics/jit"
-                performance_report_directory = "./diagnostics/jit-performance"
-            "#,
-        );
-        let jit = NixeConfig::load(&jit_file.path).unwrap().cpu;
-        assert_eq!(jit.backend, CpuBackendSelection::Jit);
-        assert_eq!(
-            jit.jit,
-            CpuJitConfig {
-                dump_directory: Some(jit_file.path.parent().unwrap().join("./diagnostics/jit")),
-                performance_report_directory: Some(
-                    jit_file
-                        .path
-                        .parent()
-                        .unwrap()
-                        .join("./diagnostics/jit-performance"),
-                ),
-            }
-        );
-
-        let empty_dump = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [cpu.jit]
-                dump_directory = ""
-                performance_report_directory = ""
-            "#,
-        );
-        assert_eq!(
-            NixeConfig::load(&empty_dump.path)
-                .unwrap()
-                .cpu
-                .jit
-                .dump_directory,
-            None
-        );
-        assert_eq!(
-            NixeConfig::load(&empty_dump.path)
-                .unwrap()
-                .cpu
-                .jit
-                .performance_report_directory,
-            None
         );
 
         let invalid_backend = TemporaryConfig::new(

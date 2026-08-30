@@ -12,7 +12,6 @@ use nixe_config::{
     CpuBackendSelection, CpuConfig, DiagnosticsConfig, GuestLogsLevel, InitialOperationMode,
     TimeMode,
 };
-use nixe_cpu_jit::JitConfiguration;
 use nixe_gpu::BackendInstanceId;
 use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
@@ -38,8 +37,9 @@ use crate::logging::LogLevel;
 
 use super::load_config;
 
-const EXECUTION_PROGRESS_INTERVAL: u64 = 10_000_000;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const EXECUTION_RATE_COMPLETIONS: u64 = 1024;
+const EXECUTION_RATE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
 const MAXWELL_PUSHBUFFER_DUMP_FILENAME: &str = "pushbuffer.bin";
 
@@ -179,7 +179,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     let process_started = Instant::now();
-    let cpu_backend = select_cpu_backend(cpu_configuration, &title.name)?;
+    let cpu_backend = select_cpu_backend(cpu_configuration)?;
     let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
         && log::log_enabled!(log::Level::Trace);
     let process_builder = ProcessBuilder::new()
@@ -348,17 +348,9 @@ const fn horizon_diagnostics(configuration: DiagnosticsConfig) -> HorizonDiagnos
     HorizonDiagnostics::new(guest_logs_level, configuration.file_system_access_log)
 }
 
-fn select_cpu_backend(
-    configuration: CpuConfig,
-    title_name: &str,
-) -> Result<CpuBackendConfig, String> {
+fn select_cpu_backend(configuration: CpuConfig) -> Result<CpuBackendConfig, String> {
     Ok(match configuration.backend {
-        CpuBackendSelection::Jit => CpuBackendConfig::Jit(
-            JitConfiguration::default()
-                .with_dump_directory(configuration.jit.dump_directory)
-                .with_performance_report_directory(configuration.jit.performance_report_directory)
-                .with_performance_report_title(title_name),
-        ),
+        CpuBackendSelection::Jit => CpuBackendConfig::Jit,
         CpuBackendSelection::Interpreter => CpuBackendConfig::Interpreter,
     })
 }
@@ -372,10 +364,6 @@ mod backend_selection_tests {
         let configured = CpuConfig {
             backend: CpuBackendSelection::Interpreter,
             parallel_vcpus: true,
-            jit: nixe_config::CpuJitConfig {
-                dump_directory: Some("jit-diagnostics".into()),
-                performance_report_directory: Some("jit-performance".into()),
-            },
         };
 
         assert_eq!(
@@ -393,19 +381,15 @@ mod backend_selection_tests {
 
     #[test]
     fn application_composition_selects_one_concrete_backend() {
-        let interpreter = select_cpu_backend(
-            CpuConfig {
-                backend: CpuBackendSelection::Interpreter,
-                parallel_vcpus: true,
-                ..CpuConfig::default()
-            },
-            "test-title",
-        )
+        let interpreter = select_cpu_backend(CpuConfig {
+            backend: CpuBackendSelection::Interpreter,
+            parallel_vcpus: true,
+        })
         .unwrap();
         assert!(matches!(interpreter, CpuBackendConfig::Interpreter));
 
-        let jit = select_cpu_backend(CpuConfig::default(), "test-title").unwrap();
-        assert!(matches!(jit, CpuBackendConfig::Jit(_)));
+        let jit = select_cpu_backend(CpuConfig::default()).unwrap();
+        assert!(matches!(jit, CpuBackendConfig::Jit));
     }
 
     #[test]
@@ -595,9 +579,10 @@ fn execute(
     .with_diagnostics(horizon_environment.diagnostics);
     let mut instructions = 0_u64;
     let execution_started = Instant::now();
-    let mut next_progress = EXECUTION_PROGRESS_INTERVAL;
-    let mut last_progress_instructions = 0_u64;
-    let mut last_progress_elapsed = Duration::ZERO;
+    let execution_rate_enabled = log::log_enabled!(log::Level::Info);
+    let mut execution_completions = 0_u64;
+    let mut last_rate_instructions = 0_u64;
+    let mut last_rate_elapsed = Duration::ZERO;
     let mut rejected = BTreeSet::new();
     let mut next_input_poll = Duration::ZERO;
     let mut last_input_poll = Duration::ZERO;
@@ -673,6 +658,23 @@ fn execute(
         for execution in executions {
             let report = execution.report;
             instructions = instructions.saturating_add(report.instructions_executed);
+            if execution_rate_enabled {
+                execution_completions = execution_completions.wrapping_add(1);
+                if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
+                    let elapsed = execution_started.elapsed();
+                    let interval = elapsed.saturating_sub(last_rate_elapsed);
+                    if interval >= EXECUTION_RATE_LOG_INTERVAL {
+                        let interval_instructions =
+                            instructions.saturating_sub(last_rate_instructions);
+                        let ips = interval_instructions as f64 / interval.as_secs_f64();
+                        log::info!(
+                            "guest CPU rate: ips={ips:.0}, instructions={instructions}, elapsed={elapsed:?}"
+                        );
+                        last_rate_instructions = instructions;
+                        last_rate_elapsed = elapsed;
+                    }
+                }
+            }
             if trace_interpreter {
                 log::trace!(
                     "interpreter slice completed: process={:?} thread={:?} vcpu={:?} generation={:?} {report}",
@@ -681,18 +683,6 @@ fn execute(
                     execution.lease.vcpu,
                     execution.lease.generation,
                 );
-            }
-            if log::log_enabled!(log::Level::Debug) && instructions >= next_progress {
-                let elapsed = execution_started.elapsed();
-                let interval_instructions = instructions.saturating_sub(last_progress_instructions);
-                let interval_elapsed = elapsed.saturating_sub(last_progress_elapsed);
-                let interval_ips = instructions_per_second(interval_instructions, interval_elapsed);
-                log::debug!(
-                    "guest execution progress: instructions={instructions}, elapsed={elapsed:?}, interval_ips={interval_ips:.0}"
-                );
-                last_progress_instructions = instructions;
-                last_progress_elapsed = elapsed;
-                next_progress = next_progress.saturating_add(EXECUTION_PROGRESS_INTERVAL);
             }
             match &report.stop {
                 ExecutionStop::BudgetExhausted
@@ -853,14 +843,6 @@ fn report_input_change(
         None => log::debug!("no matching first-gamepad input profile; player one is disconnected"),
     }
     *active = next;
-}
-
-fn instructions_per_second(instructions: u64, elapsed: Duration) -> f64 {
-    if elapsed.is_zero() {
-        0.0
-    } else {
-        instructions as f64 / elapsed.as_secs_f64()
-    }
 }
 
 fn host_service_wait_duration(now: Duration, next_input_poll: Duration) -> Duration {
@@ -1029,15 +1011,6 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<RunnableProcess>();
-    }
-
-    #[test]
-    fn computes_instruction_rate_for_the_progress_interval() {
-        assert_eq!(
-            instructions_per_second(20_000_000, Duration::from_millis(2_500)),
-            8_000_000.0
-        );
-        assert_eq!(instructions_per_second(1, Duration::ZERO), 0.0);
     }
 
     #[test]

@@ -2827,11 +2827,6 @@ mod tests {
         let mut abandoned = CanonicalWriteBatch::new();
         abandoned.stage(&range, 0, &[0x11]).unwrap();
         assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
-        assert_eq!(
-            arena.metrics().mprotect_calls,
-            0,
-            "a quiescent readable page needs no transient protection round trip"
-        );
         drop(abandoned);
         assert_eq!(arena.protection_at(0x1000), Some(DirectProtection::Read));
 

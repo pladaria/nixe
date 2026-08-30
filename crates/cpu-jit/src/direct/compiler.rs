@@ -20,8 +20,6 @@ use nixe_cpu_direct_memory::{
     HostIntegerRegister, NativeFaultCompletion, NativeMemoryAccess, NativeMemoryAccessKind,
 };
 
-use crate::diagnostics::RegionDump;
-
 use super::lookup::{
     DIRECT_LOOKUP_MASK, NATIVE_LOOKUP_HEAD_OFFSET, NATIVE_LOOKUP_NODE_ENTRY_OFFSET,
     NATIVE_LOOKUP_NODE_NEXT_OFFSET, NATIVE_LOOKUP_NODE_PC_OFFSET, NativeLookupSlot, lookup_salt,
@@ -44,9 +42,8 @@ pub(super) type NativeGateway = unsafe extern "C" fn(*mut NativeContext, usize);
 pub(super) struct CompiledRegion {
     pub(super) entry: usize,
     pub(super) native_bytes: usize,
+    #[cfg(test)]
     pub(super) clif_instructions: usize,
-    pub(super) dump: Option<RegionDump>,
-    pub(super) direct_accesses: Box<[NativeMemoryAccess]>,
     pub(super) fault_sites: Box<[CompiledFaultSite]>,
     #[cfg(test)]
     pub(super) register_loads: usize,
@@ -71,7 +68,6 @@ struct PendingFaultSite {
 }
 
 struct PendingDirectMetadata {
-    accesses: Vec<NativeMemoryAccess>,
     fault_sites: Vec<PendingFaultSite>,
 }
 
@@ -156,7 +152,6 @@ impl DirectCompiler {
         &mut self,
         region: &NativeRegion,
         static_slots: &[usize],
-        capture_dump: bool,
     ) -> Result<CompiledRegion, DirectJitError> {
         self.context.func.signature = tail_signature();
         self.context.func.name = UserFuncName::user(1, self.next_function);
@@ -186,6 +181,7 @@ impl DirectCompiler {
             )?
             .translate(self.module.target_config())?
         };
+        #[cfg(test)]
         let clif_instructions = self
             .context
             .func
@@ -193,7 +189,6 @@ impl DirectCompiler {
             .blocks()
             .map(|block| self.context.func.layout.block_insts(block).count())
             .sum();
-        let clif = capture_dump.then(|| self.context.func.display().to_string());
         self.module
             .define_function(function, &mut self.context)
             .map_err(module_error)?;
@@ -203,20 +198,12 @@ impl DirectCompiler {
                 .expect("defined direct JIT function retains compiled code"),
             &pending_direct.fault_sites,
         )?;
-        let direct_accesses = pending_direct.accesses.into_boxed_slice();
         let native_bytes = self
             .context
             .compiled_code()
             .expect("defined direct JIT function retains compiled code")
             .code_buffer()
             .len();
-        let native = capture_dump.then(|| {
-            self.context
-                .compiled_code()
-                .expect("defined direct JIT function retains compiled code")
-                .code_buffer()
-                .to_vec()
-        });
         self.native_bytes = self.native_bytes.saturating_add(native_bytes);
         self.module.finalize_definitions().map_err(module_error)?;
         let entry = self.module.get_finalized_function(function).addr();
@@ -226,11 +213,8 @@ impl DirectCompiler {
         Ok(CompiledRegion {
             entry,
             native_bytes,
+            #[cfg(test)]
             clif_instructions,
-            dump: clif
-                .zip(native)
-                .map(|(clif, native)| RegionDump { clif, native }),
-            direct_accesses,
             fault_sites: fault_sites.into_boxed_slice(),
             #[cfg(test)]
             register_loads: accessed.count(),
@@ -377,7 +361,6 @@ struct CraneliftTranslator<'a, 'region> {
     block_retired: u32,
     call_conv: CallConv,
     direct_memory: bool,
-    direct_accesses: Vec<NativeMemoryAccess>,
     fault_sites: Vec<PendingFaultSite>,
 }
 
@@ -458,7 +441,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             block_retired: 0,
             call_conv,
             direct_memory,
-            direct_accesses: Vec::new(),
             fault_sites: Vec::new(),
         })
     }
@@ -593,7 +575,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         self.builder.seal_all_blocks();
         self.builder.finalize(target_config);
         Ok(PendingDirectMetadata {
-            accesses: self.direct_accesses,
             fault_sites: self.fault_sites,
         })
     }
@@ -625,7 +606,12 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
         kind: NativeMemoryAccessKind,
         completion: NativeFaultCompletion,
     ) -> TrapCode {
-        let access = self.record_direct_access(source, size, kind);
+        let access = NativeMemoryAccess {
+            address_space: self.region.key.address_space,
+            guest_pc: source,
+            kind,
+            size,
+        };
         let trap_code = u8::try_from(self.fault_sites.len() + 1)
             .ok()
             .and_then(TrapCode::user)
@@ -639,22 +625,6 @@ impl<'a, 'region> CraneliftTranslator<'a, 'region> {
             retired_delta: self.block_retired,
         });
         trap_code
-    }
-
-    fn record_direct_access(
-        &mut self,
-        source: GuestVirtualAddress,
-        size: u8,
-        kind: NativeMemoryAccessKind,
-    ) -> NativeMemoryAccess {
-        let access = NativeMemoryAccess {
-            address_space: self.region.key.address_space,
-            guest_pc: source,
-            kind,
-            size,
-        };
-        self.direct_accesses.push(access);
-        access
     }
 
     fn checkpoint_direct_fault_state(&mut self, flags: &LazyFlags) -> Result<(), DirectJitError> {
@@ -2273,7 +2243,6 @@ fn compile_fault_sites(
         // control flow. Every native trap carrying this access's private
         // source location is an exact machine-code realization of the same
         // guest operation and therefore needs identical immutable metadata.
-        // Keep the logical access separately so diagnostics count it once.
         output.extend(traps.into_iter().map(|trap| {
             let native_start = trap.offset;
             CompiledFaultSite {

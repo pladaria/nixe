@@ -15,7 +15,7 @@ use nixe_cpu::memory::ExecutionMemory;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::{RegisterContext, ThreadCpuState};
 use nixe_cpu_interpreter::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};
-use nixe_cpu_jit::{JitConfiguration, JitProcess, JitThread};
+use nixe_cpu_jit::{JitProcess, JitThread};
 use nixe_memory::{GuestVirtualAddress, MemoryInvalidationSource};
 
 use crate::{ExceptionTerminationScope, GuestBreakPayload, VirtualClock};
@@ -38,12 +38,12 @@ pub use nixe_cpu::execution::{CpuExit as ExecutionStop, ExecutionReport};
 #[derive(Clone, Debug)]
 pub enum CpuBackendConfig {
     Interpreter,
-    Jit(JitConfiguration),
+    Jit,
 }
 
 impl Default for CpuBackendConfig {
     fn default() -> Self {
-        Self::Jit(JitConfiguration::default())
+        Self::Jit
     }
 }
 
@@ -60,14 +60,10 @@ impl CpuBackend {
     ) -> Result<Self, CpuFault> {
         match selection {
             CpuBackendConfig::Interpreter => Ok(Self::Interpreter(InterpreterProcess::new(cpu))),
-            CpuBackendConfig::Jit(configuration) => {
-                JitProcess::with_configuration(cpu, configuration.clone())
-                    .map(Arc::new)
-                    .map(Self::Jit)
-                    .map_err(|error| {
-                        runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())
-                    })
-            }
+            CpuBackendConfig::Jit => JitProcess::new(cpu)
+                .map(Arc::new)
+                .map(Self::Jit)
+                .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
         }
     }
 

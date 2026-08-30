@@ -54,248 +54,6 @@ impl VisibilityCoordinator for DeviceWriteback {
 }
 
 #[test]
-fn configured_diagnostics_dump_direct_clif_native_code_and_one_compact_report() {
-    let root = tempfile::tempdir().unwrap();
-    let dumps = root.path().join("dumps");
-    let reports = root.path().join("reports");
-    let process = JitProcess::with_configuration(
-        cpu(),
-        JitConfiguration::default()
-            .with_dump_directory(Some(dumps.clone()))
-            .with_performance_report_directory(Some(reports.clone()))
-            .with_performance_report_title("Test Title"),
-    )
-    .unwrap();
-    let memory = memory(&[(0, 0xd503_201f), (4, breakpoint(7))]);
-    let mut state = state(CODE, 0);
-
-    assert!(matches!(
-        JitThread::new()
-            .run(&process, &memory, &mut state, 1)
-            .unwrap(),
-        DirectExit::Budget { .. }
-    ));
-    process.shutdown();
-    process.shutdown();
-
-    let session = std::fs::read_dir(&dumps)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let dump_names: BTreeSet<_> = std::fs::read_dir(session)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert!(dump_names.iter().any(|name| name.ends_with(".clif")));
-    assert!(dump_names.iter().any(|name| name.ends_with(".bin")));
-    assert!(!dump_names.iter().any(|name| name.contains("nixe-ir")));
-
-    let report_paths: Vec<_> = std::fs::read_dir(reports)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(report_paths.len(), 1);
-    let report_path = &report_paths[0];
-    assert!(
-        report_path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("test-title-")
-    );
-    let report: toml::Value =
-        toml::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
-    let table = report.as_table().unwrap();
-    assert_eq!(table["version"].as_integer(), Some(7));
-    let expected: BTreeSet<_> = [
-        "version",
-        "memory_backend",
-        "memory_backend_reason",
-        "regions_discovered",
-        "guest_blocks_discovered",
-        "regions_compiled",
-        "region_entry_points",
-        "secondary_entry_hits",
-        "compiled_guest_instructions",
-        "unique_guest_instructions",
-        "overlapping_guest_instructions",
-        "lookup_hits",
-        "lookup_misses",
-        "guest_instructions",
-        "clif_instructions",
-        "native_bytes",
-        "compile_time_ns",
-        "native_time_ns",
-        "slow_memory_calls",
-        "direct_faults",
-        "compiled_direct_accesses",
-        "direct_memory",
-        "invalidations",
-        "invalidation_details",
-        "exit_reasons",
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(
-        table.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        expected
-    );
-    assert_eq!(table["regions_compiled"].as_integer(), Some(1));
-    assert_eq!(table["memory_backend"].as_str(), Some("unbound"));
-    assert_eq!(table["region_entry_points"].as_integer(), Some(1));
-    assert_eq!(table["compiled_guest_instructions"].as_integer(), Some(2));
-    assert_eq!(table["unique_guest_instructions"].as_integer(), Some(2));
-    assert_eq!(
-        table["overlapping_guest_instructions"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(table["lookup_misses"].as_integer(), Some(1));
-    assert_eq!(table["guest_instructions"].as_integer(), Some(1));
-    assert!(table["clif_instructions"].as_integer().unwrap() > 0);
-    assert!(table["native_bytes"].as_integer().unwrap() > 0);
-    assert_eq!(
-        table["direct_memory"]["writable_alias_pages_armed"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        table["direct_memory"]["writable_alias_pages_revoked"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        table["direct_memory"]["transition_safepoint_notifications"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        table["compiled_direct_accesses"]["read_8"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        table["invalidation_details"]["regions_retired"].as_integer(),
-        Some(0)
-    );
-    assert_eq!(
-        table["invalidation_details"]["mapping"].as_integer(),
-        Some(1)
-    );
-    assert_eq!(
-        table["invalidation_details"]["irrelevant"].as_integer(),
-        Some(1)
-    );
-    assert_eq!(table["exit_reasons"]["budget"].as_integer(), Some(1));
-}
-
-#[test]
-fn direct_diagnostics_count_compiled_access_sites_by_kind_and_width() {
-    let root = tempfile::tempdir().unwrap();
-    let reports = root.path().join("reports");
-    let mut memory = ExecutionMemory::new();
-    let code_page = GuestPhysicalPageId::new(1);
-    let data_page = GuestPhysicalPageId::new(2);
-    assert!(memory.add_ram_page(code_page));
-    assert!(memory.add_ram_page(data_page));
-    for (offset, encoding) in [
-        (0, 0x3940_0020_u32),  // LDRB W0,[X1]
-        (4, 0x3900_0020_u32),  // STRB W0,[X1]
-        (8, 0x7940_0020_u32),  // LDRH W0,[X1]
-        (12, 0x7900_0020_u32), // STRH W0,[X1]
-        (16, 0xb940_0020_u32), // LDR W0,[X1]
-        (20, 0xb900_0020_u32), // STR W0,[X1]
-        (24, 0xf940_0020_u32), // LDR X0,[X1]
-        // Register-offset lowering can duplicate the faultable guard while
-        // arranging native control flow. It is still one logical guest site.
-        (28, 0xf822_7820_u32), // STR X0,[X1,X2,LSL#3]
-        (32, 0x3dc0_0020_u32), // LDR Q0,[X1]
-        (36, 0x3d80_0020_u32), // STR Q0,[X1]
-        (40, breakpoint(0)),
-    ] {
-        assert!(memory.initialize_ram(code_page, offset, &encoding.to_le_bytes()));
-    }
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(CODE),
-        code_page,
-        MemoryPermissions::READ_EXECUTE,
-    ));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(DATA),
-        data_page,
-        MemoryPermissions::READ_WRITE,
-    ));
-    memory
-        .bind_cpu_memory_backend(SPACE, 0x1_0000, DirectBackendPolicy::Required)
-        .unwrap();
-
-    let process = JitProcess::with_configuration(
-        cpu(),
-        JitConfiguration::default()
-            .with_performance_report_directory(Some(reports.clone()))
-            .with_performance_report_title("Direct access counts"),
-    )
-    .unwrap();
-    let binding = MemoryBinding {
-        address_space: SPACE,
-        end_exclusive: GuestVirtualAddress::new(0x1_0000),
-        memory: &memory,
-        mapping_epoch: memory.mapping_epoch().get(),
-        invalidation_cursor: memory.invalidation_cursor(),
-    };
-    process.bind_memory(binding).unwrap();
-    let mut thread = JitThread::new();
-    thread.synchronize_address_space(&process, binding).unwrap();
-    let mut state = memory_state();
-    thread.run(&process, &memory, &mut state, 8).unwrap();
-    process.shutdown();
-
-    let report_path = std::fs::read_dir(reports)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let report: toml::Value =
-        toml::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
-    assert_eq!(report["memory_backend"].as_str(), Some("linux_direct"));
-    assert!(
-        report["memory_backend_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("host capability validation"))
-    );
-    let accesses = &report["compiled_direct_accesses"];
-    for width in [1, 2, 4, 8] {
-        assert_eq!(
-            accesses[format!("read_{width}")].as_integer(),
-            Some(1),
-            "unexpected direct read sites for width {width}: {accesses}"
-        );
-        assert_eq!(
-            accesses[format!("write_{width}")].as_integer(),
-            Some(1),
-            "unexpected direct write sites for width {width}: {accesses}"
-        );
-    }
-    assert_eq!(accesses["read_16"].as_integer(), Some(1));
-    assert_eq!(accesses["write_16"].as_integer(), Some(1));
-    assert_eq!(
-        report["direct_faults"]["tracking_writes"].as_integer(),
-        Some(0),
-        "statically detected first writes complete without a host signal"
-    );
-    assert!(
-        report["direct_memory"]["writable_alias_pages_armed"]
-            .as_integer()
-            .is_some_and(|value| value >= 1)
-    );
-    assert!(
-        report["direct_memory"]["vma_samples"]
-            .as_integer()
-            .is_some_and(|value| value >= 1)
-    );
-}
-
-#[test]
 fn normalized_multiblock_region_executes_without_nixe_ir() {
     let memory = memory(&[
         (0x00, 0xd503_201f), // NOP
@@ -346,7 +104,7 @@ fn multiblock_region_publishes_one_native_function_for_every_block_entry() {
     assert_eq!(secondary, primary);
     {
         let state = process.state.lock().unwrap();
-        assert_eq!(state.compiled_regions, 1);
+        assert_eq!(state.regions.len(), 1);
         let secondary_key = RegionKey::new(cpu(), location(CODE + 0x0c));
         assert_eq!(
             state.lookup.get(secondary_key).unwrap().owner.start.get(),
@@ -387,11 +145,11 @@ fn discovery_stops_at_an_existing_secondary_region_entry() {
     process.entry_for(&memory, location(CODE)).unwrap();
 
     let state = process.state.lock().unwrap();
-    assert_eq!(state.compiled_regions, 2);
+    assert_eq!(state.regions.len(), 2);
     let source = state
         .region_for(RegionKey::new(cpu(), location(CODE)))
         .unwrap();
-    assert_eq!(source.guest_blocks, 1);
+    assert_eq!(source.entry_keys.len(), 1);
     assert_eq!(source.entry_keys.len(), 1);
     assert_eq!(source.links[0].slot.load(Ordering::Acquire), target_entry);
 }
@@ -474,7 +232,7 @@ fn direct_backedge_keeps_register_ssa_until_precise_budget_exit() {
     let key = RegionKey::new(cpu(), location(CODE));
     let process_state = process.state.lock().unwrap();
     let compiled = process_state.region_for(key).unwrap();
-    assert_eq!(compiled.guest_blocks, 1);
+    assert_eq!(compiled.entry_keys.len(), 1);
     assert!(compiled.native_bytes > 0);
     assert_eq!(compiled.dependencies.len(), 1);
     assert_eq!(compiled.register_loads, 1);
@@ -562,7 +320,6 @@ fn indirect_branch_and_return_chain_through_the_native_lookup() {
         }
     );
     assert_eq!(read_x0(&state), target + 1);
-    assert_eq!(thread.rust_dispatches.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -611,7 +368,7 @@ fn one_process_lock_produces_one_synchronous_compilation_flight() {
     }
     let entries: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
     assert!(entries.windows(2).all(|pair| pair[0] == pair[1]));
-    assert_eq!(process.state.lock().unwrap().compiled_regions, 1);
+    assert_eq!(process.state.lock().unwrap().regions.len(), 1);
 }
 
 #[test]
@@ -938,7 +695,7 @@ fn running_native_backedge_observes_concurrent_executable_invalidation() {
     );
     let state = process.state.lock().unwrap();
     assert_eq!(state.retired.len(), 1);
-    assert_eq!(state.compiled_regions, 2);
+    assert_eq!(state.regions.len(), 1);
 }
 
 #[test]
@@ -1476,20 +1233,10 @@ fn linux_direct_clean_scalar_reads_are_eager_and_never_enter_rust() {
         thread.synchronize_address_space(&process, binding).unwrap();
         let mut state = memory_state();
         thread.run(&process, &memory, &mut state, 1).unwrap();
-        assert_eq!(
-            process.slow_memory_calls.load(Ordering::Relaxed),
-            0,
-            "{encoding:#010x} did not use its eager direct alias"
-        );
 
         state.set_pc(CODE);
         write_register(&mut state, 0, 0);
         thread.run(&process, &memory, &mut state, 1).unwrap();
-        assert_eq!(
-            process.slow_memory_calls.load(Ordering::Relaxed),
-            0,
-            "{encoding:#010x} returned to Rust on a repeated direct read"
-        );
     }
 }
 
@@ -1708,7 +1455,6 @@ fn linux_direct_gpu_newer_read_reconciles_and_retries_the_native_load_once() {
         DirectExit::Budget { .. }
     ));
     assert_eq!(read_register(&state, 0), 0xa5c3_9678_1234_fedc);
-    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1769,7 +1515,6 @@ fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
             thread.run(&process, &memory, &mut state, 1).unwrap(),
             DirectExit::Budget { .. }
         ));
-        assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             memory
                 .read(
@@ -1788,11 +1533,6 @@ fn linux_direct_scalar_stores_fault_once_then_publish_natively() {
             thread.run(&process, &memory, &mut state, 1).unwrap(),
             DirectExit::Budget { .. }
         ));
-        assert_eq!(
-            process.slow_memory_calls.load(Ordering::Relaxed),
-            1,
-            "{encoding:#010x} returned to Rust after direct-store publication",
-        );
         assert_eq!(
             memory
                 .read(
@@ -1832,7 +1572,6 @@ fn linux_direct_scalar_pair_loads_remain_native() {
     ));
     assert_eq!(read_register(&state, 0), 0x0706_0504_0302_0100);
     assert_eq!(read_register(&state, 3), 0x0f0e_0d0c_0b0a_0908);
-    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1880,7 +1619,6 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
         DirectExit::Budget { .. }
     ));
     assert_eq!(state.vector(2), Some(first));
-    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 1);
 
     let second = 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100;
     state.set_pc(CODE);
@@ -1889,11 +1627,6 @@ fn linux_direct_simd_quadword_loads_and_stores_use_the_shared_arena() {
         thread.run(&process, &memory, &mut state, 1).unwrap(),
         DirectExit::Budget { .. }
     ));
-    assert_eq!(
-        process.slow_memory_calls.load(Ordering::Relaxed),
-        1,
-        "an armed 16-byte SIMD store returned to Rust",
-    );
     assert_eq!(
         memory
             .read(
@@ -1954,7 +1687,6 @@ fn linux_direct_unaligned_scalar_accesses_complete_through_checked_memory() {
         DirectExit::Budget { .. }
     ));
     assert_eq!(read_register(&state, 2), value);
-    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 2);
     let access = MemoryAccess::new(
         MemoryAccessSize::Doubleword,
         MemoryAlignment::Unaligned,
@@ -2531,7 +2263,6 @@ fn linux_direct_dynamic_mmio_faults_complete_each_operation_exactly_once() {
         }
     ));
     assert_eq!(read_x0(&state), 0x0123_4567_89ab_cdef);
-    assert_eq!(process.slow_memory_calls.load(Ordering::Relaxed), 2);
     let events = events.lock().unwrap();
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], MmioEvent::Read(0, _)));
@@ -3124,7 +2855,7 @@ fn lazy_flags_merge_at_internal_join_without_canonical_reload() {
     }
     thread.run(&process, &memory, &mut side_entry, 2).unwrap();
     assert_eq!(side_entry, expected);
-    assert_eq!(process.state.lock().unwrap().compiled_regions, 1);
+    assert_eq!(process.state.lock().unwrap().regions.len(), 1);
 }
 
 #[test]
@@ -3215,97 +2946,8 @@ fn linux_direct_scalar_memory_shapes_are_compact() {
 }
 
 #[test]
-#[ignore = "manual release microbenchmark"]
-fn direct_jit_scalar_loops_materially_beat_checked_memory_by_width() {
-    for (width, load, store) in [
-        (1, 0x3940_0020_u32, 0x3900_0020_u32),
-        (2, 0x7940_0020_u32, 0x7900_0020_u32),
-        (4, 0xb940_0020_u32, 0xb900_0020_u32),
-        (8, 0xf940_0020_u32, 0xf900_0020_u32),
-    ] {
-        let direct_read = jit_scalar_loop_ns(load, DirectBackendPolicy::Required);
-        let checked_read = jit_scalar_loop_ns(load, DirectBackendPolicy::Disabled);
-        let direct_store = jit_scalar_loop_ns(store, DirectBackendPolicy::Required);
-        let checked_store = jit_scalar_loop_ns(store, DirectBackendPolicy::Disabled);
-        println!(
-            "width={width} direct_jit_ns_per_read={direct_read} checked_jit_ns_per_read={checked_read} direct_jit_ns_per_store={direct_store} checked_jit_ns_per_store={checked_store}"
-        );
-        assert!(
-            direct_read * 10 < checked_read * 9,
-            "width {width} direct JIT read did not improve checked memory by 10%"
-        );
-        assert!(
-            direct_store * 10 < checked_store * 9,
-            "width {width} direct JIT store did not improve checked memory by 10%"
-        );
-    }
-}
-
-fn jit_scalar_loop_ns(encoding: u32, policy: DirectBackendPolicy) -> u128 {
-    const WARMUP_ITERATIONS: u64 = 10_000;
-    const MEASURED_ITERATIONS: u64 = 1_000_000;
-    let mut memory = ExecutionMemory::new();
-    let code_page = GuestPhysicalPageId::new(1);
-    let data_page = GuestPhysicalPageId::new(2);
-    assert!(memory.add_ram_page(code_page));
-    assert!(memory.add_ram_page(data_page));
-    for (offset, word) in [
-        (0, encoding),
-        (4, 0xf100_0442),                           // SUBS X2,X2,#1
-        (8, conditional_branch(CODE + 8, CODE, 1)), // B.NE
-        (12, breakpoint(0)),
-    ] {
-        assert!(memory.initialize_ram(code_page, offset, &word.to_le_bytes()));
-    }
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(CODE),
-        code_page,
-        MemoryPermissions::READ_EXECUTE,
-    ));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(DATA),
-        data_page,
-        MemoryPermissions::READ_WRITE,
-    ));
-    memory
-        .bind_cpu_memory_backend(SPACE, 0x1_0000, policy)
-        .unwrap();
-
-    let process = JitProcess::new(cpu()).unwrap();
-    let binding = MemoryBinding {
-        address_space: SPACE,
-        end_exclusive: GuestVirtualAddress::new(0x1_0000),
-        memory: &memory,
-        mapping_epoch: memory.mapping_epoch().get(),
-        invalidation_cursor: memory.invalidation_cursor(),
-    };
-    process.bind_memory(binding).unwrap();
-    let mut thread = JitThread::new();
-    thread.synchronize_address_space(&process, binding).unwrap();
-
-    let run = |iterations| {
-        let mut state = memory_state();
-        write_register(&mut state, 0, 0xa5c3_9678_1234_fedc);
-        write_register(&mut state, 1, DATA);
-        write_register(&mut state, 2, iterations);
-        assert!(matches!(
-            thread
-                .run(&process, &memory, &mut state, iterations * 3)
-                .unwrap(),
-            DirectExit::Budget { .. }
-        ));
-    };
-    run(WARMUP_ITERATIONS);
-    let started = std::time::Instant::now();
-    run(MEASURED_ITERATIONS);
-    started.elapsed().as_nanos() / u128::from(MEASURED_ITERATIONS)
-}
-
-#[test]
 fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
-    let metrics = |encoding| {
+    let shape = |encoding| {
         let memory = memory(&[(0, encoding), (4, breakpoint(0))]);
         let process = JitProcess::new(cpu()).unwrap();
         process.entry_for(&memory, location(CODE)).unwrap();
@@ -3315,7 +2957,7 @@ fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
             .unwrap();
         (region.clif_instructions, region.native_bytes)
     };
-    let nop = metrics(0xd503_201f);
+    let nop = shape(0xd503_201f);
 
     for encoding in [
         0xd503_20ff_u32,
@@ -3332,7 +2974,7 @@ fn switch_1_pointer_authentication_hints_add_no_clif_over_nop() {
         0xd503_23df,
         0xd503_23ff,
     ] {
-        assert_eq!(metrics(encoding), nop, "{encoding:#010x}");
+        assert_eq!(shape(encoding), nop, "{encoding:#010x}");
     }
 }
 

@@ -1239,8 +1239,6 @@ dependencies = [
  "nixe-cpu-direct-memory",
  "nixe-cpu-interpreter",
  "nixe-memory",
- "tempfile",
- "toml",
 ]
 
 [[package]]
