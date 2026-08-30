@@ -3,24 +3,12 @@
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
-
-/// Snapshot of transition-boundary diagnostics.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ExecutionGateMetrics {
-    pub shared_acquisitions: u64,
-    pub exclusive_acquisitions: u64,
-    pub exclusive_wait_ns: u64,
-    pub peak_shared_holders: u64,
-    pub safepoint_notifications: u64,
-}
 
 #[derive(Debug)]
 struct ExecutionGateState {
     active_shared: usize,
     transition_pending: bool,
     epoch: u64,
-    metrics: ExecutionGateMetrics,
 }
 
 struct ExecutionGateInner {
@@ -68,7 +56,6 @@ impl ExecutionGate {
                     active_shared: 0,
                     transition_pending: false,
                     epoch: 1,
-                    metrics: ExecutionGateMetrics::default(),
                 }),
                 changed: Condvar::new(),
                 transition_notifier: Mutex::new(None),
@@ -108,11 +95,6 @@ impl ExecutionGate {
             .active_shared
             .checked_add(1)
             .expect("shared execution holders are bounded by host workers");
-        state.metrics.shared_acquisitions = state.metrics.shared_acquisitions.saturating_add(1);
-        state.metrics.peak_shared_holders = state
-            .metrics
-            .peak_shared_holders
-            .max(state.active_shared as u64);
         let epoch = state.epoch;
         ExecutionSharedGuard {
             gate: self.clone(),
@@ -123,7 +105,6 @@ impl ExecutionGate {
     /// Closes admission and waits until every bounded CPU slice reaches its
     /// safepoint. Pending transitions cannot be overtaken by new readers.
     pub fn acquire_exclusive(&self) -> ExecutionTransitionGuard<'_> {
-        let started = Instant::now();
         let mut state = self.lock_state();
         while state.transition_pending {
             state = self
@@ -146,13 +127,6 @@ impl ExecutionGate {
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        let elapsed = started.elapsed();
-        state.metrics.exclusive_acquisitions =
-            state.metrics.exclusive_acquisitions.saturating_add(1);
-        state.metrics.exclusive_wait_ns = state
-            .metrics
-            .exclusive_wait_ns
-            .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
         ExecutionTransitionGuard {
             gate: self,
             state: Some(state),
@@ -168,11 +142,6 @@ impl ExecutionGate {
     #[must_use]
     pub fn transition_pending(&self) -> bool {
         self.lock_state().transition_pending
-    }
-
-    #[must_use]
-    pub fn metrics(&self) -> ExecutionGateMetrics {
-        self.lock_state().metrics
     }
 
     fn lock_state(&self) -> MutexGuard<'_, ExecutionGateState> {
@@ -192,11 +161,6 @@ impl ExecutionGate {
         let Some(notifier) = notifier else {
             return;
         };
-        {
-            let mut state = self.lock_state();
-            state.metrics.safepoint_notifications =
-                state.metrics.safepoint_notifications.saturating_add(1);
-        }
         let _ = catch_unwind(AssertUnwindSafe(|| notifier()));
     }
 }
@@ -316,7 +280,6 @@ mod tests {
             std::thread::yield_now();
         }
         notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(gate.metrics().safepoint_notifications, 1);
         drop(active);
         worker.join().unwrap();
     }

@@ -548,11 +548,6 @@ impl CraneliftTranslator<'_, '_> {
         if ordering != MemoryOrdering::Relaxed || !self.direct_memory || completion.is_none() {
             return self.memory_write_slow(source, address, value, size, ordering, flags);
         }
-        self.record_direct_access(
-            source,
-            size.bytes() as u8,
-            nixe_cpu_direct_memory::NativeMemoryAccessKind::Write,
-        );
         self.checkpoint_direct_fault_state(flags)?;
         self.builder.ins().set_pinned_reg(address);
         let arena_size = self.load_context(types::I64, offset_of!(NativeContext, direct_size))?;

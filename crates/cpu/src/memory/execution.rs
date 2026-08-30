@@ -18,11 +18,11 @@ use nixe_memory::{
     CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
     CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, CanonicalWriteBatch,
     ContentGeneration, ContentMutationEpoch, CpuMemoryBackend, DirectAddressSpaceView, DirectArena,
-    DirectArenaMetrics, DirectBackendPolicy, DirectMapRequest, DirectProtectRequest,
-    DirectProtection, ExecutionGate, ExecutionSharedGuard, ExecutionTransitionGuard,
-    GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking, MappingGeneration,
-    MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
-    MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
+    DirectBackendPolicy, DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate,
+    ExecutionSharedGuard, ExecutionTransitionGuard, GuestPhysicalPageId, GuestVirtualAddress,
+    HostMappedBacking, MappingGeneration, MemoryInvalidation, MemoryInvalidationCursor,
+    MemoryInvalidationError, MemoryInvalidationKind, MemoryInvalidationLog,
+    MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 
 use crate::{
@@ -1030,17 +1030,6 @@ impl ExecutionMemory {
     }
 
     #[must_use]
-    pub fn direct_arena_metrics(
-        &self,
-        address_space: AddressSpaceId,
-    ) -> Option<DirectArenaMetrics> {
-        match self.lock_inner().backends.get(&address_space)? {
-            ExecutionBackendBinding::Checked => None,
-            ExecutionBackendBinding::LinuxDirect { arena, .. } => Some(arena.metrics()),
-        }
-    }
-
-    #[must_use]
     pub fn direct_protection_at(
         &self,
         address_space: AddressSpaceId,
@@ -2000,24 +1989,6 @@ impl CpuMemory for ExecutionMemory {
         address_space: AddressSpaceId,
     ) -> Option<DirectAddressSpaceView> {
         ExecutionMemory::direct_address_space_view(self, address_space)
-    }
-
-    fn direct_memory_metrics(
-        &self,
-        address_space: AddressSpaceId,
-    ) -> Option<super::DirectMemoryMetrics> {
-        Some(super::DirectMemoryMetrics {
-            arena: self.direct_arena_metrics(address_space)?,
-            execution_gate: self.execution_gate.metrics(),
-        })
-    }
-
-    fn enable_direct_memory_metrics(&self, address_space: AddressSpaceId) {
-        if let Some(ExecutionBackendBinding::LinuxDirect { arena, .. }) =
-            self.lock_inner().backends.get(&address_space)
-        {
-            arena.enable_vma_sampling();
-        }
     }
 
     fn execution_gate_identity(&self) -> Option<usize> {
@@ -3502,58 +3473,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "release-only bulk-memory evidence benchmark"]
-    fn bounded_bulk_transfer_cost_is_reproducible() {
-        const BULK_SIZE: usize = 4 * 1024 * 1024;
-        const ITERATIONS: u32 = 16;
-        let space = AddressSpaceId::new(7);
-        let address = GuestVirtualAddress::new(0x1000);
-        let memory = ExecutionMemory::new();
-        memory
-            .resize_zeroed_mapping(
-                space,
-                address,
-                0,
-                BULK_SIZE as u64,
-                MemoryPermissions::READ_WRITE,
-                MemoryMappingPurpose::Heap,
-            )
-            .unwrap();
-        let input = vec![0x5a; BULK_SIZE];
-        let mut output = vec![0; BULK_SIZE];
-        memory.write_bytes(space, address, &input).unwrap();
-        memory.read_bytes(space, address, &mut output).unwrap();
-        assert_eq!(output, input);
-
-        let started = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            let mut scratch = vec![0; BULK_SIZE];
-            scratch.copy_from_slice(std::hint::black_box(&input));
-            std::hint::black_box(scratch);
-        }
-        let scratch_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
-
-        let started = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            memory.read_bytes(space, address, &mut output).unwrap();
-            std::hint::black_box(&output);
-        }
-        let read_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
-
-        let started = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            memory
-                .write_bytes(space, address, std::hint::black_box(&input))
-                .unwrap();
-        }
-        let write_ns = started.elapsed().as_nanos() / u128::from(ITERATIONS);
-
-        println!(
-            "bulk_bytes={BULK_SIZE} scratch_allocate_copy_ns={scratch_ns} canonical_read_ns={read_ns} canonical_write_ns={write_ns}"
-        );
-    }
-
-    #[test]
     fn canonical_translation_retains_checked_page_spanning_segments() {
         let memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(7);
@@ -4303,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_backend_batches_zeroed_mapping_growth_and_shrink() {
+    fn direct_backend_grows_and_shrinks_zeroed_mappings() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(32);
         let start = GuestVirtualAddress::new(0x1000);
@@ -4326,9 +4245,10 @@ mod tests {
                 MemoryMappingPurpose::Heap,
             )
             .unwrap();
-        let grown = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(grown.mmap_calls, 1);
-        assert_eq!(grown.mmap_pages, page_count);
+        assert_eq!(
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::Read)
+        );
 
         memory
             .resize_zeroed_mapping(
@@ -4340,14 +4260,18 @@ mod tests {
                 MemoryMappingPurpose::Heap,
             )
             .unwrap();
-        let shrunk = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(shrunk.mmap_calls, grown.mmap_calls + 1);
-        assert_eq!(shrunk.replaced_pages, page_count - 1);
-        assert_eq!(shrunk.peak_mapped_pages, page_count);
+        assert_eq!(
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::Read)
+        );
+        assert_eq!(
+            memory.direct_protection_at(space, start.wrapping_offset(SYNTHETIC_PAGE_SIZE as i64)),
+            None
+        );
     }
 
     #[test]
-    fn direct_backend_batches_contiguous_protection_mutations() {
+    fn direct_backend_applies_contiguous_protection_mutations() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(33);
         let start = GuestVirtualAddress::new(0x10_0000);
@@ -4371,7 +4295,6 @@ mod tests {
             )
             .unwrap();
 
-        let mapped = memory.direct_arena_metrics(space).unwrap();
         memory
             .set_attributes(
                 space,
@@ -4381,9 +4304,6 @@ mod tests {
                 MemoryAttributes::UNCACHED,
             )
             .unwrap();
-        let uncached = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(uncached.mprotect_calls, mapped.mprotect_calls + 1);
-        assert_eq!(uncached.mprotect_pages, mapped.mprotect_pages + page_count);
         assert_eq!(
             memory.direct_protection_at(space, start),
             Some(DirectProtection::None)
@@ -4398,9 +4318,6 @@ mod tests {
                 MemoryAttributes::NONE,
             )
             .unwrap();
-        let cached = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(cached.mprotect_calls, uncached.mprotect_calls + 1);
-        assert_eq!(cached.mprotect_pages, uncached.mprotect_pages + page_count);
         assert_eq!(
             memory.direct_protection_at(space, start),
             Some(DirectProtection::Read)
@@ -4409,20 +4326,16 @@ mod tests {
         memory
             .set_permissions(space, start, size, MemoryPermissions::WRITE)
             .unwrap();
-        let write_only = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(write_only.mprotect_calls, cached.mprotect_calls + 1);
         assert_eq!(
-            write_only.mprotect_pages,
-            cached.mprotect_pages + page_count
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::None)
         );
         memory
             .set_permissions(space, start, size, MemoryPermissions::READ)
             .unwrap();
-        let readable = memory.direct_arena_metrics(space).unwrap();
-        assert_eq!(readable.mprotect_calls, write_only.mprotect_calls + 1);
         assert_eq!(
-            readable.mprotect_pages,
-            write_only.mprotect_pages + page_count
+            memory.direct_protection_at(space, start),
+            Some(DirectProtection::Read)
         );
     }
 

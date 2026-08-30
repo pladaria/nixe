@@ -37,3 +37,4 @@ Thumbs.db
 /perf.*
 /perf-*
 /dump/
+/docker/reference-*

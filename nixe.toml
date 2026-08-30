@@ -48,13 +48,6 @@ backend = "jit"
 # Opt-in host-parallel vCPU execution. False keeps deterministic serialization.
 parallel_vcpus = false
 
-[cpu.jit]
-# Optional per-region CLIF and native-code dumps. Missing or empty disables
-# dumps; relative paths are resolved from this file.
-# dump_directory = "./dump/jit"
-# Directory receiving one timestamped aggregate JIT report at shutdown.
-performance_report_directory = "./dump/jit-perf/"
-
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by
 # least-recent use; this is a software budget rather than a hardware limit.

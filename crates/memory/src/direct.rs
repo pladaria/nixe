@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::host_mapped::HostMappedBacking;
@@ -182,42 +182,6 @@ pub struct DirectProtectRequest {
     pub protection: DirectProtection,
 }
 
-/// Aggregate diagnostics. Counters are updated only at mapping/protection
-/// boundaries and add no work to a successful guest memory access.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DirectArenaMetrics {
-    pub mmap_calls: u64,
-    pub mmap_pages: u64,
-    pub mprotect_calls: u64,
-    pub mprotect_pages: u64,
-    pub replaced_pages: u64,
-    pub writable_alias_pages_armed: u64,
-    pub writable_alias_pages_revoked: u64,
-    pub host_failures: u64,
-    pub peak_mapped_pages: u64,
-    /// Sparse virtual reservation used by the one-index store-control table.
-    pub control_reserved_bytes: u64,
-    pub baseline_vma_count: u64,
-    pub peak_vma_growth: u64,
-    pub vma_samples: u64,
-}
-
-#[derive(Default)]
-struct DirectArenaCounters {
-    mmap_calls: AtomicU64,
-    mmap_pages: AtomicU64,
-    mprotect_calls: AtomicU64,
-    mprotect_pages: AtomicU64,
-    replaced_pages: AtomicU64,
-    writable_alias_pages_armed: AtomicU64,
-    writable_alias_pages_revoked: AtomicU64,
-    host_failures: AtomicU64,
-    peak_mapped_pages: AtomicU64,
-    peak_vma_growth: AtomicU64,
-    vma_operations: AtomicU64,
-    vma_samples: AtomicU64,
-}
-
 struct DirectMappedPage {
     fd: i32,
     backing_offset: u64,
@@ -293,11 +257,8 @@ struct DirectArenaInner {
     base: NonNull<u8>,
     address_space_size: usize,
     store_controls: DirectControlTable,
-    baseline_vma_count: usize,
-    vma_sampling_enabled: AtomicBool,
     state: Mutex<DirectArenaState>,
     poisoned: AtomicBool,
-    counters: DirectArenaCounters,
     #[cfg(test)]
     fail_after_host_calls: std::sync::atomic::AtomicI64,
 }
@@ -347,7 +308,7 @@ impl std::fmt::Debug for DirectArena {
 impl DirectArena {
     /// Reserves one process-sized arena surrounded by inaccessible guard pages.
     pub fn new(address_space_size: usize) -> Result<Self, DirectMemoryError> {
-        let capabilities = DirectHostCapabilities::detect()?;
+        DirectHostCapabilities::detect()?;
         if address_space_size == 0 || !address_space_size.is_multiple_of(DIRECT_PAGE_SIZE) {
             return Err(DirectMemoryError::invalid(
                 "direct address-space size must be a nonzero guest-page multiple",
@@ -370,8 +331,6 @@ impl DirectArena {
                 "direct host address calculation overflows",
             ));
         }
-        let baseline_vma_count =
-            host_vma_count().unwrap_or_else(|_| capabilities.current_vma_count().saturating_add(2));
         Ok(Self {
             inner: Arc::new(DirectArenaInner {
                 reservation,
@@ -379,13 +338,10 @@ impl DirectArena {
                 base,
                 address_space_size,
                 store_controls,
-                baseline_vma_count,
-                vma_sampling_enabled: AtomicBool::new(false),
                 state: Mutex::new(DirectArenaState {
                     pages: BTreeMap::new(),
                 }),
                 poisoned: AtomicBool::new(false),
-                counters: DirectArenaCounters::default(),
                 #[cfg(test)]
                 fail_after_host_calls: std::sync::atomic::AtomicI64::new(-1),
             }),
@@ -421,19 +377,6 @@ impl DirectArena {
 
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.inner).addr()
-    }
-
-    /// Enables the fallible `/proc` sampling used only by optional performance
-    /// reports. Mapping counters themselves remain available regardless.
-    pub fn enable_vma_sampling(&self) {
-        if self
-            .inner
-            .vma_sampling_enabled
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.sample_vma_count();
-        }
     }
 
     pub(crate) fn downgrade(&self) -> DirectArenaWeak {
@@ -527,13 +470,6 @@ impl DirectArena {
                 .ok_or_else(|| DirectMemoryError::invalid("direct map batch size overflows"))?;
             self.map_run(first, size)?;
             for request in &requests[start..end] {
-                self.record_write_protection_transition(
-                    state
-                        .pages
-                        .get(&request.guest_address)
-                        .map(|page| page.protection),
-                    request.protection,
-                );
                 state.pages.insert(
                     request.guest_address,
                     DirectMappedPage {
@@ -543,15 +479,8 @@ impl DirectArena {
                     },
                 );
             }
-            add(&self.inner.counters.mmap_calls, 1);
-            add(&self.inner.counters.mmap_pages, page_count as u64);
             start = end;
         }
-        self.inner
-            .counters
-            .peak_mapped_pages
-            .fetch_max(state.pages.len() as u64, Ordering::Relaxed);
-        self.record_vma_count();
         Ok(())
     }
 
@@ -778,17 +707,10 @@ impl DirectArena {
                     .pages
                     .get_mut(&page)
                     .expect("direct protection pages were preflighted");
-                self.record_write_protection_transition(Some(mapped.protection), first.protection);
                 mapped.protection = first.protection;
             }
-            add(&self.inner.counters.mprotect_calls, 1);
-            add(
-                &self.inner.counters.mprotect_pages,
-                (size / DIRECT_PAGE_SIZE) as u64,
-            );
             start = end;
         }
-        self.record_vma_count();
         Ok(())
     }
 
@@ -805,92 +727,14 @@ impl DirectArena {
         for request in requests {
             self.replace_run_with_none(request.guest_address, request.size)?;
             for page in pages(request.guest_address, request.size) {
-                if let Some(mapped) = state.pages.get(&page) {
-                    self.record_write_protection_transition(
-                        Some(mapped.protection),
-                        DirectProtection::None,
-                    );
-                }
                 state.pages.remove(&page);
                 self.inner
                     .store_controls
                     .slot(page as usize / DIRECT_PAGE_SIZE)
                     .store(0, Ordering::Release);
             }
-            add(&self.inner.counters.mmap_calls, 1);
-            add(
-                &self.inner.counters.mmap_pages,
-                (request.size / DIRECT_PAGE_SIZE) as u64,
-            );
-            add(
-                &self.inner.counters.replaced_pages,
-                (request.size / DIRECT_PAGE_SIZE) as u64,
-            );
         }
-        self.record_vma_count();
         Ok(())
-    }
-
-    #[must_use]
-    pub fn metrics(&self) -> DirectArenaMetrics {
-        let counters = &self.inner.counters;
-        DirectArenaMetrics {
-            mmap_calls: counters.mmap_calls.load(Ordering::Relaxed),
-            mmap_pages: counters.mmap_pages.load(Ordering::Relaxed),
-            mprotect_calls: counters.mprotect_calls.load(Ordering::Relaxed),
-            mprotect_pages: counters.mprotect_pages.load(Ordering::Relaxed),
-            replaced_pages: counters.replaced_pages.load(Ordering::Relaxed),
-            writable_alias_pages_armed: counters.writable_alias_pages_armed.load(Ordering::Relaxed),
-            writable_alias_pages_revoked: counters
-                .writable_alias_pages_revoked
-                .load(Ordering::Relaxed),
-            host_failures: counters.host_failures.load(Ordering::Relaxed),
-            peak_mapped_pages: counters.peak_mapped_pages.load(Ordering::Relaxed),
-            control_reserved_bytes: self.inner.store_controls.byte_size as u64,
-            baseline_vma_count: self.inner.baseline_vma_count as u64,
-            peak_vma_growth: counters.peak_vma_growth.load(Ordering::Relaxed),
-            vma_samples: counters.vma_samples.load(Ordering::Relaxed),
-        }
-    }
-
-    fn record_vma_count(&self) {
-        if !self.inner.vma_sampling_enabled.load(Ordering::Acquire) {
-            return;
-        }
-        let operation = self
-            .inner
-            .counters
-            .vma_operations
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        if operation > 16 && !operation.is_multiple_of(4096) {
-            return;
-        }
-        self.sample_vma_count();
-    }
-
-    fn sample_vma_count(&self) {
-        if let Ok(current) = host_vma_count() {
-            add(&self.inner.counters.vma_samples, 1);
-            self.inner.counters.peak_vma_growth.fetch_max(
-                current.saturating_sub(self.inner.baseline_vma_count) as u64,
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    fn record_write_protection_transition(
-        &self,
-        previous: Option<DirectProtection>,
-        next: DirectProtection,
-    ) {
-        let was_writable = previous == Some(DirectProtection::ReadWrite);
-        let is_writable = next == DirectProtection::ReadWrite;
-        if !was_writable && is_writable {
-            add(&self.inner.counters.writable_alias_pages_armed, 1);
-        } else if was_writable && !is_writable {
-            add(&self.inner.counters.writable_alias_pages_revoked, 1);
-        }
     }
 
     fn map_run(&self, first: &DirectMapRequest<'_>, size: usize) -> Result<(), DirectMemoryError> {
@@ -988,7 +832,6 @@ impl DirectArena {
     }
 
     fn host_failure<T>(&self, operation: &str) -> Result<T, DirectMemoryError> {
-        add(&self.inner.counters.host_failures, 1);
         self.poison();
         Err(DirectMemoryError::last(operation))
     }
@@ -1221,12 +1064,6 @@ fn coalesce_pages(pages: &[u64], protection: DirectProtection) -> Vec<DirectProt
     ranges
 }
 
-fn add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(value))
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,8 +1097,6 @@ mod tests {
     #[test]
     fn thirty_nine_bit_control_table_is_sparse_and_keeps_one_index_lookup() {
         const ADDRESS_SPACE_SIZE: usize = 1_usize << 39;
-        const CONTROL_RESERVED_BYTES: u64 = 1_u64 << 30;
-
         let arena = DirectArena::new(ADDRESS_SPACE_SIZE).unwrap();
         let view = arena.view();
         let first = unsafe { &*(view.store_controls as *const AtomicUsize) };
@@ -1272,10 +1107,6 @@ mod tests {
 
         assert_eq!(first.load(Ordering::Relaxed), 0);
         assert_eq!(last.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            arena.metrics().control_reserved_bytes,
-            CONTROL_RESERVED_BYTES
-        );
         assert_eq!(arena.mapped_pages(), 0);
     }
 
@@ -1289,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_backing_pages_are_mapped_in_one_host_call() {
+    fn adjacent_backing_pages_are_mapped() {
         let store = CanonicalBackingStore::allocate().unwrap();
         let first = page(&store, 1, 0x11);
         let second = page(&store, 2, 0x22);
@@ -1313,12 +1144,10 @@ mod tests {
         let view = arena.view();
         assert_eq!(unsafe { *((view.base + 0x4000) as *const u8) }, 0x11);
         assert_eq!(unsafe { *((view.base + 0x5000) as *const u8) }, 0x22);
-        assert_eq!(arena.metrics().mmap_calls, 1);
-        assert_eq!(arena.metrics().mmap_pages, 2);
     }
 
     #[test]
-    fn aliases_share_bytes_and_protection_batches_coalesce() {
+    fn aliases_share_bytes_and_protection() {
         let store = CanonicalBackingStore::allocate().unwrap();
         let page = page(&store, 1, 0x33);
         let backing = page.direct_backing().unwrap();
@@ -1337,11 +1166,6 @@ mod tests {
                 },
             ])
             .unwrap();
-        assert_eq!(arena.metrics().writable_alias_pages_armed, 2);
-        assert_eq!(arena.metrics().vma_samples, 0);
-        arena.enable_vma_sampling();
-        let samples_after_enable = arena.metrics().vma_samples;
-        assert_eq!(samples_after_enable, 1);
         arena
             .protect_ranges(&[
                 DirectProtectRequest {
@@ -1356,11 +1180,6 @@ mod tests {
                 },
             ])
             .unwrap();
-        assert_eq!(
-            arena.metrics().vma_samples,
-            samples_after_enable,
-            "a no-op protection publication must not sample /proc"
-        );
         let view = arena.view();
         unsafe { *((view.base + 0x4000) as *mut u8) = 0x77 };
         assert_eq!(unsafe { *((view.base + 0x8000) as *const u8) }, 0x77);
@@ -1378,19 +1197,8 @@ mod tests {
                 },
             ])
             .unwrap();
-        assert_eq!(arena.metrics().mprotect_calls, 2);
-        assert_eq!(arena.metrics().writable_alias_pages_revoked, 2);
-        assert_eq!(arena.metrics().vma_samples, samples_after_enable + 1);
-    }
-
-    #[test]
-    fn optional_vma_sampling_is_bounded_under_many_host_operations() {
-        let arena = DirectArena::new(0x20_000).unwrap();
-        arena.enable_vma_sampling();
-        for _ in 0..10_000 {
-            arena.record_vma_count();
-        }
-        assert_eq!(arena.metrics().vma_samples, 19);
+        assert_eq!(arena.protection_at(0x4000), Some(DirectProtection::Read));
+        assert_eq!(arena.protection_at(0x8000), Some(DirectProtection::Read));
     }
 
     #[test]
@@ -1418,6 +1226,5 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("injected"));
         assert!(arena.is_poisoned());
-        assert_eq!(arena.metrics().host_failures, 1);
     }
 }

@@ -1,7 +1,6 @@
 //! Typed runtime boundaries used by direct native code.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::Ordering;
 
 use nixe_cpu::decode::a64::fp_simd::{
     FloatAddOperation, FloatConversion, FloatFusedMultiplyOperation, FloatMultiplyOperation,
@@ -211,7 +210,6 @@ fn read_memory<const SIZE: u8, const ORDER: u8>(
     aligned: bool,
 ) {
     contain(context, |context| {
-        unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
         let access = access::<SIZE, ORDER>(MemoryAccessClass::Normal, aligned);
         let memory = unsafe { &*context.memory };
         let result = memory.read(
@@ -232,7 +230,6 @@ unsafe extern "C" fn write_relaxed_128(
     high: u64,
 ) {
     contain(context, |context| {
-        unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
         let memory = unsafe { &*context.memory };
         memory.complete_direct_write_fault(
             AddressSpaceId::new(context.address_space),
@@ -270,7 +267,6 @@ fn write_memory<const SIZE: u8, const ORDER: u8>(
     aligned: bool,
 ) {
     contain(context, |context| {
-        unsafe { &*context.slow_memory_calls }.fetch_add(1, Ordering::Relaxed);
         let access = access::<SIZE, ORDER>(MemoryAccessClass::Normal, aligned);
         let memory = unsafe { &*context.memory };
         memory.complete_direct_write_fault(
